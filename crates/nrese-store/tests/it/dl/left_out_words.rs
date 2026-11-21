@@ -23,11 +23,13 @@ const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
 const OWL: &str = "http://www.w3.org/2002/07/owl#";
 
 /// What each left-out sentence among `texts` says of the part it gives first: the verdict's
-/// and the mark's are separate reasons, and each is told.
+/// and the mark's are separate reasons, and each is told. A name an axiom reads as two kinds
+/// is no part left out, and its verdict's sentence says what it is: a name the DL engines read
+/// as one.
 fn firsts<'a>(texts: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
-    let parts = texts
-        .into_iter()
-        .flat_map(|t| t.split("left out; first: ").skip(1));
+    let parts = texts.into_iter().flat_map(|t| {
+        (t.split("left out; first: ").skip(1)).chain(t.split("as one name; first: ").skip(1))
+    });
     parts.collect()
 }
 

@@ -772,10 +772,16 @@ impl StoreService {
     }
 
     /// Waits until the engine's background maintenance has nothing requested or running
-    /// ([`Engine::settle`]): for measurements of what the store holds.
+    /// ([`Engine::settle`]), or reports that the worker ended: for measurements of what the
+    /// store holds.
     #[doc(hidden)]
-    pub fn settle(&self) {
-        self.engine.settle();
+    pub fn settle(&self) -> StoreResult<()> {
+        self.engine.settle().map_err(Into::into)
+    }
+
+    /// The background maintenance worker's recorded error, once it has ended.
+    pub fn maintenance_error(&self) -> Option<EngineError> {
+        self.engine.maintenance_error()
     }
 
     pub(crate) fn engine(&self) -> &Engine {
@@ -1043,8 +1049,9 @@ impl StoreService {
         // A state with violations (read at open, or recorded before): whether `owl2-dl`
         // decides them, derived under the mode now set (`ReasoningState::undecided`).
         if let Some(mut state) = self.reasoning_state().filter(|s| s.violations > 0) {
+            let treatments = &self.config.dl.treatments;
             state.undecided = active
-                .then(|| self.dl.undecided(&self.engine.snapshot()))
+                .then(|| self.dl.undecided(&self.engine.snapshot(), treatments))
                 .flatten();
             *self.materialised.lock().unwrap_or_else(|p| p.into_inner()) = Some(state);
         }
@@ -1335,7 +1342,9 @@ impl StoreService {
             cancellation,
             &memory,
             out,
-            |ql| {
+            |mut ql| {
+                self.certify_ql(ql.as_deref_mut(), prepared, &snapshot);
+                let ql = ql.as_deref();
                 let status = self.status_outside_dl(prepared, ql, at);
                 // The cache's context is the whole assessment, not what the reader is told.
                 let context = context_outside_dl(status.as_ref(), ql.is_some());
@@ -1348,9 +1357,9 @@ impl StoreService {
     }
 
     /// The status of answers outside the DL bounds: the QL rewriting's report where it ran,
-    /// as it left the rewriting with what neither it nor the closure answers composed onto
-    /// it ([`crate::dl::query::certify_report`]) and the list mark ([`Self::ql_status`]);
-    /// else [`Self::status_without_dl`], marked for the data `at` the answers were read from.
+    /// certified ([`Self::certify_ql`]: what neither it nor the closure answers, the list
+    /// mark among it, composed onto it); else [`Self::status_without_dl`], marked for the
+    /// data `at` the answers were read from.
     fn status_outside_dl(
         &self,
         prepared: &PreparedQuery,
@@ -1362,7 +1371,7 @@ impl StoreService {
                 .then(nrese_sparql::Completeness::not_certified);
         }
         let route = match ql {
-            Some(ql) => Some(self.ql_status(ql, at.snapshot())),
+            Some(ql) => Some(ql.completeness.clone()),
             None => self.status_without_dl_at(prepared, at),
         };
         self.assess(prepared, at, route)
@@ -1395,7 +1404,7 @@ impl StoreService {
         };
         let mut status = route?;
         let source = if certificate.dl { "dl" } else { "transaction" };
-        if let Revision::Pending(_, deletes) = at {
+        if let Revision::Pending { deletes, .. } = at {
             // Under `owl2-dl` a pending read has no DL bounds whatever its dataset; it reads the
             // committed closure where it surely reads the default graph.
             let closure = match (
@@ -1415,7 +1424,7 @@ impl StoreService {
             crate::dl::query::mark(self, prepared, at, &mut status);
         }
         let (reads, decided) = (prepared.reads(), matches!(at, Revision::Decided(_)));
-        if matches!(at, Revision::Pending(..)) {
+        if matches!(at, Revision::Pending { .. }) {
             crate::dl::query::negation_rule(&mut status, reads, source);
         } else if certificate.dl {
             crate::dl::query::certify(&mut status, reads, "dl", decided, Some(at.snapshot()));
@@ -1471,7 +1480,7 @@ impl StoreService {
             // A read of every statement inside a transaction lacks only the pending
             // operations' reasoning (`Self::assess`); any other read, the DL bounds.
             let mut status = nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Dl);
-            let pending = matches!(at, Revision::Pending(..));
+            let pending = matches!(at, Revision::Pending { .. });
             if let Some(reason) = omission_reason {
                 status.incomplete("dl", reason.to_owned());
             } else if prepared.read_model() != ReadModel::Materialised || !pending {
@@ -1585,6 +1594,7 @@ impl StoreService {
         hooks::run(&hooks::AFTER_DECIDED);
         let mut explanation =
             explain_prepared(&snapshot, prepared, &self.settings, cancellation, &memory)?;
+        self.certify_ql(explanation.ql.as_mut(), prepared, &snapshot);
         if let Some(mode) = self.dl_mode(prepared, &snapshot) {
             // The status as the query would answer, never failing for it.
             let mode = match mode {
@@ -1649,6 +1659,7 @@ impl StoreService {
         hooks::run(&hooks::AFTER_DECIDED);
         let mut planned =
             plan_prepared(&snapshot, prepared, &self.settings, cancellation, &memory)?;
+        self.certify_ql(planned.ql.as_mut(), prepared, &snapshot);
         let at = Revision::Committed(&snapshot);
         planned.completeness = match self.dl_mode(prepared, &snapshot) {
             Some(_) => Some(plan_status(self, &snapshot, prepared, cancellation)?),
@@ -1680,11 +1691,14 @@ impl StoreService {
         let snapshot = self.engine.snapshot();
         let mut printed = nrese_sparql::ql::print(&snapshot, &query, form)?;
         // The status this store gives the same answers ([`Self::status_outside_dl`]): its
-        // regime, as the rewriting's run sets it for the RL closure, and its composition.
+        // regime, as the rewriting's run sets it for the RL closure, and its composition, the
+        // list mark included.
         if let nrese_sparql::ql::Printed::Query { completeness, .. } = &mut printed {
             completeness.regime = Some(nrese_sparql::Regime::Owl2Rl);
             let reads = crate::dl::query::Reads::default();
-            certify_closure(completeness, (&query, &reads), "ql", Some(&snapshot));
+            let lists = || self.lists_left_out(&snapshot);
+            let query = (&query, &reads);
+            crate::dl::query::certify_report(Some(completeness), query, Some(&snapshot), lists);
         }
         Ok(printed)
     }
@@ -1768,14 +1782,28 @@ impl StoreService {
         cancellation: &CancellationToken,
         read: impl FnOnce(&nrese_engine::Snapshot) -> StoreResult<T>,
     ) -> StoreResult<T> {
+        self.with_pending_record(pending, scope, memory, cancellation, |view, _| read(view))
+    }
+
+    /// [`Self::with_pending`], handing `read` too whether the operations keep their base's
+    /// record of what the reader left out (`dl::bounds::Bounds::keeps_record`), kept with a
+    /// session's view as the view is.
+    fn with_pending_record<T>(
+        &self,
+        pending: &crate::StatementsRequest,
+        scope: &crate::ReadScope,
+        memory: &nrese_exec::Envelope,
+        cancellation: &CancellationToken,
+        read: impl FnOnce(&nrese_engine::Snapshot, bool) -> StoreResult<T>,
+    ) -> StoreResult<T> {
         // The rules the view is decided under, read before it is made: one made under later
         // rules is kept as of these, never the reverse.
         let epoch = self.supports.epoch();
-        if let Some(view) = self
-            .sessions
-            .view(&self.engine.snapshot(), scope, pending, epoch)
+        if let Some((view, keeps_record)) =
+            self.sessions
+                .view(&self.engine.snapshot(), scope, pending, epoch)
         {
-            return read(&view);
+            return read(&view, keeps_record);
         }
         // Never committed: no writer slot, so other clients commit meanwhile. The operations
         // read as the reader may; what they change is checked at the commit (the view is
@@ -1798,6 +1826,7 @@ impl StoreService {
             },
         )
         .map_err(crate::StoreError::refusal_within)?;
+        let keeps_record = self.dl().bounds.keeps_record(&tx);
         let view = match self.reading(scope.access(), memory, Some(cancellation)) {
             Some(reading) => reading.pending(&tx, &budget)?,
             // Operations that touch no input of the list scan (a list fact; under compact
@@ -1816,11 +1845,11 @@ impl StoreService {
             tx.base().clone(),
             scope,
             pending,
-            view.clone(),
+            (view.clone(), keeps_record),
             epoch,
             self.supports.epoch(),
         );
-        read(&view)
+        read(&view, keeps_record)
     }
 
     /// [`run_query`](Self::run_query) on the data as `pending` would leave it.
@@ -1871,28 +1900,40 @@ impl StoreService {
             let run = Err(refusal_for_its_reader(prepared, error));
             return for_its_reader(prepared, crate::EntryPoint::RunPending, run, |_| {});
         }
-        let run = self.with_pending(pending, &scope, &memory, cancellation, |snapshot| {
-            // The status the answers carry, of the pending state `at` they are read from.
-            // Under `owl2-dl` the QL rewriting doesn't run: the status needs no report.
-            let at = Revision::Pending(snapshot, deletes);
-            let status = || self.status_outside_dl(prepared, None, at);
-            self.refuse_exact(prepared, snapshot, status)?;
-            run_query(
-                snapshot,
-                prepared,
-                &self.settings,
-                cancellation,
-                &memory,
-                out,
-                |ql| {
-                    // A transaction's pending state: never answered from the cache.
-                    let status = self.status_outside_dl(prepared, ql, at);
-                    report(self.told(prepared, status, ql.is_some()), None);
-                    (Vec::new(), |_| None)
-                },
-            )
-            .map(|_| ())
-        });
+        let run = self.with_pending_record(
+            pending,
+            &scope,
+            &memory,
+            cancellation,
+            |snapshot, keeps_record| {
+                // The status the answers carry, of the pending state `at` they are read from.
+                // Under `owl2-dl` the QL rewriting doesn't run: the status needs no report.
+                let at = Revision::Pending {
+                    snapshot,
+                    deletes,
+                    keeps_record,
+                };
+                let status = || self.status_outside_dl(prepared, None, at);
+                self.refuse_exact(prepared, snapshot, status)?;
+                run_query(
+                    snapshot,
+                    prepared,
+                    &self.settings,
+                    cancellation,
+                    &memory,
+                    out,
+                    |mut ql| {
+                        // A transaction's pending state: never answered from the cache.
+                        self.certify_ql(ql.as_deref_mut(), prepared, snapshot);
+                        let ql = ql.as_deref();
+                        let status = self.status_outside_dl(prepared, ql, at);
+                        report(self.told(prepared, status, ql.is_some()), None);
+                        (Vec::new(), |_| None)
+                    },
+                )
+                .map(|_| ())
+            },
+        );
         let run = run.map_err(|error| refusal_for_its_reader(prepared, error));
         for_its_reader(prepared, crate::EntryPoint::RunPending, run, |_| {})
     }
@@ -2401,21 +2442,19 @@ impl StoreService {
             && (self.lists).own(snapshot, || Program::leaves_out_a_list(snapshot)))
     }
 
-    /// The QL rewriting's status at `snapshot`: under `owl2-rl`, not `complete` where the
-    /// closure leaves out a list axiom, whose conclusions an answer may miss.
-    fn ql_status(
+    /// The QL rewriting's report of `prepared`'s read of `snapshot`, certified
+    /// ([`crate::dl::query::certify_report`]) with this store's record of the lists its
+    /// closure leaves out.
+    fn certify_ql(
         &self,
-        ql: &nrese_sparql::ql::QlReport,
+        ql: Option<&mut nrese_sparql::ql::QlReport>,
+        prepared: &PreparedQuery,
         snapshot: &nrese_engine::Snapshot,
-    ) -> nrese_sparql::Completeness {
-        let mut status = ql.completeness.clone();
-        let rl = status.regime == Some(nrese_sparql::Regime::Owl2Rl);
-        if status.complete && rl && self.lists_left_out(snapshot) {
-            let why =
-                "a list axiom the rules can't build is left out of the closure (a list diagnostic)";
-            status.incomplete("rules", why.to_owned());
-        }
-        status
+    ) {
+        let completeness = ql.map(|r| &mut r.completeness);
+        crate::dl::query::certify_report(completeness, prepared.reads(), Some(snapshot), || {
+            self.lists_left_out(snapshot)
+        });
     }
 
     /// A statement by the snapshot's ids; `None` if a term isn't in the store.
@@ -2568,7 +2607,7 @@ impl StoreService {
         );
         // Under `owl2-dl`, whether it decides the violations (`ReasoningState::undecided`).
         let undecided = (violations > 0 && self.dl.active())
-            .then(|| self.dl.undecided(base))
+            .then(|| self.dl.undecided(base, &self.config.dl.treatments))
             .flatten();
         // The last word under the writer slot: a caller whose claim ended meanwhile (a
         // retired pipeline, a cancelled request) changes nothing.

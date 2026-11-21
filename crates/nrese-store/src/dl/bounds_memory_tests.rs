@@ -421,7 +421,8 @@ fn embedded_low_memory_stops_maintenance_of_an_existing_upper_bound() {
     // A writer's ids: the seeded U1 is published state, whose names are shared.
     let mut tx = store.engine().transaction();
     source::intern_vocabulary(&tx);
-    let ontology = source::read_snapshot(tx.base(), Arc::clone(store.dl().bounds.kept())).unwrap();
+    let kept = Arc::clone(store.dl().bounds.kept());
+    let ontology = source::read_snapshot(tx.base(), kept, &Default::default()).unwrap();
     let normalised = nrese_owl::normalise(&ontology);
     // Seed the existing U1 without a watch, as if the process had been below its
     // budget at the prior revision. The next preparation must carry its own watch.
@@ -471,7 +472,8 @@ fn a_change_s_deleted_facts_are_looked_up_until_its_stop() {
     let store = pooled(&members(1));
     let tx = store.engine().transaction();
     source::intern_vocabulary(&tx);
-    let ontology = source::read_snapshot(tx.base(), Arc::clone(store.dl().bounds.kept())).unwrap();
+    let kept = Arc::clone(store.dl().bounds.kept());
+    let ontology = source::read_snapshot(tx.base(), kept, &Default::default()).unwrap();
     let normalised = nrese_owl::normalise(&ontology);
     let upper = Upper::build(
         &ontology,

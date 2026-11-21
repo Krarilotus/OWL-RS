@@ -19,8 +19,9 @@
 # evidence. The fleet refuses a failed job's rerun without it, and escalates the same failure again.
 #
 # The merge check's jobs are the fleet's merge gates (`priority_class = "merge-gate"`, a class its
-# config ranks): either tier's job when COMMIT is for refactor/engine-v2, i.e. NRESE_PUSH_REF, the
-# ref it goes to, is refs/heads/refactor/engine-v2: the pre-push hook's, or by hand the caller's
+# config ranks): either tier's job when COMMIT lands, i.e. NRESE_PUSH_REF, the ref it goes to, is
+# refs/heads/refactor/engine-v2 or a release branch, refs/heads/release/<name> (gate-key.sh
+# landing_ref): the pre-push hook's, or by hand the caller's
 # word (a merge check run before its push states it for both tiers). A package's push or Windows
 # check isn't one, a merge among its commits or not (PR #69), nor a
 # check by hand that names no ref.
@@ -91,9 +92,10 @@ case $mode in
   *) cores=${NRESE_GATE_CORES:-2} ram=${NRESE_GATE_RAM_GB:-4} est=${NRESE_GATE_EST_MIN:-10} ;;
 esac
 priority=${NRESE_GATE_PRIORITY:-600}
-# The merge check's jobs (above): either tier's, for a commit that goes to engine-v2.
+# The merge check's jobs (above): either tier's, for a commit that lands (gate-key.sh landing_ref:
+# engine-v2 or a release branch).
 class=""
-if [ "${NRESE_PUSH_REF:-}" = refs/heads/refactor/engine-v2 ]; then
+if landing_ref "${NRESE_PUSH_REF:-}"; then
   class=merge-gate
 fi
 # A list longer than a step carries well within the fleet's 64 KB request is made on the host from

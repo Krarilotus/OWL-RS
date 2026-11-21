@@ -5,7 +5,8 @@
 //! `cls-oo`, `scm-int`, `scm-uni`, `cax-adc`, `eq-diff2/3`, `prp-adp`) aren't in the
 //! text: they're instantiated per list axiom by [`super::lists`]. Left out, as in owlrl's
 //! default mode and the reasoning benchmark's normalisation: `eq-ref` (`x sameAs x` for
-//! every term), the datatype rules (table 8) and the axiomatic triples. What `eq-ref`
+//! every term), some datatype rules (table 8) and axiomatic triples beyond the rules'
+//! own seed statements. What `eq-ref`
 //! contributes to consistency is kept without materialising it: `x differentFrom x` is a
 //! second `eq-diff1` rule, and `AllDifferent` lists naming one individual twice are
 //! inconsistent (`eq-diff2/3` in [`super::lists`]).
@@ -88,7 +89,13 @@ pub const ALL: [Ruleset; 6] = [
 /// store with an inverse property expression, a policy rebuild, a first write) is judged by
 /// the rebuild's own violations. Version 5 could accept such a commit and record the store
 /// consistent over a clash, so a version 5 verdict is rechecked once.
-pub const SEMANTICS_VERSION: u32 = 6;
+///
+/// 7 (19 Nov 2026): the OWL 2 RL closure includes the annotation property and class
+/// declarations from prp-ap, cls-thing and cls-nothing1, so version 6 stores rebuild once.
+///
+/// 8 (19 Nov 2026): an incomplete branch or a side loop no longer hides the
+/// rules of a list's walks to `rdf:nil`. An older store rematerialises once.
+pub const SEMANTICS_VERSION: u32 = 8;
 
 /// A part of the evaluation semantics only some user rulesets use ([`SEMANTICS_VERSION`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,7 +196,12 @@ impl Ruleset {
     pub fn axioms(self) -> &'static str {
         match self {
             Self::RdfsFull => RDFS_AXIOMS,
-            Self::Owl2Rl => OWL2_RL_DATATYPE_AXIOMS,
+            Self::Owl2Rl => {
+                static AXIOMS: OnceLock<String> = OnceLock::new();
+                AXIOMS.get_or_init(|| {
+                    [OWL2_RL_DATATYPE_AXIOMS, OWL2_RL_ANNOTATION_AND_CLASS_AXIOMS].concat()
+                })
+            }
             _ => "",
         }
     }
@@ -309,6 +321,21 @@ xsd:base64Binary rdf:type rdfs:Datatype
 xsd:anyURI rdf:type rdfs:Datatype
 xsd:dateTime rdf:type rdfs:Datatype
 xsd:dateTimeStamp rdf:type rdfs:Datatype
+"#;
+
+/// OWL 2 RL's empty-body rules prp-ap, cls-thing and cls-nothing1.
+const OWL2_RL_ANNOTATION_AND_CLASS_AXIOMS: &str = r#"
+rdfs:label rdf:type owl:AnnotationProperty
+rdfs:comment rdf:type owl:AnnotationProperty
+rdfs:seeAlso rdf:type owl:AnnotationProperty
+rdfs:isDefinedBy rdf:type owl:AnnotationProperty
+owl:deprecated rdf:type owl:AnnotationProperty
+owl:versionInfo rdf:type owl:AnnotationProperty
+owl:priorVersion rdf:type owl:AnnotationProperty
+owl:backwardCompatibleWith rdf:type owl:AnnotationProperty
+owl:incompatibleWith rdf:type owl:AnnotationProperty
+owl:Thing rdf:type owl:Class
+owl:Nothing rdf:type owl:Class
 "#;
 
 pub const RDFS_AXIOMS: &str = r#"

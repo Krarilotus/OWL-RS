@@ -19,6 +19,8 @@ pub enum EngineError {
     UnsupportedTerm,
     #[error("the write-ahead log failed earlier; reopen the engine to recover")]
     WalPoisoned,
+    #[error("maintenance ended: {0}")]
+    MaintenanceEnded(&'static str),
     /// A commit's note ([`crate::Transaction::note_commit`]) refused it: nothing of the commit
     /// was written, and the log takes the next one.
     #[error("the commit's note refused it: {0}")]

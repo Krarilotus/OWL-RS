@@ -287,7 +287,8 @@ impl Omissions {
 
 /// The axioms any program of `normalised` leaves out, and why: those the normalisation
 /// reports unsupported where that leaves answers a lower bound (`leaves_out`), and those
-/// the reader couldn't take as OWL 2 DL. Known before any test: with one, no test can show
+/// the reader couldn't take as OWL 2 DL, a name of two kinds read as one among them
+/// (`joins_kinds`, whatever its treatment). Known before any test: with one, no test can show
 /// a class satisfiable or a subsumption absent.
 pub fn left_out(ontology: &Ontology, normalised: &Normalised) -> Omissions {
     let mut causes = Vec::new();
@@ -296,7 +297,9 @@ pub fn left_out(ontology: &Ontology, normalised: &Normalised) -> Omissions {
             causes.push(cause);
         }
     }
-    let fatal = ontology.diagnostics.iter().filter(|d| d.is_fatal()).count();
+    let fatal = (ontology.diagnostics.iter())
+        .filter(|d| d.is_fatal() || d.joins_kinds())
+        .count();
     Omissions { causes, fatal }
 }
 

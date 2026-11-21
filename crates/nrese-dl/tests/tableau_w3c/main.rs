@@ -24,9 +24,10 @@
 //!   they are counted apart, and the run fails if one of them changes its answer.
 //! - Tests documented as over budget are listed in `over-budget.txt` with their cause; they
 //!   run on a small budget.
-//! - Every test is decided but those listed in `undecided.txt` with the reason (none now:
-//!   docs/plan/2026-10-05-v2-merge-checklist.md §4, the DL scope): the run fails on an open
-//!   test not listed there, and on a listed one that is decided. Not checked where
+//! - Every test of species DL is decided except those listed in `undecided.txt`, each with its
+//!   reason (docs/plan/2026-10-05-v2-merge-checklist.md §4, the DL scope). A listed test is one
+//!   whose source text breaks OWL 2 DL though the manifest marks it DL. The run fails on an
+//!   open test not listed there, and on a listed one that is decided. Not checked where
 //!   `NRESE_W3C_SWITCHES` or a budget variable changes the configuration.
 
 mod negate;

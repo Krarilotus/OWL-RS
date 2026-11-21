@@ -22,8 +22,9 @@
 #                                  hand: HEAD, from its upstream (else from where it left
 #                                  origin's refactor/engine-v2), so a push then finds the pass;
 #                                  NRESE_PUSH_REF names the ref it will go to, as the hook's
-#                                  does (a merge check: refs/heads/refactor/engine-v2, which
-#                                  makes its job a merge gate on the fleet). A value the
+#                                  does (a merge check: refs/heads/refactor/engine-v2, or a
+#                                  release branch refs/heads/release/<name>, which makes its
+#                                  job a merge gate on the fleet). A value the
 #                                  caller's environment already holds is that caller's word.
 #        scripts/check.sh windows [COMMIT]
 #                                  the merge check's Windows part, on the fleet only
@@ -35,7 +36,8 @@
 #                                  passed before, under the Python runtime it declares
 #                                  (gate_runtime), carries that pass: "carried from <commit>".
 #                                  NRESE_PUSH_REF as for push: the merge check's Windows part
-#                                  for refactor/engine-v2 is a merge gate, a package's isn't.
+#                                  for refactor/engine-v2 or a release branch is a merge gate,
+#                                  a package's isn't.
 #        scripts/check.sh [all]    milestones and CI: everything, both Cargo workspaces,
 #                                  doc tests, cargo-deny, the console.
 #        scripts/check.sh crates FILE...
@@ -101,6 +103,21 @@ changed_crates() {
   else
     crates_of "$@"
   fi
+}
+
+# Whether none of the files can reach a workspace crate in changed_crates (nothing under crates/,
+# no workspace-wide file): added to a push tier's files, they leave its workspace builds, lints and
+# tests as they were (one cargo run over the same crates; cargo resolves features across the crates
+# a run selects, so a run over more crates isn't the same check of each) and only add steps of
+# their own (side_steps). A pass covers a narrower push of its commit only across such files
+# (scripts/lib/gate-key.sh gate_covering; benches/suite/tests/test_push_tier_monotone.py).
+reaches_no_crate() { ! printf '%s\n' "$@" | grep -qE "$EVERY_CRATE|^crates/"; }
+
+# Whether COMMIT's own check.sh, which its fleet gate runs, draws its seeds from the full commit id
+# (run_seeds), so its pass names the same random cases on every host. Its pass may cover a narrower
+# push; a commit whose runner abbreviates the id keeps exact reuse only.
+stable_seeds_at() {
+  git show "$1:scripts/check.sh" 2> /dev/null | grep -qE '^[[:space:]]+local base=\$\(\( 16#\$\{head:0:6\} '
 }
 
 # The workspace crates (directories with a Cargo.toml under crates/) that `files` touch.
@@ -188,7 +205,11 @@ run_seeds() {
   local -a crates=() exprs=()
   local name crate target filter seed binary code=0
   for name in "$@"; do wanted[$name]=1; done
-  local base=$(( 16#$(git rev-parse --short=6 HEAD) % 100000 + 1000 ))
+  # The first six hex digits of the full id: an abbreviation (--short) grows where another object
+  # shares the prefix, so the same commit would draw other seeds on another host.
+  local head
+  head=$(git rev-parse HEAD) || return 2
+  local base=$(( 16#${head:0:6} % 100000 + 1000 ))
   while IFS=: read -r crate target filter; do
     [ -n "${wanted[$crate]:-}" ] || continue
     crates+=("$crate")
@@ -374,8 +395,9 @@ if { [ "$mode" = windows ] || [ "$mode" = push ]; } && [ -z "${NRESE_ON_BUILD_HO
   list_hash=$(git hash-object "$list")
   identity=$(gate_identity "$push_commit") || { echo "the gate can't name its toolchain and flags (above): no $mode pass" >&2; exit 2; }
   # The Windows part's pass belongs to the commit's inputs, not its tree: a later commit with the
-  # same inputs carries it (scripts/lib/gate-key.sh windows_inputs), and its record names the commit.
-  keyed=$tree on=""
+  # same inputs carries it (scripts/lib/gate-key.sh windows_inputs). Either record names the commit
+  # first.
+  keyed=$tree on="$push_commit "
   if [ "$mode" = windows ]; then
     keyed=inputs-$(windows_inputs "$push_commit") || { echo "no inputs of $push_commit to key its pass" >&2; exit 2; }
     # And the Python runtime the commit declares for the suite: a pass under another, or one from
@@ -384,7 +406,6 @@ if { [ "$mode" = windows ] || [ "$mode" = push ]; } && [ -z "${NRESE_ON_BUILD_HO
       || { echo "$(git rev-parse --short "$push_commit") declares no Python runtime for the suite" \
              "(scripts/lib/gate-tools.txt python-windows): it can't be checked" >&2; exit 2; }
     identity="$identity $(gate_python "$runtime")"
-    on="$push_commit "
   fi
   key=$(gate_key "$mode" "$keyed" "$list_hash" "$identity")
   if record=$(gate_pass "$key"); then
@@ -395,9 +416,18 @@ if { [ "$mode" = windows ] || [ "$mode" = push ]; } && [ -z "${NRESE_ON_BUILD_HO
     fi
     exit 0
   fi
+  # A pass of this commit on more files covers these when its other files reach no crate: its
+  # workspace builds, lints and tests were these files' own, and the other files only added steps
+  # (scripts/lib/gate-key.sh gate_covering, reaches_no_crate above), and its runner's seeds are the
+  # same on every host (stable_seeds_at).
+  if [ "$mode" = push ] && stable_seeds_at "$push_commit" && record=$(gate_covering "$mode" "$keyed" "$list" "$identity" "$push_commit" reaches_no_crate); then
+    echo "=== $mode: $(git rev-parse --short "$push_commit") passed on the fleet before (this commit, these files and others reaching no crate)"
+    exit 0
+  fi
   bash scripts/lib/fleet-gate.sh "$mode" "$list" "$tree" "$list_hash" "$identity" "$where" "$push_commit" "${push_base:-}"
   case $? in
-    0) gate_record "$key" "$on$(cat "$where")"; exit 0 ;;
+    0) [ "$mode" != push ] || gate_list_keep "$list" "$list_hash"
+       gate_record "$key" "$on$(cat "$where")"; exit 0 ;;
     1) exit 1 ;;
     *) echo "no fleet verdict for $(git rev-parse --short "$push_commit") (tree $tree): no $mode pass; the $mode" \
          "tier runs on the fleet only" >&2

@@ -24,7 +24,6 @@ use nrese_sparql_results::{QueryResultsFormat, QueryResultsSerializer};
 use nrese_sparql_syntax::Query;
 use nrese_sparql_syntax::algebra::QueryDataset;
 
-use crate::dl::query::certify_report;
 use crate::error::{StoreError, StoreResult};
 use crate::query::{GraphResultFormat, QueryResultKind, SolutionsResultFormat, SparqlQueryRequest};
 
@@ -548,9 +547,10 @@ pub(crate) fn protocol_dataset(
 
 /// Evaluates `prepared` on `view` and writes the serialised results to `out` as they are
 /// produced. On error the output is incomplete and must be discarded by the caller.
-/// `report` receives the retained QL report before any bytes and returns the cache
-/// context: what the store's answer depends on beyond the query's options (the
-/// `owl2-dl` mode with its `dl-answers` option, the completeness status it reports): part
+/// `report` receives the retained QL report before any bytes, to certify
+/// ([`crate::dl::query::certify_report`]; the report returned is as `report` left it), and
+/// returns the cache context: what the store's answer depends on beyond the query's options
+/// (the `owl2-dl` mode with its `dl-answers` option, the completeness status it reports): part
 /// of the key of the answer's bytes in the result cache. A part's rows don't depend on it
 /// (every path evaluates with the same options; the QL rewriting is in the algebra).
 /// With it, `report` returns `tell`, handed next, before any bytes, the status header kept
@@ -563,13 +563,11 @@ pub(crate) fn run_query<T: FnOnce(crate::service::StatusHeader) -> Option<String
     cancellation: &CancellationToken,
     memory: &nrese_exec::Envelope,
     out: impl Write,
-    report: impl FnOnce(Option<&nrese_sparql::ql::QlReport>) -> (Vec<u8>, T),
+    report: impl FnOnce(Option<&mut nrese_sparql::ql::QlReport>) -> (Vec<u8>, T),
 ) -> StoreResult<Option<nrese_sparql::ql::QlReport>> {
     let mut options = query_options(view, prepared, store, cancellation, memory);
     let (query, mut ql) = nrese_sparql::prepare_ql_query(view, &prepared.query, &options)?;
-    let completeness = ql.as_mut().map(|r| &mut r.completeness);
-    certify_report(completeness, prepared.reads(), view.snapshot());
-    let (context, tell) = report(ql.as_ref());
+    let (context, tell) = report(ql.as_mut());
     cancellation.check()?;
     // A repeated query's answer as written before, in this format; else written, and its
     // bytes offered to the cache with the time writing them took (`nrese_sparql::cache`).
@@ -770,7 +768,8 @@ fn results_serializer(
 }
 
 /// Runs `prepared` on `view` as [`run_query`] would, consuming the results instead of
-/// serialising them, and reports how it ran (EXPLAIN ANALYZE).
+/// serialising them, and reports how it ran (EXPLAIN ANALYZE); its QL report uncertified, as
+/// [`run_query`] hands it on.
 pub(crate) fn explain_prepared(
     view: &impl ReadView,
     prepared: &PreparedQuery,
@@ -779,14 +778,12 @@ pub(crate) fn explain_prepared(
     memory: &nrese_exec::Envelope,
 ) -> StoreResult<Explanation> {
     let options = query_options(view, prepared, store, cancellation, memory);
-    let mut explanation = explain_query(view, &prepared.query, &options)?;
-    let report = explanation.ql.as_mut().map(|r| &mut r.completeness);
-    certify_report(report, prepared.reads(), view.snapshot());
-    Ok(explanation)
+    explain_query(view, &prepared.query, &options).map_err(StoreError::from)
 }
 
 /// The plan `prepared` would run as on `view`, with estimated rows, without running it
-/// (EXPLAIN), drawing from the request's envelope `memory` as its run would.
+/// (EXPLAIN), drawing from the request's envelope `memory` as its run would; its QL report
+/// uncertified, as [`run_query`] hands it on.
 pub(crate) fn plan_prepared(
     view: &impl ReadView,
     prepared: &PreparedQuery,
@@ -795,10 +792,7 @@ pub(crate) fn plan_prepared(
     memory: &nrese_exec::Envelope,
 ) -> StoreResult<PlannedQuery> {
     let options = query_options(view, prepared, store, cancellation, memory);
-    let mut planned = plan_query(view, &prepared.query, &options)?;
-    let report = planned.ql.as_mut().map(|r| &mut r.completeness);
-    certify_report(report, prepared.reads(), view.snapshot());
-    Ok(planned)
+    plan_query(view, &prepared.query, &options).map_err(StoreError::from)
 }
 
 /// The options `prepared` runs with, for execution and explanation alike, drawing from
