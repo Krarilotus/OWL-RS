@@ -627,111 +627,107 @@ pub(crate) fn instantiate_projected(
     let mut premises: Vec<Vec<[u64; 3]>> = Vec::new();
     let mut diagnostics: Vec<ListDiagnostic> = Vec::new();
     let nil_is_cell = std::cell::OnceCell::new();
-    let mut lists = |predicate: u64,
-                     name: &'static str,
-                     kind: ListKind,
-                     rules: &mut Vec<Rule>,
-                     make: &mut MakeRules| {
-        debug_assert!(voc.is_list_fact([0, predicate, 0]), "read, not a list fact");
-        for (subject, head) in facts.pairs(predicate) {
-            let mut diagnose = |problem| {
-                let diagnostic = ListDiagnostic {
-                    rules: name,
-                    subject,
-                    predicate,
-                    head,
-                    problem,
-                };
-                if !diagnostics.contains(&diagnostic) {
-                    diagnostics.push(diagnostic);
-                }
-            };
-            // Only `owl:members` and `owl:distinctMembers` lists are read as written: their
-            // rules are checks alone, never an inference, and never too long for a rule.
-            let checks = matches!(kind, ListKind::Pairwise { .. });
-            let nil_is_cell = *nil_is_cell.get_or_init(|| {
-                !facts.objects(voc.nil, voc.first).is_empty()
-                    && !facts.objects(voc.nil, voc.rest).is_empty()
-            });
-            let (walks, cycle) = voc.list(facts, head, nil_is_cell);
-            if let Some(problem) = cycle {
-                diagnose(problem);
-            }
-            let read = match (walks, written, kind) {
-                (
-                    Err(ListProblem::TooManyVariants),
-                    Some(written),
-                    ListKind::Pairwise { written_predicate },
-                ) => {
-                    diagnose(ListProblem::TooManyVariants);
-                    // Where equality merges cells as written past the cap too, each
-                    // node's own cells, as the list was asserted.
-                    let unmerged = |problem: ListProblem| match written.unmerged() {
-                        Some(unmerged) if problem == ListProblem::TooManyVariants => {
-                            vocabulary.unmerged_list(unmerged, [subject, written_predicate, head])
-                        }
-                        _ => Err(problem),
+    let mut lists =
+        |predicate, name: &'static str, kind, rules: &mut Vec<Rule>, make: &mut MakeRules| {
+            debug_assert!(voc.is_list_fact([0, predicate, 0]), "read, not a list fact");
+            for (subject, head) in facts.pairs(predicate) {
+                let mut diagnose = |problem| {
+                    let diagnostic = ListDiagnostic {
+                        rules: name,
+                        subject,
+                        predicate,
+                        head,
+                        problem,
                     };
-                    match voc.list_as_written(written, head).or_else(unmerged) {
-                        Ok(variants) => Ok(variants),
-                        Err(_) => continue,
+                    if !diagnostics.contains(&diagnostic) {
+                        diagnostics.push(diagnostic);
                     }
-                }
-                (read, _, _) => read,
-            };
-            match read {
-                Ok(variants) => {
-                    let rules_before = rules.len();
-                    let premises_before = premises.len();
-                    let most = kind.member_limit();
-                    for (members, used) in variants {
-                        let before = rules.len();
-                        let limit = if members.len() > most {
-                            Some(most)
-                        } else {
-                            make(subject, &members, rules);
-                            (!rules[before..].iter().all(Rule::fits))
-                                .then_some(crate::eval::MAX_RULE_ATOMS)
-                        };
-                        if let Some(most) = limit {
-                            diagnose(ListProblem::TooLong {
-                                members: members.len(),
-                                most,
-                            });
-                            if cycle.is_some() {
-                                rules.truncate(before);
-                                continue;
-                            }
-                            // Every walk of this head has to fit the enumerated form.
-                            rules.truncate(rules_before);
-                            premises.truncate(premises_before);
-                            break;
-                        }
-                        let mut facts_used = used;
-                        facts_used.push([subject, predicate, head]);
-                        if checks {
-                            for class in [
-                                voc.all_disjoint_classes,
-                                voc.all_disjoint_properties,
-                                voc.all_different,
-                            ] {
-                                if facts.objects(subject, voc.rdf_type).contains(&class) {
-                                    facts_used.push([subject, voc.rdf_type, class]);
-                                }
-                            }
-                        }
-                        for _ in before..rules.len() {
-                            premises.push(facts_used.clone());
-                        }
-                    }
-                }
-                Err(problem) if cycle.is_none() || problem == ListProblem::TooManyVariants => {
+                };
+                // Only `owl:members` and `owl:distinctMembers` lists are read as written: their
+                // rules are checks alone, never an inference, and never too long for a rule.
+                let checks = matches!(kind, ListKind::Pairwise { .. });
+                let nil_is_cell = *nil_is_cell.get_or_init(|| {
+                    !facts.objects(voc.nil, voc.first).is_empty()
+                        && !facts.objects(voc.nil, voc.rest).is_empty()
+                });
+                let (walks, cycle) = voc.list(facts, head, nil_is_cell);
+                if let Some(problem) = cycle {
                     diagnose(problem);
                 }
-                Err(_) => {}
+                let read = match (walks, written, kind) {
+                    (
+                        Err(ListProblem::TooManyVariants),
+                        Some(written),
+                        ListKind::Pairwise { written_predicate },
+                    ) => {
+                        diagnose(ListProblem::TooManyVariants);
+                        // Where equality merges cells as written past the cap too, each
+                        // node's own cells, as the list was asserted.
+                        let unmerged = |problem: ListProblem| match written.unmerged() {
+                            Some(unmerged) if problem == ListProblem::TooManyVariants => vocabulary
+                                .unmerged_list(unmerged, [subject, written_predicate, head]),
+                            _ => Err(problem),
+                        };
+                        match voc.list_as_written(written, head).or_else(unmerged) {
+                            Ok(variants) => Ok(variants),
+                            Err(_) => continue,
+                        }
+                    }
+                    (read, _, _) => read,
+                };
+                match read {
+                    Ok(variants) => {
+                        let rules_before = rules.len();
+                        let premises_before = premises.len();
+                        let most = kind.member_limit();
+                        for (members, used) in variants {
+                            let before = rules.len();
+                            let limit = if members.len() > most {
+                                Some(most)
+                            } else {
+                                make(subject, &members, rules);
+                                (!rules[before..].iter().all(Rule::fits))
+                                    .then_some(crate::eval::MAX_RULE_ATOMS)
+                            };
+                            if let Some(most) = limit {
+                                diagnose(ListProblem::TooLong {
+                                    members: members.len(),
+                                    most,
+                                });
+                                if cycle.is_some() {
+                                    rules.truncate(before);
+                                    continue;
+                                }
+                                // Every walk of this head has to fit the enumerated form.
+                                rules.truncate(rules_before);
+                                premises.truncate(premises_before);
+                                break;
+                            }
+                            let mut facts_used = used;
+                            facts_used.push([subject, predicate, head]);
+                            if checks {
+                                for class in [
+                                    voc.all_disjoint_classes,
+                                    voc.all_disjoint_properties,
+                                    voc.all_different,
+                                ] {
+                                    if facts.objects(subject, voc.rdf_type).contains(&class) {
+                                        facts_used.push([subject, voc.rdf_type, class]);
+                                    }
+                                }
+                            }
+                            for _ in before..rules.len() {
+                                premises.push(facts_used.clone());
+                            }
+                        }
+                    }
+                    Err(problem) if cycle.is_none() || problem == ListProblem::TooManyVariants => {
+                        diagnose(problem);
+                    }
+                    Err(_) => {}
+                }
             }
-        }
-    };
+        };
     let ty = voc.rdf_type;
     // prp-spo2: (x0 p1 x1) … (x(n-1) pn xn) -> (x0 p xn)
     lists(
