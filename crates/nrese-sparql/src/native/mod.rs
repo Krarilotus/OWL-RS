@@ -1539,11 +1539,13 @@ struct Context<'a> {
     /// itself, not its address: patterns made during the evaluation (substituted
     /// subqueries) come and go, and a freed address may hold another expression next.
     numbers: RefCell<HashMap<(Expression, Variable), nrese_exec::IdMap<Number>>>,
+    /// The numbers remembered since each open save point, innermost last ([`Self::save`]).
+    since: RefCell<Vec<Remembered>>,
     cancellation: Option<CancellationToken>,
     budget: Arc<Budget>,
     /// What the context keeps to the query's end, charged to `budget`: its computed terms
-    /// ([`Self::id`]) and remembered numbers ([`Self::numeric_pass`]). A retry that releases
-    /// what a failed attempt held ([`Self::group`]) leaves it.
+    /// ([`Self::id`]) and remembered numbers ([`Self::keep`]); what an attempt adds to it is
+    /// let go by a restore ([`Self::save`]).
     kept: RefCell<Reservation>,
     /// The request's envelope: what a part of the evaluation keeps beyond it (the spatial
     /// index) draws from it ([`spatial`]).
@@ -1819,6 +1821,7 @@ impl<'a> Context<'a> {
             distinct_counts: RefCell::new(ChargedMap::new(Arc::clone(&budget))),
             decodes: AtomicU64::new(0),
             numbers: RefCell::default(),
+            since: RefCell::default(),
             cancellation: options.resources.cancellation.clone(),
             kept: RefCell::new(Reservation::new(Arc::clone(&budget))),
             budget,
@@ -2143,6 +2146,70 @@ impl<'a> Context<'a> {
         computed.push(term.clone());
         ids.insert(term.clone(), id);
         Ok(id)
+    }
+
+    /// A save point: what the context keeps to the query's end as it stands now, for an
+    /// attempt that may be undone. It covers the terms made new to the query ([`Self::id`]),
+    /// the numbers remembered ([`Self::numeric_pass`]) and both their charges. Closed by
+    /// [`Self::keep`] (what the attempt added stays) or [`Self::restore`], which is total:
+    /// every term made since is let go with its id and charge, and every number remembered
+    /// since with its charge, so the context holds and is charged exactly what it was at the
+    /// point. Nothing that outlives the attempt may hold an id made since (its tables and
+    /// results are dropped before the restore). Points nest: one closes before any opened
+    /// before it (checked), and a point kept inside another hands its numbers to that one.
+    /// Not covered: the decode cache, which gives way of itself, and the aliases and distinct
+    /// counts, which hold stored ids under their own charges.
+    fn save(&self) -> SavePoint {
+        let mut since = self.since.borrow_mut();
+        since.push(Remembered {
+            numbers: HashMap::new(),
+            held: Reservation::new(Arc::clone(&self.budget)),
+        });
+        SavePoint {
+            terms: self.computed.borrow().len(),
+            depth: since.len(),
+        }
+    }
+
+    /// Closes `point`, keeping what was added since ([`Self::save`]): its numbers go to the
+    /// point it was opened in, or to the query's memo ([`Self::keep_numbers`]).
+    fn keep(&self, point: SavePoint) {
+        let mut since = self.since.borrow_mut();
+        debug_assert_eq!(
+            since.len(),
+            point.depth,
+            "save points close innermost first"
+        );
+        let Some(added) = since.pop() else { return };
+        match since.last_mut() {
+            Some(outer) => {
+                merge_numbers(&mut outer.numbers, added.numbers);
+                outer.held.absorb(added.held);
+            }
+            None => {
+                drop(since);
+                self.keep_numbers(added);
+            }
+        }
+    }
+
+    /// Closes `point`, letting go of everything added since ([`Self::save`]).
+    fn restore(&self, point: SavePoint) {
+        let mut since = self.since.borrow_mut();
+        debug_assert_eq!(
+            since.len(),
+            point.depth,
+            "save points close innermost first"
+        );
+        // The numbers, then their charge.
+        since.truncate(point.depth - 1);
+        let mut ids = self.computed_ids.borrow_mut();
+        let mut bytes = 0usize;
+        for term in self.computed.borrow_mut().drain(point.terms..) {
+            bytes = bytes.saturating_add(computed_bytes(&term));
+            ids.remove(&term);
+        }
+        self.kept.borrow_mut().release(bytes);
     }
 
     fn binding<'s>(
@@ -6032,12 +6099,19 @@ impl<'a> Context<'a> {
         {
             return self.group_streamed(plan, variables, aggregates);
         }
+        // A streamed retry starts from what the query held before the direct attempt.
+        let point = streamable.is_some().then(|| self.save());
         let before = self.budget.used();
         let kept = self.kept.borrow().bytes();
-        match self.group_direct(inner, variables, aggregates, having) {
-            Err(error) if streamable.is_some() && stream::is_memory_limit(&error) => {
-                // What the attempt held, not what the context keeps of it (its computed
-                // terms and numbers stay, and stay charged).
+        match (
+            self.group_direct(inner, variables, aggregates, having),
+            point,
+        ) {
+            (Err(error), Some(point)) if stream::is_memory_limit(&error) => {
+                // What the context keeps of the attempt (its terms and numbers: the point),
+                // then the tables the attempt charged and no holder keeps any more: its
+                // charges past those of the context's other holders.
+                self.restore(point);
                 let grown = self.kept.borrow().bytes().saturating_sub(kept);
                 self.budget.release(
                     self.budget
@@ -6048,7 +6122,12 @@ impl<'a> Context<'a> {
                 let plan = streamable.as_ref().expect("checked");
                 self.group_streamed(plan, variables, aggregates)
             }
-            result => result,
+            (result, point) => {
+                if let Some(point) = point {
+                    self.keep(point);
+                }
+                result
+            }
         }
     }
 
@@ -6549,8 +6628,10 @@ impl<'a> Context<'a> {
     /// number: the general path decides, durations included). BSBM BI q4: 154 M rows of
     /// `AVG(xsd:float(xsd:string(?price)))` at 80 ns a row per group, now a pass.
     /// Once it applies, and before it allocates, it calls `reserve` with what the pass
-    /// holds at most ([`aggregate::pass_bytes`]); the numbers it remembers are charged to
-    /// the query before they are found, and released as they are let go. A refusal ends it.
+    /// holds at most ([`aggregate::pass_bytes`]). The numbers it finds are charged before
+    /// they are found and remembered since the save point it runs in ([`Self::save`]): its
+    /// caller keeps them or, where the pass is refused or declines, lets them go. A refusal
+    /// ends it.
     fn numeric_pass(
         &self,
         solutions: &Solutions,
@@ -6630,19 +6711,22 @@ impl<'a> Context<'a> {
             let key = ((*expr).clone(), solutions.vars[*column].clone());
             let mut missing: nrese_exec::IdMap<usize> = nrese_exec::IdMap::default();
             {
-                let numbers = self.numbers.borrow();
-                let known = numbers.get(&key);
+                let (numbers, since) = (self.numbers.borrow(), self.since.borrow());
+                let known = remembered(&numbers, &since, &key);
                 for (row, &id) in table.column(*column).iter().enumerate() {
-                    if !known.is_some_and(|known| known.contains_key(&id)) {
+                    if !known.iter().any(|known| known.contains_key(&id)) {
                         missing.entry(id).or_insert(row);
                     }
                 }
             }
             let missing: Vec<(u64, usize)> = missing.into_iter().collect();
-            // Each number found is kept: charged before (`number_bytes`), however many
+            // Each number found is remembered: charged before (`number_bytes`), however many
             // expressions the query sums.
-            self.kept
+            self.since
                 .borrow_mut()
+                .last_mut()
+                .expect("a numeric pass runs in a save point")
+                .held
                 .charge(missing.len().saturating_mul(number_bytes()))?;
             let number = |aggregator: &Aggregator<'_>, row: usize| {
                 let binding = aggregator.binding(solutions, row);
@@ -6654,7 +6738,7 @@ impl<'a> Context<'a> {
                     },
                 }
             };
-            let found: Vec<(u64, Number)> = if missing.len() < 2 * PARALLEL_EXPRESSION_ROWS {
+            let new: Vec<(u64, Number)> = if missing.len() < 2 * PARALLEL_EXPRESSION_ROWS {
                 let term = |id: u64| self.term(id);
                 let aggregator = Aggregator {
                     evaluator: &self.evaluator,
@@ -6690,20 +6774,24 @@ impl<'a> Context<'a> {
                     })
                     .collect()
             };
-            self.numbers
+            self.since
                 .borrow_mut()
+                .last_mut()
+                .expect("a numeric pass runs in a save point")
+                .numbers
                 .entry(key)
                 .or_default()
-                .extend(found);
+                .extend(new);
         }
-        let numbers = self.numbers.borrow();
-        let known: Vec<Option<&nrese_exec::IdMap<Number>>> = plans
+        let (numbers, since) = (self.numbers.borrow(), self.since.borrow());
+        let known: Vec<Vec<&nrese_exec::IdMap<Number>>> = plans
             .iter()
             .map(|plan| match plan {
                 Plan::Total { expr, column, .. } => {
-                    numbers.get(&((*expr).clone(), solutions.vars[*column].clone()))
+                    let key = ((*expr).clone(), solutions.vars[*column].clone());
+                    remembered(&numbers, &since, &key)
                 }
-                _ => None,
+                _ => Vec::new(),
             })
             .collect();
         // The states of groups `range`, from every row in order; `None` once a value isn't
@@ -6733,7 +6821,7 @@ impl<'a> Context<'a> {
                         Plan::Total { column, .. } => {
                             let id = table.get(row, *column);
                             state.count += 1;
-                            match known[a].and_then(|known| known.get(&id)) {
+                            match known[a].iter().find_map(|known| known.get(&id)) {
                                 Some(Number::Value(number)) => {
                                     state.total = state.total.and_then(|total| total.add(*number));
                                 }
@@ -6773,21 +6861,6 @@ impl<'a> Context<'a> {
         let Some(states) = states else {
             return Ok(None);
         };
-        // Kept for the next chunk only while small: a GROUP BY over many distinct values
-        // would hold all their numbers to the end of the query.
-        drop(known);
-        drop(numbers);
-        let mut let_go = 0usize;
-        self.numbers.borrow_mut().retain(|_, known| {
-            let keep = known.len() <= NUMBER_MEMO_ENTRIES;
-            if !keep {
-                let_go = let_go.saturating_add(known.len());
-            }
-            keep
-        });
-        self.kept
-            .borrow_mut()
-            .release(let_go.saturating_mul(number_bytes()));
         Ok(Some(
             (0..groups)
                 .map(|group| {
@@ -6807,6 +6880,26 @@ impl<'a> Context<'a> {
                 })
                 .collect(),
         ))
+    }
+
+    /// Keeps the numbers remembered since a save point ([`Self::keep`]) for the query's next
+    /// chunks ([`Self::group_crossed`]), with their charge, while an expression's are few: a
+    /// GROUP BY over many distinct values would hold all their numbers to the end of the
+    /// query.
+    fn keep_numbers(&self, found: Remembered) {
+        let mut numbers = self.numbers.borrow_mut();
+        merge_numbers(&mut numbers, found.numbers);
+        let mut kept = self.kept.borrow_mut();
+        kept.absorb(found.held);
+        let mut let_go = 0usize;
+        numbers.retain(|_, known| {
+            let keep = known.len() <= NUMBER_MEMO_ENTRIES;
+            if !keep {
+                let_go = let_go.saturating_add(known.len());
+            }
+            keep
+        });
+        kept.release(let_go.saturating_mul(number_bytes()));
     }
 
     /// GROUP BY over evaluated `solutions` (charged). The groups' table, a column per key
@@ -7301,6 +7394,48 @@ fn alias_bytes(alias: &str, term: &Term) -> usize {
         .saturating_mul(3)
         .saturating_add(slots * 4)
         .saturating_add(heap(term))
+}
+
+/// The numbers [`Context::numeric_pass`] remembered since a save point, by expression and
+/// the variable it reads, and their charge: the maps go before it.
+struct Remembered {
+    numbers: HashMap<(Expression, Variable), nrese_exec::IdMap<Number>>,
+    held: Reservation,
+}
+
+/// The numbers remembered for `key`: the query's, then those since each open save point.
+fn remembered<'m>(
+    numbers: &'m HashMap<(Expression, Variable), nrese_exec::IdMap<Number>>,
+    since: &'m [Remembered],
+    key: &(Expression, Variable),
+) -> Vec<&'m nrese_exec::IdMap<Number>> {
+    std::iter::once(numbers.get(key))
+        .chain(since.iter().map(|since| since.numbers.get(key)))
+        .flatten()
+        .collect()
+}
+
+/// `added` into `into`: an expression's map moved where `into` has none for it.
+fn merge_numbers(
+    into: &mut HashMap<(Expression, Variable), nrese_exec::IdMap<Number>>,
+    added: HashMap<(Expression, Variable), nrese_exec::IdMap<Number>>,
+) {
+    for (key, new) in added {
+        match into.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut known) => known.get_mut().extend(new),
+            std::collections::hash_map::Entry::Vacant(place) => {
+                place.insert(new);
+            }
+        }
+    }
+}
+
+/// An open save point ([`Context::save`]): the computed terms the context held, and how
+/// many points were open with it.
+#[must_use = "a save point is closed by `keep` or `restore`"]
+struct SavePoint {
+    terms: usize,
+    depth: usize,
 }
 
 /// What a number [`Context::numeric_pass`] remembers holds in its map: the id and the

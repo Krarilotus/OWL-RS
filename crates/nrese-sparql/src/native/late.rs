@@ -128,6 +128,7 @@ impl super::Context<'_> {
             ))),
             decodes: std::sync::atomic::AtomicU64::new(0),
             numbers: RefCell::default(),
+            since: RefCell::default(),
             cancellation: self.cancellation.clone(),
             budget: std::sync::Arc::clone(&self.budget),
             kept: RefCell::new(nrese_exec::Reservation::new(std::sync::Arc::clone(

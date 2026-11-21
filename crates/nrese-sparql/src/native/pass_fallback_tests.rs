@@ -432,3 +432,76 @@ fn a_streamed_retry_holds_nothing_of_the_refused_direct_attempt() {
         "no limit had the direct attempt refused and the query answered"
     );
 }
+
+/// What the context keeps to the query's end, by counter: its charge, its computed terms,
+/// its remembered numbers (since any open save point too) and the budget's use, its decode
+/// cache let go first (never needed for an answer, and not covered by a save point).
+fn counters(ctx: &Context<'_>) -> [usize; 4] {
+    *ctx.decoded.borrow_mut() =
+        decode_cache::DecodeCache::new(&ctx.budget, DECODE_CACHE_ENTRIES, 1);
+    let since = ctx.since.borrow();
+    let remembered = ctx
+        .numbers
+        .borrow()
+        .values()
+        .map(|m| m.len())
+        .sum::<usize>()
+        + since
+            .iter()
+            .flat_map(|since| since.numbers.values())
+            .map(|m| m.len())
+            .sum::<usize>();
+    [
+        ctx.kept.borrow().bytes(),
+        ctx.computed.borrow().len(),
+        remembered,
+        ctx.budget.used(),
+    ]
+}
+
+/// Spec: a restored save point ([`Context::save`]) leaves the context's own counters as they
+/// were at the point: its charge, its computed terms, its remembered numbers and the
+/// budget's use. Before the point, a pass's numbers and a term, which stay; in it, two
+/// passes (each in a point of its own, kept into this one: numbers, and new terms) and a
+/// term by itself, all let go.
+#[test]
+fn a_restored_save_point_leaves_the_context_as_it_was() {
+    let snapshot = snapshot();
+    let options = options(None);
+    let ctx = Context::new(&snapshot, &options, None, None);
+    let aggregate = |text: &str| {
+        let query = SparqlParser::new().parse_query(text).unwrap();
+        let Query::Select { pattern, .. } = &query else {
+            panic!("a SELECT")
+        };
+        let (inner, variables, aggregates) = group_in(pattern);
+        let solutions = ctx.eval(inner).ok().expect("no limit");
+        let (groups, _) = aggregate::groups_of(&solutions, variables).ok().unwrap();
+        let columns = ctx.aggregate_columns(&solutions, &groups.group_of, groups.len(), aggregates);
+        assert!(columns.is_ok(), "no limit");
+        ctx.consumed(solutions);
+    };
+    let decimal =
+        |lexical: &str| -> Term { Literal::new_typed_literal(lexical, xsd::DECIMAL).into() };
+    aggregate(&grouped(&wide(), "(SUM(?v + 0) AS ?t)"));
+    assert!(ctx.id(&decimal("0.5")).is_ok());
+    let before = counters(&ctx);
+    let point = ctx.save();
+    aggregate(&grouped(&wide(), "(SUM(?v * 3) AS ?t)"));
+    aggregate(&grouped(
+        &single(),
+        &format!("(SUM({XSD_DOUBLE}(?v)) AS ?t)"),
+    ));
+    assert!(ctx.id(&decimal("1.5")).is_ok());
+    let within = counters(&ctx);
+    assert!(
+        within[1] > before[1] && within[2] > before[2],
+        "the attempt made terms and numbers: {before:?}, then {within:?}"
+    );
+    ctx.restore(point);
+    assert_eq!(
+        counters(&ctx),
+        before,
+        "[kept bytes, computed terms, remembered numbers, budget used]"
+    );
+}
