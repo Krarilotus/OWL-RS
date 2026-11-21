@@ -5047,6 +5047,72 @@ fn aggregates_by_group_drop_erring_arguments_from_the_count() {
     check(&beside, &expected);
 }
 
+/// Aggregates of integers and their COUNTs, some of a variable another aggregate reads too
+/// (SPARQL 1.1 §18.5.1.2: COUNT counts the bound values): per group, SUM, COUNT of the
+/// same variable, COUNT of another and COUNT(*). g1's values are all bound (1, 2), g2 has
+/// one unbound (3 and none: SUM unbound), and only one row of each binds `?w`. Whole rows
+/// as written, planned, streamed and by the reference.
+#[test]
+fn counts_beside_a_sum_count_their_own_variable() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let mut add = |s: &str, p: &str, o: Term| {
+        tx.insert(Quad::new(ex(s), ex(p), o, GraphName::DefaultGraph).as_ref());
+    };
+    for (s, g, v) in [
+        ("a1", "g1", Some(1_i64)),
+        ("a2", "g1", Some(2)),
+        ("b1", "g2", Some(3)),
+        ("b2", "g2", None),
+    ] {
+        add(s, "group", ex(g).into());
+        if let Some(v) = v {
+            add(s, "val", Literal::from(v).into());
+        }
+    }
+    add("a1", "other", ex("x").into());
+    add("b2", "other", ex("y").into());
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let query = SparqlParser::new()
+        .parse_query(&format!(
+            "SELECT ?g (SUM(?v) AS ?t) (COUNT(?v) AS ?n) (COUNT(?w) AS ?m) (COUNT(*) AS ?r) \
+             WHERE {{ ?s <{EX}group> ?g OPTIONAL {{ ?s <{EX}val> ?v }} \
+             OPTIONAL {{ ?s <{EX}other> ?w }} }} GROUP BY ?g"
+        ))
+        .unwrap();
+    let int = |n: i64| format!("\"{n}\"^^<http://www.w3.org/2001/XMLSchema#integer>");
+    let expected = [
+        format!("<{EX}g1>\t{}\t{}\t{}\t{}", int(3), int(2), int(1), int(2)),
+        format!("<{EX}g2>\tUNDEF\t{}\t{}\t{}", int(1), int(1), int(2)),
+    ];
+    let reference = rows(
+        reference(&snapshot, &query, &QueryOptions::default()).unwrap(),
+        false,
+    );
+    assert_eq!(reference, expected, "reference");
+    for (route, options) in [
+        (
+            "as written",
+            QueryOptions {
+                as_written: true,
+                ..QueryOptions::default()
+            },
+        ),
+        ("planned", QueryOptions::default()),
+        (
+            "streamed",
+            QueryOptions {
+                stream_rows: Some(1),
+                ..QueryOptions::default()
+            },
+        ),
+    ] {
+        let found = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
+        assert_eq!(found, expected, "{route}");
+    }
+}
+
 /// Eager aggregation (the early group over B, the join's input without the group's keys)
 /// where it pays, its aggregates reading B's values and the join variable B binds in every
 /// solution. Per team two products with four offers each: t0's prices are all 0, so
