@@ -6739,9 +6739,10 @@ impl<'a> Context<'a> {
 
     /// Every aggregate of every group in one pass over the rows, where each is `COUNT(*)`,
     /// `COUNT` of a variable, `SUM` or `AVG` of an expression of one variable whose values
-    /// are numbers, or `COUNT` of such an expression beside its `SUM` or `AVG` (none DISTINCT): each id's number is found once, and the rows
-    /// are read in order instead of per group. `None` otherwise (and where a value isn't a
-    /// number: the general path decides, durations included). BSBM BI q4: 154 M rows of
+    /// are numbers, or `COUNT` of such an expression beside its `SUM` or `AVG` (none
+    /// DISTINCT): each id's number is found once, and the rows are read in order instead of
+    /// per group. `None` otherwise (and where a value isn't a number: the general path
+    /// decides, durations included). BSBM BI q4: 154 M rows of
     /// `AVG(xsd:float(xsd:string(?price)))` at 80 ns a row per group, now a pass.
     /// Once it applies, and before it allocates, it calls `reserve` with what the pass
     /// holds at most ([`aggregate::pass_bytes`]). The numbers it finds are charged before
@@ -6769,19 +6770,6 @@ impl<'a> Context<'a> {
             /// is no number ends the pass, and an error counts in neither.
             CountOf(usize),
         }
-        // The one column `expr` reads, if it reads one.
-        let one_column = |expr: &Expression| {
-            let mut columns: Vec<usize> = expression_variables(expr)
-                .iter()
-                .filter_map(|v| solutions.column(v))
-                .collect();
-            columns.sort_unstable();
-            columns.dedup();
-            match columns[..] {
-                [column] => Some(column),
-                _ => None,
-            }
-        };
         let mut plans = Vec::with_capacity(aggregates.len());
         let mut totals = 0;
         // `COUNT` of an expression: only beside a `SUM` or `AVG` of it, whose count it takes
@@ -6812,7 +6800,13 @@ impl<'a> Context<'a> {
                     expr,
                     distinct: false,
                 } if !pushdown::per_solution(expr) => {
-                    let Some(column) = one_column(expr) else {
+                    let mut columns: Vec<usize> = expression_variables(expr)
+                        .iter()
+                        .filter_map(|v| solutions.column(v))
+                        .collect();
+                    columns.sort_unstable();
+                    columns.dedup();
+                    let [column] = columns[..] else {
                         return Ok(None);
                     };
                     totals += 1;
