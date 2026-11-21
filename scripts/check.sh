@@ -159,21 +159,25 @@ workspace_packages() {
 if [ "$mode" = crates ]; then shift; changed_crates "$@"; exit; fi
 
 # The workspace crates depending on any of the given ones (directly or not, dev-
-# dependencies included: their tests must still compile), the given ones excluded. Fails (2) where
-# cargo can't tell: never "none" for a lookup that failed.
+# dependencies included: their tests must still compile), the given ones excluded. Prints every one
+# found, then fails (2) where cargo couldn't tell for one of them: never "none" for a lookup that
+# failed (quick fails on it; push runs the ones found).
 dependents_of() {
-  local name found="" tree
+  local name found="" tree code=0
   declare -A given=()
   for name in "$@"; do given[$name]=1; done
   for name in "$@"; do
-    tree=$(cargo tree -i "$name" --workspace --prefix none -e normal,build,dev --offline 2>/dev/null) \
-      || { echo "cargo tree can't tell what depends on $name" >&2; return 2; }
-    found+=$tree$'\n'
+    if tree=$(cargo tree -i "$name" --workspace --prefix none -e normal,build,dev --offline 2>/dev/null); then
+      found+=$tree$'\n'
+    else
+      echo "cargo tree can't tell what depends on $name" >&2
+      code=2
+    fi
   done
   printf '%s' "$found" | sed 's/ (\*)//; s/ .*//' | sort -u | while read -r dep; do
     [ -n "$dep" ] && [ -z "${given[$dep]:-}" ] && echo "$dep"
   done
-  return 0
+  return $code
 }
 
 package_args() { local name; for name in "$@"; do printf -- '-p %s ' "$name"; done; }
@@ -275,9 +279,9 @@ run_targets() {
   shift 3
   local -A wanted=()
   local -a crates=() targets=() filters=() exprs=()
-  local name crate target filter seed binary code=0 expr out i how
+  local name crate target filter seed binary code=0 expr out i how content
   # A list that can't be read fails: it never selects nothing.
-  [ -r "$list" ] || { echo "$what: no list $list" >&2; return 2; }
+  content=$(cat -- "$list") || { echo "$what: can't read the list $list" >&2; return 2; }
   for name in "$@"; do wanted[$name]=1; done
   while IFS=: read -r crate target filter; do
     [ -n "${wanted[$crate]:-}" ] || continue
@@ -285,7 +289,7 @@ run_targets() {
     binary=$crate
     [ "$target" = lib ] || binary="$crate::$target"
     exprs+=("(binary_id($binary)${filter:+ & test($filter)})")
-  done < <(grep -v '^#' "$list" | tr -d '\r' | grep .)
+  done < <(printf '%s\n' "$content" | grep -v '^#' | tr -d '\r' | grep .)
   [ ${#exprs[@]} -gt 0 ] || return 0
   expr=$(IFS='|'; echo "${exprs[*]}")
   for seed in ${seeds:-none}; do
@@ -320,10 +324,10 @@ run_targets() {
 # crates runs: each listed crate that is one of them or depends on one (dependents_of). Fails (2)
 # where the list can't be read or the dependents can't be told.
 explorer_crates() {
-  local list=scripts/lib/explorer-targets.txt dependents
+  local list=scripts/lib/explorer-targets.txt dependents content
   local -a listed=()
-  [ -r "$list" ] || { echo "no list $list" >&2; return 2; }
-  mapfile -t listed < <(grep -v '^#' "$list" | tr -d '\r' | grep . | cut -d: -f1 | sort -u)
+  content=$(cat -- "$list") || { echo "can't read the list $list" >&2; return 2; }
+  mapfile -t listed < <(printf '%s\n' "$content" | grep -v '^#' | tr -d '\r' | grep . | cut -d: -f1 | sort -u)
   [ ${#listed[@]} -gt 0 ] || return 0
   dependents=$(dependents_of "$@") || return 2
   printf '%s\n' "$@" "$dependents" | sort -u | grep -Fx -f <(printf '%s\n' "${listed[@]}")

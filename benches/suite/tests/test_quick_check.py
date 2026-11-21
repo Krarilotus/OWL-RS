@@ -140,14 +140,15 @@ class QuickOnTheFleet(fixture.Repo):
 # The build host's side: check.sh's tiers over a file list, with stand-ins, each call one line in $CALLS.
 # A workspace of alpha, beta depending on alpha, gamma nested under crates/rdf/, and nrese-server (the
 # generated views' crate); alpha and gamma have probes. HAS_NEXTEST says whether cargo-nextest is there;
-# TREE_FAILS makes cargo tree fail; a build admission call holding FAIL fails, one holding EMPTY selects no
-# test (nextest then fails, 4, unless told --no-tests=pass; cargo test passes, 0 passed).
+# TREE_FAILS makes cargo tree fail (1: for every crate, else for the one it names); a build admission call
+# holding FAIL fails, one holding EMPTY selects no test (nextest then fails, 4, unless told
+# --no-tests=pass; cargo test passes, 0 passed).
 CARGO = """#!/bin/sh
 echo "cargo $*" >> "$CALLS"
 case "$1" in
   metadata) echo '{"packages":[{"name":"alpha"},{"name":"beta"},{"name":"gamma"},{"name":"nrese-server"}]}' ;;
   nextest) [ -n "${HAS_NEXTEST:-}" ] || exit 1 ;;
-  tree) [ -z "${TREE_FAILS:-}" ] || exit 101
+  tree) case "${TREE_FAILS:-}" in 1|"$3") exit 101 ;; esac
     case "$3" in alpha) printf 'alpha v0.1.0\\nbeta v0.1.0\\n' ;; *) printf '%s v0.1.0\\n' "$3" ;; esac ;;
 esac
 exit 0
@@ -327,23 +328,52 @@ class QuickTier(unittest.TestCase):
         # fail their step, never select nothing; a readable list naming none of the crates passes.
         code, steps, _, out = self.tier("quick", ALPHA, TREE_FAILS="1")
         self.assertEqual((code, steps.get("explorer", 0) != 0), (1, True), f"SPEC quick-discovery: cargo tree\n{out}")
+        # Review r2, 3: a list that is there but can't be read (a directory in its place) as one that is gone.
         for rel, step in (("scripts/lib/explorer-targets.txt", "explorer"), ("scripts/lib/fuzz-targets.txt", "seeds")):
-            with self.subTest(missing=rel):
-                path = self.repo / rel
-                path.rename(path.with_name("away"))
-                try:
-                    code, steps, _, out = self.tier("quick", ALPHA)
-                finally:
-                    path.with_name("away").rename(path)
-                self.assertEqual((code, steps.get(step, 0) != 0), (1, True), f"SPEC quick-discovery: {rel}\n{out}")
+            for how in ("missing", "a directory"):
+                with self.subTest(list=rel, how=how):
+                    path = self.repo / rel
+                    path.rename(path.with_name("away"))
+                    try:
+                        if how == "a directory":
+                            path.mkdir()
+                            (path / "entry").write_text(path.with_name("away").read_text())
+                        code, steps, _, out = self.tier("quick", ALPHA)
+                    finally:
+                        if path.is_dir():
+                            shutil.rmtree(path)
+                        path.with_name("away").rename(path)
+                    self.assertEqual((code, steps.get(step, 0) != 0), (1, True),
+                                     f"SPEC quick-discovery: {rel} {how}\n{out}")
         code, steps, _, out = self.tier("quick", ["crates/nrese-server/src/lib.rs"])
         self.assertEqual((code, steps.get("seeds"), "explorer" in steps), (0, 0, False),
                          f"SPEC quick-discovery: lists naming no changed crate\n{out}")
+
+    def test_a_lookup_failing_for_one_crate_fails_quick_and_leaves_push_the_dependents_found(self):
+        # Spec (review r2, 2): alpha's lookup finds beta, gamma's fails. Push runs the dependents found (beta),
+        # as before quick; quick fails its explorer step on the failed lookup.
+        files = ALPHA + ["crates/rdf/gamma/src/lib.rs"]
+        pushed = self.tier("push", files, TREE_FAILS="gamma")[3]
+        said = re.search(r"(?m)^=== changed: .*; depending on them: (.*)$", pushed)
+        code, steps, _, out = self.tier("quick", files, TREE_FAILS="gamma")
+        self.assertEqual((said and said.group(1), code, steps.get("explorer", 0) != 0), ("beta", 1, True),
+                         f"SPEC dependents-partial\n{pushed}\n{out}")
 
 
 # The sweeps of every runner before this one, push's and /verify's: these entries at the cache's root
 # (and wt/target).
 OLDER_SWEEPS = ("bin-*", "target-*", "py-*", "node-*")
+
+
+def real_cargo():
+    """The toolchain's own cargo binary (rustup's proxy needs the host's home, which the jobs here
+    don't have), or None where there is no Cargo."""
+    if not shutil.which("cargo") or not shutil.which("rustc"):
+        return None
+    sysroot = subprocess.run(["rustc", "--print", "sysroot"], cwd=ROOT, capture_output=True, text=True,
+                             timeout=60, env={**os.environ, "RUSTUP_AUTO_INSTALL": "0"})
+    cargo = Path(sysroot.stdout.strip()) / "bin" / "cargo"
+    return cargo if sysroot.returncode == 0 and cargo.is_file() else None
 
 
 @unittest.skipUnless(BASH and shutil.which("flock"), "the gate job runs on Linux fleet hosts (flock)")
@@ -500,6 +530,27 @@ class QuickGateJob(fixture.Repo):
         quick = self.ended(first)
         self.assertEqual((quick, self.said("quick").get("nextest"), pushed, self.said("push").get("nextest")),
                          (0, "0.9.1", 0, "0.9.2"), "SPEC tools-per-version\n"
+                         f"{(self.root / 'job-1.log').read_text()}{(self.root / 'job-2.log').read_text()}")
+
+    def test_a_job_whose_cargo_runs_another_nextest_than_the_pinned_one_has_no_verdict(self):
+        # Spec (review r2, 1): real Cargo runs `cargo nextest` from $CARGO_HOME/bin before PATH. With another
+        # version there the job ends with no verdict (3) before its check; with the pinned one it runs it.
+        cargo = real_cargo()
+        if cargo is None:
+            self.skipTest("no Cargo here")
+        (self.stubs / "cargo").write_text(f'#!/bin/sh\n[ "$1" = nextest ] && exec "{cargo}" "$@"\nexit 0\n')
+        (self.repo / "scripts/lib/gate-tools.txt").write_text("cargo-nextest 0.9.2\n")
+        got = {}
+        for version in ("0.9.1", "0.9.2"):
+            home = self.root / f"cargo-home-{version}"
+            (home / "bin").mkdir(parents=True)
+            (home / "bin" / "cargo-nextest").write_text(f'#!/bin/sh\necho "cargo-nextest {version}"\n')
+            (home / "bin" / "cargo-nextest").chmod(0o755)
+            Path(f"{self.seen}-quick").unlink(missing_ok=True)
+            job = self.start("quick", CARGO_HOME=str(home))
+            got[version] = (self.ended(job), self.said("quick").get("nextest"))
+        self.assertEqual(got, {"0.9.1": (3, None), "0.9.2": (0, "0.9.2")},
+                         f"SPEC cargo-runs-the-pinned-nextest ({cargo})\n"
                          f"{(self.root / 'job-1.log').read_text()}{(self.root / 'job-2.log').read_text()}")
 
 

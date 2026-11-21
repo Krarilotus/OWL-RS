@@ -148,6 +148,10 @@ if [ "$mode" = push ] && grep -q 'cargo +nightly' scripts/miri.sh 2> /dev/null; 
   chmod +x "$cache/shim/cargo"
   export PATH="$cache/shim:$PATH"
 fi
+# ... and the one the checks get: cargo looks for `cargo nextest` in $CARGO_HOME/bin before PATH, where a
+# host's own cargo-nextest would stand in for the pinned one.
+got=$(cargo nextest --version 2> /dev/null | awk 'NR == 1 { print $2 }')
+[ "$got" = "$want" ] || infra "cargo nextest is cargo-nextest ${got:-none}, not the pinned $want (\$CARGO_HOME/bin first)"
 exec 7>&-
 # The suite contracts' Python packages, in an environment of their own (scripts/lib/suite-python.sh).
 # shellcheck source=suite-python.sh
