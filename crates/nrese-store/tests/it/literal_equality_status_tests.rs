@@ -3,8 +3,8 @@
 //! literals, and that `owl:sameAs` has a literal subject, which no store holds. A value
 //! written in a later commit then gets no copy in the other spelling (Table 4 eq-rep-o),
 //! where the same data in one commit do; under compact equality not even in one commit.
-//! While the rules have derived such an equality, a read of a property that holds typed
-//! values is not told `complete` (docs/limits.md, "two spellings across commits"). The
+//! While the rules have derived such an equality, a read of a property that holds literals
+//! is not told `complete` (docs/limits.md, "two spellings across commits"). The
 //! answers stay as they are: only the word drops.
 
 use std::{path::Path, sync::Arc};
@@ -17,6 +17,7 @@ use nrese_store::{
 
 const PREFIXES: &str = "PREFIX : <http://example.com/> \
      PREFIX owl: <http://www.w3.org/2002/07/owl#> \
+     PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> \
      PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> \
      PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> ";
 
@@ -148,6 +149,73 @@ fn a_value_read_after_two_spellings_were_equated_is_not_complete() {
     );
 }
 
+/// Strings have spellings too: a plain string is its `xsd:token` spelling where it has no
+/// spaces to collapse (OWL 2 Structural Specification §4.3: `xsd:token` is derived from
+/// `xsd:string`), and `"Rex@en"^^rdf:PlainLiteral` is the language-tagged `"Rex"@en`
+/// (rdf:PlainLiteral §3). Each pair, then the later string as written.
+const STRINGS: [(&str, &str); 2] = [
+    ("\"Rex\"", "\"Rex\"^^xsd:token"),
+    ("\"Rex\"@en", "\"Rex@en\"^^rdf:PlainLiteral"),
+];
+
+/// A plain or a language-tagged string read after its other spelling was equated: the
+/// property read holds strings only, and the later string lacks its copy all the same.
+#[test]
+fn a_string_read_after_another_spelling_was_equated_is_not_complete() {
+    let mut unmet = Vec::new();
+    for ruleset in RULESETS {
+        for mode in MODES {
+            for (written, other) in STRINGS {
+                let pipeline = open(ruleset, config(mode, None));
+                insert(
+                    &pipeline,
+                    &format!("{} :s :p {written} , {other} .", SOURCES[0]),
+                );
+                insert(&pipeline, &format!(":t :q {written} ."));
+                let case = format!("{ruleset} {mode} {written}");
+                told_otherwise(pipeline.store(), &case, &mut unmet);
+            }
+        }
+    }
+    assert!(
+        unmet.is_empty(),
+        "a string read after another spelling was equated is told complete:\n{}",
+        unmet.join("\n")
+    );
+}
+
+/// An equality met in a commit on a store that already holds data (the commit's
+/// maintenance, not a first closure): the later value is withheld as well.
+#[test]
+fn an_equality_met_on_a_store_holding_data_is_withheld() {
+    let mut unmet = Vec::new();
+    for ruleset in RULESETS {
+        for mode in MODES {
+            for (source, axiom) in SOURCES.iter().enumerate() {
+                let pipeline = open(ruleset, config(mode, None));
+                insert(&pipeline, ":u :r :w .");
+                insert(&pipeline, &format!("{axiom} :s :p {INTEGER} , {DECIMAL} ."));
+                insert(&pipeline, &format!(":t :q {INTEGER} ."));
+                let case = format!("{ruleset} {mode} source {source}");
+                told_otherwise(pipeline.store(), &case, &mut unmet);
+            }
+        }
+    }
+    assert!(
+        unmet.is_empty(),
+        "an equality met on a store holding data is told complete:\n{}",
+        unmet.join("\n")
+    );
+}
+
+/// An at-most-one restriction on a class (Table 6 cls-maxqc3) whose members the range types
+/// (Table 5 prp-rng): the rules equate the two values through a type of each literal, a
+/// statement no store holds. OWL 2 RL/RDF's rules, not OWL 2 DL: a property with a class for
+/// its range holds no literal there.
+const QUALIFIED: &str = ":p rdfs:range :C . :D rdfs:subClassOf [ a owl:Restriction ; \
+     owl:onProperty :p ; owl:onClass :C ; \
+     owl:maxQualifiedCardinality \"1\"^^xsd:nonNegativeInteger ] . :s a :D .";
+
 /// A library store reopened from disk is not rematerialised: the condition holds across the
 /// reopen all the same, and a value written after it is withheld.
 #[test]
@@ -179,6 +247,79 @@ fn a_reopened_store_withholds_the_word_after_a_literal_equality() {
     assert!(
         unmet.is_empty(),
         "after a reopen, a read after a literal equality is told complete:\n{}",
+        unmet.join("\n")
+    );
+}
+
+/// The equality of [`QUALIFIED`] rests on statements about literals, which the store never
+/// held: a reopened store, which finds it again over what it holds, finds it all the same.
+#[test]
+fn a_reopened_store_finds_an_equality_through_a_literal_typed_by_a_range() {
+    let mut unmet = Vec::new();
+    for mode in MODES {
+        let dir = tempfile::tempdir().expect("dir");
+        {
+            let before = open("owl2-rl", config(mode, Some(dir.path())));
+            insert(
+                &before,
+                &format!("{QUALIFIED} :s :p {INTEGER} , {DECIMAL} ."),
+            );
+            insert(&before, &format!(":t :q {INTEGER} ."));
+            told_otherwise(before.store(), &format!("{mode} before"), &mut unmet);
+        }
+        let after = open("owl2-rl", config(mode, Some(dir.path())));
+        assert!(
+            after.store().last_materialisation().is_none(),
+            "{mode}: the reopened store was rematerialised"
+        );
+        told_otherwise(after.store(), &format!("{mode} reopened"), &mut unmet);
+    }
+    assert!(
+        unmet.is_empty(),
+        "an equality through a literal typed by a range is told complete:\n{}",
+        unmet.join("\n")
+    );
+}
+
+/// The controls of a reopen: two spellings with nothing to equate them (told `complete`), and
+/// [`QUALIFIED`] over two IRIs (an equality, of no literal): reopened, each read is told what
+/// it was told before.
+#[test]
+fn a_reopened_store_with_no_literal_equality_keeps_the_word() {
+    let words = |store: &StoreService| READS.map(|query| read(store, query).1);
+    let mut unmet = Vec::new();
+    for ruleset in RULESETS {
+        for mode in MODES {
+            for (name, data) in [
+                ("no equality", format!(":s :p {INTEGER} , {DECIMAL} .")),
+                ("IRIs equated", format!("{QUALIFIED} :s :p :a , :b .")),
+            ] {
+                let case = format!("{ruleset} {mode} {name}");
+                let dir = tempfile::tempdir().expect("dir");
+                let was = {
+                    let before = open(ruleset, config(mode, Some(dir.path())));
+                    insert(&before, &data);
+                    insert(&before, &format!(":t :q {INTEGER} ."));
+                    words(before.store())
+                };
+                if name == "no equality" && was != ["complete", "complete"] {
+                    unmet.push(format!("{case}, before the reopen: {was:?}"));
+                }
+                let after = open(ruleset, config(mode, Some(dir.path())));
+                assert!(
+                    after.store().last_materialisation().is_none(),
+                    "{case}: the reopened store was rematerialised"
+                );
+                let now = words(after.store());
+                if now != was {
+                    unmet.push(format!("{case}: {was:?} before the reopen, {now:?} after"));
+                }
+            }
+        }
+    }
+    assert!(
+        unmet.is_empty(),
+        "a reopened store with no literal equality isn't told what it was:\n{}",
         unmet.join("\n")
     );
 }
