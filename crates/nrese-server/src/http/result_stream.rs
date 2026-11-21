@@ -69,7 +69,9 @@ pub fn read_envelope(state: &AppState) -> impl FnOnce() -> Envelope + use<> {
 }
 
 /// Answers a request of `version` with `respond`: whole, if it is HTTP/1.0 or older. Every
-/// request passes here (`app::screen`), so every route that streams is covered.
+/// request passes here (`app::screen`), so every route that streams through
+/// [`stream_blocking`] is covered; the one that streams otherwise, the replication image,
+/// is a file sent with its size.
 pub async fn answering<F: Future>(version: Version, respond: F) -> F::Output {
     let whole = matches!(version, Version::HTTP_09 | Version::HTTP_10);
     WHOLE.scope(whole, respond).await

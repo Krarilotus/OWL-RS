@@ -64,8 +64,8 @@ enum Framing {
     Never(&'static str),
 }
 
-const HELD: &str =
-    "an HTTP/1.0 answer is held whole, so its length is known (no close-delimited body)";
+const HELD: &str = "an HTTP/1.0 answer is held whole, or is a file sent with its size (the \
+     replication image), so its length is known (no close-delimited body)";
 const STREAMED: &str = "a streamed answer's length is unknown until it ends";
 
 /// Every combination of (version, length known, `HEAD`) for a streamed answer.

@@ -272,6 +272,10 @@ pub async fn image(
     .map_err(|error| ApiError::internal(error.to_string()))?
     .map_err(answered)?;
     let path = dir.path().join(&manifest.file);
+    // Sent with its length, known on disk: over HTTP/1.0 too, a cut image is told apart.
+    let length = std::fs::metadata(&path)
+        .map_err(|error| ApiError::internal(error.to_string()))?
+        .len();
     let manifest_json =
         serde_json::to_string(&manifest).map_err(|error| ApiError::internal(error.to_string()))?;
     // Read in pieces on a thread of its own; the directory goes when the body is sent.
@@ -312,6 +316,7 @@ pub async fn image(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),
     );
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(length));
     headers.insert(
         MANIFEST,
         HeaderValue::from_str(&manifest_json)
