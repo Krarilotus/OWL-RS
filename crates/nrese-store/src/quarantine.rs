@@ -238,6 +238,20 @@ pub struct Quarantine {
     unknown: std::sync::atomic::AtomicBool,
     #[cfg(feature = "fault-points")]
     fail_commit: std::sync::atomic::AtomicBool,
+    #[cfg(any(test, feature = "fault-points"))]
+    placement_faults: PlacementFaults,
+}
+
+/// Test hooks for placing a load's file: each fails the next commit that reaches its step.
+#[cfg(any(test, feature = "fault-points"))]
+#[derive(Debug, Default)]
+struct PlacementFaults {
+    /// The rename moves the file, then reports an error.
+    rename: std::sync::atomic::AtomicBool,
+    /// The directory's sync after the rename.
+    sync: std::sync::atomic::AtomicBool,
+    /// The removal of a file placed but not made durable.
+    removal: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -354,6 +368,8 @@ impl Quarantine {
             unknown: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "fault-points")]
             fail_commit: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "fault-points"))]
+            placement_faults: PlacementFaults::default(),
         })
     }
 
@@ -361,6 +377,24 @@ impl Quarantine {
     #[cfg(feature = "fault-points")]
     pub fn fail_next_commit(&self) {
         self.fail_commit.store(true, Ordering::Relaxed);
+    }
+
+    /// Test hook: the next rename of a load's file into place moves it, then reports an error.
+    #[cfg(any(test, feature = "fault-points"))]
+    pub fn fail_next_rename_after_moving(&self) {
+        self.placement_faults.rename.store(true, Ordering::Relaxed);
+    }
+
+    /// Test hook: the next sync of the directory after a load's file is renamed into it fails.
+    #[cfg(any(test, feature = "fault-points"))]
+    pub fn fail_next_placement_sync(&self) {
+        self.placement_faults.sync.store(true, Ordering::Relaxed);
+    }
+
+    /// Test hook: the next removal of a load's file placed but not made durable fails.
+    #[cfg(any(test, feature = "fault-points"))]
+    pub fn fail_next_record_removal(&self) {
+        self.placement_faults.removal.store(true, Ordering::Relaxed);
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -1154,8 +1188,8 @@ impl Collector<'_> {
             // load of only invalid statements publishes nothing else.
             let listed = partial.with_extension("jsonl");
             let dir = partial.parent().expect("in the quarantine directory");
-            nrese_engine::place::rename(partial, &listed)?;
-            if let Err(reason) = sync_placement(dir) {
+            self.rename_into_place(partial, &listed)?;
+            if let Err(reason) = self.sync_placement(dir) {
                 let withdrawal = match published {
                     true => Withdrawal::Kept,
                     false => self.withdraw(&listed, dir),
@@ -1184,7 +1218,7 @@ impl Collector<'_> {
     /// Takes back the load's file `listed`, placed in `dir` but not made durable: removes it,
     /// then syncs `dir` so that a power loss doesn't bring it back. Best effort.
     fn withdraw(&self, listed: &Path, dir: &Path) -> Withdrawal {
-        match remove_record(listed) {
+        match self.remove_record(listed) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => {
@@ -1200,6 +1234,56 @@ impl Collector<'_> {
             }
         }
     }
+
+    /// Moves the load's file `partial` to its listed name `listed`.
+    fn rename_into_place(&self, partial: &Path, listed: &Path) -> io::Result<()> {
+        nrese_engine::place::rename(partial, listed)?;
+        #[cfg(any(test, feature = "fault-points"))]
+        if self
+            .quarantine
+            .placement_faults
+            .rename
+            .swap(false, Ordering::Relaxed)
+        {
+            return Err(io::Error::other(
+                "the rename reported a failure after moving the file (a test's)",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Makes the load's file, just renamed into `dir`, durably named.
+    fn sync_placement(&self, dir: &Path) -> io::Result<()> {
+        #[cfg(any(test, feature = "fault-points"))]
+        if self
+            .quarantine
+            .placement_faults
+            .sync
+            .swap(false, Ordering::Relaxed)
+        {
+            return Err(io::Error::other(
+                "the quarantine's directory sync failed (a test's)",
+            ));
+        }
+        nrese_engine::place::sync_dir(dir)
+    }
+
+    /// Removes the load's file `path`, placed but not made durable.
+    fn remove_record(&self, path: &Path) -> io::Result<()> {
+        #[cfg(any(test, feature = "fault-points"))]
+        if self
+            .quarantine
+            .placement_faults
+            .removal
+            .swap(false, Ordering::Relaxed)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "removing the load's file failed (a test's)",
+            ));
+        }
+        fs::remove_file(path)
+    }
 }
 
 /// How far taking back a load's file got ([`Collector::withdraw`]).
@@ -1211,29 +1295,6 @@ enum Withdrawal {
     Unsynced,
     /// Still listed.
     Kept,
-}
-
-/// Makes a load's file, just renamed into `dir`, durably named.
-fn sync_placement(dir: &Path) -> io::Result<()> {
-    #[cfg(test)]
-    if tests::FAIL_PLACEMENT_SYNC.get() {
-        return Err(io::Error::other(
-            "the quarantine's directory sync failed (a test's)",
-        ));
-    }
-    nrese_engine::place::sync_dir(dir)
-}
-
-/// Removes a load's file `path` that was placed but not made durable.
-fn remove_record(path: &Path) -> io::Result<()> {
-    #[cfg(test)]
-    if tests::FAIL_RECORD_REMOVAL.get() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "removing the load's file failed (a test's)",
-        ));
-    }
-    fs::remove_file(path)
 }
 
 impl Drop for Collector<'_> {
@@ -1354,14 +1415,7 @@ mod tests {
             const { std::cell::Cell::new(false) };
         /// Taking back what a failed append wrote fails.
         pub(super) static FAIL_TAKE_BACK: std::cell::Cell<bool> =
-            const { std::cell::Cell::new(false) };
-        /// The quarantine directory's sync after a load's file is renamed into it fails.
-        pub(super) static FAIL_PLACEMENT_SYNC: std::cell::Cell<bool> =
-            const { std::cell::Cell::new(false) };
-        /// Removing a load's file that was placed but not made durable fails.
-        pub(super) static FAIL_RECORD_REMOVAL: std::cell::Cell<bool> =
-            const { std::cell::Cell::new(false) };
-        /// The process stops (exits with [`STOPPED`], nothing unwound) at this point of a
+            const { std::cell::Cell::new(false) };        /// The process stops (exits with [`STOPPED`], nothing unwound) at this point of a
         /// readmission.
         static STOP_AT: std::cell::Cell<Option<Stop>> = const { std::cell::Cell::new(None) };
     }
@@ -1671,11 +1725,19 @@ mod tests {
 
     /// A load of one invalid statement: it publishes nothing.
     const INVALID_LOAD: &str = "_:b <urn:p> \"invalid\" extra .\n";
+    /// A load of one valid and one invalid statement: it publishes.
+    const MIXED_LOAD: &str = "<urn:a> <urn:p> \"valid\" .\n_:b <urn:p> \"invalid\" extra .\n";
+    /// The advice of a load that published nothing and whose records may be listed.
+    fn may_be_listed(load: &str) -> String {
+        format!(
+            "This load's records may be listed under load ID {load}. If they are, its quarantine is kept: don't send it again. If they aren't, sending it again is safe."
+        )
+    }
 
     /// A load that a store with two quarantined statements ran, its quarantine's commit
-    /// meeting the failures `fail` set up for the quarantine directory.
+    /// meeting the failures `fail` set up.
     struct FailedCommit {
-        _dir: tempfile::TempDir,
+        dir: tempfile::TempDir,
         store: crate::StoreService,
         result: StoreResult<crate::BulkLoadReport>,
         /// The quarantine's listing and open count before the load.
@@ -1684,9 +1746,9 @@ mod tests {
     }
 
     impl FailedCommit {
-        /// Loads `content`; `fail` is called with the quarantine directory before the load
-        /// and with `None` after it.
-        fn run(content: &str, fail: impl Fn(Option<&Path>)) -> Self {
+        /// Loads `content`; `fail` is called with the quarantine and its directory before
+        /// the load, and this thread's directory sync fault point is cleared after it.
+        fn run(content: &str, fail: impl FnOnce(&Quarantine, &Path)) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let store_dir = dir.path().join("store");
             quarantined(&store_dir, dir.path());
@@ -1698,16 +1760,16 @@ mod tests {
             let open = store.quarantine().open_count();
             let file = dir.path().join("load.nt");
             fs::write(&file, content).unwrap();
-            fail(Some(&store_dir.join(DIR)));
+            fail(store.quarantine(), &store_dir.join(DIR));
             let result = store.bulk_load(&crate::BulkLoadRequest {
                 files: vec![file],
                 replace: false,
                 graph: crate::GraphTarget::DefaultGraph,
                 invalid: None,
             });
-            fail(None);
+            nrese_engine::fault_points::fail_dir_sync_of(None);
             Self {
-                _dir: dir,
+                dir,
                 store,
                 result,
                 before,
@@ -1722,8 +1784,30 @@ mod tests {
                 .unwrap()
         }
 
+        fn listed_of(&self, load: &str) -> Vec<QuarantineItem> {
+            self.store
+                .quarantine()
+                .list(&QuarantineFilter {
+                    load: Some(load.to_owned()),
+                    ..QuarantineFilter::default()
+                })
+                .unwrap()
+        }
+
         fn message(&self) -> String {
             self.result.as_ref().unwrap_err().to_string()
+        }
+
+        /// The listing and open count of the store opened again.
+        fn reopened(self) -> (Vec<QuarantineItem>, u64) {
+            drop(self.store);
+            let store_dir = self.dir.path().join("store");
+            let store = crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
+            let listed = store
+                .quarantine()
+                .list(&QuarantineFilter::default())
+                .unwrap();
+            (listed, store.quarantine().open_count())
         }
     }
 
@@ -1731,7 +1815,9 @@ mod tests {
     /// file back: nothing of it is listed or counted, and sending it again is safe.
     #[test]
     fn failed_quarantine_directory_sync_leaves_no_listed_records() {
-        let run = FailedCommit::run(INVALID_LOAD, |dir| FAIL_PLACEMENT_SYNC.set(dir.is_some()));
+        let run = FailedCommit::run(INVALID_LOAD, |quarantine, _| {
+            quarantine.fail_next_placement_sync();
+        });
 
         let Err(StoreError::LoadQuarantineNotRecorded(QuarantineCommitError::NotListed(_))) =
             &run.result
@@ -1748,12 +1834,12 @@ mod tests {
 
     /// A load that published nothing, whose file's removal fails after its placement wasn't
     /// made durable: the file stays listed and counted, and the answer names the load and
-    /// how to take its records out before sending it again.
+    /// says when sending it again is safe.
     #[test]
     fn failed_record_removal_keeps_the_records_listed_and_counted() {
-        let run = FailedCommit::run(INVALID_LOAD, |dir| {
-            FAIL_PLACEMENT_SYNC.set(dir.is_some());
-            FAIL_RECORD_REMOVAL.set(dir.is_some());
+        let run = FailedCommit::run(INVALID_LOAD, |quarantine, _| {
+            quarantine.fail_next_placement_sync();
+            quarantine.fail_next_record_removal();
         });
 
         let Err(StoreError::LoadQuarantineNotRecorded(QuarantineCommitError::PossiblyListed {
@@ -1763,34 +1849,27 @@ mod tests {
         else {
             panic!("{:?}", run.result);
         };
-        let of_load = run
-            .store
-            .quarantine()
-            .list(&QuarantineFilter {
-                load: Some(load.clone()),
-                ..QuarantineFilter::default()
-            })
-            .unwrap();
-        assert_eq!(of_load.len(), 1, "{:#?}", run.listed());
+        assert_eq!(run.listed_of(load).len(), 1, "{:#?}", run.listed());
         assert_eq!(run.listed().len(), run.before.len() + 1);
         assert_eq!(run.store.quarantine().open_count(), run.open + 1);
         assert_eq!(
             run.message(),
             format!(
-                "the load published nothing. The quarantine record couldn't be kept: the quarantine's directory sync failed (a test's). This load's records may still be listed under load ID {load}. If they are, stop the server and remove quarantine/load-{load}.jsonl from its data directory before you send it again."
+                "the load published nothing. The quarantine record couldn't be kept: the quarantine's directory sync failed (a test's). {}",
+                may_be_listed(load)
             )
         );
     }
 
     /// A load that published nothing took its file back, but the sync that makes the removal
-    /// durable failed: a power loss may bring the file back, so the answer doesn't call sending
-    /// it again safe, and names the load.
+    /// durable failed: a power loss may bring the file back, so the answer names the load and
+    /// says when sending it again is safe.
     #[test]
     fn failed_sync_of_a_record_removal_may_leave_it_listed() {
         use nrese_engine::fault_points::fail_dir_sync_of;
 
-        let run = FailedCommit::run(INVALID_LOAD, |dir| {
-            fail_dir_sync_of(dir.map(|dir| (dir, io::ErrorKind::Other)));
+        let run = FailedCommit::run(INVALID_LOAD, |_, dir| {
+            fail_dir_sync_of(Some((dir, io::ErrorKind::Other)));
         });
 
         let Err(StoreError::LoadQuarantineNotRecorded(QuarantineCommitError::PossiblyListed {
@@ -1804,7 +1883,7 @@ mod tests {
         assert_eq!(run.store.quarantine().open_count(), run.open);
         let message = run.message();
         assert!(
-            message.contains(&format!("listed under load ID {load}.")) && !message.contains("safe"),
+            message.ends_with(&format!(". {}", may_be_listed(load))),
             "{message}"
         );
     }
@@ -1813,10 +1892,9 @@ mod tests {
     /// made durable: they stay listed and counted for review, and the answer names their load.
     #[test]
     fn published_load_keeps_its_records_when_the_directory_sync_fails() {
-        let run = FailedCommit::run(
-            &format!("<urn:a> <urn:p> \"valid\" .\n{INVALID_LOAD}"),
-            |dir| FAIL_PLACEMENT_SYNC.set(dir.is_some()),
-        );
+        let run = FailedCommit::run(MIXED_LOAD, |quarantine, _| {
+            quarantine.fail_next_placement_sync();
+        });
 
         let Err(StoreError::LoadPublished { revision, .. }) = &run.result else {
             panic!("{:?}", run.result);
@@ -1835,6 +1913,101 @@ mod tests {
                 "the load completed at published revision {revision}. Its quarantine record couldn't be kept: the quarantine's directory sync failed (a test's). This load's records are listed under load ID {load}, but a power loss may lose them. Don't send it again."
             )
         );
+    }
+
+    /// A rename that reports an error may have moved the file anyway (Windows' write-through
+    /// move): its file listed is a placement not made durable. A load that published nothing
+    /// takes it back; one that published keeps it, listed and counted, and names its load.
+    #[test]
+    fn rename_failing_after_it_moved_the_file_is_a_placement_not_made_durable() {
+        let unpublished = FailedCommit::run(INVALID_LOAD, |quarantine, _| {
+            quarantine.fail_next_rename_after_moving();
+        });
+        let Err(StoreError::LoadQuarantineNotRecorded(QuarantineCommitError::NotListed(_))) =
+            &unpublished.result
+        else {
+            panic!("{:?}", unpublished.result);
+        };
+        assert_eq!(unpublished.listed(), unpublished.before);
+        assert_eq!(
+            unpublished.store.quarantine().open_count(),
+            unpublished.open
+        );
+
+        let published = FailedCommit::run(MIXED_LOAD, |quarantine, _| {
+            quarantine.fail_next_rename_after_moving();
+        });
+        let Err(StoreError::LoadPublished {
+            reason: QuarantineCommitError::PossiblyListed { load, .. },
+            ..
+        }) = &published.result
+        else {
+            panic!("{:?}", published.result);
+        };
+        assert_eq!(
+            published.listed_of(load).len(),
+            1,
+            "{:#?}",
+            published.listed()
+        );
+        assert_eq!(
+            published.store.quarantine().open_count(),
+            published.open + 1
+        );
+    }
+
+    /// What a failed commit leaves listed and counted is what a restart finds, for each way
+    /// the placement of a load's file can fail.
+    #[test]
+    fn failed_placements_list_and_count_the_same_after_a_restart() {
+        use nrese_engine::fault_points::fail_dir_sync_of;
+
+        type Fail = fn(&Quarantine, &Path);
+        let outcomes: [(&str, &str, Fail); 6] = [
+            ("taken back", INVALID_LOAD, |quarantine, _| {
+                quarantine.fail_next_placement_sync();
+            }),
+            ("removal failed", INVALID_LOAD, |quarantine, _| {
+                quarantine.fail_next_placement_sync();
+                quarantine.fail_next_record_removal();
+            }),
+            ("removal not made durable", INVALID_LOAD, |_, dir| {
+                fail_dir_sync_of(Some((dir, io::ErrorKind::Other)));
+            }),
+            ("published, kept", MIXED_LOAD, |quarantine, _| {
+                quarantine.fail_next_placement_sync();
+            }),
+            (
+                "rename failed after moving",
+                INVALID_LOAD,
+                |quarantine, _| {
+                    quarantine.fail_next_rename_after_moving();
+                },
+            ),
+            (
+                "published, rename failed after moving",
+                MIXED_LOAD,
+                |quarantine, _| {
+                    quarantine.fail_next_rename_after_moving();
+                },
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (outcome, content, fail) in outcomes {
+            let run = FailedCommit::run(content, fail);
+            let at_end = (run.listed(), run.store.quarantine().open_count());
+            let reopened = run.reopened();
+            if reopened != at_end {
+                wrong.push(format!(
+                    "{outcome}: {} listed, {} open before the restart; {} listed, {} open after",
+                    at_end.0.len(),
+                    at_end.1,
+                    reopened.0.len(),
+                    reopened.1
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// The log a start reads is the one a power loss keeps: a start that

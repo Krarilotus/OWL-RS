@@ -1048,6 +1048,100 @@ async fn quarantine_failure_in_server_file_import_says_load_again() {
     );
 }
 
+/// A server on a store on disk in `dir`, `fail` setting up its quarantine's next failures.
+fn import_on_disk(
+    dir: &std::path::Path,
+    fail: impl FnOnce(&StoreService),
+) -> (Router, std::sync::Arc<StoreService>) {
+    let state = crate::support::test_state_with_store_config(
+        StoreConfig::on_disk(dir),
+        PolicyConfig::default(),
+        ReasonerConfig::default(),
+    )
+    .unwrap();
+    let store = state.store();
+    fail(&store);
+    (nrese_server::build_app(state), store)
+}
+
+/// The load ID a quarantine answer names, and the records the store lists under it.
+fn named_load<'a>(store: &StoreService, text: &'a str) -> (&'a str, usize) {
+    let load = text
+        .split_once("under load ID ")
+        .and_then(|(_, rest)| rest.split_once([',', '.']))
+        .map(|(load, _)| load)
+        .expect(text);
+    let listed = store
+        .quarantine()
+        .list(&nrese_store::QuarantineFilter {
+            load: Some(load.to_owned()),
+            ..nrese_store::QuarantineFilter::default()
+        })
+        .unwrap();
+    (load, listed.len())
+}
+
+/// An upload that published nothing, whose quarantine file was placed but couldn't be made
+/// durable or taken back: 500, naming the load whose record is listed, and saying when
+/// sending the document again is safe.
+#[tokio::test]
+async fn kept_quarantine_without_publication_says_when_to_send_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, store) = import_on_disk(dir.path(), |store| {
+        store.quarantine().fail_next_placement_sync();
+        store.quarantine().fail_next_record_removal();
+    });
+    let (status, body) = send(
+        &app,
+        Method::POST,
+        "/api/v1/repositories/nrese/import",
+        Some("application/n-triples"),
+        INVALID_UPLOAD,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    let problem: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let detail = problem["detail"].as_str().expect(&body);
+    let (load, listed) = named_load(&store, detail);
+    assert_eq!(
+        detail,
+        format!(
+            "the load published nothing. The quarantine record couldn't be kept: the quarantine's directory sync failed (a test's). This load's records may be listed under load ID {load}. If they are, its quarantine is kept: don't send it again. If they aren't, sending it again is safe."
+        )
+    );
+    assert_eq!(listed, 1, "{body}");
+}
+
+/// An import job that published, whose quarantine file was placed but not made durable:
+/// done, its warning naming the load whose record stays listed.
+#[tokio::test]
+async fn published_import_job_warning_names_the_kept_quarantine() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, store) = import_on_disk(dir.path(), |store| {
+        store.quarantine().fail_next_placement_sync();
+    });
+    let (_, body) = send(
+        &app,
+        Method::POST,
+        "/api/v1/repositories/nrese/import?async=true",
+        Some("application/n-triples"),
+        MIXED_UPLOAD,
+    )
+    .await;
+    let started: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let job = finished(&app, started["path"].as_str().expect(&body)).await;
+    assert_eq!(job["state"], "done", "{job}");
+    let warning = job["report"]["warning"].as_str().expect("a warning");
+    let (load, listed) = named_load(&store, warning);
+    assert_eq!(
+        warning,
+        format!(
+            "the quarantine record couldn't be kept: the quarantine's directory sync failed (a test's). This load's records are listed under load ID {load}, but a power loss may lose them."
+        )
+    );
+    assert_eq!(listed, 1, "{job}");
+}
+
 /// Imports run as jobs: an uploaded document with `async=true`, and files from the
 /// server's import directory (administrators), whose paths can't leave it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

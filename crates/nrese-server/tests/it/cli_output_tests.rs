@@ -128,6 +128,44 @@ fn quarantine_failure_without_publication_says_load_again() -> Result<(), Box<dy
     Ok(())
 }
 
+/// A load that published nothing, whose quarantine file was placed but couldn't be made
+/// durable or taken back: the error names the load and says when loading it again is safe.
+#[cfg(feature = "fault-points")]
+#[test]
+fn kept_quarantine_without_publication_says_when_to_load_again()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("invalid.nt");
+    std::fs::write(&file, "this is not a statement\n")?;
+    let mut command = nrese(dir.path(), &dir.path().join("data"));
+    command
+        .env("NRESE_TEST_FAIL_QUARANTINE_REMOVAL", "1")
+        .arg("load")
+        .arg(&file);
+    let output = run(&mut command)?;
+    let lines = output
+        .stderr
+        .lines()
+        .filter(|line| line.starts_with("Error:"))
+        .collect::<Vec<_>>();
+    let [line] = lines[..] else {
+        panic!("{}", output.stderr);
+    };
+    let load = line
+        .split_once("under load ID ")
+        .and_then(|(_, rest)| rest.split_once(". "))
+        .map(|(load, _)| load)
+        .expect(line);
+    assert_eq!(
+        line,
+        format!(
+            "Error: the load published nothing. The quarantine record couldn't be kept: the quarantine's directory sync failed (a test's). This load's records may be listed under load ID {load}. If they are, its quarantine is kept: don't load it again. If they aren't, loading it again is safe."
+        )
+    );
+    assert!(!output.status.success(), "{}", output.status);
+    Ok(())
+}
+
 /// `query --format json`: standard output is one SPARQL 1.1 JSON results document (`ASK {}`
 /// is true), nothing before or after it; the INFO lines are on standard error.
 #[test]
