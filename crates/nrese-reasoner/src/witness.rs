@@ -34,10 +34,13 @@ pub(crate) enum Site {
     Merge,
     /// Old consistency instances inspected in a delete's witness lookup.
     OldWitnessInstance,
+    /// Length of the counter array.
+    Count,
 }
 
 thread_local! {
-    static COUNTS: [Cell<u64>; 11] = const { [const { Cell::new(0) }; 11] };
+    static COUNTS: [Cell<u64>; Site::Count as usize] =
+        const { [const { Cell::new(0) }; Site::Count as usize] };
 }
 
 /// Counts `n` units at `site` on this thread.
