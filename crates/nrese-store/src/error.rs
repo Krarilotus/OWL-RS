@@ -88,12 +88,13 @@ pub enum StoreError {
     #[error("the load was cancelled; nothing of it was committed")]
     LoadCancelled,
     #[error(
-        "the load completed at published revision {revision}. Its quarantine record couldn't be kept: {reason}. Don't send it again."
+        "the load completed at published revision {revision}. Its quarantine record couldn't be kept: {reason}.{} Don't send it again.",
+        .reason.published_note()
     )]
     LoadPublished {
         revision: u64,
         #[source]
-        reason: std::io::Error,
+        reason: crate::quarantine::QuarantineCommitError,
     },
     /// The quarantine record could not be kept and the load published no changes.
     #[error("{}", .0.unpublished_message("send"))]

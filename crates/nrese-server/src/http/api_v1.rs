@@ -959,7 +959,11 @@ fn start_import(
         let uploaded = remove.is_some();
         drop(remove);
         if let Err(nrese_store::StoreError::LoadPublished { revision, reason }) = &loaded {
-            let warning = format!("the quarantine record couldn't be kept: {reason}");
+            let mut warning = format!("the quarantine record couldn't be kept: {reason}");
+            let note = reason.published_note();
+            if !note.is_empty() {
+                warning += &format!(".{note}");
+            }
             let report = serde_json::json!({ "revision": revision, "warning": warning });
             job.finish(Ok(report));
             return;

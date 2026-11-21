@@ -212,12 +212,12 @@ pub(crate) fn bulk_load(
     // A no-op load can still have a quarantine to record.
     let published = summary.inserted + summary.deleted + summary.inferred_deleted > 0;
     let quarantined = collector
-        .map(Collector::commit)
+        .map(|collector| collector.commit(published))
         .transpose()
         .map_err(|error| match published {
             true => StoreError::LoadPublished {
                 revision: summary.revision,
-                reason: error.into_io(),
+                reason: error,
             },
             false => StoreError::LoadQuarantineNotRecorded(error),
         })?

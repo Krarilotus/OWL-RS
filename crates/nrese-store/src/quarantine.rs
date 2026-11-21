@@ -966,10 +966,11 @@ pub(crate) struct LoadFile {
 /// An I/O failure committing one load's quarantine records.
 #[derive(Debug, thiserror::Error)]
 pub enum QuarantineCommitError {
-    /// No finished record file remains visible.
+    /// None of the load's records is listed, now or after a power loss.
     #[error(transparent)]
     NotListed(#[from] io::Error),
-    /// The record file was placed but could not be synced or removed.
+    /// The load's records are listed under `load`, or may be after a power loss: its file was
+    /// placed, but that wasn't made durable, or taking it back wasn't.
     #[error("{reason}")]
     PossiblyListed {
         #[source]
@@ -979,25 +980,31 @@ pub enum QuarantineCommitError {
 }
 
 impl QuarantineCommitError {
-    pub(crate) fn into_io(self) -> io::Error {
-        match self {
-            Self::NotListed(reason) | Self::PossiblyListed { reason, .. } => reason,
-        }
-    }
-
-    /// Tells the caller what happened when the load published no RDF changes.
+    /// Tells the caller what happened when the load published no RDF changes; `retry_action`
+    /// is how the caller sends it again (`send`, `load`).
     pub fn unpublished_message(&self, retry_action: &str) -> String {
         let advice = match self {
             Self::NotListed(_) => {
                 format!("It's safe to {retry_action} it again once the cause is resolved.")
             }
             Self::PossiblyListed { load, .. } => format!(
-                "This load's records may still be listed under load ID {load}. Check the quarantine before retrying."
+                "This load's records may still be listed under load ID {load}. If they are, stop the server and remove quarantine/load-{load}.jsonl from its data directory before you {retry_action} it again."
             ),
         };
         format!(
             "the load published nothing. The quarantine record couldn't be kept: {self}. {advice}"
         )
+    }
+
+    /// For a load that published: a sentence naming the load its records are listed under,
+    /// with a leading space, or nothing if none is.
+    pub fn published_note(&self) -> String {
+        match self {
+            Self::NotListed(_) => String::new(),
+            Self::PossiblyListed { load, .. } => format!(
+                " This load's records are listed under load ID {load}, but a power loss may lose them."
+            ),
+        }
     }
 }
 
@@ -1116,7 +1123,10 @@ impl Collector<'_> {
     }
 
     /// The load committed: its statements join the quarantine. Returns what it quarantined.
-    pub(crate) fn commit(self) -> Result<Quarantined, QuarantineCommitError> {
+    /// `published`: the load published changes. If its file's placement isn't made durable,
+    /// a load that published keeps its file listed, for review; one that published nothing
+    /// takes it back, so that sending it again doesn't list its statements twice.
+    pub(crate) fn commit(self, published: bool) -> Result<Quarantined, QuarantineCommitError> {
         let count = self.count.load(Ordering::Relaxed);
         #[cfg(feature = "fault-points")]
         if count > 0 && self.quarantine.fail_commit.swap(false, Ordering::Relaxed) {
@@ -1135,26 +1145,30 @@ impl Collector<'_> {
         } else {
             None
         };
+        // Held from the rename through the syncs, and a listing reads the directory under it
+        // ([`Quarantine::each`]): no listing sees a file that is then taken back. The cost:
+        // listings wait behind one load's directory syncs.
         let mut state = self.quarantine.state();
         if let Some(partial) = partial {
             // Durably named before the load is acknowledged: a
             // load of only invalid statements publishes nothing else.
             let listed = partial.with_extension("jsonl");
+            let dir = partial.parent().expect("in the quarantine directory");
             nrese_engine::place::rename(partial, &listed)?;
-            if let Err(reason) =
-                sync_placement(partial.parent().expect("in the quarantine directory"))
-            {
-                if let Err(cleanup) = remove_record(&listed)
-                    && cleanup.kind() != io::ErrorKind::NotFound
-                {
-                    state.total += count;
-                    tracing::warn!(load = %self.load, %cleanup, "couldn't remove an unsynced quarantine record");
-                    return Err(QuarantineCommitError::PossiblyListed {
-                        reason,
-                        load: self.load.clone(),
-                    });
+            if let Err(reason) = sync_placement(dir) {
+                let withdrawal = match published {
+                    true => Withdrawal::Kept,
+                    false => self.withdraw(&listed, dir),
+                };
+                match withdrawal {
+                    Withdrawal::Done => return Err(reason.into()),
+                    Withdrawal::Unsynced => {}
+                    Withdrawal::Kept => state.total += count,
                 }
-                return Err(reason.into());
+                return Err(QuarantineCommitError::PossiblyListed {
+                    reason,
+                    load: self.load.clone(),
+                });
             }
         }
         state.held.append(&mut inner.held);
@@ -1166,6 +1180,37 @@ impl Collector<'_> {
             examples: inner.examples.drain(..).map(|(_, s)| s).collect(),
         })
     }
+
+    /// Takes back the load's file `listed`, placed in `dir` but not made durable: removes it,
+    /// then syncs `dir` so that a power loss doesn't bring it back. Best effort.
+    fn withdraw(&self, listed: &Path, dir: &Path) -> Withdrawal {
+        match remove_record(listed) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(load = %self.load, %error, "couldn't remove an unsynced quarantine record");
+                return Withdrawal::Kept;
+            }
+        }
+        match nrese_engine::place::sync_dir(dir) {
+            Ok(()) => Withdrawal::Done,
+            Err(error) => {
+                tracing::warn!(load = %self.load, %error, "couldn't sync the removal of an unsynced quarantine record");
+                Withdrawal::Unsynced
+            }
+        }
+    }
+}
+
+/// How far taking back a load's file got ([`Collector::withdraw`]).
+#[derive(Debug, Clone, Copy)]
+enum Withdrawal {
+    /// Removed, durably: nothing of the load is listed, now or after a power loss.
+    Done,
+    /// Removed, but a power loss may bring it back.
+    Unsynced,
+    /// Still listed.
+    Kept,
 }
 
 /// Makes a load's file, just renamed into `dir`, durably named.

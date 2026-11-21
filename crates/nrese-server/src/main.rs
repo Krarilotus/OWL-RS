@@ -615,7 +615,8 @@ fn bulk_load(store: &StoreService, load: LoadCommand) -> Result<()> {
     };
     let report = store.bulk_load(&request).map_err(|error| match error {
         nrese_store::StoreError::LoadPublished { revision, reason } => anyhow::anyhow!(
-            "the load completed at published revision {revision}. Its quarantine record couldn't be kept: {reason}. Don't load it again."
+            "the load completed at published revision {revision}. Its quarantine record couldn't be kept: {reason}.{} Don't load it again.",
+            reason.published_note()
         ),
         nrese_store::StoreError::LoadQuarantineNotRecorded(error) => {
             anyhow::Error::msg(error.unpublished_message("load"))
