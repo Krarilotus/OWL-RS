@@ -1264,7 +1264,7 @@ impl OntologyFamilies {
     }
 
     fn assert_complete(&self) {
-        assert_eq!(self.0.len(), 8);
+        assert_eq!(self.0.len(), 8, "generator families: {:?}", self.0.keys());
         for (&name, &(size, observed)) in &self.0 {
             assert_eq!(
                 observed.count_ones() as usize,
@@ -2327,10 +2327,6 @@ fn delta_equality_equals_rematerialisation() {
     };
     let closure =
         |asserted: &[Triple]| batch::materialise(asserted, &rules, Some(&lists), &schema).derived;
-    // The edits of seed 7 that split and join classes under each policy.
-    let edits = [
-        15, 6, 15, 13, 4, 1, 1, 12, 9, 17, 7, 4, 6, 3, 6, 16, 1, 16, 17, 3,
-    ];
     let pinned = pinned_cases();
     for policy in [
         Policy::default(),
@@ -2343,13 +2339,8 @@ fn delta_equality_equals_rematerialisation() {
         let mut inferred = closure(&asserted);
         let mut recomputed = 0;
         let mut kinds = HashSet::new();
-        for step in 0..test_cases(edits.len() as u64, 60) {
-            let index = if pinned {
-                edits[step as usize]
-            } else {
-                next(pool.len())
-            };
-            let fact = pool[index];
+        for step in 0..test_cases(20, 60) {
+            let fact = pool[next(pool.len())];
             let deleting = asserted.binary_search(&fact).is_ok();
             let mut after: Vec<Triple> = asserted.iter().copied().filter(|&t| t != fact).collect();
             if !deleting {
@@ -2456,12 +2447,14 @@ fn materialisation_stops_when_asked() {
 }
 
 /// Random small ontologies: the batch executor equals the naive one.
-/// By default, this test replays fixed witnesses for eight consistency rules. With `NRESE_CHECK_TIER=nightly`, it draws 400 ontologies.
+/// By default, this test checks the first 100 fixed ontologies, witnesses for eight consistency rules and every generator family. With `NRESE_CHECK_TIER=nightly`, it draws 400.
 #[test]
 fn batch_equals_naive_on_random_ontologies() {
     let mut next = rng(0x9E37_79B9_7F4A_7C15);
     let (mut derived, mut violations, mut rules) =
         (0, 0, std::collections::BTreeSet::<String>::new());
+    let pinned = pinned_cases();
+    let mut families = OntologyFamilies::default();
     let cases = test_cases(100, 400);
     let floor = (cases.saturating_mul(75) / 2) as usize;
     let covered = |derived: usize, rules: usize| derived > floor && rules >= 8;
@@ -2469,7 +2462,7 @@ fn batch_equals_naive_on_random_ontologies() {
         if !draws_on(case, cases, covered(derived, rules.len())) {
             break;
         }
-        let lines = random_ontology(&mut next);
+        let lines = families.input(&mut next, pinned);
         let mut vocabulary = LocalVocabulary::default();
         let input = load(&mut vocabulary, &lines.join("\n"));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2488,7 +2481,8 @@ fn batch_equals_naive_on_random_ontologies() {
         covered(derived, rules.len()),
         "{derived} derived, {violations} violations of {rules:?}"
     );
-    if pinned_cases() {
+    if pinned {
+        families.assert_complete();
         for rule in [
             "cax-dw",
             "cls-com",
