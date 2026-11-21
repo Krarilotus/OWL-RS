@@ -1024,12 +1024,15 @@ class GateJob(Repo):
         # (where that home is cargo's); `gate-own-unused`: there on a host with rustup (where cargo never
         # looks). `late-3`: the pinned one there, and the tier ending with 3 (cargo didn't run it inside the
         # run). `mispinned`: the checkout pins an archive whose executable isn't the pinned one (a wrong
-        # pin): fetched, its executable is never run.
+        # pin): fetched, its executable is never run. `rustup-late`: a host without rustup whose rustup
+        # appears while the job waits for the tools' lock, and another runner in $CARGO_HOME/bin: the job
+        # keeps the home it checked (its own), so that runner never runs.
         nextest_entry = cache / "tools" / f"nextest-{v}-{good_sum[:12]}"
         pinned, failing, cold_failing, tampered, mixed = "pinned", "failing", "cold-failing", "tampered", "mixed"
         host_own, gate_own, gate_unused, late_3 = "host-own", "gate-own", "gate-own-unused", "late-3"
-        mispinned = "mispinned"
+        mispinned, rustup_late = "mispinned", "rustup-late"
         cargo_home, tampered_ran, marked_ran = self.root / "cargo-home", self.root / "tampered-ran", self.root / "marked-ran"
+        late_ran = self.root / "late-ran"
         (self.root / "marked").mkdir()
         marked_archive, _, marked_sum, _ = nextest_archives(self.root / "marked", runner + f': > "{marked_ran}"\n')
         # The host without rustup: the stand-ins but rustup, and no PATH directory holding one.
@@ -1038,6 +1041,12 @@ class GateJob(Repo):
         (no_rustup / "rustup").unlink()
         path_no_rustup = os.pathsep.join([str(no_rustup)] + [d for d in os.environ["PATH"].split(os.pathsep)
                                                              if d and not (Path(d) / "rustup").exists()])
+        # rustup-late: a flock that puts rustup on PATH when the job takes the tools' lock (flock -w).
+        late = self.root / "stubs-late"
+        late.mkdir()
+        (late / "flock").write_text(f'#!/bin/sh\ncase "$*" in *-w*) cp "{stubs / "rustup"}" "{late}/rustup" ;; esac\n'
+                                    f'exec "{shutil.which("flock")}" "$@"\n')
+        (late / "flock").chmod(0o755)
         pins_text = tools_txt.read_text()
         cases = [  # tree sent, C compiler, nextest -> exit
             # None there: the archive the tree pins by its sha256 is fetched, installed and runs.
@@ -1061,6 +1070,8 @@ class GateJob(Repo):
             (tree, "cc-links", host_own, 3),
             (tree, "cc-links", gate_own, 3),
             (tree, "cc-links", gate_unused, 0),
+            # rustup appearing after that check changes nothing: the home checked is the home used.
+            (tree, "cc-links", rustup_late, 0),
             # The tier ends with 3: no verdict, nothing recorded.
             (tree, "cc-links", late_3, 3),
             # A wrong pin: the archive's executable isn't the pinned one: never run, nothing installed.
@@ -1077,7 +1088,8 @@ class GateJob(Repo):
             shutil.rmtree(cargo_home, ignore_errors=True)
             (cargo_home / "bin").mkdir(parents=True)
             fetched = (nextest if isinstance(nextest, Path) else marked_archive if nextest == mispinned else
-                       good_archive if nextest in (cold_failing, tampered, mixed, host_own, gate_own, gate_unused) else None)
+                       good_archive if nextest in (cold_failing, tampered, mixed, host_own, gate_own, gate_unused,
+                                                   rustup_late) else None)
             # The checkout's pins: the tree's, or (mispinned) the marked archive's sha256 beside the pinned
             # executable's.
             tools_txt.write_text(pins_text.replace(good_sum, marked_sum) if nextest == mispinned else pins_text,
@@ -1097,12 +1109,17 @@ class GateJob(Repo):
                 (own / "cargo-nextest").chmod(0o755)
                 if nextest in (gate_own, gate_unused):  # the gate's own rustup there, as its bootstrap leaves it
                     shutil.copy(stubs / "rustup", own / "rustup")
+            if nextest == rustup_late:  # the host's runner of the pinned version, which marks that it ran
+                (late / "rustup").unlink(missing_ok=True)
+                (cargo_home / "bin" / "cargo-nextest").write_text(runner + f': > "{late_ran}"\n', newline="\n")
+                (cargo_home / "bin" / "cargo-nextest").chmod(0o755)
             done = subprocess.run(
                 [BASH, "scripts/lib/gate-job.sh", "push", sent, empty, "--"], cwd=self.repo, capture_output=True,
                 text=True, timeout=120,
                 env={**self.env, "FLEET_OUT": str(out), "NRESE_GATE_CACHE": str(cache), "SEEN": str(seen),
                      "HOME": str(self.root), "NRESE_GATE_CC": linker,
-                     "PATH": path_no_rustup if nextest == gate_own else f"{stubs}:{os.environ['PATH']}",
+                     "PATH": (path_no_rustup if nextest == gate_own else f"{late}:{path_no_rustup}"
+                              if nextest == rustup_late else f"{stubs}:{os.environ['PATH']}"),
                      "FLEET_JOB": f"gate-{case}", "FLEET_STEP": "1", "FLEET_HOST": "office-pc",
                      "CARGO_HOME": str(cargo_home), "STUB_ARCHIVE": str(fetched) if fetched else "",
                      "STUB_NEXTEST": "failing" if nextest in (failing, cold_failing) else "",
@@ -1112,6 +1129,9 @@ class GateJob(Repo):
                 self.assertFalse(tampered_ran.exists(), f"SPEC gate-nextest: a cached runner not the pinned one ran: case {case}")
             if nextest == mispinned:
                 self.assertFalse(marked_ran.exists(), f"SPEC gate-nextest: an executable not the pinned one ran: case {case}")
+            if nextest == rustup_late:
+                self.assertFalse(late_ran.exists(),
+                                 f"SPEC gate-nextest: a runner in a Cargo home the job didn't check ran: case {case}")
             if fetched is bad_archive or nextest in (cold_failing, host_own, gate_own, mispinned):
                 self.assertEqual([p.name for p in nextest_entry.parent.glob("nextest-*")], [],
                                  f"SPEC gate-nextest: a cargo-nextest was installed: case {case}")

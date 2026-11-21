@@ -88,9 +88,11 @@ cd "$wt" || infra "no worktree"
 # A cargo-nextest where cargo runs one first, before any on PATH, would stand in for the pinned one
 # whatever its version says: no verdict, before anything is installed. Cargo's home here: the host's
 # where it has rustup (a relative one from this worktree, as cargo resolves it), else the gate's own,
-# made below.
+# made below. Decided once, here: the setup below takes the same home, whatever appears on PATH meanwhile.
+host_rustup=""
+command -v rustup > /dev/null && host_rustup=1
 cargo_home=$cache/cargo
-command -v rustup > /dev/null && cargo_home=${CARGO_HOME:-$HOME/.cargo}
+[ -z "$host_rustup" ] || cargo_home=${CARGO_HOME:-$HOME/.cargo}
 [ ! -e "$cargo_home/bin/cargo-nextest" ] \
   || infra "a cargo-nextest in $cargo_home/bin would run in place of the pinned one: no verdict"
 
@@ -108,7 +110,7 @@ exec 7> "$cache/tools/lock"
 flock -w 1800 7 || infra "the tools' lock wasn't free within 30 minutes"
 # A host without rustup (the development machine's WSL VM, 20 Oct 2026) gets one of the gate's own, under the cache:
 # the host's own home and PATH stay as they are.
-if ! command -v rustup > /dev/null; then
+if [ -z "$host_rustup" ]; then
   export RUSTUP_HOME="$cache/rustup" CARGO_HOME="$cache/cargo"
   export PATH="$CARGO_HOME/bin:$PATH"
   if ! command -v rustup > /dev/null; then
