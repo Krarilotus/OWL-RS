@@ -19,7 +19,17 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
-HOST = "gamergrill"
+
+
+def host() -> str:
+    """The checks host: the private overlay's [fleet] verify (benches/suite/suitekit/hosts.py).
+    Stops without it: a /verify job anywhere else could land on a timed host."""
+    from suitekit import hosts  # verify.py puts benches/suite on the path
+    named = hosts.fleet("verify")
+    if len(named) != 1:
+        raise SystemExit(f"no checks host for /verify: the private overlay's [fleet] verify names {named or 'none'} "
+                         f"({hosts.PRIVATE} names the overlay)")
+    return named[0]
 # A debug build of nrese-server at -j2, cold at ebaeb593 (verify-coldbuild-ebaeb593-10201518): 119 s;
 # the build itself held at most 897 MiB (anonymous memory, sampled each second), the step's cgroup
 # 2,319 MiB with the page cache of what it wrote, which the cap reclaims. 2 GB (capped at 3) holds
@@ -69,6 +79,7 @@ def jobs(repo: Path, rev: str, harness: str, scenarios: list[str], settings: lis
     if missing:
         raise SystemExit(f"not committed at {harness_sha[:12]} (a fleet job sees git only): {', '.join(missing)}")
     stamp = stamp or time.strftime("%m%d%H%M")
+    checks = host()
     build_id, run_id = f"verify-build-{sha[:8]}-{stamp}", f"verify-run-{sha[:8]}-{stamp}"
     script = (HERE / "build-on-host.sh").read_text(encoding="utf-8").replace("\r\n", "\n")  # bash -c, on Linux
     source = str(repo.resolve().as_posix())
@@ -77,7 +88,7 @@ def jobs(repo: Path, rev: str, harness: str, scenarios: list[str], settings: lis
         "priority_reason": f"{reason} (debug nrese-server {sha[:12]} for /verify)", "est_min": BUILD["est_min"],
         "env": {"CARGO_BUILD_JOBS": str(BUILD["cores"])},
         "steps": [["bash", "-c", script, "build-on-host"]],
-        "requires": {"hosts": [HOST], "cores": BUILD["cores"], "ram_gb": BUILD["ram_gb"]},
+        "requires": {"hosts": [checks], "cores": BUILD["cores"], "ram_gb": BUILD["ram_gb"]},
         "inputs": [{"name": "checkout", "source": {"git": source, "rev": sha}}]}
     run_args = [a for s in settings for a in ("--set", s)]
     # Every phase of verify.py has its own deadline; each step also has a ceiling of its own
@@ -91,6 +102,6 @@ def jobs(repo: Path, rev: str, harness: str, scenarios: list[str], settings: lis
         "id": run_id, "group": "verify", "kind": "owlrs.any", "priority": priority, "priority_reason": reason,
         "after": [build_id], "est_min": RUN["est_min"], "steps": steps,
         **({"verifies": verifies} if verifies else {}),
-        "requires": {"hosts": [HOST], "cores": RUN["cores"], "ram_gb": ram_gb or RUN["ram_gb"]},
+        "requires": {"hosts": [checks], "cores": RUN["cores"], "ram_gb": ram_gb or RUN["ram_gb"]},
         "inputs": [{"name": "checkout", "source": {"git": source, "rev": harness_sha}}]}
     return {build_id: build, run_id: run}

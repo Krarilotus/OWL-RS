@@ -1,6 +1,6 @@
 # The reasoning home-turf jobs
 
-> Superseded on 2 Nov 2026: these job files were written for the measurement queue before the fleet (kept in the private overlay); they name hosts and aren't submitted any more. A run of this kit is a fleet job ([../../README.md](../../README.md#on-the-fleet)); porting them is a follow-up.
+> Superseded on 2 Nov 2026: these job files were written for the measurement queue before the fleet; they name hosts, aren't submitted any more, and are in the private overlay (its `jobs/reasoning/`), not here. A run of this kit is a fleet job ([../../README.md](../../README.md#on-the-fleet)); porting them is a follow-up.
 
 Measurement-queue jobs for this week's reasoning
 families: `lubm` (RDFox's L and LE programs), `claros`, `ldbc-spb`, `datalog-graphs`,

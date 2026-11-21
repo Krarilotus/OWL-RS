@@ -42,7 +42,14 @@ COPIED = (".githooks/pre-push", "scripts/check.sh", "scripts/cargo-guarded.sh", 
           "scripts/lib/gate-publish.sh", "rust-toolchain.toml",
           "scripts/lib/gate-record.py", "scripts/lib/windows-job.ps1", "scripts/lib/windows-job.sh",
           "scripts/lib/suite-python.sh", "scripts/lib/gate-node.sh", *isolation.NS_SH,
-          "benches/suite/requirements.txt", "scripts/lib/gate-job.sh")
+          "benches/suite/requirements.txt", "scripts/lib/gate-job.sh", "benches/hosts.toml",
+          "benches/suite/suitekit/hosts.py")
+# The private overlay's [fleet] lists fleet-gate.sh reads (benches/suite/suitekit/hosts.py fleet).
+FLEET_LISTS = """[fleet]
+gate_unconfirmed = ["dev-host", "dev-host-wsl"]
+gate_confirm = ["shared-host", "timed-host", "checks-host"]
+gate_confirm_windows = ["win-host"]
+"""
 # A stand-in for the fleet's CLI: each submit keeps its job file; status, results and cancel as told.
 FLEET = """#!/bin/sh
 answer() {
@@ -155,7 +162,7 @@ class Repo(unittest.TestCase):
         where = self.fake / tier if separate else self.fake
         out = where / "results" / "out"
         out.mkdir(parents=True, exist_ok=True)
-        (where / "status").write_text(json.dumps({"state": state, "host": "office-pc"}))
+        (where / "status").write_text(json.dumps({"state": state, "host": "shared-host"}))
         for name in ("gate.json", "attempt", "gate.log"):
             if (out / name).exists():
                 (out / name).unlink()
@@ -168,8 +175,8 @@ class Repo(unittest.TestCase):
                                   capture_output=True, text=True, env=self.env).stdout.strip()
         record = {
             "tier": tier, "part": "rest", "tree": tree, "list_hash": list_hash, "identity": identity,
-            "w3c_optional": False, "tracked_changes": "", "code": 0, "host": "office-pc", "cpu": "znver3",
-            "job": "gate-1", "fleet_host": "office-pc", "attempt": "gate-1:0:1:1", "summary": True,
+            "w3c_optional": False, "tracked_changes": "", "code": 0, "host": "shared-host", "cpu": "znver3",
+            "job": "gate-1", "fleet_host": "shared-host", "attempt": "gate-1:0:1:1", "summary": True,
             "steps": [{"name": "fmt", "code": 0, "seconds": 1}]}
         declared = self.declared() if tier == "windows" else None
         if declared:
@@ -591,6 +598,11 @@ esac
         super().setUp()
         self.tip = self.commit("a.txt", "a changed\n")
         (self.fake / "fleet").write_text(self.MULTI, newline="\n")
+        # Which hosts' failures count alone, and where a gate runs again: the private overlay's.
+        overlay = self.root / "overlay"
+        overlay.mkdir()
+        (overlay / "hosts.toml").write_text(FLEET_LISTS, newline="\n")
+        self.env["NRESE_BENCH_PRIVATE"] = overlay.as_posix()
 
     def reset(self):
         for path in self.fake.iterdir():
@@ -636,15 +648,15 @@ esac
             ("done", {"steps": failing}, 75),
             # Another job's, another host's, an earlier attempt's record; no summary.
             ("done", {"job": "gate-0"}, 75),
-            ("done", {"fleet_host": "phuoc-yu"}, 75),
+            ("done", {"fleet_host": "timed-host"}, 75),
             ("done", {"attempt": "gate-1:0"}, 75),
             ("done", {"summary": False}, 75),
         ]
         for state, result, want in cases:
             self.reset()
-            self.job(1, "office-pc", state, **result)
+            self.job(1, "shared-host", state, **result)
             code, where, _, err = self.gate()
-            self.assertEqual((code, where), (want, "fleet:gate-1@office-pc cpu=znver3" if want == 0 else ""),
+            self.assertEqual((code, where), (want, "fleet:gate-1@shared-host cpu=znver3" if want == 0 else ""),
                              f"SPEC whole-record: {state} {result}\n{err}")
 
     def test_a_job_compiles_and_tests_on_the_cores_it_asks_for(self):
@@ -724,33 +736,33 @@ esac
     def test_a_failure_on_an_unconfirmed_host_counts_only_when_another_host_fails_too(self):
         cases = [  # first host, its code, the re-run's code -> exit, recorded pass, jobs submitted
             # The pass names the run it re-checked (durable provenance).
-            ("khaleesi-wsl", 1, 0, 0,
-             "fleet:gate-2@office-pc cpu=znver3 re-checking fleet:gate-1@khaleesi-wsl (failed there)", 2),
-            ("khaleesi-wsl", 1, 1, 1, "", 2),
-            ("office-pc", 1, None, 1, "", 1),
+            ("dev-host-wsl", 1, 0, 0,
+             "fleet:gate-2@shared-host cpu=znver3 re-checking fleet:gate-1@dev-host-wsl (failed there)", 2),
+            ("dev-host-wsl", 1, 1, 1, "", 2),
+            ("shared-host", 1, None, 1, "", 1),
         ]
         failing = {"code": 1, "steps": [{"name": "test", "code": 1, "seconds": 1}]}
         for first, code, again, want, recorded, submitted in cases:
             self.reset()
             self.job(1, first, "failed", **failing)
             if again is not None:
-                self.job(2, "office-pc", "done" if again == 0 else "failed", **({} if again == 0 else failing))
+                self.job(2, "shared-host", "done" if again == 0 else "failed", **({} if again == 0 else failing))
             got, where, n, err = self.gate()
             self.assertEqual((got, where, n), (want, recorded, submitted), f"SPEC unconfirmed: {first} {again}\n{err}")
             if again is not None:
                 self.assertIn(f"unconfirmed ({first})", err)
-                self.assertIn('hosts = ["office-pc", "phuoc-yu", "gamergrill"]', (self.fake / "job-2.toml").read_text())
+                self.assertIn('hosts = ["shared-host", "timed-host", "checks-host"]', (self.fake / "job-2.toml").read_text())
 
-    def test_a_windows_failure_on_khaleesi_is_checked_again_on_a_windows_host(self):
+    def test_a_windows_failure_on_an_unconfirmed_host_is_checked_again_on_a_windows_host(self):
         """The Windows part's re-check after an unconfirmed failure goes to the Windows host: a Linux host
         would never start it."""
         failing = {"code": 1, "steps": [{"name": "test", "code": 1, "seconds": 1}]}
-        self.job(1, "khaleesi", "failed", tier="windows", **failing)
-        self.job(2, "kraris-gptler", "done", tier="windows")
+        self.job(1, "dev-host", "failed", tier="windows", **failing)
+        self.job(2, "win-host", "done", tier="windows")
         got, where, n, err = self.gate("windows")
         self.assertEqual(
-            (got, where, n, 'hosts = ["kraris-gptler"]' in (self.fake / "job-2.toml").read_text()),
-            (0, "fleet:gate-2@kraris-gptler cpu=znver3 re-checking fleet:gate-1@khaleesi (failed there)", 2, True),
+            (got, where, n, 'hosts = ["win-host"]' in (self.fake / "job-2.toml").read_text()),
+            (0, "fleet:gate-2@win-host cpu=znver3 re-checking fleet:gate-1@dev-host (failed there)", 2, True),
             f"SPEC windows-unconfirmed\n{err}")
 
     def test_no_gate_under_flags_its_identity_doesnt_name(self):
@@ -760,6 +772,30 @@ esac
                                   capture_output=True, text=True, env={**self.env, "CARGO_ENCODED_RUSTFLAGS": flags})
             self.assertNotEqual(done.returncode, 0, f"SPEC encoded-flags: {done.stdout}")
             self.assertIn("CARGO_ENCODED_RUSTFLAGS", done.stderr)
+
+
+class RemoteBuildHost(unittest.TestCase):
+    """scripts/lib/remote.sh: a host the private overlay's [fleet] builds_by_fleet_only names times
+    benchmarks, so a build reaches it only as a fleet job (19 Oct 2026: hooks built on the shared
+    host during A-B-B-As). remote.sh refuses it, by its ssh alias whatever its case, before any ssh."""
+
+    def test_a_host_the_overlay_names_is_refused_before_any_ssh(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        checkout = isolation.checkout(root / "repo", "scripts/lib/remote.sh", "benches/hosts.toml",
+                                      "benches/suite/suitekit/hosts.py")
+        isolation.repo(checkout, 1)
+        (root / "overlay").mkdir()
+        (root / "overlay" / "hosts.toml").write_text('[fleet]\nbuilds_by_fleet_only = ["timed-host"]\n', newline="\n")
+        (root / "bin").mkdir()
+        (root / "bin" / "ssh").write_text(f'#!/bin/sh\ntouch "{(root / "ssh-called").as_posix()}"\nexit 255\n',
+                                          newline="\n")
+        (root / "bin" / "ssh").chmod(0o755)
+        env = isolation.inherit(*LEAKS, PATH=(root / "bin").as_posix() + os.pathsep + os.environ.get("PATH", ""),
+                                NRESE_BENCH_PRIVATE=(root / "overlay").as_posix(), NRESE_BUILD_HOST="Timed-Host")
+        done = subprocess.run([BASH, "scripts/lib/remote.sh", "run", "true"], cwd=checkout, env=env,
+                              capture_output=True, text=True, timeout=120)
+        self.assertEqual((done.returncode, (root / "ssh-called").exists()), (2, False), done.stderr)
+        self.assertIn("is a fleet host", done.stderr)
 
 
 class MeasurementRefs(Repo):
@@ -985,7 +1021,7 @@ class GateJob(Repo):
                 text=True, timeout=120,
                 env={**self.env, "FLEET_OUT": str(out), "NRESE_GATE_CACHE": str(cache), "SEEN": str(seen),
                      "HOME": str(self.root), "PATH": f"{stubs}:{os.environ['PATH']}", "NRESE_GATE_CC": linker,
-                     "FLEET_JOB": f"gate-{case}", "FLEET_STEP": "1", "FLEET_HOST": "office-pc"})
+                     "FLEET_JOB": f"gate-{case}", "FLEET_STEP": "1", "FLEET_HOST": "shared-host"})
             self.assertEqual(done.returncode, code, f"SPEC job: {sent} {linker}\n{done.stdout}{done.stderr}")
             if code:
                 self.assertFalse((out / "gate.json").exists(), linker)
@@ -994,7 +1030,7 @@ class GateJob(Repo):
             self.assertEqual({k: result[k] for k in ("tier", "tree", "code", "cpu", "tracked_changes", "job",
                                                      "fleet_host", "summary")},
                              {"tier": "push", "tree": tree, "code": 0, "cpu": "znver3", "tracked_changes": "",
-                              "job": f"gate-{case}", "fleet_host": "office-pc", "summary": True})
+                              "job": f"gate-{case}", "fleet_host": "shared-host", "summary": True})
             self.assertEqual(result["attempt"], (out / "attempt").read_text().strip())
             self.assertRegex(result["identity"],
                              r"^rustc-1\.98\.1-abcdef123456 flags=-C_target-cpu=native tools=[0-9a-f]{12}$")
@@ -1098,7 +1134,7 @@ class WindowsCheck(Repo):
         passed = self.passed()
         done = self.check(self.changed(passed, "docs/note.md"))
         self.assertEqual((done.returncode, len(self.submitted())), (0, 1), f"SPEC windows-carry\n{done.stderr}")
-        self.assertIn(f"carried from {passed} fleet:gate-1@office-pc cpu=znver3", done.stdout, "SPEC windows-carry")
+        self.assertIn(f"carried from {passed} fleet:gate-1@shared-host cpu=znver3", done.stdout, "SPEC windows-carry")
 
     def test_a_commit_that_changes_an_input_runs_again(self):
         """Rust code, any file but documentation (a crate's tests read the Dockerfile and ops/), and a
@@ -1143,7 +1179,7 @@ class WindowsCheck(Repo):
                               ' "$(git hash-object --stdin < /dev/null)" "$(gate_identity HEAD)"', "-", tip],
                              cwd=self.repo, capture_output=True, text=True, env=self.env, check=True).stdout.strip()
         common = Path(self.git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
-        (common / "nrese-gate-passed").write_text(f"{old} | {tip} fleet:gate-0@office-pc cpu=znver3\n", newline="\n")
+        (common / "nrese-gate-passed").write_text(f"{old} | {tip} fleet:gate-0@shared-host cpu=znver3\n", newline="\n")
         self.fleet("pending")
         done = self.check(tip)
         self.assertEqual((done.returncode, len(self.submitted())), (75, 1),
@@ -1327,7 +1363,7 @@ class WindowsJob(Repo):
                 [BASH, "-c", run, "-", "scripts/lib/windows-job.sh", sent], cwd=self.repo,
                 stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120,
                 env={**self.env, "PATH": stubs.as_posix() + os.pathsep + self.env["PATH"], "FLEET_OUT": str(out),
-                     "FLEET_JOB": f"win-{case}", "FLEET_STEP": "1", "FLEET_HOST": "kraris-gptler", "STUB_FAIL": fail,
+                     "FLEET_JOB": f"win-{case}", "FLEET_STEP": "1", "FLEET_HOST": "win-host", "STUB_FAIL": fail,
                      "STUB_MISSING": lacking, "STUB_INSTALLED": (self.root / f"installed-{case}").as_posix(),
                      "STUB_NO_TOOLCHAIN": proxied.as_posix(),
                      "STUB_RUSTUP_LOG": rustup.as_posix(), "STUB_RUSTUP_FAIL": rustup_fails,
@@ -1352,7 +1388,7 @@ class WindowsJob(Repo):
                 {k: result[k] for k in ("tier", "tree", "list_hash", "code", "stdin", "tracked_changes", "job",
                                         "fleet_host", "summary")},
                 {"tier": "windows", "tree": tree, "list_hash": empty, "code": code, "stdin": stdin,
-                 "tracked_changes": "", "job": f"win-{case}", "fleet_host": "kraris-gptler", "summary": True},
+                 "tracked_changes": "", "job": f"win-{case}", "fleet_host": "win-host", "summary": True},
                 f"SPEC windows-record: case {case}")
             failed = dict([fail.split(":")]) if fail else {}
             self.assertEqual([(s["name"], s["code"]) for s in result["steps"]],

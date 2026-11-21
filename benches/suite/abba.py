@@ -360,6 +360,8 @@ def jobs(family: dict, harness: str, checkout: str, host: str = "", round_: int 
            # its hold would end there and the blocks run elsewhere, without its builds.
            "step_deadline_min": rg.BUILD_MIN * len(revisions) + 120,
            "requires": requires, "inputs": source + rg.side_inputs(checkout, source[0]["source"]["rev"], revisions) + fetched}
+    # Its host's entry, from the private overlay.
+    job = rg.overlay_job(job)
     if host:
         requires["hosts"] = [host]
         job["pin_reason"] = "the family names its timing host (its floor, or a run to reproduce there)"

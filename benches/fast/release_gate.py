@@ -1061,7 +1061,8 @@ def read_floor(path: Path) -> dict | None:
     return {"source": f"{path.name}: {data.get('source', '?')}", "cases": data.get("cases", {})}
 
 
-FLOORS = ROOT / "benches" / "fast" / "noise-floor"
+# The hosts' floors: in the private overlay's noise-floor/ where one is set (our hosts'), else here.
+FLOORS = (hosts_registry.private_dir() or ROOT / "benches" / "fast") / "noise-floor"
 
 
 def quiet_verdicts(directory: Path) -> tuple[dict, list[str]]:
@@ -2823,6 +2824,13 @@ def bench_inputs(cases: list[dict]) -> list[dict]:
     return [{"name": BENCH_INPUTS_INPUT, "source": {"git": Path(repo).as_posix(), "rev": rev.stdout.strip()}}]
 
 
+def overlay_job(job: dict, overlay: dict | None = None) -> dict:
+    """A timed job reading the private overlay on its host: its hosts.toml and commit in the job's
+    environment (`overlay`, else hosts.overlay_env(); hosts.overlay_job()). Stops the writer where
+    the overlay isn't here."""
+    return hosts_registry.overlay_job(job, overlay or hosts_registry.overlay_env())
+
+
 def case_seconds(measure: dict | None, case: str) -> float | None:
     """A case's seconds a pass by the calibration, None where it has none."""
     value = (measure or {}).get(case, {}).get("seconds")
@@ -2876,6 +2884,7 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
     need = {c: whole_squares(int(e.get("blocks", blocks_per_round)), sides) for c, e in (measure or {}).items()}
     count = max([blocks_per_round, *need.values()]) if measure else blocks_per_round
     report = [[*gate_, "report", harness, f"cand={candidate}", f"base={base}", f"main={main}"], [*gate_, "clean"]]
+    overlay = hosts_registry.overlay_env()  # one overlay commit for every part
 
     def part(job_id: str, part_env: dict, planned: list[str], timed_steps: list[list[str]], ram_gb: float,
              block_cases: list[list[str]]) -> dict:
@@ -2894,14 +2903,14 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
         if fetched:
             part_env = {**part_env, "BENCH_INPUTS_REV": fetched[0]["source"]["rev"]}
         est = plan_minutes(len(revisions), sides, block_cases, measure)
-        return {"id": job_id, "group": "release", "kind": "owlrs.timed", "class": "exclusive", **data_fields,
+        return overlay_job({"id": job_id, "group": "release", "kind": "owlrs.timed", "class": "exclusive", **data_fields,
                 "priority_class": "merge-gate", "env": part_env, "stall_after_min": 90,
                 "est_min": round(est["total_min"]), "_plan": est,
                 "steps": steps,
                 # Builds ask the part's whole memory: a host too small for its blocks would end the hold
                 # after them.
                 "step_deadline_min": BUILD_MIN * len(revisions) + 120,
-                "requires": requires, "inputs": inputs + fetched}
+                "requires": requires, "inputs": inputs + fetched}, overlay)
 
     timed_steps = [[*gate_, "plan-blocks", harness]] if measure else []
     block_cases = []
@@ -3056,7 +3065,7 @@ def confirm_job(rounds: list[dict], checkout: str, measure: dict | None = None) 
            "GATE_ROUND": str(k), "GATE_PREFIX": prefix, "GATE_MIN_BLOCKS": str(n), "NRESE_QUIET_SLOT": "0",
            "GATE_PLAN": f"plan-confirm{k}.json", "GATE_MAX_GB": str(ctx.get("max_gb", 24)),
            **({"GATE_LAYOUTS": str(layouts)} if layouts > 1 else {})}
-    return {"id": name, "group": "release", "kind": "owlrs.timed", "class": "exclusive",
+    return overlay_job({"id": name, "group": "release", "kind": "owlrs.timed", "class": "exclusive",
             "priority_class": "merge-gate", "env": env,
             "est_min": round(n * (seconds / 60 + 2) + 5), "stall_after_min": 60,
             "steps": [[*gate_, "plan-cases", ",".join(cases)]]
@@ -3067,7 +3076,7 @@ def confirm_job(rounds: list[dict], checkout: str, measure: dict | None = None) 
                          "ram_gb": ctx.get("ram_gb", 24)},
             "pin_reason": "a confirmation round runs on its first round's host: its builds there, its floor, its rounds combined",
             "inputs": [{"name": "checkout", "source": {"git": checkout,
-                                                       "rev": checkout_rev(checkout, revs["cand"], harness)}}]}
+                                                       "rev": checkout_rev(checkout, revs["cand"], harness)}}]})
 
 
 def known_lines(timed: list[dict], policy: Policy) -> tuple[list[str], list[str]]:

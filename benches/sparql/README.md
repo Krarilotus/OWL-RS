@@ -50,8 +50,8 @@ system (QLever's 26 GB for queries becomes 23 GB, its 6 GB cache 5 GB; NRESE get
 The settings are environment variables of the suite's adapters (`QLEVER_INDEX_SETTINGS`,
 `QLEVER_VOCABULARY_TYPE`, `QLEVER_CACHE_MAX_SIZE`, `QLEVER_RUNTIME`,
 `VIRTUOSO_NUMBER_OF_BUFFERS`, `VIRTUOSO_MAX_DIRTY_BUFFERS`, `VIRTUOSO_THREADS_PER_QUERY`,
-`VIRTUOSO_SERVER_THREADS`, `MDB_*`, `JENA_LOADER`); each job file under [jobs/](jobs/) sets
-them, and the run's manifest records them.
+`VIRTUOSO_SERVER_THREADS`, `MDB_*`, `JENA_LOADER`); each job file (in the private overlay's
+`jobs/sparql/`) sets them, and the run's manifest records them.
 
 ## Running
 

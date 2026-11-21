@@ -5,6 +5,10 @@ protocol, and how each case came out. Raw samples stay in the run's results dire
 which git ignores (some vendors forbid publishing them); the record names it with its
 SHA-256. [../STATUS.md](../STATUS.md) is generated from these records and the registries.
 
+Public run records start after the reset: none is here yet. The records of our own hosts' runs,
+those from before the reset among them, are in the private overlay (its `runs/`, where
+`suite.py ledger` writes when `NRESE_BENCH_PRIVATE` is set), because a record names its host.
+
 ```sh
 python benches/suite/suite.py ledger benches/suite/results/<run>   # write or refresh a suite run's record
 python benches/suite/suite.py ledger --all                         # every local results directory
@@ -14,7 +18,7 @@ python benches/suite/suite.py standings --write                    # regenerate 
 
 Refreshing a record keeps the hand-written fields. A run on another host gets its record
 there; records come here by git. A kit with its own driver writes its record by hand in
-the same shape ([2026-10-11-horn-recovery.toml](2026-10-11-horn-recovery.toml) is one).
+the same shape.
 
 ## Fields
 

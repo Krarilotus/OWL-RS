@@ -111,6 +111,21 @@ def load_records(runs_dir: Path) -> list[dict]:
     return records
 
 
+def records_home(root: Path) -> Path:
+    """Where a run's record is written: the private overlay's runs/ where one is set (a record
+    names its host), else benches/runs/ (its README)."""
+    from . import hosts
+    private = hosts.private_dir()
+    return private / "runs" if private else root / "benches/runs"
+
+
+def all_records(root: Path) -> list[dict]:
+    """The records a plan reads: benches/runs/'s, and the private overlay's runs/'s where one is
+    set (our runs, those from before the reset among them). The generated pages read only the
+    first (status.py, standings.py)."""
+    return [r for d in dict.fromkeys([root / "benches/runs", records_home(root)]) for r in load_records(d)]
+
+
 def run_directories(directory: Path) -> list[Path]:
     """The results directories a record covers: the directory, or the runs in it (a batch)."""
     if (directory / "results.csv").exists():
@@ -233,5 +248,5 @@ def main(argv: list[str], root: Path) -> int:
     if not directories:
         p.error("name results directories, or --all")
     for directory in directories:
-        print(refresh(directory, root, root / "benches/runs").relative_to(root).as_posix())
+        print(refresh(directory, root, records_home(root)).as_posix())
     return 0

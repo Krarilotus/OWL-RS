@@ -7,16 +7,20 @@ adjudicated count; and the host registry (suitekit/hosts.py).
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib.util
 import io
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+
+import isolation
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -790,6 +794,54 @@ class Hosts(unittest.TestCase):
         with patch.dict("os.environ", {"NRESE_BENCH_PRIVATE": str(overlay / "missing")}), \
                 self.assertRaises(FileNotFoundError):
             hosts.load(public)
+
+
+def git(where: Path, *args: str) -> str:
+    return subprocess.run(["git", "-C", str(where), *args], capture_output=True, text=True, check=True,
+                          timeout=60).stdout.strip()
+
+
+class Overlay(unittest.TestCase):
+    """A fleet job reads the private overlay on its host (benches/hosts.toml's header; the lead's
+    decision of 21 Nov 2026: the fleet stages one git input, so the job carries the overlay's
+    hosts.toml and its commit in its environment, written on the machine that has the overlay; a
+    run's identity records which overlay it read, so compare never sets side by side runs whose
+    hosts came from two overlays)."""
+
+    def setUp(self):
+        self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.repo = self.tmp / "inputs"
+        self.head = isolation.overlay_repo(self.repo, "# the private hosts\n" + isolation.OVERLAY_HOSTS)
+        self.tree = git(self.repo, "rev-parse", "HEAD:overlay")
+
+    def test_on_its_host_a_job_reads_the_hosts_of_the_overlay_its_writer_had(self):
+        # Spec: the writer, with the overlay folder, puts its committed hosts.toml (no comment
+        # lines) and commit into the job's environment; on the host, with that environment and
+        # nothing else of the overlay, the registry registers the overlay's host.
+        overlay = hosts.overlay_env({"NRESE_BENCH_PRIVATE": str(self.repo / "overlay")})
+        job = hosts.overlay_job({"env": {"A": "1"}, "inputs": [{"name": "checkout"}]}, overlay)
+        self.assertEqual(job["inputs"], [{"name": "checkout"}], "the checkout alone, as it was")
+        self.assertEqual(job["env"], {"A": "1", "NRESE_BENCH_HOSTS": isolation.OVERLAY_HOSTS,
+                                      "NRESE_BENCH_OVERLAY_REV": self.head})
+        found = hosts.current(hosts.load(hosts.HOSTS, job["env"]), "timed-host")
+        self.assertEqual(found and found[0], "timed-host")
+        self.assertEqual(hosts.overlay_identity(job["env"]), f"rev:{self.head}")
+        with self.assertRaises(ValueError):  # one overlay at a time
+            hosts.load(hosts.HOSTS, {**job["env"], "NRESE_BENCH_PRIVATE": str(self.repo / "overlay")})
+        with self.assertRaises(SystemExit):  # no overlay on the writing machine: no job
+            hosts.overlay_env({"BENCH_INPUTS_GIT": str(self.tmp / "missing")})
+
+    def test_a_run_records_the_overlays_tree_and_two_overlays_dont_compare(self):
+        from suitekit import compare, manifest
+        with patch.dict("os.environ", {"NRESE_BENCH_PRIVATE": str(self.repo / "overlay"), "NRESE_BENCH_HOSTS": ""}):
+            recorded = manifest.machine("process").get("overlay")
+        self.assertEqual(recorded, f"tree:{self.tree}")
+        a = hosts.run_identity({"host": "h", "overlay": recorded}, "2026-11-21", {})
+        b = hosts.run_identity({"host": "h", "overlay": "another tree"}, "2026-11-21", {})
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            self.assertEqual(compare.host_check([a], [b], allow=False), 2, "refused")
+            self.assertIsNone(compare.host_check([a], [dict(a)], allow=False), "one overlay compares")
+        self.assertIn("different private overlays", said.getvalue())
 
 
 if __name__ == "__main__":

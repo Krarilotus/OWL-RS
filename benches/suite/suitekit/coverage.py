@@ -29,7 +29,7 @@ from . import driver, receipts
 from .adapters import adapter, declared_context
 from .datasets import load as load_datasets
 from .dockerfile import declared_source_commit
-from .ledger import RESET_BASE, load_records
+from .ledger import RESET_BASE, all_records
 from .manifest import git as checkout_state
 from .runtime import KINDS
 from .status import runnable, standard_tiers
@@ -486,7 +486,7 @@ def main(argv: list[str], systems: dict, workloads: dict, root: Path) -> int:
     wanted = {k: v for k, v in workloads.items() if not args.workloads or k in args.workloads.split(",")}
     try:
         owners = Owners(root, args.engine)
-        records = global_read("benches/runs", load_records, root / "benches/runs")
+        records = global_read("benches/runs", all_records, root)
         out = cells(owners, chosen, wanted, records)
     except (GlobalReadError, OSError, subprocess.SubprocessError) as error:
         print(f"refused: {error}", file=sys.stderr)

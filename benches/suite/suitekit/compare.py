@@ -531,6 +531,9 @@ def host_check(base: list[dict | None], new: list[dict | None], allow: bool) -> 
     governors = {i["governor"] for i in known if i.get("governor")}
     if len(governors) > 1:
         problems.append("the runs read different CPU governors: " + ", ".join(sorted(governors)))
+    overlays = {i.get("overlay") or "none" for i in known}
+    if len(overlays) > 1:
+        problems.append("the runs' hosts came from different private overlays (trees): " + ", ".join(sorted(overlays)))
     blocking = [p for p in problems if not p.startswith("unknown host")]
     if not problems:
         return None

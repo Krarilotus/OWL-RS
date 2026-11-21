@@ -17,7 +17,12 @@
 # (docker, java: a case's needs the driver checks), `cpus`, and `config`, the host's
 # configurations, newest first, each from `since` (local time): what changes timings (toolchain,
 # CPU governor, profiling, page-cache control). compare refuses to set runs of two configurations
-# side by side (suitekit/compare.py).
+# side by side (suitekit/compare.py), or of two overlays (a run records the overlay's tree).
+# The overlay's [fleet]: lists of host keys OWL-RS's own scripts choose among the fleet's hosts,
+# each read by the script its comment names (hosts.py fleet NAME); without the overlay, none.
+# A fleet job reads the overlay on its host from its environment: the job writers, on the machine
+# that has the overlay, put its committed hosts.toml in NRESE_BENCH_HOSTS and its commit in
+# NRESE_BENCH_OVERLAY_REV (hosts.py overlay_job), and stop where there is no overlay.
 
 [inputs]
 data = { env = "BENCH_DATA", what = "the suite's datasets (suite.py run --data)" }

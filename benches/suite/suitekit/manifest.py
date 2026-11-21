@@ -158,6 +158,11 @@ def machine(runtime: str, root: Path | None = None) -> dict:
     # (`host` is the machine's own name, which the fleet's may not be).
     if os.environ.get("FLEET_HOST"):
         out["fleet_host"] = os.environ["FLEET_HOST"]
+    # The private overlay the host's entry came from (hosts.py): part of a run's identity, so that
+    # compare never sets side by side runs whose hosts two overlays described.
+    from . import hosts
+    if overlay := hosts.overlay_identity():
+        out["overlay"] = overlay
     # What changes timings on the host, as the run found it (hosts.toml `config` records the
     # intended configuration; compare checks both).
     for key, path in (("governor", "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),

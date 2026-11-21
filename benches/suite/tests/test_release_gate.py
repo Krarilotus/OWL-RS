@@ -42,6 +42,15 @@ import fast  # noqa: E402
 import isolation  # noqa: E402
 from suitekit import gatestats  # noqa: E402
 
+OVERLAY_HEAD = ""  # the commit of this module's private bench overlay (setUpModule)
+
+
+def setUpModule():  # noqa: N802
+    """The job writers stop without the private bench overlay: this module's own."""
+    global OVERLAY_HEAD
+    OVERLAY_HEAD = isolation.writers_overlay()
+
+
 def LOCAL_TABLES(checkout, harness):  # noqa: N802
     """A fake harness (a test's "c" * 40 in "C:/repo") reads as this tree's dataset metadata."""
     return gate_module.local_tables()
@@ -119,8 +128,8 @@ def harness_commit(repo: Path, lubm_size: tuple | None = (4, 8), lubm_made_by: s
 HARNESS = "h" * 40
 REVS = {"cand": "c" * 40, "base": "b" * 40, "main": "m" * 40}
 SIDES = ("base", "main", "cand")
-MACHINE = {"host": "phuoc-yu", "cpu": "Ryzen", "governor": "performance", "fleet_host": "phuoc-yu"}
-CONTEXT = {"host": "phuoc-yu", "round": 0, "prefix": "rg-cccccccc", "max_gb": 24.0, "ram_gb": 24.0}
+MACHINE = {"host": "timed-host", "cpu": "Ryzen", "governor": "performance", "fleet_host": "timed-host"}
+CONTEXT = {"host": "timed-host", "round": 0, "prefix": "rg-cccccccc", "max_gb": 24.0, "ram_gb": 24.0}
 
 
 def remove_checkout(tree, repo=ROOT) -> subprocess.CompletedProcess:
@@ -468,7 +477,7 @@ class Rounds(unittest.TestCase):
         self.assertIn("**pending**", text)
         with patch.object(gate_module, "checkout_rev", lambda checkout, cand, harness: harness):  # no repository
             job = gate_module.confirm_job([first], "C:/repo")
-        self.assertEqual((job["id"], job["requires"]["hosts"]), ("rg-cccccccc-confirm", ["phuoc-yu"]))
+        self.assertEqual((job["id"], job["requires"]["hosts"]), ("rg-cccccccc-confirm", ["timed-host"]))
         self.assertEqual(job["steps"][0][2:], ["plan-cases", "lab-olympics"])
         self.assertEqual({s[2] for s in job["steps"][1:-2]}, {"block"})
         confirmed, text = gate_module.verdict([first, self.round_(1.08, 1)], self.W3C, self.GUARDS)
@@ -599,8 +608,11 @@ class Rounds(unittest.TestCase):
         first = self.round_(1.08)
         with patch.object(gate_module, "checkout_rev", lambda checkout, cand, harness: harness):
             job = gate_module.confirm_job([first], "C:/repo")
-            self.assertEqual((job["requires"]["hosts"], job["requires"]["roles"]), (["phuoc-yu"], ["measure", "build"]))
+            self.assertEqual((job["requires"]["hosts"], job["requires"]["roles"]), (["timed-host"], ["measure", "build"]))
             self.assertIn("first round", job["pin_reason"])
+            # Its host's floor and entry, from the private overlay, as every timed job's.
+            self.assertEqual((job["env"]["NRESE_BENCH_OVERLAY_REV"], [i["name"] for i in job["inputs"]]),
+                             (OVERLAY_HEAD, ["checkout"]))
             hostless = run_gate(passes(slower(1.08)), context={**CONTEXT, "host": ""})
             with self.assertRaises(SystemExit):
                 gate_module.confirm_job([hostless], "C:/repo")
@@ -614,9 +626,9 @@ class Rounds(unittest.TestCase):
                 p["report"]["machine"] = {**MACHINE, "fleet_host": host} if host else \
                     {k: v for k, v in MACHINE.items() if k != "fleet_host"}
             return out
-        self.assertEqual(run_gate(ran_on("phuoc-yu"))["errors"], [])
+        self.assertEqual(run_gate(ran_on("timed-host"))["errors"], [])
         moved = run_gate(ran_on("shared-a"))["errors"]
-        self.assertTrue(any("passes ran on shared-a, not on phuoc-yu" in e for e in moved), moved)
+        self.assertTrue(any("passes ran on shared-a, not on timed-host" in e for e in moved), moved)
         unsaid = run_gate(ran_on(None))["errors"]
         self.assertTrue(any("don't say which fleet host ran them" in e for e in unsaid), unsaid)
         # A report naming no host (a run outside a fleet job) holds them to none.
@@ -1952,6 +1964,25 @@ class Parts(unittest.TestCase):
         import tomllib
         self.assertEqual(tomllib.loads(gate_module.toml_job(timed))["steps"], timed["steps"])
 
+    def test_every_timed_job_reads_the_private_overlay_on_its_host(self):
+        """The lead's decision of 21 Nov 2026 (the fleet stages one git input, the checkout): a timed
+        job carries the private overlay's hosts.toml and commit in its environment, written where the
+        overlay is, and its inputs are as they were, so its checkout is exactly the harness's tree.
+        A writer without the overlay stops: its jobs would run without their hosts (no CPU pinning,
+        no cold-cache command, every configuration "-")."""
+        found = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, "lab-olympics", big_gb=None)
+        timed = [job for job in found.values() if job["kind"] == "owlrs.timed"]
+        self.assertEqual([j["id"] for j in timed], ["rg-test-timed"])
+        for job in timed:
+            self.assertEqual((job["env"]["NRESE_BENCH_HOSTS"], job["env"]["NRESE_BENCH_OVERLAY_REV"]),
+                             (isolation.OVERLAY_HOSTS, OVERLAY_HEAD), job["id"])
+            self.assertEqual([(i["name"], i["source"].get("rev")) for i in job["inputs"]], [("checkout", "c" * 40)],
+                             "the harness's commit, alone: no input of the overlay's")
+        with patch.dict(os.environ, {"NRESE_BENCH_PRIVATE": "", "BENCH_INPUTS_GIT": str(ROOT / "no-such-inputs")}), \
+                self.assertRaises(SystemExit) as stopped:
+            gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, "lab-olympics")
+        self.assertIn("private bench overlay", str(stopped.exception))
+
     def test_the_big_cases_run_on_a_linux_host_never_native_windows(self):
         """Round 8: the big job went to the development machine, native Windows, with the build's ELF binaries. It
         asks for Linux and the memory of its cases, and builds its own binaries there."""
@@ -2655,7 +2686,7 @@ class Instances(unittest.TestCase):
         summary = gate_module.gate(aa, {s: REVS["base"] for s in ("cand", "base", "main")}, "cand",
                                    ["base", "main"], HARNESS, context=CONTEXT)
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "phuoc-yu.toml"
+            path = Path(tmp) / "timed-host.toml"
             path.write_text(gate_module.write_floor(gate_module.noise_floor(summary), "aa-test"), encoding="utf-8")
             floor = gate_module.read_floor(path)
         self.assertGreater(floor["cases"]["lab-olympics"]["time/q06"], 0.03)

@@ -31,11 +31,12 @@
 # check by hand that names no ref.
 #
 # A failure on a host whose failures don't count alone (NRESE_GATE_UNCONFIRMED_HOSTS, default
-# the development machine and its WSL VM: its RAM never formally verified) is reported
-# as unconfirmed and the gate runs again on another host (NRESE_GATE_CONFIRM_HOSTS, default
-# the shared host, the timed host, the checks host; for windows the Windows host). The tree fails only if that run
-# fails too; if it passes, the pass counts and both jobs are named as a possible fault of the
-# first host.
+# the private overlay's [fleet] gate_unconfirmed: the development machine and its WSL VM, its RAM
+# never formally verified) is reported as unconfirmed and the gate runs again on another host
+# (NRESE_GATE_CONFIRM_HOSTS, default its gate_confirm, for windows gate_confirm_windows;
+# benches/suite/suitekit/hosts.py fleet). The tree fails only if that run fails too; if it
+# passes, the pass counts and both jobs are named as a possible fault of the first host. Without
+# the overlay every failure counts.
 #
 # Exit: 0 passed (WHERE then names the job, its host and the CPU), 1 failed (its log is shown),
 # 75 no verdict: no FLEET_OWNER, the fleet refused or didn't answer, no host started it within
@@ -55,7 +56,9 @@ fleet_label="fleet gate"
 . scripts/lib/fleet-job.sh
 start_s=${NRESE_GATE_START_S:-180}
 max_s=${NRESE_GATE_MAX_S:-10800}
-unconfirmed=" ${NRESE_GATE_UNCONFIRMED_HOSTS:-khaleesi khaleesi-wsl} "
+# fleet_hosts NAME: the overlay's [fleet] list NAME, space-separated (none without the overlay).
+fleet_hosts() { python benches/suite/suitekit/hosts.py fleet "$1"; }
+unconfirmed=" ${NRESE_GATE_UNCONFIRMED_HOSTS:-$(fleet_hosts gate_unconfirmed)} "
 no_verdict() {
   fleet_say "$*: no verdict, so no pass"
   fleet_cancel
@@ -73,7 +76,7 @@ fi
 
 # What a tier asks for (cores also bound its compilers; the step's slice caps its memory on
 # Linux, scripts/cargo-guarded.sh's job object on Windows).
-os=linux kind=owlrs.gate confirm="office-pc phuoc-yu gamergrill"
+os=linux kind=owlrs.gate confirm=$(fleet_hosts gate_confirm)
 reason="the $mode gate of a pushed commit (scripts/check.sh); no push without it"
 deadline=""
 case $mode in
@@ -90,7 +93,7 @@ case $mode in
     # was free.
     # est: the slowest whole 4-core run, 1,547 s, x 1.5 (others took 1,011-1,073 s).
     cores=${NRESE_GATE_CORES:-4} ram=${NRESE_GATE_RAM_GB:-9} est=${NRESE_GATE_EST_MIN:-39}
-    os=windows kind=owlrs.any confirm=kraris-gptler start_s=${NRESE_GATE_START_S:-1800}
+    os=windows kind=owlrs.any confirm=$(fleet_hosts gate_confirm_windows) start_s=${NRESE_GATE_START_S:-1800}
     # What the tier uses there, in the fleet config's names: `rust`, rustup with its MSVC toolchain
     # and linker (scripts/lib/windows-job.sh installs the tree's pinned release). The rest comes with
     # every Windows host of the fleet, unnamed: Git Bash, a stdlib `python` on PATH (the cache's

@@ -2,7 +2,8 @@
 from a private overlay, the hosts themselves and the verified inputs on those that hold them.
 
     load()               benches/hosts.toml, with the overlay's hosts.toml merged over it when
-                         NRESE_BENCH_PRIVATE names an overlay folder
+                         NRESE_BENCH_PRIVATE names an overlay folder, or a fleet job's
+                         NRESE_BENCH_HOSTS holds its text
     current()            the host this process runs on: (key, entry), or None
     input_path(kind)     an input's path here: its environment variable, else hosts.toml
     lacking(needs)       what of `needs` this registered host doesn't have (an unregistered
@@ -12,18 +13,95 @@ from a private overlay, the hosts themselves and the verified inputs on those th
                          preserved alias on a host whose Docker has only that
     configuration(key)   a host's configuration in force at a time (hosts.toml `config`)
     run_identity(...)    a run's host, configuration and measured governor, for compare
+    private_dir()        the overlay's folder, or None
+    overlay_identity()   which overlay this process reads (its commit or tree), or None
+    overlay_job(job, o)  a fleet job that reads the overlay `o` (overlay_env()) on its host
+    fleet(name)          a list of host keys the overlay's [fleet] table gives OWL-RS's scripts
+
+    python benches/suite/suitekit/hosts.py fleet NAME   that list, space-separated (shell scripts)
 """
 from __future__ import annotations
 
 import os
 import socket
+import subprocess
 import tomllib
 from pathlib import Path
 
 HOSTS = Path(__file__).resolve().parents[2] / "hosts.toml"
+ROOT = HOSTS.parents[1]
 # The private overlay's folder: its hosts.toml adds the hosts, [assets] and the inputs' paths.
 # Unset, no host is registered, as for an unregistered host.
 PRIVATE = "NRESE_BENCH_PRIVATE"
+# A fleet job's overlay, from the machine that writes the job (overlay_env()): the overlay's
+# hosts.toml as text, and the commit of the private bench inputs repository it was taken from,
+# for a run's identity. The fleet stages one git input, the job's checkout, so the overlay
+# travels in the job's environment. Set together with NRESE_BENCH_PRIVATE, it is an error.
+HOSTS_TEXT, OVERLAY_REV = "NRESE_BENCH_HOSTS", "NRESE_BENCH_OVERLAY_REV"
+
+
+def git(where: Path, *args: str) -> str | None:
+    try:
+        done = subprocess.run(["git", "-C", str(where), *args], capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return done.stdout.strip() if done.returncode == 0 else None
+
+
+def private_dir(environ: dict | None = None) -> Path | None:
+    """The overlay folder NRESE_BENCH_PRIVATE names, None when unset."""
+    environ = os.environ if environ is None else environ
+    return Path(environ[PRIVATE]) if environ.get(PRIVATE) else None
+
+
+def overlay_identity(environ: dict | None = None) -> str | None:
+    """Which overlay this process reads, None without one: in a fleet job the commit its hosts.toml
+    was taken from (`rev:SHA`); from a folder, the folder's git tree (`tree:SHA`, with "+changes"
+    where the folder differs from its commit), "unknown" where git doesn't say."""
+    environ = os.environ if environ is None else environ
+    if environ.get(HOSTS_TEXT):
+        return "rev:" + (environ.get(OVERLAY_REV) or "unknown")
+    folder = private_dir(environ)
+    if folder is None:
+        return None
+    tree = git(folder, "rev-parse", "HEAD:./")
+    if tree is None:
+        return "unknown"
+    return "tree:" + tree + ("+changes" if git(folder, "status", "--porcelain", "--", ".") else "")
+
+
+def overlay_env(environ: dict | None = None) -> dict[str, str]:
+    """What a fleet job carries of the private overlay, made on the machine that writes the job:
+    the overlay's hosts.toml as committed (its comment lines left out, its tables as they are),
+    and that commit: of the checkout NRESE_BENCH_PRIVATE's folder is in, else of the private bench
+    inputs repository (benches/hosts.toml [sources] bench-inputs: its variable). So a change to
+    the overlay reaches a job once committed. Stops the writer where there is none, or its HEAD has
+    no hosts.toml there: the job would run without its hosts."""
+    environ = os.environ if environ is None else environ
+    source = load(environ=environ).get("sources", {}).get("bench-inputs", {})
+    named = environ.get(source.get("env") or "BENCH_INPUTS_GIT") or source.get("git")
+    folder = private_dir(environ)
+    repo, at = (folder, "HEAD:./hosts.toml") if folder else (
+        Path(os.path.expanduser(named)) if named else None, "HEAD:overlay/hosts.toml")
+    found = repo is not None and repo.is_dir()
+    rev = git(repo, "rev-parse", "--verify", "HEAD^{commit}") if found else None
+    text = git(repo, "show", at) if rev else None
+    if not text:
+        raise SystemExit(f"the private bench overlay isn't here ({repo or 'no repository named'}, or its HEAD has "
+                         f"no overlay/hosts.toml): a fleet job would run without its hosts. Set {PRIVATE} to the "
+                         f"overlay/ folder of a checkout of the private bench inputs repository, or "
+                         f"{source.get('env') or 'BENCH_INPUTS_GIT'} to that repository")
+    kept = "\n".join(line for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")) + "\n"
+    if tomllib.loads(kept) != tomllib.loads(text):
+        raise SystemExit(f"the overlay's hosts.toml at {rev[:12]} reads otherwise without its comment lines")
+    return {HOSTS_TEXT: kept, OVERLAY_REV: rev}
+
+
+def overlay_job(job: dict, overlay: dict[str, str]) -> dict:
+    """`job` reading the private overlay on its host: `overlay` (overlay_env()) in its environment.
+    Its inputs, and so its checkout's tree, are as they were."""
+    return {**job, "env": {**job.get("env", {}), **overlay}}
 
 
 def merged(public: dict, overlay: dict) -> dict:
@@ -39,11 +117,15 @@ def load(path: Path = HOSTS, environ: dict | None = None) -> dict:
     environ = os.environ if environ is None else environ
     with open(path, "rb") as f:
         registry = tomllib.load(f)
-    if not environ.get(PRIVATE):
+    folder, text = private_dir(environ), environ.get(HOSTS_TEXT)
+    if folder and text:
+        raise ValueError(f"both {PRIVATE} and {HOSTS_TEXT} are set: one overlay at a time")
+    if text:
+        return merged(registry, tomllib.loads(text))
+    if folder is None:
         return registry
-    overlay = Path(environ[PRIVATE]) / "hosts.toml"
     try:
-        with open(overlay, "rb") as f:
+        with open(folder / "hosts.toml", "rb") as f:
             return merged(registry, tomllib.load(f))
     except FileNotFoundError:
         raise FileNotFoundError(f"{PRIVATE} names {environ[PRIVATE]}, which has no hosts.toml") from None
@@ -147,4 +229,19 @@ def run_identity(machine: dict, started: str, registry: dict | None = None) -> d
     found = current(registry, name)
     key = found[0] if found else name
     config = configuration(key, started, registry) if found else None
-    return {"host": key, "config": config["since"] if config else "-", "governor": machine.get("governor")}
+    # The overlay its host's entry came from (manifest.machine()), where one was read.
+    overlay = {"overlay": machine["overlay"]} if machine.get("overlay") else {}
+    return {"host": key, "config": config["since"] if config else "-", "governor": machine.get("governor"), **overlay}
+
+
+def fleet(name: str, registry: dict | None = None) -> list[str]:
+    """The overlay's [fleet] list `name` (host keys), empty without one."""
+    registry = load() if registry is None else registry
+    return [str(h) for h in registry.get("fleet", {}).get(name, [])]
+
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) != 3 or sys.argv[1] != "fleet":
+        sys.exit("usage: hosts.py fleet NAME")
+    print(" ".join(fleet(sys.argv[2])))

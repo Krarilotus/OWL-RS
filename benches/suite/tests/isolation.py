@@ -130,6 +130,41 @@ def repo(path: Path, commits: int) -> list[str]:
     return git("rev-list", "--reverse", "HEAD").split()
 
 
+#: A private overlay's hosts.toml for a test: one host, neutral names.
+OVERLAY_HOSTS = '[host.timed-host]\nhostname = "timed-host"\nhas = []\nassets = false\n'
+
+
+def overlay_repo(path: Path, hosts: str = OVERLAY_HOSTS) -> str:
+    """A private bench inputs repository of the test's own at `path`: one commit holding
+    overlay/hosts.toml (`hosts`); its id."""
+    (path / "overlay").mkdir(parents=True, exist_ok=True)
+    (path / "overlay" / "hosts.toml").write_text(hosts, encoding="utf-8", newline="\n")
+    return repo(path, 1)[0]
+
+
+def writers_overlay() -> str:
+    """For a test module whose tests write fleet jobs, from its setUpModule: the job writers stop
+    without the private bench overlay (suitekit/hosts.py overlay_env), so a repository of the
+    module's own holds one, its overlay/ named by NRESE_BENCH_PRIVATE until the module's tests end
+    (BENCH_INPUTS_GIT unset); its commit. Set and restored here, not by a started mock patch: a
+    test's patch.stopall would stop that one too."""
+    path = Path(tempfile.mkdtemp(prefix="overlay-", dir=OWN))
+    head = overlay_repo(path)
+    names = ("NRESE_BENCH_PRIVATE", "BENCH_INPUTS_GIT", "NRESE_BENCH_HOSTS")
+    before = {name: os.environ.get(name) for name in names}
+    os.environ.update({"NRESE_BENCH_PRIVATE": (path / "overlay").as_posix(), "BENCH_INPUTS_GIT": "",
+                       "NRESE_BENCH_HOSTS": ""})
+
+    def restore() -> None:
+        for name, value in before.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    unittest.addModuleCleanup(restore)
+    return head
+
+
 if __name__ == "__main__":
     sys.modules["isolation"] = sys.modules["__main__"]  # one isolation, however a test imports it
 OWN = isolate()

@@ -251,8 +251,11 @@ each file checked against its pin (`sha256`, or `rdfc_sha256` for a file whose m
 blank nodes afresh) before it is kept, and asks for what its makers need (`docker`); only a file
 no maker here makes still needs the verified bench assets (`has = ["owlrs-bench-assets"]`). Answers come before time: compete captures
 every answer, a timed `suite.py run` must ask for them (`--answers full`).
-The kits' `jobs/*.toml` were written for the measurement queue that came before the fleet (kept
-in the private overlay); they aren't used any more.
+The kits' job files were written for the measurement queue that came before the fleet; they
+aren't used any more, and are in the private overlay (its `jobs/KIT/`). So are our hosts' run
+records from before the reset (`runs/`), their fast baselines (`baselines/fast/`) and the A-A'
+noise floors (`noise-floor/`): with `NRESE_BENCH_PRIVATE` set, the suite reads and writes them
+there.
 
 ## A run, step by step
 
@@ -266,8 +269,9 @@ run        suite/batch.sh NAME -- ARGS [-- ARGS]  from a worktree of HEAD; write
                                                   logs/         per pair and repetition
 check      suite.py report suite/results/NAME   tables (restricted systems left out)
            suite.py compare BASE NEW            regressions and changed answers against a baseline run
-record     suite.py ledger suite/results/NAME   writes runs/NAME.toml; then fill in purpose, cases, findings
-           suite.py status --write              regenerates STATUS.md
+record     suite.py ledger suite/results/NAME   writes runs/NAME.toml (the overlay's runs/ when set); then fill in
+                                                purpose, cases, findings
+           suite.py status --write              regenerates STATUS.md (from runs/ here)
 commit     runs/NAME.toml and STATUS.md         never the raw results
 clean      batch.sh: containers, stores, scratch go; datasets stay until the results are concluded
 ```

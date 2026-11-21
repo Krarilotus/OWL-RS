@@ -16,6 +16,17 @@ import suite
 import isolation
 
 A = "a" * 40
+# One record in which each system these tests plan ran ok once, on a workload they don't plan.
+RECORDS = [{"id": "2026-11-20-adapters", "started": "2026-11-20T10:00", "commit": "f" * 40,
+            "pairs": [{"workload": "basics-mix", "tier": "olympics", "system": s, "outcome": "ok"}
+                      for s in ("qlever", "jena", "oxigraph")]}]
+OVERLAY_HEAD = ""  # the commit of this module's private bench overlay (setUpModule)
+
+
+def setUpModule():  # noqa: N802
+    """The job writers stop without the private bench overlay: this module's own."""
+    global OVERLAY_HEAD
+    OVERLAY_HEAD = isolation.writers_overlay()
 
 
 class FleetCells(unittest.TestCase):
@@ -32,6 +43,10 @@ class FleetCells(unittest.TestCase):
         patch.object(abba.rg, "fleet_call", side_effect=self.fleet).start()
         # The harness A is this tree: its data step's makers are this catalogue's.
         patch.object(abba.rg, "harness_tables", side_effect=lambda *_: abba.rg.local_tables()).start()
+        # The run records the plan reads (adapter evidence: a system with an ok pair), its own: the
+        # repository's moved to the private overlay.
+        from suitekit import ledger
+        patch.object(ledger, "all_records", return_value=RECORDS).start()
 
     def asks(self, job, memory=28):
         """What a cell's job must ask (fleet Spec 9; #132 B2): its slice's own work (fleet_cells.SLICE_GB, measured)
@@ -140,6 +155,18 @@ class FleetCells(unittest.TestCase):
         self.assertEqual(payload["nrese"], A)
         self.assertEqual(payload["harness"], A)
         self.assertEqual(payload["group"]["references"], ["jena", "oxigraph"])
+
+    def test_each_cell_reads_the_private_overlay_whose_tree_is_in_its_identity(self):
+        # The lead's decision of 21 Nov 2026: a cell's host entry comes from the private overlay,
+        # whose hosts.toml and commit the job carries in its environment; that commit is part of the
+        # cell's identity, so another overlay is another cell.
+        code, text = self.run_plan("--budget-hours", "50", "--plan")
+        self.assertEqual(code, 0, text)
+        job = self.document()["job"][0]
+        self.assertEqual((job["env"]["NRESE_BENCH_HOSTS"], job["env"]["NRESE_BENCH_OVERLAY_REV"]),
+                         (isolation.OVERLAY_HOSTS, OVERLAY_HEAD))
+        self.assertNotIn("BENCH_INPUTS", [i["name"] for i in job["inputs"]])
+        self.assertEqual(json.loads(job["env"]["SUITE_CELL"])["identity"].get("overlay"), OVERLAY_HEAD)
 
     def test_check_refusal_cannot_submit(self):
         # Spec point 3: fleet's refusal is final; --submit must not bypass it.

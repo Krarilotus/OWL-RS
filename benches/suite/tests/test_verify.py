@@ -580,5 +580,23 @@ class Refusals(unittest.TestCase):
                 scenario.from_dict({"step": [case]}, "case")
 
 
+class Jobs(unittest.TestCase):
+    """verify.py jobs (verifykit/jobs.py): the build and the run go to the checks host the private
+    overlay's [fleet] verify names, never a timed host; without the overlay none is written."""
+
+    def test_both_jobs_go_to_the_overlays_checks_host_and_none_without_it(self):
+        from unittest.mock import patch
+        from verifykit import jobs
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        isolation.repo(root / "repo", 1)
+        (root / "overlay").mkdir()
+        (root / "overlay" / "hosts.toml").write_text('[fleet]\nverify = ["checks-host"]\n', encoding="utf-8")
+        with patch.dict(os.environ, {"NRESE_BENCH_PRIVATE": str(root / "overlay")}):
+            found = jobs.jobs(root / "repo", "HEAD", "HEAD", [], [], 500, "test")
+        self.assertEqual([j["requires"]["hosts"] for j in found.values()], [["checks-host"]] * 2)
+        with patch.dict(os.environ, {"NRESE_BENCH_PRIVATE": ""}), self.assertRaises(SystemExit):
+            jobs.jobs(root / "repo", "HEAD", "HEAD", [], [], 500, "test")
+
+
 if __name__ == "__main__":
     unittest.main()

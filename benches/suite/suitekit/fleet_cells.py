@@ -13,7 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import abba
-from . import adapters, cases, driver, ledger, manifest, schema, status, workloads as definitions
+from . import adapters, cases, driver, hosts, ledger, manifest, schema, status, workloads as definitions
 from .runtime import Mount
 
 
@@ -64,7 +64,7 @@ def eligible(root, key, system, workload, plan, settings, passed):
 
 def select(root, systems, workloads, args):
     catalog = cases.load()
-    records = ledger.load_records(root / "benches/runs")
+    records = ledger.all_records(root)
     passed = {p["system"] for r in records for p in r.get("pairs", []) if p.get("outcome") == "ok"}
     indexed = status.newest(records)
     settings = {"SPARQL_DATA": str(abba.rg.sparql_data())}
@@ -126,6 +126,11 @@ def select(root, systems, workloads, args):
 
 def jobs(groups, args):
     members = []
+    if not groups:
+        return members
+    # Each cell's host entry, from the private overlay: one commit for the whole set, part of each
+    # cell's identity.
+    overlay = hosts.overlay_env()
     for group in groups:
         case = group["case"]
         key = group["systems"][0]
@@ -154,7 +159,8 @@ def jobs(groups, args):
         needs = {**needs, "ram_gb": asked["ram_gb"],
                  "cores": max([needs["cores"]] + [c["cpus"] for c in containers if "cpus" in c])}
         identity = {"cell": [case["workload"], case["tier"], key], "nrese": args.nrese, "harness_tree": args.harness_tree,
-                    "inputs": group["input_hashes"], "scenario": {"name": "native", "memory_gb": cap, "references": group["references"]}}
+                    "inputs": group["input_hashes"], "scenario": {"name": "native", "memory_gb": cap, "references": group["references"]},
+                    "overlay": overlay[hosts.OVERLAY_REV]}
         token = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
         member = f"suite-cell-{case['name']}-{key}-{token[:16]}"
         adapter_needs = ["docker"] if "docker" in adapters.adapter(key).runtimes else []
@@ -163,7 +169,7 @@ def jobs(groups, args):
         print(f"{key} / {case['workload']} / {case['tier']}: resource basis {basis}; ask {needs}; adapter needs {adapter_needs}; workload/driver needs {workload_needs}")
         payload = {"identity": identity, "group": group, "nrese": args.nrese, "harness": args.harness, "member": member,
                    "result_root": args.result_root, "deadline_min": group["minutes"] * args.deadline_factor}
-        members.append({"spec": 9, "containers": containers, "id": member, "group": "suite-cells", "kind": "owlrs.timed", "class": "exclusive",
+        members.append(hosts.overlay_job({"spec": 9, "containers": containers, "id": member, "group": "suite-cells", "kind": "owlrs.timed", "class": "exclusive",
                         "purpose": "timing", "priority": 600, "priority_reason": "catalogue cells below confirmation and merge gates",
                         "notify": False, "hold_between_steps": True, "est_min": group["minutes"],
                         "step_deadline_min": payload["deadline_min"], "results_at": f"{args.result_root}/{member}",
@@ -175,7 +181,7 @@ def jobs(groups, args):
                                 "NRESE_SUITE_MEMORY_GB": f"{cap:g}", **data_env,
                                 "NRESE_GATE_DIR": f"~/owlrs/{member}", "GATE_NAME": member, "GATE_CASES": case["name"]},
                         "inputs": [{"name": "checkout", "source": {"git": str(args.checkout), "rev": args.harness}}]
-                                  + abba.rg.side_inputs(str(args.checkout), args.harness, [args.nrese])})
+                                  + abba.rg.side_inputs(str(args.checkout), args.harness, [args.nrese])}, overlay))
     return members
 
 

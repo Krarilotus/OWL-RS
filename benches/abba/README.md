@@ -110,7 +110,7 @@ The harness answers it in two ways:
 - **The A-A' arm** (A' is A's build again, a copy of its own, interleaved in every block) measures
   the round's own floor. A round whose A-A' arm itself differs has no verdict (3). B against A is
   judged with a spread of at least that arm's, or the host's recorded floor
-  (`benches/fast/noise-floor/HOST.toml`) where larger.
+  (`noise-floor/HOST.toml`, in the private overlay) where larger.
 
 Before you chase a small loss in a path the change doesn't touch:
 - read its history across rounds;

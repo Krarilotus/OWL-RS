@@ -75,7 +75,10 @@ VOLUME_SCRATCH = f"/fast/scratch/{ns.name('scratch', ROOT)}"
 # The host lock under which shared fast data is made (generated or concatenated): one job at a time.
 FAST_LOCK = ns.lock_dir() / "fast-data.lock"
 SCRATCH = ROOT / "tmp" / "fast"
-BASELINES = Path(os.environ.get("NRESE_FAST_BASELINES") or ROOT / "benches" / "baselines" / "fast")
+# The compact records: in the private overlay's baselines/fast where one is set (our hosts' times),
+# else in this tree's.
+BASELINES = Path(os.environ.get("NRESE_FAST_BASELINES")
+                 or (hosts.private_dir() or ROOT / "benches") / "baselines" / "fast")
 # The full reports, outside git (the same path on the development machine and the shared host).
 REPORTS = Path(os.environ.get("NRESE_BENCH_REPORTS") or Path.home() / "nrese-bench" / "reports") / "fast"
 CASE_TIMEOUT_S = 900
