@@ -215,14 +215,12 @@ fn empty_store_publishes_datatype_axioms() {
 }
 
 #[test]
-#[ignore = "an accepting cycle starting at rdf:nil needs the per-cell form"]
 fn nil_head_starts_an_explicit_walk() {
     // Spec: Table 3 matches the head again, so prp-spo2 gives both p,q and p,q,p,q.
     check_nil_walk("nil-head");
 }
 
 #[test]
-#[ignore = "an accepting cycle through rdf:nil needs the per-cell form"]
 fn nil_cell_continues_an_explicit_walk() {
     // Spec: Table 3 matches the interior cell again, so prp-spo2 gives both p,q and p,q,q.
     check_nil_walk("nil-cell");
@@ -636,7 +634,6 @@ fn accepting_walk_requires_a_first_at_every_cell() {
 }
 
 #[test]
-#[ignore = "documented limit reasoning-semantics.md:63-65: asserting an entailed shortcut changes the first load's chain answer"]
 fn redundant_list_premise_leaves_chain_unchanged() {
     // Spec: Table 9 scm-spo and Table 5 prp-spo1 and prp-spo2 give the same
     // chain row with or without the entailed subproperty.
@@ -648,7 +645,6 @@ fn redundant_list_premise_leaves_chain_unchanged() {
 }
 
 #[test]
-#[ignore = "documented limit reasoning-semantics.md:68: a back edge hides an accepting list walk until the chain is rebuilt correctly"]
 fn cycle_keeps_its_exiting_walk() {
     // Spec: Table 3 and Table 5 prp-spo2 give a chain consequence while the
     // exiting walk and both data edges exist, including with a back edge.
@@ -700,7 +696,6 @@ fn schema_operand_delete_retracts_chain_row() {
 }
 
 #[test]
-#[ignore = "undocumented: the diagonal is missed in an owl:sameAs chain operand"]
 fn same_as_operand_makes_a_disjoint_chain_inconsistent() {
     // Spec: Table 4 eq-ref and Table 5 prp-spo2 copy ex:p through the chain;
     // Table 5 prp-pdw rejects the copied row because the properties are disjoint.
@@ -728,7 +723,6 @@ fn same_as_operand_makes_a_disjoint_chain_inconsistent() {
 }
 
 #[test]
-#[ignore = "documented limit reasoning-semantics.md:63-65: a 251-cell property chain loses its endpoint row"]
 fn long_property_chain_reaches_its_endpoint() {
     // Spec: Table 3 and Table 5 prp-spo2 derive the row for a 251-member walk.
     check(generator::long_chain(251), &[true, true], &[false, true]);
