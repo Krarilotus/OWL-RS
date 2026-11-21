@@ -314,33 +314,42 @@ pub(crate) fn plan_status(
     Ok(composed(store, prepared, snapshot, &decided, completeness))
 }
 
-/// The status when the DL bounds view isn't used ([`PART`], [`LATER`], [`DEADLINE`]): `why`;
-/// for a reader of every graph that doesn't read the store's closure ([`reads_store_closure`]),
-/// its cause without "answers over the RL closure", and that its dataset leaves the closure
-/// out. A reader of some graphs keeps [`PART`] alone: it never reads the bounds, and under
-/// `owl2-dl` it is told `not-certified` whatever the reason (`status_for_its_reader` in
-/// `service.rs`), so no reason here reaches it.
+/// The status when the DL bounds view isn't used ([`PART`], [`LATER`], [`DEADLINE`]): `why`,
+/// its cause without "answers over the RL closure" unless the read surely reads the closure
+/// ([`reads_store_closure`]); for a reader of every graph that can't read it
+/// ([`may_read_store_closure`]), also that its dataset leaves the closure out. A reader of
+/// some graphs keeps [`PART`] alone: it never reads the bounds, and under `owl2-dl` it is
+/// told `not-certified` whatever the reason (`status_for_its_reader` in `service.rs`), so no
+/// reason here reaches it.
 fn fallback(prepared: &PreparedQuery, why: &str) -> Status {
-    match prepared.dataset_omission_reason() {
-        Some(reason) if prepared.access().is_none() && !reads_store_closure(prepared) => {
-            let cause = match why.strip_suffix(OVER_THE_CLOSURE) {
-                Some(cause) => format!("{cause}{NOT_CHECKED}"),
-                None => why.to_owned(),
-            };
-            let mut status = Status::sound_only(cause);
-            status.add(reason.to_owned());
-            status
+    let mut status = match why.strip_suffix(OVER_THE_CLOSURE) {
+        Some(cause) if !reads_store_closure(prepared) => {
+            Status::sound_only(format!("{cause}{NOT_CHECKED}"))
         }
         _ => Status::sound_only(why),
+    };
+    if let Some(reason) = prepared.dataset_omission_reason()
+        && prepared.access().is_none()
+        && !may_read_store_closure(prepared)
+    {
+        status.add(reason.to_owned());
     }
+    status
 }
 
-/// Whether `prepared` reads the store's default graph, where the closure's inferred statements
-/// are: its dataset keeps it, or its query reads it by `GRAPH`
-/// ([`may_read_store_default_by_graph`]).
+/// Whether `prepared` surely reads the store's default graph, where the closure's inferred
+/// statements are: its dataset keeps it, or its query names it by `GRAPH`
+/// ([`reads_store_default_by_graph`]).
 pub(crate) fn reads_store_closure(prepared: &PreparedQuery) -> bool {
     prepared.dataset_omission_reason().is_none()
-        || may_read_store_default_by_graph(prepared.query())
+        || reads_store_default_by_graph(prepared.query(), false)
+}
+
+/// Whether `prepared` may read the store's default graph: as [`reads_store_closure`], or by
+/// a variable graph (`GRAPH ?g`), which may be bound to its name.
+fn may_read_store_closure(prepared: &PreparedQuery) -> bool {
+    prepared.dataset_omission_reason().is_none()
+        || reads_store_default_by_graph(prepared.query(), true)
 }
 
 /// The bounds' view of `snapshot` its answers and their status are decided on, or
@@ -352,7 +361,7 @@ const PART: &str = "the reader sees part of the data: answers are checked agains
                     only for readers of every graph";
 
 /// The end of [`LATER`] and [`DEADLINE`]: what a read without the bounds' view answers over,
-/// where it reads the closure ([`fallback`]).
+/// where it surely reads the closure ([`fallback`]).
 macro_rules! over_the_closure {
     () => {
         ": answers over the RL closure, not checked against the bounds"
@@ -360,7 +369,7 @@ macro_rules! over_the_closure {
 }
 const OVER_THE_CLOSURE: &str = over_the_closure!();
 
-/// [`OVER_THE_CLOSURE`] for a read that leaves the closure out.
+/// [`OVER_THE_CLOSURE`] for a read that may leave the closure out.
 const NOT_CHECKED: &str = ": not checked against the bounds";
 
 /// An older revision whose bounds a later commit replaced reads its RL closure.

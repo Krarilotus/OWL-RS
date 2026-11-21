@@ -1397,7 +1397,7 @@ impl StoreService {
         let source = if certificate.dl { "dl" } else { "transaction" };
         if let Revision::Pending(_, deletes) = at {
             // Under `owl2-dl` a pending read has no DL bounds whatever its dataset; it reads the
-            // committed closure unless it leaves the default graph out.
+            // committed closure where it surely reads the default graph.
             let closure = match (
                 certificate.dl,
                 crate::dl::query::reads_store_closure(prepared),
