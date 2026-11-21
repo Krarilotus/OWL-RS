@@ -860,14 +860,16 @@ impl Context<'_> {
     }
 }
 
-/// Per aggregate, the column [`aggregate_in_one_pass`] reads (`None`: the rows) and its
-/// function; `None` if one isn't for that pass.
+/// Per aggregate: the column it reads (`None`: the rows) and its function.
+type OnePassPlan = Vec<(Option<usize>, AggregateFunction)>;
+
+/// [`aggregate_in_one_pass`]'s plan, and whether a MIN or MAX column holds several
+/// datatypes; `None` if one aggregate isn't for that pass.
 fn one_pass_plan(
     solutions: &Solutions,
     aggregates: &[(Variable, AggregateExpression)],
-) -> Option<(Vec<(Option<usize>, AggregateFunction)>, bool)> {
-    // Per aggregate: the column it reads (`None`: the rows) and its function.
-    let mut plan: Vec<(Option<usize>, AggregateFunction)> = Vec::new();
+) -> Option<(OnePassPlan, bool)> {
+    let mut plan = OnePassPlan::new();
     let mut mixed = false;
     for (_, aggregate) in aggregates {
         match aggregate {
