@@ -77,6 +77,10 @@ if ! git -C "$wt" checkout -q -f --detach "$sha" 2> /dev/null; then
 fi
 git -C "$wt" clean -q -fd
 [ "$(git -C "$wt" rev-parse 'HEAD^{tree}')" = "$tree" ] || infra "the checkout isn't tree $tree"
+# A host's own cargo-nextest where cargo runs one first, before any on PATH, would stand in for the
+# pinned one whatever its version says: no verdict, before anything is installed.
+[ ! -e "${CARGO_HOME:-$HOME/.cargo}/bin/cargo-nextest" ] \
+  || infra "the host's own cargo-nextest in ${CARGO_HOME:-$HOME/.cargo}/bin would run in place of the pinned one: no verdict"
 files=$home/files
 if [ $# -gt 0 ]; then
   printf '%s\n' "$@" > "$files"
@@ -117,20 +121,12 @@ quiet rustup toolchain install "$channel" --no-self-update --profile minimal --c
   || infra "no toolchain $channel"
 # The gate's pinned tools (scripts/lib/gate-tools.txt); check.sh checks them again.
 pin() { sed -n "s/^$1 //p" "$tool/scripts/lib/gate-tools.txt" | tr -d '\r'; }
-# cargo-nextest: each version in a directory of its own (tools/nextest-<version>), made aside, moved
-# into place whole once it runs as that version and never changed after, first on PATH: no job
-# replaces the one another job runs.
+# cargo-nextest: the pinned build, by its archive's sha256 and its executable's (scripts/lib/gate-nextest.sh),
+# first on PATH: each version and archive in an entry of its own, made aside and moved into place whole.
 want=$(pin cargo-nextest)
-nextest=$cache/tools/nextest-$want
-nextest_version() { "$1/cargo-nextest" nextest --version 2> /dev/null | awk 'NR == 1 { print $2 }'; }
-if [ ! -d "$nextest" ]; then
-  rm -rf -- "$nextest".partial-*
-  part=$(mktemp -d "$nextest.partial-XXXXXX") || infra "no cargo-nextest $want"
-  curl -fsSL --max-time 300 "https://get.nexte.st/$want/linux" | tar -xz -C "$part"
-  [ "$(nextest_version "$part")" = "$want" ] && mv -T -- "$part" "$nextest" \
-    || { rm -rf -- "$part"; infra "no cargo-nextest $want"; }
-fi
-[ "$(nextest_version "$nextest")" = "$want" ] || infra "$nextest isn't cargo-nextest $want"
+# shellcheck source=gate-nextest.sh
+. "$tool/scripts/lib/gate-nextest.sh"
+nextest=$(gate_nextest "$cache" "$tool/scripts/lib/gate-tools.txt" linux) || infra "no cargo-nextest ${want:-pinned}"
 export PATH="$nextest:$PATH"
 nightly=$(pin miri)
 # Miri, for the push tier's nrese-exec step (scripts/miri.sh, which builds under this worktree:
