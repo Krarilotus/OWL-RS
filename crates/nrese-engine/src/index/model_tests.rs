@@ -222,14 +222,25 @@ fn assert_matches_model(version: &IndexVersion, model: &BTreeSet<EncodedQuad>, c
     );
 }
 
+fn pinned_compactions() -> bool {
+    !crate::check_tier::nightly()
+        && std::env::var_os("NRESE_FUZZ_CASES").is_none()
+        && std::env::var_os("NRESE_FUZZ_SEED").is_none()
+}
+
+/// By default, this test replays policy compactions in each layout. With `NRESE_CHECK_TIER=nightly`, it draws 40 seeds per layout.
 #[test]
 fn random_commits_with_policy_compaction_match_the_model() {
     let policy = CompactionPolicy {
         fanout: 2,
         ..CompactionPolicy::default()
     };
+    let pinned = pinned_compactions();
+    let cases = super::test_cases(10, 40) as u64;
     for layout in LAYOUTS {
-        for seed in 0..40 {
+        let mut compacted = false;
+        // Seed 0 exposes the loss of tombstones during compaction.
+        for seed in (0..cases).filter(|seed| !pinned || [0, 9].contains(seed)) {
             let mut rng = Rng(fuzz(seed));
             let mut model = BTreeSet::new();
             let mut version = IndexVersion::empty(layout);
@@ -238,6 +249,7 @@ fn random_commits_with_policy_compaction_match_the_model() {
                 if let Some(plan) = policy.plan(version.runs()) {
                     let merged = merge_runs(&version.runs()[plan.window.clone()]);
                     version = version.with_compacted(plan.window, merged);
+                    compacted = true;
                 }
                 let context = format!("{layout:?} seed {seed} step {step}");
                 assert_matches_model(&version, &model, &context);
@@ -250,13 +262,20 @@ fn random_commits_with_policy_compaction_match_the_model() {
                 );
             }
         }
+        if pinned {
+            assert!(compacted, "no compaction in {layout:?}");
+        }
     }
 }
 
+/// By default, this test replays fixed windows that touch or leave either boundary in each layout. With `NRESE_CHECK_TIER=nightly`, it draws 40 seeds per layout.
 #[test]
 fn arbitrary_compaction_windows_preserve_contents() {
+    let pinned = pinned_compactions();
+    let cases = super::test_cases(10, 40) as u64;
     for layout in LAYOUTS {
-        for seed in 100..140 {
+        let mut windows = BTreeSet::new();
+        for seed in (100..100 + cases).filter(|seed| !pinned || [100, 103, 109].contains(seed)) {
             let mut rng = Rng(fuzz(seed));
             let mut model = BTreeSet::new();
             let mut version = IndexVersion::empty(layout);
@@ -268,10 +287,14 @@ fn arbitrary_compaction_windows_preserve_contents() {
                     let end = start + 2 + rng.below(runs - start as u64 - 1) as usize;
                     let merged = merge_runs(&version.runs()[start..end]);
                     version = version.with_compacted(start..end, merged);
+                    windows.insert((start == 0, end as u64 == runs));
                 }
                 let context = format!("{layout:?} seed {seed} step {step}");
                 assert_matches_model(&version, &model, &context);
             }
+        }
+        if pinned {
+            assert_eq!(windows.len(), 4, "{layout:?}: {windows:?}");
         }
     }
 }

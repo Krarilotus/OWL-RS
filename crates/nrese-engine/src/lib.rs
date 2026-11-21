@@ -21,6 +21,9 @@
 #[global_allocator]
 static MEASURED: nrese_exec::measure::Measured<std::alloc::System> =
     nrese_exec::measure::Measured(std::alloc::System);
+#[cfg(test)]
+#[path = "../tests/it/support.rs"]
+mod check_tier;
 pub mod cpu;
 mod durability;
 pub mod engine;

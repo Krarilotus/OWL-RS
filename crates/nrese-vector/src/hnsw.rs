@@ -502,6 +502,19 @@ fn with_visited<R>(nodes: usize, f: impl FnOnce(&mut Visited<'_>) -> R) -> R {
 }
 
 #[cfg(test)]
+fn test_cases(default: usize, full: usize) -> usize {
+    let cases = if crate::tests::nightly() {
+        full
+    } else {
+        default
+    };
+    std::env::var("NRESE_FUZZ_CASES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(cases)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{exact, tests::random_vectors};
@@ -582,24 +595,26 @@ mod tests {
         found as f64 / (queries * k) as f64
     }
 
+    /// By default, this test extends 2,500 vectors to 5,000 for both metrics. With `NRESE_CHECK_TIER=nightly`, it extends 10,000 to 20,000.
     #[test]
     fn hnsw_finds_nearly_all_nearest_neighbours() {
-        let vectors = random_vectors(20_000, 16, 3);
+        let count = super::test_cases(5_000, 20_000).max(5_000);
+        let vectors = random_vectors(count, 16, 3);
         for metric in [Metric::Cosine, Metric::L2] {
             let mut graph = Hnsw::new(metric, HnswParameters::default());
             // In two parts: the second extends the graph.
             let mut first = Vectors::new(16);
-            for position in 0..10_000 {
+            for position in 0..(count / 2) as u32 {
                 first.push(vectors.id(position), vectors.get(position));
             }
             graph.extend(&first);
             graph.extend(&vectors);
-            assert_eq!(graph.len(), vectors.len());
             let all = recall(&vectors, &graph, 10, 64, &|_| true);
             assert!(all >= 0.95, "{metric:?}: recall {all}");
             // A filter that accepts half of the ids.
             let half = recall(&vectors, &graph, 10, 64, &|id| id % 2 == 0);
             assert!(half >= 0.9, "{metric:?}: recall with a filter {half}");
+            assert_eq!(graph.len(), vectors.len());
         }
     }
 
@@ -741,6 +756,7 @@ mod growth_tests {
     /// A graph's parts read back give the same answers; a copy extended with new vectors
     /// finds them, the original stays as it was; a graph over a prefix plus an exact scan
     /// of the rest answers as one graph does.
+    /// By default, this test grows a 1,000-vector prefix to 1,500. With `NRESE_CHECK_TIER=nightly`, it uses 4,000 and 6,000.
     #[test]
     fn graphs_round_trip_grow_and_cover_a_prefix() {
         // Fix insertion order as well as the level seed: parallel insertion can change
@@ -749,14 +765,17 @@ mod growth_tests {
             .num_threads(1)
             .build()
             .unwrap();
-        let all = random_vectors(6_000, 8, 11);
+        let count = super::test_cases(1_500, 6_000).max(1_500);
+        let prefix_len = count * 2 / 3;
+        let tail_query = (count * 5 / 6) as u32;
+        let all = random_vectors(count, 8, 11);
         let mut prefix = Vectors::new(8);
-        for p in 0..4_000u32 {
+        for p in 0..prefix_len as u32 {
             prefix.push(all.id(p), all.get(p));
         }
         let mut graph = Hnsw::new(Metric::L2, HnswParameters::default());
         one.install(|| graph.extend(&prefix));
-        let query = all.get(5_000).to_vec();
+        let query = all.get(tail_query).to_vec();
         let read = Hnsw::from_parts(graph.to_parts()).expect("sound parts");
         assert_eq!(
             read.search(&prefix, &query, 5, 64, &|_| true, &Budget::unlimited())
@@ -786,7 +805,7 @@ mod growth_tests {
         let merged = merge(from_graph.into_iter().chain(tail), 5, &Budget::unlimited())
             .unwrap()
             .to_vec();
-        assert_eq!(merged[0].id, all.id(5_000));
+        assert_eq!(merged[0].id, all.id(tail_query));
         // This deterministic graph plus the exact tail finds all five exact nearest
         // neighbours, in order and with the same distances.
         let truth = exact(&all, &query, 5, Metric::L2, &|_| true, &Budget::unlimited())
@@ -797,15 +816,15 @@ mod growth_tests {
         // still covers the prefix.
         let mut grown = graph.duplicate();
         one.install(|| grown.extend(&all));
-        assert_eq!(grown.len(), 6_000);
-        assert_eq!(graph.len(), 4_000);
+        assert_eq!(grown.len(), count);
+        assert_eq!(graph.len(), prefix_len);
         assert_eq!(
             grown
                 .search(&all, &query, 1, 64, &|_| true, &Budget::unlimited())
                 .unwrap()
                 .to_vec()[0]
                 .id,
-            all.id(5_000)
+            all.id(tail_query)
         );
         // Unsound parts are refused.
         let mut bad = graph.to_parts();

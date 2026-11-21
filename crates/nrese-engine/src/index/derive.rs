@@ -246,11 +246,13 @@ mod tests {
         assert_eq!(derivable(Spog, Spog), None);
     }
 
+    /// By default, this test partitions 40,000 quads across multiple chunks. With `NRESE_CHECK_TIER=nightly`, it uses 100,000.
     #[test]
     fn a_partition_equals_a_sort_for_every_derivable_pair_and_chain() {
         let mut derived_pairs = 0;
+        let cases = crate::index::test_cases(40_000, 100_000).max(40_000);
         for graphs in [1, 3, 50] {
-            let quads = quads(100_000, graphs);
+            let quads = quads(cases, graphs);
             for base in Permutation::ALL {
                 let keys = sorted(&quads, base);
                 let own = Ordered {
@@ -290,6 +292,11 @@ mod tests {
                         }
                     }
                 }
+                assert!(
+                    keys.len() > PART,
+                    "{graphs} graphs: {} distinct keys",
+                    keys.len()
+                );
             }
         }
         assert!(derived_pairs > 20, "{derived_pairs}");

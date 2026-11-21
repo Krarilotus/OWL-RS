@@ -16,7 +16,23 @@ use nrese_rdf::{Literal, NamedNode, QuadRef};
 #[global_allocator]
 static ALLOCATOR: measure::Measured<std::alloc::System> = measure::Measured(std::alloc::System);
 
+#[path = "it/support.rs"]
+mod check_tier;
+
+fn test_cases(default: usize, full: usize) -> usize {
+    let cases = if crate::check_tier::nightly() {
+        full
+    } else {
+        default
+    };
+    std::env::var("NRESE_FUZZ_CASES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(cases)
+}
+
 /// A large space is searched through its graph and finds what the exact scan finds.
+/// By default, this test uses 140 radii above the threaded build threshold. With `NRESE_CHECK_TIER=nightly`, it uses 200.
 #[test]
 fn large_spaces_are_searched_through_a_graph() {
     if !measure::alone() {
@@ -32,9 +48,9 @@ fn large_spaces_are_searched_through_a_graph() {
         ..EngineConfig::default()
     })
     .expect("engine");
-    // 72,000 points: the circle with 200 radii.
+    let points = test_cases(140, 200).max(140) * 360;
     let mut tx = engine.transaction();
-    for i in 0..72_000usize {
+    for i in 0..points {
         let angle = ((i % 360) as f32 + (i / 360) as f32 * 0.001).to_radians();
         let radius = 1.0 + (i / 360) as f32 * 0.01;
         let literal = Literal::new_typed_literal(
@@ -60,7 +76,7 @@ fn large_spaces_are_searched_through_a_graph() {
         .vector_search(&query, &|_| true, &unlimited)
         .unwrap();
     assert!(
-        report.graph && report.space == 72_000 && report.scanned == 0,
+        report.graph && report.space == points && report.scanned == 0,
         "{report:?}"
     );
     let exact = VectorQuery {

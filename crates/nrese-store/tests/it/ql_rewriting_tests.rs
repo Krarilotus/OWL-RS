@@ -16,7 +16,7 @@
 //! representatives). The store's answers must all be certain, and every query that misses
 //! one must say `sound-only` (docs/design/ql-rewriting.md §7).
 //!
-//! `NRESE_QL_CASES` sets the number of cases (default 150 per test), `NRESE_QL_SEED` the
+//! `NRESE_QL_CASES` overrides the number of cases, `NRESE_QL_SEED` the
 //! seed.
 
 use crate::support::Writes;
@@ -98,6 +98,7 @@ struct Tbox {
     /// `sub ⊑ sup`, closed under inverses.
     roles: Vec<(Role, Role)>,
     turtle: Vec<String>,
+    families: u16,
 }
 
 impl Tbox {
@@ -166,6 +167,8 @@ fn restriction(role: Role, filler: Option<usize>) -> String {
     )
 }
 
+const TBOX_FAMILIES: usize = 12;
+
 fn random_tbox(rng: &mut Rng) -> Tbox {
     let mut t = Tbox::default();
     let class = |rng: &mut Rng| rng.below(CLASSES);
@@ -176,11 +179,12 @@ fn random_tbox(rng: &mut Rng) -> Tbox {
     let axioms = 2 + rng.below(6);
     let mut generating = 0;
     for _ in 0..axioms {
-        let kind = rng.below(12);
+        let kind = rng.below(TBOX_FAMILIES);
         // At most three generating axioms keep the chase small.
         if matches!(kind, 1 | 2 | 8 | 9) && generating == 3 {
             continue;
         }
+        t.families |= 1 << kind;
         match kind {
             0 => {
                 let (a, b) = (class(rng), class(rng));
@@ -852,12 +856,30 @@ pub(crate) fn store(
     store
 }
 
-#[test]
-fn rewritten_answers_are_the_certain_answers_of_random_ql_cases() {
-    let cases: usize = std::env::var("NRESE_QL_CASES")
+fn cases() -> usize {
+    let default = if crate::support::nightly() { 150 } else { 50 };
+    std::env::var("NRESE_QL_CASES")
         .ok()
         .and_then(|n| n.parse().ok())
-        .unwrap_or(150);
+        .unwrap_or(default)
+}
+
+// Includes the three red cases (0 for printing, 1 for certain answers, 22 for EXISTS).
+fn ql_witnesses() -> Option<&'static [usize]> {
+    (!crate::support::nightly()
+        && std::env::var_os("NRESE_QL_CASES").is_none()
+        && std::env::var_os("NRESE_QL_SEED").is_none())
+    .then_some(&[
+        0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 15, 17, 19, 20, 22, 24, 26, 29, 31, 33, 41, 46,
+    ])
+}
+
+/// By default, this test compares fixed QL witnesses across both store profiles. With `NRESE_CHECK_TIER=nightly`, it draws 150 cases.
+#[test]
+fn rewritten_answers_are_the_certain_answers_of_random_ql_cases() {
+    let cases = cases();
+    let witnesses = ql_witnesses();
+    let (mut families, mut forms) = (0, BTreeSet::new());
     let dir = tempfile::tempdir().unwrap();
     let seed = std::env::var("NRESE_QL_SEED")
         .ok()
@@ -888,6 +910,9 @@ fn rewritten_answers_are_the_certain_answers_of_random_ql_cases() {
             }
         }
         let queries: Vec<Query> = (0..4).map(|_| random_query(&mut rng)).collect();
+        if witnesses.is_some_and(|examples| !examples.contains(&case)) {
+            continue;
+        }
         let kinds: HashSet<(Role, Option<usize>)> =
             tbox.generating.iter().map(|&(_, r, f)| (r, f)).collect();
         let max_vars = queries.iter().map(|q| q.vars).max().unwrap_or(1);
@@ -921,17 +946,17 @@ fn rewritten_answers_are_the_certain_answers_of_random_ql_cases() {
             realised += store_report(&with, &query.sparql(false)).map_or(0, |r| r.realised);
             let (rows, completeness) = store_answer(&with, &query.sparql(true));
             let distinct: BTreeSet<Vec<usize>> = rows.into_iter().collect();
-            // Pure QL: nothing the rewriting doesn't follow.
-            assert!(
-                completeness.complete,
-                "case {case}: {completeness:?}\n{turtle}\n{}",
-                query.sparql(true)
-            );
             assert_eq!(
                 distinct,
                 certain,
                 "case {case} ({}):\n{turtle}\n{}",
                 ruleset.name(),
+                query.sparql(true)
+            );
+            // Pure QL: nothing the rewriting doesn't follow.
+            assert!(
+                completeness.complete,
+                "case {case}: {completeness:?}\n{turtle}\n{}",
                 query.sparql(true)
             );
             // Bags: the materialised rows, and each further answer once.
@@ -963,7 +988,9 @@ fn rewritten_answers_are_the_certain_answers_of_random_ql_cases() {
             }
             gained += added;
             checked += 1;
+            forms.insert((case % 2, query.answers.is_empty()));
         }
+        families |= tbox.families;
     }
     eprintln!(
         "QL differential: {checked} queries checked, {gained} answers only through the rewriting, {realised} witnesses the data had (not folded), {skipped} cases skipped (chase too large)"
@@ -972,8 +999,19 @@ fn rewritten_answers_are_the_certain_answers_of_random_ql_cases() {
         realised > 0,
         "no witness the data had: the check went untested"
     );
-    assert!(checked >= cases * 3, "too many cases skipped: {skipped}");
+    assert!(
+        checked >= witnesses.map_or(cases, <[usize]>::len) * 3,
+        "too many cases skipped: {skipped}"
+    );
     assert!(gained > 0, "no case exercised the rewriting");
+    if witnesses.is_some() {
+        assert_eq!(families.count_ones() as usize, TBOX_FAMILIES);
+        assert_eq!(
+            forms.len(),
+            4,
+            "ASK and SELECT under both profiles: {forms:?}"
+        );
+    }
 }
 
 #[test]
@@ -2362,14 +2400,14 @@ fn rewritten_answers_follow_the_readers_graph_access() {
 /// with reasoning (`owl2-rl`, the rewriting on) does: the same rows, as bags and with
 /// DISTINCT, and the same completeness. On the pure and the mixed random cases; what the
 /// printer can't write exactly it says, and those are counted.
+/// By default, this test checks fixed pure and mixed cases in both printed forms. With `NRESE_CHECK_TIER=nightly`, it draws 150 cases.
 #[test]
 fn printed_queries_answer_on_a_store_without_reasoning_as_nrese_with_it() {
     use nrese_sparql::ql::{PrintForm, Printed};
 
-    let cases: usize = std::env::var("NRESE_QL_CASES")
-        .ok()
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(150);
+    let cases = cases();
+    let witnesses = ql_witnesses();
+    let mut families = 0u16;
     let dir = tempfile::tempdir().unwrap();
     let seed = std::env::var("NRESE_QL_SEED")
         .ok()
@@ -2404,6 +2442,9 @@ fn printed_queries_answer_on_a_store_without_reasoning_as_nrese_with_it() {
             })
             .collect();
         let queries: Vec<Query> = (0..4).map(|_| random_query(&mut rng)).collect();
+        if witnesses.is_some_and(|examples| !examples.contains(&case)) {
+            continue;
+        }
         let turtle = format!(
             "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
              @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
@@ -2465,6 +2506,7 @@ fn printed_queries_answer_on_a_store_without_reasoning_as_nrese_with_it() {
                 }
             }
         }
+        families |= tbox.families;
     }
     eprintln!(
         "QL printer: {pure} pure and {mixed_printed} mixed queries printed (both forms, \
@@ -2472,9 +2514,15 @@ fn printed_queries_answer_on_a_store_without_reasoning_as_nrese_with_it() {
          through reasoning; not expressible (queries): {refused:?}"
     );
     // Pure QL prints whole.
-    assert_eq!(pure, cases.div_ceil(2) * 4, "{refused:?}");
+    let pure_cases = witnesses.map_or(cases.div_ceil(2), |xs| {
+        xs.iter().filter(|&&case| case % 2 == 0).count()
+    });
+    assert_eq!(pure, pure_cases * 4, "{refused:?}");
     assert!(mixed_printed > 0 && sound_only > 0, "{refused:?}");
     assert!(gained > 0, "no printed query needed reasoning");
+    if witnesses.is_some() {
+        assert_eq!(families.count_ones() as usize, TBOX_FAMILIES);
+    }
 }
 
 /// A store holding `turtle` as asserted: no reasoning, no rewriting.
@@ -2569,12 +2617,12 @@ fn inclusions_through_inverse_expressions_are_materialised() {
 /// where it hasn't), by the chase. Pure QL: exactly those, complete. Mixed ontologies: an
 /// answer that isn't the chase's says `unsound`, a missing one says so too (the
 /// negation's pattern may miss what makes an answer wrong).
+/// By default, this test checks fixed pure and mixed cases for EXISTS, NOT EXISTS and MINUS. With `NRESE_CHECK_TIER=nightly`, it draws 150 cases.
 #[test]
 fn negation_and_exists_answer_as_the_chase() {
-    let cases: usize = std::env::var("NRESE_QL_CASES")
-        .ok()
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(150);
+    let cases = cases();
+    let witnesses = ql_witnesses();
+    let (mut families, mut forms) = (0, BTreeSet::new());
     let dir = tempfile::tempdir().unwrap();
     let seed = std::env::var("NRESE_QL_SEED")
         .ok()
@@ -2665,6 +2713,9 @@ fn negation_and_exists_answer_as_the_chase() {
                 (q1, q2)
             })
             .collect();
+        if witnesses.is_some_and(|examples| !examples.contains(&case)) {
+            continue;
+        }
         let kinds: HashSet<(Role, Option<usize>)> =
             tbox.generating.iter().map(|&(_, r, f)| (r, f)).collect();
         let max_vars = pairs
@@ -2782,19 +2833,28 @@ fn negation_and_exists_answer_as_the_chase() {
                     decided_by_rewriting += 1;
                 }
                 checked += 1;
+                forms.insert((mixed, name));
             }
         }
+        families |= tbox.families;
     }
     eprintln!(
         "QL negation: {checked} queries checked, {decided_by_rewriting} answered otherwise than \
          over the closure alone, {skipped} cases skipped (chase too large); mixed: {flagged} \
          flagged, {silent_ok} complete"
     );
-    assert!(checked >= cases * 2, "too few checked: {checked}");
+    assert!(
+        checked >= witnesses.map_or(cases, <[usize]>::len) * 2,
+        "too few checked: {checked}"
+    );
     assert!(
         decided_by_rewriting > 0,
         "no query needed the rewriting inside the negation"
     );
+    if witnesses.is_some() {
+        assert_eq!(families.count_ones() as usize, TBOX_FAMILIES);
+        assert_eq!(forms.len(), 6, "all forms in both modes: {forms:?}");
+    }
 }
 
 /// A reader who may not read every graph gets nothing derived from what it can't see
