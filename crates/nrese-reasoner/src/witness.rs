@@ -20,6 +20,8 @@ pub(crate) enum Site {
     PartnerRead,
     /// List-rule extractions started for an overdelete pass (`Rules::list_rules`).
     ListRules,
+    /// Starts of one grounding pass over list axioms.
+    ListGrounding,
     /// Morsel tasks started (`run_morsels`).
     MorselTask,
     /// Facts an expanded listing's fold takes (`batch::list`).

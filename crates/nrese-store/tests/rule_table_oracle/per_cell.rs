@@ -223,21 +223,25 @@ fn keys_share_a_tail_and_still_require_their_own_class() {
         ex:d ex:p0 ex:value
         ",
     );
-    let writes = vec![schema, data];
+    let writes = vec![schema, data, delete("ex:C1 owl:hasKey ex:h1")];
     for (shape, watch, present) in [
-        ("shared-key-tail-c1", ["ex:a", "owl:sameAs", "ex:b"], true),
-        ("shared-key-tail-c2", ["ex:c", "owl:sameAs", "ex:d"], true),
+        (
+            "shared-key-tail-c1",
+            ["ex:a", "owl:sameAs", "ex:b"],
+            [false, true, false],
+        ),
+        (
+            "shared-key-tail-c2",
+            ["ex:c", "owl:sameAs", "ex:d"],
+            [false, true, true],
+        ),
         (
             "shared-key-tail-across-classes",
             ["ex:a", "owl:sameAs", "ex:c"],
-            false,
+            [false; 3],
         ),
     ] {
-        check(
-            case(shape, watch, writes.clone()),
-            &[true; 2],
-            &[false, present],
-        );
+        check(case(shape, watch, writes.clone()), &[true; 3], &present);
     }
 }
 
@@ -426,6 +430,10 @@ fn later_writes_maintain_per_cell_support_with_or_without_a_warm_table() {
         ["ex:a", "ex:out", "ex:c"],
         vec![setup, data, remove],
     );
+    check_later_writes(fixture, true);
+}
+
+pub(super) fn check_later_writes(fixture: crate::generator::Case, require_delta: bool) {
     check(fixture.clone(), &[true; 3], &[false, true, false]);
     for &mode in judges::MODES {
         for cold in [false, true] {
@@ -445,7 +453,7 @@ fn later_writes_maintain_per_cell_support_with_or_without_a_warm_table() {
                     i == 1,
                     "{mode}, cold={cold}, write={i}",
                 );
-                if i != 0 {
+                if require_delta && i != 0 {
                     assert_ne!(
                         pipeline.last_reasoning_run().unwrap().work.plan,
                         Plan::Rebuild

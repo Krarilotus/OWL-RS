@@ -582,6 +582,8 @@ pub(crate) fn compile(
     predicates: &mut Predicates,
     rule_kind: RuleKind,
 ) -> (Vec<Rule>, Vec<Vec<[u64; 3]>>, Vec<ListDiagnostic>) {
+    #[cfg(test)]
+    crate::witness::add(crate::witness::Site::ListGrounding, 1);
     let mut rules = Vec::new();
     let mut premises: Vec<Vec<[u64; 3]>> = Vec::new();
     let mut diagnostics: Vec<ListDiagnostic> = Vec::new();
