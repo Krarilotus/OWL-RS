@@ -215,14 +215,14 @@ fn empty_store_publishes_datatype_axioms() {
 }
 
 #[test]
-#[ignore = "undocumented: a chain starting at rdf:nil drops its explicit first and rest"]
+#[ignore = "an accepting cycle starting at rdf:nil needs the per-cell form"]
 fn nil_head_starts_an_explicit_walk() {
     // Spec: Table 3 matches the head again, so prp-spo2 gives both p,q and p,q,p,q.
     check_nil_walk("nil-head");
 }
 
 #[test]
-#[ignore = "undocumented: a chain stops at rdf:nil before reading its explicit continuation"]
+#[ignore = "an accepting cycle through rdf:nil needs the per-cell form"]
 fn nil_cell_continues_an_explicit_walk() {
     // Spec: Table 3 matches the interior cell again, so prp-spo2 gives both p,q and p,q,q.
     check_nil_walk("nil-cell");

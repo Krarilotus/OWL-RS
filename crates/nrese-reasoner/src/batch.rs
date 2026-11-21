@@ -3161,6 +3161,16 @@ fn sees_classes(rule: &Rule) -> bool {
     matches!(rule.guards.as_slice(), [Guard::OverClasses { .. }])
 }
 
+/// List constants in a round's fact view use the same names as its facts.
+fn projected_lists(
+    lists: Option<&ListVocabulary>,
+    representatives: Option<&Representatives>,
+) -> Option<ListVocabulary> {
+    let (lists, representatives) = lists.zip(representatives)?;
+    (!representatives.stale.is_empty())
+        .then(|| lists.projected(|id| representatives.classes.representative(id)))
+}
+
 /// Semi-naive evaluation to the fixpoint, from a store holding the input as its delta;
 /// with equality by representatives if `representatives` is given. The process's memory
 /// limit stops it too, whatever the caller polls. Its consistency violations are charged
@@ -3316,7 +3326,13 @@ fn run_body(
                 store: &store,
                 stale,
             };
-            let mut source = fact_rules(&current, &rules, lists, &mut result.diagnostics);
+            let projected = projected_lists(lists, representatives.as_ref());
+            let mut source = fact_rules(
+                &current,
+                &rules,
+                projected.as_ref().or(lists),
+                &mut result.diagnostics,
+            );
             if let Some(equality) = &equality {
                 source.retain(|r| !is_replacement_rule(r, equality.same_as));
             }
@@ -3572,7 +3588,13 @@ fn run_body(
             classes: representatives.as_ref().map(|reps| &reps.classes),
             poll: &poll,
         };
-        let mut checks = consistency_rules(&current, &rules, lists, Some(&written));
+        let projected = projected_lists(lists, representatives.as_ref());
+        let mut checks = consistency_rules(
+            &current,
+            &rules,
+            projected.as_ref().or(lists),
+            Some(&written),
+        );
         poll.ended().map_err(|Stopped| Interrupted::default())?;
         if let Some(reps) = &representatives {
             give_classes(&mut checks, reps, &mut guard_classes, &mut guarded);

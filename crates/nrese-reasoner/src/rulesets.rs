@@ -92,7 +92,10 @@ pub const ALL: [Ruleset; 6] = [
 ///
 /// 7 (19 Nov 2026): the OWL 2 RL closure includes the annotation property and class
 /// declarations from prp-ap, cls-thing and cls-nothing1, so version 6 stores rebuild once.
-pub const SEMANTICS_VERSION: u32 = 7;
+///
+/// 8 (19 Nov 2026): an incomplete branch or a side loop no longer hides the
+/// rules of a list's walks to `rdf:nil`. An older store rematerialises once.
+pub const SEMANTICS_VERSION: u32 = 8;
 
 /// A part of the evaluation semantics only some user rulesets use ([`SEMANTICS_VERSION`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
