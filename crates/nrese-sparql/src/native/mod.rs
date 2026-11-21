@@ -2183,22 +2183,25 @@ impl<'a> Context<'a> {
             "save points close innermost first"
         );
         let Some(added) = since.pop() else { return };
-        match since.last_mut() {
-            Some(outer) => {
-                merge_numbers(&mut outer.numbers, added.numbers);
-                outer.held.absorb(added.held);
-                // The query memo's limit holds within the outer point too, the memo counted.
-                let memo = self.numbers.borrow();
-                let let_go = past_limit(&mut outer.numbers, |key| {
-                    memo.get(key).map_or(0, |m| m.len())
-                });
-                outer.held.release(let_go.saturating_mul(number_bytes()));
-            }
-            None => {
-                drop(since);
-                self.keep_numbers(added);
-            }
-        }
+        let Some((outer, earlier)) = since.split_last_mut() else {
+            drop(since);
+            self.keep_numbers(added);
+            return;
+        };
+        merge_numbers(&mut outer.numbers, added.numbers);
+        outer.held.absorb(added.held);
+        // The query memo's limit holds within the outer point too, counting what the memo
+        // and every point opened before it hold.
+        let memo = self.numbers.borrow();
+        let let_go = past_limit(&mut outer.numbers, |key| {
+            let earlier = earlier.iter().filter_map(|layer| layer.numbers.get(key));
+            memo.get(key)
+                .into_iter()
+                .chain(earlier)
+                .map(|m| m.len())
+                .sum()
+        });
+        outer.held.release(let_go.saturating_mul(number_bytes()));
     }
 
     /// Closes `point`, letting go of everything added since ([`Self::save`]).
