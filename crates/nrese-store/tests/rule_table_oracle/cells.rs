@@ -291,6 +291,42 @@ fn matches_oracle(cell: &Case, accepted: &[bool], present: &[bool]) -> bool {
 }
 
 #[test]
+fn nil_alias_terminates_a_list() {
+    // Spec: Table 4 eq-rep-o lets the rest through an alias of rdf:nil end
+    // the Table 3 list, so Table 5 prp-spo2 derives the chain row.
+    let fixture = case(
+        "nil-alias",
+        ["ex:a", "ex:out", "ex:c"],
+        vec![
+            insert("ex:x ex:marker ex:y"),
+            insert(
+                "
+            rdf:nil owl:sameAs ex:x
+            ex:out owl:propertyChainAxiom ex:h
+            ex:h rdf:first ex:p
+            ex:h rdf:rest ex:t
+            ex:t rdf:first ex:q
+            ex:t rdf:rest ex:x
+            ex:a ex:p ex:b
+            ex:b ex:q ex:c
+        ",
+            ),
+        ],
+    );
+    let (store, accepted) = judges::first_and_rebuild("compact", &fixture.writes[0].insert, false);
+    assert!(accepted);
+    let snapshot = store.read_snapshot(None).expect("read term dictionary");
+    let x = nrese_rdf::NamedNodeRef::new("http://example.org/x").unwrap();
+    let x = snapshot.lookup(x.into()).expect("the alias is interned");
+    let nil = snapshot.lookup(nrese_rdf::vocab::rdf::NIL.into());
+    assert!(
+        nil.is_none_or(|nil| x.raw() < nil.raw()),
+        "the alias was interned first"
+    );
+    check(fixture, &[true, true], &[false, true]);
+}
+
+#[test]
 #[ignore = "documented limit reasoning-semantics.md:63-65: asserting an entailed shortcut changes the first load's chain answer"]
 fn redundant_list_premise_leaves_chain_unchanged() {
     // Spec: Table 9 scm-spo and Table 5 prp-spo1 and prp-spo2 give the same
