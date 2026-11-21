@@ -1,10 +1,12 @@
 # Roadmap
 
 This page gives the order of work, the detail of the "planned" list in the
-[scope](what-it-covers.md#scope), and only a stage marked done here is in the code. What is done
-is in [STATUS.md](STATUS.md), the items checked for 1.5's merge to `main` are in the status table
-of the [merge checklist](plan/2026-10-05-v2-merge-checklist.md), and why things are decided as they
-are is in [adr/](adr/), above all [ADR-0010](adr/0010-standing-product-decisions.md).
+[scope](what-it-covers.md#scope), and a stage marked done here is in the code. 1.5 is released as
+`v1.5.0` ([release notes](releases/v1.5.md)). What is done is in [STATUS.md](STATUS.md), the items
+checked for 1.5's merge to `main` are in the status table of the
+[merge checklist](plan/2026-10-05-v2-merge-checklist.md), dated 5 October, and why things
+are decided as they are is in [adr/](adr/), above all
+[ADR-0010](adr/0010-standing-product-decisions.md).
 
 ## Goal
 
@@ -22,8 +24,14 @@ This order dates from 5 October 2026.
 2. Benchmark it with the fast regression suite, the core workloads with a real
    reasoning workload, workloads other stores are designed for as well (so that no result
    rests on a choice that suits NRESE), and a defaults track beside the
-   best-configuration track ([benches/PROTOCOL.md](../benches/PROTOCOL.md)).
-3. 1.5 to `main`, as a prerelease ([release notes](releases/v1.5.md)).
+   best-configuration track ([benches/PROTOCOL.md](../benches/PROTOCOL.md)). This is half done.
+   The comparison with the `main` before 1.5 is done, with the cases it leaves uncompared named
+   ([release notes](releases/v1.5.md#known-to-be-slower-than-the-earlier-main),
+   [not compared](releases/v1.5.md#not-compared-and-why)). The workloads other
+   stores are designed for, and the defaults track, are open: every run against another store
+   predates 25 October ([standings](../benches/STANDINGS.md)), and the defaults track has no run.
+3. 1.5 to `main`, as a prerelease ([release notes](releases/v1.5.md)). This is done: the
+   prerelease `v1.5.0-pre.1`, followed by `v1.5.0`.
 4. Concise docs and a major refactoring, with the README and docs short enough to
    contribute from, files over about 600 lines split, Miri over the unsafe code, measured
    test coverage, work on duplicate dependency versions and the last typed errors.

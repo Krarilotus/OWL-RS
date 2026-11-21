@@ -49,6 +49,23 @@ come with. What is in is on
   ([full-text search](ops/http-api.md#sparql)). Words without `AND` match as any of them, as
   `OR` would. To require words, join them with `AND` (every word is then needed), and to search
   one property, name it in `text:query`'s list.
+- A full-text search in the same group as a spatial relation with a fixed side
+  (`{ ?g geo:sfWithin ex:box . ?g text:query "needle" }`) can miss matches: the search is read
+  there as a stored statement. Planned for v1.5.1.
+- A full-text search joined with a vector search (`SERVICE nrv:search`) can miss its matches
+  when the vector search runs first over many candidates: the search is then read as a stored
+  statement. Planned for v1.5.1.
+- Two groups written side by side, `{ { … } { … } }`, are read as one group, so a full-text
+  search and the other group's triples are taken together. For one,
+  `SELECT ?o ?r { { ?o bds:search "alpha" } { ?o bds:relevance ?r } }` applies the second
+  group's option to the search and gives each match with its relevance, where the groups as
+  written give no row (with no `bds:relevance` statement stored). Planned for v1.5.1.
+- With computed spatial relations, `SELECT DISTINCT` over a spatial relation joined with other
+  triples (`SELECT DISTINCT ?g { ?g geo:sfWithin ?box . ?g a ex:Selected }`) can return only the
+  relations stated in the data and miss the computed ones. Planned for v1.5.1.
+- Under `SELECT DISTINCT`, a vector search (`SERVICE nrv:search`) whose query vector comes from
+  outside the `SERVICE` (a `VALUES`, say) can fail with an argument error: the vector isn't
+  passed in. Planned for v1.5.1.
 - A named graph without statements doesn't exist. `CREATE GRAPH` stores nothing, and an
   emptied graph answers 404 ([Graph Store Protocol](ops/http-api.md#graph-store-protocol)).
   Read that 404 as an empty graph.
@@ -100,17 +117,37 @@ leave something out.
   [modes](spec/reasoning-semantics.md#modes)).
 - `owl2-rl` doesn't infer `x owl:sameAs x` for every term, so `?x owl:sameAs ?x` doesn't
   return one for each, though an asserted one is returned. It checks the datatype rules in part,
-  and of the axiomatic triples it holds only `dt-type1`'s 32 datatype statements, in every store.
-  It doesn't type a literal by its own datatype (`dt-type2`), nor do `owl-horst` and
+  and of the axiomatic triples it holds only `dt-type1`'s 32 datatype statements
+  (`rdf:PlainLiteral rdf:type rdfs:Datatype` and the like;
+  [when](spec/reasoning-semantics.md#omitted-and-what-that-means)). It doesn't type a literal by its own datatype (`dt-type2`), nor do `owl-horst` and
   `rdfs-plus`: without a range, `∃:p.xsd:integer ⊑ :C` and `:a :p 5` give no `:a a :C`, even in
   one commit, where `owl2-dl` gives it
   ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)).
   Lists past their limits (a property chain of more than 250 properties, a key of more than
-  127, an intersection of more than 256 classes, more than 64 member sequences) aren't used
+  127, an intersection of more than 256 classes; for more than 64 member sequences,
+  [below](#a-list-past-the-cap)) aren't used
   at all, never truncated, and each is reported in the log and the reasoning diagnostics;
   while one is left out, no answer that reads the inferences is `complete`
   ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)); none known beyond
-  keeping lists within those limits. Literals aren't
+  keeping lists within those limits. Where the list of an axiom has a cycle, or a branch that
+  ends in a cell without `rdf:first` or `rdf:rest`, the whole axiom is left out, though OWL 2
+  RL's rules apply along every well-formed path through the list. A cyclic list is left out as a
+  whole, so a row only one of its paths entails is not inferred, and a read over the inferences
+  isn't `complete`; a violation only one of its paths entails is missed too, and the store can
+  report itself consistent over it. `owl:sameAs` between a list's cells makes the list cyclic
+  too: under `owl2-rl`, a property chain whose second cell is stated equal to its first is left
+  out as a whole, so the chain as written isn't applied, where the earlier `main` applies it.
+  An intersection of more than 256 classes is too long for the
+  rule format and is left out the same way (`list-too-long`): it gives no rules, a read over the
+  inferences isn't `complete`, and writes that leave it so stay incremental. A write after which
+  an axiom's list is read otherwise (left out where it was read, read where it was left out, or
+  left out for another reason) is rebuilt after its incremental maintenance
+  ([list limits](spec/reasoning-semantics.md#list-limits)): such a write is rematerialised, and
+  other writes stay incremental. For example, on one 32-core machine and a store of 2.8 million
+  stated facts, an edit that made a chain's list cyclic took 5.9 s and the edit that repaired it
+  7.5 s, against 1.5 s and 2.9 s incrementally, and the peak memory was 2.2 GB against 1.5 GB
+  (medians of 24 edits each). A list written as the OWL 2 RDF mapping writes it, one `rdf:first` and one
+  `rdf:rest` per cell, ending in `rdf:nil`, has no cycle or branch. Literals aren't
   equated by value (`"1"^^xsd:integer` and `"01"^^xsd:integer` stay two terms): compare
   values in a `FILTER` (`?v = 1`), which SPARQL does by value. Otherwise none known.
 - Without the OWL 2 QL rewriting, every answer over a
@@ -161,6 +198,14 @@ leave something out.
   the rules apply. An inclusion into an intersection
   (`:C rdfs:subClassOf [ owl:intersectionOf ( :A :B ) ]`), which OWL 2 QL allows, is answered
   and `complete`.
+- Under `owl2-ql`, an ontology with an axiom the OWL reader leaves out or alters (a reserved
+  name used as a class, property or individual, a structure it can't read, a property declared
+  as two kinds, SWRL rules) gets no `complete` answer from the rewriting: the reads it answers
+  are told `sound-only` at best, with the reader's reason, since conclusions of that axiom may
+  be missing. For one: with `:A rdfs:subClassOf [ owl:intersectionOf ( rdf:List :C ) ] .
+  :a a :A`, `SELECT ?x { ?x a :C }` returns no row, told `sound-only`, the reason naming
+  `rdf:List` as reserved vocabulary used as an entity; under the Direct Semantics `:a` is a
+  `:C`. With `:D` in place of `rdf:List`, the same read returns `:a`, `complete`.
 - Under `owl2-rl` with `reasoner.ql_rewriting = "on"`, a universal restriction on
   `owl:topObjectProperty` puts every individual into its filler, which the rules don't derive:
   the read answers `false` and is told `complete`. For one:
@@ -232,7 +277,17 @@ leave something out.
   is outside OWL 2 DL. A literal typed by a range is such a fact too, in valid OWL 2 DL: read
   back by `someValuesFrom` that datatype in a later commit (`:p rdfs:range xsd:integer .
   :a :p 5`, then `∃:p.xsd:integer ⊑ :C`, asked `:a a :C`), `owl2-rl` and `owl-horst` miss it
-  until a rebuild, and don't tell it `complete`; `owl2-dl` answers it.
+  until a rebuild, and don't tell it `complete`; `owl2-dl` answers it. Under `owl2-rl`, a later
+  commit's consistency check misses a clash through such a fact too: `:p owl:inverseOf :q .
+  :x :p "bad"`, then `:q rdfs:domain xsd:integer`, is accepted and the store says it is
+  consistent, where the same statements in one commit are refused; a rebuild of the inferences
+  finds the violation. The earlier `main` does the same.
+- Where a functional data property holds one value written in two lexical forms on one subject
+  (`:p a owl:FunctionalProperty . :a :p "1"^^xsd:integer , "1.0"^^xsd:decimal`), a first load
+  and a rebuild of the inferences give a later statement that uses one form the other form too,
+  and an incremental write doesn't: a store's rows can differ from its own rebuild. Under compact
+  equality, for a later statement in the integer form, a first load and a rebuild leave out the
+  other form too. The earlier `main` does the same ([why](spec/reasoning-semantics.md#generalised-triples)).
 - <a id="two-spellings-across-commits"></a>Under `owl2-dl`, a functional data property (or an
   at-most-one restriction) that holds one value written two ways (`"1"^^xsd:int`,
   `"01"^^xsd:int`) equates the two literals within a commit, but not across commits: after a
@@ -297,6 +352,61 @@ leave something out.
   schema statement they derive again, or that edits the list of an axiom together with other
   statements. The commit changes nothing, and the store stays as it was. Repair the existing
   violation first; the commit is then accepted.
+- A write maintained by a rebuild of the inferences (a split of an `owl:sameAs` class under
+  compact equality, a delete the maintenance rebuilds, a reasoning change on a store with an
+  inverse property expression, a store's first insert) is judged by the rebuild's own violations
+  while the store is marked consistent. The rebuild reads the whole store, so a clash that was
+  there before, and that an earlier check missed, refuses such a write too. On a store already
+  marked inconsistent such a write is judged by the incremental check, as other writes are.
+- A store holding `owl:sameAs` on OWL's own vocabulary isn't OWL 2 DL. A rebuild of it can miss
+  a clash the equality hides, and a write that removes the equality is then refused with the
+  clash it reveals.
+- In the cases run under `owl2-rl`, data that makes `rdf:rest` or `rdf:nil` `owl:sameAs` a term
+  of its own misses a property chain's inference; the read is told `sound-only`, as every read
+  over the `owl2-rl` closure is. `:out owl:propertyChainAxiom ( :p :q )` with
+  `:a :p :b . :b :q :z` isn't applied when its list goes on through a name made equal to
+  `rdf:rest` (the list written with
+  `:r`, then `rdf:rest owl:sameAs :r`; under the default equality setting) or ends in a name made
+  equal to `rdf:nil` (under compact equality): `ASK { :a :out :z }` stays `false`. The earlier
+  `main` infers both, with no status. In another case run, a key written with a property made
+  equal to `owl:hasKey` (under compact equality), it is the earlier `main` that misses the
+  equality this release infers. Don't make the standard vocabulary equal to terms of your own.
+- A write refused by a list rule (`eq-diff2` of an `owl:AllDifferent`, `cax-adc` of an
+  `owl:AllDisjointClasses`) can be named by the rule and an individual, or by the rule alone with
+  no member, without the statements behind it.
+- A store opened as a library, without the server, keeps the consistency verdict an earlier
+  version recorded for its reads until its first reasoned write; the server checks it again at
+  its start.
+- A disjointness that names an operand twice (`ex:C owl:disjointUnionOf ( ex:A ex:A )`, or a
+  class twice in `owl:AllDisjointClasses`) is read by position, as OWL 2's RDF-Based Semantics
+  reads it, and as the OWL 2 RL rules read the other disjointness axioms: the repeated operand is
+  empty. Under the Direct Semantics the
+  operands are a set, so an ontology consistent under that reading can be refused here; the
+  reader's report names the repeat. Under `owl2-dl` such a disjoint union takes the ontology off
+  the rules' route, and the DL check decides it.
+- A negative property assertion through an inverse property, committed after the statement it
+  contradicts, isn't caught by the OWL 2 RL rules' incremental check.
+- Under `owl2-dl`, an OWL 2 RL clash in an ontology with an empty intersection or union is
+  stated as undecided, not as an inconsistency.
+- Under `owl2-dl`, the status an answer is told (`complete`, `sound-only`) is a promise for data
+  that is an OWL 2 DL ontology, and this release doesn't yet check all of OWL 2 DL's conditions
+  on the data. Data that breaks one it doesn't check isn't refused for it, and the OWL 2 RL
+  rules still read it, so an answer can be told `complete` or `sound-only` where OWL 2 DL
+  doesn't entail it. Remove structures the OWL reader leaves unused and use each name as one
+  kind only, declared as that kind, or use `owl2-rl`, whose promise is the rules' reading. Two
+  kinds are known, and other structures and names of these kinds can do the same:
+  - A structure the OWL reader can't read as OWL 2 DL and leaves unused, such as a blank node
+    that no axiom uses but that carries two class structures at once. With its classes and its
+    property declared, and with
+    `_:x owl:intersectionOf ( :A :B ) ; owl:onProperty :p ; owl:allValuesFrom :D` and
+    `:x a :A , :B . :x :p :y`, `ASK { :y a :D }` is `true`, told `complete`; the earlier `main`
+    gives the same answer, with no status. An `owl:hasValue` beside an `owl:allValuesFrom` does
+    the same.
+  - A name used as two kinds of entity, such as a property never declared and used both with a
+    literal and with a resource. With `:C a owl:Class . :p rdfs:domain :C . :a :p "x" .
+    :b :p :c`, `ASK { :a a :C }` is `true`, told `complete`; the earlier `main` gives the same
+    answer, with no status. An annotation property also declared functional can make two
+    names equal, told `sound-only`.
 - Labels and notes on a store with `owl:sameAs` read as `unsound`. Under `owl2-dl`, and under `owl2-ql`
   and `owl2-rl` where the QL rewriting answers, a query that reads an annotation property
   (`rdfs:label`, `rdfs:comment`, or one the data declares) or any predicate (a variable
@@ -372,15 +482,32 @@ leave something out.
   answer, which is `sound-only` and names the setting, as it does at
   [`dl.timeout`](ops/config-reference.md#dl.timeout) (30 min). On a server the query's timeout
   ([`budgets.query_timeout`](ops/config-reference.md#budgets.query_timeout), 30 s) comes first:
-  the answer is a `408` with no rows and no status, and nothing in it says that the OWL 2 DL
-  checks took the time or which setting to raise. Raise the query timeout for such a read, or
-  ask `dl-answers=sound`, whose answers skip those checks and are `sound-only`.
-- Under `owl2-dl`, a query past the query timeout is answered `408`, but the reasoning its
-  answer needs first (the bounds over the data, which every `owl2-dl` read waits for) runs on
-  until it ends or until [`dl.timeout`](ops/config-reference.md#dl.timeout) (30 min), on the
-  server's shared workers. Meanwhile reads on other repositories of the same server can slow
-  down or time out, and further `owl2-dl` reads on that repository wait for the same work and
-  time out too. It is a wait, not a lock: when the work ends, the other reads are at their
+  where its answer can still be written in time (below), the read returns the rows it has,
+  `sound-only` with the bounds' counts, its untested
+  candidates unresolved, and the reason names `dl.timeout` though it was the query's timeout
+  that passed. Under `dl-answers=exact` it is refused, as at any limit. Raise the query timeout
+  for such a read, or ask `dl-answers=sound`, whose answers skip those checks and are
+  `sound-only`. The store stops 300 ms before the query timeout, to write the answer in time: a
+  read with many rows in hand, or one whose lower or upper evaluation or shared view is still
+  being prepared then, can still end in `408`, and a query timeout of 300 ms or less leaves the checks no time: a read that needs
+  them is told incomplete from its start.
+- With [`dl.model_labels`](ops/config-reference.md#dl.model_labels) on, a read whose request has
+  no room for the labels' work gets no refutations from them and is decided by its own tests.
+  Candidates past the first rows of the read without the labels go to their tests in batches of
+  no more decoded bytes than that read's costliest. Where the request has no room to admit such
+  a batch, or one row
+  alone costs more, the tests end there: the rest are left unresolved, and the read is told
+  incomplete, with the request's memory as the reason, or for such a row "the next candidate's
+  row costs more than … bytes". No later, cheaper row is tried.
+- Under `owl2-dl`, the reasoning a read's answer needs first (the bounds over the data, which
+  every `owl2-dl` read waits for) runs on past the query timeout, until it ends or until
+  [`dl.timeout`](ops/config-reference.md#dl.timeout) (30 min), on the server's shared workers:
+  the work can outlive the read that began it, and the store keeps the bounds for later reads.
+  Meanwhile reads on other repositories of the same server can slow down or time out, and
+  further `owl2-dl` reads on that repository wait for the same work until their own deadline,
+  then answer over the OWL 2 RL closure, saying why, or under `dl-answers=exact` are refused
+  (such an answer can still end in `408` where it waits for the ontology to be read). It is a
+  wait, not a lock: when the work ends, the other reads are at their
   usual speed at once. Measured on one machine (10 workers, bounds that take 59 s to build,
   a query timeout of 5 s): for about 30 s after the `408` a read on another repository that
   takes 8 ms idle timed out or took up to 4.3 s; with `dl.timeout` at 10 s the other reads
@@ -401,8 +528,11 @@ leave something out.
   are computed in the background at start, else the first scoped read after one computes them.
   A commit updates them for what it changes; a bulk load, a rebuild of the inferences or a
   schema change computes them again in full.
-- With `inference-scope=dataset`, text search, vector search and computed spatial relations
-  are refused (`501`).
+- With `inference-scope=dataset`, text search, vector search, reader-ranked search and computed
+  spatial relations are refused (`501`), wherever they stand in the query, also in a part that
+  has no rows to run on: the refusal is decided before anything is evaluated, and for a pattern
+  an `EXISTS` or a `LATERAL` builds from an outer binding, when it is built. A `SERVICE` body is
+  answered by its endpoint.
 - An OWL list (of an intersection, a union, a property chain or a key, say) is read over the
   whole store. Where statements in other graphs make it malformed (an `rdf:rest` back to one of
   its nodes, or more than 64 member sequences), its rules are left out, so a read with
@@ -413,6 +543,37 @@ leave something out.
   inferred ones, which are in the default graph. Under `owl2-rl` its status is `sound-only`
   with the reason of a read over the closure, which doesn't say that the inferred statements
   are outside its dataset. For what follows from those graphs, add `inference-scope=dataset`.
+- <a id="a-list-past-the-cap"></a>A list axiom whose members' `owl:sameAs` aliases give it more
+  than 64 member sequences is reported (`too-many-list-variants`). The clash checks of such an
+  `owl:AllDifferent`, `owl:AllDisjointClasses` or `owl:AllDisjointProperties` list are made from
+  the list as written. A write that leaves the store holding such a list, one it held already or
+  one the write brings, is rebuilt after its incremental check, and the rebuild makes what the
+  list gives while its cells give it at most 64 sequences
+  ([list limits](spec/reasoning-semantics.md#list-limits)). A write that deletes nothing is
+  refused if either check refuses it; a write that deletes is judged by the rebuild alone. Such a
+  write is rematerialised. For example, on one 12-core machine and a store of 2.8 million stated
+  facts (60,000 disjoint-class and 60,000 intersection lists, 2 million typed individuals, 20,000
+  `owl:sameAs` pairs) holding one list past the cap, a one-fact insert took about 6.5 to 7.1 s
+  instead of about 0.1 ms, and the peak memory over the writes rose from about 1.0 GiB to 1.6 GiB
+  (medians of 32 writes per equality mode). A store with no list past the cap is not affected.
+  An answer that
+  reads the inferences of a store with such a list isn't `complete`, but its reason need not name
+  the list: under `owl2-rl` it can name only the QL rewriting. These cases are left as they are:
+  - A write whose every statement is already inferred is not reasoned over again. Over a store
+    holding an axiom's list past the cap it can change what a rebuild would read of that list,
+    since a member then reaches the list in an earlier round. Such a store keeps its rows until
+    its next write that changes something, which is rebuilt; a restart doesn't. The rows it keeps
+    stay entailed, and a read over the inferences says `sound-only`.
+  - A list that is past the cap as written (a cell with more than 64 asserted `rdf:first`
+    values) gets no rules from a rebuild either: an inference made while it was within the cap
+    goes with the first rebuilt write.
+  - Where the store isn't marked consistent, such a write is judged by its incremental check
+    alone.
+  - Under equality by representatives, a first write whose list goes past the cap through an
+    alias of its head, or through other lists on the same axiom node, is accepted over the clash
+    the list gives, where the earlier `main` refuses it.
+  - With equality replicated, a clash through a cell that an alias of a list node gives
+    (`ex:l2 owl:sameAs ex:l2b . ex:l2b rdf:first ex:D`) is accepted.
 
 ## SHACL
 
@@ -488,7 +649,9 @@ leave something out.
   value an update generates (`UUID()`, `RAND()`, `NOW()`, `BNODE()`, blank nodes) and read inside
   the transaction isn't the one committed; a malformed update fails only at the next read or at
   the commit; and a failed commit ends the transaction. Reads take the latest commit, and
-  `SNAPSHOT` and `SERIALIZABLE` isolation are refused. A read, then a write
+  `SNAPSHOT` and `SERIALIZABLE` isolation are refused. Two transactions that each read and
+  then write are not isolated from one another: neither commit is refused because of the
+  other, so a check made inside one of them (is this item still unclaimed?) can pass in both. A read, then a write
   that depends on it, fits in one SPARQL update (`DELETE … INSERT … WHERE`), which is one
   commit.
 - A stop signal during start-up acts as a kill, and on Windows a service stop or
@@ -523,6 +686,19 @@ leave something out.
   only the rewriting gives (one an existential leads to) can be missing there. Where the
   rewriting runs for it, its limits under `owl2-rl` ([reasoning](#reasoning): a universal
   restriction on `owl:topObjectProperty`, a store inconsistent only through an existential) hold
-  for this reader alike, `complete` included.
+  for this reader alike, `complete` included. Under `reasoner.equality = "compact"`, and
+  wherever the support computation leaves a list axiom out in any graph, it is told
+  `not-certified` as well. So whether it is told `not-certified` or `complete` can depend on what
+  a graph it can't read holds; withholding the status changes none of its rows. Before a read,
+  the library's status of a query (`status_without_dl`) tells it `not-certified` on a reasoned
+  store, also with `infer=false`, where the read itself carries no status (over HTTP, `complete`
+  with no regime).
+- A reader of some graphs who sees inferred statements by support can lose an inferred answer
+  through graphs it can't read. Where statements there (`owl:sameAs` on a list's members) push a
+  list past the list limits, the support computation leaves that list axiom out, and the reader's
+  view lacks what it infers: an `ASK` a reader of every graph answers `true` can be `false` for
+  it. It is then told `not-certified`. This is a way the content of graphs it can't read shows in
+  what it sees. A list left out in such a graph that its own answer doesn't need (an unrelated
+  broken list, say) can change its status, from `complete` to `not-certified`, but not its rows.
 - A refusal for memory or work can hint at how much data a reader of only some graphs may not see. v2.0 admits
   requests by what the reader sees.

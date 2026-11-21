@@ -601,6 +601,10 @@ fn print_query(store: &StoreService, command: PrintQueryCommand) -> Result<()> {
 
 /// `nrese-server load`: bulk-loads files into the configured store and exits.
 fn bulk_load(store: &StoreService, load: LoadCommand) -> Result<()> {
+    #[cfg(feature = "fault-points")]
+    if std::env::var_os("NRESE_TEST_FAIL_QUARANTINE_COMMIT").is_some() {
+        store.quarantine().fail_next_commit();
+    }
     let request = BulkLoadRequest {
         files: load.files,
         replace: load.replace,
@@ -609,7 +613,12 @@ fn bulk_load(store: &StoreService, load: LoadCommand) -> Result<()> {
             .map_or(GraphTarget::DefaultGraph, GraphTarget::NamedGraph),
         invalid: load.invalid,
     };
-    let report = store.bulk_load(&request).context("bulk load failed")?;
+    let report = store.bulk_load(&request).map_err(|error| match error {
+        nrese_store::StoreError::LoadPublished { revision, reason } => anyhow::anyhow!(
+            "the load completed at published revision {revision}. Its quarantine record couldn't be kept: {reason}. Don't load it again."
+        ),
+        error => anyhow::Error::new(error).context("bulk load failed"),
+    })?;
     let seconds = report.elapsed.as_secs_f64();
     tracing::info!(
         revision = report.revision,

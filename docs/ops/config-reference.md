@@ -435,7 +435,7 @@ The server asks the provider about each token through [OAuth 2.0 token introspec
 
 ### Graph-level access control
 
-The rules are the server's access state (users, workspaces, personal spaces, role rules; [ADR-0008](../adr/0008-users-workspaces-policies.md)), kept in `system/` of the data directory and changed through `/api/v1/access` while the server runs ([HTTP API](http-api.md#users-workspaces-and-policies-apiv1access)). Until access is enforced, every user reads and writes what its authentication grants allow.
+The rules are the server's access state (users, workspaces, personal spaces, role rules; [ADR-0008](../adr/0008-users-workspaces-policies.md)), kept in `system/` of the data directory and changed through `/api/v1/access` while the server runs ([HTTP API](http-api.md#users-workspaces-and-policies-apiv1access)). Until access is enforced, every user reads and writes what its authentication grants allow. A local login is granted reading, and an administrator's administering too, so until then a local login that isn't an administrator may read but not write (`403`, "the local login does not grant access to this endpoint"), even where `auth.mode = none` lets a request without credentials write; once access is enforced, it writes what the access rules allow it.
 
 | Key | Env | Type | Default | Meaning |
 |---|---|---|---|---|
