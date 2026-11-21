@@ -291,29 +291,37 @@ fn matches_oracle(cell: &Case, accepted: &[bool], present: &[bool]) -> bool {
 }
 
 #[test]
-fn nil_alias_terminates_a_list() {
-    // Spec: Table 4 eq-rep-o lets the rest through an alias of rdf:nil end
-    // the Table 3 list, so Table 5 prp-spo2 derives the chain row.
-    let fixture = case(
-        "nil-alias",
-        ["ex:a", "ex:out", "ex:c"],
-        vec![
-            insert("ex:x ex:marker ex:y"),
-            insert(
-                "
-            rdf:nil owl:sameAs ex:x
-            ex:out owl:propertyChainAxiom ex:h
-            ex:h rdf:first ex:p
-            ex:h rdf:rest ex:t
-            ex:t rdf:first ex:q
-            ex:t rdf:rest ex:x
-            ex:a ex:p ex:b
-            ex:b ex:q ex:c
-        ",
-            ),
-        ],
-    );
-    check_vocabulary_alias(fixture, "http://example.org/x", nrese_rdf::vocab::rdf::NIL);
+fn nil_alias_terminates_linear_and_cyclic_lists() {
+    // Tables 3–5 derive the prefix's chain row at the first visit to nil's class.
+    for (end, extra) in [
+        ("ex:x", ""),
+        (
+            "rdf:nil",
+            "rdf:nil rdf:first ex:r\nrdf:nil rdf:rest rdf:nil",
+        ),
+    ] {
+        let fixture = case(
+            "nil-alias",
+            ["ex:a", "ex:out", "ex:c"],
+            vec![
+                insert("ex:x ex:marker ex:y"),
+                insert(&format!(
+                    "
+                    rdf:nil owl:sameAs ex:x
+                    ex:out owl:propertyChainAxiom ex:h
+                    ex:h rdf:first ex:p
+                    ex:h rdf:rest ex:t
+                    ex:t rdf:first ex:q
+                    ex:t rdf:rest {end}
+                    ex:a ex:p ex:b
+                    ex:b ex:q ex:c
+                    {extra}
+                    "
+                )),
+            ],
+        );
+        check_vocabulary_alias(fixture, "http://example.org/x", nrese_rdf::vocab::rdf::NIL);
+    }
 }
 
 #[test]
@@ -431,16 +439,10 @@ fn check_vocabulary_alias(fixture: Case, alias: &str, vocabulary: nrese_rdf::Nam
             }
             let snapshot = store.read_snapshot(None).expect("read term dictionary");
             let alias = nrese_rdf::NamedNodeRef::new(alias).unwrap();
-            let alias = snapshot
-                .lookup(alias.into())
-                .expect("the alias is interned");
-            let term = snapshot
-                .lookup(vocabulary.into())
-                .expect("the vocabulary term is interned");
-            assert!(
-                alias.raw() < term.raw(),
-                "{mode} rebuild={rebuild}: {alias:?} >= {term:?}"
-            );
+            let id =
+                |term: nrese_rdf::NamedNodeRef<'_>| snapshot.lookup(term.into()).unwrap().raw();
+            let (alias, term) = (id(alias), id(vocabulary));
+            assert!(alias < term, "{mode} rebuild={rebuild}: {alias} >= {term}");
             if !judges::rows(&store).0.contains(&fixture.watch) {
                 missing.push((mode, rebuild));
             }

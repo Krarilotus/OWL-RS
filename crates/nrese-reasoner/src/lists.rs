@@ -8,8 +8,8 @@
 //!
 //! Lists are read from the facts: each cell on a walk to `rdf:nil` supplies one
 //! `rdf:first` and one `rdf:rest`. Only cells on such a walk contribute rules.
-//! When there is no walk, or the cells on walks contain a cycle, the reader
-//! diagnoses the axiom and instantiates no rules.
+//! A head with no walk is diagnosed. For a cycle the reader marks the axiom
+//! incomplete and keeps the rules of walks previously read up to `rdf:nil`.
 //!
 //! Lists of any length are instantiated. The pairwise axioms (`owl:AllDifferent`,
 //! `owl:AllDisjointClasses`, `owl:AllDisjointProperties`) would need a rule per pair, so
@@ -177,19 +177,26 @@ impl ListVocabulary {
                 .contains(&o))
     }
 
-    /// Every walk to `rdf:nil`, up to [`MAX_VARIANTS`], with the facts along each.
+    /// Walks to `rdf:nil`, with the facts along each and any accepting cycle.
     fn list(
         &self,
         facts: &impl Facts,
         head: u64,
         nil_is_cell: bool,
-    ) -> Result<Vec<Variant>, ListProblem> {
+    ) -> (Result<Vec<Variant>, ListProblem>, Option<ListProblem>) {
         if !nil_is_cell && let Some(linear) = self.linear_list(facts, head) {
-            return linear;
+            return (linear, None);
         }
-        let cells = self.accepting_cells(facts, head)?;
-        check_acyclic(&cells, head)?;
-        self.enumerate(&cells, head)
+        let cells = match self.accepting_cells(facts, head) {
+            Ok(cells) => cells,
+            Err(problem) => return (Err(problem), None),
+        };
+        let Err(cycle) = check_acyclic(&cells, head) else {
+            return (self.enumerate(&cells, head), None);
+        };
+        // Preserve the previous reader's result and report the accepting
+        // cycle. The previous reader stopped on its first visit to nil.
+        (self.list_as_written(facts, head), Some(cycle))
     }
 
     /// The one walk when every cell has exactly one first and one rest. In this
@@ -301,7 +308,7 @@ impl ListVocabulary {
         Ok(variants)
     }
 
-    /// Keep the asserted fallback's reading for pairwise axioms past the cap.
+    /// The earlier reading, for cycles through nil and the asserted pairwise fallback.
     fn list_as_written(
         &self,
         facts: &(impl Facts + ?Sized),
@@ -637,7 +644,11 @@ pub fn instantiate_written(
                 !facts.objects(voc.nil, voc.first).is_empty()
                     && !facts.objects(voc.nil, voc.rest).is_empty()
             });
-            let read = match (voc.list(facts, head, nil_is_cell), written) {
+            let (walks, cycle) = voc.list(facts, head, nil_is_cell);
+            if let Some(problem) = cycle {
+                diagnose(problem);
+            }
+            let read = match (walks, written) {
                 (Err(ListProblem::TooManyVariants), Some(written)) if checks => {
                     diagnose(ListProblem::TooManyVariants);
                     // Where equality merges cells as written past the cap too, each
@@ -670,13 +681,17 @@ pub fn instantiate_written(
                                 .then_some(crate::eval::MAX_RULE_ATOMS)
                         };
                         if let Some(most) = limit {
-                            // Every walk of this head has to fit the enumerated form.
-                            rules.truncate(rules_before);
-                            premises.truncate(premises_before);
                             diagnose(ListProblem::TooLong {
                                 members: members.len(),
                                 most,
                             });
+                            if cycle.is_some() {
+                                rules.truncate(before);
+                                continue;
+                            }
+                            // Every walk of this head has to fit the enumerated form.
+                            rules.truncate(rules_before);
+                            premises.truncate(premises_before);
                             break;
                         }
                         let mut facts_used = used;
@@ -697,7 +712,10 @@ pub fn instantiate_written(
                         }
                     }
                 }
-                Err(problem) => diagnose(problem),
+                Err(problem) if cycle.is_none() || problem == ListProblem::TooManyVariants => {
+                    diagnose(problem);
+                }
+                Err(_) => {}
             }
         }
     };
