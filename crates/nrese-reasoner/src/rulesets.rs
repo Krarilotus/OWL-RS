@@ -719,9 +719,10 @@ mod tests {
 
     /// Spec (reasoning-semantics.md, "Freshness": a build that changes what a ruleset derives
     /// rebuilds its stores once; one that doesn't keeps them): `owl2-ql`'s rules no longer
-    /// read an annotation (D16-1112), so its fingerprint differs from the one the build before
-    /// stored, `091ff2fcfe077a51` (1e8720666's, computed from that build's rule text outside
-    /// the crate); `owl2-rl`'s derives the same and keeps that build's, `d21b78c6c05606e7`.
+    /// read an annotation (reasoning-semantics.md, the `owl2-ql` row), so its fingerprint
+    /// differs from the one the build before stored, `091ff2fcfe077a51` (1e8720666's, computed
+    /// from that build's rule text outside the crate); `owl2-rl`'s derives the same and keeps
+    /// that build's, `d21b78c6c05606e7`.
     #[test]
     fn only_owl2_qls_fingerprint_changes_with_its_annotation_readings() {
         let [ql, rl] =

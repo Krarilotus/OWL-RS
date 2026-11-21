@@ -503,7 +503,8 @@ fn no_owl2_ql_rule_reads_an_annotation_as_an_axiom() {
 
 /// Spec: a store with a custom program answers what that program entails, and the user's
 /// rules are the user's choice (as `equality_rule_names_tests` states of their names); the
-/// guard against annotation readings is on `owl2-ql`'s built-in rules only (D16-1112). On
+/// guard against annotation readings is on `owl2-ql`'s built-in rules only
+/// (reasoning-semantics.md, "User rules (Notation3)"). On
 /// `owl2-ql`, a user rule `(?p rdfs:subPropertyOf ?q), (?x ?p ?y)
 /// -> (?x ?q ?y)` applies to `:note`, declared an annotation property: with
 /// `:note rdfs:subPropertyOf :q` and `:x :note :v` committed, `:x :q :v` is read `true`.

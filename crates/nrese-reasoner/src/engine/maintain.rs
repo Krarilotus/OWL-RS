@@ -1892,10 +1892,11 @@ mod tests {
 
     /// Spec: annotations "have no semantic meaning in OWL 2" (Direct Semantics §1), so under
     /// `owl2-ql` an annotation property's domain and range entail no membership; a commit
-    /// that changes no declaration stays incremental (the decided page of D16-1112, mechanism
-    /// A). Over a committed state declaring `:note` an annotation property, a commit giving it
-    /// a domain and a range and using it derives neither `:alice a :Doc` nor `:bob a :Doc`, and
-    /// isn't rebuilt; with `:note` undeclared, the same commit derives both.
+    /// that changes no declaration stays incremental (a run reads the declarations of its own
+    /// state; only a change to them rebuilds the closure). Over a committed state declaring
+    /// `:note` an annotation property, a commit giving it a domain and a range and using it
+    /// derives neither `:alice a :Doc` nor `:bob a :Doc`, and isn't rebuilt; with `:note`
+    /// undeclared, the same commit derives both.
     #[test]
     fn a_commit_through_an_annotation_propertys_domain_derives_nothing_under_owl2_ql() {
         use crate::delta::policy::Plan;
