@@ -72,13 +72,16 @@ fn values_inside_a_group_count_only_at_that_site() {
 }
 
 #[test]
-#[ignore = "an EXISTS that draws decides once for all the rows it tests"]
 fn exists_draws_independently_for_each_tested_row() {
     drawing("exists-independent");
 }
 
 #[test]
-#[ignore = "left rows with the same correlated values share one right-side draw"]
+fn a_drawing_subquery_in_exists_decides_once_per_group_solution() {
+    drawing("exists-subquery-seed");
+}
+
+#[test]
 fn lateral_draws_for_each_left_row() {
     drawing("lateral-draw");
 }
@@ -97,7 +100,6 @@ fn vector_hits_copy_the_draw_from_an_unrelated_group() {
 }
 
 #[test]
-#[ignore = "a vector search that goes first evaluates a group sharing no variable with the hit once per hit"]
 fn a_group_beside_a_vector_search_draws_once_for_all_hits() {
     if unsupported(generator::VECTOR_INDEX, NO_VECTORS) {
         return;
@@ -105,14 +107,110 @@ fn a_group_beside_a_vector_search_draws_once_for_all_hits() {
     drawing("vector-disjoint");
 }
 
+// The nearest of two active vectors (k = 1) beside a VALUES with one row on the
+// farther vector and `free` rows leaving ?v unbound: the unbound rows join the
+// nearest, the bound row joins nothing. With `draw`, the group draws too.
+fn mixed_bound(free: usize, draw: bool) -> (Case, String) {
+    let mut data = Vec::new();
+    generator::vectors(&mut data, 2);
+    let n = "urn:nrese:vector:";
+    let far = format!(
+        "\"{}\"^^<{n}vector>",
+        nrese_engine::vector::lexical(&[1.0, 0.01])
+    );
+    let near = format!(
+        "\"{}\"^^<{n}vector>",
+        nrese_engine::vector::lexical(&[1.0, 0.0])
+    );
+    let rows: String = (0..free)
+        .map(|i| format!("(UNDEF <urn:free:{i}>) "))
+        .collect();
+    let bind = if draw { "BIND(STRUUID() AS ?d)" } else { "" };
+    let text = format!(
+        "SELECT ?v ?i ?d {{ {{ VALUES (?v ?i) {{ ({far} <urn:bound>) {rows}}} {bind} }} \
+         SERVICE <{n}search> {{ ?v <{n}near> {near} ; <{n}k> 1 ; <{n}exact> true }} }}"
+    );
+    (
+        Case::new("vector-mixed", data, Query::plain(text.clone())),
+        text,
+    )
+}
+
+// Every route gives the `free` unbound rows on the nearest vector, and nothing else.
+fn assert_nearest(free: usize, draw: bool) -> Routes {
+    let (case, text) = mixed_bound(free, draw);
+    let routes = Routes::open(&case);
+    let nearest =
+        routes.native("SELECT ?v { <urn:vec:0> <urn:embedding> ?v }", true)[0]["v"].clone();
+    let expected: Vec<(String, String)> = (0..free)
+        .map(|i| (nearest.clone(), format!("<urn:free:{i}>")))
+        .collect();
+    let request = SparqlQueryRequest::all(&text);
+    let answers = [true, false]
+        .map(|as_written| routes.native(&text, as_written))
+        .into_iter()
+        .chain(routes::STORES.map(|s| routes::execute(routes.store(s), &request)));
+    for rows in answers {
+        assert_eq!(
+            rows.iter().filter(|r| r.contains_key("d")).count(),
+            if draw { free } else { 0 }
+        );
+        let mut got: Vec<(String, String)> = rows
+            .iter()
+            .map(|r| (r["v"].clone(), r["i"].clone()))
+            .collect();
+        got.sort();
+        let mut want = expected.clone();
+        want.sort();
+        assert_eq!(got, want, "{text}");
+    }
+    routes
+}
+
 #[test]
-#[ignore = "SERVICE evaluates its pattern again for each batch of bound values it sends"]
+fn a_drawing_group_beside_a_vector_search_keeps_the_hits_its_unbound_rows_join() {
+    if unsupported(generator::VECTOR_INDEX, NO_VECTORS) {
+        return;
+    }
+    assert_nearest(50, true);
+}
+
+#[test]
+fn a_vector_search_beside_few_partly_unbound_rows_keeps_the_nearest() {
+    if unsupported(generator::VECTOR_INDEX, NO_VECTORS) {
+        return;
+    }
+    // Below the probe-first cutoff: the pattern beside the search goes first.
+    assert_nearest(2, false);
+}
+
+#[test]
+fn a_vector_search_probes_first_beside_many_partly_unbound_rows() {
+    if unsupported(generator::VECTOR_INDEX, NO_VECTORS) {
+        return;
+    }
+    // The drawing cell's fixture without the draw takes the probe-first route.
+    let routes = assert_nearest(50, false);
+    let (_, text) = mixed_bound(50, false);
+    let explained = routes::explain(
+        routes.store(StoreRoute::QlOff),
+        &SparqlQueryRequest::all(text),
+    );
+    assert!(
+        explained
+            .steps
+            .iter()
+            .any(|s| s.operator == "vector search first"),
+        "{explained:?}"
+    );
+}
+
+#[test]
 fn a_remote_solution_draws_once_even_if_joined_in_batches() {
     drawing("service-batches");
 }
 
 #[test]
-#[ignore = "streamed AVG can evaluate its argument separately for the sum and the count"]
 fn streamed_average_uses_the_same_arguments_for_sum_and_count() {
     drawing("average-draw");
 }

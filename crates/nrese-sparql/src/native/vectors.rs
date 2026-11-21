@@ -196,13 +196,13 @@ impl Context<'_> {
     ) -> NativeResult<Solutions> {
         self.check()?;
         let search = parse(inner)?;
-        // The candidates the rest of the query allows, if it binds the matched variable.
+        // The candidates the rest of the query allows, if it binds the matched variable in
+        // every row: a row that leaves it unbound joins any hit, so then none is ruled out.
         let candidates: Option<HashSet<u64>> = bound
             .and_then(|b| Some((b, b.column(&search.matched)?)))
-            .map(|(b, column)| {
+            .and_then(|(b, column)| {
                 (0..b.table.len())
-                    .map(|row| b.table.get(row, column))
-                    .filter(|&id| id != UNDEF)
+                    .map(|row| Some(b.table.get(row, column)).filter(|&id| id != UNDEF))
                     .collect()
             });
         // The query vectors, each with the id it is bound to (for a `nrv:near` variable).
@@ -284,8 +284,9 @@ impl Context<'_> {
     ) -> NativeResult<Solutions> {
         let search = parse(inner)?;
         let estimate = self.estimate(local);
+        // A `local` that draws goes first: probed per hit, it would draw once per hit.
         let probe_first = match &search.near {
-            Near::Vector(_) => estimate >= (PROBE_ABOVE * search.k) as f64,
+            Near::Vector(_) => estimate >= (PROBE_ABOVE * search.k) as f64 && !self.draws_in(local),
             Near::Variable(_) => false,
         };
         if !probe_first {
@@ -297,6 +298,7 @@ impl Context<'_> {
             unreachable!("checked above")
         };
         self.check()?;
+        let start = std::time::Instant::now();
         // The hits are probed against `local` after the search, so the index sees no
         // filter; it is told how many vectors `local` is estimated to accept, so that its
         // beam is widened by the inverse share as for a filter it applies itself. Without
@@ -366,6 +368,14 @@ impl Context<'_> {
                 return Err(error);
             }
         };
+        let detail = "the search first, the pattern beside it probed per hit".to_owned();
+        self.note(
+            "vector search first",
+            detail,
+            None,
+            local.table.len(),
+            start,
+        );
         self.join(local, found)
     }
 

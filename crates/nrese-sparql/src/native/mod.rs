@@ -573,7 +573,8 @@ pub(crate) fn delete_insert(
         return Err(QueryEvaluationError::Unsupported(what));
     }
     let as_written = search::as_written(pattern, options);
-    let ctx = Context::in_mode(snapshot, options, using, base, as_written);
+    let mut ctx = Context::in_mode(snapshot, options, using, base, as_written);
+    ctx.draws = pattern.find(&mut pushdown::draw);
     let pattern = match as_written {
         true => pattern.clone(),
         false => optimise(pattern.clone(), &mut Vec::new(), &ctx),
@@ -1558,6 +1559,10 @@ struct Context<'a> {
     graph: RefCell<GraphScope>,
     /// [`QueryOptions::as_written`].
     as_written: bool,
+    /// Whether the query's pattern draws a value anywhere ([`pushdown::draw`]), found by one
+    /// walk where its mode is decided; `true` for a context made without a query, whose
+    /// places then walk their part ([`Self::draws_in`]).
+    draws: bool,
     /// [`QueryOptions::cross_chunk_rows`].
     cross_chunk_rows: usize,
     /// [`QueryOptions::stream_rows`].
@@ -1688,9 +1693,19 @@ impl<'a> Context<'a> {
 
     /// The context for `query`, in the mode it is evaluated in ([`search::as_written`]).
     fn for_query(snapshot: &'a Snapshot, query: &Query, options: &QueryOptions) -> Self {
-        let as_written = search::as_written(pattern_and_form(query).0, options);
+        let pattern = pattern_and_form(query).0;
+        let as_written = search::as_written(pattern, options);
         let (dataset, base) = (query_dataset(query), query_base(query));
-        Self::in_mode(snapshot, options, dataset, base, as_written)
+        let mut ctx = Self::in_mode(snapshot, options, dataset, base, as_written);
+        ctx.draws = pattern.find(&mut pushdown::draw);
+        ctx
+    }
+
+    /// Whether `part` draws a value: a route that evaluates it more or less often than the
+    /// algebra does is taken only where it doesn't. One boolean read for a query that draws
+    /// nothing.
+    fn draws_in(&self, part: &GraphPattern) -> bool {
+        self.draws && part.find(&mut pushdown::draw)
     }
 
     /// `dataset` is the query's own (`FROM`); the protocol's, in `options`, replaces it.
@@ -1773,6 +1788,7 @@ impl<'a> Context<'a> {
             named,
             store_default,
             as_written,
+            draws: true,
             spatial_rewrite: !options.geosparql_stated_only,
             cross_chunk_rows: options.cross_chunk_rows.unwrap_or(CROSS_CHUNK_ROWS).max(1),
             stream_rows: options.stream_rows,
@@ -6007,7 +6023,7 @@ impl<'a> Context<'a> {
     ) -> NativeResult<Solutions> {
         let streamable = match self.as_written {
             true => None,
-            false => stream::Plan::of(inner, aggregates),
+            false => stream::Plan::of(inner, aggregates, self.draws),
         };
         if let Some(plan) = &streamable
             && self.stream_rows.is_some()

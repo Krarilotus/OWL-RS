@@ -152,6 +152,17 @@ pub fn drawing(shape: &'static str) -> Case {
             format!("SELECT ?i {{ VALUES ?i {{ {many} }} <urn:a> <urn:few> ?k FILTER EXISTS {{ ?s <urn:q> ?z FILTER($DRAW && ?s = <urn:a> && ?k = 1) }} }}"),
             filter(&["i"]),
         ),
+        // Each group solution is tested once, however often the seed repeats its key.
+        "exists-subquery-seed" => {
+            let subjects = (0..40).map(|i| {
+                data.push(format!("<urn:s:{i}> <urn:sibling> {i} ."));
+                format!("<urn:s:{i}> <urn:s:{i}>")
+            }).collect::<Vec<_>>().join(" ");
+            (
+                format!("SELECT ?s ?o {{ VALUES ?s {{ {subjects} }} {{ ?s <urn:sibling> ?o FILTER EXISTS {{ SELECT ?s {{ ?s <urn:sibling> ?z FILTER($DRAW) }} }} }} }}"),
+                filter(&["s"]),
+            )
+        }
         "lateral-draw" => (
             "SELECT ?i ?d { VALUES (?s ?i) { (<urn:a> 1) (<urn:a> 2) } LATERAL { ?s <urn:few> ?o BIND($DRAW AS ?d) } }".into(),
             value("UUID()", &["i"]),
