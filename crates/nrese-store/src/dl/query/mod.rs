@@ -926,7 +926,7 @@ fn annotation_rule(
     completeness.unsound(source, format!("the query {what} {COPIES}"));
 }
 
-/// Why a read of typed values may miss rows while the rules equate a literal with another
+/// Why a read of literals may miss rows while the rules equate a literal with another
 /// term ([`crate::ReasoningState::literal_equality`]).
 const LITERAL_EQUALITY: &str = "the rules equate two literals as one value (an owl:sameAs \
                                 between literals, which no store can hold), so a statement \
@@ -938,8 +938,8 @@ const LITERAL_EQUALITY: &str = "the rules equate two literals as one value (an o
 /// operator rule ([`negation_rule`]) over what it took away. Each entry: the condition, the
 /// reads it touches, its reason.
 /// - The rules equate a literal with another term (`state`): a read of a property that may
-///   hold typed values in `snapshot` (a variable predicate, any; for a reader of some
-///   graphs, every property, as [`certify`] reads them), [`LITERAL_EQUALITY`].
+///   hold literals in `snapshot` ([`holds_literals`]; a variable predicate, any; for a
+///   reader of some graphs, every property, as [`certify`] reads them), [`LITERAL_EQUALITY`].
 pub(crate) fn withhold(
     completeness: &mut Completeness,
     (query, reads): (&Query, &Reads),
@@ -951,22 +951,42 @@ pub(crate) fn withhold(
     if !matches!(completeness.regime, Some(Owl2Dl | Owl2Ql | Owl2Rl)) {
         return;
     }
-    let typed = |predicate: &Option<String>| {
+    let literals = |predicate: &Option<String>| {
         reads.access.is_some()
             || match predicate {
                 Some(p) => snapshot
                     .lookup(NamedNodeRef::new_unchecked(p).into())
-                    .is_some_and(|p| {
-                        snapshot.holds_typed_literals(ReadModel::Materialised, Some(p))
-                    }),
-                None => snapshot.holds_typed_literals(ReadModel::Materialised, None),
+                    .is_some_and(|p| holds_literals(snapshot, Some(p))),
+                None => holds_literals(snapshot, None),
             }
     };
     let read = reads.predicates.get_or_init(|| predicates(query));
-    if state.literal_equality && read.iter().any(typed) {
+    if state.literal_equality && read.iter().any(literals) {
         completeness.incomplete(source, LITERAL_EQUALITY.to_owned());
     }
     negation_rule(completeness, (query, reads), source);
+}
+
+/// Whether a statement read with `predicate` (any, where `None`) has a literal object, of
+/// any kind: strings have spellings too (`"Rex"` and `"Rex"^^xsd:token`, `"Rex"@en` and
+/// `"Rex@en"^^rdf:PlainLiteral`). The literal kinds' ids are two ranges, so this is up to
+/// two seeks in the predicate-first index (object-first without a predicate); `true` where
+/// the index can't answer by range.
+fn holds_literals(snapshot: &Snapshot, predicate: Option<TermId>) -> bool {
+    use nrese_engine::{TermKind, quad::Permutation};
+    let mut pattern = QuadPattern::all();
+    pattern.predicate = predicate;
+    let index = predicate.map_or(Permutation::Ospg, |_| Permutation::Posg);
+    [
+        (TermKind::String, TermKind::TypedLiteral),
+        (TermKind::DerivedInteger, TermKind::DerivedInteger),
+    ]
+    .into_iter()
+    .any(|(first, last)| {
+        let (low, high) = (TermId::kind_range(first).0, TermId::kind_range(last).1);
+        (snapshot.scan_range_in(ReadModel::Materialised, &pattern, index, low, high))
+            .is_none_or(|mut quads| quads.next().is_some())
+    })
 }
 
 /// Why a read [`annotation_rule`] names may give wrong rows.
