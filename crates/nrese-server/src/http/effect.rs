@@ -20,11 +20,17 @@ enum End<T> {
 struct Held<T, H> {
     guard: Guard<End<T>>,
     value: Option<H>,
+    #[cfg(test)]
+    pause: Option<tests::PauseAfterEnd>,
 }
 
 impl<T, H> Held<T, H> {
     fn finish(mut self, work: impl FnOnce(Option<&mut H>) -> End<T>) {
         self.guard.end(work(self.value.as_mut()));
+        #[cfg(test)]
+        if let Some(pause) = self.pause.take() {
+            pause.wait();
+        }
     }
 }
 
@@ -34,7 +40,12 @@ fn spawn<T: Clone + Send + Sync + 'static, H: Send + 'static>(
     work: impl FnOnce(Option<&mut H>) -> End<T> + Send + 'static,
 ) -> Terminal<End<T>> {
     let (end, guard) = terminal(fallback);
-    let held = Held { guard, value: held };
+    let held = Held {
+        guard,
+        value: held,
+        #[cfg(test)]
+        pause: tests::PAUSE_AFTER_END.take(),
+    };
     drop(tokio::task::spawn_blocking(move || held.finish(work)));
     end
 }

@@ -1,5 +1,7 @@
+use std::cell::Cell;
 use std::future::poll_fn;
 use std::pin::pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::task::Poll;
 
@@ -11,6 +13,116 @@ use nrese_store::{
 };
 
 use super::*;
+use crate::ai::AiSuggestionService;
+use crate::auth::Identity;
+use crate::policy::PolicyConfig;
+use crate::{AppState, DeploymentPosture};
+
+thread_local! {
+    // Each test installs its own pause on its current-thread runtime. Only its next
+    // worker takes the pause with it.
+    pub(super) static PAUSE_AFTER_END: Cell<Option<PauseAfterEnd>> = const { Cell::new(None) };
+}
+
+pub(super) struct PauseAfterEnd {
+    reached: tokio::sync::oneshot::Sender<()>,
+    release: mpsc::Receiver<()>,
+}
+
+impl PauseAfterEnd {
+    pub(super) fn wait(self) {
+        let _ = self.reached.send(());
+        let _ = self.release.recv_timeout(Duration::from_secs(30));
+    }
+}
+
+fn pause_next_worker() -> (tokio::sync::oneshot::Receiver<()>, mpsc::Sender<()>) {
+    let (reached, waiting) = tokio::sync::oneshot::channel();
+    let (resume, release) = mpsc::channel();
+    PAUSE_AFTER_END.set(Some(PauseAfterEnd { reached, release }));
+    (waiting, resume)
+}
+
+// Spec: after an answered write, dropping the state allows an immediate reopen.
+#[tokio::test]
+async fn request_release_allows_reopening_the_system_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let open = || {
+        AppState::try_new(
+            StoreService::new(StoreConfig::on_disk(dir.path()))?,
+            ReasonerService::new(ReasonerConfig::for_mode(ReasoningMode::Disabled)),
+            PolicyConfig::default(),
+            AiSuggestionService::disabled(),
+            DeploymentPosture::OpenWorkbench,
+        )
+    };
+    let state = open().unwrap();
+    let access = state.access_view(&Identity {
+        admin: true,
+        ..Default::default()
+    });
+    let requester = access.requester();
+    let ticket = MutationTicket::checking(Some(access.rights.expect("checking ticket")));
+    let pipeline = state.pipeline();
+    let (waiting, resume) = pause_next_worker();
+    let report = run(
+        ticket,
+        Duration::from_secs(30),
+        "timeout",
+        LostCancel::AwaitEnd,
+        None::<()>,
+        move |ticket, _| {
+            pipeline
+                .apply(
+                    MutationCommand::Update(SparqlUpdateRequest::new(
+                        "INSERT DATA { <urn:s> <urn:p> <urn:o> }",
+                    )),
+                    &requester,
+                    ticket,
+                )
+                .map_err(|error| ApiError::internal(error.to_string()))
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(report, MutationCommitReport::Applied { .. }));
+    waiting.await.unwrap();
+    drop(state);
+    let reopened = open();
+    resume.send(()).expect("worker was still paused at reopen");
+    reopened.expect("reopen after the write answer");
+}
+
+// Spec: returning the worker's answer releases its held value.
+#[tokio::test]
+async fn request_release_drops_the_held_value_by_the_answer() {
+    struct HeldValue(Arc<AtomicBool>);
+
+    impl Drop for HeldValue {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let (waiting, resume) = pause_next_worker();
+    let answer = run(
+        MutationTicket::new(),
+        Duration::from_secs(30),
+        "timeout",
+        LostCancel::AwaitEnd,
+        Some(HeldValue(Arc::clone(&dropped))),
+        |_, _| Err(ApiError::bad_request("write refused")),
+    )
+    .await;
+    assert!(matches!(answer, Err(ApiError::BadRequest(_))));
+    waiting.await.unwrap();
+    let dropped_by_the_answer = dropped.load(Ordering::SeqCst);
+    resume
+        .send(())
+        .expect("worker was still paused at the answer");
+    assert!(dropped_by_the_answer, "the worker still held the value");
+}
 
 fn publish_at_gate(
     ticket: &MutationTicket,
@@ -87,32 +199,32 @@ async fn a_disconnected_request_does_not_publish() {
     ));
 }
 
-// Spec: lifecycle rule 5 says that even a simulated failure records its end before release.
+// Spec: even a worker that panics releases its held value before recording its answer.
 #[tokio::test]
-async fn held_value_is_dropped_after_the_end_is_recorded() {
+async fn request_release_drops_the_held_value_before_the_fallback_end() {
     struct HeldValue {
         terminal: mpsc::Receiver<Terminal<End<()>>>,
-        recorded: tokio::sync::mpsc::UnboundedSender<bool>,
+        released_first: tokio::sync::mpsc::UnboundedSender<bool>,
     }
 
     impl Drop for HeldValue {
         fn drop(&mut self) {
-            let recorded = self
+            let released_first = self
                 .terminal
                 .try_recv()
-                .ok()
-                .and_then(|terminal| terminal.get());
-            let _ = self
-                .recorded
-                .send(matches!(recorded, Some(End::Fallback(None))));
+                .is_ok_and(|terminal| terminal.get().is_none());
+            let _ = self.released_first.send(released_first);
         }
     }
 
     let (send_terminal, terminal) = mpsc::channel();
-    let (recorded, mut observed) = tokio::sync::mpsc::unbounded_channel();
+    let (released_first, mut observed) = tokio::sync::mpsc::unbounded_channel();
     let (release, gate) = mpsc::channel();
     let end = spawn(
-        Some(HeldValue { terminal, recorded }),
+        Some(HeldValue {
+            terminal,
+            released_first,
+        }),
         || End::Fallback(None),
         move |_| {
             // The work is held at a gate until the observer has the terminal.
@@ -120,11 +232,15 @@ async fn held_value_is_dropped_after_the_end_is_recorded() {
             panic!("simulated failure");
         },
     );
-    let _ = send_terminal.send(end);
+    let _ = send_terminal.send(end.clone());
     let _ = release.send(());
+    let answer = end
+        .wait_or(tokio::time::sleep(Duration::from_secs(30)))
+        .await;
+    assert!(matches!(answer, Some(End::Fallback(None))));
     assert!(
         observed.recv().await.unwrap(),
-        "release must observe the fallback end"
+        "the fallback end was recorded before the held value was released"
     );
 }
 

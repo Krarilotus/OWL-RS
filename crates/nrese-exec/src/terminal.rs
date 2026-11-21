@@ -254,6 +254,43 @@ mod tests {
         );
     }
 
+    // Spec: the worker's final end wakes a waiter after its fallback captures are released.
+    #[test]
+    fn request_release_releases_fallback_captures_before_waking_a_waiter() {
+        struct AtWake {
+            capture: Arc<()>,
+            count: AtomicUsize,
+        }
+
+        impl Wake for AtWake {
+            fn wake(self: Arc<Self>) {
+                self.count
+                    .store(Arc::strong_count(&self.capture), Ordering::SeqCst);
+            }
+        }
+
+        let witness = Arc::new(AtWake {
+            capture: Arc::new(()),
+            count: AtomicUsize::new(0),
+        });
+        let captured = Arc::clone(&witness.capture);
+        let (reader, guard) = terminal(move || {
+            drop(captured);
+            Outcome::Unknown
+        });
+        let waker = Waker::from(Arc::clone(&witness));
+        let mut cx = Context::from_waker(&waker);
+        let mut waiter = pin!(reader.wait_or(pending()));
+        assert!(waiter.as_mut().poll(&mut cx).is_pending());
+
+        assert!(guard.end(Outcome::Committed));
+        assert_eq!(
+            waiter.as_mut().poll(&mut cx),
+            Poll::Ready(Some(Outcome::Committed))
+        );
+        assert_eq!(witness.count.load(Ordering::SeqCst), 1);
+    }
+
     /// A guard dropped before any end records its fallback; until then there is no end.
     #[test]
     fn a_drop_with_no_end_records_the_fallback() {
