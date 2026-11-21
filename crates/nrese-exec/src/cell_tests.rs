@@ -405,6 +405,43 @@ fn a_waiter_whose_stop_fires_once_the_build_has_ended_is_told_the_end() {
     );
 }
 
+/// Spec (`Build::join`): a waiter whose stop or deadline has fired leaves (`Left`), on a
+/// pool thread too: it is not answered [`Busy`], which would send it to build the value
+/// itself. Two cases on a one-thread pool, an opaque build held: the stop fired, and the
+/// deadline passed.
+#[test]
+fn a_pool_waiter_whose_stop_or_deadline_fired_leaves_rather_than_builds() {
+    let cell: BuildCell<u64, u64> = BuildCell::default();
+    let Claim::Build(_held) = cell.claim(7, Kind::Opaque, || None) else {
+        panic!("absent.claim builds");
+    };
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    let answered = |deadline: Option<Instant>, stop: &(dyn Fn() -> bool + Sync)| {
+        pool.install(|| match cell.claim(7, Kind::Opaque, || None) {
+            Claim::Wait(build) => match build.join(deadline, stop) {
+                Joined::Left => "left",
+                Joined::Busy => "busy",
+                Joined::Told(_) => "told",
+            },
+            Claim::Build(_) => panic!("one build at a time"),
+        })
+    };
+    let (fired, unfired): (&(dyn Fn() -> bool + Sync), &(dyn Fn() -> bool + Sync)) =
+        (&|| true, &|| false);
+    let told = [
+        ("stop fired", answered(None, fired)),
+        ("deadline passed", answered(Some(Instant::now()), unfired)),
+    ];
+    assert_eq!(
+        told,
+        [("stop fired", "left"), ("deadline passed", "left")],
+        "a pool waiter past its stop or deadline was not told to leave"
+    );
+}
+
 /// An opaque build in progress: a pool thread is turned away at once, a thread off the
 /// pool sleeps until the builder finishes, and a builder that ends without a value
 /// wakes it with none. What's kept is charged until it's dropped.

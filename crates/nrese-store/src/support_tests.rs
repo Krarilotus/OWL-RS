@@ -784,8 +784,9 @@ fn a_reader_waiting_on_anothers_build_leaves_at_its_cancellation_and_the_build_g
 /// Spec (`get_or_build`: a kept value is answered; `None` once `stop` has fired, the caller
 /// then building nothing): with a slot's build held by the test, a reader whose stop has
 /// fired builds nothing where that build is busy to its pool thread, or ends with no value
-/// while it waits; and a kept value is answered without joining a build under way. Three
-/// cases, each run before the test answers.
+/// while it waits; and a kept value is answered without joining a build under way. On a
+/// cold slot, a reader whose stop fired before its claim, or once it claimed, builds and
+/// keeps nothing. Five cases, each run before the test answers.
 #[test]
 fn a_reader_whose_stop_fired_builds_nothing_and_a_kept_value_joins_no_build() {
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
@@ -848,6 +849,38 @@ fn a_reader_whose_stop_fired_builds_nothing_and_a_kept_value_joins_no_build() {
         let _ = slot.kept.set(Arc::new(5));
         if get_or_build(&slot, &|| true, || 3) != Some(5) {
             wrong.push("kept, a build under way");
+        }
+    }
+    // Case 4: a cold slot, its stop fired before the claim: nothing built, kept or claimed.
+    {
+        let slot: Slot<u64> = Slot::default();
+        let built = AtomicUsize::new(0);
+        let got = get_or_build(&slot, &|| true, || {
+            built.fetch_add(1, SeqCst);
+            3
+        });
+        if got.is_some() || built.load(SeqCst) > 0 || slot.get().is_some() || !slot.build.is_idle()
+        {
+            wrong.push("cold, stopped before the claim");
+        }
+    }
+    // Case 5: a cold slot, its stop firing once the claim is made: the claimed build is let
+    // go unrun, nothing kept, and it ends abandoned (its waiters claim again).
+    {
+        let slot: Slot<u64> = Slot::default();
+        let (asked, built) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let stop = || asked.fetch_add(1, SeqCst) >= 1;
+        let got = get_or_build(&slot, &stop, || {
+            built.fetch_add(1, SeqCst);
+            3
+        });
+        if got.is_some()
+            || built.load(SeqCst) > 0
+            || slot.get().is_some()
+            || !slot.build.is_idle()
+            || slot.build.ends().abandoned != 1
+        {
+            wrong.push("cold, stopped once claimed");
         }
     }
     assert!(wrong.is_empty(), "wrong at: {wrong:?}");
