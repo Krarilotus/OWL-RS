@@ -395,9 +395,16 @@ if { [ "$mode" = windows ] || [ "$mode" = push ]; } && [ -z "${NRESE_ON_BUILD_HO
     fi
     exit 0
   fi
+  # A pass for this tree on more files covers these: the tier never runs fewer checks for more
+  # files (scripts/lib/gate-key.sh gate_covering).
+  if [ "$mode" = push ] && record=$(gate_covering "$mode" "$keyed" "$list" "$identity"); then
+    echo "=== $mode: $(git rev-parse --short "$push_commit") passed on the fleet before (its tree, files including these)"
+    exit 0
+  fi
   bash scripts/lib/fleet-gate.sh "$mode" "$list" "$tree" "$list_hash" "$identity" "$where" "$push_commit" "${push_base:-}"
   case $? in
-    0) gate_record "$key" "$on$(cat "$where")"; exit 0 ;;
+    0) [ "$mode" != push ] || gate_list_keep "$list"
+       gate_record "$key" "$on$(cat "$where")"; exit 0 ;;
     1) exit 1 ;;
     *) echo "no fleet verdict for $(git rev-parse --short "$push_commit") (tree $tree): no $mode pass; the $mode" \
          "tier runs on the fleet only" >&2

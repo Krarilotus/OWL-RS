@@ -10,7 +10,8 @@
 #   checked commit's inputs (windows_inputs), so a pass carries to a later commit with the same
 #   inputs;
 # - file list: the hash of the files the tier was selected from (the pushed range's; none for
-#   `windows`, which runs everything);
+#   `windows`, which runs everything); a push pass keeps its list, and covers a push of the same
+#   tree whose files it holds (gate_covering);
 # - the toolchain rustc +<the commit's channel> -vV reports (a host with
 #   another install or an override doesn't match), and the flags rustc gets
 #   (scripts/cargo-guarded.sh --print-rustflags: `-C target-cpu=native` means each machine's own
@@ -112,6 +113,39 @@ gate_pass() {
   [ -z "${NRESE_GATE_RERUN:-}" ] && awk -v k="$1 |" \
     'index($0, k) == 1 { print substr($0, length(k) + 2); found = 1; exit } END { exit !found }' \
     "$(gate_passed_file)" 2> /dev/null
+}
+
+# gate_list_keep LIST: LIST, the file list a push pass is recorded for, kept in the repository's
+# objects under its hash (the key's file list), so gate_covering can read it back. Git prunes it
+# with other unreachable objects in time; a pass whose list is gone counts for its exact list only.
+gate_list_keep() { git hash-object -w "$1" > /dev/null; }
+
+# gate_covering TIER TREE LIST IDENTITY: the record of a pass for TREE (its key's tier, identity
+# and W3C mark the same as gate_key's) whose recorded file list holds every file of LIST, if one is
+# recorded. The push tier given more files never runs fewer checks (more crates, each tested at
+# least as fully, more side steps: benches/suite/tests/test_push_tier_monotone.py), so a pass for
+# the same tree on more files covers LIST. Two approved branches then land one after the other on
+# one gate run: the second's pass, gated on top of the first, covers the narrower range left once
+# the first landed.
+gate_covering() {
+  local prefix="$1${NRESE_W3C_OPTIONAL:+ w3c-optional} $2 " suffix=" $4 fleet" passed line key hash
+  passed=$(gate_passed_file)
+  [ -z "${NRESE_GATE_RERUN:-}" ] && [ -f "$passed" ] || return 1
+  while IFS= read -r line; do
+    key=${line%% | *}
+    case $key in "$prefix"*"$suffix") ;; *) continue ;; esac
+    hash=${key#"$prefix"}
+    hash=${hash%"$suffix"}
+    [[ $hash =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] || continue
+    git cat-file -e "$hash^{blob}" 2> /dev/null || continue
+    # Every file of LIST in the recorded list (an empty recorded list holds only the empty one).
+    if git cat-file blob "$hash" | awk '!listed { held[$0] = 1; next } !($0 in held) { missing = 1; exit }
+                                        END { exit missing }' - listed=1 "$3"; then
+      printf '%s\n' "${line#* | }"
+      return 0
+    fi
+  done < "$passed"
+  return 1
 }
 
 # gate_record KEY WHERE: KEY passed (WHERE: the fleet job, its host and CPU; for windows first the

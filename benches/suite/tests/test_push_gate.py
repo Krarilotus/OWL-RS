@@ -322,6 +322,49 @@ class PushGate(Repo):
         self.assertNotEqual(done.returncode, 0, f"SPEC pushed-tree: a tree passed on another's result\n{done.stderr}")
         self.assertEqual([tree for _, tree, _ in self.jobs()], [self.tree(first), self.tree(second)])
 
+    def test_a_pass_on_more_files_covers_a_narrower_push_of_its_tree(self):
+        """Spec (21 Nov 2026): a pass for the same tree whose recorded file list contains the
+        pushed range's files lets the push through with no job: the push tier never runs fewer
+        checks for more files (test_push_tier_monotone.py). The second of two approved branches,
+        gated on top of the first, lands on that pass once the first has landed."""
+        first = self.commit("a.txt", "a changed\n")
+        tip = self.commit("b.txt", "b changed\n")
+        self.fleet("done", self.tree(tip), ["a.txt", "b.txt"])
+        done = self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", ZERO))
+        self.assertEqual(done.returncode, 0, f"SPEC verified: {done.stderr}")
+        self.fleet("pending")
+        narrower = self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", first))
+        self.assertEqual((narrower.returncode, len(self.jobs())), (0, 1),
+                         f"SPEC covering-pass: the pass on [a.txt, b.txt] didn't cover [b.txt]\n{narrower.stderr}")
+
+    def test_a_pass_on_fewer_or_other_files_covers_nothing_more(self):
+        """A pass covers only files its list holds: a push of its tree whose range has a file it
+        didn't hold is gated on its own (here refused: no verdict)."""
+        first = self.commit("a.txt", "a changed\n")
+        tip = self.commit("b.txt", "b changed\n")
+        self.fleet("done", self.tree(tip), ["b.txt"])
+        done = self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", first))
+        self.assertEqual(done.returncode, 0, f"SPEC verified: {done.stderr}")
+        self.fleet("pending")
+        wider = self.push(("refs/heads/pkg/y", tip, "refs/heads/pkg/y", ZERO))
+        self.assertEqual((wider.returncode != 0, len(self.jobs())), (True, 2),
+                         f"SPEC covering-pass: a pass on [b.txt] let [a.txt, b.txt] through\n{wider.stderr}")
+
+    def test_a_pass_on_more_files_covers_only_its_own_tree(self):
+        """A pass on more files never covers another tree: a later tip whose range's files the pass
+        held is still gated on its own."""
+        self.commit("a.txt", "a changed\n")
+        second = self.commit("b.txt", "b changed\n")
+        self.fleet("done", self.tree(second), ["a.txt", "b.txt"])
+        done = self.push(("refs/heads/pkg/x", second, "refs/heads/pkg/x", ZERO))
+        self.assertEqual(done.returncode, 0, f"SPEC verified: {done.stderr}")
+        third = self.commit("b.txt", "b changed again\n")
+        self.fleet("pending")
+        later = self.push(("refs/heads/pkg/x", third, "refs/heads/pkg/x", second))
+        self.assertEqual((later.returncode != 0, [tree for _, tree, _ in self.jobs()]),
+                         (True, [self.tree(second), self.tree(third)]),
+                         f"SPEC covering-pass: another tree passed on a wider list's pass\n{later.stderr}")
+
     def test_the_files_come_from_the_pushed_range(self):
         """The gate is told the files of the pushed range, from where the remote has the branch
         (or, new there, where it left refactor/engine-v2) to the pushed commit: not the last commit's
