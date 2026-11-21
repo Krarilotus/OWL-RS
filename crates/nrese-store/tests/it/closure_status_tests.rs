@@ -1246,21 +1246,10 @@ impl Fillers {
 ///   (Profiles §4.2.3, `subClassExpression`).
 ///
 /// By default use fixed constructors, including the shared class union that exposed a
-/// kind error. With `NRESE_CHECK_TIER=nightly` draw 200 cases per stream unless overridden.
+/// kind error. With `NRESE_CHECK_TIER=nightly` draw 200 cases per stream.
 #[test]
 fn generated_fillers_are_read_by_their_kind_seed_5eedda7a() {
     let full = nightly();
-    let count = match std::env::var("NRESE_FUZZ_CASES") {
-        Ok(value) => Some(
-            value
-                .parse::<usize>()
-                .ok()
-                .filter(|&count| count > 0)
-                .expect("NRESE_FUZZ_CASES must be a positive integer"),
-        ),
-        Err(std::env::VarError::NotPresent) => full.then_some(200),
-        Err(error) => panic!("NRESE_FUZZ_CASES: {error}"),
-    };
     let data_witnesses = [
         ("datatype", "xsd:integer"),
         ("oneOf", "[ a rdfs:Datatype ; owl:oneOf ( 5 7 ) ]"),
@@ -1322,9 +1311,9 @@ fn generated_fillers_are_read_by_their_kind_seed_5eedda7a() {
     };
     let (aged, social) = ("ASK { :a a :Aged }", "ASK { :a a :Social }");
     let rl_data = |range: &str| format!("{} :a :age \"5\"^^xsd:int .", data_existential(range));
-    if let Some(count) = count {
+    if full {
         let mut fillers = Fillers::new();
-        for i in 0..count {
+        for i in 0..200 {
             let range = fillers.data(3);
             let data = format!("{} {}", fillers.take(), data_existential(&range));
             check(&format!("data {i}"), &data, aged, "", Some(false));
@@ -1340,7 +1329,7 @@ fn generated_fillers_are_read_by_their_kind_seed_5eedda7a() {
             );
         }
         let mut fillers = Fillers::new();
-        for i in 0..count {
+        for i in 0..200 {
             let range = fillers.rl_data(3);
             let data = format!("{} {}", fillers.take(), rl_data(&range));
             check(&format!("rl {i}"), &data, aged, "true", None);
@@ -1364,7 +1353,7 @@ fn generated_fillers_are_read_by_their_kind_seed_5eedda7a() {
         }
     }
     assert!(wrong.is_empty(), "{} wrong: {wrong:#?}", wrong.len());
-    if count.is_none() {
+    if !full {
         use std::collections::BTreeSet;
         let witnesses = [
             (
