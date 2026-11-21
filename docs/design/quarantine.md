@@ -81,6 +81,14 @@ error. Re-admitting one takes the fixed text.
   found at a start is from a load that didn't
   commit (a crash between the engine's commit and the rename loses that load's
   quarantine, not its data) and is removed.
+  The rename is made durable by syncing the directory. If the rename or that sync fails
+  with the file under its name (a failed rename may still have moved it), the name isn't
+  durable. A load that published nothing then takes its file back: it removes the file
+  and syncs the directory again, so that sending it again doesn't quarantine its
+  statements twice. Only when both hold does its error call sending it again safe;
+  otherwise the error names the load, whose records may be listed. A load that published
+  keeps its file, listed and counted, so that its statements can still be reviewed; its
+  error names the load, and a power loss may lose the file.
 - `resolutions.jsonl`: append-only, one record per resolved statement (`outcome`
   `readmitted` with the commit's revision, or `discarded`; when; the repairs; the text
   admitted where it isn't the quarantined one; a note). On open, an incomplete final

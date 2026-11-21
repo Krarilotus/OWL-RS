@@ -1015,14 +1015,14 @@ pub enum QuarantineCommitError {
 
 impl QuarantineCommitError {
     /// Tells the caller what happened when the load published no RDF changes; `retry_action`
-    /// is how the caller sends it again (`send`, `load`).
+    /// is how the caller sends it again, a verb whose `-ing` form is regular (`send`, `load`).
     pub fn unpublished_message(&self, retry_action: &str) -> String {
         let advice = match self {
             Self::NotListed(_) => {
                 format!("It's safe to {retry_action} it again once the cause is resolved.")
             }
             Self::PossiblyListed { load, .. } => format!(
-                "This load's records may still be listed under load ID {load}. If they are, stop the server and remove quarantine/load-{load}.jsonl from its data directory before you {retry_action} it again."
+                "This load's records may be listed under load ID {load}. If they are, its quarantine is kept: don't {retry_action} it again. If they aren't, {retry_action}ing it again is safe."
             ),
         };
         format!(
@@ -1188,8 +1188,15 @@ impl Collector<'_> {
             // load of only invalid statements publishes nothing else.
             let listed = partial.with_extension("jsonl");
             let dir = partial.parent().expect("in the quarantine directory");
-            self.rename_into_place(partial, &listed)?;
-            if let Err(reason) = self.sync_placement(dir) {
+            let placed = match self.rename_into_place(partial, &listed) {
+                // A rename that reports an error may have moved the file anyway (Windows'
+                // write-through move): listed, it is a placement not made durable.
+                Err(error) if matches!(listed.try_exists(), Ok(false)) => {
+                    return Err(error.into());
+                }
+                placed => placed.and_then(|()| self.sync_placement(dir)),
+            };
+            if let Err(reason) = placed {
                 let withdrawal = match published {
                     true => Withdrawal::Kept,
                     false => self.withdraw(&listed, dir),
