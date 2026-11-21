@@ -940,6 +940,7 @@ const LITERAL_EQUALITY: &str = "the rules equate two literals as one value (an o
 /// - The rules equate a literal with another term (`state`): a read of a property that may
 ///   hold literals in `snapshot` ([`holds_literals`]; a variable predicate, any; for a
 ///   reader of some graphs, every property, as [`certify`] reads them), [`LITERAL_EQUALITY`].
+/// - An import no loaded ontology answers ([`unread_import`]): every read.
 pub(crate) fn withhold(
     completeness: &mut Completeness,
     (query, reads): (&Query, &Reads),
@@ -964,7 +965,68 @@ pub(crate) fn withhold(
     if state.literal_equality && read.iter().any(literals) {
         completeness.incomplete(source, LITERAL_EQUALITY.to_owned());
     }
+    if let Some(target) = unread_import(snapshot, reads.access.as_deref()) {
+        completeness.incomplete(
+            source,
+            format!(
+                "the store holds owl:imports {target}, and no ontology with that IRI is \
+                 loaded: its axioms take no part in reasoning"
+            ),
+        );
+    }
     negation_rule(completeness, (query, reads), source);
+}
+
+/// The W3C vocabulary documents, whose meaning is built in: an import of one counts as read.
+const BUILT_IN_ONTOLOGIES: [&str; 4] = [
+    "http://www.w3.org/1999/02/22-rdf-syntax-ns",
+    "http://www.w3.org/2000/01/rdf-schema",
+    "http://www.w3.org/2002/07/owl",
+    "http://www.w3.org/2001/XMLSchema",
+];
+
+/// The first ontology an asserted `owl:imports` names that the statements a read reasons over
+/// don't hold (OWL 2 Structural Specification §3.4): no `<t> a owl:Ontology` and no
+/// `?o owl:versionIRI <t>` among them, and not a W3C vocabulary ([`BUILT_IN_ONTOLOGIES`], with
+/// or without its trailing `#`). The store follows no import, so that ontology's axioms take
+/// no part in reasoning. Every `owl:imports` the store holds is checked, an imported
+/// ontology's own too, so the closure of imports is checked link by link. A document address
+/// is no ontology IRI: it is read only where a header names it. The statements reasoned over
+/// are the whole store's, or, for a reader who sees the inferences its graphs support
+/// (`access`), its own graphs'. One index lookup where the store never held `owl:imports`.
+fn unread_import(
+    snapshot: &Snapshot,
+    access: Option<&nrese_sparql::GraphAccess>,
+) -> Option<String> {
+    let id = |iri: &str| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into());
+    let imports = id("http://www.w3.org/2002/07/owl#imports")?;
+    let by_support = access.filter(|a| a.inferred_by_support);
+    let readable = |g: TermId| by_support.is_none_or(|a| a.allows_id(snapshot, g));
+    let held = |pattern: QuadPattern| {
+        (snapshot.quads_for_pattern_in(ReadModel::Asserted, &pattern)).any(|q| readable(q.graph))
+    };
+    let (ty, ontology) = (id(RDF_TYPE), id("http://www.w3.org/2002/07/owl#Ontology"));
+    let version = id("http://www.w3.org/2002/07/owl#versionIRI");
+    let pattern = any_graph(None, Some(imports), None);
+    (snapshot.quads_for_pattern_in(ReadModel::Asserted, &pattern))
+        .filter(|q| readable(q.graph))
+        .map(|q| q.object)
+        .find(|&target| {
+            let built_in = matches!(snapshot.decode(target), Some(Term::NamedNode(iri))
+                if BUILT_IN_ONTOLOGIES.contains(&iri.as_str().trim_end_matches('#')));
+            let header = || {
+                ty.zip(ontology)
+                    .is_some_and(|(ty, o)| held(any_graph(Some(target), Some(ty), Some(o))))
+            };
+            let versioned =
+                || version.is_some_and(|v| held(any_graph(None, Some(v), Some(target))));
+            !(built_in || header() || versioned())
+        })
+        .map(|target| {
+            snapshot
+                .decode(target)
+                .map_or_else(|| format!("term {}", target.raw()), |t| t.to_string())
+        })
 }
 
 /// Whether a statement read with `predicate` (any, where `None`) has a literal object, of
