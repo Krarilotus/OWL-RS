@@ -40,12 +40,10 @@ pub struct ReadyResponse {
     pub reasoning_semantic_tier: &'static str,
     /// Under `owl2-dl`: the data's consistency under OWL 2 DL, as last checked.
     pub dl: Option<DlReady>,
-    /// The repositories that can't serve (`id: unavailable`): the server stays ready for
-    /// the others, so that a load balancer keeps it.
+    /// Unavailable repositories and stopped maintenance workers. The server stays ready
+    /// for stores that can serve.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub degraded: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub maintenance_error: Option<String>,
 }
 
 /// The `owl2-dl` mode's status.
@@ -165,8 +163,8 @@ pub struct ExtendedHealthResponse {
     pub reasoning_mode: &'static str,
     pub reasoning_profile: &'static str,
     pub ontology_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub maintenance_error: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub degraded: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -200,8 +198,8 @@ pub fn build_ready_response(
     identity: &crate::auth::Identity,
 ) -> Result<ReadyResponse, ApiError> {
     super::guard::whole_read_scope(state.access_view(identity))?;
-    let store = state.store();
-    let stats = store
+    let stats = state
+        .store()
         .stats()
         .map_err(|error| ApiError::internal(error.to_string()))?;
     let posture = state.runtime_posture();
@@ -254,7 +252,6 @@ pub fn build_ready_response(
                 },
             }),
         degraded: state.degraded(),
-        maintenance_error: store.maintenance_error().map(|error| error.to_string()),
     })
 }
 
@@ -371,7 +368,7 @@ pub fn build_extended_health_response(
         reasoning_mode: ready.reasoning_mode,
         reasoning_profile: ready.reasoning_profile,
         ontology_path: ready.ontology_path,
-        maintenance_error: ready.maintenance_error,
+        degraded: ready.degraded,
     }
 }
 

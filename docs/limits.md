@@ -631,8 +631,9 @@ leave something out.
 
 ## Storage and transactions
 
-- If the background maintenance worker ends, extended health reports where it stopped
-  and the write-ahead log keeps growing with new commits until restart.
+- If the background maintenance worker stops, the `degraded` list in detailed health and info
+  reports where it stopped, and new commits grow the write-ahead log and uncompacted run stacks
+  until restart, slowing reads and increasing index memory.
 - A commit holds at most 4 GiB of log payload, about 130 M quads.
   Larger loads go through the bulk loader
   ([storage](spec/02-storage-and-transactions.md#limits)).

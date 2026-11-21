@@ -837,6 +837,7 @@ struct Worker {
     thread: Option<JoinHandle<()>>,
     life: Arc<Lifecycle>,
     terminal: Terminal<&'static str>,
+    reported_end: AtomicBool,
 }
 
 impl Worker {
@@ -860,14 +861,11 @@ impl Worker {
                             let again = Self::task(&shared, &life);
                             // Again once what held it up has ended (this thread may wait).
                             if again.merge {
-                                *life.step.lock() = "compaction";
                                 shared.versions.wait_for_merge();
                             }
                             if again.checkpoint {
-                                *life.step.lock() = "checkpoint";
                                 shared.wait_for_checkpoint();
                             }
-                            *life.step.lock() = "worker";
                             if !(again.merge || again.checkpoint) {
                                 break;
                             }
@@ -880,7 +878,16 @@ impl Worker {
             thread: Some(thread),
             life,
             terminal,
+            reported_end: AtomicBool::new(false),
         })
+    }
+
+    fn end_error(&self, step: &'static str) -> EngineError {
+        // Logging can call a subscriber. Do it in a reader, outside the guard's unwind.
+        if !self.reported_end.swap(true, Ordering::Relaxed) {
+            tracing::error!(step, "maintenance ended");
+        }
+        EngineError::MaintenanceEnded(step)
     }
 
     /// Runs one task and waits for it: on the pool while the engine lives, on this thread
@@ -1312,7 +1319,7 @@ impl Engine {
                 .terminal
                 .wait_until(Instant::now() + Duration::from_millis(1))
             {
-                return Err(EngineError::MaintenanceEnded(step));
+                return Err(worker.end_error(step));
             }
         }
         self.maintenance_error().map_or(Ok(()), Err)
@@ -1320,12 +1327,8 @@ impl Engine {
 
     /// The background worker's recorded error, once it has ended.
     pub fn maintenance_error(&self) -> Option<EngineError> {
-        self.inner
-            .worker
-            .as_ref()?
-            .terminal
-            .get()
-            .map(EngineError::MaintenanceEnded)
+        let worker = self.inner.worker.as_ref()?;
+        worker.terminal.get().map(|step| worker.end_error(step))
     }
 
     /// Compacts until the policy is satisfied, waiting for any background merge. On a Rayon

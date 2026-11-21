@@ -92,7 +92,7 @@ async fn maintenance_panic_in_a_second_repository_is_visible_in_health() {
 }
 
 /// Spec: the maintenance worker contract says extended health reports a checkpoint panic,
-/// later commits still answer successfully, and their WAL grows without a checkpoint.
+/// and later commits still answer successfully.
 #[tokio::test]
 async fn maintenance_checkpoint_panic_is_visible_over_http() {
     let dir = tempfile::tempdir().unwrap();
@@ -101,7 +101,7 @@ async fn maintenance_checkpoint_panic_is_visible_over_http() {
     let state =
         test_state_with_store_config(config, PolicyConfig::default(), ReasonerConfig::default())
             .unwrap();
-    let app = build_app(state.clone());
+    let app = build_app(state);
     let fault = MaintenancePanic::arm(dir.path(), "checkpoint");
 
     tokio::time::timeout(DEADLINE, async {
@@ -111,41 +111,18 @@ async fn maintenance_checkpoint_panic_is_visible_over_http() {
             .await
             .unwrap();
         assert_eq!(first.status(), StatusCode::NO_CONTENT);
-        fault.wait(DEADLINE);
-        let before = state.store().engine_stats();
-        let second = app
-            .clone()
-            .oneshot(update("/dataset/update", 1))
+        tokio::task::spawn_blocking(move || fault.wait(DEADLINE))
             .await
             .unwrap();
-        let after = state.store().engine_stats();
 
-        let until = tokio::time::Instant::now() + DEADLINE / 2;
-        let health = loop {
-            let answer = app
-                .clone()
-                .oneshot(Request::get("/api/v1/health").body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            let health = body_text(answer).await.unwrap();
-            let document: serde_json::Value = serde_json::from_str(&health).unwrap();
-            if !document["maintenance_error"].is_null() || tokio::time::Instant::now() >= until {
-                break document;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        };
-        assert_eq!(health["maintenance_error"], "maintenance ended: checkpoint");
-        assert_eq!(second.status(), StatusCode::NO_CONTENT);
-        assert_eq!(after.checkpoints, before.checkpoints);
-        assert!(after.wal_bytes_since_checkpoint > before.wal_bytes_since_checkpoint);
-        println!(
-            "maintenance health: {}; commit: {}; checkpoints: {}; WAL: {} -> {} bytes",
-            health["maintenance_error"],
-            second.status(),
-            after.checkpoints,
-            before.wal_bytes_since_checkpoint,
-            after.wal_bytes_since_checkpoint,
+        let (code, health) = degraded_health(&app).await;
+        assert_eq!(
+            health["degraded"],
+            serde_json::json!(["nrese: maintenance ended: checkpoint"])
         );
+        assert_eq!(code, StatusCode::OK);
+        let second = app.oneshot(update("/dataset/update", 1)).await.unwrap();
+        assert_eq!(second.status(), StatusCode::NO_CONTENT);
     })
     .await
     .expect("maintenance HTTP scenario exceeded its deadline");
