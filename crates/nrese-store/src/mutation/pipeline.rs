@@ -592,10 +592,7 @@ impl MutationPipeline {
             return Ok(());
         }
         let first = report.results.first().map_or_else(String::new, |result| {
-            format!(
-                "; first: focus node {}, {}",
-                result.focus_node, result.component
-            )
+            format!("; first: {}", crate::shacl::described(result))
         });
         let detail = format!(
             "the commit introduces {} SHACL result(s) and {} failure(s){first}",

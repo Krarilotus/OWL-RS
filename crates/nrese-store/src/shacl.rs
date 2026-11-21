@@ -309,6 +309,17 @@ fn introduced_in<A: ReadView + Sync, B: ReadView + Sync>(
     )?))
 }
 
+/// A result as a refusal names it: its focus node and component, and its messages
+/// (`sh:resultMessage`) where it has any.
+pub(crate) fn described(result: &nrese_shacl::ValidationResult) -> String {
+    let mut text = format!("focus node {}, {}", result.focus_node, result.component);
+    for (i, message) in result.messages.iter().enumerate() {
+        text.push_str(if i == 0 { ", message " } else { ", " });
+        text.push_str(&message.to_string());
+    }
+    text
+}
+
 /// The SHACL reason a restricted committer's view shows: the results the commit introduces
 /// in the statements asserted in graphs it may read, against the shapes of the shapes
 /// graph, if it may read that ([`crate::mutation::evidence::Readable`]). `None` if there
@@ -362,10 +373,9 @@ pub(crate) fn view_reason(
         )
     })?;
     let reason = format!(
-        "the commit introduces {} SHACL result(s) the gate rejects; first: focus node {}, {}",
+        "the commit introduces {} SHACL result(s) the gate rejects; first: {}",
         rejecting.len(),
-        first.focus_node,
-        first.component
+        described(first)
     );
     Some(crate::mutation::evidence::shown(
         crate::RejectKind::ShapesViolated,

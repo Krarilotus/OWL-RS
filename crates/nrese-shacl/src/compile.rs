@@ -15,8 +15,8 @@ use nrese_sparql_syntax::{Query, SparqlParser};
 
 use crate::graph::{GraphView, Selection};
 use crate::model::{
-    Bound, Component, Constraint, Logical, NodeKind, Path, SH, Severity, Shape, ShapeRef, Shapes,
-    SparqlCheck, Target,
+    Bound, Component, Constraint, Logical, Message, NodeKind, Path, SH, Severity, Shape, ShapeRef,
+    Shapes, SparqlCheck, Target,
 };
 use crate::sparql;
 
@@ -620,6 +620,18 @@ impl<V: ReadView> Compiler<'_, V> {
             .map(|literal| literal.value().to_owned())
     }
 
+    /// A SPARQL check's `sh:message`s, each with its template if it has blocks to fill in.
+    fn messages(&self, ids: Vec<TermId>) -> Vec<Message> {
+        ids.into_iter()
+            .map(|id| Message {
+                id,
+                template: self
+                    .literal(id)
+                    .and_then(|literal| sparql::Template::parse(&literal)),
+            })
+            .collect()
+    }
+
     /// The `PREFIX` lines `node`'s `sh:prefixes` declare: the `sh:declare`s of each value
     /// and of what it imports (`owl:imports`), transitively.
     fn prefixes(&self, node: TermId) -> String {
@@ -729,7 +741,7 @@ impl<V: ReadView> Compiler<'_, V> {
                 query,
                 ask: false,
                 parameters: Vec::new(),
-                messages: self.values(constraint, "message"),
+                messages: self.messages(self.values(constraint, "message")),
             })));
         }
     }
@@ -858,7 +870,7 @@ impl<V: ReadView> Compiler<'_, V> {
                 query,
                 ask,
                 parameters: values,
-                messages,
+                messages: self.messages(messages),
             })));
         }
     }

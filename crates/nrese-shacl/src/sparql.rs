@@ -21,13 +21,16 @@
 //!
 //! **Results** map solutions as §5.3.2 says: `sh:focusNode` the focus node, `sh:resultPath`
 //! `?path` if it is an IRI else the shape's path, `sh:value` `?value` if bound else, for a
-//! node shape, the focus node. `?failure` true is a validation failure.
+//! node shape, the focus node. `?failure` true is a validation failure. `sh:resultMessage` is
+//! `?message` if it is bound to a literal, else the `sh:message`s of the constraint (of the
+//! validator, else of the component), their `{?name}` and `{$name}` blocks filled in
+//! ([`Template`]); a result with neither has its shape's messages, if any (§2.1.5).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use nrese_engine::TermId;
-use nrese_rdf::{NamedNode, Term, Variable};
+use nrese_rdf::{Literal, NamedNode, Term, Variable};
 use nrese_sparql::{
     QueryEvaluationError, QueryOptions, QueryResults, QuerySolution, QuerySolutionIter, ReadView,
     Resources,
@@ -42,6 +45,8 @@ pub(crate) const THIS: &str = "this";
 pub(crate) const CURRENT_SHAPE: &str = "currentShape";
 pub(crate) const SHAPES_GRAPH: &str = "shapesGraph";
 pub(crate) const VALUE: &str = "value";
+/// The variable a SELECT query binds a result's message to (SHACL §5.3.2).
+const MESSAGE: &str = "message";
 /// The placeholder for a property shape's path (SHACL §5.2): legal only as the predicate of
 /// a triple pattern, where it is read as the path.
 pub(crate) const PATH: &str = "PATH";
@@ -167,12 +172,116 @@ pub(crate) fn path_expression(
     })
 }
 
-/// A solution of a SELECT check, as a result: the value and path it names, if any (taken out
-/// of the solution, not copied), and whether it reports a failure.
+/// A solution of a SELECT check, as a result: the value, path and message it names, if any
+/// (taken out of the solution, not copied), the bindings its check's message templates name
+/// ([`SparqlCheck::template_variables`]), and whether it reports a failure.
 pub(crate) struct Found {
     pub(crate) value: Option<Term>,
     pub(crate) path: Option<NamedNode>,
+    pub(crate) message: Option<Literal>,
+    pub(crate) bindings: Vec<(String, Term)>,
     pub(crate) failure: bool,
+}
+
+/// An `sh:message` with `{?name}` or `{$name}` blocks (SHACL §5.3.2): "These {?varName} and
+/// {$varName} blocks SHOULD be replaced with suitable string representations of the values
+/// of said variables." Its literal's language tag (and direction) or datatype is kept.
+#[derive(Debug, Clone)]
+pub(crate) struct Template {
+    literal: Literal,
+    parts: Vec<Part>,
+}
+
+#[derive(Debug, Clone)]
+enum Part {
+    Text(String),
+    /// A block: its variable's name, and the block as written (`{?name}` or `{$name}`).
+    Variable {
+        name: String,
+        block: String,
+    },
+}
+
+impl Template {
+    /// The template of `literal`, if it has a block: `{`, `?` or `$`, a variable name (SPARQL
+    /// `VARNAME`, read here as letters, digits and `_`), `}`.
+    pub(crate) fn parse(literal: &Literal) -> Option<Self> {
+        let text = literal.value();
+        let mut parts = Vec::new();
+        let mut plain = 0;
+        let mut at = 0;
+        while let Some(open) = text[at..].find('{').map(|i| at + i) {
+            let block = text[open + 1..].strip_prefix(['?', '$']).and_then(|rest| {
+                let name_len = rest
+                    .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .unwrap_or(rest.len());
+                (name_len > 0 && rest[name_len..].starts_with('}')).then(|| &rest[..name_len])
+            });
+            match block {
+                Some(name) => {
+                    if plain < open {
+                        parts.push(Part::Text(text[plain..open].to_owned()));
+                    }
+                    // `{`, the sigil, the name and `}`.
+                    at = open + name.len() + 3;
+                    parts.push(Part::Variable {
+                        name: name.to_owned(),
+                        block: text[open..at].to_owned(),
+                    });
+                    plain = at;
+                }
+                None => at = open + 1,
+            }
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        if plain < text.len() {
+            parts.push(Part::Text(text[plain..].to_owned()));
+        }
+        Some(Self {
+            literal: literal.clone(),
+            parts,
+        })
+    }
+
+    /// The names of the variables its blocks name.
+    pub(crate) fn variables(&self) -> impl Iterator<Item = &str> {
+        self.parts.iter().filter_map(|part| match part {
+            Part::Variable { name, .. } => Some(name.as_str()),
+            Part::Text(_) => None,
+        })
+    }
+
+    /// The message with each block replaced by the text of `value`'s term for its variable: a
+    /// literal's lexical form, an IRI's text, any other term as N-Triples writes it. A block
+    /// whose variable has no value is left as written.
+    pub(crate) fn fill<'t>(&self, value: impl Fn(&str) -> Option<&'t Term>) -> Literal {
+        let mut text = String::new();
+        for part in &self.parts {
+            match part {
+                Part::Text(plain) => text.push_str(plain),
+                Part::Variable { name, block } => match value(name) {
+                    Some(Term::Literal(literal)) => text.push_str(literal.value()),
+                    Some(Term::NamedNode(iri)) => text.push_str(iri.as_str()),
+                    Some(other) => text.push_str(&other.to_string()),
+                    None => text.push_str(block),
+                },
+            }
+        }
+        let literal = &self.literal;
+        match (literal.language(), literal.direction()) {
+            (Some(language), Some(direction)) => {
+                Literal::new_directional_language_tagged_literal_unchecked(
+                    text, language, direction,
+                )
+            }
+            (Some(language), None) => {
+                Literal::new_language_tagged_literal_unchecked(text, language)
+            }
+            (None, _) => Literal::new_typed_literal(text, literal.datatype().into_owned()),
+        }
+    }
 }
 
 /// What a check found for one focus node: per value node (ASK) or per solution (SELECT).
@@ -282,32 +391,55 @@ pub(crate) fn run<'a, V: ReadView>(
 
 /// A SELECT check's solution, as a result ([`Outcome::Solutions`] yields them as they are
 /// read: each is decoded, used and dropped before the next). Its terms are moved out of it,
-/// not copied; a row that reports `?failure` has its value and path dropped with it.
-pub(crate) fn found(solution: QuerySolution) -> Found {
+/// not copied, but for those `check`'s message templates name, which are copied first; a row
+/// that reports `?failure` has its terms dropped with it.
+pub(crate) fn found(solution: QuerySolution, check: &SparqlCheck) -> Found {
     let at = |name: &str| {
         solution
             .variables()
             .iter()
             .position(|variable| variable.as_str() == name)
     };
-    let (failure_at, path_at, value_at) = (at("failure"), at("path"), at(VALUE));
+    let (failure_at, path_at, value_at, message_at) =
+        (at("failure"), at("path"), at(VALUE), at(MESSAGE));
+    let mut named: Vec<(String, usize)> = Vec::new();
+    for name in check.template_variables() {
+        if let Some(at) = at(name)
+            && !named.iter().any(|(seen, _)| seen == name)
+        {
+            named.push((name.to_owned(), at));
+        }
+    }
     let mut values = solution.into_values();
-    let mut take = |at: Option<usize>| at.and_then(|at| values.get_mut(at)?.take());
-    let failure = matches!(take(failure_at), Some(Term::Literal(l)) if l.value() == "true");
-    if failure {
+    let failure = failure_at.and_then(|at| values.get(at)?.as_ref());
+    if matches!(failure, Some(Term::Literal(l)) if l.value() == "true") {
         return Found {
             value: None,
             path: None,
-            failure,
+            message: None,
+            bindings: Vec::new(),
+            failure: true,
         };
     }
+    let bindings = named
+        .into_iter()
+        .filter_map(|(name, at)| Some((name, values.get(at)?.clone()?)))
+        .collect();
+    let mut take = |at: Option<usize>| at.and_then(|at| values.get_mut(at)?.take());
     let path = match take(path_at) {
         Some(Term::NamedNode(path)) => Some(path),
+        _ => None,
+    };
+    // A message is a literal (§2.1.5); another term bound to `?message` is none.
+    let message = match take(message_at) {
+        Some(Term::Literal(message)) => Some(message),
         _ => None,
     };
     Found {
         value: take(value_at),
         path,
-        failure,
+        message,
+        bindings,
+        failure: false,
     }
 }

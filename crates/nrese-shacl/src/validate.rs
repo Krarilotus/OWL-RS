@@ -124,8 +124,10 @@ pub(crate) struct RawResult {
     pub(crate) component: Component,
     /// `sh:sourceConstraint` (SHACL-SPARQL).
     pub(crate) source: Option<TermId>,
-    /// The result's messages, where they aren't the shape's (SHACL-SPARQL).
-    pub(crate) messages: Option<Vec<TermId>>,
+    /// The result's messages, where they aren't the shape's (SHACL-SPARQL): an `sh:message`
+    /// as it is, or one a query bound or a template filled in, stored or computed as a value
+    /// is ([`Validator::result_term`]).
+    pub(crate) messages: Option<Vec<ResultTerm>>,
 }
 
 impl RawResult {
@@ -146,7 +148,14 @@ impl RawResult {
                 _ => 0,
             }
             + self.messages.as_ref().map_or(0, |messages| {
-                messages.capacity() * std::mem::size_of::<TermId>()
+                messages.capacity() * std::mem::size_of::<ResultTerm>()
+                    + messages
+                        .iter()
+                        .map(|message| match message {
+                            ResultTerm::Computed(computed) => computed.bytes(),
+                            ResultTerm::Stored(_) => 0,
+                        })
+                        .sum::<usize>()
             })
     }
 }
@@ -1108,14 +1117,16 @@ impl<'a, V: ReadView> Validator<'a, V> {
     ) {
         let shape = &self.shapes.shapes[shape_ref];
         let (view, data) = self.graph.parts();
-        let raw = |value: Option<ResultTerm>, path: Option<ResultPath>| RawResult {
+        let raw = |value: Option<ResultTerm>,
+                   path: Option<ResultPath>,
+                   messages: Option<Vec<ResultTerm>>| RawResult {
             focus,
             path,
             value,
             shape: shape_ref,
             component: check.component,
             source: check.source,
-            messages: (!check.messages.is_empty()).then(|| check.messages.clone()),
+            messages,
         };
         let failure = |problem: &str| {
             // Where failures are thrown away, none is made.
@@ -1164,12 +1175,22 @@ impl<'a, V: ReadView> Validator<'a, V> {
                 }
                 Err(sparql::Problem::Failed(error)) => failure(&error),
                 Ok(sparql::Outcome::Failed(failed)) => {
+                    // An ASK validator's solution is `$this` and `$value` (SHACL §6.3).
                     for value in failed {
+                        let messages = self.sparql_messages(
+                            check,
+                            None,
+                            Vec::new(),
+                            parameters,
+                            focus,
+                            Some(value),
+                        );
                         self.keep(
                             results,
                             raw(
                                 Some(ResultTerm::Stored(value)),
                                 shape.path.clone().map(ResultPath::Path),
+                                messages,
                             ),
                         );
                     }
@@ -1197,7 +1218,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
                         };
                         // The solution's terms are moved into the result, not copied; a
                         // `?failure` row's are dropped unread.
-                        let found = sparql::found(solution);
+                        let found = sparql::found(solution, check);
                         if found.failure {
                             failure("the query reported ?failure");
                             continue;
@@ -1213,12 +1234,74 @@ impl<'a, V: ReadView> Validator<'a, V> {
                             .path
                             .map(|path| self.result_path(path))
                             .or_else(|| shape.path.clone().map(ResultPath::Path));
-                        self.keep(results, raw(value, path));
+                        let messages = self.sparql_messages(
+                            check,
+                            found.message,
+                            found.bindings,
+                            parameters,
+                            focus,
+                            None,
+                        );
+                        self.keep(results, raw(value, path, messages));
                     }
                 }
             }
             ControlFlow::Continue(())
         });
+    }
+
+    /// A SHACL-SPARQL result's messages (SHACL §5.3.2, "executed from top to bottom, so that
+    /// the first bound value will be used"): `bound`, the solution's `?message`; else
+    /// `check`'s `sh:message`s, each template filled in from the solution's `bindings`, then
+    /// the `parameters`, `$this` (the `focus`) and, for an ASK validator, `$value`. None where
+    /// there is neither, so the shape's messages apply (§2.1.5).
+    fn sparql_messages(
+        &self,
+        check: &SparqlCheck,
+        bound: Option<nrese_rdf::Literal>,
+        mut bindings: Vec<(String, Term)>,
+        parameters: &[(nrese_rdf::Variable, TermId)],
+        focus: TermId,
+        value: Option<TermId>,
+    ) -> Option<Vec<ResultTerm>> {
+        if let Some(message) = bound {
+            return Some(vec![self.result_term(message.into())]);
+        }
+        if check.messages.is_empty() {
+            return None;
+        }
+        if check
+            .messages
+            .iter()
+            .any(|message| message.template.is_some())
+        {
+            let pre_bound = parameters
+                .iter()
+                .map(|(variable, id)| (variable.as_str(), *id))
+                .chain([(sparql::THIS, focus)])
+                .chain(value.map(|value| (sparql::VALUE, value)));
+            for (name, id) in pre_bound {
+                if let Some(term) = self.graph.decode(id) {
+                    bindings.push((name.to_owned(), term));
+                }
+            }
+        }
+        let value_of = |name: &str| {
+            bindings
+                .iter()
+                .find(|(bound, _)| bound == name)
+                .map(|(_, term)| term)
+        };
+        Some(
+            check
+                .messages
+                .iter()
+                .map(|message| match &message.template {
+                    None => ResultTerm::Stored(message.id),
+                    Some(template) => self.result_term(template.fill(value_of).into()),
+                })
+                .collect(),
+        )
     }
 }
 
