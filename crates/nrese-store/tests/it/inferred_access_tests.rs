@@ -702,11 +702,13 @@ fn a_pending_read_charges_its_view_to_the_query() {
 /// A read inside a transaction charges what its operations' replay reads and builds to its
 /// query's memory, as it charges the read itself (PR #50; G1's I37). Each row: a control
 /// that answers within the query's limit, then the read whose
-/// replay takes it past that limit, refused with the query's memory limit, not the server's.
-/// - The view: the replay's `WHERE` reads through the reader's view, so the reader's first
-///   read makes it there (5,000 facts in its graph: well past 64 KiB, as in
-///   `a_pending_read_charges_its_view_to_the_query`). The control: a reader of every graph,
-///   who has no view.
+/// replay takes it past that limit, refused for memory, though no budget but the query's
+/// limit is below the process's.
+/// - The view: the reader's view of the committed base, which the read makes before the
+///   replay (5,000 facts in its graph: well past 64 KiB, as in
+///   `a_pending_read_charges_its_view_to_the_query`); the replay itself is the next row's.
+///   The control: a reader of every graph, who has no view. A view's refusal is told the
+///   server's class alone (its budget may depend on graphs the reader can't read).
 /// - The `WHERE`'s solutions: 10,000 statements matched by a reader of every graph, at 16 KiB
 ///   (`ASK {}` itself needs 64 bytes). The control: a `WHERE` that matches nothing.
 #[test]
@@ -727,8 +729,11 @@ fn a_pending_reads_replay_is_charged_to_the_query() {
             &mut Vec::new(),
         )
     };
+    // No process limit: only the query's own limit can refuse the view.
     let supported = || {
-        let store = StoreService::new(in_memory_store_config()).unwrap();
+        let mut config = in_memory_store_config();
+        config.process_memory_bytes = nrese_store::ProcessMemory::Bytes(0);
+        let store = StoreService::new(config).unwrap();
         let facts: String = (0..5_000).map(|i| format!("ex:i{i} a ex:C . ")).collect();
         store
             .execute_update(&SparqlUpdateRequest::new(format!(
@@ -756,25 +761,28 @@ fn a_pending_reads_replay_is_charged_to_the_query() {
             "INSERT {{ GRAPH <urn:open> {{ ?s <urn:q> ?o }} }} WHERE {{ GRAPH <urn:open> {{ ?s <{p}> ?o }} }}"
         )
     };
-    let rows: [(&str, StoreResult<()>, StoreResult<()>); 2] = [
+    // Whether a refusal is told as the server's class (a view's) or the query's own limit.
+    let rows: [(&str, StoreResult<()>, StoreResult<()>, bool); 2] = [
         (
             "the view",
             ask(&supported(), ReadScope::All, &marker, 64 * 1024),
             ask(&supported(), reader(true), &marker, 64 * 1024),
+            true,
         ),
         (
             "the WHERE's solutions",
             ask(&matched, ReadScope::All, &copy("urn:none"), 16 * 1024),
             ask(&matched, ReadScope::All, &copy("urn:p"), 16 * 1024),
+            false,
         ),
     ];
     let wrong: Vec<String> = rows
         .iter()
-        .filter(|(_, control, read)| {
+        .filter(|(_, control, read, class)| {
             !(control.is_ok()
-                && matches!(read, Err(error) if error.is_memory_limit() && !error.is_server_memory_limit()))
+                && matches!(read, Err(error) if error.is_memory_limit() && error.is_server_memory_limit() == *class))
         })
-        .map(|(row, control, read)| format!("{row}: control {control:?}, read {read:?}"))
+        .map(|(row, control, read, _)| format!("{row}: control {control:?}, read {read:?}"))
         .collect();
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
@@ -953,20 +961,21 @@ fn a_cancelled_statement_read_fails_and_keeps_no_view() {
 }
 
 /// A planned read (EXPLAIN without running) charges the view it makes to its query's memory,
-/// as a run does. With the query's limit at 1 byte,
-/// a supported reader whose view is past it is refused by that limit, not by the server's
-/// query memory (64 KiB here), which the view passes too.
+/// as a run does. With the query's limit at 1 byte and no budget for all queries, a supported
+/// reader whose view is past it is refused, by that limit alone. A view's refusal is told the
+/// server's class (its budget may depend on graphs the reader can't read).
 #[test]
 fn a_planned_read_charges_its_view_to_the_query() {
     use nrese_store::{CancellationToken, StoreConfig};
     let store = StoreService::new(StoreConfig {
-        total_query_memory_bytes: 64 * 1024,
+        total_query_memory_bytes: 0,
+        process_memory_bytes: nrese_store::ProcessMemory::Bytes(0),
         ..in_memory_store_config()
     })
     .unwrap();
     let facts: String = (0..5_000).map(|i| format!("ex:i{i} a ex:C . ")).collect();
-    // Loaded past the pipeline: a write's pending changes draw on the same 64 KiB (D16-039),
-    // and the data is the read's, not what this tests.
+    // Loaded past the pipeline, as a bulk load of a file is: the data is the read's, not what
+    // this tests.
     crate::support::load_past_the_pipeline(
         &store,
         &format!(
@@ -984,7 +993,7 @@ fn a_planned_read_charges_its_view_to_the_query() {
     let prepared = store.prepare_query(&request).unwrap();
     let planned = store.plan_query(&prepared, &CancellationToken::new());
     assert!(
-        matches!(&planned, Err(error) if error.is_memory_limit() && !error.is_server_memory_limit()),
+        matches!(&planned, Err(error) if error.is_memory_limit() && error.is_server_memory_limit()),
         "{planned:?}"
     );
 }

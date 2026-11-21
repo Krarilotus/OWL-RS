@@ -42,7 +42,7 @@ COPIED = (".githooks/pre-push", "scripts/check.sh", "scripts/cargo-guarded.sh", 
           "scripts/lib/gate-publish.sh", "rust-toolchain.toml",
           "scripts/lib/gate-record.py", "scripts/lib/windows-job.ps1", "scripts/lib/windows-job.sh",
           "scripts/lib/suite-python.sh", "scripts/lib/gate-node.sh", *isolation.NS_SH,
-          "benches/suite/requirements.txt")
+          "benches/suite/requirements.txt", "scripts/lib/gate-job.sh")
 # A stand-in for the fleet's CLI: each submit keeps its job file; status, results and cancel as told.
 FLEET = """#!/bin/sh
 answer() {
@@ -65,6 +65,16 @@ RUSTC = """#!/bin/sh
 [ "${1#+}" != "$1" ] && shift
 [ "$1" = -vV ] && printf 'rustc 1.98.1\\nbinary: rustc\\ncommit-hash: abcdef1234567890\\nrelease: 1.98.1\\n'
 exit 0
+"""
+# A stand-in for curl fetching a cargo-nextest release (get.nexte.st/<version>/linux, the last argument): a
+# gzipped tar of a cargo-nextest that says it is that version.
+CURL_NEXTEST = r"""for arg; do url=$arg; done
+v=${url#https://get.nexte.st/}; v=${v%%/*}
+d=$(mktemp -d)
+printf '#!/bin/sh\necho "cargo-nextest %s"\n' "$v" > "$d/cargo-nextest"
+chmod +x "$d/cargo-nextest"
+tar -cz -C "$d" cargo-nextest
+rm -rf -- "$d"
 """
 
 
@@ -930,7 +940,8 @@ class GateJob(Repo):
             "rustup": "exit 0",
             "rustc": '[ "${1#+}" != "$1" ] && shift; case "$1" in -vV) echo "release: 1.98.1"; echo "commit-hash: abcdef1234567890" ;;'
                      ' --print) echo "    native - Select the CPU of the current host (currently znver3)." ;; esac',
-            "cargo": 'echo "cargo-nextest 0.9.146"',  # the pinned one (Miri's too): nothing to install
+            "cargo": 'echo "cargo-nextest 0.9.146"',  # Miri there: nothing to install
+            "curl": CURL_NEXTEST,  # the pinned cargo-nextest, installed under the cache
             "cc-links": 'while [ $# -gt 0 ]; do [ "$1" = -o ] && { shift; : > "$1"; }; shift; done',
             "cc-broken": "exit 1",
         }.items():

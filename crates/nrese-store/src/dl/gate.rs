@@ -358,7 +358,7 @@ fn rejection(
 
 const CONSTRAINT: &str = "owl2-dl-consistency";
 
-/// A justification's axioms, each by its source triples.
+/// A justification's axioms, each by its source triples, each triple once.
 fn axiom_evidence(
     tx: &Transaction<'_>,
     ontology: &nrese_owl::Ontology,
@@ -368,11 +368,14 @@ fn axiom_evidence(
         tx.decode(nrese_engine::TermId::from_raw(t))
             .map_or_else(|| format!("#{t}"), |term| term.to_string())
     };
+    let mut seen = std::collections::HashSet::new();
     justification
         .axioms
         .iter()
         .flat_map(|&i| &ontology.sources[i])
-        .flat_map(|source| source.triples.iter().map(|t| t.map(decode)))
+        .flat_map(|source| source.triples.iter().copied())
+        .filter(|&t| seen.insert(t))
+        .map(|t| t.map(decode))
         .map(|[s, p, o]| nrese_reasoner::RejectEvidence {
             role: "axiom",
             subject: s,

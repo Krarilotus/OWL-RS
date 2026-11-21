@@ -94,3 +94,10 @@ opt-level = 1
 
 [profile.dev.package.nrese-sparql-syntax]
 opt-level = 1
+
+# Password hashing is nearly all of the login tests' time in an unoptimised build. With Argon2 at
+# opt-level 3, the store's and the server's 47 password tests took 9.7 s in place of 80.4 s (the sum of
+# each test's median over three interleaved runs); the slowed-login test 1.2 s in place of 27.5 s.
+# Optimising its blake2 as well gained nothing more. Release builds are unchanged.
+[profile.dev.package.argon2]
+opt-level = 3

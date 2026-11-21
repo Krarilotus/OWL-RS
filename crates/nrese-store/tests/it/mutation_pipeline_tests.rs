@@ -240,17 +240,19 @@ fn an_rl_rejection_shows_no_premise_of_a_graph_the_committer_cannot_read() {
         let Err(MutationError::Rejected(reject)) = result else {
             panic!("expected a rejection, got {result:?}");
         };
-        let secret = |text: &str| text.contains("disjointWith") || text.contains(&format!("{EX}B"));
+        // The secret graph's terms, and what it relates to the committer's statement.
+        let secret = [
+            "disjointWith".to_owned(),
+            format!("{EX}B"),
+            format!("{EX}A"),
+        ];
         if restricted {
             // Nothing of the secret graph, nor what it relates to the committer's statement.
             assert!(reject.explanation.is_none(), "{reject:?}");
             assert!(reject.attribution.is_none(), "{reject:?}");
-            assert!(!secret(&reject.detail), "{}", reject.detail);
-            assert!(
-                !reject.detail.contains(&format!("{EX}A")),
-                "{}",
-                reject.detail
-            );
+            for term in &secret {
+                assert!(!reject.detail.contains(term), "{term}: {}", reject.detail);
+            }
             assert!(
                 reject
                     .detail
@@ -259,14 +261,16 @@ fn an_rl_rejection_shows_no_premise_of_a_graph_the_committer_cannot_read() {
                 reject.detail
             );
         } else {
+            // The controls on the same words: the detail names each.
+            for term in &secret {
+                assert!(
+                    reject.detail.contains(term),
+                    "{term} not in {}",
+                    reject.detail
+                );
+            }
             let explanation = reject.explanation.expect("an explanation");
-            let shown: Vec<String> = explanation
-                .evidence
-                .iter()
-                .map(|e| format!("{} {} {}", e.subject, e.predicate, e.object))
-                .collect();
-            assert_eq!(shown.len(), 3, "{shown:#?}");
-            assert!(shown.iter().any(|s| secret(s)), "{shown:#?}");
+            assert_eq!(explanation.evidence.len(), 3, "{explanation:#?}");
         }
     }
 }

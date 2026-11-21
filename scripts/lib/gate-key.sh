@@ -6,6 +6,9 @@
 #
 #   <tier>[ w3c-optional] <tree> <file list> rustc-<release>-<commit> flags=<rustflags> tools=<id> fleet
 #
+# - tier: push, quick or windows. A quick check's pass (scripts/check.sh quick) is its own tier's,
+#   keyed as push's and found by its exact key only: it never stands for a push pass, and no pass
+#   covers another's list for it (gate_covering is the push tier's);
 # - tree: the pushed commit's tree, what was tested, byte for byte; for `windows`, the hash of the
 #   checked commit's inputs (windows_inputs), so a pass carries to a later commit with the same
 #   inputs;
@@ -27,7 +30,7 @@
 #
 # A pass is a line `<key> | <the commit it ran on> <the job, its host and CPU>` in
 # <git-common-dir>/nrese-gate-passed, written by scripts/check.sh only (a push pass recorded before
-# 21 Nov 2026 names no commit).
+# 21 Nov 2026 names no commit; a quick pass always names it).
 
 # rustc-<release>-<commit> flags=<rustflags> tools=<id>, for the toolchain, flags and tools a
 # build of COMMIT uses, independently of the caller's checkout.

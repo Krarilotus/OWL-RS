@@ -33,6 +33,12 @@ fn firsts<'a>(texts: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
     parts.collect()
 }
 
+/// The first parts of `text`'s left-out sentences, each up to the text's next quote.
+fn first_parts(text: &str) -> Vec<&str> {
+    let parts = text.split("left out; first: ").skip(1);
+    parts.filter_map(|rest| rest.split('"').next()).collect()
+}
+
 /// Whether `text` holds neither a debug form nor a term's id.
 fn in_words(text: &str) -> bool {
     !text.contains('{') && !text.contains("term ")
@@ -165,71 +171,81 @@ fn open_only() -> Arc<GraphAccess> {
     })
 }
 
-/// A reserved name in a graph the reader can't read and a broken list in one it can: a
-/// reader of `open` only is told no name or statement of the first anywhere, and no left-out
-/// sentence that names either, through its read, its exact read and its own commit's
-/// rejection (which shows its own graphs' statements). A reader of every graph is told the
-/// first, named.
+/// A reserved name in a graph the reader can't read, the one part left out: a reader of
+/// `open` only is told no name of it anywhere, and no left-out sentence that names a term,
+/// through its read, its exact read and its own commit's rejection (which shows its own
+/// graphs' statements). A reader of every graph is told it by each, in the same text.
 #[test]
 fn a_reader_of_some_graphs_is_told_no_name_from_the_left_out_sentence() {
     let dl = pipeline();
     insert(
         &dl,
-        &format!(
-            "GRAPH :secret {{ rdfs:member rdfs:domain :Hidden . :h rdfs:member :hv . }} \
-             GRAPH :open {{ :A a owl:Class ; owl:intersectionOf _:l . _:l <{RDF}first> :C ; \
-             <{RDF}rest> _:m . _:m <{RDF}first> :D . :x a :A . }}"
-        ),
+        "GRAPH :secret { rdfs:member rdfs:domain :Hidden ; owl:propertyDisjointWith :q . \
+         :q a owl:ObjectProperty . :h rdfs:member :hv . } \
+         GRAPH :open { :A a owl:Class . :x a :A . }",
     )
     .expect("committed");
     let store = dl.store();
-    let secret = ["Hidden", "example.com/h", "rdf-schema#member"];
-    // A left-out sentence's first part, up to the text's next quote, naming a term.
-    let names = |text: &str| {
-        let parts = text.split("left out; first: ").skip(1);
-        parts
-            .filter_map(|rest| rest.split('"').next())
-            .any(|s| s.contains('<'))
-    };
-    let leaks = |text: &str| secret.iter().any(|s| text.contains(*s)) || names(text);
-    let mut told = Vec::new();
-    for mode in [None, Some(DlAnswers::Exact)] {
-        let mut request = SparqlQueryRequest::new(
-            format!("{PREFIXES}ASK {{ :x a :C }}"),
-            ReadScope::Graphs(open_only()),
+    // The reserved name, in any text.
+    let member = |text: &String| text.contains("rdf-schema#member");
+    // A left-out sentence's first part naming a term.
+    let names = |text: &String| first_parts(text).iter().any(|s| s.contains('<'));
+    // Its read's status, its exact read's refusal, and its commit's rejection (an
+    // `rdfs:member` statement the secret graph makes disjoint from the commit's `:q`), as
+    // `requester` is told them.
+    let told = |requester: &Requester| {
+        let run = |mode| {
+            let query = format!("{PREFIXES}ASK {{ :x a :C }}");
+            let mut request = SparqlQueryRequest::new(query, requester.read.clone());
+            request.dl_answers = mode;
+            let prepared = store.prepare_query(&request).expect("prepared");
+            super::run_dl(store, &prepared, &mut Vec::new())
+        };
+        let read = match run(None) {
+            Ok(Some(status)) => format!("{status:?}"),
+            other => panic!("the read has a status, not {other:?}"),
+        };
+        let exact = match run(Some(DlAnswers::Exact)) {
+            Err(refused @ StoreError::Incomplete(_)) => refused.to_string(),
+            other => panic!("the exact read is refused as incomplete, not {other:?}"),
+        };
+        let rejected = dl.apply(
+            MutationCommand::Update(SparqlUpdateRequest::new(format!(
+                "{PREFIXES}INSERT DATA {{ GRAPH :open {{ :h :q :hv }} }}"
+            ))),
+            requester,
+            &MutationTicket::new(),
         );
-        request.dl_answers = mode;
-        let prepared = store.prepare_query(&request).expect("prepared");
-        let mut out = Vec::new();
-        told.push(match super::run_dl(store, &prepared, &mut out) {
-            Ok(status) => format!("{status:?}"),
-            Err(error) => error.to_string(),
-        });
-    }
+        let Err(MutationError::Rejected(reject)) = rejected else {
+            panic!("expected a rejection, got {rejected:?}");
+        };
+        [read, exact, format!("{reject:?}")]
+    };
+    // What a reader of `open` only isn't told: the reserved name, in each text; a left-out
+    // sentence naming a term, in each read (a rejection carries no left-out sentence).
     let committer = Requester::new(
         ReadScope::Graphs(open_only()),
         WriteScope::Graphs(open_only()),
     );
-    let rejected = dl.apply(
-        MutationCommand::Update(SparqlUpdateRequest::new(format!(
-            "{PREFIXES}INSERT DATA {{ GRAPH :open {{ :C owl:disjointWith :D . :y a :C , :D }} }}"
-        ))),
-        &committer,
-        &MutationTicket::new(),
-    );
-    let Err(MutationError::Rejected(reject)) = rejected else {
-        panic!("expected a rejection, got {rejected:?}");
-    };
-    told.push(format!("{reject:?}"));
-    let wrong: Vec<_> = told.iter().filter(|t| leaks(t)).collect();
+    let shown = told(&committer);
+    let reads = shown[..2].iter().filter(|t| names(t));
+    let wrong: Vec<_> = shown.iter().filter(|t| member(t)).chain(reads).collect();
     assert!(wrong.is_empty(), "{wrong:#?}");
-    let all = query_with(&dl, "ASK { :x a :C }", None)
-        .expect("read")
-        .1
-        .reasons();
-    let told = firsts(all.iter().map(String::as_str));
-    let named = told.len() >= 2 && told.iter().all(|s| in_words(s) && s.contains('<'));
-    assert!(named, "a reader of every graph: {all:?}");
+    // The controls, on the same texts: a reader of every graph is told the reserved name
+    // itself. Each read's left-out sentences name it as the data writes it, `<…#member>`; its
+    // commit's rejection names it as reject reports show an IRI, plainly, a premise's whole
+    // term (`"…#member"` in the rejection's Debug form).
+    let full = told(&Requester::all());
+    let iri = format!("<{RDFS}member>");
+    let named = |text: &String| {
+        let parts = first_parts(text);
+        !parts.is_empty() && parts.iter().all(|s| s.contains(iri.as_str()))
+    };
+    let premise = format!("\"{RDFS}member\"");
+    let reads = full[..2].iter().filter(|t| !named(t));
+    let commit = full[2..].iter().filter(|t| !t.contains(premise.as_str()));
+    let missing: Vec<_> = reads.chain(commit).collect();
+    assert!(missing.is_empty(), "{missing:#?}");
 }
 
 /// A read that makes the sentence itself (a revision no commit here recorded: the store

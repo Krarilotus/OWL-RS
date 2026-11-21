@@ -1,0 +1,7 @@
+# The state explorer's targets: tests that walk a component's reachable states to their ordinary
+# depth, as crate:target:filter (target `lib` for the unit tests), like fuzz-targets.txt. The quick
+# tier of scripts/check.sh runs a target when its crate changed or depends on a crate that changed;
+# the push tier runs them as its crate's tests. Their deeper settings are not the quick tier's.
+#
+# None yet. Once the session-step explorer is on the line, nrese-store's line is:
+#   nrese-store:lib:session_step_tests::

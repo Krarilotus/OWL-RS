@@ -5,6 +5,7 @@
 use std::time::Duration;
 
 use super::build::Build;
+use nrese_dl::limits::Limit;
 use nrese_dl::tableau::{Answer, Config, consistency, satisfiable};
 use nrese_owl::{Axiom, Characteristic, ClassExpr, ObjProp, Ontology, normalise};
 
@@ -37,11 +38,18 @@ fn decided(o: &Ontology, quick: bool) -> Answer {
         max_branch_points: Some(2_000_000),
         ..configs().last().expect("16 configs")
     };
+    let late = Config {
+        timeout: Some(Duration::ZERO),
+        ..default.clone()
+    };
     let default = consistency(o, &default).answer;
     assert!(
         matches!(default, Answer::Consistent | Answer::Inconsistent),
         "{default:?}"
     );
+    // The control on the same words: past its deadline, a run gives up on the clock.
+    let late = consistency(o, &late).answer;
+    assert_eq!(budget(&late), Some(Limit::Time), "{late:?}");
     let expansions: &[u32] = if quick { &[0, 2] } else { &[0, 2, 8] };
     for &expand in expansions {
         for config in configs().filter(|c| !quick || c.backjumping) {
@@ -50,15 +58,27 @@ fn decided(o: &Ontology, quick: bool) -> Answer {
                 ..config
             };
             let answer = consistency(o, &config).answer;
-            // Giving up is allowed on the deterministic budget only, never on the clock.
+            // Giving up is allowed on the deterministic budgets the configs set only, never
+            // on the clock.
             assert!(
                 answer == default
-                    || matches!(&answer, Answer::GaveUp(why) if !why.contains("time budget")),
+                    || matches!(
+                        budget(&answer),
+                        Some(Limit::BranchPoints | Limit::Nodes | Limit::Memory)
+                    ),
                 "{answer:?}, not {default:?}, under {config:?}"
             );
         }
     }
     default
+}
+
+/// The budget a give-up's reason names; `None` for any other answer.
+fn budget(answer: &Answer) -> Option<Limit> {
+    match answer {
+        Answer::GaveUp(why) => Limit::named_in(why),
+        _ => None,
+    }
 }
 
 fn inverse_pair(b: &mut Build, p: u64, q: u64) {

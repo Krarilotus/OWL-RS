@@ -70,17 +70,25 @@ come with. What is in is on
   emptied graph answers 404 ([Graph Store Protocol](ops/http-api.md#graph-store-protocol)).
   Read that 404 as an empty graph.
 - A reader of only some graphs gets no plan steps in `EXPLAIN`.
-- A value drawn at each evaluation (`RAND()`, `UUID()`, `STRUUID()`, `BNODE()`) is drawn once
-  per solution of its group, as SPARQL says, except where the engine shares one evaluation
-  between rows or repeats it: in an `EXISTS` (once per distinct value it reads, not once per
-  row), a `LATERAL`, a property path, a group beside a vector search probed first, a
-  `SERVICE` call sent in batches, and an `AVG` over a drawn value.
-- A group that draws such a value is evaluated from the distinct values of the rows joined
-  to it, not from the rows themselves, which costs a little more than a group that draws
-  nothing. Where those rows share no variable the group binds in every solution, or leave
-  such a variable unbound in a row, the group is evaluated alone and then joined: a
-  `FILTER(RAND() < …)` over a `UNION` in which only some arms bind the joined variable reads
-  all of those arms' data, not only the rows' values.
+- A part of a query that draws a value at each evaluation (`RAND()`, `UUID()`, `STRUUID()`,
+  `BNODE()`) is evaluated as follows, and gives up some faster plans for it, so it costs more
+  than one that draws nothing:
+  - an `EXISTS` that draws is evaluated once per tested row, and in an `OPTIONAL`'s condition
+    once per compatible pair: its cost grows with the rows, not with their distinct values;
+  - a `LATERAL` right side that draws is evaluated once per left row;
+  - a `SERVICE` pattern that draws is sent once per endpoint it resolves to, per evaluation of
+    the `SERVICE`, without the joined rows' values, and joined here;
+  - a group that draws, beside a vector search, is evaluated first: the search doesn't go
+    first. Where every row of the group binds the matched vector, the search ranks only those
+    vectors; otherwise it ranks every vector of the active graph;
+  - a `GROUP BY` with an `AVG` over a drawn value is never computed in parts: where its rows
+    don't fit the query's memory, the query is refused.
+- In a plan that passes rows sideways into a group, a group that draws is evaluated from the
+  distinct values of the rows joined to it, not from the rows themselves, which costs a little
+  more than a group that draws nothing. Where those rows share no variable the group binds in
+  every solution, or leave such a variable unbound in a row, the group is evaluated alone and
+  then joined: a `FILTER(RAND() < …)` over a `UNION` in which only some arms bind the joined
+  variable reads all of those arms' data, not only the rows' values.
   The answer is right, but slower, or refused under a tight memory budget.
 - Directional strings in the data alone don't make a result announce RDF 1.2, but a query that
   makes or matches them, or triple terms, does ([announcing](ops/http-api.md#requests-in-detail)).
@@ -636,6 +644,9 @@ leave something out.
   part has no stated bound in this release.
 - Near the memory limit, a cached decoding can cause a refusal while memory the cache could give back is still
   held. The output is never wrong.
+- A published snapshot's `owl:sameAs` classes are built by the first query that needs them, charged to its memory.
+  Where they don't fit, that query runs without them and nothing is kept, until a query with room builds them: the
+  answer is the same, only slower. Earlier versions built them in the first query whatever its budget.
 - A cancel, a deadline or a refusal takes effect at the work's next poll, which bounds work, not time. Under
   nested reads in reasoning, more work runs between two polls ([the bound](architecture/contracts.md#cancellation)).
   A stop never gives a partial or wrong answer.
