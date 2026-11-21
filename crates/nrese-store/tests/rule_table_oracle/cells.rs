@@ -4,31 +4,35 @@ use crate::{
     judges, oracle, sweep,
 };
 
+const ANNOTATION_AND_CLASS_DECLARATIONS: &str = "
+    rdfs:label rdf:type owl:AnnotationProperty
+    rdfs:comment rdf:type owl:AnnotationProperty
+    rdfs:seeAlso rdf:type owl:AnnotationProperty
+    rdfs:isDefinedBy rdf:type owl:AnnotationProperty
+    owl:deprecated rdf:type owl:AnnotationProperty
+    owl:versionInfo rdf:type owl:AnnotationProperty
+    owl:priorVersion rdf:type owl:AnnotationProperty
+    owl:backwardCompatibleWith rdf:type owl:AnnotationProperty
+    owl:incompatibleWith rdf:type owl:AnnotationProperty
+    owl:Thing rdf:type owl:Class
+    owl:Nothing rdf:type owl:Class
+";
+
 #[test]
 fn first_write_publishes_annotation_and_class_seeds() {
     // Spec: OWL 2 Profiles §4.3, prp-ap, cls-thing, cls-nothing1 and scm-cls
     // require these rows after a first write, including after a disk reopen.
-    let required = insert(
+    let mut required = insert(ANNOTATION_AND_CLASS_DECLARATIONS).insert;
+    let schema = insert(
         "
-        rdfs:label rdf:type owl:AnnotationProperty
-        rdfs:comment rdf:type owl:AnnotationProperty
-        rdfs:seeAlso rdf:type owl:AnnotationProperty
-        rdfs:isDefinedBy rdf:type owl:AnnotationProperty
-        owl:deprecated rdf:type owl:AnnotationProperty
-        owl:versionInfo rdf:type owl:AnnotationProperty
-        owl:priorVersion rdf:type owl:AnnotationProperty
-        owl:backwardCompatibleWith rdf:type owl:AnnotationProperty
-        owl:incompatibleWith rdf:type owl:AnnotationProperty
-        owl:Thing rdf:type owl:Class
-        owl:Nothing rdf:type owl:Class
         owl:Thing rdfs:subClassOf owl:Thing
         owl:Thing owl:equivalentClass owl:Thing
         owl:Nothing rdfs:subClassOf owl:Thing
         owl:Nothing rdfs:subClassOf owl:Nothing
         owl:Nothing owl:equivalentClass owl:Nothing
         ",
-    )
-    .insert;
+    );
+    required.extend(schema.insert);
     let write = insert("ex:a ex:p ex:b");
     let mut missing = Vec::new();
     for &mode in judges::MODES {
@@ -60,32 +64,44 @@ fn first_write_publishes_annotation_and_class_seeds() {
 
 #[test]
 fn deleting_assertions_keeps_the_seed_declarations() {
-    // Spec: reasoning-semantics.md, OWL 2 RL seeds are inferred and never retracted.
-    let declarations = "owl:Thing rdf:type owl:Class\nrdfs:label rdf:type owl:AnnotationProperty";
-    let asserted = insert(declarations);
-    let removed = delete(declarations);
+    // Spec: reasoning-semantics.md, OWL 2 RL seeds are inferred and never retracted,
+    // so OWL 2 Profiles §4.3 cax-sco can use cls-thing during the same write.
+    let mut asserted = insert(ANNOTATION_AND_CLASS_DECLARATIONS);
+    asserted
+        .insert
+        .push(crate::triple(["xsd:integer", "rdf:type", "rdfs:Datatype"]));
+    let mut write = insert("owl:Class rdfs:subClassOf ex:Metaclass");
+    write.delete.clone_from(&asserted.insert);
+    let inferred = crate::triple(["owl:Thing", "rdf:type", "ex:Metaclass"]);
+    let mut missing = Vec::new();
     for &mode in judges::MODES {
         let temp = tempfile::tempdir().expect("seed deletion store directory");
         let open = || judges::open(mode, Some(temp.path()));
-        let check = |store: &nrese_store::StoreService, stage: &str| {
-            assert_eq!(store.stats().expect("asserted count").quad_count, 0);
+        let mut check = |store: &nrese_store::StoreService, stage| {
+            assert_eq!(store.stats().expect("asserted count").quad_count, 1);
             let (rows, _) = judges::rows(store);
-            for row in &asserted.insert {
-                assert!(rows.contains(row), "{mode} {stage}: missing {row:?}");
+            for row in asserted.insert.iter().chain([&inferred]) {
+                if !rows.contains(row) {
+                    missing.push((mode, stage, row));
+                }
             }
         };
         {
             let store = open();
             let pipeline = judges::pipeline(&store, nrese_reasoner::ReasoningMode::Owl2Rl);
             assert!(judges::apply(&pipeline, &asserted), "{mode} insert");
-            assert_eq!(store.stats().expect("asserted count").quad_count, 2);
-            assert!(judges::apply(&pipeline, &removed), "{mode} delete");
+            assert_eq!(store.stats().expect("asserted count").quad_count, 12);
+            assert!(judges::apply(&pipeline, &write), "{mode} mixed update");
             check(&store, "warm");
         }
         let store = open();
         let _pipeline = judges::pipeline(&store, nrese_reasoner::ReasoningMode::Owl2Rl);
         check(&store, "reopened");
     }
+    assert!(
+        missing.is_empty(),
+        "seed rows or consequences absent: {missing:?}"
+    );
 }
 
 #[test]
