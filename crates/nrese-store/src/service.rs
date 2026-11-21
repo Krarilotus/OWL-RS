@@ -1670,11 +1670,14 @@ impl StoreService {
         let snapshot = self.engine.snapshot();
         let mut printed = nrese_sparql::ql::print(&snapshot, &query, form)?;
         // The status this store gives the same answers ([`Self::status_outside_dl`]): its
-        // regime, as the rewriting's run sets it for the RL closure, and its composition.
+        // regime, as the rewriting's run sets it for the RL closure, and its composition, the
+        // list mark included.
         if let nrese_sparql::ql::Printed::Query { completeness, .. } = &mut printed {
             completeness.regime = Some(nrese_sparql::Regime::Owl2Rl);
             let reads = crate::dl::query::Reads::default();
-            certify_closure(completeness, (&query, &reads), "ql", Some(&snapshot));
+            let lists = || self.lists_left_out(&snapshot);
+            let query = (&query, &reads);
+            crate::dl::query::certify_report(Some(completeness), query, Some(&snapshot), lists);
         }
         Ok(printed)
     }
