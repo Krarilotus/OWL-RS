@@ -444,6 +444,41 @@ fn accepting_walk_is_maintained_when_a_branch_changes() {
 }
 
 #[test]
+fn accepting_walk_requires_a_first_at_every_cell() {
+    // Spec: Table 3 requires rdf:first even on the last cell. With no
+    // alternative walk, Table 5 derives no chain row and the axiom is diagnosed.
+    let fixture = case(
+        "missing-first-only-walk",
+        ["ex:a", "ex:out", "ex:c"],
+        vec![insert(
+            "
+            ex:out owl:propertyChainAxiom ex:h
+            ex:h rdf:first ex:p
+            ex:h rdf:rest ex:t
+            ex:t rdf:rest rdf:nil
+            ex:a ex:p ex:b
+            ex:b ex:q ex:c
+            ",
+        )],
+    );
+    assert!(matches_oracle(&fixture, &[true], &[false]));
+    for &mode in judges::MODES {
+        let store = judges::open(mode, None);
+        let pipeline = judges::pipeline(&store, nrese_reasoner::ReasoningMode::Owl2Rl);
+        assert!(judges::apply(&pipeline, &fixture.writes[0]));
+        let report = pipeline.last_reasoning_run().expect("reasoning ran");
+        assert_eq!(
+            report.diagnostics_total, 1,
+            "{mode}: {:?}",
+            report.diagnostics
+        );
+        let diagnostic = &report.diagnostics[0];
+        assert_eq!(diagnostic.kind, "malformed-list", "{mode}");
+        assert_eq!(diagnostic.node.as_deref(), Some("http://example.org/t"));
+    }
+}
+
+#[test]
 #[ignore = "documented limit reasoning-semantics.md:63-65: asserting an entailed shortcut changes the first load's chain answer"]
 fn redundant_list_premise_leaves_chain_unchanged() {
     // Spec: Table 9 scm-spo and Table 5 prp-spo1 and prp-spo2 give the same
