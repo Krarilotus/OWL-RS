@@ -392,11 +392,15 @@ impl Bounds {
 }
 
 /// Whether the commit `tx` keeps the RL route `kinds` was decided on: the closure it leaves
-/// leaves out no list axiom, and no asserted change gives a term a new kind ([`Kinds::keep`]).
+/// leaves out no list axiom, and no asserted change gives a term a new kind ([`Kinds::keep`])
+/// or deletes a reified triple ([`reified`]).
 fn route_kept(kinds: &Kinds, tx: &impl PendingView, lists_left_out: bool) -> bool {
     !lists_left_out
         && tx.inserted().all(|q| kinds.keep(tx, quad_triple(q), false))
-        && tx.deleted().all(|q| kinds.keep(tx, quad_triple(q), true))
+        && tx.deleted().all(|q| {
+            let t = quad_triple(q);
+            kinds.keep(tx, t, true) && !reified(tx, t)
+        })
 }
 
 /// Whether the delta executor changes `upper` for `tx`'s asserted changes, which leave what
@@ -404,12 +408,49 @@ fn route_kept(kinds: &Kinds, tx: &impl PendingView, lists_left_out: bool) -> boo
 /// individuals over U1's signature ([`Upper::is_assertion`], which no schema change passes),
 /// names no reserved name or SHACL property ([`reserved_named`]) and says nothing about the
 /// ontology's node ([`header`]), and no deleted literal may retype its property
-/// ([`may_retype`]). A U1 with equality classes is evaluated afresh (`Upper`'s module docs).
+/// ([`may_retype`]) and no deleted triple is reified ([`reified`]). A U1 with equality classes
+/// is evaluated afresh (`Upper`'s module docs).
 fn assertions_only(upper: &Upper, tx: &impl PendingView) -> bool {
     upper.classes().is_empty()
         && (tx.inserted().chain(tx.deleted()).map(quad_triple))
             .all(|t| upper.is_assertion(t) && !reserved_named(tx, t) && !header(tx, t[0]))
-        && !tx.deleted().any(|q| may_retype(tx, quad_triple(q)))
+        && !tx.deleted().any(|q| {
+            let t = quad_triple(q);
+            may_retype(tx, t) || reified(tx, t)
+        })
+}
+
+/// Whether a node in the data as `tx` leaves it names the triple as its main triple
+/// (`owl:annotatedSource`, `owl:annotatedProperty`, `owl:annotatedTarget`): an annotated
+/// axiom's reification or an annotation's annotation (*Mapping to RDF* Table 17). Deleting
+/// the triple leaves the node annotating nothing, which the reader reports
+/// (`Diagnostic::Malformed`), so what it left out changes. Any such node counts, whatever its
+/// type: one the reader doesn't take for a reification only costs a read. Adding or deleting
+/// a node's own statements is a schema change ([`changes_schema`]). Probes of the pending
+/// state: the triple's subject's annotations, then each one's two other roles.
+fn reified(tx: &impl PendingView, [s, p, o]: Triple) -> bool {
+    let id = |local: &str| {
+        let iri = format!("http://www.w3.org/2002/07/owl#{local}");
+        tx.lookup(nrese_rdf::NamedNodeRef::new_unchecked(&iri).into())
+    };
+    let (Some(source), Some(property), Some(target)) = (
+        id("annotatedSource"),
+        id("annotatedProperty"),
+        id("annotatedTarget"),
+    ) else {
+        return false;
+    };
+    let any = |subject: Option<TermId>, predicate: TermId, object: u64| {
+        let mut pattern = nrese_engine::QuadPattern::all();
+        (pattern.subject, pattern.predicate, pattern.object) =
+            (subject, Some(predicate), Some(TermId::from_raw(object)));
+        tx.quads_for_pattern_in(ReadModel::Asserted, &pattern)
+            .map(|q| q.subject)
+            .collect::<Vec<_>>()
+    };
+    any(None, source, s).into_iter().any(|node| {
+        !any(Some(node), property, p).is_empty() && !any(Some(node), target, o).is_empty()
+    })
 }
 
 impl Bounds {
@@ -418,17 +459,27 @@ impl Bounds {
     /// take its record without reading the ontology (the commit's record: the RL route kept,
     /// or the delta executor's change, [`assertions_only`]), by the same tests: the reader's
     /// own, no second list. `false` where the bounds describe another revision than the
-    /// base's. The list axioms the closure leaves out are no part of the record.
+    /// base's. The list axioms the closure leaves out are no part of the record. Checked
+    /// under the state, as a read takes what it needs of U1 (serial work over what is in
+    /// memory), never keeping U1: a commit installs its change in place.
     pub(crate) fn keeps_record(&self, tx: &impl PendingView) -> bool {
         let base = tx.base().revision();
-        let current = lock(&self.state)
-            .as_ref()
-            .filter(|s| s.revision == base)
-            .map(|s| (s.kinds.clone(), s.upper.clone()));
-        match current {
-            Some((Some(kinds), _)) => route_kept(&kinds, tx, false),
-            Some((None, Ok(upper))) => assertions_only(&upper, tx),
-            Some((None, Err(_))) | None => false,
+        let state = lock(&self.state);
+        match state.as_ref().filter(|s| s.revision == base) {
+            Some(State {
+                kinds: Some(kinds), ..
+            }) => route_kept(kinds, tx, false),
+            Some(State {
+                kinds: None,
+                upper: Ok(upper),
+                ..
+            }) => assertions_only(upper, tx),
+            Some(State {
+                kinds: None,
+                upper: Err(_),
+                ..
+            })
+            | None => false,
         }
     }
 }
