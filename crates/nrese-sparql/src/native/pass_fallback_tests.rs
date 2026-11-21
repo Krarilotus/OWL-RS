@@ -204,7 +204,7 @@ fn aggregated(
         [
             ctx.budget.used(),
             ctx.kept.borrow().bytes(),
-            ctx.decoded.borrow().bytes_for_test(),
+            ctx.decoded.borrow().bytes_for_test() + ctx.budget.ahead(),
         ]
     };
     let solutions = match ctx.eval(inner) {
@@ -390,7 +390,7 @@ fn a_pass_that_falls_back_leaves_nothing_charged() {
             Ok(general) if general != per_column => {
                 wrong.push(format!("{shape} at {limit}: the routes answer differently"));
             }
-            Ok(_) if after != alone => wrong.push(format!(
+            Ok(_) if after[0] - after[2] != alone[0] - alone[2] || after[1] != alone[1] => wrong.push(format!(
                 "{shape} at {limit}: charges {after:?} afterwards, the per-column route {alone:?}"
             )),
             Ok(_) => {}
@@ -461,20 +461,35 @@ fn seed_cache(ctx: &Context<'_>) {
 }
 
 fn evict_cache(ctx: &Context<'_>) {
+    assert!(
+        ctx.decoded.borrow().get(FIRST_CACHED).is_some(),
+        "live decoder entry before eviction"
+    );
     let mut holds_room = Reservation::new(&*ctx.budget);
     holds_room.charge(ctx.budget.remaining() - 1).unwrap();
     ctx.decoded.borrow_mut().keep(ADDED_CACHED, &None);
+    assert!(
+        ctx.decoded.borrow().get(FIRST_CACHED).is_none(),
+        "decoder entry evicted"
+    );
 }
 
 fn plan_count(ctx: &Context<'_>) {
-    ctx.distinct_counts
-        .borrow_mut()
-        .get_or_insert_with(
-            (nrese_engine::QuadPattern::all(), Permutation::Spog),
-            || Some(16),
-        )
-        .ok()
-        .unwrap();
+    let mut counts = ctx.distinct_counts.borrow_mut();
+    let before = counts.charged();
+    for id in 0..64 {
+        let pattern = nrese_engine::QuadPattern {
+            subject: Some(TermId::from_raw(u64::MAX - 64 - id)),
+            ..nrese_engine::QuadPattern::all()
+        };
+        counts
+            .get_or_insert_with((pattern, Permutation::Spog), || Some(16))
+            .unwrap();
+        if counts.charged() > before {
+            return;
+        }
+    }
+    panic!("the direct plan did not grow its distinct-count cache");
 }
 
 pub(super) fn direct_input(ctx: &Context<'_>) -> NativeResult<()> {
@@ -503,7 +518,8 @@ pub(super) fn direct_output(
     }
     if matches!(refusal, RefuseDirect::CacheGrowth) {
         plan_count(ctx);
-        ctx.decoded.borrow_mut().keep(ADDED_CACHED, &None);
+        let term = Some(Literal::from("y".repeat(8_192)).into());
+        ctx.decoded.borrow_mut().keep(ADDED_CACHED, &term);
     }
     ctx.consumed(solutions);
     Err(refuse_direct(ctx))
@@ -530,7 +546,6 @@ fn streamed_retry(refusal: RefuseDirect, message: &str) {
         let ctx = Context::new(&snapshot, &options, None, None);
         let mut live = Reservation::new(&*ctx.budget);
         live.charge(65_536).unwrap();
-        let baseline = ctx.budget.used();
         if matches!(refusal, RefuseDirect::CacheEviction) {
             seed_cache(&ctx);
         }
@@ -567,16 +582,19 @@ fn streamed_retry(refusal: RefuseDirect, message: &str) {
         ctx.consumed(solutions);
         let [kept, terms, numbers, used, decoded] = counters(&ctx);
         let planned = ctx.distinct_counts.borrow().charged();
+        let ahead = ctx.budget.ahead();
         // Sample both live caches, then let the decoder independently give back its room.
         *ctx.decoded.borrow_mut() =
             decode_cache::DecodeCache::new(&ctx.budget, DECODE_CACHE_ENTRIES, 1);
         let remaining = ctx.budget.used();
-        let attributed = baseline + kept + planned;
+        let attributed = (kept + planned) as i64;
         (
             rows,
             [kept, terms, numbers],
-            [used, remaining],
-            [attributed + decoded, attributed],
+            [
+                used as i64 - (decoded + ahead) as i64 - attributed,
+                remaining as i64 - attributed,
+            ],
             reached_refusal,
         )
     };
@@ -588,9 +606,12 @@ fn streamed_retry(refusal: RefuseDirect, message: &str) {
         retried.0, expected,
         "retried adaptive streaming answers AVG"
     );
-    assert!(retried.4, "the same direct plan reached the refused charge");
-    assert_eq!(alone.2, alone.3, "adaptive streaming's live charges");
-    assert_eq!(retried.2, retried.3, "{message}");
+    assert!(retried.3, "the same direct plan reached the refused charge");
+    assert_eq!(
+        alone.2[0], alone.2[1],
+        "adaptive streaming's decoder releases its charge"
+    );
+    assert_eq!(retried.2, alone.2, "{message}");
     assert_eq!(retried.1, alone.1, "{message}");
 }
 
