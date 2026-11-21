@@ -2,6 +2,7 @@
 //! result interning remain in the executor; these helpers preserve row order and errors.
 
 use std::cell::{Cell, RefCell};
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -242,18 +243,12 @@ impl Aggregator<'_> {
                 } else {
                     values
                 };
-                // By value, breaking numeric ties by inline datatype IRI to match `value::order`
-                // (`"1"^^xsd:integer` < `"1"^^xsd:nonNegativeInteger`).
-                let key = |id: &u64| {
-                    let tid = TermId::from_raw(*id);
-                    (tid.as_inline_integer(), tid.inline_datatype_iri())
-                };
                 Some(match name {
                     AggregateFunction::Min => {
-                        Agg::Id(ids.iter().copied().min_by_key(key).unwrap_or(UNDEF))
+                        Agg::Id(ids.iter().copied().min_by(inline_order).unwrap_or(UNDEF))
                     }
                     AggregateFunction::Max => {
-                        Agg::Id(ids.iter().copied().max_by_key(key).unwrap_or(UNDEF))
+                        Agg::Id(ids.iter().copied().max_by(inline_order).unwrap_or(UNDEF))
                     }
                     _ => {
                         let Some(sum) = values.iter().try_fold(0i64, |acc, &v| acc.checked_add(v))
@@ -582,25 +577,28 @@ impl Running {
             Some(sum) => self.sum = sum,
             None => self.overflow = true,
         }
-        if self.min.is_none_or(|(m, mid)| {
-            value < m
-                || (value == m
-                    && id != mid
-                    && TermId::from_raw(id).inline_datatype_iri()
-                        < TermId::from_raw(mid).inline_datatype_iri())
-        }) {
+        if self
+            .min
+            .is_none_or(|(m, mid)| value < m || (value == m && inline_order(&id, &mid).is_lt()))
+        {
             self.min = Some((value, id));
         }
-        if self.max.is_none_or(|(m, mid)| {
-            value > m
-                || (value == m
-                    && id != mid
-                    && TermId::from_raw(id).inline_datatype_iri()
-                        > TermId::from_raw(mid).inline_datatype_iri())
-        }) {
+        if self
+            .max
+            .is_none_or(|(m, mid)| value > m || (value == m && inline_order(&id, &mid).is_gt()))
+        {
             self.max = Some((value, id));
         }
     }
+}
+
+/// `value::order` of two inline integers: by value, then (one value
+/// of two datatypes, `"1"^^xsd:integer` and `"1"^^xsd:nonNegativeInteger`) by datatype IRI.
+fn inline_order(a: &u64, b: &u64) -> Ordering {
+    let (a, b) = (TermId::from_raw(*a), TermId::from_raw(*b));
+    a.as_inline_integer()
+        .cmp(&b.as_inline_integer())
+        .then_with(|| a.inline_datatype_iri().cmp(&b.inline_datatype_iri()))
 }
 
 /// Every aggregate of every group in one pass over the rows, where each is `COUNT(*)`,

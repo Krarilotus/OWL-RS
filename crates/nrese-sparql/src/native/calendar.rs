@@ -46,7 +46,6 @@ fn day_time(value: &Value) -> Option<DayTimeDuration> {
 fn factor(value: &Value) -> Option<Decimal> {
     match value {
         Value::Integer(i) => Some(Decimal::from(*i)),
-        Value::BigInteger(b) => b.to_decimal(),
         Value::Decimal(d) => Some(*d),
         Value::Float(f) => Decimal::try_from(*f).ok(),
         Value::Double(d) => Decimal::try_from(*d).ok(),

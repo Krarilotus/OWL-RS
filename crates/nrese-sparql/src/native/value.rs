@@ -16,7 +16,7 @@ use nrese_xsd::{
 
 /// A valid XSD integer strictly outside signed 64-bit range (`< i64::MIN` or `> i64::MAX`),
 /// stored canonically as a sign and non-empty ASCII decimal digits with no leading zeros.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BigInteger {
     negative: bool,
     digits: String,
@@ -366,28 +366,17 @@ fn to_double(value: &Value) -> Option<Double> {
     }
 }
 
-/// Result of a SPARQL relational comparison (`<`, `<=`, `>`, `>=`) when the operand types
-/// are compatible: either a total [`Ordering`] or [`Comparison::Unordered`] (numeric `NaN`,
-/// where every relational operator returns `false` rather than a type error).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Comparison {
-    Ordered(Ordering),
-    Unordered,
-}
-
-/// Relational comparison distinguishing numeric `NaN` ([`Comparison::Unordered`]) from
-/// incompatible operand types (`None`).
-pub fn compare_rel(a: &Value, b: &Value) -> Option<Comparison> {
+/// `<`, `>`, `<=`, `>=` as operators: `None` is a type error, `Some(None)` a number
+/// unordered with NaN, for which XPath's op:numeric-less-than and op:numeric-greater-than
+/// give false.
+pub(crate) fn compare_rel(a: &Value, b: &Value) -> Option<Option<Ordering>> {
     if a.is_numeric() && b.is_numeric() {
-        return Some(match compare_numeric(a, b) {
-            Some(ordering) => Comparison::Ordered(ordering),
-            None => Comparison::Unordered,
-        });
+        return Some(compare_numeric(a, b));
     }
-    compare(a, b).map(Comparison::Ordered)
+    compare(a, b).map(Some)
 }
 
-/// `<`, `>`, `<=`, `>=`: `None` is a type error (or unordered `NaN`).
+/// `<`, `>`, `<=`, `>=`: `None` is a type error (or a number unordered with NaN).
 pub fn compare(a: &Value, b: &Value) -> Option<Ordering> {
     if a.is_numeric() && b.is_numeric() {
         return compare_numeric(a, b);

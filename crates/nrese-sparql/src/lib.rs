@@ -37,9 +37,7 @@ pub mod view;
 /// constraints).
 pub mod value {
     pub use crate::native::expr::compile_regex;
-    pub use crate::native::value::{
-        BigInteger, Value, canonical, compare, equals, lang_matches, order,
-    };
+    pub use crate::native::value::{Value, canonical, compare, equals, lang_matches, order};
     /// The values of `SUM`, `AVG` and `GROUP_CONCAT` over a group's values.
     pub use crate::native::{average, group_concat, sum};
 }

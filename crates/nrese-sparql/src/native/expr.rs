@@ -5,6 +5,7 @@
 //! error or an unbound variable, which SPARQL treats alike in FILTERs. The supported set
 //! grows with coverage (execution-core design, XC5).
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -19,14 +20,14 @@ use sha2::{Sha256, Sha384, Sha512};
 
 use nrese_xsd::{
     Date, DateTime, DayTimeDuration, Decimal, Double, Duration, Float, GDay, GMonth, GMonthDay,
-    GYear, GYearMonth, Integer, Time, TimezoneOffset, YearMonthDuration,
+    GYear, GYearMonth, Time, TimezoneOffset, YearMonthDuration,
 };
 
 use super::calendar;
 use super::numeric::{Numeric, Operator};
 use super::value::{
-    Comparison, Value, boolean_term, canonical, compare_rel, effective_boolean, equals,
-    is_lang_string, parse_integer,
+    Value, boolean_term, canonical, compare_rel, effective_boolean, equals, is_lang_string,
+    parse_integer,
 };
 
 /// True if the native evaluator implements every node of `expr`.
@@ -246,23 +247,19 @@ impl Evaluator {
             Expression::SameTerm(a, b) => boolean(self.eval(a, binding)? == self.eval(b, binding)?),
             Expression::Greater(a, b) => {
                 let (x, y) = values(a, b)?;
-                compare_rel(&x, &y)
-                    .map(|c| boolean_term(matches!(c, Comparison::Ordered(o) if o.is_gt())))
+                compare_rel(&x, &y).map(|o| boolean_term(o.is_some_and(Ordering::is_gt)))
             }
             Expression::GreaterOrEqual(a, b) => {
                 let (x, y) = values(a, b)?;
-                compare_rel(&x, &y)
-                    .map(|c| boolean_term(matches!(c, Comparison::Ordered(o) if o.is_ge())))
+                compare_rel(&x, &y).map(|o| boolean_term(o.is_some_and(Ordering::is_ge)))
             }
             Expression::Less(a, b) => {
                 let (x, y) = values(a, b)?;
-                compare_rel(&x, &y)
-                    .map(|c| boolean_term(matches!(c, Comparison::Ordered(o) if o.is_lt())))
+                compare_rel(&x, &y).map(|o| boolean_term(o.is_some_and(Ordering::is_lt)))
             }
             Expression::LessOrEqual(a, b) => {
                 let (x, y) = values(a, b)?;
-                compare_rel(&x, &y)
-                    .map(|c| boolean_term(matches!(c, Comparison::Ordered(o) if o.is_le())))
+                compare_rel(&x, &y).map(|o| boolean_term(o.is_some_and(Ordering::is_le)))
             }
             Expression::In(a, list) => {
                 let needle = Value::of(&self.eval(a, binding)?);
@@ -929,30 +926,19 @@ fn cast(name: &str, term: Term) -> Option<Term> {
         return typed(v.to_string(), xsd::FLOAT);
     }
     if name == xsd::INTEGER.as_str() {
-        return match value {
-            Value::Float(v) => typed(Integer::try_from(v).ok()?.to_string(), xsd::INTEGER),
-            Value::Double(v) => typed(Integer::try_from(v).ok()?.to_string(), xsd::INTEGER),
+        let v = match value {
+            Value::Float(v) => Value::Integer(v.try_into().ok()?),
+            Value::Double(v) => Value::Integer(v.try_into().ok()?),
+            Value::Decimal(v) => Value::Integer(v.try_into().ok()?),
+            Value::Boolean(b) => Value::Integer(Boolean::from(b).into()),
+            // A cast collapses the string's whitespace first (XPath F&O §17.1.1); an RDF
+            // literal's lexical form is never trimmed.
+            Value::String(s) => parse_integer(s.trim_matches(['\t', '\n', '\r', ' ']), None, None)?,
+            v => v,
+        };
+        return match v {
             Value::Integer(v) => typed(v.to_string(), xsd::INTEGER),
             Value::BigInteger(v) => typed(v.to_string(), xsd::INTEGER),
-            Value::Decimal(v) => match Integer::try_from(v) {
-                Ok(i) => typed(i.to_string(), xsd::INTEGER),
-                Err(_) => {
-                    let s = v.to_string();
-                    let whole = s.split('.').next().unwrap_or(&s);
-                    typed(whole.to_owned(), xsd::INTEGER)
-                }
-            },
-            Value::Boolean(b) => typed(Integer::from(Boolean::from(b)).to_string(), xsd::INTEGER),
-            Value::String(s) => {
-                // XPath string-to-integer casting applies XML whitespace normalization
-                // before lexical parsing (raw RDF literals remain strictly validated).
-                let trimmed = s.trim_matches(|c| matches!(c, ' ' | '\t' | '\r' | '\n'));
-                match parse_integer(trimmed, None, None)? {
-                    Value::Integer(v) => typed(v.to_string(), xsd::INTEGER),
-                    Value::BigInteger(v) => typed(v.to_string(), xsd::INTEGER),
-                    _ => None,
-                }
-            }
             _ => None,
         };
     }
