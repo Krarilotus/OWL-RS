@@ -13,12 +13,13 @@
 #   fleet_cancel                  cancels it, once (also on an interrupt)
 #   q TEXT                        TEXT as a TOML string
 #
-# Silence is a call with no answer: no reply, an error, a timeout or no state. It is unknown, not an
+# Silence is a call with no answer: no reply, a call that failed (whatever it printed), a timeout or
+# no state. It is unknown, not an
 # end: the job is neither judged nor cancelled for it, and a pending job's start window doesn't run
 # meanwhile. A spell of it ends the wait only once it has lasted NRESE_FLEET_SILENT_S seconds
 # (default 600) or MAX_S has passed; then the job is cancelled. Both are checked before every fleet
-# call and before every sleep: no call starts and no sleep begins after either. A job is never
-# submitted again.
+# call and again when it returns: no call starts after either, and an answer that came after either
+# isn't taken. A job is never submitted again.
 fleet_bin=${NRESE_FLEET_BIN:-$(git config --get nrese.fleetBin || echo ${HOME:+"$HOME"/Documents/fleet-scheduler/state/owlrs/bin/fleet.exe})}
 fleet_id=""
 fleet_state=""
@@ -72,19 +73,23 @@ fleet_submit() {
 
 fleet_follow() {
   local start_s=$1 max_s=$2 poll_s=${NRESE_FLEET_POLL_S:-10}
-  local start_by=$((SECONDS + start_s)) last="" quiet="" asked now
+  local start_by=$((SECONDS + start_s)) last="" quiet="" asked now reply
   fleet_end_by=$((SECONDS + max_s)) fleet_max_s=$max_s
   while :; do
     fleet_may_wait "$quiet" || { fleet_cancel; return 75; }
     asked=$SECONDS
-    now=$(timeout --kill-after=10 30 "$fleet_bin" status "$fleet_id" --json 2> /dev/null | python -c '
+    # A failed call is silence, whatever it printed.
+    now="" reply=""
+    reply=$(timeout --kill-after=10 30 "$fleet_bin" status "$fleet_id" --json 2> /dev/null) &&
+      now=$(printf '%s\n' "$reply" | python -c '
 import json, sys
 j = json.load(sys.stdin)
 if j.get("state"):
     print(j["state"], j.get("host") or "-", j.get("reason") or "")' 2> /dev/null | tr -d '\r')
-    if [ -z "$now" ]; then
-      quiet=${quiet:-$asked}
-    else
+    [ -n "$now" ] || quiet=${quiet:-$asked}
+    # An answer counts only if it came inside both deadlines.
+    fleet_may_wait "$quiet" || { fleet_cancel; return 75; }
+    if [ -n "$now" ]; then
       [ -z "$quiet" ] || start_by=$((start_by + SECONDS - quiet))
       quiet=""
       fleet_state=${now%% *}
@@ -99,32 +104,36 @@ if j.get("state"):
         cancelled | blocked) fleet_say "it was $fleet_state"; fleet_id=""; return 75 ;;
       esac
     fi
-    fleet_may_wait "$quiet" || { fleet_cancel; return 75; }
     sleep "$poll_s"
   done
 }
 
 # fleet_may_wait [SINCE]: whether the wait may go on: MAX_S not passed and, where a silence began at
-# SINCE (in SECONDS), that silence still under its cap. Asked before every fleet call and every sleep.
+# SINCE (in SECONDS), that silence still under its cap. Asked before every fleet call, and after it
+# returns, before its answer is taken.
 fleet_may_wait() {
   local since=${1:-}
-  [ $SECONDS -lt $fleet_end_by ] && { [ -z "$since" ] || [ $((SECONDS - since)) -lt "${NRESE_FLEET_SILENT_S:-600}" ]; } \
-    && return
-  if [ -n "$since" ]; then fleet_say "the fleet didn't answer for $((SECONDS - since)) s"; else fleet_say "past $fleet_max_s s"; fi
+  if [ $SECONDS -ge $fleet_end_by ]; then
+    fleet_say "past $fleet_max_s s"
+  elif [ -n "$since" ] && [ $((SECONDS - since)) -ge "${NRESE_FLEET_SILENT_S:-600}" ]; then
+    fleet_say "the fleet didn't answer for $((SECONDS - since)) s"
+  else
+    return 0
+  fi
   return 1
 }
 
 fleet_results() {
-  local quiet="" asked dir
+  local quiet="" asked dir got
   while fleet_may_wait "$quiet"; do
-    asked=$SECONDS
-    if dir=$(timeout --kill-after=10 300 "$fleet_bin" results "$fleet_id" 2> /dev/null) && dir=${dir//$'\r'/} &&
-      [ -n "${dir##*$'\n'}" ]; then
-      echo "${dir##*$'\n'}"
-      return
+    asked=$SECONDS got=""
+    if dir=$(timeout --kill-after=10 300 "$fleet_bin" results "$fleet_id" 2> /dev/null) && dir=${dir//$'\r'/}; then
+      got=${dir##*$'\n'}
     fi
-    quiet=${quiet:-$asked}
+    [ -n "$got" ] || quiet=${quiet:-$asked}
+    # Results count only if they came inside both deadlines.
     fleet_may_wait "$quiet" || return 75
+    [ -z "$got" ] || { echo "$got"; return; }
     sleep "${NRESE_FLEET_POLL_S:-10}"
   done
   return 75

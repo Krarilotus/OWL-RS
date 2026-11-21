@@ -72,6 +72,11 @@ class FleetFollow(push.Repo):
         path = self.fake / "cancelled"
         return path.read_text().split() if path.exists() else []
 
+    def calls(self, command):
+        """How often job gate-1's COMMAND reached the fleet."""
+        path = self.fake / f"{command}-gate-1.n"
+        return int(path.read_text()) if path.exists() else 0
+
     def test_a_silence_shorter_than_the_cap_is_waited_out(self):
         """Silence for many more calls than the old limit of six, but for less time than the cap:
         the gate follows the job on, cancels nothing, and passes on its result."""
@@ -86,34 +91,68 @@ class FleetFollow(push.Repo):
         """A silence ends the wait once it has lasted NRESE_FLEET_SILENT_S seconds, or the gate's
         MAX_S has passed, whichever comes first: no verdict, and the job, named, cancelled once. It
         is counted in seconds, not calls: two slow silent calls outlast a cap of three seconds."""
-        for silent_s, max_s, silence in (("1", "10800", [""]), ("600", "3", [""]),
-                                         ("3", "10800", ["~2", "~2", state("done")])):
-            with self.subTest(silent_s=silent_s, max_s=max_s, silence=silence):
+        silent = "the fleet didn't answer for \\d+ s"
+        for silent_s, max_s, status, said in (("1", "10800", [state("running"), ""], silent),
+                                              ("600", "3", ["~4"], "past 3 s"),
+                                              ("3", "10800", [state("running"), "~2", "~2", state("done")], silent)):
+            with self.subTest(silent_s=silent_s, max_s=max_s, status=status):
                 self.reset()
                 self.env.update(NRESE_FLEET_SILENT_S=silent_s, NRESE_GATE_MAX_S=max_s)
-                self.play("status", state("running"), *silence)
+                self.play("status", *status)
                 self.play("results", self.results())
                 code, where, _, err = self.gate()
-                self.assertEqual((code, where, self.cancels()), (75, "", ["gate-1"]),
+                self.assertEqual((code, where, self.cancels(), self.calls("results")), (75, "", ["gate-1"], 0),
                                  f"SPEC silence-cap: not one cancel at the cap\n{err}")
-                self.assertRegex(err, r"gate-1: (the fleet didn't answer for|past) \d+ s",
-                                 "SPEC silence-cap: the job isn't named with the end of its wait")
+                self.assertRegex(err, f"gate-1: {said}", "SPEC silence-cap: the job isn't named with the end of its wait")
 
     def test_no_fleet_call_starts_after_the_cap_or_the_gates_limit(self):
         """A poll longer than what is left of the wait: the next status or results call would start
         after the silence's cap or after MAX_S, so the wait ends there instead, with one cancel,
-        whatever that call would have answered."""
-        self.env["NRESE_GATE_POLL_S"] = "2"
-        for silent_s, max_s, status, results in (("1", "10800", [state("running"), "", state("done")], []),
-                                                 ("30", "1", [state("done")], [""])):
+        whatever that call would have answered. Neither call reaches the fleet. (MAX_S is 4 s: the
+        status and the first results call fit in it on a slow host; the 8 s poll runs past it.)"""
+        for silent_s, max_s, poll_s, status, results, calls in (
+                ("1", "10800", "2", [state("running"), "", state("done")], [], (2, 0)),
+                ("30", "4", "8", [state("done")], [""], (1, 1))):
             with self.subTest(silent_s=silent_s, max_s=max_s):
                 self.reset()
-                self.env.update(NRESE_FLEET_SILENT_S=silent_s, NRESE_GATE_MAX_S=max_s)
+                self.env.update(NRESE_FLEET_SILENT_S=silent_s, NRESE_GATE_MAX_S=max_s, NRESE_GATE_POLL_S=poll_s)
                 self.play("status", *status)
                 self.play("results", *results, self.results())
                 code, where, _, err = self.gate()
+                self.assertEqual((code, where, self.cancels(), (self.calls("status"), self.calls("results"))),
+                                 (75, "", ["gate-1"], calls),
+                                 f"SPEC no-call-after-deadline: a call started after the deadline\n{err}")
+
+    def test_an_answer_that_came_after_a_deadline_is_not_taken(self):
+        """A call that started inside the deadlines but answered after one of them: its answer isn't
+        taken, however good. A status `done` that took longer than what was left of a silence's cap, and
+        results that came after MAX_S or after the cap of a silence while fetching them: no verdict, one
+        cancel, and (for the status) no results asked for."""
+        for name, silent_s, max_s, status, results in (
+                ("status after the cap", "2", "10800", ["", f"+3 {state('done')}"], []),
+                ("results after MAX_S", "30", "1", [state("done")], ["+2"]),
+                ("results after the cap", "2", "10800", [state("done")], ["", "+3"])):
+            with self.subTest(name):
+                self.reset()
+                self.env.update(NRESE_FLEET_SILENT_S=silent_s, NRESE_GATE_MAX_S=max_s)
+                self.play("status", *status)
+                record = self.results()
+                self.play("results", *[f"{r} {record}" if r.startswith("+") else r for r in results] or [record])
+                code, where, _, err = self.gate()
                 self.assertEqual((code, where, self.cancels()), (75, "", ["gate-1"]),
-                                 f"SPEC no-call-after-deadline: a call after the deadline gave the verdict\n{err}")
+                                 f"SPEC late-answer: an answer after the deadline gave the verdict\n{err}")
+                if not results:
+                    self.assertEqual(self.calls("results"), 0, "SPEC late-answer: results asked for after a late `done`")
+
+    def test_a_status_call_that_failed_is_silence_whatever_it_printed(self):
+        """The fleet's CLI prints a valid state and exits with an error: that is a CLI error, silence,
+        not the job's state. Silence to the cap: no verdict, one cancel, no results asked for."""
+        self.env["NRESE_FLEET_SILENT_S"] = "1"
+        self.play("status", f"!{state('done')}")
+        self.play("results", self.results())
+        code, where, _, err = self.gate()
+        self.assertEqual((code, where, self.cancels(), self.calls("results")), (75, "", ["gate-1"], 0),
+                         f"SPEC failed-call-silence: a failed call's output was taken as the job's state\n{err}")
 
     def test_no_results_call_starts_after_the_gates_limit(self):
         """The job's `done` comes from a status call that started inside MAX_S and answered after it:
