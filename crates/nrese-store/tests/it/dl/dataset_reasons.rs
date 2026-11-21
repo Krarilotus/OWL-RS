@@ -23,6 +23,14 @@ const OMITTED: &str = "this read's dataset leaves out the store's default graph 
 /// The beginning of the reason a read is told when its time was up before the bounds' view.
 const TIME_UP: &str = "the request's time was up";
 
+/// What a read without the bounds' view answers over, where it reads the closure.
+const OVER_THE_CLOSURE: &str = "answers over the RL closure";
+
+/// The pending reason's end for a read of the committed closure, and for one leaving it out.
+const PENDING_CLOSURE: &str =
+    "aren't reasoned over before the commit (the committed closure, no DL bounds)";
+const PENDING_NO_BOUNDS: &str = "aren't reasoned over before the commit (no DL bounds)";
+
 /// `:tom a :Animal` follows from `:g1`'s axiom and `:g2`'s fact, into the default graph.
 fn store() -> MutationPipeline {
     let dl = pipeline();
@@ -55,7 +63,8 @@ const FROM_G2: &str = "SELECT ?x FROM :g2 WHERE { ?x a :Animal }";
 /// Spec: under `owl2-dl`, a reader of every graph whose `FROM` leaves out the store's default
 /// graph is told `sound-only` with the reason that names the omitted default graph, with the
 /// bounds' view of the revision built and without it; without it, beside the reason it has
-/// none (the request's time was up), which isn't replaced. A reader of some graphs never
+/// none (the request's time was up), which isn't replaced, and which says nothing of an RL
+/// closure the read doesn't reach. A reader of some graphs never
 /// reads the bounds and is told `not-certified` both times: under `owl2-dl` its status is
 /// withheld, as every graph's axioms decide it. Every read here has its time up from the
 /// start; a read with time to wait builds the view between the two rounds, and a read of
@@ -94,7 +103,8 @@ fn a_read_leaving_out_the_default_graph_is_told_so_with_the_bounds_and_without()
         assert!(
             all.starts_with("sound-only; regime=owl2-dl;")
                 && all.contains(OMITTED)
-                && all.contains(TIME_UP) != *built,
+                && all.contains(TIME_UP) != *built
+                && !all.contains(OVER_THE_CLOSURE),
             "every graph, built={built}: {all}"
         );
         assert_eq!(some, "not-certified", "some graphs, built={built}");
@@ -103,7 +113,8 @@ fn a_read_leaving_out_the_default_graph_is_told_so_with_the_bounds_and_without()
 
 /// Spec: a read whose `FROM` leaves out the store's default graph but that reads it by
 /// `GRAPH` under another store's name for it reads the closure: without the bounds' view it
-/// is told why (the request's time was up), and nothing of an omitted default graph.
+/// is told why (the request's time was up) and that it answers over the RL closure, and
+/// nothing of an omitted default graph.
 #[test]
 fn a_read_of_the_default_graph_by_graph_keeps_the_fallbacks_reason() {
     let dl = store();
@@ -113,20 +124,17 @@ fn a_read_of_the_default_graph_by_graph_keeps_the_fallbacks_reason() {
     assert!(
         header.starts_with("sound-only; regime=owl2-dl;")
             && header.contains(TIME_UP)
+            && header.contains(OVER_THE_CLOSURE)
             && !header.contains(OMITTED),
         "{header}"
     );
 }
 
-/// Spec: inside a transaction, a read whose `FROM` leaves out the store's default graph is
-/// told that its pending operations aren't reasoned over, and that it leaves out the default
-/// graph; nothing of a committed closure it doesn't read.
-#[test]
-fn a_pending_read_leaving_out_the_default_graph_names_no_committed_closure() {
-    let dl = store();
-    let store = dl.store();
+/// The `NRESE-Completeness` header of `query` (over [`PREFIXES`]) read inside a transaction
+/// with one operation pending, an unrelated addition.
+fn pending(store: &StoreService, query: &str) -> String {
     let prepared = store
-        .prepare_query(&SparqlQueryRequest::all(format!("{PREFIXES}{FROM_G2}")))
+        .prepare_query(&SparqlQueryRequest::all(format!("{PREFIXES}{query}")))
         .expect("prepared");
     let ops = vec![StatementOp::Add {
         data: nrese_store::RdfPayload {
@@ -151,12 +159,33 @@ fn a_pending_read_leaving_out_the_default_graph_names_no_committed_closure() {
             },
         )
         .expect("answered");
-    let header = status.map_or_else(|| "none".to_owned(), |s| s.header());
+    status.map_or_else(|| "none".to_owned(), |s| s.header())
+}
+
+/// Spec: inside a transaction, a read whose `FROM` leaves out the store's default graph is
+/// told that its pending operations aren't reasoned over and that it has no DL bounds, and
+/// that it leaves out the default graph; nothing of a committed closure it doesn't read.
+#[test]
+fn a_pending_read_leaving_out_the_default_graph_names_no_committed_closure() {
+    let dl = store();
+    let header = pending(dl.store(), FROM_G2);
     println!("DATASET pending: {header}");
     assert!(
-        header.contains("a read inside a transaction")
+        header.contains(PENDING_NO_BOUNDS)
             && header.contains(OMITTED)
             && !header.contains("committed closure"),
         "{header}"
     );
+}
+
+/// Spec: inside a transaction, a read whose `FROM` leaves out the store's default graph but
+/// that reads it by `GRAPH` under another store's name for it is told that its pending
+/// operations aren't reasoned over, over the committed closure, with no DL bounds.
+#[test]
+fn a_pending_read_of_the_default_graph_by_graph_keeps_the_pending_cause() {
+    let dl = store();
+    let query = "SELECT ?x FROM :g2 WHERE { GRAPH <urn:x-arq:DefaultGraph> { ?x a :Animal } }";
+    let header = pending(dl.store(), query);
+    println!("DATASET pending alias: {header}");
+    assert!(header.contains(PENDING_CLOSURE), "{header}");
 }
