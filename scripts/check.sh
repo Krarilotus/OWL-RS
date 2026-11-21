@@ -97,11 +97,12 @@ step() {
 }
 # Where the run's job requires a version (NRESE_NEXTEST_REQUIRED, scripts/lib/windows-job.sh), cargo
 # must run exactly that one, asked right before the tests; any other, or none, ends the run with 3, no
-# verdict: never cargo test or another runner in its place.
+# verdict: never cargo test or another runner in its place. Elsewhere (a developer's run) any
+# cargo-nextest whose version command succeeds is used.
 nextest() {
   local got
+  [ -n "${NRESE_NEXTEST_REQUIRED:-}" ] || { cargo nextest --version > /dev/null 2>&1; return; }
   got=$(cargo nextest --version 2> /dev/null) || got=""
-  [ -n "${NRESE_NEXTEST_REQUIRED:-}" ] || { [ -n "$got" ]; return; }
   [ "$(printf '%s\n' "$got" | tr -d '\r' | awk 'NR == 1 { print $2 }')" = "$NRESE_NEXTEST_REQUIRED" ] && return 0
   echo "cargo-nextest $NRESE_NEXTEST_REQUIRED is required here; cargo runs ${got:-none}: no verdict" >&2
   exit 3
