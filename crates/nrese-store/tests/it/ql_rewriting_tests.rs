@@ -2634,7 +2634,7 @@ fn inclusions_through_inverse_expressions_are_materialised() {
 fn negation_and_exists_answer_as_the_chase() {
     let cases = cases();
     let witnesses = ql_witnesses();
-    let (mut families, mut forms) = (0, BTreeSet::new());
+    let (mut families, mut negations) = (0, BTreeSet::new());
     let dir = tempfile::tempdir().unwrap();
     let seed = std::env::var("NRESE_QL_SEED")
         .ok()
@@ -2845,7 +2845,7 @@ fn negation_and_exists_answer_as_the_chase() {
                     decided_by_rewriting += 1;
                 }
                 checked += 1;
-                forms.insert((mixed, name));
+                negations.insert((mixed, name));
             }
         }
         families |= tbox.families;
@@ -2865,7 +2865,7 @@ fn negation_and_exists_answer_as_the_chase() {
     );
     if witnesses.is_some() {
         assert_eq!(families.count_ones() as usize, TBOX_FAMILIES);
-        assert_eq!(forms.len(), 6, "all forms in both modes: {forms:?}");
+        assert_eq!(negations.len(), 6, "all forms in both modes: {negations:?}");
     }
 }
 
