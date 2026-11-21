@@ -3448,8 +3448,8 @@ fn a_list_reads_member_pairs_across_aliased_walks() {
     let lists = ListVocabulary::new(&mut vocabulary);
     let (rules, diagnostics) = super::lists::instantiate(&lists, &SliceFacts(&every));
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
-    let left = Term::Const(vocabulary.term("ex:m1-alias1"));
-    let right = Term::Const(vocabulary.term("ex:m3-alias4"));
+    let [left, _, right] =
+        load(&mut vocabulary, "ex:m1-alias1 owl:sameAs ex:m3-alias4")[0].map(Term::Const);
     assert!(rules.iter().any(|r| {
         r.name == "eq-diff2"
             && r.body
