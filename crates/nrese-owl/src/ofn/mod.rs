@@ -136,6 +136,8 @@ impl<'a> FunctionalReader<'a> {
             empty_list: None,
             // The route reads triples only, through the RDF reader.
             rules_unread: None,
+            // Functional syntax has no list cells.
+            list_cell_outside: None,
             qualified_data_max: model.qualified_data_max,
         };
         crate::mapping::complete(&mut ontology, terms);

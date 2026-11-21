@@ -199,12 +199,13 @@ fn routed_to_rules(ontology: &Ontology) -> bool {
 /// What the RL route was decided on: the TBox signature as the reader typed it, the
 /// built-in annotation properties among its annotation properties, the SHACL properties
 /// whose statements were read as SHACL content (`Ontology::shacl`), and the ids of
-/// `rdf:type` and `owl:sameAs` (`None`: not in the dictionary then).
+/// `rdf:type`, `owl:sameAs` and `rdf:first` (`None`: not in the dictionary then).
 pub(crate) struct Kinds {
     signature: nrese_owl::profile::Signature,
     shacl: std::collections::BTreeSet<u64>,
     rdf_type: Option<u64>,
     same_as: Option<u64>,
+    first: Option<u64>,
 }
 
 impl Kinds {
@@ -221,7 +222,30 @@ impl Kinds {
             shacl: ontology.shacl.clone(),
             rdf_type: id("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
             same_as: id("http://www.w3.org/2002/07/owl#sameAs"),
+            first: id("http://www.w3.org/1999/02/22-rdf-syntax-ns#first"),
         })
+    }
+
+    /// Whether `t` is a list's cell at `tx`'s base: a blank node with an asserted `rdf:first`
+    /// there (one probe of the committed index; the pending changes aren't scanned, so a
+    /// commit's cost stays linear in its statements). The reader reports a cell that a
+    /// statement outside its list names (`Ontology::list_cell_outside`), so such a statement
+    /// is read. A cell new in the commit has its own pending `rdf:first`, which
+    /// [`changes_schema`] already sends to the reader; without `rdf:first` in the dictionary
+    /// at the route's revision there was no cell at the base.
+    fn cell(&self, tx: &Transaction<'_>, t: u64) -> bool {
+        let id = TermId::from_raw(t);
+        let Some(first) = self.first else {
+            return false;
+        };
+        if id.kind() != nrese_engine::TermKind::BlankNode {
+            return false;
+        }
+        let mut pattern = nrese_engine::QuadPattern::all();
+        (pattern.subject, pattern.predicate) = (Some(id), Some(TermId::from_raw(first)));
+        let base = tx.base();
+        let mut found = base.quads_for_pattern_in(ReadModel::Asserted, &pattern);
+        found.next().is_some()
     }
 
     /// Whether an asserted triple, inserted or deleted, leaves every term the kinds the
@@ -236,9 +260,13 @@ impl Kinds {
     /// only as the kind its object needs (a literal a data property, an IRI an object
     /// property). A deleted literal needs a declared data property: one that is data only
     /// by its literals may lose the last one, and its other axioms then read it as an
-    /// object property.
+    /// object property. A statement that names a list's cell ([`Self::cell`]), an annotation
+    /// too, is read.
     fn keep(&self, tx: &Transaction<'_>, triple @ [s, p, o]: Triple, deleted: bool) -> bool {
         let k = &self.signature;
+        if self.cell(tx, s) || self.cell(tx, o) {
+            return false;
+        }
         if self.shacl.contains(&p) || (k.annotations.contains(&p) && !named(tx, p, false)) {
             return true;
         }
