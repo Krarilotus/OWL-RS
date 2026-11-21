@@ -2892,6 +2892,7 @@ pub(crate) fn consistency_rules<S: Source + ?Sized>(
     source: &S,
     rules: &[Rule],
     lists: Option<&ListVocabulary>,
+    projection: Option<&ListVocabulary>,
     written: Option<&dyn super::lists::Facts>,
 ) -> Vec<Rule> {
     let mut out: Vec<Rule> = rules
@@ -2901,7 +2902,7 @@ pub(crate) fn consistency_rules<S: Source + ?Sized>(
         .collect();
     if let Some(vocabulary) = lists {
         let (list_rules, _, _) =
-            super::lists::instantiate_written(vocabulary, &AllFacts(source), written);
+            super::lists::instantiate_projected(vocabulary, projection, &AllFacts(source), written);
         out.extend(
             list_rules
                 .into_iter()
@@ -3596,7 +3597,8 @@ fn run_body(
         let mut checks = consistency_rules(
             &current,
             &rules,
-            schema.list_projection().or(lists),
+            lists,
+            schema.list_projection(),
             Some(&written),
         );
         poll.ended().map_err(|Stopped| Interrupted::default())?;

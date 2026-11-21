@@ -457,12 +457,12 @@ fn check_acyclic(cells: &HashMap<u64, Cell>, head: u64) -> Result<(), ListProble
 /// A member sequence of a list, with the facts its path uses.
 type Variant = (Vec<u64>, Vec<[u64; 3]>);
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 enum ListKind {
     Chain,
     Key,
     Class,
-    Pairwise,
+    Pairwise { written_predicate: u64 },
 }
 
 impl ListKind {
@@ -470,7 +470,7 @@ impl ListKind {
         match self {
             Self::Chain => MAX_RULE_MEMBERS,
             Self::Key => MAX_KEY_MEMBERS,
-            Self::Class | Self::Pairwise => usize::MAX,
+            Self::Class | Self::Pairwise { .. } => usize::MAX,
         }
     }
 }
@@ -613,7 +613,16 @@ pub fn instantiate_written(
     facts: &impl Facts,
     written: Option<&dyn Facts>,
 ) -> (Vec<Rule>, Vec<Vec<[u64; 3]>>, Vec<ListDiagnostic>) {
-    let voc = vocabulary;
+    instantiate_projected(vocabulary, None, facts, written)
+}
+
+pub(crate) fn instantiate_projected(
+    vocabulary: &ListVocabulary,
+    projection: Option<&ListVocabulary>,
+    facts: &impl Facts,
+    written: Option<&dyn Facts>,
+) -> (Vec<Rule>, Vec<Vec<[u64; 3]>>, Vec<ListDiagnostic>) {
+    let voc = projection.unwrap_or(vocabulary);
     let mut rules = Vec::new();
     let mut premises: Vec<Vec<[u64; 3]>> = Vec::new();
     let mut diagnostics: Vec<ListDiagnostic> = Vec::new();
@@ -639,7 +648,7 @@ pub fn instantiate_written(
             };
             // Only `owl:members` and `owl:distinctMembers` lists are read as written: their
             // rules are checks alone, never an inference, and never too long for a rule.
-            let checks = kind == ListKind::Pairwise;
+            let checks = matches!(kind, ListKind::Pairwise { .. });
             let nil_is_cell = *nil_is_cell.get_or_init(|| {
                 !facts.objects(voc.nil, voc.first).is_empty()
                     && !facts.objects(voc.nil, voc.rest).is_empty()
@@ -648,14 +657,18 @@ pub fn instantiate_written(
             if let Some(problem) = cycle {
                 diagnose(problem);
             }
-            let read = match (walks, written) {
-                (Err(ListProblem::TooManyVariants), Some(written)) if checks => {
+            let read = match (walks, written, kind) {
+                (
+                    Err(ListProblem::TooManyVariants),
+                    Some(written),
+                    ListKind::Pairwise { written_predicate },
+                ) => {
                     diagnose(ListProblem::TooManyVariants);
                     // Where equality merges cells as written past the cap too, each
                     // node's own cells, as the list was asserted.
                     let unmerged = |problem: ListProblem| match written.unmerged() {
                         Some(unmerged) if problem == ListProblem::TooManyVariants => {
-                            voc.unmerged_list(unmerged, [subject, predicate, head])
+                            vocabulary.unmerged_list(unmerged, [subject, written_predicate, head])
                         }
                         _ => Err(problem),
                     };
@@ -664,7 +677,7 @@ pub fn instantiate_written(
                         Err(_) => continue,
                     }
                 }
-                (read, _) => read,
+                (read, _, _) => read,
             };
             match read {
                 Ok(variants) => {
@@ -864,7 +877,9 @@ pub fn instantiate_written(
     lists(
         voc.members,
         "cax-adc, prp-adp, eq-diff2",
-        ListKind::Pairwise,
+        ListKind::Pairwise {
+            written_predicate: vocabulary.members,
+        },
         &mut rules,
         &mut |node, members, rules| {
             if members.len() > PAIRWISE_MEMBERS {
@@ -933,7 +948,9 @@ pub fn instantiate_written(
     lists(
         voc.distinct_members,
         "eq-diff3",
-        ListKind::Pairwise,
+        ListKind::Pairwise {
+            written_predicate: vocabulary.distinct_members,
+        },
         &mut rules,
         &mut |node, members, rules| {
             if !typed(node, voc.all_different) {
