@@ -130,6 +130,72 @@ async fn an_http10_answer_past_the_shared_memory_is_turned_away_for_now()
     Ok(())
 }
 
+/// A query whose own memory grows with its answer: every row is a distinct pair the
+/// `DISTINCT` keeps, and a short line of CSV.
+fn distinct_query() -> String {
+    let values: String = (1..=400).map(|n| format!("{n} ")).collect();
+    format!("SELECT DISTINCT ?a ?b WHERE {{ VALUES ?a {{ {values} }} VALUES ?b {{ {values} }} }}")
+}
+
+/// [`distinct_query`] asked as `version` in a memory limit of `limit` bytes, on a store of
+/// its own (no answer cached from before): the status and the body, once all the request
+/// held has gone back.
+async fn distinct_answer(
+    limit: usize,
+    version: Version,
+) -> Result<(StatusCode, axum::body::Bytes), Box<dyn Error>> {
+    let store = shared_store()?;
+    let mut policy = PolicyConfig::default();
+    policy.limits.max_query_memory_bytes = limit;
+    let app = test_app_with_store(store.clone(), policy, ReasonerConfig::default())?;
+    let before = held(&store);
+    let request = Request::post("/dataset/query")
+        .version(version)
+        .header(header::CONTENT_TYPE, "application/sparql-query")
+        .header(header::ACCEPT, "text/csv")
+        .body(Body::from(distinct_query()))?;
+    let response = app.oneshot(request).await?;
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await?;
+    released_to(&store, before).await;
+    Ok((status, body))
+}
+
+/// The query's own work and its answer held whole draw on one envelope. When the query's
+/// work is refused while part of its answer is held, the request gets the same 413 as an
+/// answer too large for HTTP/1.0, which tells the client to ask over HTTP/1.1, not to raise
+/// the query's memory: over HTTP/1.1, in the same limit, the same query is answered.
+#[tokio::test]
+async fn an_http10_query_whose_work_is_refused_beside_its_held_answer_is_told_to_stream()
+-> Result<(), Box<dyn Error>> {
+    // The least limit, to 16 KiB, that HTTP/1.1 answers the query in.
+    let (mut refused, mut answered) = (0, 256 << 20);
+    while answered - refused > 16 << 10 {
+        let limit = (refused + answered) / 2;
+        match distinct_answer(limit, Version::HTTP_11).await?.0 {
+            StatusCode::OK => answered = limit,
+            StatusCode::PAYLOAD_TOO_LARGE => refused = limit,
+            other => panic!("{other} in {limit} bytes"),
+        }
+    }
+    let (status, streamed) = distinct_answer(answered, Version::HTTP_11).await?;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = distinct_answer(answered, Version::HTTP_10).await?;
+    let problem: serde_json::Value = serde_json::from_slice(&body)?;
+    eprintln!(
+        "{} bytes answered in {answered}: {status} {problem}",
+        streamed.len()
+    );
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    let detail = problem["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("an HTTP/1.0 request can be answered with")
+            && detail.contains("Ask over HTTP/1.1 or HTTP/2"),
+        "{detail}"
+    );
+    Ok(())
+}
+
 /// A client that leaves while its HTTP/1.0 answer is being made stops the request: hyper
 /// drops it once the connection reads the client's end, which cancels the query and
 /// releases its envelope. Pins, for HTTP/1.0, what the hold's own exit relies on.
