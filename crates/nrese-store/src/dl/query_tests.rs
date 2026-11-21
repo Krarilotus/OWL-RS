@@ -750,13 +750,13 @@ fn marks_and_passes(
 /// A read off the rules route of a store with neither an annotation-property axiom nor an
 /// equality is told no mark, committed and inside a transaction. Neither read's mark goes to
 /// the whole ontology: the store's indexes and the commit's record show there is neither, and
-/// the pending change, a class assertion over the base's signature, keeps the record, as its
-/// commit would (`Bounds::keeps_record`).
+/// the pending change, a member of a class the base declares, keeps the record
+/// (`Bounds::keeps_record`).
 #[test]
 fn a_store_without_annotation_axioms_or_equality_is_marked_without_the_ontology() {
     let (reads, _) = marks_and_passes(
         crate::StoreConfig::in_memory(),
-        ":tib :owner :ann . :ann rdfs:label \"Ann\" .",
+        ":Pet a owl:Class . :tib :owner :ann . :ann rdfs:label \"Ann\" .",
         ":rex a :Pet .",
     );
     assert_eq!(
@@ -985,14 +985,22 @@ fn a_reinserted_triple_a_surviving_reification_names_is_told_as_a_fresh_read_tel
 /// A store under `owl2-dl` with `base` committed and the consistency check off, so no check
 /// reads the data again: a commit's record is the one it carries over or reads.
 fn unchecked(base: &str) -> (Arc<StoreService>, crate::MutationPipeline) {
-    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
-    let config = crate::StoreConfig {
-        dl: crate::DlConfig {
-            consistency: crate::DlConsistency::Off,
-            ..crate::DlConfig::default()
-        },
-        ..crate::StoreConfig::in_memory()
+    let dl = crate::DlConfig {
+        consistency: crate::DlConsistency::Off,
+        ..crate::DlConfig::default()
     };
+    opened(
+        crate::StoreConfig {
+            dl,
+            ..crate::StoreConfig::in_memory()
+        },
+        base,
+    )
+}
+
+/// A store of `config` under `owl2-dl` with `base` committed.
+fn opened(config: crate::StoreConfig, base: &str) -> (Arc<StoreService>, crate::MutationPipeline) {
+    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
     let store = Arc::new(StoreService::new(config).unwrap());
     let pipeline = crate::MutationPipeline::new(
         Arc::clone(&store),
@@ -1022,18 +1030,61 @@ fn a_deleted_value_that_typed_an_undeclared_property_is_told_as_a_fresh_read_tel
     ));
     let route = store.dl_bounds().last;
     commit(&pipeline, "DELETE DATA { :s :p :o . }");
-    let snapshot = store.engine().snapshot();
-    let whole = read_ontology(&store, &snapshot).expect("the ontology");
-    let fresh = by_ontology(&snapshot, whole.value());
+    let (record, fresh) = record_and_fresh(&store);
     assert!(
         fresh.as_ref().is_some_and(|f| f.contains("were left out")),
         "setup: a fresh read tells {fresh:?}"
     );
-    let told = reads_differently(&store, Revision::Committed(&snapshot));
     assert_eq!(
-        first_named(&told),
+        first_named(&record),
         first_named(&fresh),
         "from {route}: the commit's record, and a fresh read"
+    );
+}
+
+/// The record of what the reader left out that the latest commit published, which it must
+/// have published, and what a fresh read of the data it left tells ([`by_ontology`]).
+fn record_and_fresh(store: &StoreService) -> (Option<String>, Option<String>) {
+    let snapshot = store.engine().snapshot();
+    let record = (store.dl().status())
+        .filter(|s| s.revision == snapshot.revision())
+        .and_then(|s| s.left_out);
+    let Some(record) = record else {
+        panic!("the commit published no record of what the reader left out");
+    };
+    let whole = read_ontology(store, &snapshot).expect("the ontology");
+    (record, by_ontology(&snapshot, whole.value()))
+}
+
+/// Spec (the reader types an undeclared property by its uses, as above): `:p` is the inverse
+/// of `:q`, so U1 knows it as an object property, and its one value, on the ontology's node,
+/// is a literal, so the reader reads it as a data property, whose range, a class's
+/// complement, is no data range. Inserting an IRI value makes it an object property, whose
+/// range that is. With no consistency check reading the data again, the commit's record is
+/// what a fresh read of that data tells: how many parts, and of which kind (left out, or read
+/// otherwise by the rules); which part it names first follows the read's order, so it isn't
+/// compared.
+#[test]
+fn an_inserted_value_that_retypes_an_undeclared_property_is_told_as_a_fresh_read_tells_it() {
+    let (store, pipeline) = unchecked(&format!(
+        "{OFF_ROUTE}:p owl:inverseOf :q ; rdfs:range [ owl:complementOf :C ] . \
+         :ont a owl:Ontology ; :p \"v\" . "
+    ));
+    let route = store.dl_bounds().last;
+    commit(&pipeline, "INSERT DATA { :s :p :o . }");
+    let (record, fresh) = record_and_fresh(&store);
+    let parts = |reason: &Option<String>| {
+        let reason = reason.as_deref().unwrap_or("");
+        let head = reason.split("; first: ").next().unwrap_or("");
+        head.split(", whose statements")
+            .next()
+            .unwrap_or("")
+            .to_owned()
+    };
+    assert_eq!(
+        parts(&record),
+        parts(&fresh),
+        "from {route}: the commit's record {record:?}, and a fresh read {fresh:?}"
     );
 }
 
@@ -1052,19 +1103,194 @@ fn a_statement_of_a_reification_role_is_told_as_a_fresh_read_tells_it() {
     ));
     let route = store.dl_bounds().last;
     commit(&pipeline, "INSERT DATA { :x owl:annotatedSource :y . }");
-    let snapshot = store.engine().snapshot();
-    let whole = read_ontology(&store, &snapshot).expect("the ontology");
-    let fresh = by_ontology(&snapshot, whole.value());
+    let (record, fresh) = record_and_fresh(&store);
     assert!(
         fresh.as_ref().is_some_and(|f| f.contains("were left out")),
         "setup: a fresh read tells {fresh:?}"
     );
-    let told = reads_differently(&store, Revision::Committed(&snapshot));
     assert_eq!(
-        first_named(&told),
+        first_named(&record),
         first_named(&fresh),
         "from {route}: the commit's record, and a fresh read"
     );
+}
+
+/// Spec (a read inside a transaction takes its base's clean record only where its commit
+/// would carry the record over and every change is on the short list whose effect on the
+/// reader the base's declarations fix, `bounds::listed`): each change found so far to alter
+/// what the reader reports while a carry-over took it is refused (a reified main triple
+/// deleted and inserted again, a retyping deletion and insertion, a statement of a
+/// reification's role, an annotation on the rules route); the list's own changes, a member
+/// of a declared class and a value of a declared object and of a declared data property,
+/// inserted and deleted, take the base's clean record, and are told what their own ontology
+/// tells.
+#[test]
+fn a_pending_read_takes_its_bases_record_only_for_changes_on_the_list() {
+    use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term};
+    let iri = |t: &str| {
+        let (ns, local) = match t.split_once(':') {
+            Some(("", local)) => ("urn:test:", local),
+            Some(("rdfs", local)) => ("http://www.w3.org/2000/01/rdf-schema#", local),
+            Some(("owl", local)) => ("http://www.w3.org/2002/07/owl#", local),
+            _ => ("http://www.w3.org/1999/02/22-rdf-syntax-ns#", "type"),
+        };
+        NamedNode::new_unchecked(format!("{ns}{local}"))
+    };
+    let quad = |[s, p, o]: [&str; 3]| {
+        let o: Term = match o.strip_prefix('"') {
+            Some(value) => Literal::new_simple_literal(value.trim_end_matches('"')).into(),
+            None => iri(o).into(),
+        };
+        Quad::new(iri(s), iri(p), o, GraphName::DefaultGraph)
+    };
+    let declared = format!(
+        "{OFF_ROUTE}:Pet a owl:Class . :owns a owl:ObjectProperty . \
+         :age a owl:DatatypeProperty . :tib :owns :ann ; :age \"3\" . "
+    );
+    let axiom = "[ a owl:Axiom ; owl:annotatedSource :tib ; owl:annotatedProperty :owner ; \
+                 owl:annotatedTarget :ann ; rdfs:comment \"since 2020\" ] . ";
+    let typed = ":p rdfs:range [ owl:complementOf :C ] . :ont a owl:Ontology ; :p \"v\" . ";
+    let rules = ":Pet a owl:Class . :tib a :Pet ; rdfs:label \"tib\" ; owl:versionInfo \"1\" . ";
+    // (the case, the base, inserted, deleted, whether it takes the record)
+    type Change = &'static [[&'static str; 3]];
+    let cases: [(&str, String, Change, Change, bool); 11] = [
+        (
+            "a member",
+            declared.clone(),
+            &[[":rex", "a", ":Pet"]],
+            &[],
+            true,
+        ),
+        (
+            "an object value",
+            declared.clone(),
+            &[[":rex", ":owns", ":bone"]],
+            &[],
+            true,
+        ),
+        (
+            "a data value",
+            declared.clone(),
+            &[[":rex", ":age", "\"2\""]],
+            &[],
+            true,
+        ),
+        (
+            "the three deleted",
+            declared.clone(),
+            &[],
+            &[
+                [":tib", "a", ":Pet"],
+                [":tib", ":owns", ":ann"],
+                [":tib", ":age", "\"3\""],
+            ],
+            true,
+        ),
+        (
+            "V1: a reified main triple deleted",
+            format!("{OFF_ROUTE}:owner a owl:ObjectProperty . :tib :owner :ann . {axiom}"),
+            &[],
+            &[[":tib", ":owner", ":ann"]],
+            false,
+        ),
+        (
+            "W3: a reified main triple inserted again",
+            format!("{OFF_ROUTE}:owner a owl:ObjectProperty . {axiom}"),
+            &[[":tib", ":owner", ":ann"]],
+            &[],
+            false,
+        ),
+        (
+            "D2: a retyping deletion",
+            format!("{OFF_ROUTE}{typed}:s :p :o . "),
+            &[],
+            &[[":s", ":p", ":o"]],
+            false,
+        ),
+        (
+            "D3: a statement of a reification's role",
+            format!(
+                "{OFF_ROUTE}:Pet rdfs:subClassOf [ a owl:Restriction ; \
+                 owl:onProperty owl:annotatedSource ; owl:someValuesFrom :Dog ] . "
+            ),
+            &[[":x", "owl:annotatedSource", ":y"]],
+            &[],
+            false,
+        ),
+        (
+            "E1: a retyping insertion",
+            format!("{OFF_ROUTE}:p owl:inverseOf :q . {typed}"),
+            &[[":s", ":p", ":o"]],
+            &[],
+            false,
+        ),
+        (
+            "E2: a label on the rules route",
+            rules.to_owned(),
+            &[[":rex", "rdfs:label", "\"rex\""]],
+            &[],
+            false,
+        ),
+        (
+            "E2: a version on the rules route",
+            rules.to_owned(),
+            &[[":tib", "owl:versionInfo", "\"2\""]],
+            &[],
+            false,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (case, base, inserted, deleted, takes) in cases {
+        let (store, _pipeline) = opened(crate::StoreConfig::in_memory(), &base);
+        let route = store.dl_bounds().last;
+        if case.starts_with("E2") && route != "rules" {
+            wrong.push(format!(
+                "{case}: setup: the base is off the rules route ({route})"
+            ));
+        }
+        let snapshot = store.engine().snapshot();
+        let mut tx = store
+            .engine()
+            .speculative(Arc::new(nrese_exec::Budget::unlimited()));
+        for &change in inserted {
+            tx.try_insert(quad(change).as_ref()).unwrap();
+        }
+        for &change in deleted {
+            tx.remove(quad(change).as_ref()).unwrap();
+        }
+        let keeps_record = store.dl().bounds.keeps_record(&tx);
+        if keeps_record != takes {
+            wrong.push(format!(
+                "{case} (from {route}): takes the record: {keeps_record}"
+            ));
+        }
+        if !takes {
+            continue;
+        }
+        // The record is taken, and clean, and tells what its own ontology tells.
+        let pending = tx.pending_snapshot().unwrap();
+        let record = (store.dl().status())
+            .filter(|s| s.revision == snapshot.revision())
+            .and_then(|s| s.left_out);
+        if record != Some(None) || by_index(&pending) != Some(None) {
+            wrong.push(format!(
+                "{case}: setup: the record {record:?} isn't taken alone"
+            ));
+        }
+        let at = |keeps_record| Revision::Pending {
+            snapshot: &pending,
+            deletes: !deleted.is_empty(),
+            keeps_record,
+        };
+        let (told, own) = (
+            reads_differently(&store, at(true)),
+            reads_differently(&store, at(false)),
+        );
+        if told != own {
+            wrong.push(format!("{case}: told {told:?}, its own ontology {own:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// A revision with no record of what the reader left out (as a reopened store has none; a
@@ -1557,8 +1783,8 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
 /// ontology. Each store also has `:a :p :b`, sometimes with a reification of it, and besides a
 /// random transaction three fixed ones: one adding `:c a :A`, one deleting `:a :p :b`, one
 /// adding `:b owl:sameAs :c`; the first store has nothing random, so each seed has a record
-/// taken over by an insert and by a delete, and kept by the equality (whose read the indexes
-/// leave to the ontology). `NRESE_FUZZ_SEED` (default 0) varies them; each run prints, per kind of
+/// taken over by an insert and by a delete (an equality is off the list `bounds::listed`
+/// takes). `NRESE_FUZZ_SEED` (default 0) varies them; each run prints, per kind of
 /// transaction, how many kept the record and how many of those the base's clean record
 /// answered, and how many deletions a reification kept from it.
 #[test]
@@ -1705,9 +1931,8 @@ fn a_kept_record_marks_a_pending_read_as_its_own_ontology_does() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     assert!(refused * 4 < CASES, "{refused} of {CASES} stores refused");
     assert!(
-        answered[1] > 0 && answered[2] > 0 && keeping[3] > 0,
-        "no insert or no delete took its base's clean record, or no equality kept it: \
-         {keeping:?}, {answered:?}"
+        answered[1] > 0 && answered[2] > 0,
+        "no insert or no delete took its base's clean record: {answered:?}"
     );
 }
 
