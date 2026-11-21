@@ -617,14 +617,23 @@ pub(super) fn aggregate_in_one_pass(
         return Ok(None);
     };
     reserve(pass_bytes(groups, plan.len()))?;
+    // A column's running state is the same whatever reads it: each aggregate takes the
+    // first one's that reads its column (eager AVG's partial `SUM(?v)` and `COUNT(?v)`).
+    let first: Vec<usize> = (0..plan.len())
+        .map(|a| {
+            plan.iter()
+                .position(|(column, _)| *column == plan[a].0)
+                .unwrap_or(a)
+        })
+        .collect();
     let mut running = vec![Running::default(); groups * plan.len()];
     let mut rows = vec![0u64; groups];
     for (row, &group) in group_of.iter().enumerate() {
         let group = group as usize;
         rows[group] += 1;
         for (a, (column, _)) in plan.iter().enumerate() {
-            if let Some(column) = column {
-                running[group * plan.len() + a].add(solutions.table.get(row, *column));
+            if let Some(column) = column.filter(|_| first[a] == a) {
+                running[group * plan.len() + a].add(solutions.table.get(row, column));
             }
         }
     }
@@ -634,7 +643,7 @@ pub(super) fn aggregate_in_one_pass(
                 plan.iter()
                     .enumerate()
                     .map(|(a, (column, name))| {
-                        let r = running[group * plan.len() + a];
+                        let r = running[group * plan.len() + first[a]];
                         if column.is_none() {
                             return integer_agg(rows[group] as i64);
                         }
