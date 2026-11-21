@@ -352,6 +352,116 @@ fn other_properties_domains_keep_their_meaning() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Each `owl2-ql` rule beside `prp-dom` / `prp-rng` that can consume what the OWL reader reads
+/// as an annotation: an annotation property's assertion (`:x :note :v`), or an
+/// `rdfs:subPropertyOf` with an annotation property at either end. `:note` is declared an
+/// annotation property, `:p` and `:q` object properties. The case's name is the rule; the
+/// data has a model; the question (where there is one) is a consequence only an annotation
+/// would give, so it isn't an answer.
+const ANNOTATION_READINGS: [(&str, &str, Option<&str>); 14] = [
+    (
+        "prp-spo1",
+        ":note rdfs:subPropertyOf :q . :x :note :v .",
+        Some(":x :q :v"),
+    ),
+    (
+        "prp-eqp1",
+        ":note owl:equivalentProperty :q . :x :note :v .",
+        Some(":x :q :v"),
+    ),
+    (
+        "prp-eqp2",
+        ":q owl:equivalentProperty :note . :x :note :v .",
+        Some(":x :q :v"),
+    ),
+    (
+        "prp-inv1",
+        ":note owl:inverseOf :q . :x :note :v .",
+        Some(":v :q :x"),
+    ),
+    (
+        "prp-inv2",
+        ":q owl:inverseOf :note . :x :note :v .",
+        Some(":v :q :x"),
+    ),
+    (
+        "prp-symp",
+        ":note a owl:SymmetricProperty . :x :note :v .",
+        Some(":v :note :x"),
+    ),
+    (
+        "prp-asyp",
+        ":note a owl:AsymmetricProperty . :x :note :v . :v :note :x .",
+        None,
+    ),
+    (
+        "prp-irp",
+        ":note a owl:IrreflexiveProperty . :x :note :x .",
+        None,
+    ),
+    (
+        "prp-pdw",
+        ":note owl:propertyDisjointWith :q . :x :note :v ; :q :v .",
+        None,
+    ),
+    (
+        "cls-svf2",
+        "[ a owl:Restriction ; owl:onProperty :note ; owl:someValuesFrom owl:Thing ] \
+         rdfs:subClassOf :D . :x :note :v .",
+        Some(":x a :D"),
+    ),
+    (
+        "scm-spo",
+        ":p rdfs:subPropertyOf :note . :note rdfs:subPropertyOf :q . :x :p :v .",
+        Some(":x :q :v"),
+    ),
+    (
+        "scm-eqp2",
+        ":p rdfs:subPropertyOf :note . :note rdfs:subPropertyOf :p . :x :p :v .",
+        Some(":x :note :v"),
+    ),
+    (
+        "scm-dom2",
+        ":note rdfs:domain :Doc . :p rdfs:subPropertyOf :note . :x :p :v .",
+        Some(":x a :Doc"),
+    ),
+    (
+        "scm-rng2",
+        ":note rdfs:range :Doc . :p rdfs:subPropertyOf :note . :x :p :v .",
+        Some(":v a :Doc"),
+    ),
+];
+
+/// Spec (module docs, Direct Semantics §1; the OWL reader's readings: an annotation
+/// property's assertion, and an `rdfs:subPropertyOf` with an annotation property at either
+/// end, are annotations, with no axiom): under `owl2-ql`, each of [`ANNOTATION_READINGS`] is
+/// applied as a commit, and its question, if it has one, is read `false`; loaded and rebuilt,
+/// the store is consistent, not in quarantine, and the question is `false` again, the QL
+/// rewriting on or as configured.
+#[test]
+fn no_owl2_ql_rule_reads_an_annotation_as_an_axiom() {
+    let declarations = ":note a owl:AnnotationProperty . :p a owl:ObjectProperty . \
+                        :q a owl:ObjectProperty . ";
+    let mut wrong = Vec::new();
+    for (rule, data, question) in ANNOTATION_READINGS {
+        let data = format!("{declarations}{data}");
+        let asked = question.unwrap_or(":nothing a :Asked");
+        let store = store(QlRewritingMode::Auto);
+        let committed = commit(&pipeline(&store, ReasoningMode::Owl2Ql), &data);
+        let after = read(&store, asked);
+        if committed != "applied" || !after.starts_with("false, ") {
+            wrong.push(format!("{rule}, committed: {committed}, read {after}"));
+        }
+        for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
+            let found = loaded(ReasoningMode::Owl2Ql, ql, &data, asked);
+            if !found.starts_with("consistent, quarantined false, read false, ") {
+                wrong.push(format!("{rule}, loaded, {ql:?}: {found}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// A property's domain, with `:alice` using it: `:alice a :Doc` follows while `:note` isn't
 /// declared an annotation property (the OWL reader reads the domain as an object property's),
 /// and doesn't once it is.
