@@ -248,13 +248,12 @@ pub struct Quarantine {
 struct PlacementFaults {
     /// The rename moves the file, then reports an error.
     rename: std::sync::atomic::AtomicBool,
-    /// The rename reports an error without moving the file.
+    /// The rename reports an error without moving the file, and the check whether it moved
+    /// the file fails.
     unmoved_rename: std::sync::atomic::AtomicBool,
-    /// The check whether a failed rename moved the file fails.
-    existence: std::sync::atomic::AtomicBool,
-    /// Where a commit whose placement failed waits twice, holding the state lock: once to say
-    /// it is there, once to go on.
-    pause: Mutex<Option<std::sync::Arc<std::sync::Barrier>>>,
+    /// Where a commit whose placement failed stops, holding the state lock: it sends on the
+    /// first once there, and goes on once the second receives a message or is disconnected.
+    pause: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     /// The directory's sync after the rename.
     sync: std::sync::atomic::AtomicBool,
     /// The removal of a file placed but not made durable.
@@ -399,20 +398,24 @@ impl Quarantine {
         self.placement_faults
             .unmoved_rename
             .store(true, Ordering::Relaxed);
-        self.placement_faults
-            .existence
-            .store(true, Ordering::Relaxed);
     }
 
-    /// Test hook: the next commit whose placement fails waits at `pause` twice, holding the
-    /// state lock, between placing its file and taking it back or keeping it.
+    /// Test hook: the next commit whose placement fails stops, holding the state lock,
+    /// between placing its file and taking it back or keeping it. The receiver returned gets
+    /// a message once it has stopped; it goes on once the sender returned sends one or is
+    /// dropped.
     #[cfg(any(test, feature = "fault-points"))]
-    pub fn pause_next_placement_failure(&self, pause: std::sync::Arc<std::sync::Barrier>) {
+    pub fn pause_next_placement_failure(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (stopped, at_pause) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
         *self
             .placement_faults
             .pause
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(pause);
+            .unwrap_or_else(PoisonError::into_inner) = Some((stopped, released));
+        (at_pause, release)
     }
 
     /// Test hook: the next sync of the directory after a load's file is renamed into it fails.
@@ -1051,15 +1054,16 @@ impl QuarantineCommitError {
     /// Tells the caller what happened when the load published no RDF changes; `retry_action`
     /// is how the caller sends it again, a verb whose `-ing` form is regular (`send`, `load`).
     /// The file the load's quarantine may have been kept as is named relative to the
-    /// server's data directory `data_dir` (without one, relative to the store's).
+    /// server's data directory `data_dir` (without one, relative to the store's, and the
+    /// message says which).
     pub fn unpublished_message(&self, retry_action: &str, data_dir: Option<&Path>) -> String {
         let advice = match self {
             Self::NotListed(_) => {
                 format!("It's safe to {retry_action} it again once the cause is resolved.")
             }
             Self::PossiblyListed { file, .. } => format!(
-                "This load's quarantine may have been kept as {} in the server's data directory. If that file is there, don't {retry_action} it again. If it isn't, {retry_action}ing it again is safe.",
-                kept_as(file, data_dir).display()
+                "This load's quarantine may have been kept as {}. If that file is there, don't {retry_action} it again. If it isn't, {retry_action}ing it again is safe.",
+                kept_as(file, data_dir)
             ),
         };
         format!(
@@ -1084,16 +1088,19 @@ impl QuarantineCommitError {
     }
 }
 
-/// `file`, a load's file, relative to the server's data directory `data_dir`: its path
-/// below it, or (without `data_dir`, or one it isn't below) its path in its store. Never
-/// a path on the server's file system as a whole.
-fn kept_as(file: &Path, data_dir: Option<&Path>) -> PathBuf {
-    data_dir
-        .and_then(|data_dir| file.strip_prefix(data_dir).ok())
-        .map_or_else(
-            || Path::new(DIR).join(file.file_name().unwrap_or_default()),
-            Path::to_path_buf,
-        )
+/// `file`, a load's file, and the directory it is named in: its path below the server's
+/// data directory `data_dir`, or (without `data_dir`, or one it isn't below) its path in
+/// its store's. Never a path on the server's file system as a whole.
+fn kept_as(file: &Path, data_dir: Option<&Path>) -> String {
+    match data_dir.and_then(|data_dir| file.strip_prefix(data_dir).ok()) {
+        Some(file) => format!("{} in the server's data directory", file.display()),
+        None => format!(
+            "{} in the store's data directory",
+            Path::new(DIR)
+                .join(file.file_name().unwrap_or_default())
+                .display()
+        ),
+    }
 }
 
 /// The quarantine of one load: its statements go to a file named for the load until it
@@ -1309,11 +1316,12 @@ impl Collector<'_> {
     /// Moves the load's file `partial` to its listed name `listed`.
     fn rename_into_place(&self, partial: &Path, listed: &Path) -> io::Result<()> {
         #[cfg(any(test, feature = "fault-points"))]
+        // Left set: the existence check that follows fails too, and ends it.
         if self
             .quarantine
             .placement_faults
             .unmoved_rename
-            .swap(false, Ordering::Relaxed)
+            .load(Ordering::Relaxed)
         {
             return Err(io::Error::other("the rename failed (a test's)"));
         }
@@ -1338,7 +1346,7 @@ impl Collector<'_> {
         if self
             .quarantine
             .placement_faults
-            .existence
+            .unmoved_rename
             .swap(false, Ordering::Relaxed)
         {
             return Err(io::Error::other(
@@ -1358,9 +1366,9 @@ impl Collector<'_> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        if let Some(pause) = pause {
-            pause.wait();
-            pause.wait();
+        if let Some((stopped, released)) = pause {
+            let _ = stopped.send(());
+            let _ = released.recv();
         }
     }
 
@@ -1840,10 +1848,11 @@ mod tests {
     const INVALID_LOAD: &str = "_:b <urn:p> \"invalid\" extra .\n";
     /// A load of one valid and one invalid statement: it publishes.
     const MIXED_LOAD: &str = "<urn:a> <urn:p> \"valid\" .\n_:b <urn:p> \"invalid\" extra .\n";
-    /// The advice of a load that published nothing and whose records may be listed.
+    /// The advice of a load that published nothing and whose records may be listed, as the
+    /// store gives it, without the server's data directory.
     fn may_be_listed(load: &str) -> String {
         format!(
-            "This load's quarantine may have been kept as quarantine/load-{load}.jsonl in the server's data directory. If that file is there, don't send it again. If it isn't, sending it again is safe."
+            "This load's quarantine may have been kept as quarantine/load-{load}.jsonl in the store's data directory. If that file is there, don't send it again. If it isn't, sending it again is safe."
         )
     }
 
@@ -2162,11 +2171,13 @@ mod tests {
         let before = quarantine.list(&QuarantineFilter::default()).unwrap();
         let file = dir.path().join("load.nt");
         fs::write(&file, INVALID_LOAD).unwrap();
-        let pause = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let bound = std::time::Duration::from_secs(60);
         quarantine.fail_next_placement_sync();
-        quarantine.pause_next_placement_failure(std::sync::Arc::clone(&pause));
+        let (stopped, release) = quarantine.pause_next_placement_failure();
 
         let (load, waited, listed) = std::thread::scope(|scope| {
+            // Owned here: a failure below drops it, and the commit goes on.
+            let go_on = release;
             let load = scope.spawn(|| {
                 store.bulk_load(&crate::BulkLoadRequest {
                     files: vec![file],
@@ -2176,15 +2187,19 @@ mod tests {
                 })
             });
             // The commit has placed its file and waits, holding the state lock.
-            pause.wait();
+            stopped
+                .recv_timeout(bound)
+                .expect("the commit stops after its placement failed");
             let (sender, receiver) = std::sync::mpsc::channel();
             scope.spawn(move || {
                 let _ = sender.send(quarantine.list(&QuarantineFilter::default()));
             });
             let during = receiver.recv_timeout(std::time::Duration::from_millis(500));
-            pause.wait();
+            let _ = go_on.send(());
             let waited = during.is_err();
-            let listed = during.or_else(|_| receiver.recv()).unwrap();
+            let listed = during
+                .or_else(|_| receiver.recv_timeout(bound))
+                .expect("the listing ends");
             (load.join().unwrap(), waited, listed)
         });
 

@@ -90,6 +90,14 @@ error. Re-admitting one takes the fixed text.
   that file is there, the load isn't sent again; if it isn't, sending it again is safe.
   A load that published keeps its file, listed and counted, so that its statements can
   still be reviewed; its error names the load, and a power loss may lose the file.
+
+  If a rename reports an error and looking for the file under its name then fails too,
+  the file was never seen there: its records are not counted, and the error says they
+  may be listed. Counting them would over-count whenever the rename didn't move the
+  file. The limit: if the rename did move it, the listing shows the records while the
+  open count leaves them out, until the next start counts the files again. The same can
+  happen to a load that published nothing when that check fails and taking the file
+  back then fails with an error other than the file not being there.
 - `resolutions.jsonl`: append-only, one record per resolved statement (`outcome`
   `readmitted` with the commit's revision, or `discarded`; when; the repairs; the text
   admitted where it isn't the quarantined one; a note). On open, an incomplete final
