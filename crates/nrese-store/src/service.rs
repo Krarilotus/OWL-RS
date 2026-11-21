@@ -739,19 +739,23 @@ impl StoreService {
     /// `certificate` with its state marked as the rules equating a literal with another term
     /// ([`crate::ReasoningState::literal_equality`]), for the version of a commit that derived
     /// such a fact; the same object where it is marked already or isn't this store's. The
-    /// state kept in memory is marked too, so a certificate made again (a change of the mode
-    /// or the QL setting) keeps the mark; the marker on disk isn't changed (an open finds the
-    /// equality again, [`Self::literal_equality_at_open`]).
+    /// state kept in memory is marked too, under the writer slot, so a certificate made again
+    /// (a change of the mode or the QL setting, which waits for the slot) keeps the mark; the
+    /// second value says whether it was, for [`Self::unmark_literal_equality`] if the commit
+    /// fails. The marker on disk isn't changed (an open finds the equality again,
+    /// [`Self::literal_equality_at_open`]).
     pub(crate) fn with_literal_equality(
         &self,
         _writer: nrese_engine::WriterHeld<'_>,
         certificate: nrese_engine::Certificate,
-    ) -> nrese_engine::Certificate {
+    ) -> (nrese_engine::Certificate, bool) {
+        let mut kept_marked = false;
         let marked = match certificate.downcast_ref::<Certificate>() {
             Some(held) if !held.state.literal_equality => {
                 let mut kept = self.materialised.lock().unwrap_or_else(|p| p.into_inner());
-                if let Some(kept) = kept.as_mut() {
+                if let Some(kept) = kept.as_mut().filter(|kept| !kept.literal_equality) {
                     kept.literal_equality = true;
+                    kept_marked = true;
                 }
                 let state = crate::ReasoningState {
                     literal_equality: true,
@@ -767,7 +771,16 @@ impl StoreService {
             }
             _ => None,
         };
-        marked.unwrap_or(certificate)
+        (marked.unwrap_or(certificate), kept_marked)
+    }
+
+    /// Takes back the mark [`Self::with_literal_equality`] put on the state kept in memory,
+    /// for a commit that failed: no version holds its equality.
+    pub(crate) fn unmark_literal_equality(&self) {
+        let mut kept = self.materialised.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(kept) = kept.as_mut() {
+            kept.literal_equality = false;
+        }
     }
 
     /// Whether the rules of `state` equate a literal with another term over the statements
