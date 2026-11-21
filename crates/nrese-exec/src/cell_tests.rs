@@ -485,3 +485,734 @@ fn only_threads_off_the_pool_wait_for_an_opaque_build() {
     drop(kept);
     assert_eq!(budget.used(), 0);
 }
+
+// The explored model: one key and `N` claimers, every schedule of their moves to a depth,
+// each move one atomic section of the cell (a claim, a builder's finish, end or drop, a
+// waiter's deadline or look), run against the real `step` and `event_of`. Every new world is
+// checked (`check`), then drained by the server's moves alone (a live builder dropped, then
+// each waiter looks) until no builder lives and no claimer waits. What it covers, and what
+// the cell's own tests cover instead: the doc of the test at the end.
+
+use crate::lifecycle_explorer::{Model, Stats, explore};
+
+/// A value given as a build's: the build it belongs to (renumbered with the builds; `GONE`
+/// once that build is forgotten), the claimer that named it, and which naming of its build
+/// it was (0 the first, 1 any later), so an end delivered from the wrong build, named by
+/// another, or replaced by a later naming, is told apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Value {
+    build: u8,
+    by: u8,
+    seq: u8,
+}
+
+const GONE: u8 = u8::MAX;
+
+/// An end: as named (never `Abandoned`), as recorded, and as told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Heard {
+    Kept(Value),
+    Empty,
+    Later,
+    Unkept(Value),
+    Abandoned,
+}
+
+impl Heard {
+    /// Its counter, in `counter`'s order.
+    fn counter(self) -> usize {
+        match self {
+            Self::Kept(_) => 0,
+            Self::Empty => 1,
+            Self::Later => 2,
+            Self::Unkept(_) => 3,
+            Self::Abandoned => 4,
+        }
+    }
+
+    /// The real end a builder names, for the real `event_of` (`None`: none named).
+    fn real(self) -> Option<End<()>> {
+        match self {
+            Self::Kept(_) => Some(End::Kept(Arc::new(()))),
+            Self::Empty => Some(End::Empty),
+            Self::Later => Some(End::Later),
+            Self::Unkept(_) => Some(End::Unkept(Some(Arc::new(())))),
+            Self::Abandoned => None,
+        }
+    }
+
+    fn value(self) -> Option<Value> {
+        match self {
+            Self::Kept(value) | Self::Unkept(value) => Some(value),
+            Self::Empty | Self::Later | Self::Abandoned => None,
+        }
+    }
+
+    /// The same end, its value's build renumbered by `new`.
+    fn renumbered(self, new: impl Fn(u8) -> u8) -> Self {
+        let moved = |value: Value| Value {
+            build: new(value.build),
+            ..value
+        };
+        match self {
+            Self::Kept(value) => Self::Kept(moved(value)),
+            Self::Unkept(value) => Self::Unkept(moved(value)),
+            Self::Empty | Self::Later | Self::Abandoned => self,
+        }
+    }
+}
+
+/// The counter `step` adds an end to, in `Heard::counter`'s order.
+fn counter(kind: EndKind) -> usize {
+    match kind {
+        EndKind::Kept => 0,
+        EndKind::Empty => 1,
+        EndKind::Later => 2,
+        EndKind::Unkept => 3,
+        EndKind::Abandoned => 4,
+    }
+}
+
+/// One claimer: a build named by its index in the world's `builds`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Claimer {
+    Idle,
+    /// A builder; whether it named its end by the consuming `Builder::end` (then its only
+    /// next move is its drop).
+    Builder(u8, bool),
+    /// Joined to a build; whether its deadline has passed.
+    Waiting(u8, bool),
+    Told(u8, Heard),
+    Left(u8),
+}
+
+impl Claimer {
+    fn build(self) -> Option<u8> {
+        match self {
+            Self::Idle => None,
+            Self::Builder(b, _) | Self::Waiting(b, _) | Self::Told(b, _) | Self::Left(b) => Some(b),
+        }
+    }
+}
+
+/// One build: the first end its builder asked for (the record check 4 reads, kept apart
+/// from `pending`), the end pending at its drop, its terminal, whether it was dropped and
+/// `step` counted it, and whether it is a claim told at once (no builder, never counted).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ModelBuild {
+    asked: Option<Heard>,
+    pending: Option<Heard>,
+    terminal: Option<Heard>,
+    dropped: bool,
+    counted: bool,
+    at_once: bool,
+}
+
+impl ModelBuild {
+    fn running() -> Self {
+        Self {
+            asked: None,
+            pending: None,
+            terminal: None,
+            dropped: false,
+            counted: false,
+            at_once: false,
+        }
+    }
+
+    /// A claim told `heard` at once, where `expected` is what its lookup had.
+    fn told(expected: Heard, heard: Heard) -> Self {
+        Self {
+            asked: Some(expected),
+            terminal: Some(heard),
+            at_once: true,
+            ..Self::running()
+        }
+    }
+}
+
+/// A check a move broke, judged against the world before the move (so before renumbering
+/// forgets a build): kept in the world, reported by `check`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Fault {
+    /// 8: a claim's `step.next` is not the phase its answer leaves.
+    Next,
+    /// 9: a drop recorded no end.
+    NoEnd,
+    /// 10: a look's outcome is not what the end held and the deadline before it say.
+    Look,
+    /// 11: a drop recorded an end other than the first its builder named.
+    Recorded,
+    /// 12: a claim's outcome is not what the entry before it and its lookup say.
+    Claim,
+}
+
+/// The key, its builds still named by someone (renumbered in order of mention, so worlds
+/// that differ only in old builds' ids are one), the counters, and the claimers.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CellWorld<const N: usize> {
+    /// The key's entry: the build under way, as `step` leaves it.
+    entry: Option<u8>,
+    builds: Vec<ModelBuild>,
+    /// The counters, as `step` counts: kept, empty, later, unkept, abandoned.
+    ends: [u8; 5],
+    /// The model's own: each build dropped, by the end its terminal holds after the drop.
+    dropped: [u8; 5],
+    rejected: u8,
+    /// The first check a move broke.
+    fault: Option<Fault>,
+    claimers: [Claimer; N],
+}
+
+impl<const N: usize> CellWorld<N> {
+    fn build(&self, b: u8) -> &ModelBuild {
+        &self.builds[usize::from(b)]
+    }
+
+    fn build_mut(&mut self, b: u8) -> &mut ModelBuild {
+        &mut self.builds[usize::from(b)]
+    }
+
+    /// The index the next added build takes.
+    fn next_build(&self) -> u8 {
+        u8::try_from(self.builds.len()).expect("a few builds")
+    }
+
+    fn add(&mut self, build: ModelBuild) -> u8 {
+        let b = self.next_build();
+        self.builds.push(build);
+        b
+    }
+
+    fn broke(&mut self, fault: Fault) {
+        self.fault.get_or_insert(fault);
+    }
+
+    /// The value `c` names for build `b`: its first naming, or a later one (a build not yet
+    /// added has none before).
+    fn value(&self, b: u8, c: usize) -> Value {
+        let named = self
+            .builds
+            .get(usize::from(b))
+            .is_some_and(|build| build.asked.is_some());
+        Value {
+            build: b,
+            by: u8::try_from(c).expect("a few claimers"),
+            seq: u8::from(named),
+        }
+    }
+
+    /// A builder names `named`: the record of the first end asked, and the cell's pending
+    /// end (`Builder::name`), each first-wins.
+    fn name(&mut self, b: u8, named: Heard) {
+        let build = self.build_mut(b);
+        build.asked.get_or_insert(named);
+        build.pending = build.pending.or(Some(named));
+    }
+
+    /// Forgets builds no one names, and numbers the rest in order of mention.
+    fn renumber(&mut self) {
+        let mut order: Vec<u8> = Vec::new();
+        for b in self
+            .entry
+            .into_iter()
+            .chain(self.claimers.iter().filter_map(|c| c.build()))
+        {
+            if !order.contains(&b) {
+                order.push(b);
+            }
+        }
+        let new = |b: u8| {
+            order
+                .iter()
+                .position(|&o| o == b)
+                .map_or(GONE, |at| u8::try_from(at).expect("a few builds"))
+        };
+        let moved = |heard: Option<Heard>| heard.map(|heard| heard.renumbered(new));
+        self.builds = order
+            .iter()
+            .map(|&b| {
+                let build = self.build(b);
+                ModelBuild {
+                    asked: moved(build.asked),
+                    pending: moved(build.pending),
+                    terminal: moved(build.terminal),
+                    ..build.clone()
+                }
+            })
+            .collect();
+        self.entry = self.entry.map(new);
+        for c in &mut self.claimers {
+            *c = match *c {
+                Claimer::Idle => Claimer::Idle,
+                Claimer::Builder(b, consumed) => Claimer::Builder(new(b), consumed),
+                Claimer::Waiting(b, passed) => Claimer::Waiting(new(b), passed),
+                Claimer::Told(b, heard) => Claimer::Told(new(b), heard.renumbered(new)),
+                Claimer::Left(b) => Claimer::Left(new(b)),
+            };
+        }
+    }
+}
+
+/// What the owner's `kept` finds for a claim where no build is under way: nothing, a value
+/// kept, or a failure kept (`Some(None)`). Free, on a fresh cell too.
+#[derive(Debug, Clone, Copy)]
+enum Lookup {
+    Nothing,
+    Value,
+    Failure,
+}
+
+/// An end named by the consuming `Builder::end`.
+#[derive(Debug, Clone, Copy)]
+enum Ending {
+    Kept,
+    Empty,
+    Later,
+    Unkept,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CellMove {
+    Claim(usize, Lookup),
+    /// `Builder::finish`: a value (`Kept`) or none (`Empty`); first named wins, and the
+    /// builder goes on.
+    Finish(usize, bool),
+    /// `Builder::end`: names the end (first named wins) and consumes the builder.
+    End(usize, Ending),
+    /// The builder's drop: the one transition.
+    Drop(usize),
+    Deadline(usize),
+    Look(usize),
+}
+
+impl CellMove {
+    fn claimer(self) -> usize {
+        match self {
+            Self::Claim(c, _)
+            | Self::Finish(c, _)
+            | Self::End(c, _)
+            | Self::Drop(c)
+            | Self::Deadline(c)
+            | Self::Look(c) => c,
+        }
+    }
+}
+
+struct CellModel<const N: usize>;
+
+impl<const N: usize> Model for CellModel<N> {
+    type World = CellWorld<N>;
+    type Move = CellMove;
+    const DRAIN_BOUND: usize = 2 * N;
+
+    fn start() -> CellWorld<N> {
+        CellWorld {
+            entry: None,
+            builds: Vec::new(),
+            ends: [0; 5],
+            dropped: [0; 5],
+            rejected: 0,
+            fault: None,
+            claimers: [Claimer::Idle; N],
+        }
+    }
+
+    fn moves(world: &CellWorld<N>) -> Vec<CellMove> {
+        let mut moves = Vec::new();
+        for (c, claimer) in world.claimers.iter().enumerate() {
+            match *claimer {
+                Claimer::Idle | Claimer::Told(..) => match world.entry {
+                    // `kept` is asked only where no build is under way.
+                    None => {
+                        for lookup in [Lookup::Nothing, Lookup::Value, Lookup::Failure] {
+                            moves.push(CellMove::Claim(c, lookup));
+                        }
+                    }
+                    Some(_) => moves.push(CellMove::Claim(c, Lookup::Nothing)),
+                },
+                Claimer::Builder(_, consumed) => {
+                    if !consumed {
+                        moves.push(CellMove::Finish(c, true));
+                        moves.push(CellMove::Finish(c, false));
+                        for ending in [Ending::Kept, Ending::Empty, Ending::Later, Ending::Unkept] {
+                            moves.push(CellMove::End(c, ending));
+                        }
+                    }
+                    moves.push(CellMove::Drop(c));
+                }
+                Claimer::Waiting(_, passed) => {
+                    if !passed {
+                        moves.push(CellMove::Deadline(c));
+                    }
+                    // Every waiter may look; a look that changes nothing is the same world.
+                    moves.push(CellMove::Look(c));
+                }
+                Claimer::Left(_) => {}
+            }
+        }
+        moves
+    }
+
+    fn apply(world: &CellWorld<N>, action: &CellMove) -> CellWorld<N> {
+        let mut w = world.clone();
+        match *action {
+            CellMove::Claim(c, lookup) => {
+                let before = w.entry;
+                // What `claim` makes of its owner's `kept`: a value kept is `Kept`, a failure
+                // kept `Empty` (a claim told at once is the build `next_build` names).
+                let found = match (w.entry, lookup) {
+                    (Some(_), _) | (None, Lookup::Nothing) => None,
+                    (None, Lookup::Value) => Some(Heard::Kept(w.value(w.next_build(), c))),
+                    (None, Lookup::Failure) => Some(Heard::Empty),
+                };
+                let phase = match w.entry {
+                    Some(_) => Phase::Building,
+                    None => Phase::Absent,
+                };
+                let event = match found {
+                    Some(_) => Event::ClaimFound,
+                    None => Event::Claim,
+                };
+                let step = step(phase, event).ok();
+                // The phase a claim's answer leaves: a build under way, or as it was.
+                let leaves = match step.and_then(|step| step.answer) {
+                    Some(Answer::Build | Answer::Join) => Some(Phase::Building),
+                    Some(Answer::Told) => Some(phase),
+                    None => None,
+                };
+                if let (Some(step), Some(leaves)) = (step, leaves)
+                    && step.next != leaves
+                {
+                    w.broke(Fault::Next);
+                }
+                w.claimers[c] = match (step.and_then(|step| step.answer), w.entry, found) {
+                    (Some(Answer::Build), _, _) => {
+                        let b = w.add(ModelBuild::running());
+                        w.entry = Some(b);
+                        Claimer::Builder(b, false)
+                    }
+                    (Some(Answer::Join), Some(b), _) => Claimer::Waiting(b, false),
+                    (Some(Answer::Told), _, Some(heard)) => {
+                        // What the owner had, read from the lookup by a mapping of its own,
+                        // for check 4.
+                        let had = match lookup {
+                            Lookup::Value => Heard::Kept(w.value(w.next_build(), c)),
+                            Lookup::Failure => Heard::Empty,
+                            Lookup::Nothing => Heard::Abandoned,
+                        };
+                        Claimer::Told(w.add(ModelBuild::told(had, heard)), heard)
+                    }
+                    // Rejected (or an answer with nothing to give): counted, and told
+                    // `Abandoned` by a build of its own, as `claim` does.
+                    (Some(Answer::Join), None, _)
+                    | (Some(Answer::Told), _, None)
+                    | (None, _, _) => {
+                        w.rejected += 1;
+                        let abandoned = ModelBuild::told(Heard::Abandoned, Heard::Abandoned);
+                        Claimer::Told(w.add(abandoned), Heard::Abandoned)
+                    }
+                };
+                // 12. Judged by the entry before the claim and its lookup: an entry is joined;
+                // with none, a lookup that found something is told at once (its end is check
+                // 4's), and one that found nothing builds.
+                let required = match (before, lookup) {
+                    (Some(e), _) => {
+                        w.claimers[c] == Claimer::Waiting(e, false) && w.entry == before
+                    }
+                    (None, Lookup::Value | Lookup::Failure) => {
+                        matches!(w.claimers[c], Claimer::Told(b, _) if w.build(b).at_once)
+                            && w.entry.is_none()
+                    }
+                    (None, Lookup::Nothing) => {
+                        matches!(w.claimers[c], Claimer::Builder(b, false) if w.entry == Some(b))
+                    }
+                };
+                if !required {
+                    w.broke(Fault::Claim);
+                }
+            }
+            CellMove::Finish(c, with_value) => {
+                if let Claimer::Builder(b, false) = w.claimers[c] {
+                    let named = match with_value {
+                        true => Heard::Kept(w.value(b, c)),
+                        false => Heard::Empty,
+                    };
+                    w.name(b, named);
+                }
+            }
+            CellMove::End(c, ending) => {
+                if let Claimer::Builder(b, false) = w.claimers[c] {
+                    let value = w.value(b, c);
+                    let named = match ending {
+                        Ending::Kept => Heard::Kept(value),
+                        Ending::Empty => Heard::Empty,
+                        Ending::Later => Heard::Later,
+                        Ending::Unkept => Heard::Unkept(value),
+                    };
+                    w.name(b, named);
+                    w.claimers[c] = Claimer::Builder(b, true);
+                }
+            }
+            CellMove::Drop(c) => {
+                if let Claimer::Builder(b, _) = w.claimers[c] {
+                    // `Builder::drop`, in one section: the step, the entry, the count, the
+                    // end recorded, the waiters woken (they hear it at their next look).
+                    let phase = match w.entry == Some(b) {
+                        true => Phase::Building,
+                        false => Phase::Absent,
+                    };
+                    let pending = w.build(b).pending;
+                    let event = event_of(pending.and_then(Heard::real).as_ref());
+                    match step(phase, event) {
+                        Ok(step) => {
+                            if step.next == Phase::Absent {
+                                w.entry = None;
+                            }
+                            if let Some(kind) = step.counts {
+                                w.ends[counter(kind)] += 1;
+                                w.build_mut(b).counted = true;
+                            }
+                        }
+                        Err(_) => w.rejected += 1,
+                    }
+                    let recorded = pending.unwrap_or(Heard::Abandoned);
+                    let build = w.build_mut(b);
+                    build.terminal.get_or_insert(recorded);
+                    build.dropped = true;
+                    // Before renumbering can forget the build: the end its terminal holds,
+                    // tallied for check 2 and judged by check 11 against the first end its
+                    // builder named (else `Abandoned`); or none held (check 9).
+                    match w.build(b).terminal {
+                        Some(held) => {
+                            w.dropped[held.counter()] += 1;
+                            if held != w.build(b).asked.unwrap_or(Heard::Abandoned) {
+                                w.broke(Fault::Recorded);
+                            }
+                        }
+                        None => w.broke(Fault::NoEnd),
+                    }
+                    w.claimers[c] = Claimer::Idle;
+                }
+            }
+            CellMove::Deadline(c) => {
+                if let Claimer::Waiting(b, false) = w.claimers[c] {
+                    w.claimers[c] = Claimer::Waiting(b, true);
+                }
+            }
+            CellMove::Look(c) => {
+                if let Claimer::Waiting(b, passed) = w.claimers[c] {
+                    let held = w.build(b).terminal;
+                    // `join`: an end recorded is told before a passed deadline is left.
+                    let looked = match (held, passed) {
+                        (Some(heard), _) => Claimer::Told(b, heard),
+                        (None, true) => Claimer::Left(b),
+                        (None, false) => Claimer::Waiting(b, false),
+                    };
+                    // 10. Judged by the world before the look: told the end held, if any;
+                    // else left only past its deadline.
+                    let expected = if let Some(heard) = held {
+                        Claimer::Told(b, heard)
+                    } else if passed {
+                        Claimer::Left(b)
+                    } else {
+                        Claimer::Waiting(b, false)
+                    };
+                    if looked != expected {
+                        w.broke(Fault::Look);
+                    }
+                    w.claimers[c] = looked;
+                }
+            }
+        }
+        w.renumber();
+        w
+    }
+
+    fn check(w: &CellWorld<N>) -> Result<(), String> {
+        // Checks 8-12 are judged at the move, against the world before it; reported in this
+        // order: a drop with no end (9; the counts can't agree then), the counts (2), the
+        // other moves' faults, then the rest.
+        if w.fault == Some(Fault::NoEnd) {
+            return Err("9: a build dropped with no end recorded".into());
+        }
+        // 2. Each dropped build counted by `step` exactly once, by the end its terminal holds.
+        if w.ends != w.dropped {
+            return Err(format!("2: counted {:?}, dropped {:?}", w.ends, w.dropped));
+        }
+        match w.fault {
+            Some(Fault::Next) => {
+                return Err("8: a claim's next phase is not the phase its answer leaves".into());
+            }
+            Some(Fault::Look) => {
+                return Err(
+                    "10: a look's outcome is not what the end held and the deadline before it say"
+                        .into(),
+                );
+            }
+            Some(Fault::Recorded) => {
+                return Err("11: a drop recorded an end other than its builder's first".into());
+            }
+            Some(Fault::Claim) => {
+                return Err(
+                    "12: a claim's outcome is not what the entry before it and its lookup say"
+                        .into(),
+                );
+            }
+            Some(Fault::NoEnd) | None => {}
+        }
+        // 1. At most one entry for the key: a builder lives iff its build is the entry.
+        let builders: Vec<u8> = w
+            .claimers
+            .iter()
+            .filter_map(|c| match *c {
+                Claimer::Builder(b, _) => Some(b),
+                Claimer::Idle | Claimer::Waiting(..) | Claimer::Told(..) | Claimer::Left(_) => None,
+            })
+            .collect();
+        if builders.len() > 1 || builders.iter().any(|&b| w.entry != Some(b)) {
+            return Err(format!("1: builders {builders:?}, entry {:?}", w.entry));
+        }
+        if w.entry.is_some() && builders.is_empty() {
+            return Err(format!("1: entry {:?} with no builder", w.entry));
+        }
+        // 3. Nothing rejected.
+        if w.rejected != 0 {
+            return Err(format!("3: rejected {}", w.rejected));
+        }
+        for (c, claimer) in w.claimers.iter().enumerate() {
+            match *claimer {
+                Claimer::Told(b, heard) => {
+                    let build = w.build(b);
+                    // 4. Told its own build's end: the first its builder asked for (else
+                    // `Abandoned`), or for a claim told at once what its owner found; a
+                    // value only of its own build.
+                    let asked = match build.at_once {
+                        true => build.asked,
+                        false => Some(build.asked.unwrap_or(Heard::Abandoned)),
+                    };
+                    if asked != Some(heard) || heard.value().is_some_and(|v| v.build != b) {
+                        return Err(format!(
+                            "4: claimer {c} told {heard:?}, its build asked {asked:?}"
+                        ));
+                    }
+                    // 5. At a told waiter, the ended build is no longer the key's entry.
+                    if !build.at_once && w.entry == Some(b) {
+                        return Err(format!(
+                            "5: claimer {c} told while its ended build is still the key's entry"
+                        ));
+                    }
+                    // 6. Counted before the wake.
+                    if !build.at_once && !build.counted {
+                        return Err(format!("6: claimer {c} told an end not counted"));
+                    }
+                }
+                Claimer::Waiting(b, _) => {
+                    // 6. A recorded end a waiter can hear is counted.
+                    let build = w.build(b);
+                    if build.terminal.is_some() && !build.counted {
+                        return Err(format!("6: claimer {c} waits on an end not counted"));
+                    }
+                }
+                Claimer::Left(b) => {
+                    // 7. A left waiter's build goes on: the entry until its builder drops it.
+                    if !w.build(b).dropped && w.entry != Some(b) {
+                        return Err(format!("7: claimer {c} left a build that is gone"));
+                    }
+                }
+                Claimer::Idle | Claimer::Builder(..) => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn quiet(w: &CellWorld<N>) -> bool {
+        w.claimers
+            .iter()
+            .all(|c| !matches!(c, Claimer::Builder(..) | Claimer::Waiting(..)))
+    }
+
+    /// A live builder dropped, then each waiter looks. The drain moves no deadline, so a
+    /// waiter whose deadline hasn't passed can only end `Told`: its build's end must reach
+    /// it within the bound (check 9 holds every dropped build to a recorded end).
+    fn drain_move(w: &CellWorld<N>) -> Option<CellMove> {
+        let first = |wanted: fn(&Claimer) -> bool| w.claimers.iter().position(wanted);
+        first(|c| matches!(c, Claimer::Builder(..)))
+            .map(CellMove::Drop)
+            .or_else(|| first(|c| matches!(c, Claimer::Waiting(..))).map(CellMove::Look))
+    }
+
+    fn answer(_: &CellWorld<N>, action: &CellMove, next: &CellWorld<N>) -> String {
+        format!("{:?}", next.claimers[action.claimer()])
+    }
+}
+
+/// Explores `N` claimers to `depth` within `worlds`: the depth completed, the worlds and the
+/// time on stderr; a failed check panics with its schedule.
+fn explored<const N: usize>(depth: usize, worlds: usize) -> Stats {
+    let started = Instant::now();
+    let outcome = explore::<CellModel<N>>(depth, worlds);
+    let took = started.elapsed();
+    match outcome {
+        Ok(stats) => {
+            eprintln!(
+                "the cell explored: {N} claimers, depth {depth} asked, {} completed, {} worlds, collision bound {:.1e}, {took:?} (drain {:?})",
+                stats.completed_depth,
+                stats.worlds,
+                stats.collision_bound(),
+                stats.drain_time,
+            );
+            assert!(!stats.budget_hit, "the world budget ran out");
+            assert_eq!(stats.completed_depth, depth);
+            stats
+        }
+        Err(trace) => panic!(
+            "the cell explored: {N} claimers: check {}\nschedule: {:#?}\ndrain: {:#?}\n{} worlds, depth {} completed, {took:?}",
+            trace.violation,
+            trace.schedule,
+            trace.drain,
+            trace.stats.worlds,
+            trace.stats.completed_depth,
+        ),
+    }
+}
+
+/// The fingerprints each run may keep (the explorer allocates them up front): four times
+/// the worlds measured, 12,690 for two claimers to depth 12 and 55,891 for three to 10.
+const WORLDS_TWO: usize = 4 * 12_700;
+const WORLDS_THREE: usize = 4 * 56_000;
+
+/// Spec (the module docs): every schedule of two claimers' moves to depth 12, and of three
+/// to depth 10, holds checks 1-12 in every world, and the server's moves alone bring each
+/// world to rest, every waiter whose deadline hasn't passed told an end.
+///
+/// What it covers: the table's consequences under every interleaving of the claimers, each
+/// section of the cell taken as one atomic move as the model writes it. Checks 1, 3, 5, 7,
+/// 8 and 12 follow from `step`'s rows (12: each claim joins, is told at once or builds as
+/// the entry before it and its lookup say), and 2 from its counted kinds against the
+/// model's own tally of the ends the terminals hold. Checks 4, 6, 9, 10 and 11 follow from
+/// the model's sections: first-wins naming, an end recorded and counted at the drop (the
+/// first its builder named), a claim told at once what its owner had, and a waiter told the
+/// end held before it leaves. Each expected value is read from the move's input and the
+/// world before the move.
+///
+/// What it does not cover: it runs no `BuildCell`, so nothing here shows the production
+/// cell's order inside its drop, its counters, or its `join`. The cell's own tests observe
+/// these, each from outside the drop's critical section:
+/// - `a_waiter_woken_by_an_end_never_claims_the_ended_build`: a waiter told an end then
+///   finds the key free (`is_idle`, which takes the map's lock);
+/// - `a_build_s_named_end_is_told_to_its_waiter_and_counted`: the end told, and the counts
+///   once the drop has returned;
+/// - `a_builder_that_panics_is_counted_and_its_waiters_are_told_abandoned`: `Abandoned`
+///   told, and the counts once the drop has returned;
+/// - `a_waiter_whose_stop_fires_once_the_build_has_ended_is_told_the_end`: a waiter whose
+///   stop fires once the build has ended is told the end, not left.
+///
+/// None of them shows that the entry is removed, or the end counted, before the end can be
+/// read. A waiter that reads it inside the drop's section still claims only once the map's
+/// lock is free.
+#[test]
+fn the_explored_cell_holds_its_checks_for_every_schedule() {
+    explored::<2>(12, WORLDS_TWO);
+    explored::<3>(10, WORLDS_THREE);
+}
