@@ -5125,9 +5125,10 @@ fn counts_beside_a_sum_count_their_own_variable() {
     }
 }
 
-/// Grouped SUM(?v) and COUNT(STR(?v)), as written, under a memory limit that the
-/// per-column path fits and the one pass over all aggregates doesn't: the answer is
-/// SPARQL's, never `MemoryLimit`. The pass holds per group and aggregate a state of 344
+/// Grouped SUM(?v) and COUNT(STR(?v)), as written, under memory limits that the
+/// per-column path fits and the one pass over all aggregates would not: the answer is
+/// SPARQL's, as main gives it, never `MemoryLimit`. The pass doesn't take a COUNT of an
+/// expression without a SUM or AVG of it beside. What it would hold: per group and aggregate a state of 344
 /// bytes (twice, with the result) and per group a list of 24, and per distinct value and
 /// expression a remembered number of 114 bytes; the per-column path holds the rows, one
 /// group's values at a time, and a term per distinct value of `STR(?v)`.
@@ -5186,6 +5187,58 @@ fn a_one_pass_that_does_not_fit_leaves_the_groups_to_the_per_column_path() {
     }
     // Every case's outcome, not only the first one's.
     assert!(failed.is_empty(), "{failed:#?}");
+}
+
+/// A COUNT of an expression beside a SUM of another (SPARQL 1.1 §18.5.1.2: COUNT drops the
+/// errors) is counted by the per-column path, as main counts it, not by the one pass over
+/// all aggregates: 4,096 groups, group g with the one value g, so SUM is g and
+/// COUNT(1 / ?v) is 1, but 0 in group 0 (a division by zero). EXPLAIN names no aggregation
+/// route, so the route shows in memory: as written under 1.5 MiB, which the per-column path
+/// (about 0.6 MB, a remembered quotient per value included)
+/// fits and the pass's states (4,096 × (2 × 344 + 24) = 2,916,352 bytes) don't, the answer
+/// is SPARQL's; a pass would end the query at that reservation. Unlimited and planned too,
+/// and by the reference.
+#[test]
+fn an_independent_count_beside_a_sum_is_counted_as_main_counts_it() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let snapshot = engine.snapshot();
+    let int = |n: usize| format!("\"{n}\"^^<http://www.w3.org/2001/XMLSchema#integer>");
+    let values: String = (0..4_096).map(|g| format!("({g} {g}) ")).collect();
+    let text = format!(
+        "SELECT ?g (SUM(?v) AS ?t) (COUNT(1 / ?v) AS ?n) \
+         WHERE {{ VALUES (?g ?v) {{ {values}}} }} GROUP BY ?g"
+    );
+    let query = SparqlParser::new().parse_query(&text).unwrap();
+    let mut expected: Vec<String> = (0..4_096)
+        .map(|g| format!("{}\t{}\t{}", int(g), int(g), int(usize::from(g > 0))))
+        .collect();
+    expected.sort();
+    let sorted = |mut found: Vec<String>| {
+        found.sort();
+        found
+    };
+    let reference = rows(
+        reference(&snapshot, &query, &QueryOptions::default()).unwrap(),
+        false,
+    );
+    assert_eq!(sorted(reference), expected, "reference");
+    let limited = QueryOptions {
+        as_written: true,
+        resources: nrese_sparql::Resources {
+            memory: nrese_exec::Envelope::new(Some(3 << 19), None),
+            ..nrese_sparql::Resources::default()
+        },
+        ..QueryOptions::default()
+    };
+    for (route, options) in [
+        ("as written, within 1.5 MiB", limited),
+        ("planned", QueryOptions::default()),
+    ] {
+        match evaluate_query(&snapshot, &query, &options) {
+            Ok(results) => assert_eq!(sorted(rows(results, false)), expected, "{route}"),
+            Err(error) => panic!("{route}: {error:?}"),
+        }
+    }
 }
 
 /// Eager aggregation (the early group over B, the join's input without the group's keys)
