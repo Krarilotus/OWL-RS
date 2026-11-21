@@ -81,6 +81,10 @@ const NOT_TOLD: &[&str] = &["hypertableau unknown; read not complete"];
 /// too, never kept apart: `unknown`, and every read says why it isn't complete.
 const ISLANDS_NOT_TOLD: &[&str] = &["touched-islands unknown; read not complete"];
 const RULES: &[&str] = &["rules consistent; read complete"];
+/// The rules' route consistent, where they equate two literals (`prp-fp`): no store holds that
+/// `owl:sameAs`, so a later statement of one lacks its copy with the other, and a read of the
+/// property's values isn't complete (it::literal_equality_status_tests).
+const RULES_EQUATED: &[&str] = &["rules consistent; read not complete"];
 const REFUSED: &[&str] = &["refused"];
 const DECIDED: &[&str] = &["hypertableau consistent; read complete"];
 
@@ -329,7 +333,7 @@ fn a_literal_of_the_ontologys_own_datatype_is_kept_as_written() {
         (
             "two literals of the ontology's own datatype under a functional property",
             vec![DATA, functional, r#":a :born "x"^^:T , "y"^^:T ."#],
-            RULES,
+            RULES_EQUATED,
         ),
         (
             "a literal of the ontology's own datatype beside a hasValue",

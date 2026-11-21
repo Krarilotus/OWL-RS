@@ -928,10 +928,9 @@ fn annotation_rule(
 
 /// Why a read of typed values may miss rows while the rules equate a literal with another
 /// term ([`crate::ReasoningState::literal_equality`]).
-const LITERAL_EQUALITY: &str = "the rules equate two spellings of one value (an owl:sameAs \
-                                between literals, which no store can hold), so a value \
-                                written in a later commit may lack its copy in the other \
-                                spelling";
+const LITERAL_EQUALITY: &str = "the rules equate two literals as one value (an owl:sameAs \
+                                between literals, which no store can hold), so a statement \
+                                of one may lack its copy with the other";
 
 /// The conditions of the store under which a read that rests on reasoning isn't told
 /// `complete`, whatever its route (the closure, the QL rewriting, the bounds): one list,
