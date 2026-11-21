@@ -5032,6 +5032,19 @@ fn aggregates_by_group_drop_erring_arguments_from_the_count() {
     let implicit =
         format!("SELECT (AVG(1 / ?v) AS ?a) WHERE {{ ?s <{EX}group> <{EX}g1> ; <{EX}val> ?v }}");
     check(&implicit, std::slice::from_ref(&zero));
+    // COUNTs beside a SUM whose values are all numbers: a term that is no number (a
+    // string) counts, an error (a division by zero) doesn't.
+    let beside = format!(
+        "SELECT ?g (SUM(?v) AS ?t) (COUNT(STR(?v)) AS ?n) (COUNT(1 / ?v) AS ?r) \
+         WHERE {{ ?s <{EX}group> ?g . ?s <{EX}val> ?v FILTER(isNumeric(?v)) }} GROUP BY ?g"
+    );
+    let int = |n: &str| typed(n, "integer");
+    let expected = [
+        format!("<{EX}g2>\t{}\t{}\t{}", int("3"), int("2"), int("2")),
+        format!("<{EX}g3>\t{}\t{}\t{}", int("4"), int("1"), int("1")),
+        format!("<{EX}g4>\t{}\t{}\t{}", int("0"), int("2"), int("0")),
+    ];
+    check(&beside, &expected);
 }
 
 /// Eager aggregation (the early group over B, the join's input without the group's keys)
