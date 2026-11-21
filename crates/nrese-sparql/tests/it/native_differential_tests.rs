@@ -4955,6 +4955,89 @@ fn avg_where_every_argument_errs_is_integer_zero_as_written_and_planned() {
     }
 }
 
+/// Eager aggregation groups B, the join's input without the group's keys, before the join.
+/// Where B leaves an aggregated variable unbound (here under OPTIONAL) and A, the input with
+/// the keys, binds it, the join keeps A's value in each solution (SPARQL 1.1 §18.3,
+/// compatible mappings), so the aggregates see 5 and 7: SUM 12, MIN 5, MAX 7, AVG 6 and
+/// COUNT 2. With the early group forced, each aggregate still gives that answer.
+#[test]
+fn eager_aggregation_sees_a_value_the_other_side_binds() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let snapshot = engine.snapshot();
+    let as_written = QueryOptions {
+        as_written: true,
+        ..QueryOptions::default()
+    };
+    let typed =
+        |n: &str, datatype: &str| format!("\"{n}\"^^<http://www.w3.org/2001/XMLSchema#{datatype}>");
+    for (aggregate, answer) in [
+        ("SUM", typed("12", "integer")),
+        ("MIN", typed("5", "integer")),
+        ("MAX", typed("7", "integer")),
+        ("AVG", typed("6", "decimal")),
+        ("COUNT", typed("2", "integer")),
+    ] {
+        let text = format!(
+            "SELECT ?g ({aggregate}(?x) AS ?a) WHERE {{ VALUES (?g ?s ?x) {{ (1 10 5) (1 20 7) }} \
+             {{ VALUES ?s {{ 10 20 }} OPTIONAL {{ VALUES (?s ?x) {{ (30 1) }} }} }} }} GROUP BY ?g"
+        );
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        let nrese_sparql_syntax::Query::Select { pattern, .. } = &query else {
+            unreachable!("a select")
+        };
+        let forced = nrese_sparql_syntax::Query::Select {
+            dataset: None,
+            pattern: nrese_sparql::plan::eager_aggregation(pattern),
+            base_iri: None,
+        };
+        let expected = [format!("{}\t{answer}", typed("1", "integer"))];
+        for (route, query) in [("as written", &query), ("early group forced", &forced)] {
+            let found = rows(
+                evaluate_query(&snapshot, query, &as_written).unwrap(),
+                false,
+            );
+            assert_eq!(found, expected, "{route}: {text}");
+        }
+    }
+}
+
+/// SPARQL evaluates an aggregate's argument once per solution (§18.5.1), here an `EXISTS`
+/// whose body draws: a group of one row has the mean 1 (decimal) when it holds and 0
+/// (integer, an error's mean) when it doesn't, never unbound. A streamed group that
+/// evaluated the argument once for its sum and again for its count could get a value for
+/// one and an error for the other, a chance of one in four per run.
+#[test]
+fn a_streamed_avg_draws_an_exists_once_per_row() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    tx.insert(Quad::new(ex("s1"), ex("group"), ex("g1"), GraphName::DefaultGraph).as_ref());
+    let one = Literal::from(1_i64);
+    tx.insert(Quad::new(ex("s1"), ex("val"), one, GraphName::DefaultGraph).as_ref());
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let streamed = QueryOptions {
+        stream_rows: Some(1),
+        ..QueryOptions::default()
+    };
+    let text = format!(
+        "SELECT ?g (AVG(IF(EXISTS {{ FILTER(RAND() < 0.5) }}, 1, ?missing)) AS ?a) \
+         WHERE {{ ?s <{EX}group> ?g . ?s <{EX}val> ?v }} GROUP BY ?g"
+    );
+    let query = SparqlParser::new().parse_query(&text).unwrap();
+    let group = format!("<{EX}g1>");
+    let allowed = [
+        format!("{group}\t\"1\"^^<http://www.w3.org/2001/XMLSchema#decimal>"),
+        format!("{group}\t\"0\"^^<http://www.w3.org/2001/XMLSchema#integer>"),
+    ];
+    for run in 0..64 {
+        let found = rows(evaluate_query(&snapshot, &query, &streamed).unwrap(), false);
+        assert!(
+            found.len() == 1 && allowed.contains(&found[0]),
+            "run {run}: {found:?}"
+        );
+    }
+}
+
 /// SPARQL 1.1 §18.5.1.4: AVG(M) = "0"^^xsd:integer whenever Count(M) = 0, including when
 /// every row in the group evaluates the argument to an error (unbound variable, division
 /// by zero, type error). Mixed value + error and bound non-numeric literals stay unbound,
