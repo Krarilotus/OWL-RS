@@ -5059,6 +5059,71 @@ fn eager_aggregation_stays_where_its_side_binds_the_join_variable_it_reads() {
     );
 }
 
+/// An `EXISTS` behind a cast in an aggregate argument is evaluated per solution (SPARQL 1.1
+/// §17.4.1.4, §18.5.1): the executor answers as the reference does, or refuses the query as
+/// unsupported, directly and streamed; it never takes the `EXISTS` for an error. One group
+/// of two subjects, one of them marked: the SUM's arguments are an error (the cast of
+/// "bad") and 1, so SUM is unbound; the first AVG's are 1 and an error, so it is unbound;
+/// the second AVG's (`EXISTS {}` holds everywhere) are two errors, so it is integer 0.
+#[test]
+fn an_exists_behind_a_cast_in_an_aggregate_is_answered_as_sparql_or_refused() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let node = |iri: &str| NamedNode::new_unchecked(iri);
+    let mut tx = engine.transaction();
+    let mut add = |s: &str, p: &str, o: Term| {
+        tx.insert(Quad::new(node(s), node(p), o, GraphName::DefaultGraph).as_ref());
+    };
+    for (s, v) in [("urn:s1", 1_i64), ("urn:s2", 2)] {
+        add(s, "urn:group", node("urn:g1").into());
+        add(s, "urn:value", Literal::from(v).into());
+    }
+    add("urn:s1", "urn:marked", node("urn:yes").into());
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let int = "<http://www.w3.org/2001/XMLSchema#integer>";
+    let body = "WHERE { ?s <urn:group> ?g . ?s <urn:value> ?v } GROUP BY ?g";
+    let marked = "EXISTS { ?s <urn:marked> <urn:yes> }";
+    let cases = [
+        (
+            format!("SELECT ?g (SUM({int}(COALESCE(IF({marked}, \"bad\", 1), 1))) AS ?a) {body}"),
+            "UNDEF".to_owned(),
+        ),
+        (
+            format!("SELECT ?g (AVG({int}(IF({marked}, 1, ?missing))) AS ?a) {body}"),
+            "UNDEF".to_owned(),
+        ),
+        (
+            format!(
+                "SELECT ?g (AVG({int}(COALESCE(IF(EXISTS {{}}, \"bad\", 1), 1))) AS ?a) {body}"
+            ),
+            format!("\"0\"^^{int}"),
+        ),
+    ];
+    let streamed = QueryOptions {
+        stream_rows: Some(1),
+        ..QueryOptions::default()
+    };
+    for (text, mean) in &cases {
+        let query = SparqlParser::new().parse_query(text).unwrap();
+        let expected = [format!("<urn:g1>\t{mean}")];
+        let reference = rows(
+            reference(&snapshot, &query, &QueryOptions::default()).unwrap(),
+            false,
+        );
+        assert_eq!(reference, expected, "reference: {text}");
+        for (route, options) in [
+            ("direct", QueryOptions::default()),
+            ("streamed", streamed.clone()),
+        ] {
+            match evaluate_query(&snapshot, &query, &options) {
+                Err(nrese_sparql::QueryEvaluationError::Unsupported(_)) => {}
+                Ok(results) => assert_eq!(rows(results, false), expected, "{route}: {text}"),
+                Err(error) => panic!("{route}: {error}: {text}"),
+            }
+        }
+    }
+}
+
 /// SPARQL 1.1 §18.5.1.4: AVG(M) = "0"^^xsd:integer whenever Count(M) = 0, including when
 /// every row in the group evaluates the argument to an error (unbound variable, division
 /// by zero, type error). Mixed value + error and bound non-numeric literals stay unbound,
