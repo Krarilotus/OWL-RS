@@ -222,11 +222,12 @@ impl<'a, V: ReadView> GraphView<'a, V> {
 
 /// The most bytes a dictionary lookup of `literal` allocates, by the engine's bound for a key
 /// of its encoded length on a plain or a compressed base, whichever is larger (a key grown
-/// by doubling from 64 bytes, and the compressor's buffers): `7 × encoded + 192` covers both
-/// `3 × max(encoded, 64)` and `2 × max(encoded, 64) + 5 × encoded + 16`. The encoded length
-/// is taken as the text, the datatype IRI and the language tag, and 16 bytes of framing.
-/// For a view that isn't a snapshot, whose lookup has no charged form, and a lookup through
-/// a comparison's frontier.
+/// by doubling from 64 bytes, and the compressor's buffers), with the own key an overlay
+/// makes after its probe: `8 × encoded + 192` covers both `3 × max(encoded, 64)` and
+/// `2 × max(encoded, 64) + 5 × encoded + 16`, each plus `encoded`. The encoded length is
+/// taken as the text, the datatype IRI and the language tag, and 16 bytes of framing. For a
+/// view that isn't a snapshot, whose lookup has no charged form, and a lookup through a
+/// comparison's frontier, whose state after may be a transaction's overlay.
 pub(crate) fn literal_lookup_bound(literal: &Term) -> usize {
     let encoded = match literal {
         Term::Literal(literal) => {
@@ -237,5 +238,5 @@ pub(crate) fn literal_lookup_bound(literal: &Term) -> usize {
         }
         other => other.to_string().len() + 16,
     };
-    7 * encoded + 192
+    8 * encoded + 192
 }
