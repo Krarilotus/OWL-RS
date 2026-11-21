@@ -52,6 +52,56 @@ fn dense_conjunctive_list_search_stays_within_counted_work() {
     }
 }
 
+/// How many rules of the property chain `ex:out` read or conclude a private relation (the
+/// per-cell form). Its list starts at `head`; `cells` cells `ex:c0`… with two firsts each
+/// end it, after the cells of `before`.
+fn per_cell_rules(head: &str, before: &str, cells: usize) -> usize {
+    use crate::ir::{Atom, Head, Term};
+    let mut text = format!("ex:out owl:propertyChainAxiom {head}\n{before}");
+    for i in 0..cells {
+        let rest = if i + 1 == cells {
+            "rdf:nil".to_owned()
+        } else {
+            format!("ex:c{}", i + 1)
+        };
+        text.push_str(&format!(
+            "\nex:c{i} rdf:first ex:p{i}\nex:c{i} rdf:first ex:q{i}\nex:c{i} rdf:rest {rest}"
+        ));
+    }
+    let mut vocabulary = LocalVocabulary::default();
+    let input = load(&mut vocabulary, &text);
+    let voc = ListVocabulary::new(&mut vocabulary);
+    let (rules, diagnostics) = crate::lists::instantiate(&voc, &SliceFacts(&input));
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    let private =
+        |Atom(terms): &Atom| matches!(terms[1], Term::Const(p) if crate::lists::internal(p));
+    rules
+        .iter()
+        .filter(|rule| {
+            rule.body.iter().any(private)
+                || matches!(&rule.head, Head::Facts(heads) if heads.iter().any(private))
+        })
+        .count()
+}
+
+#[test]
+fn a_chain_of_up_to_sixty_four_walks_is_enumerated() {
+    // Spec: reasoning-semantics.md, list limits: a property chain uses the
+    // ordinary rule form for up to 64 alternatives. Five and six cells with
+    // two firsts each give 32 and 64 walks.
+    for cells in [5, 6] {
+        assert_eq!(per_cell_rules("ex:c0", "", cells), 0, "{cells} cells");
+    }
+    // A head with one first before the six cells, and a second rest to a
+    // one-cell list, gives 65 walks: past the bound, individual cells.
+    let before = "ex:h rdf:first ex:r
+        ex:h rdf:rest ex:c0
+        ex:h rdf:rest ex:y
+        ex:y rdf:first ex:s
+        ex:y rdf:rest rdf:nil";
+    assert!(per_cell_rules("ex:h", before, 6) > 0);
+}
+
 #[test]
 fn explaining_an_ordinary_property_refusal_does_no_list_grounding() {
     use crate::engine::{Program, explain_violation, maintain};
