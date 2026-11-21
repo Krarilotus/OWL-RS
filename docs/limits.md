@@ -124,24 +124,18 @@ leave something out.
   `rdfs-plus`: without a range, `∃:p.xsd:integer ⊑ :C` and `:a :p 5` give no `:a a :C`, even in
   one commit, where `owl2-dl` gives it
   ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)).
-  Lists past their limits (a property chain of more than 250 properties, a key of more than
-  127, an intersection of more than 256 classes; for more than 64 member sequences,
-  [below](#a-list-past-the-cap)) aren't used
-  at all, never truncated, and each is reported in the log and the reasoning diagnostics;
-  while one is left out, no answer that reads the inferences is `complete`
-  ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)); none known beyond
-  keeping lists within those limits. Where the list of an axiom has a cycle, or a branch that
-  ends in a cell without `rdf:first` or `rdf:rest`, the whole axiom is left out, though OWL 2
-  RL's rules apply along every well-formed path through the list. A cyclic list is left out as a
-  whole, so a row only one of its paths entails is not inferred, and a read over the inferences
-  isn't `complete`; a violation only one of its paths entails is missed too, and the store can
-  report itself consistent over it. `owl:sameAs` between a list's cells makes the list cyclic
-  too: under `owl2-rl`, a property chain whose second cell is stated equal to its first is left
-  out as a whole, so the chain as written isn't applied, where the earlier `main` applies it.
-  An intersection of more than 256 classes is too long for the
-  rule format and is left out the same way (`list-too-long`): it gives no rules, a read over the
-  inferences isn't `complete`, and writes that leave it so stay incremental. A write after which
-  an axiom's list is read otherwise (left out where it was read, read where it was left out, or
+  The reader uses well-formed walks to `rdf:nil`. It ignores branches that cannot reach
+  `rdf:nil`, including loops with no exit to it. If the part that reaches `rdf:nil` contains a
+  cycle, including one created by `owl:sameAs`, the reader falls back to stopping at its
+  first visit to `rdf:nil` and reports the cycle. A row or clash
+  that needs an omitted walk can still be missed.
+  A walk past its limit (a chain of more than 250 properties, a key of more than 127, or an
+  intersection of more than 256 classes) is left out. Other walks that fit still give rules.
+  A list with more than 64 walks is handled [below](#a-list-past-the-cap). These limits are
+  reported in the log and reasoning diagnostics. While a list read is incomplete, an answer
+  that reads the inferences isn't `complete`
+  ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)).
+  A write after which an axiom's list is read otherwise (left out where it was read, read where it was left out, or
   left out for another reason) is rebuilt after its incremental maintenance
   ([list limits](spec/reasoning-semantics.md#list-limits)): such a write is rematerialised, and
   other writes stay incremental. For example, on one 32-core machine and a store of 2.8 million
@@ -535,12 +529,12 @@ leave something out.
   inferred ones, which are in the default graph. Under `owl2-rl` its status is `sound-only`
   with the reason of a read over the closure, which doesn't say that the inferred statements
   are outside its dataset. For what follows from those graphs, add `inference-scope=dataset`.
-- <a id="a-list-past-the-cap"></a>A list axiom whose members' `owl:sameAs` aliases give it more
-  than 64 member sequences is reported (`too-many-list-variants`). The clash checks of such an
+- <a id="a-list-past-the-cap"></a>A list axiom with more than 64 walks to `rdf:nil` is reported
+  (`too-many-list-variants`). Walks with identical member sequences count separately. The clash checks of such an
   `owl:AllDifferent`, `owl:AllDisjointClasses` or `owl:AllDisjointProperties` list are made from
   the list as written. A write that leaves the store holding such a list, one it held already or
   one the write brings, is rebuilt after its incremental check, and the rebuild makes what the
-  list gives while its cells give it at most 64 sequences
+  list gives while its cells give it at most 64 walks
   ([list limits](spec/reasoning-semantics.md#list-limits)). A write that deletes nothing is
   refused if either check refuses it; a write that deletes is judged by the rebuild alone. Such a
   write is rematerialised. For example, on one 12-core machine and a store of 2.8 million stated

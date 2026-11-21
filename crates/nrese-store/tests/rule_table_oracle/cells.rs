@@ -215,14 +215,14 @@ fn empty_store_publishes_datatype_axioms() {
 }
 
 #[test]
-#[ignore = "undocumented: a chain starting at rdf:nil drops its explicit first and rest"]
+#[ignore = "an accepting cycle starting at rdf:nil needs the per-cell form"]
 fn nil_head_starts_an_explicit_walk() {
     // Spec: Table 3 matches the head again, so prp-spo2 gives both p,q and p,q,p,q.
     check_nil_walk("nil-head");
 }
 
 #[test]
-#[ignore = "undocumented: a chain stops at rdf:nil before reading its explicit continuation"]
+#[ignore = "an accepting cycle through rdf:nil needs the per-cell form"]
 fn nil_cell_continues_an_explicit_walk() {
     // Spec: Table 3 matches the interior cell again, so prp-spo2 gives both p,q and p,q,q.
     check_nil_walk("nil-cell");
@@ -288,6 +288,350 @@ fn matches_oracle(cell: &Case, accepted: &[bool], present: &[bool]) -> bool {
         );
     }
     sweep::check_cell(cell, &steps)
+}
+
+#[test]
+fn nil_alias_terminates_linear_and_cyclic_lists() {
+    // Tables 3–5 derive the prefix's chain row at the first visit to nil's class.
+    for (end, extra) in [
+        ("ex:x", ""),
+        (
+            "rdf:nil",
+            "rdf:nil rdf:first ex:r\nrdf:nil rdf:rest rdf:nil",
+        ),
+    ] {
+        let fixture = case(
+            "nil-alias",
+            ["ex:a", "ex:out", "ex:c"],
+            vec![
+                insert("ex:x ex:marker ex:y"),
+                insert(&format!(
+                    "
+                    rdf:nil owl:sameAs ex:x
+                    ex:out owl:propertyChainAxiom ex:h
+                    ex:h rdf:first ex:p
+                    ex:h rdf:rest ex:t
+                    ex:t rdf:first ex:q
+                    ex:t rdf:rest {end}
+                    ex:a ex:p ex:b
+                    ex:b ex:q ex:c
+                    {extra}
+                    "
+                )),
+            ],
+        );
+        check_vocabulary_alias(fixture, "http://example.org/x", nrese_rdf::vocab::rdf::NIL);
+    }
+}
+
+#[test]
+fn rest_alias_links_list_cells() {
+    // Spec: Table 4 eq-rep-p lets an alias of rdf:rest supply the edge
+    // in the Table 3 list, so Table 5 prp-spo2 derives the chain row.
+    check_rest_alias(rest_alias_fixture("ex:r"));
+}
+
+#[test]
+fn mixed_rest_spellings_link_the_same_list() {
+    // Spec: Table 4 eq-rep-p lets the two spellings supply different steps
+    // of the same Table 3 list. Table 5 prp-spo2 derives its chain row.
+    check_rest_alias(rest_alias_fixture("rdf:rest"));
+}
+
+#[test]
+fn alias_only_rest_edits_maintain_chain_answers() {
+    // Spec: Tables 3–5 add the new walk's answer when an alias of rdf:rest
+    // connects it and retract it when that edge goes, even after reopening.
+    let mut fixture = rest_alias_fixture("rdf:rest");
+    fixture.writes[1].insert.extend(
+        insert(
+            "
+            ex:u rdf:first ex:s
+            ex:u ex:r rdf:nil
+            ex:b ex:s ex:d
+            ",
+        )
+        .insert,
+    );
+    fixture.writes.push(insert("ex:h ex:r ex:u"));
+    fixture.writes.push(delete("ex:h ex:r ex:u"));
+    let added = crate::triple(["ex:a", "ex:out", "ex:d"]);
+    let steps = sweep::steps(&fixture);
+    let rl = nrese_reasoner::ReasoningMode::Owl2Rl;
+    for &mode in judges::MODES {
+        for cold in [false, true] {
+            let temp = tempfile::tempdir().expect("private store directory");
+            let open = || judges::open(mode, Some(temp.path()));
+            let mut store = open();
+            let raw = judges::pipeline(&store, nrese_reasoner::ReasoningMode::Disabled);
+            assert!(judges::apply(&raw, &fixture.writes[0]));
+            drop(raw);
+            let mut pipeline = judges::pipeline(&store, rl);
+            for (index, step) in steps.iter().enumerate().skip(1) {
+                if cold && index > 1 {
+                    drop(pipeline);
+                    drop(store);
+                    store = open();
+                    pipeline = judges::pipeline(&store, rl);
+                }
+                assert!(judges::apply(&pipeline, &fixture.writes[index]));
+                let rows = judges::rows(&store).0;
+                for row in [&fixture.watch, &added] {
+                    assert_eq!(
+                        rows.contains(row),
+                        step.model.facts.contains(row),
+                        "{mode} cold={cold} write={index} row={row:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn check_rest_alias(fixture: Case) {
+    check_vocabulary_alias(fixture, "http://example.org/r", nrese_rdf::vocab::rdf::REST);
+}
+
+fn rest_alias_fixture(head_rest: &str) -> Case {
+    case(
+        "rest-alias",
+        ["ex:a", "ex:out", "ex:c"],
+        vec![
+            insert("ex:r ex:marker ex:y"),
+            insert(&format!(
+                "
+            rdf:rest owl:sameAs ex:r
+            ex:out owl:propertyChainAxiom ex:h
+            ex:h rdf:first ex:p
+            ex:h {head_rest} ex:t
+            ex:t rdf:first ex:q
+            ex:t ex:r rdf:nil
+            ex:a ex:p ex:b
+            ex:b ex:q ex:c
+        ",
+            )),
+        ],
+    )
+}
+
+fn check_vocabulary_alias(fixture: Case, alias: &str, vocabulary: nrese_rdf::NamedNodeRef<'_>) {
+    let steps = sweep::steps(&fixture);
+    let expected = &steps[1].model;
+    assert!(!expected.inconsistent);
+    assert!(expected.facts.contains(&fixture.watch));
+
+    use nrese_reasoner::{ReasonerConfig, ReasoningMode};
+    let rl = ReasoningMode::Owl2Rl;
+    let mut missing = Vec::new();
+    for &mode in judges::MODES {
+        for rebuild in [false, true] {
+            let store = judges::open(mode, None);
+            let raw = judges::pipeline(&store, ReasoningMode::Disabled);
+            // An RL pipeline interns its rule vocabulary before the first write.
+            assert!(judges::apply(&raw, &fixture.writes[0]));
+            let reasoned = judges::pipeline(&store, rl);
+            if rebuild {
+                assert!(judges::apply(&raw, &fixture.writes[1]));
+                let program = ReasonerConfig::for_mode(rl).materialised_program().unwrap();
+                assert_eq!(store.rematerialise(program).unwrap().violations, 0);
+            } else {
+                assert!(judges::apply(&reasoned, &fixture.writes[1]));
+            }
+            let snapshot = store.read_snapshot(None).expect("read term dictionary");
+            let alias = nrese_rdf::NamedNodeRef::new(alias).unwrap();
+            let id =
+                |term: nrese_rdf::NamedNodeRef<'_>| snapshot.lookup(term.into()).unwrap().raw();
+            let (alias, term) = (id(alias), id(vocabulary));
+            assert!(alias < term, "{mode} rebuild={rebuild}: {alias} >= {term}");
+            if !judges::rows(&store).0.contains(&fixture.watch) {
+                missing.push((mode, rebuild));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "the chain row differs from the oracle in {missing:?} (mode, rebuild)"
+    );
+}
+
+fn chain_with(extra: &str) -> generator::Write {
+    insert(&format!(
+        "
+        ex:out owl:propertyChainAxiom ex:h
+        ex:h rdf:first ex:p
+        ex:h rdf:rest ex:t
+        ex:t rdf:first ex:q
+        ex:t rdf:rest rdf:nil
+        ex:a ex:p ex:b
+        ex:b ex:q ex:c
+        {extra}
+        "
+    ))
+}
+
+#[test]
+fn oversized_walks_keep_their_short_alternatives() {
+    // Tables 5, 6 and 9 derive the short alternatives' chain, membership and
+    // subclass rows. Diagnose only the oversized walk in each case.
+    use nrese_reasoner::{ReasonerConfig, ReasoningMode};
+
+    let rl = ReasoningMode::Owl2Rl;
+    for (length, axiom, data, answers) in [
+        (
+            257,
+            "owl:intersectionOf",
+            "ex:a rdf:type ex:p",
+            "ex:a rdf:type ex:out\nex:out rdfs:subClassOf ex:p",
+        ),
+        (
+            251,
+            "owl:propertyChainAxiom",
+            "ex:a ex:p ex:b",
+            "ex:a ex:out ex:b",
+        ),
+    ] {
+        let mut input = generator::long_chain(length).writes.remove(0);
+        input.insert[0][1] = axiom.into();
+        input
+            .insert
+            .extend(insert(&format!("ex:c0 rdf:rest rdf:nil\n{data}")).insert);
+        let answers = generator::rows(answers);
+        let model = oracle::evaluate(
+            &input.insert.iter().cloned().collect(),
+            oracle::Datatypes::Standard,
+        );
+        assert!(answers.iter().all(|answer| model.facts.contains(answer)));
+
+        for &mode in judges::MODES {
+            let store = judges::open(mode, None);
+            let raw = judges::pipeline(&store, ReasoningMode::Disabled);
+            assert!(judges::apply(&raw, &insert("rdf:nil ex:marker ex:seed")));
+            assert!(judges::apply(&raw, &input));
+            let snapshot = store.read_snapshot(None).unwrap();
+            let id = |name| {
+                let iri = nrese_rdf::NamedNodeRef::new(name).unwrap();
+                snapshot.lookup(iri.into()).unwrap().raw()
+            };
+            assert!(id(nrese_rdf::vocab::rdf::NIL.as_str()) < id("http://example.org/c1"));
+            let _reader = judges::pipeline(&store, rl);
+            let program = ReasonerConfig::for_mode(rl).materialised_program().unwrap();
+            let report = store.rematerialise(program).unwrap();
+            for answer in &answers {
+                assert!(judges::ask(&store, answer).0, "{mode}: missing {answer:?}");
+            }
+            assert!(
+                report.diagnostics.iter().any(|d| d.kind == "list-too-long"),
+                "{mode}: {axiom} must report its oversized walk"
+            );
+        }
+    }
+}
+
+#[test]
+fn accepting_walk_survives_incomplete_branches() {
+    // Spec: Table 3 requires a first and a rest at each position. Table 5
+    // prp-spo2 still derives the row from the branch with both.
+    check(
+        case(
+            "incomplete-branches",
+            ["ex:a", "ex:out", "ex:c"],
+            vec![chain_with(
+                "
+                ex:h rdf:rest ex:noFirst
+                ex:noFirst rdf:rest rdf:nil
+                ex:h rdf:rest ex:noRest
+                ex:noRest rdf:first ex:r
+                ",
+            )],
+        ),
+        &[true],
+        &[true],
+    );
+}
+
+#[test]
+fn accepting_walk_survives_a_side_loop() {
+    // Spec: Table 3 matches walks ending at rdf:nil. A branch with no exit
+    // contributes no walk and leaves the Table 5 prp-spo2 result intact.
+    check(
+        case(
+            "side-loop",
+            ["ex:a", "ex:out", "ex:c"],
+            vec![chain_with(
+                "
+                ex:h rdf:rest ex:loop
+                ex:loop rdf:first ex:r
+                ex:loop rdf:rest ex:loop
+                ",
+            )],
+        ),
+        &[true],
+        &[true],
+    );
+}
+
+#[test]
+fn accepting_walk_is_maintained_when_a_branch_changes() {
+    // Spec: Tables 3 and 5 keep the first branch's conclusion through all
+    // writes. Completing the other branch adds its conclusion until its
+    // last edge is deleted, including after the store has been reopened.
+    let mut fixture = case(
+        "edit-incomplete-branch",
+        ["ex:a", "ex:out", "ex:c"],
+        vec![
+            chain_with(
+                "
+                ex:h rdf:rest ex:branch
+                ex:branch rdf:first ex:r
+                ex:b ex:r ex:d
+                ",
+            ),
+            delete("ex:h rdf:rest ex:branch"),
+            insert("ex:h rdf:rest ex:branch"),
+            insert("ex:branch rdf:rest rdf:nil"),
+            delete("ex:branch rdf:rest rdf:nil"),
+        ],
+    );
+    let accepted = &[true; 5];
+    let kept = matches_oracle(&fixture, accepted, &[true; 5]);
+    fixture.watch = crate::triple(["ex:a", "ex:out", "ex:d"]);
+    let changed = matches_oracle(&fixture, accepted, &[false, false, false, true, false]);
+    assert!(kept && changed, "branch edits differ from the oracle");
+}
+
+#[test]
+fn accepting_walk_requires_a_first_at_every_cell() {
+    // Spec: Table 3 requires rdf:first even on the last cell. With no
+    // alternative walk, Table 5 derives no chain row and the axiom is diagnosed.
+    let fixture = case(
+        "missing-first-only-walk",
+        ["ex:a", "ex:out", "ex:c"],
+        vec![insert(
+            "
+            ex:out owl:propertyChainAxiom ex:h
+            ex:h rdf:first ex:p
+            ex:h rdf:rest ex:t
+            ex:t rdf:rest rdf:nil
+            ex:a ex:p ex:b
+            ex:b ex:q ex:c
+            ",
+        )],
+    );
+    assert!(matches_oracle(&fixture, &[true], &[false]));
+    for &mode in judges::MODES {
+        let store = judges::open(mode, None);
+        let pipeline = judges::pipeline(&store, nrese_reasoner::ReasoningMode::Owl2Rl);
+        assert!(judges::apply(&pipeline, &fixture.writes[0]));
+        let report = pipeline.last_reasoning_run().expect("reasoning ran");
+        assert_eq!(
+            report.diagnostics_total, 1,
+            "{mode}: {:?}",
+            report.diagnostics
+        );
+        let diagnostic = &report.diagnostics[0];
+        assert_eq!(diagnostic.kind, "malformed-list", "{mode}");
+        assert_eq!(diagnostic.node.as_deref(), Some("http://example.org/t"));
+    }
 }
 
 #[test]

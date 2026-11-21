@@ -1,4 +1,5 @@
 mod cells;
+mod cycle_compat;
 mod generator;
 mod judges;
 mod oracle;

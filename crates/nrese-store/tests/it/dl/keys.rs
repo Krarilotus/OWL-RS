@@ -18,7 +18,7 @@ const OUTSIDE_RL: &str = ":Pet rdfs:subClassOf [ owl:unionOf ( :Dog :Cat ) ] . :
 
 /// Under reasoning-semantics.md, Freshness, version 7 and the new seeds change the
 /// `owl2-rl` program fingerprint, so stores rebuild once at their next start.
-const OWL2_RL_FINGERPRINT: &str = "392360a62c2c60f5";
+const OWL2_RL_FINGERPRINT: &str = "8373f9bd2f1319f8";
 
 /// An object key over `z`, `:a` and `:b` sharing it as value, and `more`.
 fn object_key(z: &str, more: &str) -> String {

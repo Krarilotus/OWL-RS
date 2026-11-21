@@ -113,12 +113,10 @@ fn assert_refused_for(result: Result<(), MutationError>, rule: &str, case: &str)
     }
 }
 
-/// An equality that hides an `owl:AllDisjointClasses` marker (invalid OWL 2 DL input, which
-/// a store holds all the same): the axiom isn't read while the equality stands, so the
-/// rematerialised store reads `ex:x`, in both `ex:A` and `ex:B`, as consistent. Deleting only
-/// the equality brings the clash; over a compact stack the split is rebuilt.
+/// OWL 2 RL Tables 3, 4 and 7: the two types of `ex:x` clash by cax-adc before
+/// and after the marker's alias is deleted, so the split in quarantine commits.
 #[test]
-fn a_split_that_brings_a_clash_is_refused_and_leaves_the_published_state_as_it_was() {
+fn the_existing_list_clash_survives_a_split_in_quarantine() {
     let store = loaded(
         true,
         "alias-marker",
@@ -135,12 +133,39 @@ _:m2 <{RDF}rest> <{RDF}nil> .
 "
         ),
     );
+    assert!(store.is_quarantined());
+    let delete = "DELETE DATA { ex:alias owl:sameAs owl:AllDisjointClasses . }";
+    apply(&pipeline(&store), delete).expect("the split introduces no clash");
+    assert!(store.is_quarantined());
+    assert!(!holds(&store, "ex:alias owl:sameAs owl:AllDisjointClasses"));
+}
+
+/// OWL 2 RL Table 7: adding the second disjoint type introduces cax-adc.
+/// The expanded list has 81 variants, so the compact split's rebuild finds it.
+#[test]
+fn a_split_that_brings_a_clash_is_refused_and_leaves_the_published_state_as_it_was() {
+    let store = store(true);
+    let commits = pipeline(&store);
+    apply(
+        &commits,
+        "INSERT DATA { ex:alias owl:sameAs owl:AllDisjointClasses .
+         ex:ax rdf:type owl:AllDisjointClasses ; owl:members (ex:A ex:B) .
+         ex:A owl:sameAs ex:A1, ex:A2, ex:A3, ex:A4, ex:A5, ex:A6, ex:A7, ex:A8 .
+         ex:B owl:sameAs ex:B1, ex:B2, ex:B3, ex:B4, ex:B5, ex:B6, ex:B7, ex:B8 .
+         ex:x rdf:type ex:A . }",
+    )
+    .expect("one type from the list is consistent");
     let before = state(&store);
     let result = apply(
-        &pipeline(&store),
-        "DELETE DATA { ex:alias owl:sameAs owl:AllDisjointClasses . }",
+        &commits,
+        "DELETE DATA { ex:alias owl:sameAs owl:AllDisjointClasses . } ;
+         INSERT DATA { ex:x rdf:type ex:B . }",
     );
-    assert_refused_for(result, "cax-adc", "the alias delete");
+    assert_refused_for(result, "cax-adc", "the split and type insert");
+    assert_eq!(
+        commits.last_reasoning_run().unwrap().work.plan,
+        nrese_reasoner::delta::policy::Plan::Rebuild
+    );
     assert_eq!(
         state(&store),
         before,
@@ -150,6 +175,7 @@ _:m2 <{RDF}rest> <{RDF}nil> .
         holds(&store, "ex:alias owl:sameAs owl:AllDisjointClasses"),
         "the equality the refused write deleted is still there"
     );
+    assert!(!holds(&store, "ex:x rdf:type ex:B"));
 }
 
 /// Valid OWL 2 DL: a store with `ObjectInverseOf(ex:p)` and `ex:a ex:p ex:b`, so `ex:b` relates
