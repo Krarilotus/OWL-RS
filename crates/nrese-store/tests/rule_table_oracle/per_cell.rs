@@ -5,7 +5,7 @@ use nrese_store::ReadScope;
 use crate::{
     cells::check,
     generator::{case, delete, insert},
-    judges, triple,
+    judges, sweep, triple,
 };
 
 const CYCLIC_CHAIN: &str = "
@@ -246,6 +246,8 @@ fn key_membership_survives_the_rule_encoder_boundary() {
     // Spec: Table 5 prp-key uses every common value in a nonempty key.
     // The list length does not change the key's answer.
     let watch = triple(["ex:a", "owl:sameAs", "ex:b"]);
+    let mut expected = Vec::new();
+    let mut differences = Vec::new();
     for size in [0, 127, 128] {
         let mut write = insert("ex:a rdf:type ex:K\nex:b rdf:type ex:K");
         let head = if size == 0 { "rdf:nil" } else { "ex:c0" };
@@ -263,16 +265,31 @@ fn key_membership_survives_the_rule_encoder_boundary() {
             write.insert.push(triple(["ex:a", &member, "ex:value"]));
             write.insert.push(triple(["ex:b", &member, "ex:value"]));
         }
+        let fixture = case(
+            "key-encoder-boundary",
+            ["ex:a", "owl:sameAs", "ex:b"],
+            vec![write],
+        );
+        let model = &sweep::steps(&fixture)[0].model;
+        assert!(!model.inconsistent, "oracle verdict with {size} members");
+        let same = model.facts.contains(&watch);
+        println!("ORACLE key with {size} members: sameAs={same}");
+        expected.push(same);
         for &mode in judges::MODES {
-            let (store, accepted) = judges::first_and_rebuild(mode, &write.insert, true);
+            let (store, accepted) =
+                judges::first_and_rebuild(mode, &fixture.writes[0].insert, true);
             assert!(accepted, "{mode} with {size} members");
-            assert_eq!(
-                judges::ask(&store, &watch).0,
-                size != 0,
-                "{mode}, {size} members"
-            );
+            let found = judges::ask(&store, &watch).0;
+            if found != same {
+                differences.push((mode, size, found, same));
+            }
         }
     }
+    assert_eq!(expected, [false, true, true], "the oracle's key answers");
+    assert!(
+        differences.is_empty(),
+        "key answers differ: {differences:?}"
+    );
 }
 
 #[test]
@@ -350,11 +367,18 @@ fn a_derived_equality_can_collapse_sixty_five_firsts_in_one_load() {
     }
     // One functional subject equates all 65 operands. The all-identity view
     // has over 64 walks even though the representative view keeps one.
-    let watch = triple(["ex:a", "ex:out", "ex:c"]);
+    let fixture = case("collapse-firsts", ["ex:a", "ex:out", "ex:c"], vec![setup]);
+    let model = &sweep::steps(&fixture)[0].model;
+    let wanted = model.facts.contains(&fixture.watch);
+    println!("ORACLE collapse-firsts: composed row={wanted}");
+    assert!(!model.inconsistent && wanted, "the oracle's composed row");
     for &mode in judges::MODES {
-        let (store, accepted) = judges::first_and_rebuild(mode, &setup.insert, true);
+        let (store, accepted) = judges::first_and_rebuild(mode, &fixture.writes[0].insert, true);
         assert!(accepted, "{mode}");
-        assert!(judges::ask(&store, &watch).0, "{mode}: the composed row");
+        assert!(
+            judges::ask(&store, &fixture.watch).0,
+            "{mode}: the composed row"
+        );
     }
 }
 
