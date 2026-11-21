@@ -392,46 +392,63 @@ impl Bounds {
 }
 
 /// Whether the commit `tx` keeps the RL route `kinds` was decided on: the closure it leaves
-/// leaves out no list axiom, and no asserted change gives a term a new kind ([`Kinds::keep`])
-/// or deletes a reified triple ([`reified`]).
+/// leaves out no list axiom, no asserted change gives a term a new kind ([`Kinds::keep`]), and
+/// none is a reified triple ([`changes_reified`]).
 fn route_kept(kinds: &Kinds, tx: &impl PendingView, lists_left_out: bool) -> bool {
     !lists_left_out
         && tx.inserted().all(|q| kinds.keep(tx, quad_triple(q), false))
-        && tx.deleted().all(|q| {
-            let t = quad_triple(q);
-            kinds.keep(tx, t, true) && !reified(tx, t)
-        })
+        && tx.deleted().all(|q| kinds.keep(tx, quad_triple(q), true))
+        && !changes_reified(tx)
 }
 
 /// Whether the delta executor changes `upper` for `tx`'s asserted changes, which leave what
-/// the reader reads of the base as it was but for them: each only asserts something about
-/// individuals over U1's signature ([`Upper::is_assertion`], which no schema change passes),
-/// names no reserved name or SHACL property ([`reserved_named`]) and says nothing about the
-/// ontology's node ([`header`]), and no deleted literal may retype its property
-/// ([`may_retype`]) and no deleted triple is reified ([`reified`]). A U1 with equality classes
-/// is evaluated afresh (`Upper`'s module docs).
+/// the reader reads of the base as it was but for them: the transaction's part
+/// ([`probed_assertions`]) and U1's ([`upper_keeps`]).
 fn assertions_only(upper: &Upper, tx: &impl PendingView) -> bool {
-    upper.classes().is_empty()
-        && (tx.inserted().chain(tx.deleted()).map(quad_triple))
-            .all(|t| upper.is_assertion(t) && !reserved_named(tx, t) && !header(tx, t[0]))
-        && !tx.deleted().any(|q| {
-            let t = quad_triple(q);
-            may_retype(tx, t) || reified(tx, t)
-        })
+    probed_assertions(tx).is_some_and(|triples| upper_keeps(upper, &triples))
 }
 
-/// Whether a node in the data as `tx` leaves it names the triple as its main triple
+/// The delta's carry-over as far as the transaction tells it, which reads the engine and the
+/// dictionary: `tx`'s changed triples, inserted and deleted, where none names a reserved name
+/// or SHACL property ([`reserved_named`]) or says something about the ontology's node
+/// ([`header`]), no deleted literal may retype its property ([`may_retype`]), and none is a
+/// reified triple ([`changes_reified`]); `None` otherwise.
+fn probed_assertions(tx: &impl PendingView) -> Option<Vec<Triple>> {
+    let triples: Vec<Triple> = tx.inserted().chain(tx.deleted()).map(quad_triple).collect();
+    let probed = triples
+        .iter()
+        .all(|&t| !reserved_named(tx, t) && !header(tx, t[0]))
+        && !tx.deleted().any(|q| may_retype(tx, quad_triple(q)))
+        && !changes_reified(tx);
+    probed.then_some(triples)
+}
+
+/// The delta's carry-over as far as U1 tells it, which reads U1 alone: no equality classes
+/// (one with them is evaluated afresh: `Upper`'s module docs), and each triple only asserts
+/// something about individuals over U1's signature ([`Upper::is_assertion`], which no schema
+/// change passes: its sets and its term ids' kind bits).
+fn upper_keeps(upper: &Upper, triples: &[Triple]) -> bool {
+    upper.classes().is_empty() && triples.iter().all(|&t| upper.is_assertion(t))
+}
+
+/// Whether a changed triple of `tx`, inserted or deleted, is the main triple a node names
 /// (`owl:annotatedSource`, `owl:annotatedProperty`, `owl:annotatedTarget`): an annotated
-/// axiom's reification or an annotation's annotation (*Mapping to RDF* Table 17). Deleting
-/// the triple leaves the node annotating nothing, which the reader reports
-/// (`Diagnostic::Malformed`), so what it left out changes. Any such node counts, whatever its
-/// type: one the reader doesn't take for a reification only costs a read. Adding or deleting
-/// a node's own statements is a schema change ([`changes_schema`]). Probes of the pending
-/// state: the triple's subject's annotations, then each one's two other roles.
-fn reified(tx: &impl PendingView, [s, p, o]: Triple) -> bool {
+/// axiom's reification or an annotation's annotation (*Mapping to RDF* Table 17). Deleting it
+/// leaves the node annotating nothing, which the reader reports (`Diagnostic::Malformed`);
+/// inserting it gives a node that annotated nothing its triple back: either way what the
+/// reader left out changes. Any such node counts, whatever its type: one the reader doesn't
+/// take for a reification only costs a read.
+///
+/// The base's nodes: an edit of a node's role statements uses OWL's vocabulary, which both
+/// carry-overs refuse beside this ([`Kinds::keep`] by [`changes_schema`],
+/// [`Upper::is_assertion`]), so where this answer counts, the roles are the base's. Its cost:
+/// one probe of the base's indexes per changed triple, and two per node it finds; none of the
+/// pending changes.
+fn changes_reified(tx: &impl PendingView) -> bool {
+    let base = tx.base();
     let id = |local: &str| {
         let iri = format!("http://www.w3.org/2002/07/owl#{local}");
-        tx.lookup(nrese_rdf::NamedNodeRef::new_unchecked(&iri).into())
+        base.lookup(nrese_rdf::NamedNodeRef::new_unchecked(&iri).into())
     };
     let (Some(source), Some(property), Some(target)) = (
         id("annotatedSource"),
@@ -440,16 +457,24 @@ fn reified(tx: &impl PendingView, [s, p, o]: Triple) -> bool {
     ) else {
         return false;
     };
-    let any = |subject: Option<TermId>, predicate: TermId, object: u64| {
+    let nodes = |s: u64| -> Vec<TermId> {
+        let mut pattern = nrese_engine::QuadPattern::all();
+        (pattern.predicate, pattern.object) = (Some(source), Some(TermId::from_raw(s)));
+        let found = base.quads_for_pattern_in(ReadModel::Asserted, &pattern);
+        found.map(|q| q.subject).collect()
+    };
+    let holds = |node: TermId, role: TermId, term: u64| {
         let mut pattern = nrese_engine::QuadPattern::all();
         (pattern.subject, pattern.predicate, pattern.object) =
-            (subject, Some(predicate), Some(TermId::from_raw(object)));
-        tx.quads_for_pattern_in(ReadModel::Asserted, &pattern)
-            .map(|q| q.subject)
-            .collect::<Vec<_>>()
+            (Some(node), Some(role), Some(TermId::from_raw(term)));
+        let mut found = base.quads_for_pattern_in(ReadModel::Asserted, &pattern);
+        found.next().is_some()
     };
-    any(None, source, s).into_iter().any(|node| {
-        !any(Some(node), property, p).is_empty() && !any(Some(node), target, o).is_empty()
+    let mut changed = tx.inserted().chain(tx.deleted()).map(quad_triple);
+    changed.any(|[s, p, o]| {
+        nodes(s)
+            .into_iter()
+            .any(|node| holds(node, property, p) && holds(node, target, o))
     })
 }
 
@@ -459,27 +484,33 @@ impl Bounds {
     /// take its record without reading the ontology (the commit's record: the RL route kept,
     /// or the delta executor's change, [`assertions_only`]), by the same tests: the reader's
     /// own, no second list. `false` where the bounds describe another revision than the
-    /// base's. The list axioms the closure leaves out are no part of the record. Checked
-    /// under the state, as a read takes what it needs of U1 (serial work over what is in
-    /// memory), never keeping U1: a commit installs its change in place.
+    /// base's. The list axioms the closure leaves out are no part of the record.
+    ///
+    /// Taken as the commit takes it ([`Self::keeps_route`]): no bounds guard is held across
+    /// the engine or the dictionary (`docs/architecture/contracts.md`). Under the state only
+    /// the revision check, the RL route's kinds (an `Arc`, cloned), and U1's part
+    /// ([`upper_keeps`], which reads U1 alone, never keeping it: a commit installs its change
+    /// in place); every probe of the transaction runs without it.
     pub(crate) fn keeps_record(&self, tx: &impl PendingView) -> bool {
         let base = tx.base().revision();
-        let state = lock(&self.state);
-        match state.as_ref().filter(|s| s.revision == base) {
-            Some(State {
-                kinds: Some(kinds), ..
-            }) => route_kept(kinds, tx, false),
-            Some(State {
-                kinds: None,
-                upper: Ok(upper),
-                ..
-            }) => assertions_only(upper, tx),
-            Some(State {
-                kinds: None,
-                upper: Err(_),
-                ..
-            })
-            | None => false,
+        let kinds = lock(&self.state)
+            .as_ref()
+            .filter(|s| s.revision == base)
+            .map(|s| s.kinds.clone());
+        match kinds {
+            Some(Some(kinds)) => route_kept(&kinds, tx, false),
+            Some(None) => {
+                let Some(triples) = probed_assertions(tx) else {
+                    return false;
+                };
+                let state = lock(&self.state);
+                matches!(
+                    state.as_ref().filter(|s| s.revision == base),
+                    Some(State { kinds: None, upper: Ok(upper), .. })
+                        if upper_keeps(upper, &triples)
+                )
+            }
+            None => false,
         }
     }
 }
