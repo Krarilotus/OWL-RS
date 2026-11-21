@@ -31,6 +31,11 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/Krarilotus/OWL-RS"
 version = "1.5.0"
 
+# The project's name where a build names itself: the W3C implementation reports' subject
+# (crates/rdf/nrese-rdf-io/tests/support/earl.rs).
+[workspace.metadata.project]
+name = "NRESE"
+
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 # `--cfg system_alloc` switches the perf lab to the system allocator (RUSTFLAGS for a perf_lab build),

@@ -20,6 +20,8 @@ Thumbs.db
 /artifacts/
 /tmp/
 /.cache/
+# The W3C implementation reports scripts/w3c-reports.sh writes
+/w3c-reports/
 *.log
 *.out
 *.err

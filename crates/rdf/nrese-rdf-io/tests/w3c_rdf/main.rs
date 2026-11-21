@@ -22,8 +22,16 @@
 //!   `rdfDirection` option is set), so documents with either skip that one.
 //! - **Parallel parsing.** Every Turtle and TriG document that parses is also cut into 2,
 //!   3 and 8 chunks by the exact splitter and parsed chunk by chunk: the same statements.
+//! - **Expected failures** are listed with their reasons in `expected-failures.txt`. The run
+//!   fails on any failure not in the list, and on any listed test that now passes.
+//! - **Implementation reports.** The run writes one EARL report per specification
+//!   (`rdf12-turtle.ttl`, …; `tests/support/earl.rs`): one assertion per manifest entry, an
+//!   entry this runner doesn't run reported untested with its reason.
 
-use std::collections::{BTreeSet, HashMap};
+#[path = "../support/earl.rs"]
+mod earl;
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use nrese_rdf::{Dataset, Quad, Term};
@@ -33,6 +41,7 @@ const BASE: &str = "https://w3c.github.io/rdf-tests/";
 const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const MF: &str = "http://www.w3.org/2001/sw/DataAccess/tests/test-manifest#";
 const RDFT: &str = "http://www.w3.org/ns/rdftest#";
+const EXPECTED_FAILURES: &str = include_str!("expected-failures.txt");
 
 /// The suites, by the directory of their manifest under `rdf/`.
 const SUITES: [&str; 14] = [
@@ -77,8 +86,17 @@ fn suite_root() -> Option<PathBuf> {
     root.join("rdf/rdf12").is_dir().then_some(root)
 }
 
-/// The manifest's tests.
-fn read_manifest(root: &Path, suite: &str) -> Vec<Test> {
+/// Every entry of a manifest: the tests this runner runs, and the others with why not.
+struct Manifest {
+    tests: Vec<Test>,
+    /// `(test IRI, reason)`.
+    untested: Vec<(String, String)>,
+    /// The `mf:entries` members read, counted apart from the two lists.
+    entries: usize,
+}
+
+/// The manifest's entries.
+fn read_manifest(root: &Path, suite: &str) -> Manifest {
     let directory = format!("{BASE}rdf/{suite}/");
     let text = std::fs::read(root.join("rdf").join(suite).join("manifest.ttl")).unwrap();
     let quads: Vec<Quad> = RdfParser::from_format(RdfFormat::Turtle)
@@ -122,13 +140,17 @@ fn read_manifest(root: &Path, suite: &str) -> Vec<Test> {
         Term::NamedNode(n) => n.as_str().to_owned(),
         other => other.to_string(),
     };
-    entries
-        .iter()
-        .filter_map(|entry| {
+    let mut manifest = Manifest {
+        tests: Vec::new(),
+        untested: Vec::new(),
+        entries: entries.len(),
+    };
+    for entry in &entries {
+        let test = (|| {
             let key = entry.to_string();
-            let kind_iri = local(&object(&key, &format!("{RDF}type"))?);
-            let name = kind_iri.strip_prefix(RDFT)?;
-            let (format, kind) = match name {
+            let kind_iri = local(&object(&key, &format!("{RDF}type")).ok_or("no test type")?);
+            let not_run = || format!("the test type {kind_iri} is not run by this runner");
+            let (format, kind) = match kind_iri.strip_prefix(RDFT).ok_or_else(not_run)? {
                 "TestNTriplesPositiveSyntax" => (RdfFormat::NTriples, Kind::PositiveSyntax),
                 "TestNTriplesNegativeSyntax" => (RdfFormat::NTriples, Kind::NegativeSyntax),
                 "TestNQuadsPositiveSyntax" => (RdfFormat::NQuads, Kind::PositiveSyntax),
@@ -145,17 +167,23 @@ fn read_manifest(root: &Path, suite: &str) -> Vec<Test> {
                 "TestXMLNegativeSyntax" => (RdfFormat::RdfXml, Kind::NegativeSyntax),
                 "TestNTriplesPositiveC14N" => (RdfFormat::NTriples, Kind::C14n),
                 "TestNQuadsPositiveC14N" => (RdfFormat::NQuads, Kind::C14n),
-                _ => return None,
+                _ => return Err(not_run()),
             };
-            Some(Test {
+            let action = object(&key, &format!("{MF}action")).ok_or("no action")?;
+            Ok::<_, String>(Test {
                 iri: local(entry),
                 kind,
                 format,
-                action: local(&object(&key, &format!("{MF}action"))?),
+                action: local(&action),
                 result: object(&key, &format!("{MF}result")).map(|r| local(&r)),
             })
-        })
-        .collect()
+        })();
+        match test {
+            Ok(test) => manifest.tests.push(test),
+            Err(reason) => manifest.untested.push((local(entry), reason)),
+        }
+    }
+    manifest
 }
 
 /// The file behind a test IRI.
@@ -373,26 +401,189 @@ fn w3c_rdf_syntax_suites() {
         eprintln!("skipped: W3C rdf-tests not found (run scripts/fetch-w3c-tests.sh)");
         return;
     };
-    let mut failures = Vec::new();
+    // Entries are `<iri> # reason`.
+    let expected: BTreeMap<&str, &str> = EXPECTED_FAILURES
+        .lines()
+        .filter_map(|line| line.strip_prefix('<'))
+        .filter_map(|line| {
+            let (iri, reason) = line.split_once('>')?;
+            Some((iri, reason.trim().trim_start_matches('#').trim()))
+        })
+        .collect();
+    let (mut failures, mut failed_iris) = (Vec::new(), BTreeSet::new());
+    // The implementation reports, one per specification (`rdf12/rdf-turtle`), in order.
+    let mut reports: BTreeMap<&str, earl::Report> = BTreeMap::new();
     println!("W3C RDF syntax suites: passed / failed");
     for suite in SUITES {
-        let tests = read_manifest(&root, suite);
-        assert!(!tests.is_empty(), "no tests in {suite}");
+        let manifest = read_manifest(&root, suite);
+        assert!(!manifest.tests.is_empty(), "no tests in {suite}");
+        // `rdf12/rdf-turtle/syntax` and `…/eval` are one specification's, `rdf11/rdf-turtle` one.
+        let spec = &suite[..suite
+            .match_indices('/')
+            .nth(1)
+            .map_or(suite.len(), |(i, _)| i)];
+        let report = reports.entry(spec).or_insert_with(|| earl::Report {
+            title: format!("rdf/{spec}"),
+            runner: "crates/rdf/nrese-rdf-io/tests/w3c_rdf",
+            suite: root.join("rdf"),
+            entries: 0,
+            assertions: Vec::new(),
+        });
+        report.entries += manifest.entries;
         let (mut passed, mut failed) = (0, 0);
-        for test in &tests {
+        for test in &manifest.tests {
             let outcome = std::panic::catch_unwind(|| run(&root, test))
                 .unwrap_or_else(|_| Err("panicked".to_owned()));
-            match outcome {
-                Ok(()) => passed += 1,
+            let (verdict, info) = match outcome {
+                Ok(()) => {
+                    passed += 1;
+                    (earl::Outcome::Passed, None)
+                }
                 Err(why) => {
                     failed += 1;
-                    failures.push(format!("{} ({:?}): {why}", test.iri, test.kind));
+                    failed_iris.insert(test.iri.clone());
+                    let listed = expected.get(test.iri.as_str());
+                    if listed.is_none() {
+                        failures.push(format!("{} ({:?}): {why}", test.iri, test.kind));
+                    }
+                    let first = why.lines().next().unwrap_or_default().chars().take(200);
+                    (
+                        earl::Outcome::Failed,
+                        Some(listed.map_or_else(|| first.collect(), |r| (*r).to_owned())),
+                    )
                 }
-            }
+            };
+            report.assertions.push(earl::Assertion {
+                test: test.iri.clone(),
+                outcome: verdict,
+                info,
+            });
+        }
+        for (iri, reason) in &manifest.untested {
+            println!("  untested {iri}: {reason}");
+            report.assertions.push(earl::Assertion {
+                test: iri.clone(),
+                outcome: earl::Outcome::Untested,
+                info: Some(reason.clone()),
+            });
         }
         println!("  {suite}: {passed} / {failed}");
     }
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    for (spec, report) in &reports {
+        let path = earl::write(&spec.replace("/rdf-", "-"), report);
+        println!("implementation report: {}", path.display());
+    }
+    let fixed: Vec<&&str> = expected
+        .keys()
+        .filter(|iri| !failed_iris.contains(**iri))
+        .collect();
+    assert!(
+        failures.is_empty() && fixed.is_empty(),
+        "new failures (fix, or list them with a reason in expected-failures.txt):\n{}\n\
+         listed but now passing (remove them from the list): {fixed:#?}",
+        failures.join("\n")
+    );
+}
+
+/// An implementation report gives each manifest entry exactly the outcome its run had, a test
+/// that didn't run `untested` with its reason; one with an entry missing or reported twice
+/// isn't written.
+#[test]
+fn an_implementation_report_has_one_result_per_entry() {
+    use earl::Outcome::{Failed, Passed, Untested};
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("earl-{}", std::process::id()));
+    let assertion = |test: &str, outcome, info: Option<&str>| earl::Assertion {
+        test: format!("http://e/{test}"),
+        outcome,
+        info: info.map(str::to_owned),
+    };
+    let report = |assertions, entries| earl::Report {
+        title: "a suite".to_owned(),
+        runner: "a runner",
+        suite: dir.clone(),
+        entries,
+        assertions,
+    };
+    let runs = vec![
+        assertion("pass", Passed, None),
+        assertion("fail", Failed, Some("listed: \"a reason\"\non two lines")),
+        assertion("skip", Untested, Some("its type isn't run")),
+    ];
+    let path = earl::write_to(&dir, "a-suite", &report(runs, 3));
+
+    let text = std::fs::read(&path).unwrap();
+    let quads: Vec<Quad> = RdfParser::from_format(RdfFormat::Turtle)
+        .with_base_iri("file:///a-suite.ttl")
+        .unwrap()
+        .for_slice(&text)
+        .collect::<Result<_, _>>()
+        .expect("the report is Turtle");
+    // The objects of `subject`'s `predicate`: IRIs and blank nodes as written, literals by value.
+    let objects = |subject: &str, predicate: &str| -> Vec<String> {
+        quads
+            .iter()
+            .filter(|q| q.subject.to_string() == subject && q.predicate.as_str() == predicate)
+            .map(|q| match &q.object {
+                Term::Literal(literal) => literal.value().to_owned(),
+                other => other.to_string(),
+            })
+            .collect()
+    };
+    let earl = |local: &str| format!("http://www.w3.org/ns/earl#{local}");
+    let mut read = Vec::new();
+    for (node, test) in objects_of(&quads, &earl("test")) {
+        let results = objects(&node, &earl("result"));
+        let [result] = &results[..] else {
+            panic!("{test}: not one result")
+        };
+        let outcomes = objects(result, &earl("outcome"));
+        let [outcome] = &outcomes[..] else {
+            panic!("{test}: not one outcome")
+        };
+        read.push((test, outcome.clone(), objects(result, &earl("info"))));
+    }
+    read.sort();
+    let row = |test: &str, outcome: &str, info: &[&str]| {
+        (
+            format!("<http://e/{test}>"),
+            format!("<{}>", earl(outcome)),
+            info.iter().map(|i| (*i).to_owned()).collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(
+        read,
+        vec![
+            row("fail", "failed", &["listed: \"a reason\"\non two lines"]),
+            row("pass", "passed", &[]),
+            row("skip", "untested", &["its type isn't run"]),
+        ]
+    );
+
+    for (assertions, entries) in [
+        (vec![assertion("pass", Passed, None)], 2),
+        (
+            vec![
+                assertion("pass", Passed, None),
+                assertion("pass", Failed, None),
+            ],
+            2,
+        ),
+    ] {
+        let written = std::panic::catch_unwind(|| {
+            earl::write_to(&dir, "refused", &report(assertions, entries))
+        });
+        assert!(written.is_err(), "{entries} entries: a report was written");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// `(assertion node, test)` for every statement with `predicate`.
+fn objects_of(quads: &[Quad], predicate: &str) -> Vec<(String, String)> {
+    quads
+        .iter()
+        .filter(|q| q.predicate.as_str() == predicate)
+        .map(|q| (q.subject.to_string(), q.object.to_string()))
+        .collect()
 }
 
 /// A negative test passes on a syntax error from both readers, and on nothing else: a
