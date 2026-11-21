@@ -5188,6 +5188,10 @@ fn eager_aggregation_answers_each_group_as_sparql() {
 /// - B's VALUES leave `?x` unbound, A binds 2 on one row and nothing on the other: SUM and
 ///   AVG unbound (an error beside a value), COUNT 1;
 /// - B binds 5 and 7 (the rewrite applies): as in the first.
+///
+/// And where `?x` is B's alone (the rewrite applies), AVG's partial count must count what B
+/// binds: B binds 5 and 7, as in the first; B leaves `?x` unbound under OPTIONAL in every
+/// row: SUM unbound, AVG "0"^^xsd:integer (no value: Count 0, §18.5.1.4), COUNT 0.
 #[test]
 fn eager_aggregation_refuses_a_variable_its_side_may_leave_unbound() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
@@ -5210,6 +5214,12 @@ fn eager_aggregation_refuses_a_variable_its_side_may_leave_unbound() {
         ("AVG", "UNDEF".to_owned()),
         ("COUNT", typed("1", "integer")),
     ];
+    let none = [
+        ("SUM", "UNDEF".to_owned()),
+        ("AVG", typed("0", "integer")),
+        ("COUNT", typed("0", "integer")),
+    ];
+    let own = "VALUES (?g ?s) { (1 10) (1 20) }";
     let variants = [
         (
             a,
@@ -5224,6 +5234,18 @@ fn eager_aggregation_refuses_a_variable_its_side_may_leave_unbound() {
             &mixed[..],
         ),
         (a, "{ VALUES (?s ?x) { (10 5) (20 7) } }", true, &bound[..]),
+        (
+            own,
+            "{ VALUES (?s ?x) { (10 5) (20 7) } }",
+            true,
+            &bound[..],
+        ),
+        (
+            own,
+            "{ VALUES ?s { 10 20 } OPTIONAL { VALUES (?s ?x) { (30 1) } } }",
+            true,
+            &none[..],
+        ),
     ];
     let never = |_: &nrese_sparql::plan::Plan, _: &[nrese_rdf::Variable]| false;
     for (a, b, rewritten, answers) in variants {
