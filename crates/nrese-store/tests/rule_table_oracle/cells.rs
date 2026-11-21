@@ -64,39 +64,119 @@ fn first_write_publishes_annotation_and_class_seeds() {
 
 #[test]
 fn deleting_assertions_keeps_the_seed_declarations() {
-    // Spec: reasoning-semantics.md, OWL 2 RL seeds are inferred and never retracted,
-    // so OWL 2 Profiles §4.3 cax-sco can use cls-thing during the same write.
-    let mut asserted = insert(ANNOTATION_AND_CLASS_DECLARATIONS);
-    asserted
-        .insert
-        .push(crate::triple(["xsd:integer", "rdf:type", "rdfs:Datatype"]));
-    let mut write = insert("owl:Class rdfs:subClassOf ex:Metaclass");
-    write.delete.clone_from(&asserted.insert);
-    let inferred = crate::triple(["owl:Thing", "rdf:type", "ex:Metaclass"]);
+    use nrese_reasoner::ReasoningMode::{Owl2Rl, RdfsFull};
+
+    // Spec: reasoning-semantics.md, program axioms remain in the closure after
+    // their asserted copies are deleted. OWL 2 Profiles §4.3 cax-sco can use
+    // cls-thing in that same write. RDF 1.1 Semantics §8.1.1 supplies the rdf:nil row.
+    let mut mixed_answers: Vec<_> = ANNOTATION_AND_CLASS_DECLARATIONS
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .chain(["xsd:integer rdf:type rdfs:Datatype"])
+        .collect();
+    let mixed_assertions = mixed_answers.join(" . ");
+    let mixed_update = format!(
+        "DELETE DATA {{ {mixed_assertions} }} ; INSERT DATA {{ owl:Class rdfs:subClassOf ex:Metaclass }}"
+    );
+    mixed_answers.push("owl:Thing rdf:type ex:Metaclass");
+    let class = "owl:Thing rdf:type owl:Class";
+    let removed_graph = "GRAPH ex:removed { owl:Thing rdf:type owl:Class }";
+    let cases = [
+        (
+            "mixed update",
+            Owl2Rl,
+            mixed_assertions.as_str(),
+            mixed_update.as_str(),
+            [12, 1],
+            mixed_answers.as_slice(),
+        ),
+        (
+            "delete only",
+            Owl2Rl,
+            class,
+            "DELETE DATA { owl:Thing rdf:type owl:Class }",
+            [1, 0],
+            &[class],
+        ),
+        (
+            "last named graph copy",
+            Owl2Rl,
+            removed_graph,
+            "DELETE DATA { GRAPH ex:removed { owl:Thing rdf:type owl:Class } }",
+            [1, 0],
+            &[class],
+        ),
+        (
+            "one of two graph copies",
+            Owl2Rl,
+            "owl:Thing rdf:type owl:Class .
+             GRAPH ex:removed { owl:Thing rdf:type owl:Class }",
+            "DELETE DATA { GRAPH ex:removed { owl:Thing rdf:type owl:Class } }",
+            [2, 1],
+            &[class],
+        ),
+        (
+            // With an inverse expression, deleting an ordinary data triple rebuilds
+            // the inferred stack in every equality mode.
+            "rebuild",
+            Owl2Rl,
+            "owl:Thing rdf:type owl:Class . _:inverse owl:inverseOf ex:p . ex:a ex:p ex:b",
+            "DELETE DATA { owl:Thing rdf:type owl:Class . ex:a ex:p ex:b }",
+            [3, 1],
+            &[class],
+        ),
+        (
+            "RDFS axiom",
+            RdfsFull,
+            "rdf:nil rdf:type rdf:List",
+            "DELETE DATA { rdf:nil rdf:type rdf:List }",
+            [1, 0],
+            &["rdf:nil rdf:type rdf:List"],
+        ),
+    ];
     let mut missing = Vec::new();
-    for &mode in judges::MODES {
-        let temp = tempfile::tempdir().expect("seed deletion store directory");
-        let open = || judges::open(mode, Some(temp.path()));
-        let mut check = |store: &nrese_store::StoreService, stage| {
-            assert_eq!(store.stats().expect("asserted count").quad_count, 1);
-            let (rows, _) = judges::rows(store);
-            for row in asserted.insert.iter().chain([&inferred]) {
-                if !rows.contains(row) {
-                    missing.push((mode, stage, row));
+    for (name, reasoning, asserted, update, [before, after], expected) in cases {
+        let setup = format!("INSERT DATA {{ {asserted} }}");
+        let expected = generator::rows(&expected.join("\n"));
+        for &mode in judges::MODES {
+            let temp = tempfile::tempdir().expect("seed deletion store directory");
+            let open = || judges::open(mode, Some(temp.path()));
+            let mut check = |store: &nrese_store::StoreService, stage| {
+                assert_eq!(
+                    store.stats().expect("asserted count").quad_count,
+                    after,
+                    "{name} {mode} {stage}"
+                );
+                let (rows, _) = judges::rows(store);
+                for row in &expected {
+                    if !rows.contains(row) {
+                        missing.push((name, mode, stage, row.clone()));
+                    }
                 }
+            };
+            {
+                let store = open();
+                let pipeline = judges::pipeline(&store, reasoning);
+                assert!(
+                    judges::apply_update(&pipeline, &setup),
+                    "{name} {mode} insert"
+                );
+                assert_eq!(
+                    store.stats().expect("asserted count").quad_count,
+                    before,
+                    "{name} {mode} before deletion"
+                );
+                assert!(
+                    judges::apply_update(&pipeline, update),
+                    "{name} {mode} delete"
+                );
+                check(&store, "warm");
             }
-        };
-        {
             let store = open();
-            let pipeline = judges::pipeline(&store, nrese_reasoner::ReasoningMode::Owl2Rl);
-            assert!(judges::apply(&pipeline, &asserted), "{mode} insert");
-            assert_eq!(store.stats().expect("asserted count").quad_count, 12);
-            assert!(judges::apply(&pipeline, &write), "{mode} mixed update");
-            check(&store, "warm");
+            let _pipeline = judges::pipeline(&store, reasoning);
+            check(&store, "reopened");
         }
-        let store = open();
-        let _pipeline = judges::pipeline(&store, nrese_reasoner::ReasoningMode::Owl2Rl);
-        check(&store, "reopened");
     }
     assert!(
         missing.is_empty(),
