@@ -128,9 +128,9 @@ impl GraphSet {
 
 /// The dataset a request reads by: the protocol's if there is one, else the query's own
 /// (`FROM`, `FROM NAMED`; for an update `USING`, `WITH`); `None` where that leaves the
-/// store's dataset as it is. [`ResolvedDataset::resolve`] and [`omits_store_default_graph`]
-/// both take it from here.
-fn effective(
+/// store's dataset as it is. [`ResolvedDataset::resolve`], [`omits_store_default_graph`] and
+/// the store's preparation of scoped inference all take it from here.
+pub fn effective(
     protocol: Option<&QueryDatasetSpecification>,
     own: Option<&QueryDataset>,
 ) -> Option<QueryDatasetSpecification> {
@@ -143,8 +143,8 @@ fn effective(
 /// Whether the dataset a request reads by ([`effective`]) leaves the store's default graph,
 /// where the inferred statements are kept, out of its default graph: names it neither by
 /// its own name nor by another store's ([`crate::compat`]), as [`ResolvedDataset::resolve`]
-/// reads them. A dataset with the scoped inferred layer has inferred statements of its own:
-/// never.
+/// reads them. A list of graphs with the scoped inferred layer has inferred statements of its
+/// own: never (`resolve` adds the layer to a list of graphs alone).
 pub fn omits_store_default_graph(
     protocol: Option<&QueryDatasetSpecification>,
     own: Option<&QueryDataset>,
@@ -152,9 +152,6 @@ pub fn omits_store_default_graph(
     let Some(specification) = effective(protocol, own) else {
         return false;
     };
-    if specification.scoped_inference {
-        return false;
-    }
     let names_it = |name: &GraphName| match name {
         GraphName::DefaultGraph => true,
         GraphName::NamedNode(n) => {
@@ -163,6 +160,7 @@ pub fn omits_store_default_graph(
         GraphName::BlankNode(_) => false,
     };
     match specification.default_graph_graphs() {
+        Some(_) if specification.scoped_inference => false,
         Some(graphs) => !graphs.iter().any(names_it),
         None => specification
             .excluded_default_graphs()

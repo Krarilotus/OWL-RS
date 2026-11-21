@@ -429,9 +429,15 @@ fn scoped_dataset(
     if request.read_model.unwrap_or_default() != ReadModel::Materialised {
         return Err(bad("inference-scope=dataset conflicts with infer=false"));
     }
-    let mut dataset = protocol_dataset(&request.default_graphs, &request.named_graphs)?
-        .or_else(|| query_dataset(query).take().map(Into::into))
-        .unwrap_or_default();
+    // The dataset the evaluator would read by: the protocol's, else the query's own, which
+    // then becomes this one.
+    let protocol = protocol_dataset(&request.default_graphs, &request.named_graphs)?;
+    let own = query_dataset(query);
+    let mut dataset =
+        nrese_sparql::dataset::effective(protocol.as_ref(), own.as_ref()).unwrap_or_default();
+    if protocol.is_none() {
+        *own = None;
+    }
     let defaults = dataset.default_graph_graphs().unwrap_or_default();
     if dataset.available_named_graphs().is_some_and(|named| {
         named
