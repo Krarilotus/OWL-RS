@@ -982,6 +982,91 @@ fn a_reinserted_triple_a_surviving_reification_names_is_told_as_a_fresh_read_tel
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// A store under `owl2-dl` with `base` committed and the consistency check off, so no check
+/// reads the data again: a commit's record is the one it carries over or reads.
+fn unchecked(base: &str) -> (Arc<StoreService>, crate::MutationPipeline) {
+    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    let config = crate::StoreConfig {
+        dl: crate::DlConfig {
+            consistency: crate::DlConsistency::Off,
+            ..crate::DlConfig::default()
+        },
+        ..crate::StoreConfig::in_memory()
+    };
+    let store = Arc::new(StoreService::new(config).unwrap());
+    let pipeline = crate::MutationPipeline::new(
+        Arc::clone(&store),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Dl,
+        ))),
+    );
+    commit(&pipeline, &format!("INSERT DATA {{ {base} }}"));
+    (store, pipeline)
+}
+
+/// Spec (the reader types an undeclared property by its uses, every statement of it counted:
+/// a data property while its values are literals only, `nrese_owl::mapping`): `:p` has an IRI
+/// value and, on the ontology's node, a literal one, so it is an object property (and, by the
+/// header statement, an annotation property: a name of two kinds), whose range is a class's
+/// complement. Deleting the IRI value leaves it a data property by the literal, whose range
+/// is then no data range, which the reader leaves out. With no consistency check reading the
+/// data again, the commit's record is what a fresh read of that data tells: the part left
+/// out. (A read inside the deleting transaction is told its base's record, which names the
+/// two kinds: a pending read takes a base's record that tells something whatever its
+/// changes, `reads_differently`.)
+#[test]
+fn a_deleted_value_that_typed_an_undeclared_property_is_told_as_a_fresh_read_tells_it() {
+    let (store, pipeline) = unchecked(&format!(
+        "{OFF_ROUTE}:p rdfs:range [ owl:complementOf :C ] . :s :p :o . \
+         :ont a owl:Ontology ; :p \"v\" . "
+    ));
+    let route = store.dl_bounds().last;
+    commit(&pipeline, "DELETE DATA { :s :p :o . }");
+    let snapshot = store.engine().snapshot();
+    let whole = read_ontology(&store, &snapshot).expect("the ontology");
+    let fresh = by_ontology(&snapshot, whole.value());
+    assert!(
+        fresh.as_ref().is_some_and(|f| f.contains("were left out")),
+        "setup: a fresh read tells {fresh:?}"
+    );
+    let told = reads_differently(&store, Revision::Committed(&snapshot));
+    assert_eq!(
+        first_named(&told),
+        first_named(&fresh),
+        "from {route}: the commit's record, and a fresh read"
+    );
+}
+
+/// Spec (*Mapping to RDF* Table 17: `owl:annotatedSource` is a reification's role, which the
+/// reader reads only as one; a statement of it between two names is no OWL 2 DL, and is left
+/// out): a store whose restriction on `owl:annotatedSource` the reader leaves out (a reserved
+/// name), then a commit of `:x owl:annotatedSource :y`, with no consistency check reading the
+/// data again. The commit's record is what a fresh read of that data tells: the parts it
+/// leaves out, the new statement among them (which part it names first follows the read's
+/// order, so it isn't compared).
+#[test]
+fn a_statement_of_a_reification_role_is_told_as_a_fresh_read_tells_it() {
+    let (store, pipeline) = unchecked(&format!(
+        "{OFF_ROUTE}:Pet rdfs:subClassOf [ a owl:Restriction ; \
+         owl:onProperty owl:annotatedSource ; owl:someValuesFrom :Dog ] . "
+    ));
+    let route = store.dl_bounds().last;
+    commit(&pipeline, "INSERT DATA { :x owl:annotatedSource :y . }");
+    let snapshot = store.engine().snapshot();
+    let whole = read_ontology(&store, &snapshot).expect("the ontology");
+    let fresh = by_ontology(&snapshot, whole.value());
+    assert!(
+        fresh.as_ref().is_some_and(|f| f.contains("were left out")),
+        "setup: a fresh read tells {fresh:?}"
+    );
+    let told = reads_differently(&store, Revision::Committed(&snapshot));
+    assert_eq!(
+        first_named(&told),
+        first_named(&fresh),
+        "from {route}: the commit's record, and a fresh read"
+    );
+}
+
 /// A revision with no record of what the reader left out (as a reopened store has none; a
 /// commit after a delta takes its base's). Committed reads at that revision (a plan, EXPLAIN,
 /// the inferred statements alone), one after another, are each told the same mark, the
@@ -1470,9 +1555,10 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
 /// vocabulary as an individual, a property's value of either kind, an equality), the mark a
 /// pending read is told is the mark it is told where it takes no record and reads its own
 /// ontology. Each store also has `:a :p :b`, sometimes with a reification of it, and besides a
-/// random transaction two fixed ones: one adding `:c a :A`, one deleting `:a :p :b`; the first
-/// store has nothing random, so each seed has a record taken over by an insert and by a
-/// delete. `NRESE_FUZZ_SEED` (default 0) varies them; each run prints, per kind of
+/// random transaction three fixed ones: one adding `:c a :A`, one deleting `:a :p :b`, one
+/// adding `:b owl:sameAs :c`; the first store has nothing random, so each seed has a record
+/// taken over by an insert and by a delete, and kept by the equality (whose read the indexes
+/// leave to the ontology). `NRESE_FUZZ_SEED` (default 0) varies them; each run prints, per kind of
 /// transaction, how many kept the record and how many of those the base's clean record
 /// answered, and how many deletions a reification kept from it.
 #[test]
@@ -1512,10 +1598,11 @@ fn a_kept_record_marks_a_pending_read_as_its_own_ontology_does() {
     let reification = "[ a owl:Axiom ; owl:annotatedSource :a ; owl:annotatedProperty :p ; \
                        owl:annotatedTarget :b ; rdfs:comment \"r\" ] . ";
     let member = Quad::new(ex("c"), rdf_type.clone(), ex("A"), GraphName::DefaultGraph);
-    const KINDS: [&str; 3] = ["random", "insert", "delete"];
+    let equal = Quad::new(ex("b"), same_as.clone(), ex("c"), GraphName::DefaultGraph);
+    const KINDS: [&str; 4] = ["random", "insert", "delete", "same-as"];
     let (mut wrong, mut refused, mut reified_kept_out) = (Vec::new(), 0, 0);
     // Per kind of transaction: how many kept the record, how many the clean record answered.
-    let (mut keeping, mut answered) = ([0usize; 3], [0usize; 3]);
+    let (mut keeping, mut answered) = ([0usize; 4], [0usize; 4]);
     for case in 0..CASES {
         let store = Arc::new(StoreService::new(crate::StoreConfig::in_memory()).unwrap());
         let pipeline = crate::MutationPipeline::new(
@@ -1578,9 +1665,13 @@ fn a_kept_record_marks_a_pending_read_as_its_own_ontology_does() {
                     tx.try_insert(member.as_ref()).unwrap();
                     added.push(member.to_string());
                 }
-                _ => {
+                2 => {
                     tx.remove(anchor.as_ref()).unwrap();
                     removed.push(anchor.to_string());
+                }
+                _ => {
+                    tx.try_insert(equal.as_ref()).unwrap();
+                    added.push(equal.to_string());
                 }
             }
             let pending = tx.pending_snapshot().unwrap();
@@ -1608,14 +1699,15 @@ fn a_kept_record_marks_a_pending_read_as_its_own_ontology_does() {
     }
     eprintln!(
         "NRESE_FUZZ_SEED={fuzz}: {CASES} stores, {refused} refused; kept the record (random, \
-         insert, delete): {keeping:?}; answered clean by it: {answered:?}; deletions of a \
-         reified triple that took no record: {reified_kept_out}"
+         insert, delete, same-as): {keeping:?}; answered clean by it: {answered:?}; deletions \
+         of a reified triple that took no record: {reified_kept_out}"
     );
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     assert!(refused * 4 < CASES, "{refused} of {CASES} stores refused");
     assert!(
-        answered[1] > 0 && answered[2] > 0,
-        "no insert or no delete took its base's clean record: {answered:?}"
+        answered[1] > 0 && answered[2] > 0 && keeping[3] > 0,
+        "no insert or no delete took its base's clean record, or no equality kept it: \
+         {keeping:?}, {answered:?}"
     );
 }
 
