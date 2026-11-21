@@ -1527,7 +1527,8 @@ mod tests {
             const { std::cell::Cell::new(false) };
         /// Taking back what a failed append wrote fails.
         pub(super) static FAIL_TAKE_BACK: std::cell::Cell<bool> =
-            const { std::cell::Cell::new(false) };        /// The process stops (exits with [`STOPPED`], nothing unwound) at this point of a
+            const { std::cell::Cell::new(false) };
+        /// The process stops (exits with [`STOPPED`], nothing unwound) at this point of a
         /// readmission.
         static STOP_AT: std::cell::Cell<Option<Stop>> = const { std::cell::Cell::new(None) };
     }
