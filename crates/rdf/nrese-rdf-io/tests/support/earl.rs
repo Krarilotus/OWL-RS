@@ -91,9 +91,11 @@ struct Subject {
 impl Subject {
     fn of_this_build() -> Self {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        // Tracked files only: the reports this run writes may land in the checkout, and
+        // scripts/w3c-reports.sh refuses untracked files before the build.
         let clean = git(
             manifest_dir,
-            &["status", "--porcelain", "--untracked-files=normal"],
+            &["status", "--porcelain", "--untracked-files=no"],
         )
         .map(|status| status.is_empty());
         Self {
@@ -156,8 +158,14 @@ fn git_head(dir: &Path) -> String {
 /// for) without changes to it.
 fn suite_commit(dir: &Path) -> String {
     let top = |d: &Path| git(d, &["rev-parse", "--show-toplevel"]);
-    let suite = git(dir, &["remote", "get-url", "origin"])
-        .is_some_and(|url| url.trim_end_matches(".git").ends_with("/w3c/rdf-tests"));
+    let suite = git(dir, &["remote", "get-url", "origin"]).is_some_and(|url| {
+        [
+            "https://github.com/w3c/rdf-tests",
+            "git@github.com:w3c/rdf-tests",
+            "ssh://git@github.com/w3c/rdf-tests",
+        ]
+        .contains(&url.trim_end_matches('/').trim_end_matches(".git"))
+    });
     let own = top(dir)
         .filter(|t| suite && Some(t) != top(Path::new(env!("CARGO_MANIFEST_DIR"))).as_ref());
     match own.and_then(|_| git(dir, &["status", "--porcelain", "--untracked-files=normal"])) {

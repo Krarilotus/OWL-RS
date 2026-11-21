@@ -17,11 +17,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: a release tag only
+        shell: bash
         run: |
-          case "$GITHUB_REF" in
-            refs/tags/v[0-9]*) ;;
-            *) echo "W3C reports are written at a release tag (v...), not at $GITHUB_REF" >&2; exit 1 ;;
-          esac
+          if [[ ! "$GITHUB_REF" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-pre\.[0-9]+)?$ ]]; then
+            echo "W3C reports are written at a release tag (v1.5.1, v1.5.1-pre.1), not at $GITHUB_REF" >&2
+            exit 1
+          fi
       - uses: actions/checkout@v4
       - name: toolchain version from rust-toolchain.toml
         run: echo "RUST_TOOLCHAIN=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_ENV"

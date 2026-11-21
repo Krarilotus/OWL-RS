@@ -47,6 +47,21 @@ def stands_before(row: str, count: int, words: set[str]) -> bool:
                for n, w in re.findall(r"(\d[\d,]*) (\S+)", text(row)))
 
 
+def row_errors(row: str, suite: str, suites: tuple[str, ...], want: dict) -> list[str]:
+    """What `row` gets wrong of `suite`'s counts (`want`, the gate's). A row that names others of
+    its kit's `suites` too says each count directly before a word only its own suite's name has."""
+    others = [s for s in suites if s != suite and names(row, s)]
+    words = set(suite.split()) - {w for s in others for w in s.split()}
+    errors = []
+    for key in ("passed", "skipped", "disputed"):
+        if count := want.get(key):
+            if others and not stands_before(row, count, words):
+                errors.append(f"{suite}: the gate requires {key} = {count}, before one of {sorted(words)}")
+            elif not others and count not in numbers(row):
+                errors.append(f"{suite}: the gate requires {key} = {count}; its row says {sorted(numbers(row))}")
+    return errors
+
+
 def runner_link(kit) -> str:
     """The page's link to a kit's runner: `../crates/…/<crate>/tests/<test>`."""
     found = sorted((ROOT / "crates").glob(f"**/{kit.crate}/tests/{kit.test}"))
@@ -68,18 +83,8 @@ class StandardsTable(unittest.TestCase):
             for suite in kit.suites:
                 own = [row for row in rows if f"]({link})" in row and names(row, suite)]
                 self.assertEqual(len(own), 1, f"{suite}: rows naming it and linking {link}: {own}")
-                # A row shared by several suites says each count before its own suite's name.
-                others = [s for s in kit.suites if s != suite and names(own[0], s)]
-                words = set(suite.split()) - {w for s in others for w in s.split()}
-                for key in ("passed", "skipped", "disputed"):
-                    if want := expected[suite].get(key):
-                        checked += 1
-                        if others:
-                            self.assertTrue(stands_before(own[0], want, words), f"{suite}: the gate "
-                                            f"requires {key} = {want}, before one of {sorted(words)}")
-                        else:
-                            self.assertIn(want, numbers(own[0]), f"{suite}: the gate requires {key} = "
-                                          f"{want}; its row says {sorted(numbers(own[0]))}")
+                self.assertEqual(row_errors(own[0], suite, kit.suites, expected[suite]), [])
+                checked += 1
         self.assertGreater(checked, 0)
 
     def test_a_row_reads_as_its_reader_sees_it(self):
@@ -89,12 +94,12 @@ class StandardsTable(unittest.TestCase):
         self.assertFalse(names(row, "SPARQL 1.1"))
 
     def test_a_shared_row_binds_each_count_to_its_suite(self):
+        suites = ("SHACL Core", "SHACL-SPARQL")
         row = "| SHACL Core and SHACL-SPARQL | x | 98 Core and 22 SHACL-SPARQL W3C tests |"
-        self.assertTrue(stands_before(row, 98, {"SHACL", "Core"}))
-        self.assertTrue(stands_before(row, 22, {"SHACL-SPARQL"}))
         swapped = "| SHACL Core and SHACL-SPARQL | x | 22 Core and 98 SHACL-SPARQL W3C tests |"
-        self.assertFalse(stands_before(swapped, 98, {"SHACL", "Core"}))
-        self.assertFalse(stands_before(swapped, 22, {"SHACL-SPARQL"}))
+        for suite, want in (("SHACL Core", {"passed": 98}), ("SHACL-SPARQL", {"passed": 22})):
+            self.assertEqual(row_errors(row, suite, suites, want), [])
+            self.assertEqual(len(row_errors(swapped, suite, suites, want)), 1, suite)
 
 
 if __name__ == "__main__":
