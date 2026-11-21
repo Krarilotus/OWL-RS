@@ -1040,19 +1040,24 @@ pub enum QuarantineCommitError {
         #[source]
         reason: io::Error,
         load: String,
+        /// The load's file under its listed name, as the store named it.
+        file: PathBuf,
     },
 }
 
 impl QuarantineCommitError {
     /// Tells the caller what happened when the load published no RDF changes; `retry_action`
     /// is how the caller sends it again, a verb whose `-ing` form is regular (`send`, `load`).
-    pub fn unpublished_message(&self, retry_action: &str) -> String {
+    /// The file the load's quarantine may have been kept as is named relative to the
+    /// server's data directory `data_dir` (without one, relative to the store's).
+    pub fn unpublished_message(&self, retry_action: &str, data_dir: Option<&Path>) -> String {
         let advice = match self {
             Self::NotListed(_) => {
                 format!("It's safe to {retry_action} it again once the cause is resolved.")
             }
-            Self::PossiblyListed { load, .. } => format!(
-                "This load's quarantine may have been kept as quarantine/load-{load}.jsonl in the server's data directory. If that file is there, don't {retry_action} it again. If it isn't, {retry_action}ing it again is safe."
+            Self::PossiblyListed { file, .. } => format!(
+                "This load's quarantine may have been kept as {} in the server's data directory. If that file is there, don't {retry_action} it again. If it isn't, {retry_action}ing it again is safe.",
+                kept_as(file, data_dir).display()
             ),
         };
         format!(
@@ -1070,6 +1075,18 @@ impl QuarantineCommitError {
             ),
         }
     }
+}
+
+/// `file`, a load's file, relative to the server's data directory `data_dir`: its path
+/// below it, or (without `data_dir`, or one it isn't below) its path in its store. Never
+/// a path on the server's file system as a whole.
+fn kept_as(file: &Path, data_dir: Option<&Path>) -> PathBuf {
+    data_dir
+        .and_then(|data_dir| file.strip_prefix(data_dir).ok())
+        .map_or_else(
+            || Path::new(DIR).join(file.file_name().unwrap_or_default()),
+            Path::to_path_buf,
+        )
 }
 
 /// The quarantine of one load: its statements go to a file named for the load until it
@@ -1241,6 +1258,7 @@ impl Collector<'_> {
                 return Err(QuarantineCommitError::PossiblyListed {
                     reason,
                     load: self.load.clone(),
+                    file: listed,
                 });
             }
         }

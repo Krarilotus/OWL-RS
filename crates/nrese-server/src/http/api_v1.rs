@@ -879,13 +879,14 @@ pub async fn import(
         return Ok(job.into_response());
     }
     let store = state.store();
+    let data_dir = state.repositories().data_dir().to_path_buf();
     let loaded = super::effect::untracked(move || {
         let _file = file;
         store.bulk_load(&request).map_err(|error| match error {
-            nrese_store::StoreError::LoadPublished { .. }
-            | nrese_store::StoreError::LoadQuarantineNotRecorded(_) => {
-                ApiError::internal(error.to_string())
+            nrese_store::StoreError::LoadQuarantineNotRecorded(error) => {
+                ApiError::internal(error.unpublished_message("send", Some(&data_dir)))
             }
+            nrese_store::StoreError::LoadPublished { .. } => ApiError::internal(error.to_string()),
             error if error.is_request_error() => ApiError::bad_request(error.to_string()),
             _ => super::effect::unknown(),
         })
@@ -970,8 +971,9 @@ fn start_import(
         }
         let outcome = loaded
             .map_err(|error| match error {
-                nrese_store::StoreError::LoadQuarantineNotRecorded(error) if !uploaded => {
-                    error.unpublished_message("load")
+                nrese_store::StoreError::LoadQuarantineNotRecorded(error) => {
+                    let retry = if uploaded { "send" } else { "load" };
+                    error.unpublished_message(retry, Some(state.repositories().data_dir()))
                 }
                 error => error.to_string(),
             })

@@ -97,7 +97,7 @@ pub enum StoreError {
         reason: crate::quarantine::QuarantineCommitError,
     },
     /// The quarantine record could not be kept and the load published no changes.
-    #[error("{}", .0.unpublished_message("send"))]
+    #[error("{}", .0.unpublished_message("send", None))]
     LoadQuarantineNotRecorded(#[source] crate::quarantine::QuarantineCommitError),
     /// A classification or realisation request gave up waiting for the computation under
     /// way for its revision, which runs on and is kept.

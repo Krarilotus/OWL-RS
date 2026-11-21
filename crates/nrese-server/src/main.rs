@@ -631,7 +631,8 @@ fn bulk_load(store: &StoreService, load: LoadCommand) -> Result<()> {
             reason.published_note()
         ),
         nrese_store::StoreError::LoadQuarantineNotRecorded(error) => {
-            anyhow::Error::msg(error.unpublished_message("load"))
+            let data_dir = &store.config().data_dir;
+            anyhow::Error::msg(error.unpublished_message("load", Some(data_dir)))
         }
         error => anyhow::Error::new(error).context("bulk load failed"),
     })?;

@@ -423,7 +423,7 @@ For a write answered with `500`, follow the response's `detail`.
 | `not run: nothing of this write was applied; send it again` | Send the write again. |
 | `nothing of this write was published` | The write can be sent again once the failure is resolved. |
 | `the load published nothing` with `It's safe to send it again once the cause is resolved` | Send the document again once the cause is resolved. |
-| `the load published nothing` with a quarantine that may have been kept as `quarantine/load-<id>.jsonl` | If that file is in the server's data directory, don't send the document again. If it isn't, sending it again is safe. |
+| `the load published nothing` with a quarantine that may have been kept as a file in the server's data directory (`quarantine/load-<id>.jsonl` for the default repository, `repositories/<repository>/quarantine/load-<id>.jsonl` for another) | If the file the detail names is there, don't send the document again. If it isn't, sending it again is safe. |
 | `whether it was applied is unknown: read the data before sending it again` | Check the data first. Send the write again only if it still needs to be applied. |
 
 If the detail names a published revision, do not send the upload again, even if quarantine recording or reasoning failed.
