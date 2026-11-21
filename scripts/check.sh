@@ -47,15 +47,17 @@
 #
 # Tests run under cargo-nextest (every test of every binary in parallel, with the features of
 # the crates the run selects): the fleet's gate jobs install the pinned one
-# (scripts/lib/gate-tools.txt; scripts/lib/gate-job.sh, scripts/lib/windows-job.sh) and give
-# no verdict without it. A local run without it uses cargo test, crate by crate. So the push
-# tier checks that each crate it tests compiles alone, with its own features (crates_alone).
+# (scripts/lib/gate-tools.txt; scripts/lib/gate-job.sh, scripts/lib/windows-job.sh), and the
+# Windows job gives no verdict without it (NRESE_NEXTEST_REQUIRED). A run without it elsewhere
+# uses cargo test, crate by crate. So the push tier checks that each crate it tests compiles
+# alone, with its own features (crates_alone).
 # Builds go through scripts/cargo-guarded.sh. Every step runs; the summary lists
 # each one's exit code.
 #
 # Exit: 0 passed, 1 failed; 75 no verdict: the fleet gave none (push, windows), or the PC's
 # guard held or stopped a build (scripts/cargo-guarded.sh's 75), which isn't the tree's
-# failure; 2 a usage error, or nothing to check.
+# failure; 2 a usage error, or nothing to check; 3 no verdict: a required cargo-nextest didn't
+# answer.
 #
 # The W3C suites run with their test data required (NRESE_W3C_REQUIRED=1, the data fetched
 # first by scripts/fetch-w3c-tests.sh): a suite without its data fails instead of passing by
@@ -81,7 +83,13 @@ step() {
   results+=("$code  $name ($((SECONDS - start)) s)")
   echo "=== $name: exit $code"
 }
-nextest() { cargo nextest --version > /dev/null 2>&1; }
+# Where the run's job requires it (NRESE_NEXTEST_REQUIRED, scripts/lib/windows-job.sh), a runner that
+# doesn't answer ends the run with 3, no verdict: never cargo test in its place.
+nextest() {
+  cargo nextest --version > /dev/null 2>&1 && return 0
+  [ -z "${NRESE_NEXTEST_REQUIRED:-}" ] || { echo "cargo-nextest is required here and doesn't answer: no verdict" >&2; exit 3; }
+  return 1
+}
 # Python under either name: Windows has `python`, some Linux hosts only `python3`. A missing
 # interpreter fails the gate; it must never shrink the gate to nothing.
 python() {
@@ -330,9 +338,12 @@ deny_version() {
 # tests run in one run with other crates' (nextest), which unifies features, so a crate that compiles
 # only because another turns a feature on would pass there and fail `cargo test -p` for its developer.
 crates_alone() {
-  local name code=0
+  local name code=0 got
   for name in "$@"; do
-    "$guarded" check --locked -p "$name" --lib --bins --tests || code=$?
+    "$guarded" check --locked -p "$name" --lib --bins --tests && continue
+    got=$?
+    # The guard's 75 (no verdict) stands over a later crate's failure, as in the summary.
+    [ $code -eq 75 ] || code=$got
   done
   return $code
 }
