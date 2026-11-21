@@ -15,6 +15,7 @@ fn describe(rule: &str) -> &'static str {
         "cax-adc" => "an instance of two classes of an owl:AllDisjointClasses axiom",
         "cls-com" => "an instance of a class and of its complement",
         "cls-nothing2" => "an instance of owl:Nothing",
+        "cls-thing-empty" => "owl:Thing is a subclass of owl:Nothing, so nothing can exist",
         "cls-maxc1" | "cls-maxqc1" | "cls-maxqc2" => "a maximum cardinality of 0 is exceeded",
         "prp-irp" => "an irreflexive property relates a resource to itself",
         "prp-asyp" => "an asymmetric property holds in both directions",
