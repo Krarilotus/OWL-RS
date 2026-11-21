@@ -242,6 +242,40 @@ fn keys_share_a_tail_and_still_require_their_own_class() {
 }
 
 #[test]
+fn key_membership_survives_the_rule_encoder_boundary() {
+    // Spec: Table 5 prp-key uses every common value in a nonempty key.
+    // The list length does not change the key's answer.
+    let watch = triple(["ex:a", "owl:sameAs", "ex:b"]);
+    for size in [0, 127, 128] {
+        let mut write = insert("ex:a rdf:type ex:K\nex:b rdf:type ex:K");
+        let head = if size == 0 { "rdf:nil" } else { "ex:c0" };
+        write.insert.push(triple(["ex:K", "owl:hasKey", head]));
+        for i in 0..size {
+            let cell = format!("ex:c{i}");
+            let member = format!("ex:p{i}");
+            let rest = if i + 1 == size {
+                "rdf:nil".into()
+            } else {
+                format!("ex:c{}", i + 1)
+            };
+            write.insert.push(triple([&cell, "rdf:first", &member]));
+            write.insert.push(triple([&cell, "rdf:rest", &rest]));
+            write.insert.push(triple(["ex:a", &member, "ex:value"]));
+            write.insert.push(triple(["ex:b", &member, "ex:value"]));
+        }
+        for &mode in judges::MODES {
+            let (store, accepted) = judges::first_and_rebuild(mode, &write.insert, true);
+            assert!(accepted, "{mode} with {size} members");
+            assert_eq!(
+                judges::ask(&store, &watch).0,
+                size != 0,
+                "{mode}, {size} members"
+            );
+        }
+    }
+}
+
+#[test]
 fn equating_two_chain_cells_matches_each_nonempty_walk() {
     // Spec: Table 4 eq-rep merges the list operands and rest links, so
     // Tables 3 and 5 match q1, q2, and q1 followed by q2.
@@ -292,6 +326,36 @@ fn an_equality_derived_inside_a_run_merges_per_cell_relations() {
         &[true; 2],
         &[false, true],
     );
+}
+
+#[test]
+fn a_derived_equality_can_collapse_sixty_five_firsts_in_one_load() {
+    // Spec: Table 5 prp-fp equates all firsts with p0. The p0 and q
+    // data satisfy prp-spo2 before and after the representative merge.
+    let mut setup = insert(
+        "
+        ex:out owl:propertyChainAxiom ex:h
+        ex:h rdf:rest ex:t
+        ex:t rdf:first ex:q
+        ex:t rdf:rest rdf:nil
+        ex:alias rdf:type owl:FunctionalProperty
+        ex:a ex:p0 ex:b
+        ex:b ex:q ex:c
+        ",
+    );
+    for i in 0..65 {
+        let member = format!("ex:p{i}");
+        setup.insert.push(triple(["ex:h", "rdf:first", &member]));
+        setup.insert.push(triple(["ex:group", "ex:alias", &member]));
+    }
+    // One functional subject equates all 65 operands. The all-identity view
+    // has over 64 walks even though the representative view keeps one.
+    let watch = triple(["ex:a", "ex:out", "ex:c"]);
+    for &mode in judges::MODES {
+        let (store, accepted) = judges::first_and_rebuild(mode, &setup.insert, true);
+        assert!(accepted, "{mode}");
+        assert!(judges::ask(&store, &watch).0, "{mode}: the composed row");
+    }
 }
 
 #[test]
