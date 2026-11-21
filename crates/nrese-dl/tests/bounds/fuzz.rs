@@ -287,6 +287,21 @@ fn facts_a_merge_rewrites_in_the_last_round_are_evaluated() {
     );
 }
 
+/// `NRESE_FUZZ_SEED=26163`, case 142 (a PR gate, 21 November 2026). Its smallest ontology,
+/// `C2 ≡ ∃p1.C1` and `a1 : ∃p1.(C2 ⊓ ⊥)`, has no model. L holds `a1 : C2`, soundly:
+/// `⊥ ⊑ C1` (scm-cls), so `C2 ⊓ ⊥ ⊑ C1` (scm-sco) and `∃p1.(C2 ⊓ ⊥) ⊑ ∃p1.C1` (scm-svf1),
+/// which is `C2`, and `a1` is in it (cax-sco); the rules derive no `owl:Nothing` member, so
+/// L has no violation. U1 gives `a1` a `p1`-successor, a Skolem constant in `C2` and not in
+/// `C1`, and marks `⊥` there by a clash: it lacks `a1 : C2`. An ontology with no model
+/// entails every statement, so L may exceed U1 there.
+#[test]
+fn l_beyond_u1_on_an_ontology_with_no_model_is_no_failure() {
+    let (mut tally, mut failures) = (Tally::default(), Vec::new());
+    check(26163, 142, &mut tally, &mut failures);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert_eq!(tally.clashes, 1, "a case whose U1 clashes: {tally:?}");
+}
+
 /// The fuzzed case `case` of `seed`: U1 checked as a model, against L and its violations;
 /// what it came to counted in `tally`, what failed pushed to `failures`.
 fn check(seed: u64, case: u64, tally: &mut Tally, failures: &mut Vec<String>) {
