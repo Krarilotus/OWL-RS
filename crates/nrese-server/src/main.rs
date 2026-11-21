@@ -605,6 +605,11 @@ fn bulk_load(store: &StoreService, load: LoadCommand) -> Result<()> {
     if std::env::var_os("NRESE_TEST_FAIL_QUARANTINE_COMMIT").is_some() {
         store.quarantine().fail_next_commit();
     }
+    // The load's quarantine file is placed and its directory's sync fails.
+    #[cfg(feature = "fault-points")]
+    if std::env::var_os("NRESE_TEST_FAIL_QUARANTINE_SYNC").is_some() {
+        store.quarantine().fail_next_placement_sync();
+    }
     // The load's quarantine file is placed, its directory's sync fails, and so does taking
     // the file back.
     #[cfg(feature = "fault-points")]

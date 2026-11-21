@@ -166,6 +166,46 @@ fn kept_quarantine_without_publication_says_when_to_load_again()
     Ok(())
 }
 
+/// A load that published, whose quarantine file was placed but not made durable: the error
+/// names the load whose records stay listed, the one whose file the store kept.
+#[cfg(feature = "fault-points")]
+#[test]
+fn published_load_names_its_kept_quarantine() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("mixed.nt");
+    std::fs::write(
+        &file,
+        "<urn:a> <urn:p> \"one\" .\nthis is not a statement\n",
+    )?;
+    let data = dir.path().join("data");
+    let mut command = nrese(dir.path(), &data);
+    command
+        .env("NRESE_TEST_FAIL_QUARANTINE_SYNC", "1")
+        .arg("load")
+        .arg(&file);
+    let output = run(&mut command)?;
+    let kept = std::fs::read_dir(data.join("quarantine"))?
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let loads = kept
+        .iter()
+        .filter_map(|name| name.strip_prefix("load-")?.strip_suffix(".jsonl"))
+        .collect::<Vec<_>>();
+    let [load] = loads[..] else {
+        panic!("{kept:?}\n{}", output.stderr);
+    };
+    let detail = format!(
+        "Error: the load completed at published revision 1. Its quarantine record couldn't be kept: the quarantine's directory sync failed (a test's). This load's records are listed under load ID {load}, but a power loss may lose them. Don't load it again."
+    );
+    assert!(
+        output.stderr.lines().any(|line| line == detail),
+        "{}",
+        output.stderr
+    );
+    assert!(!output.status.success(), "{}", output.status);
+    Ok(())
+}
+
 /// `query --format json`: standard output is one SPARQL 1.1 JSON results document (`ASK {}`
 /// is true), nothing before or after it; the INFO lines are on standard error.
 #[test]

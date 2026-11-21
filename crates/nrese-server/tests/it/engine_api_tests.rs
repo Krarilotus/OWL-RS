@@ -1104,6 +1104,53 @@ async fn kept_quarantine_without_publication_says_when_to_send_again() {
     );
 }
 
+/// An upload that published nothing, whose quarantine file may have been kept: the answer
+/// names that file relative to the server's data directory, and it is where the store kept
+/// the load's records, for the default repository and for another one.
+#[tokio::test]
+async fn kept_quarantine_answer_names_the_file_the_store_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = crate::support::test_state_with_store_config(
+        StoreConfig::on_disk(dir.path()),
+        PolicyConfig::default(),
+        ReasonerConfig::default(),
+    )
+    .unwrap();
+    let app = nrese_server::build_app(state.clone());
+    let json = Some("application/json");
+    let (status, text) = send(&app, Method::PUT, "/api/v1/repositories/r2", json, "{}").await;
+    assert_eq!(status, StatusCode::CREATED, "{text}");
+    for id in ["nrese", "r2"] {
+        let repository = state.repositories().get(id).expect(id);
+        let store = std::sync::Arc::clone(repository.observe().1.store());
+        store.quarantine().fail_next_placement_sync();
+        store.quarantine().fail_next_record_removal();
+        let (status, body) = send(
+            &app,
+            Method::POST,
+            &format!("/api/v1/repositories/{id}/import"),
+            Some("application/n-triples"),
+            INVALID_UPLOAD,
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{id}: {body}");
+        let problem: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let detail = problem["detail"].as_str().expect(&body);
+        let named = detail
+            .split_once("kept as ")
+            .and_then(|(_, rest)| rest.split_once(" in the server's data directory"))
+            .map(|(file, _)| std::path::Path::new(file))
+            .expect(detail);
+        let kept = std::fs::read_to_string(dir.path().join(named)).unwrap_or_default();
+        let record: serde_json::Value =
+            serde_json::from_str(kept.lines().next().unwrap_or("null")).unwrap();
+        assert!(
+            named.is_relative() && record["load"] == listed_load(&store),
+            "{id}: {detail}"
+        );
+    }
+}
+
 /// An import job that published, whose quarantine file was placed but not made durable:
 /// done, its warning naming the load whose record stays listed.
 #[tokio::test]

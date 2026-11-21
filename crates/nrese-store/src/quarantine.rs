@@ -248,6 +248,13 @@ pub struct Quarantine {
 struct PlacementFaults {
     /// The rename moves the file, then reports an error.
     rename: std::sync::atomic::AtomicBool,
+    /// The rename reports an error without moving the file.
+    unmoved_rename: std::sync::atomic::AtomicBool,
+    /// The check whether a failed rename moved the file fails.
+    existence: std::sync::atomic::AtomicBool,
+    /// Where a commit whose placement failed waits twice, holding the state lock: once to say
+    /// it is there, once to go on.
+    pause: Mutex<Option<std::sync::Arc<std::sync::Barrier>>>,
     /// The directory's sync after the rename.
     sync: std::sync::atomic::AtomicBool,
     /// The removal of a file placed but not made durable.
@@ -383,6 +390,29 @@ impl Quarantine {
     #[cfg(any(test, feature = "fault-points"))]
     pub fn fail_next_rename_after_moving(&self) {
         self.placement_faults.rename.store(true, Ordering::Relaxed);
+    }
+
+    /// Test hook: the next rename of a load's file into place fails without moving it, and the
+    /// check whether it moved the file fails too.
+    #[cfg(any(test, feature = "fault-points"))]
+    pub fn fail_next_rename_and_existence_check(&self) {
+        self.placement_faults
+            .unmoved_rename
+            .store(true, Ordering::Relaxed);
+        self.placement_faults
+            .existence
+            .store(true, Ordering::Relaxed);
+    }
+
+    /// Test hook: the next commit whose placement fails waits at `pause` twice, holding the
+    /// state lock, between placing its file and taking it back or keeping it.
+    #[cfg(any(test, feature = "fault-points"))]
+    pub fn pause_next_placement_failure(&self, pause: std::sync::Arc<std::sync::Barrier>) {
+        *self
+            .placement_faults
+            .pause
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(pause);
     }
 
     /// Test hook: the next sync of the directory after a load's file is renamed into it fails.
@@ -1191,12 +1221,14 @@ impl Collector<'_> {
             let placed = match self.rename_into_place(partial, &listed) {
                 // A rename that reports an error may have moved the file anyway (Windows'
                 // write-through move): listed, it is a placement not made durable.
-                Err(error) if matches!(listed.try_exists(), Ok(false)) => {
+                Err(error) if matches!(self.listed_exists(&listed), Ok(false)) => {
                     return Err(error.into());
                 }
                 placed => placed.and_then(|()| self.sync_placement(dir)),
             };
             if let Err(reason) = placed {
+                #[cfg(any(test, feature = "fault-points"))]
+                self.pause_at_placement_failure();
                 let withdrawal = match published {
                     true => Withdrawal::Kept,
                     false => self.withdraw(&listed, dir),
@@ -1244,6 +1276,15 @@ impl Collector<'_> {
 
     /// Moves the load's file `partial` to its listed name `listed`.
     fn rename_into_place(&self, partial: &Path, listed: &Path) -> io::Result<()> {
+        #[cfg(any(test, feature = "fault-points"))]
+        if self
+            .quarantine
+            .placement_faults
+            .unmoved_rename
+            .swap(false, Ordering::Relaxed)
+        {
+            return Err(io::Error::other("the rename failed (a test's)"));
+        }
         nrese_engine::place::rename(partial, listed)?;
         #[cfg(any(test, feature = "fault-points"))]
         if self
@@ -1257,6 +1298,38 @@ impl Collector<'_> {
             ));
         }
         Ok(())
+    }
+
+    /// Whether the load's file is under its listed name `listed`.
+    fn listed_exists(&self, listed: &Path) -> io::Result<bool> {
+        #[cfg(any(test, feature = "fault-points"))]
+        if self
+            .quarantine
+            .placement_faults
+            .existence
+            .swap(false, Ordering::Relaxed)
+        {
+            return Err(io::Error::other(
+                "looking for the load's file failed (a test's)",
+            ));
+        }
+        listed.try_exists()
+    }
+
+    /// Waits where [`Quarantine::pause_next_placement_failure`] set a pause, if it did.
+    #[cfg(any(test, feature = "fault-points"))]
+    fn pause_at_placement_failure(&self) {
+        let pause = self
+            .quarantine
+            .placement_faults
+            .pause
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(pause) = pause {
+            pause.wait();
+            pause.wait();
+        }
     }
 
     /// Makes the load's file, just renamed into `dir`, durably named.
@@ -2015,6 +2088,81 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A rename that fails without moving the file, after which looking for the file fails:
+    /// a load that published neither counts its records nor says they are listed, since the
+    /// file was never seen under its name.
+    #[test]
+    fn records_never_seen_under_their_name_are_not_counted_or_called_listed() {
+        let run = FailedCommit::run(MIXED_LOAD, |quarantine, _| {
+            quarantine.fail_next_rename_and_existence_check();
+        });
+
+        let Err(StoreError::LoadPublished {
+            revision,
+            reason: QuarantineCommitError::PossiblyListed { load, .. },
+        }) = &run.result
+        else {
+            panic!("{:?}", run.result);
+        };
+        assert_eq!(run.listed(), run.before);
+        assert_eq!(run.store.quarantine().open_count(), run.open);
+        assert_eq!(
+            run.message(),
+            format!(
+                "the load completed at published revision {revision}. Its quarantine record couldn't be kept: the rename failed (a test's). This load's records may be listed under load ID {load}. Don't send it again."
+            )
+        );
+    }
+
+    /// A commit holds the state lock from placing its file to taking it back, and a listing
+    /// reads the directory under it: a listing taken while a commit is between the two waits
+    /// for it, and never shows the file taken back.
+    #[test]
+    fn a_listing_waits_for_a_commit_taking_its_file_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("store");
+        quarantined(&store_dir, dir.path());
+        let store = crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
+        let quarantine = store.quarantine();
+        let before = quarantine.list(&QuarantineFilter::default()).unwrap();
+        let file = dir.path().join("load.nt");
+        fs::write(&file, INVALID_LOAD).unwrap();
+        let pause = std::sync::Arc::new(std::sync::Barrier::new(2));
+        quarantine.fail_next_placement_sync();
+        quarantine.pause_next_placement_failure(std::sync::Arc::clone(&pause));
+
+        let (load, during, listed) = std::thread::scope(|scope| {
+            let load = scope.spawn(|| {
+                store.bulk_load(&crate::BulkLoadRequest {
+                    files: vec![file],
+                    replace: false,
+                    graph: crate::GraphTarget::DefaultGraph,
+                    invalid: None,
+                })
+            });
+            // The commit has placed its file and waits, holding the state lock.
+            pause.wait();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                let _ = sender.send(quarantine.list(&QuarantineFilter::default()).unwrap());
+            });
+            let during = receiver.recv_timeout(std::time::Duration::from_millis(500));
+            pause.wait();
+            let listed = match &during {
+                Ok(listed) => listed.clone(),
+                Err(_) => receiver.recv().unwrap(),
+            };
+            (load.join().unwrap(), during, listed)
+        });
+
+        assert!(load.is_err(), "{load:?}");
+        assert!(
+            during.is_err(),
+            "listed while the commit held its file: {during:#?}"
+        );
+        assert_eq!(listed, before);
     }
 
     /// The log a start reads is the one a power loss keeps: a start that
