@@ -1,6 +1,7 @@
 """The standards table of docs/what-it-covers.md says the counts the release gate requires
-(benches/fast/w3c-expected.toml): each suite's expected passes, and its known skips and
-disputes, stand in the row that names the suite in its first column and links its kit's runner.
+(benches/fast/w3c-expected.toml): each suite's expected passes or checks, and its known skips,
+disputes and listed failures, stand in the one row that names the suite (in its first or its tests
+column) and links its kit's runner.
 A count changed on one side only, or moved to another suite's row, fails here.
 
     python -m unittest discover benches/suite/tests
@@ -37,28 +38,48 @@ def numbers(row: str) -> set[int]:
 
 
 def names(row: str, suite: str) -> bool:
-    """Whether `row`'s first column names `suite`."""
-    return suite in text(row.split("|")[1])
+    """Whether `row` names `suite` in its first column (the standard) or its last (the tests)."""
+    cells = row.split("|")[1:-1]
+    return suite in text(cells[0]) or suite in text(cells[-1])
 
 
-def stands_before(row: str, count: int, words: set[str]) -> bool:
-    """Whether `count` stands in `row` directly before one of `words` (`98 Core`)."""
-    return any(int(n.replace(",", "")) == count and w.strip(",.;:()") in words
-               for n, w in re.findall(r"(\d[\d,]*) (\S+)", text(row)))
+def stands_before(row: str, count: int, words: set[str], stops: set[int]) -> bool:
+    """Whether `count` stands in `row` before one of `words`, in the phrase that follows it up to
+    the next of `stops` (`98 Core and 22 …`, `403 ontologies in the OWL 2 RDF/XML round trip, 295 …`)."""
+    tokens = text(row).split()
+    number = lambda token: int(token.replace(",", "")) if re.fullmatch(r"\d[\d,]*", token) else None  # noqa: E731
+    for i, token in enumerate(tokens):
+        if number(token) != count:
+            continue
+        phrase = []
+        for word in tokens[i + 1:]:
+            if number(word) in stops:
+                break
+            phrase.append(word.strip(",.;:()"))
+        if words & set(phrase):
+            return True
+    return False
 
 
-def row_errors(row: str, suite: str, suites: tuple[str, ...], want: dict) -> list[str]:
-    """What `row` gets wrong of `suite`'s counts (`want`, the gate's). A row that names others of
-    its kit's `suites` too says each count directly before a word only its own suite's name has."""
+# The gate's counts a row states: its passes or checks, and its known skips, disputes and listed failures.
+KEYS = ("passed", "checked", "skipped", "disputed", "known")
+
+
+def row_errors(row: str, suite: str, suites: tuple[str, ...], expected: dict) -> list[str]:
+    """What `row` gets wrong of `suite`'s counts (`expected`, the gate's, by suite). A row that names
+    others of its kit's `suites` too says each count before a word only its own suite's name has."""
     others = [s for s in suites if s != suite and names(row, s)]
     words = set(suite.split()) - {w for s in others for w in s.split()}
-    errors = []
-    for key in ("passed", "skipped", "disputed"):
-        if count := want.get(key):
-            if others and not stands_before(row, count, words):
-                errors.append(f"{suite}: the gate requires {key} = {count}, before one of {sorted(words)}")
-            elif not others and count not in numbers(row):
-                errors.append(f"{suite}: the gate requires {key} = {count}; its row says {sorted(numbers(row))}")
+    stops = {expected.get(s, {}).get(key) for s in others for key in KEYS} - {None, 0}
+    want = expected.get(suite, {})
+    stated = [key for key in KEYS if want.get(key)]
+    errors = [] if stated else [f"{suite}: the gate states no count for its row ({', '.join(KEYS)})"]
+    for key in stated:
+        count = want[key]
+        if others and not stands_before(row, count, words, stops):
+            errors.append(f"{suite}: the gate requires {key} = {count}, before one of {sorted(words)}")
+        elif not others and count not in numbers(row):
+            errors.append(f"{suite}: the gate requires {key} = {count}; its row says {sorted(numbers(row))}")
     return errors
 
 
@@ -83,7 +104,7 @@ class StandardsTable(unittest.TestCase):
             for suite in kit.suites:
                 own = [row for row in rows if f"]({link})" in row and names(row, suite)]
                 self.assertEqual(len(own), 1, f"{suite}: rows naming it and linking {link}: {own}")
-                self.assertEqual(row_errors(own[0], suite, kit.suites, expected[suite]), [])
+                self.assertEqual(row_errors(own[0], suite, kit.suites, expected), [])
                 checked += 1
         self.assertGreater(checked, 0)
 
@@ -94,12 +115,25 @@ class StandardsTable(unittest.TestCase):
         self.assertFalse(names(row, "SPARQL 1.1"))
 
     def test_a_shared_row_binds_each_count_to_its_suite(self):
-        suites = ("SHACL Core", "SHACL-SPARQL")
+        expected = {"SHACL Core": {"passed": 98}, "SHACL-SPARQL": {"passed": 22}}
         row = "| SHACL Core and SHACL-SPARQL | x | 98 Core and 22 SHACL-SPARQL W3C tests |"
         swapped = "| SHACL Core and SHACL-SPARQL | x | 22 Core and 98 SHACL-SPARQL W3C tests |"
-        for suite, want in (("SHACL Core", {"passed": 98}), ("SHACL-SPARQL", {"passed": 22})):
-            self.assertEqual(row_errors(row, suite, suites, want), [])
-            self.assertEqual(len(row_errors(swapped, suite, suites, want)), 1, suite)
+        for suite in expected:
+            self.assertEqual(row_errors(row, suite, tuple(expected), expected), [])
+            self.assertEqual(len(row_errors(swapped, suite, tuple(expected), expected)), 1, suite)
+        # A suite's name after its count may hold a number (`OWL 2`, `RDF 1.1`): its phrase runs to
+        # the next count the gate states for the row.
+        expected = {"RDF 1.1 syntax": {"passed": 993}, "RDF 1.2 syntax": {"passed": 351}}
+        row = "| Turtle | x | 993 RDF 1.1 syntax and 351 RDF 1.2 syntax tests |"
+        swapped = "| Turtle | x | 351 RDF 1.1 syntax and 993 RDF 1.2 syntax tests |"
+        for suite in expected:
+            self.assertEqual(row_errors(row, suite, tuple(expected), expected), [])
+            self.assertEqual(len(row_errors(swapped, suite, tuple(expected), expected)), 1, suite)
+
+    def test_a_suite_with_no_stated_count_is_no_check(self):
+        row = "| SPARQL 1.1 | x | 531 tests |"
+        self.assertEqual(row_errors(row, "SPARQL 1.1", ("SPARQL 1.1",), {"SPARQL 1.1": {"passed": 531}}), [])
+        self.assertEqual(len(row_errors(row, "SPARQL 1.1", ("SPARQL 1.1",), {"SPARQL 1.1": {}})), 1)
 
 
 if __name__ == "__main__":

@@ -1912,6 +1912,65 @@ class Parts(unittest.TestCase):
             counts["OWL 2 RL"]["skipped"] = 89
             self.assertIn("OWL 2 RL: 89 skipped, at most 3 known", gate_module.w3c_check(counts, expected))
 
+    def test_every_runners_summary_lines_are_counted(self):
+        """Each W3C runner's own summary lines, as they print them, give its suite's counts; per-manifest
+        lines are summed under the suite, and a runner's listed failures are `known`, apart from `failed`."""
+        log = "\n".join([
+            "W3C OWL 2 QL test cases (Direct Semantics): 120 passed, 9 failed (9 expected), 4 skipped; 30 conclusions "
+            "asked as queries, 2 through anonymous individuals",
+            "W3C RDF syntax suites: passed / failed",
+            "  untested http://x/y: the test type rdft:X is not run by this runner",
+            "  rdf11/rdf-turtle: 290 / 1",
+            "  rdf11/rdf-xml: 160 / 0",
+            "  rdf12/rdf-turtle/syntax: 80 / 0",
+            "W3C JSON-LD 1.1 suites: passed / failed / not run",
+            "  toRdf-manifest.jsonld: 400 / 0 / 50",
+            "  expand-manifest.jsonld: 350 / 0 / 20",
+            "W3C RDFC-1.0: 82 of 82 passed",
+            "W3C N3 parser suites: passed / failed (expected failures)",
+            "  manifest-parser.ttl: 300 / 1 (1)",
+            "  manifest-extended.ttl: 200 / 0 (0)",
+            "N3 reasoner tests: 90 in scope, 90 passed; 30 out of scope:",
+            "   12  builtins not supported",
+            "sparql10 PositiveQuery: 300/300",
+            "sparql11 NegativeUpdate: 40/41",
+            "400 ontologies of species DL checked",
+            "280 test cases compared",
+            "75 ontologies in both syntaxes compared, 900 axioms",
+        ])
+        counts = gate_module.log_counts(log)
+        self.assertEqual(counts["OWL 2 QL"], {"passed": 120, "failed": 0, "known": 9, "skipped": 4})
+        self.assertEqual(counts["RDF 1.1 syntax"], {"passed": 450, "known": 1})
+        self.assertEqual(counts["RDF 1.2 syntax"], {"passed": 80, "known": 0})
+        self.assertEqual(counts["JSON-LD 1.1"], {"passed": 750, "failed": 0, "skipped": 70})
+        self.assertEqual(counts["RDFC-1.0"], {"passed": 82, "failed": 0})
+        self.assertEqual(counts["N3 parser"], {"passed": 500, "failed": 0, "known": 1})
+        self.assertEqual(counts["N3 reasoner"], {"passed": 90, "failed": 0, "skipped": 30})
+        self.assertEqual(counts["SPARQL syntax"], {"passed": 340, "known": 1})
+        self.assertEqual(counts["OWL 2 RDF/XML round trip"], {"checked": 400})
+        self.assertEqual(counts["OWL 2 profiles"], {"checked": 280})
+        self.assertEqual(counts["OWL 2 functional syntax"], {"checked": 75})
+        # A per-manifest line counts only under its runner's own heading.
+        self.assertNotIn("RDF 1.1 syntax", gate_module.log_counts("  rdf11/rdf-turtle: 290 / 1\n"))
+
+    def test_listed_failures_are_counted_exactly_and_checks_at_least(self):
+        """A list that grows or shrinks fails until w3c-expected.toml states the new count; a runner that
+        counts what it checked must check at least its stated number."""
+        expected = {"OWL 2 QL": {"passed": 120, "known": 9}, "OWL 2 profiles": {"checked": 280}}
+        counts = {"OWL 2 QL": {"passed": 120, "failed": 0, "known": 9}, "OWL 2 profiles": {"checked": 280}}
+        self.assertEqual(gate_module.w3c_check(counts, expected), [])
+        for known in (7, 11):
+            counts["OWL 2 QL"]["known"] = known
+            self.assertEqual(gate_module.w3c_check(counts, expected), [
+                f"OWL 2 QL: {known} listed failures, 9 stated (w3c-expected.toml changes with the list)"])
+        counts["OWL 2 QL"]["known"] = 9
+        counts["OWL 2 profiles"]["checked"] = 279
+        self.assertEqual(gate_module.w3c_check(counts, expected),
+                         ["OWL 2 profiles: 279 checked, at least 280 required"])
+        # A suite that states neither a pass nor a check count is refused when the file is read.
+        _, _, bad = gate_module.load_w3c_expected('[kit."a:b"]\nsuites = ["S"]\n[suite."S"]\nskipped = 1\n')
+        self.assertEqual(bad, ["S: no passed or checked count"])
+
     def test_the_jobs_run_the_whole_gate_in_blocks_asking_by_capability_one_set(self):
         """The gate asks by capability, never a host, and goes as one set.
         Each timed part builds every side where it times them (its own first step: no binaries
