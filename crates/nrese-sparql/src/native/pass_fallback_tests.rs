@@ -115,7 +115,8 @@ fn a_pass_that_does_not_fit_leaves_the_answer_to_the_per_column_route() {
                 _ => false,
             })
     };
-    let cases: [(String, usize, &dyn Fn(&[(i64, Option<Term>)]) -> bool); 4] = [
+    type Case<'a> = (String, usize, &'a dyn Fn(&[(i64, Option<Term>)]) -> bool);
+    let cases: [Case<'_>; 4] = [
         (
             grouped(&wide(), "(SUM(IF(?v = 0, \"bad\", ?v)) AS ?t)"),
             1_060_000,
