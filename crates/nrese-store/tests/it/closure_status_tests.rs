@@ -1633,8 +1633,8 @@ fn owl2_rl_reads_only_the_mappings_spelling_of_a_max_cardinality() {
 /// `owl:OntologyProperty` has them in the `owl2-rl` and `rdfs` closures, the rewriting on or
 /// off. Under `owl2-ql` (Direct Semantics) the OWL 2 mapping reads that property as an
 /// annotation property (Mapping to RDF §3.1.2, Table 6), and annotations "have no semantic
-/// meaning in OWL 2" (Direct Semantics §1): its domain and range type nothing there, the
-/// rewriting on or off.
+/// meaning in OWL 2" (Direct Semantics §1): its domain and range type nothing there, and its
+/// super-property gets none of its statements, the rewriting on or off.
 #[test]
 fn the_rule_sets_read_an_ontology_propertys_schema() {
     let data = ":note a owl:OntologyProperty ; rdfs:domain :C ; rdfs:range :D ; \
@@ -1653,7 +1653,7 @@ fn the_rule_sets_read_an_ontology_propertys_schema() {
     }
     for ql in [QlRewritingMode::Auto, QlRewritingMode::Off] {
         let store = closure(data, Ruleset::Owl2Ql, ql);
-        for question in ["ASK { :x a :C }", "ASK { :v a :D }"] {
+        for question in ["ASK { :x a :C }", "ASK { :v a :D }", "ASK { :x :q :v }"] {
             let (text, status) = answer(&store, question);
             if !text.contains("false") {
                 wrong.push(format!("owl2-ql {ql:?}, {question}: {text} {status:?}"));

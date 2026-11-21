@@ -141,6 +141,10 @@ impl AnnotationIds {
     pub fn contains(&self, id: u64) -> bool {
         self.0.binary_search(&id).is_ok()
     }
+
+    pub fn ids(&self) -> &[u64] {
+        &self.0
+    }
 }
 
 /// The `owl:sameAs` classes a run over representatives has so far, shared by its rules'

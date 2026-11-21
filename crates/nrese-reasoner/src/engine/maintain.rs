@@ -15,7 +15,7 @@ use rayon::prelude::*;
 use super::{Program, encode, pattern, storable, triple};
 use crate::delta::{self, Base, MemoryBase, VisitsBase};
 use crate::eval::{GroundProgram, OperationStop, Poller, Probe, Stopped, Visit};
-use crate::ir::{Triple, Violations};
+use crate::ir::{AnnotationIds, Triple, Violations};
 use crate::lists::ListDiagnostic;
 
 /// A transaction's state as the delta executor reads it: the committed indexes (asserted
@@ -353,20 +353,30 @@ pub fn maintain_with(
         )?);
     }
     // The annotation properties the rules read, where they do: the state's before the
-    // change, which a change that declares or retracts one doesn't keep (it is rebuilt,
-    // `redeclared` below); a first load's, the state's after it.
-    let annotated = match first_load {
-        true => program.rules_for(&tx.pending_snapshot()),
-        false => program.rules_for(tx.base()),
+    // change (a first load's, after it). The reader reads asserted declarations only, so a
+    // change after which it reads others asserts or retracts one, whether or not its
+    // statement was inferred: that changes what the rules read throughout the closure, so
+    // the change is rebuilt (`redeclared`).
+    let read_before = match first_load {
+        true => program.annotation_ids(&tx.pending_snapshot()),
+        false => program.annotation_ids(tx.base()),
     };
+    let declares = |q| (program.annotations.as_ref()).is_some_and(|a| a.declares(triple(q)));
+    let read_after = match !first_load && tx.inserted().chain(tx.deleted()).any(declares) {
+        true => program.annotation_ids(&tx.pending_snapshot()),
+        false => read_before.clone(),
+    };
+    let redeclared = read_after != read_before;
+    let annotated = program.rules_with(read_before.as_ref());
     let rules = delta::Rules {
         rules: &annotated,
         schema: &schema,
         ..program.rules()
     };
     let unkept: bool;
-    let redeclared: bool;
     let delta_ran: bool;
+    // A redeclaring change's facts new to the state, for its judgement after the rebuild.
+    let mut new_to_state: Vec<Triple> = Vec::new();
     let deletes: bool;
     let update = {
         let mut base = EngineBase::new(tx, &program.axioms);
@@ -434,11 +444,6 @@ pub fn maintain_with(
         // Facts with an inverse expression as their predicate: the stored closure lacks the
         // base's, so a delta can't read them. Such a change runs its delta, whose consistency
         // check stands, and is then rebuilt: the closure after it is the one a rebuild gives.
-        // A change that declares an annotation property the rules read, or retracts its
-        // declaration (new to the state, or no longer asserted), changes what they read
-        // throughout the closure: it is rebuilt, and judged by the rebuild's report.
-        let declares = |f: &Triple| program.annotations.as_ref().is_some_and(|a| a.declares(*f));
-        redeclared = !first_load && inserted.iter().chain(&deleted).any(declares);
         delta_ran = !(first_load || redeclared || inserted.is_empty() && deleted.is_empty());
         deletes = !deleted.is_empty();
         unkept = delta_ran && has_inverse_expression(tx.base(), &prep).map_err(interrupted)?;
@@ -452,7 +457,17 @@ pub fn maintain_with(
                 .then(|| tx.base().len_in(ReadModel::Materialised)),
             split_rebuilds: program.stores_representatives(),
         };
-        if inserted.is_empty() && deleted.is_empty() {
+        if redeclared {
+            // Rebuilt, then judged by the rebuild's report or by what it introduces (below).
+            new_to_state = std::mem::take(&mut inserted);
+            delta::Update {
+                policy: delta::policy::Counts {
+                    plan: delta::policy::Plan::Rebuild,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        } else if inserted.is_empty() && deleted.is_empty() {
             delta::Update::default()
         } else if let Some(closure) = rebuilt.as_mut().filter(|_| first_load) {
             // One report is held: the batch's, where the caller uses it (the rebuild below
@@ -487,14 +502,6 @@ pub fn maintain_with(
                     )?,
                 },
                 insert: derived,
-                policy: delta::policy::Counts {
-                    plan: delta::policy::Plan::Rebuild,
-                    ..Default::default()
-                },
-                ..Default::default()
-            }
-        } else if redeclared {
-            delta::Update {
                 policy: delta::policy::Counts {
                     plan: delta::policy::Plan::Rebuild,
                     ..Default::default()
@@ -602,12 +609,37 @@ pub fn maintain_with(
             }
         });
         let pending = tx.pending_snapshot();
+        let judged = redeclared && !uses_rebuilt_report;
+        let mut new_inferred = Vec::new();
         let (added, dropped) =
             install_closure(&pending, &mut closure.inferred, |fact, add| match add {
-                true => tx.insert_inferred(fact),
+                true => {
+                    let new = tx.insert_inferred(fact);
+                    if new && judged {
+                        new_inferred.push(triple(fact.in_default_graph()));
+                    }
+                    new
+                }
                 false => tx.remove_inferred(fact),
             });
         (inserted, removed) = (inserted + added, removed + dropped);
+        if judged {
+            let removed_ids: Vec<u64> = (read_before.iter().flat_map(AnnotationIds::ids))
+                .filter(|&&id| !read_after.as_ref().is_some_and(|a| a.contains(id)))
+                .copied()
+                .collect();
+            update.violations = redeclaration_violations(
+                program,
+                tx,
+                &schema,
+                read_after.as_ref(),
+                &removed_ids,
+                std::mem::take(&mut new_to_state),
+                new_inferred,
+                operation,
+                memory,
+            )?;
+        }
         update.rounds += closure.rounds;
         // The delta cache may still contain heads rewritten for a formerly hidden
         // class. Ground the final prospective state, and publish this cache only if
@@ -645,6 +677,74 @@ pub fn maintain_with(
         work: update.policy,
         rebuilt_violations,
     })
+}
+
+/// The consistency violations a change that redeclares an annotation property introduces,
+/// for a caller that doesn't take the rebuild's report (it holds the state's old ones too),
+/// read over the state after it (`tx`, its rebuilt closure installed) by the rules with the
+/// set after it (`after`), as the delta executor finds a change's
+/// ([`delta::introduced_violations`]): those through a statement new to the state (`new`
+/// asserted, `inferred` by the rebuild), or through one the rules read only now, as an
+/// annotation property no longer read (`removed`) in a place their guard covers
+/// (`rulesets::guard_annotation_readings`).
+/// Any other one held before as well: its statements were there and its rule read them. The
+/// set before the change can't judge it: the rules would read what the change made an
+/// annotation, and the closure before it (a declaration used at once would clash with what
+/// its old reading derived). And the datatype checks of the new inferred statements.
+#[allow(clippy::too_many_arguments)]
+fn redeclaration_violations(
+    program: &Program,
+    tx: &Transaction<'_>,
+    schema: &crate::batch::Schema,
+    after: Option<&AnnotationIds>,
+    removed: &[u64],
+    mut new: Vec<Triple>,
+    inferred: Vec<Triple>,
+    operation: &OperationStop<'_>,
+    memory: &Arc<Budget>,
+) -> Result<Violations, delta::Interrupted> {
+    let snapshot = tx.pending_snapshot();
+    let [domain, range, sub] = program.reading_predicates.map(Some);
+    for &id in removed {
+        let id = Some(id);
+        let read = [
+            [None, id, None],
+            [id, domain, None],
+            [id, range, None],
+            [id, sub, None],
+            [None, sub, id],
+        ];
+        for bound in read {
+            let found = snapshot
+                .quads_for_pattern_in(ReadModel::Materialised, &pattern(bound, GraphSelector::Any));
+            new.extend(found.map(triple));
+        }
+    }
+    new.extend_from_slice(&inferred);
+    new.sort_unstable();
+    new.dedup();
+    let rules = program.rules_with(after);
+    let rules = delta::Rules {
+        rules: &rules,
+        schema,
+        ..program.rules()
+    };
+    let base = super::explain::SnapshotBase {
+        snapshot: &snapshot,
+        axioms: &program.axioms,
+    };
+    let mut found = delta::introduced_violations(&base, &new, &[], rules, None, operation, memory)?;
+    if found.complete() {
+        found.append(super::datatypes::violations(
+            &inferred,
+            program.rdf_type,
+            program.same_as,
+            None,
+            &|id| tx.decode(TermId::from_raw(id)),
+            memory,
+        ));
+    }
+    Ok(found)
 }
 
 /// Makes the inferred stack of `pending` hold `closure` instead, applying only the

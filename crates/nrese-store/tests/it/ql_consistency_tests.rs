@@ -133,10 +133,13 @@ fn pipeline(store: &Arc<StoreService>, mode: ReasoningMode) -> MutationPipeline 
 
 /// A commit's outcome: `applied`, `refused` as inconsistent, or `failed` with any other error.
 fn commit(pipeline: &MutationPipeline, data: &str) -> String {
+    apply(pipeline, &format!("INSERT DATA {{ {data} }}"))
+}
+
+/// [`commit`] of `update`, an update request without prefixes.
+fn apply(pipeline: &MutationPipeline, update: &str) -> String {
     match pipeline.apply(
-        MutationCommand::Update(SparqlUpdateRequest::new(format!(
-            "{PREFIXES}INSERT DATA {{ {data} }}"
-        ))),
+        MutationCommand::Update(SparqlUpdateRequest::new(format!("{PREFIXES}{update}"))),
         &Requester::all(),
         &MutationTicket::new(),
     ) {
@@ -166,13 +169,7 @@ fn read(store: &StoreService, question: &str) -> String {
 /// `nrese-server load` and a start-up rebuild see them) and rebuilt: the store's verdict,
 /// whether it is in quarantine, and what a read of `question` is told.
 fn loaded(mode: ReasoningMode, ql: QlRewritingMode, data: &str, question: &str) -> String {
-    let store = store(ql);
-    let _reasoning = pipeline(&store, mode);
-    crate::support::load_past_the_pipeline(&store, &format!("{PREFIXES}{data}"));
-    let program = ReasonerConfig::for_mode(mode)
-        .materialised_program()
-        .expect("a materialised program");
-    store.rematerialise(program).expect("rebuilt");
+    let (store, _reasoning) = rebuilt(mode, ql, data);
     let verdict = match store.consistency() {
         ConsistencyStatus::Consistent => "consistent",
         ConsistencyStatus::Inconsistent { .. } => "inconsistent",
@@ -183,6 +180,26 @@ fn loaded(mode: ReasoningMode, ql: QlRewritingMode, data: &str, question: &str) 
         store.is_quarantined(),
         read(&store, question)
     )
+}
+
+/// `data` loaded past the commit gates into a store reasoning in `mode` and rebuilt, with its
+/// commits' pipeline.
+fn rebuilt(
+    mode: ReasoningMode,
+    ql: QlRewritingMode,
+    data: &str,
+) -> (Arc<StoreService>, MutationPipeline) {
+    let store = store(ql);
+    let reasoning = pipeline(&store, mode);
+    crate::support::load_past_the_pipeline(&store, &format!("{PREFIXES}{data}"));
+    store.rematerialise(program(mode)).expect("rebuilt");
+    (store, reasoning)
+}
+
+fn program(mode: ReasoningMode) -> nrese_reasoner::RuleProgram {
+    ReasonerConfig::for_mode(mode)
+        .materialised_program()
+        .expect("a materialised program")
 }
 
 /// Spec (module docs): each OWL 2 QL ontology without a model is refused as a commit, and,
@@ -681,6 +698,186 @@ fn owl_thing_and_owl_nothing_in_their_own_places_stay_consistent() {
                 wrong.push(format!("{mode:?}, loaded, {ql:?}: {found}"));
             }
         }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// `:note` an annotation property by inference alone (`:MyAP` under `owl:AnnotationProperty`),
+/// with a domain `:alice` uses.
+const INFERRED_DECLARATION: &str = ":MyAP rdfs:subClassOf owl:AnnotationProperty . \
+                                    :note a :MyAP ; rdfs:domain :Doc . :alice :note :x .";
+
+/// Spec (module docs; the reader's rule: a property is an annotation property by an asserted
+/// declaration, never by an inferred one, as a rebuild reads it): under `owl2-ql`, over
+/// committed [`INFERRED_DECLARATION`], `:alice a :Doc` is read `true`; committing
+/// [`DECLARATION`], whose statement the closure already held, makes it `false`; retracting it
+/// again, while the closure still infers it, makes it `true`.
+#[test]
+fn a_declaration_counts_where_it_is_asserted_not_where_it_is_inferred() {
+    let store = store(QlRewritingMode::Auto);
+    let reasoning = pipeline(&store, ReasoningMode::Owl2Ql);
+    let mut wrong = Vec::new();
+    for (step, update, read_true) in [
+        (
+            "inferred only",
+            format!("INSERT DATA {{ {INFERRED_DECLARATION} }}"),
+            true,
+        ),
+        (
+            "asserted",
+            format!("INSERT DATA {{ {DECLARATION} }}"),
+            false,
+        ),
+        (
+            "retracted, still inferred",
+            format!("DELETE DATA {{ {DECLARATION} }}"),
+            true,
+        ),
+    ] {
+        let committed = apply(&reasoning, &update);
+        let after = read(&store, ":alice a :Doc");
+        if committed != "applied" || !after.starts_with(&format!("{read_true}, ")) {
+            wrong.push(format!("{step}: committed {committed}, read {after}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (the commit gate: in quarantine a commit is refused for a clash of its own and applied
+/// without one, as `mutation_pipeline_tests` states; Direct Semantics §1 for what an annotation
+/// property's statements mean): under `owl2-ql`, over a store in quarantine (`:x` in the
+/// disjoint `:A` and `:B`, loaded past the gates), each commit below is refused when it brings a
+/// clash and applied when it doesn't, whatever annotation property it declares or retracts: a
+/// clash (`:alice` in `:Doc`, disjoint from her `:Person`) alone or with an unrelated
+/// declaration; a declaration of `:note` used at once, whose domain then types nothing; and the
+/// retraction of an irreflexive `:note`'s declaration, after which `:y :note :y` clashes.
+#[test]
+fn a_redeclaring_commit_in_quarantine_is_judged_by_its_own_clashes() {
+    let disjoint = ":Doc owl:disjointWith :Person . :alice a :Person . ";
+    let mut wrong = Vec::new();
+    for (name, base, update, outcome) in [
+        (
+            "a clash",
+            disjoint.to_owned(),
+            "INSERT DATA { :alice a :Doc . }",
+            "refused",
+        ),
+        (
+            "a clash and a declaration",
+            disjoint.to_owned(),
+            "INSERT DATA { :alice a :Doc . :other a owl:AnnotationProperty . }",
+            "refused",
+        ),
+        (
+            "a declaration used at once",
+            format!("{disjoint}:note rdfs:domain :Doc ."),
+            "INSERT DATA { :note a owl:AnnotationProperty . :alice :note \"x\" . }",
+            "applied",
+        ),
+        (
+            "a retraction",
+            ":note a owl:AnnotationProperty , owl:IrreflexiveProperty . :y :note :y .".to_owned(),
+            "DELETE DATA { :note a owl:AnnotationProperty . }",
+            "refused",
+        ),
+    ] {
+        let (store, reasoning) = rebuilt(
+            ReasoningMode::Owl2Ql,
+            QlRewritingMode::Auto,
+            &format!(":A owl:disjointWith :B . :x a :A , :B . {base}"),
+        );
+        if !store.is_quarantined() {
+            wrong.push(format!("{name}: setup: not in quarantine"));
+            continue;
+        }
+        let committed = apply(&reasoning, update);
+        if committed != outcome {
+            wrong.push(format!("{name}: {committed}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (`entailment` module docs: a negative statement is decided by refutation, its opposite
+/// added and a violated consistency rule refuting it): with `:Item` disjoint from
+/// `owl:AnnotationProperty` and `:other` an `:Item`, the data entail
+/// `:other a [ owl:complementOf owl:AnnotationProperty ]` under `owl2-ql` as under `owl2-rl`:
+/// the opposite, a declaration of `:other`, clashes (`cax-dw`).
+#[test]
+fn a_refutation_through_a_declaration_is_judged() {
+    let node =
+        |local: &str| nrese_rdf::NamedNode::new_unchecked(format!("http://example.com/{local}"));
+    let owl = |local: &str| {
+        nrese_rdf::NamedNode::new_unchecked(format!("http://www.w3.org/2002/07/owl#{local}"))
+    };
+    let complement = nrese_rdf::BlankNode::new_unchecked("c");
+    let rdf_type =
+        nrese_rdf::NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+    let conclusion = [
+        nrese_rdf::Triple::new(node("other"), rdf_type, complement.clone()),
+        nrese_rdf::Triple::new(complement, owl("complementOf"), owl("AnnotationProperty")),
+    ];
+    let mut wrong = Vec::new();
+    for mode in [ReasoningMode::Owl2Ql, ReasoningMode::Owl2Rl] {
+        let (store, _reasoning) = rebuilt(
+            mode,
+            QlRewritingMode::Auto,
+            ":Item owl:disjointWith owl:AnnotationProperty . :other a :Item .",
+        );
+        let answer = store.entails(program(mode), &conclusion);
+        if !matches!(answer, Ok(nrese_store::Entailment::Entailed)) {
+            wrong.push(format!("{mode:?}: {answer:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (module docs, Direct Semantics §1; an explanation is a derivation by the rules, so it
+/// takes no step the closure doesn't): under `owl2-ql`, `:alice a :Doc` holds through `:p`, an
+/// object property with the domain `:Doc`, which `:alice :p :y` gets from its inverse `:q`;
+/// `:note`, an annotation property with the domain `:Doc` that `:alice` uses too, gives it no
+/// derivation, not even the shorter one it would be. Its explanation (the shortest derivation)
+/// and the union of its justifications name no statement about or with `:note`.
+#[test]
+fn an_explanation_takes_no_step_through_an_annotation_property() {
+    let data = ":note a owl:AnnotationProperty ; rdfs:domain :Doc . :alice :note :x . \
+                :p a owl:ObjectProperty ; owl:inverseOf :q ; rdfs:domain :Doc . \
+                :q a owl:ObjectProperty . :y :q :alice .";
+    let (store, _reasoning) = rebuilt(ReasoningMode::Owl2Ql, QlRewritingMode::Auto, data);
+    let node =
+        |local: &str| nrese_rdf::NamedNode::new_unchecked(format!("http://example.com/{local}"));
+    let rdf_type =
+        nrese_rdf::NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+    let (alice, doc) = (node("alice"), node("Doc"));
+    let statement: [nrese_rdf::TermRef<'_>; 3] = [
+        alice.as_ref().into(),
+        rdf_type.as_ref().into(),
+        doc.as_ref().into(),
+    ];
+    let note = |terms: [&str; 3]| terms.contains(&"http://example.com/note");
+    let scope = nrese_store::ReadScope::All;
+    let mut wrong = Vec::new();
+    let [s, p, o] = statement;
+    let steps = (store.explain_statement(program(ReasoningMode::Owl2Ql), &scope, s, p, o))
+        .expect("explained");
+    match steps {
+        None => wrong.push("no explanation".to_owned()),
+        Some(steps) => wrong.extend(
+            (steps.iter())
+                .filter(|s| note([&s.subject, &s.predicate, &s.object]))
+                .map(|s| format!("explanation: {} {} {}", s.subject, s.predicate, s.object)),
+        ),
+    }
+    let mode = nrese_store::reasoning::JustificationMode::Union;
+    let union = (store.justify_statement(program(ReasoningMode::Owl2Ql), &scope, statement, mode))
+        .expect("justified");
+    match union {
+        None => wrong.push("no justification".to_owned()),
+        Some(answer) => wrong.extend(
+            (answer.sets.iter().flatten())
+                .filter(|s| note([&s.subject, &s.predicate, &s.object]))
+                .map(|s| format!("justification: {} {} {}", s.subject, s.predicate, s.object)),
+        ),
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }

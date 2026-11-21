@@ -87,6 +87,9 @@ pub struct Program {
     /// Where a rule reads the data's annotation properties ([`Guard::NotAnnotation`]): the
     /// built-in ones and the declaring statements, by the OWL reader's rule.
     annotations: Option<AnnotationProperties>,
+    /// `rdfs:domain`, `rdfs:range` and `rdfs:subPropertyOf`: where, besides a statement's
+    /// predicate, those rules read a property (`rulesets::guard_annotation_readings`).
+    reading_predicates: [u64; 3],
 }
 
 impl std::fmt::Debug for Program {
@@ -152,12 +155,16 @@ impl Program {
     }
 
     /// The rules for a run over `snapshot`: where a rule reads the annotation properties,
-    /// with those of its asserted statements, read as the OWL reader reads them (an IRI it
-    /// may name one, declared in any graph, and the built-in ones) and fixed for the run.
+    /// with [`Self::annotation_ids`], fixed for the run.
     fn rules_for(&self, snapshot: &Snapshot) -> std::borrow::Cow<'_, [Rule]> {
-        let Some(annotations) = &self.annotations else {
-            return std::borrow::Cow::Borrowed(&self.rules);
-        };
+        self.rules_with(self.annotation_ids(snapshot).as_ref())
+    }
+
+    /// Where a rule reads the annotation properties, those of `snapshot`'s asserted
+    /// statements, read as the OWL reader reads them (an IRI it may name one, declared in any
+    /// graph, and the built-in ones); `None` where none does.
+    fn annotation_ids(&self, snapshot: &Snapshot) -> Option<AnnotationIds> {
+        let annotations = self.annotations.as_ref()?;
         let mut read = annotations.clone();
         let named = |s: TermId| match snapshot.decode(s) {
             Some(nrese_rdf::Term::NamedNode(n)) => nrese_owl::may_name_annotation(n.as_str()),
@@ -169,7 +176,14 @@ impl Program {
                 read.read(triple(quad), named(quad.subject));
             }
         }
-        let set = AnnotationIds::new(read.properties().collect());
+        Some(AnnotationIds::new(read.properties().collect()))
+    }
+
+    /// The rules, where a rule reads the annotation properties, with `set`.
+    fn rules_with(&self, set: Option<&AnnotationIds>) -> std::borrow::Cow<'_, [Rule]> {
+        let Some(set) = set else {
+            return std::borrow::Cow::Borrowed(&self.rules);
+        };
         let with_set = |rule: &Rule| {
             let mut rule = rule.clone();
             for guard in &mut rule.guards {
@@ -236,6 +250,8 @@ impl Program {
             .iter()
             .any(reads)
             .then(|| AnnotationProperties::new(&mut |iri| Some(constants.iri(iri))));
+        let reading_predicates = ["domain", "range", "subPropertyOf"]
+            .map(|local| constants.iri(&format!("{}{local}", crate::ir::RDFS)));
         if let Some(refused) = constants.refused {
             return Err(refused);
         }
@@ -255,6 +271,7 @@ impl Program {
             plan: None,
             axioms_storable: std::sync::OnceLock::new(),
             annotations,
+            reading_predicates,
         })
     }
 
