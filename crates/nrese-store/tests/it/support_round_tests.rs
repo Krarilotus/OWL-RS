@@ -17,21 +17,9 @@ use nrese_reasoner::rulesets::Ruleset;
 use nrese_sparql::GraphAccess;
 use nrese_store::{BulkLoadRequest, GraphTarget, ReadScope, SparqlQueryRequest, StoreService};
 
-use crate::support::in_memory_store_config;
+use crate::support::{in_memory_store_config, nightly};
 
 const EX: &str = "http://example.com/";
-
-/// Nodes of the relation: n³ = 3.4 M instances of 56-byte derivations, about 190 MB, against
-/// the n² = 22,500 facts' few sets each.
-const NODES: usize = 150;
-
-/// The query's memory limit, measured, not picked (probes `p2c5-probe-base` and
-/// `p2c5-probe-head2`, 7 Nov 2026, this read at 16 MiB to 2 GiB): at 150 nodes, with one entry
-/// per instance, the read is refused up to 768 MiB and answers at 1 GiB. With each fact's
-/// derivations kept once per distinct set as they come, it is refused at 128 MiB and
-/// answers at 192 MiB. So the limit is twice the reduced need and half of where the
-/// unreduced one is still refused.
-const LIMIT: usize = 384 << 20;
 
 /// The graph of the edge `i → j`: one of three.
 fn graph(i: usize, j: usize) -> usize {
@@ -39,13 +27,13 @@ fn graph(i: usize, j: usize) -> usize {
 }
 
 /// Every edge `i → j`, `i ≠ j`, in its graph, and `anc` transitive.
-fn quads() -> String {
+fn quads(nodes: usize) -> String {
     let mut lines = format!(
         "<{EX}anc> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> \
          <http://www.w3.org/2002/07/owl#TransitiveProperty> .\n"
     );
-    for i in 0..NODES {
-        for j in (0..NODES).filter(|&j| j != i) {
+    for i in 0..nodes {
+        for j in (0..nodes).filter(|&j| j != i) {
             lines.push_str(&format!(
                 "<{EX}n{i}> <{EX}anc> <{EX}n{j}> <{EX}g{}> .\n",
                 graph(i, j)
@@ -64,12 +52,12 @@ fn quads() -> String {
 const HIDDEN: usize = 900;
 
 /// The graphs whose asserted `ex:anc` statements `scope` reads, under the query memory limit.
-fn graphs_read(store: &StoreService, scope: &ReadScope) -> BTreeSet<String> {
+fn graphs_read(store: &StoreService, scope: &ReadScope, limit: usize) -> BTreeSet<String> {
     let mut request = SparqlQueryRequest::new(
         format!("SELECT DISTINCT ?g WHERE {{ GRAPH ?g {{ ?s <{EX}anc> ?o }} }}"),
         scope.clone(),
     );
-    request.memory_limit = Some(LIMIT);
+    request.memory_limit = Some(limit);
     let result = store.execute_query(&request).unwrap();
     let json: serde_json::Value = serde_json::from_slice(&result.payload).unwrap();
     json["results"]["bindings"]
@@ -81,14 +69,14 @@ fn graphs_read(store: &StoreService, scope: &ReadScope) -> BTreeSet<String> {
 }
 
 /// The closure of the edges in `graphs`, by Floyd–Warshall: the pairs it holds.
-fn oracle(graphs: &[usize]) -> BTreeSet<(usize, usize)> {
-    let mut reach = vec![vec![false; NODES]; NODES];
+fn oracle(graphs: &[usize], nodes: usize) -> BTreeSet<(usize, usize)> {
+    let mut reach = vec![vec![false; nodes]; nodes];
     for (i, row) in reach.iter_mut().enumerate() {
         for (j, cell) in row.iter_mut().enumerate() {
             *cell = i != j && graphs.contains(&graph(i, j));
         }
     }
-    for k in 0..NODES {
+    for k in 0..nodes {
         let via = reach[k].clone();
         for row in reach.iter_mut().filter(|row| row[k]) {
             for (cell, &step) in row.iter_mut().zip(&via) {
@@ -96,18 +84,13 @@ fn oracle(graphs: &[usize]) -> BTreeSet<(usize, usize)> {
             }
         }
     }
-    (0..NODES)
-        .flat_map(|i| (0..NODES).map(move |j| (i, j)))
+    (0..nodes)
+        .flat_map(|i| (0..nodes).map(move |j| (i, j)))
         .filter(|&(i, j)| reach[i][j])
         .collect()
 }
 
-/// The pairs `ex:anc` relates for `scope`, under the query memory limit.
-fn read(store: &StoreService, scope: &ReadScope) -> Result<BTreeSet<(usize, usize)>, String> {
-    read_within(store, scope, LIMIT)
-}
-
-/// [`read`] under the query memory limit `limit`.
+/// The pairs `ex:anc` relates for `scope`, under the query memory limit `limit`.
 fn read_within(
     store: &StoreService,
     scope: &ReadScope,
@@ -151,12 +134,24 @@ fn read_within(
 /// edge only `g2` holds not at all. Before SYN-21 the first support round held one
 /// derivation per rule instance before its size was checked, and the read was refused past
 /// the limit.
+/// The relation has 75 nodes by default and 150 with `NRESE_CHECK_TIER=nightly`.
 #[test]
 fn a_restricted_read_of_a_complete_relation_fits_its_memory_limit() {
+    // At 75 nodes the deduplicated round was refused at 24 MiB and answered at 28 MiB.
+    // The undeduplicated round was still refused at 64 MiB.
+    // At 150 nodes, 22,500 facts have about 3.4 M rule instances. With one entry
+    // per instance the read was refused at 768 MiB and answered at 1 GiB.
+    // Deduplication brought that down to a refusal at 128 MiB and an answer at
+    // 192 MiB. The full form uses a limit between the two.
+    let (nodes, limit, too_small) = if nightly() {
+        (150, 384 << 20, 16 << 20)
+    } else {
+        (75, 64 << 20, 8 << 20)
+    };
     let store = StoreService::new(in_memory_store_config()).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("data.nq");
-    std::fs::write(&file, quads()).unwrap();
+    std::fs::write(&file, quads(nodes)).unwrap();
     store
         .bulk_load(&BulkLoadRequest {
             files: vec![file],
@@ -174,20 +169,16 @@ fn a_restricted_read_of_a_complete_relation_fits_its_memory_limit() {
         inferred_by_support: true,
         ..GraphAccess::default()
     }));
-    let expected = oracle(&[0, 1]);
-    assert!(
-        expected.len() > NODES * (NODES - 1),
-        "the closure adds the loops"
-    );
-    // Refused first, under a limit the read can't fit (probes: it needs 192 MiB): that
-    // refusal keeps no view, and the same reader's next read answers.
-    assert!(
-        read_within(&store, &scope, 16 << 20).is_err(),
-        "refused at 16 MiB"
-    );
-    assert_eq!(read(&store, &scope), Ok(expected));
+    let expected = oracle(&[0, 1], nodes);
+    // Refuse the first read to check that it keeps no view for the same reader's next read.
+    let refused = read_within(&store, &scope, too_small);
+    let actual = read_within(&store, &scope, limit)
+        .unwrap_or_else(|error| panic!("{nodes} nodes, limit {limit} bytes: {error}"));
+    assert_eq!(actual, expected);
+    assert_eq!(expected.len(), nodes * nodes, "the closure adds the loops");
+    assert!(refused.is_err(), "refused at {too_small} bytes");
     assert_eq!(
-        graphs_read(&store, &scope),
+        graphs_read(&store, &scope, limit),
         BTreeSet::from([format!("{EX}g0"), format!("{EX}g1")]),
         "the reader sees asserted statements of its own graphs only"
     );

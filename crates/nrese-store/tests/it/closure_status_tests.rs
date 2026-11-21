@@ -13,6 +13,7 @@ use nrese_store::{
 
 use crate::dl::{PREFIXES, insert, pipeline, pipeline_with};
 use crate::ql_rewriting_tests::Rng;
+use crate::support::nightly;
 
 /// eq-ref (OWL 2 Profiles §4.3, table 4), which the RL rules leave out: `:rex owl:sameAs
 /// :rex` is entailed, so NOT EXISTS removes `:rex` and the certain answers are none.
@@ -1090,6 +1091,17 @@ fn owl2_rl_answers_an_undeclared_data_existential_over_any_literal() {
 /// The generated tests' seed, in their names.
 const SEED: u64 = 0x5eed_da7a;
 
+const DATA_CONSTRUCTORS: [&str; 6] = [
+    "datatype",
+    "oneOf",
+    "onDatatype",
+    "datatypeComplementOf",
+    "intersectionOf",
+    "unionOf",
+];
+const RL_CONSTRUCTORS: [&str; 2] = ["datatype", "intersectionOf"];
+const CLASS_CONSTRUCTORS: [&str; 4] = ["class", "intersectionOf", "unionOf", "complementOf"];
+
 /// Fillers in Turtle, from a seed. Each composite node is written in place (`[ … ]`) or as
 /// a shared blank node defined once (`_:sN …`), which later nodes may name again, twice in
 /// one list too; a node names only earlier ones, so there is no cycle.
@@ -1144,23 +1156,25 @@ impl Fillers {
         } else {
             ""
         };
-        let po = match self.random.below(if depth == 0 { 3 } else { 6 }) {
-            0 => {
+        let count = if depth == 0 {
+            3
+        } else {
+            DATA_CONSTRUCTORS.len()
+        };
+        let po = match DATA_CONSTRUCTORS[self.random.below(count)] {
+            "datatype" => {
                 let datatypes = ["xsd:integer", "xsd:decimal", "xsd:int", "xsd:string"];
                 return datatypes[self.random.below(4)].to_owned();
             }
-            1 => format!("{typed}owl:oneOf ( 5 7 )"),
-            2 => format!(
+            "oneOf" => format!("{typed}owl:oneOf ( 5 7 )"),
+            "onDatatype" => format!(
                 "{typed}owl:onDatatype xsd:integer ; owl:withRestrictions ( [ xsd:minInclusive 1 ] )"
             ),
-            3 => format!("{typed}owl:datatypeComplementOf {}", self.data(depth - 1)),
-            kind => {
+            "datatypeComplementOf" => {
+                format!("{typed}owl:datatypeComplementOf {}", self.data(depth - 1))
+            }
+            operator => {
                 let operands: Vec<String> = (0..2).map(|_| self.data(depth - 1)).collect();
-                let operator = if kind == 4 {
-                    "intersectionOf"
-                } else {
-                    "unionOf"
-                };
                 format!("{typed}owl:{operator} ( {} )", operands.join(" "))
             }
         };
@@ -1178,12 +1192,14 @@ impl Fillers {
         } else {
             ""
         };
-        if self.random.below(if depth == 0 { 1 } else { 2 }) == 0 {
+        let count = if depth == 0 { 1 } else { RL_CONSTRUCTORS.len() };
+        let constructor = RL_CONSTRUCTORS[self.random.below(count)];
+        if constructor == "datatype" {
             return ["xsd:int", "xsd:integer", "xsd:decimal"][self.random.below(3)].to_owned();
         }
         let operands: Vec<String> = (0..2).map(|_| self.rl_data(depth - 1)).collect();
         let operands = operands.join(" ");
-        self.node(format!("{typed}owl:intersectionOf ( {operands} )"))
+        self.node(format!("{typed}owl:{constructor} ( {operands} )"))
     }
 
     /// A class expression of depth at most `depth` that `:x`, in `:B`, `:C` and `:D`, is in:
@@ -1203,68 +1219,177 @@ impl Fillers {
             ""
         };
         let mut operands: Vec<String> = (0..2).map(|_| self.classes(depth - 1)).collect();
+        let [_, intersection, union, complement] = CLASS_CONSTRUCTORS;
         let operator = if self.random.chance(50) {
-            "intersectionOf"
+            intersection
         } else {
             if self.random.chance(50) {
-                operands.push(format!("[ owl:complementOf {} ]", named(&mut self.random)));
+                operands.push(format!("[ owl:{complement} {} ]", named(&mut self.random)));
             }
-            "unionOf"
+            union
         };
         self.node(format!("{typed}owl:{operator} ( {} )", operands.join(" ")))
     }
 }
 
 /// [`owl2_rl_reads_an_undeclared_existential_by_its_filler`] over generated fillers, a wrong
-/// case named by its half and index:
-/// - 200 data ranges ([`Fillers::data`]: every constructor the reader classifies, nested to
+/// case named by its stream and index:
+/// - Data ranges ([`Fillers::data`]: every constructor the reader classifies, nested to
 ///   depth three, with shared nodes named again). Each says the undeclared `:age` is a data
 ///   property: the places say what the table's data rows say, whatever the answer.
-/// - Most of those are outside RL, where a class reading is `sound-only` too. So 200 of RL's
-///   own ([`Fillers::rl_data`]), each holding the `xsd:int` 5 by its build: `:a a :Aged` is
+/// - Most of those are outside RL, where a class reading is `sound-only` too. RL's own
+///   ranges ([`Fillers::rl_data`]) each hold the `xsd:int` 5 by construction: `:a a :Aged` is
 ///   entailed, so the answer is `true` or no place calls it complete.
-/// - The mirror, 200 class expressions `:x` is in ([`Fillers::classes`]): object ones, the
+/// - Class expressions `:x` is in ([`Fillers::classes`]) provide the object controls. The
 ///   rules derive `:a a :Social`, `complete` in every place with the rewriting on. With a
 ///   complement in them it is `sound-only`: RL has no complement in a subclass expression
 ///   (Profiles §4.2.3, `subClassExpression`).
+///
+/// By default use fixed constructors, including the shared class union that exposed a
+/// kind error. With `NRESE_CHECK_TIER=nightly` draw 200 cases per stream unless overridden.
 #[test]
 fn generated_fillers_are_read_by_their_kind_seed_5eedda7a() {
+    let full = nightly();
+    let count = match std::env::var("NRESE_FUZZ_CASES") {
+        Ok(value) => Some(
+            value
+                .parse::<usize>()
+                .ok()
+                .filter(|&count| count > 0)
+                .expect("NRESE_FUZZ_CASES must be a positive integer"),
+        ),
+        Err(std::env::VarError::NotPresent) => full.then_some(200),
+        Err(error) => panic!("NRESE_FUZZ_CASES: {error}"),
+    };
+    let data_witnesses = [
+        ("datatype", "xsd:integer"),
+        ("oneOf", "[ a rdfs:Datatype ; owl:oneOf ( 5 7 ) ]"),
+        (
+            "onDatatype",
+            "[ owl:onDatatype xsd:integer ; owl:withRestrictions ( [ xsd:minInclusive 1 ] ) ]",
+        ),
+        (
+            "datatypeComplementOf",
+            "[ owl:datatypeComplementOf xsd:string ]",
+        ),
+        (
+            "intersectionOf",
+            "[ owl:intersectionOf ( xsd:integer xsd:decimal ) ]",
+        ),
+        ("unionOf", "[ owl:unionOf ( xsd:integer xsd:string ) ]"),
+    ];
+    let class_witnesses = [
+        ("class", "", ":B", true),
+        (
+            "intersectionOf",
+            "",
+            "[ owl:intersectionOf ( :B :C ) ]",
+            true,
+        ),
+        // The shared class expression from draw 5, where the kind error changed all four statuses.
+        (
+            "unionOf",
+            "_:s0 owl:unionOf ( :D :C ) . _:s1 a owl:Class ; owl:unionOf ( [ owl:intersectionOf ( :C _:s0 ) ] _:s0 ) .",
+            "_:s1",
+            true,
+        ),
+        (
+            "complementOf",
+            "",
+            "[ owl:unionOf ( :B [ owl:complementOf :C ] ) ]",
+            false,
+        ),
+    ];
+    let rl_witnesses = [
+        ("datatype", "xsd:int"),
+        (
+            "intersectionOf",
+            "[ owl:intersectionOf ( xsd:int xsd:decimal ) ]",
+        ),
+    ];
     let mut wrong = Vec::new();
-    let mut check = |name: String, data: &str, read: &str, answer: &str, complete: bool| {
+    let mut check = |name: &str, data: &str, read: &str, answer: &str, complete| {
         for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
             let (text, line, statuses, _) = places(data, read, ql);
-            if !text.contains(answer) || statuses != matrix(complete, ql) {
+            let right = match complete {
+                Some(complete) => text.contains(answer) && statuses == matrix(complete, ql),
+                None => text.contains(answer) || !statuses.contains(&"complete"),
+            };
+            if !right {
                 wrong.push(format!("{name}: {data} / {line}"));
             }
         }
     };
     let (aged, social) = ("ASK { :a a :Aged }", "ASK { :a a :Social }");
-    let mut fillers = Fillers::new();
-    for i in 0..200 {
-        let range = fillers.data(3);
-        let data = format!("{} {}", fillers.take(), data_existential(&range));
-        check(format!("data {i}"), &data, aged, "", false);
-        let classes = fillers.classes(3);
-        let control = format!("{} {}", fillers.take(), object_existential(&classes));
-        let complete = !control.contains("owl:complementOf");
-        check(format!("control {i}"), &control, social, "true", complete);
-    }
-    let mut fillers = Fillers::new();
-    for i in 0..200 {
-        let range = fillers.rl_data(3);
-        let data = format!(
-            "{} {} :a :age \"5\"^^xsd:int .",
-            fillers.take(),
-            data_existential(&range)
-        );
-        for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
-            let (text, line, statuses, _) = places(&data, aged, ql);
-            if !text.contains("true") && statuses.contains(&"complete") {
-                wrong.push(format!("rl {i}: {data} / {line}"));
-            }
+    let rl_data = |range: &str| format!("{} :a :age \"5\"^^xsd:int .", data_existential(range));
+    if let Some(count) = count {
+        let mut fillers = Fillers::new();
+        for i in 0..count {
+            let range = fillers.data(3);
+            let data = format!("{} {}", fillers.take(), data_existential(&range));
+            check(&format!("data {i}"), &data, aged, "", Some(false));
+            let classes = fillers.classes(3);
+            let control = format!("{} {}", fillers.take(), object_existential(&classes));
+            let complete = !control.contains("owl:complementOf");
+            check(
+                &format!("control {i}"),
+                &control,
+                social,
+                "true",
+                Some(complete),
+            );
+        }
+        let mut fillers = Fillers::new();
+        for i in 0..count {
+            let range = fillers.rl_data(3);
+            let data = format!("{} {}", fillers.take(), rl_data(&range));
+            check(&format!("rl {i}"), &data, aged, "true", None);
+        }
+    } else {
+        for (kind, range) in data_witnesses {
+            check(kind, &data_existential(range), aged, "", Some(false));
+        }
+        for (kind, definitions, classes, complete) in class_witnesses {
+            let control = format!("{definitions} {}", object_existential(classes));
+            check(
+                &format!("class {kind}"),
+                &control,
+                social,
+                "true",
+                Some(complete),
+            );
+        }
+        for (kind, range) in rl_witnesses {
+            check(&format!("rl {kind}"), &rl_data(range), aged, "true", None);
         }
     }
     assert!(wrong.is_empty(), "{} wrong: {wrong:#?}", wrong.len());
+    if count.is_none() {
+        use std::collections::BTreeSet;
+        let witnesses = [
+            (
+                &DATA_CONSTRUCTORS[..],
+                data_witnesses
+                    .iter()
+                    .map(|row| row.0)
+                    .collect::<BTreeSet<_>>(),
+            ),
+            (
+                &CLASS_CONSTRUCTORS[..],
+                class_witnesses.iter().map(|row| row.0).collect(),
+            ),
+            (
+                &RL_CONSTRUCTORS[..],
+                rl_witnesses.iter().map(|row| row.0).collect(),
+            ),
+        ];
+        for (constructors, pinned) in witnesses {
+            assert_eq!(
+                constructors.iter().copied().collect::<BTreeSet<_>>(),
+                pinned
+            );
+        }
+    }
 }
 
 /// Thirty intersections, each of the one before twice (`_:c1` is `( _:c0 _:c0 )`, …): a data

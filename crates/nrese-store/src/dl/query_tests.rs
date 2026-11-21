@@ -1,6 +1,15 @@
 use super::*;
 use nrese_dl::limits::Deadline;
 
+/// The check tier (`NRESE_CHECK_TIER`): `landing` (the default) or `nightly`.
+pub(crate) fn nightly() -> bool {
+    match std::env::var("NRESE_CHECK_TIER").as_deref() {
+        Err(_) | Ok("landing") => false,
+        Ok("nightly") => true,
+        Ok(other) => panic!("NRESE_CHECK_TIER={other:?}: expected `landing` or `nightly`"),
+    }
+}
+
 fn lower_true_store() -> Arc<StoreService> {
     lower_true_store_with(crate::StoreConfig::in_memory(), "")
 }
@@ -2114,6 +2123,110 @@ fn unions_read_of(
     Ok((out, status))
 }
 
+/// Limit comparisons use a freshly committed store for each read.
+fn first_reads<T>(
+    store: impl Fn(T) -> Arc<StoreService>,
+    pattern: &'static str,
+) -> impl Fn(T, usize) -> crate::StoreResult<Read> {
+    move |input, limit| unions_read_of(&store(input), pattern, Some(limit))
+}
+
+const LIMIT_STEP: usize = 256;
+const BAND_POINTS: usize = 64;
+
+fn least_limit(
+    mut low: usize,
+    mut high: usize,
+    precision: usize,
+    reached: impl Fn(usize) -> bool,
+) -> usize {
+    while high - low > precision {
+        let middle = low + (high - low) / 2;
+        if reached(middle) {
+            high = middle;
+        } else {
+            low = middle;
+        }
+    }
+    high
+}
+
+fn limit_band(first: usize) -> impl Iterator<Item = usize> {
+    (0..BAND_POINTS).map(move |i| first + i * LIMIT_STEP)
+}
+
+fn geometric_limits(low: usize, high: usize, divisor: usize) -> impl Iterator<Item = usize> {
+    std::iter::successors(Some(low), move |limit| Some(limit + limit / divisor))
+        .take_while(move |&limit| limit <= high)
+}
+
+/// Keep a band above the least answering limit, and centre bands on any other switches.
+/// The full form keeps its original band and geometric probes in their original order.
+fn sweep_limits<const N: usize>(
+    low: usize,
+    least: usize,
+    top: usize,
+    divisor: usize,
+    switches: impl FnOnce() -> [usize; N],
+) -> Vec<usize> {
+    if nightly() {
+        return limit_band(least)
+            .chain(geometric_limits(low, top, divisor))
+            .collect();
+    }
+    focused_limits(low, least, switches())
+}
+
+fn focused_limits(
+    low: usize,
+    least: usize,
+    switches: impl IntoIterator<Item = usize>,
+) -> Vec<usize> {
+    let bands = switches.into_iter().flat_map(|switch| {
+        let first = switch.saturating_sub(BAND_POINTS / 2 * LIMIT_STEP).max(low);
+        limit_band(first).chain([switch])
+    });
+    let mut limits: Vec<_> = limit_band(least).chain(bands).collect();
+    limits.sort_unstable();
+    limits.dedup();
+    limits
+}
+
+fn detail_limit(
+    low: usize,
+    top: usize,
+    precision: usize,
+    first: impl Fn(usize) -> crate::StoreResult<Read>,
+    reached: impl Fn(&crate::dl::DlDetail) -> bool,
+) -> usize {
+    least_limit(low, top, precision, |limit| {
+        first(limit).is_ok_and(|(_, status)| status.is_some_and(|(_, detail)| reached(&detail)))
+    })
+}
+
+/// Count the limits answered and refused with labels off. At each answered limit, require
+/// an answer with labels on, then inspect the detail if the answer carries it.
+fn compare_first_reads(
+    first: &impl Fn(bool, usize) -> crate::StoreResult<Read>,
+    limits: impl IntoIterator<Item = usize>,
+    mut inspect: impl FnMut(usize, &crate::dl::DlDetail),
+) -> (usize, usize) {
+    let (mut answered, mut refused) = (0, 0);
+    for limit in limits {
+        if first(false, limit).is_err() {
+            refused += 1;
+            continue;
+        }
+        answered += 1;
+        let (_, status) = first(true, limit)
+            .unwrap_or_else(|error| panic!("{limit} bytes: off answered, on {error:?}"));
+        if let Some((_, detail)) = status {
+            inspect(limit, &detail);
+        }
+    }
+    (answered, refused)
+}
+
 /// Spec: a setting turns the model's refutations on, off by default, and off a read is decided
 /// by each candidate's own test as before: over the 24 individuals with a candidate limit of 4,
 /// the 4 admitted refuted, 8 unresolved, the read not `complete`, none refuted by labels. On,
@@ -2162,43 +2275,24 @@ fn without_model_labels_a_read_is_decided_by_its_tests_alone() {
 /// selection needs, and the read with them on says so (`capped-gap`) and is answered. Every
 /// read, on both sides, is the first of a store just committed: a store's first read holds
 /// more than its later ones, so only first reads compare like with like.
+/// The sweep and the fallback band are unchanged by `NRESE_CHECK_TIER`.
 #[test]
 fn a_read_answered_without_model_labels_is_answered_with_them_under_every_memory_limit() {
-    let first = |labels: bool, limit: usize| unions_read(&unions_store(labels, 400), Some(limit));
-    let (mut limit, mut answered, mut failed) = (16usize << 10, 0, 0);
-    while limit <= 64 << 20 {
-        match first(false, limit) {
-            Ok(_) => {
-                answered += 1;
-                let with = first(true, limit);
-                assert!(
-                    with.is_ok(),
-                    "{limit} bytes: off answered, on {:?}",
-                    with.err()
-                );
-            }
-            Err(_) => failed += 1,
-        }
-        limit += limit / 10;
-    }
+    nightly();
+    let first = first_reads(|labels| unions_store(labels, 400), "?x a <urn:test:U0>");
+    let (low, top) = (16 << 10, 64 << 20);
+    let (answered, failed) = compare_first_reads(&first, geometric_limits(low, top, 10), |_, _| {});
     println!("off answered under {answered} limits and failed under {failed}");
     assert!(
         answered > 0 && failed > 0,
         "the limits cross the read's need"
     );
-    let (mut low, mut high) = (16usize << 10, 64usize << 20);
-    while high - low > 256 {
-        let middle = low + (high - low) / 2;
-        match first(false, middle) {
-            Ok(_) => high = middle,
-            Err(_) => low = middle,
-        }
-    }
+    let high = least_limit(low, top, LIMIT_STEP, |limit| first(false, limit).is_ok());
     let capped = |limit: usize| match first(true, limit) {
         Ok((_, Some((_, detail)))) => detail.paths.contains(&"capped-gap"),
         _ => false,
     };
-    let fallback = (0..64).map(|k| high + k * 256).find(|&limit| capped(limit));
+    let fallback = limit_band(high).find(|&limit| capped(limit));
     println!("off answered from {high} bytes; on fell back to the capped gap at {fallback:?}");
     assert!(
         fallback.is_some(),
@@ -2216,43 +2310,36 @@ fn a_read_answered_without_model_labels_is_answered_with_them_under_every_memory
 /// them on. And the case is reached: under some limit the read with them on selects the whole
 /// gap (no `capped-gap`), refutes none by labels, and is answered; and under the largest limit
 /// the same store's read refutes all 200 by labels, so no room is why none were.
+/// By default, probe the least-answering, whole-gap and labels-with-room bands and the top
+/// limit. `NRESE_CHECK_TIER=nightly` uses the original geometric sweep and least-answering band.
 #[test]
 fn a_read_whose_labels_have_no_room_needs_no_more_memory_than_without_them() {
-    let first = |labels: bool, limit: usize| {
-        unions_read(&padded_unions_store(labels, 400, 8000), Some(limit))
+    let first = first_reads(
+        |labels| padded_unions_store(labels, 400, 8000),
+        "?x a <urn:test:U0>",
+    );
+    let (low, top) = (16 << 10, 4 << 20);
+    let high = least_limit(low, top, LIMIT_STEP, |limit| first(false, limit).is_ok());
+    let on = |limit| first(true, limit);
+    let limits = sweep_limits(low, high, top, 50, || {
+        [
+            detail_limit(low, top, LIMIT_STEP, on, |d| {
+                !d.paths.contains(&"capped-gap")
+            }),
+            detail_limit(low, top, LIMIT_STEP, on, |d| d.refuted_by_labels == 200),
+        ]
+    });
+    let largest = if nightly() {
+        *limits.iter().max().unwrap()
+    } else {
+        top
     };
-    let (mut low, mut high) = (16usize << 10, 4usize << 20);
-    while high - low > 256 {
-        let middle = low + (high - low) / 2;
-        match first(false, middle) {
-            Ok(_) => high = middle,
-            Err(_) => low = middle,
-        }
-    }
-    let mut limits: Vec<usize> = (0..64).map(|k| high + k * 256).collect();
-    let mut limit = 16usize << 10;
-    while limit <= 4 << 20 {
-        limits.push(limit);
-        limit += limit / 50;
-    }
-    let largest = *limits.iter().max().unwrap();
     let mut reached = Vec::new();
-    for limit in limits {
-        if first(false, limit).is_ok() {
-            let with = first(true, limit);
-            assert!(
-                with.is_ok(),
-                "{limit} bytes: off answered, on {:?}",
-                with.err()
-            );
-            if let Ok((_, Some((_, detail)))) = &with
-                && !detail.paths.contains(&"capped-gap")
-                && detail.refuted_by_labels == 0
-            {
-                reached.push(limit);
-            }
+    compare_first_reads(&first, limits, |limit, detail| {
+        if !detail.paths.contains(&"capped-gap") && detail.refuted_by_labels == 0 {
+            reached.push(limit);
         }
-    }
+    });
     println!(
         "off answered from {high} bytes; the whole gap selected, none refuted by labels, answered under {reached:?}"
     );
@@ -2414,6 +2501,7 @@ fn an_operators_cancel_is_an_error_past_the_deadline_too() {
 /// with them off, every read the first of a store just committed, a read answered with them off
 /// is answered with them on. And the case is reached: under some limit the read with them on
 /// refutes all 16 by labels and is answered.
+/// By default, probe the least-answering and 16-refutation bands. `NRESE_CHECK_TIER=nightly` also sweeps.
 #[test]
 fn rows_the_labels_promote_past_the_capped_prefix_cost_no_more_memory() {
     let mut data = String::new();
@@ -2424,49 +2512,29 @@ fn rows_the_labels_promote_past_the_capped_prefix_cost_no_more_memory() {
     for k in 0..6 {
         data.push_str(&format!(":j{k}{pad} :val :v3 .\n"));
     }
-    let first = |model_labels: bool, limit: usize| {
+    let store = |model_labels: bool| {
         let dl = crate::DlConfig {
             max_candidates: Some(4),
             model_labels,
             ..crate::DlConfig::default()
         };
-        let store = unions_store_of(dl, &data);
-        unions_read_of(
-            &store,
-            "?x a <urn:test:U0> . ?x a <urn:test:U1>",
-            Some(limit),
-        )
+        unions_store_of(dl, &data)
     };
-    let (mut low, mut high) = (16usize << 10, 8usize << 20);
-    while high - low > 256 {
-        let middle = low + (high - low) / 2;
-        match first(false, middle) {
-            Ok(_) => high = middle,
-            Err(_) => low = middle,
-        }
-    }
-    let mut limits: Vec<usize> = (0..64).map(|k| high + k * 256).collect();
-    let mut limit = 16usize << 10;
-    while limit <= 8 << 20 {
-        limits.push(limit);
-        limit += limit / 50;
-    }
+    let first = first_reads(store, PROMOTED);
+    let (low, top) = (16 << 10, 8 << 20);
+    let high = least_limit(low, top, LIMIT_STEP, |limit| first(false, limit).is_ok());
+    let on = |limit| first(true, limit);
+    let limits = sweep_limits(low, high, top, 50, || {
+        [detail_limit(low, top, LIMIT_STEP, on, |d| {
+            d.refuted_by_labels == 16
+        })]
+    });
     let mut reached = Vec::new();
-    for limit in limits {
-        if first(false, limit).is_ok() {
-            let with = first(true, limit);
-            assert!(
-                with.is_ok(),
-                "{limit} bytes: off answered, on {:?}",
-                with.err()
-            );
-            if let Ok((_, Some((_, detail)))) = &with
-                && detail.refuted_by_labels == 16
-            {
-                reached.push(limit);
-            }
+    compare_first_reads(&first, limits, |limit, detail| {
+        if detail.refuted_by_labels == 16 {
+            reached.push(limit);
         }
-    }
+    });
     println!(
         "off answered from {high} bytes; all 16 refuted by labels, answered under {reached:?}"
     );
@@ -2616,41 +2684,32 @@ fn the_candidate_limit_is_named_only_where_that_many_were_tested() {
 /// bytes over the 16 KiB from the least limit the read is answered under with the labels off
 /// (found to 256 bytes), every read the first of a store just committed, a read answered with
 /// the labels off is answered with them on.
+/// By default, probe the least-answering limit and the switch where labels refute 60.
+/// With `NRESE_CHECK_TIER=nightly` the geometric sweep covers the switch.
 #[test]
 fn survivors_past_the_capped_prefix_are_tested_and_fail_no_read() {
     let (detail, _) = promoted_read();
     let tested = detail.proved + detail.refuted - detail.refuted_by_labels;
     assert_eq!(tested, 64, "the 4 left of the first 64, and 60 past them");
-    let first =
-        |labels: bool, limit: usize| unions_read_of(&promoted_store(labels), PROMOTED, Some(limit));
-    let (mut low, mut high) = (16usize << 10, 4usize << 20);
-    while high - low > 256 {
-        let middle = low + (high - low) / 2;
-        match first(false, middle) {
-            Ok(_) => high = middle,
-            Err(_) => low = middle,
-        }
-    }
-    let mut limits: Vec<usize> = (0..64).map(|k| high + k * 256).collect();
-    let mut limit = 16usize << 10;
-    while limit <= 4 << 20 {
-        limits.push(limit);
-        limit += limit / 50;
-    }
-    let mut answered = 0;
-    for limit in limits {
-        if first(false, limit).is_ok() {
-            answered += 1;
-            let with = first(true, limit);
-            assert!(
-                with.is_ok(),
-                "{limit} bytes: off answered, on {:?}",
-                with.err()
-            );
-        }
-    }
+    let first = first_reads(promoted_store, PROMOTED);
+    let (low, top) = (16 << 10, 4 << 20);
+    let high = least_limit(low, top, LIMIT_STEP, |limit| first(false, limit).is_ok());
+    let on = |limit| first(true, limit);
+    let limits = sweep_limits(low, high, top, 50, || {
+        [detail_limit(low, top, LIMIT_STEP, on, |d| {
+            d.refuted_by_labels == 60
+        })]
+    });
+    let mut reached = false;
+    let (answered, _) = compare_first_reads(&first, limits, |_, detail| {
+        reached |= detail.refuted_by_labels == 60;
+    });
     println!("off answered from {high} bytes, under {answered} limits; on under each");
     assert!(answered > 0, "off answers under some limit");
+    assert!(
+        reached,
+        "no compared limit reaches the 60 label refutations"
+    );
 }
 
 /// The unions store under [`PROMOTED`] with a candidate limit of 4 and the labels on, its gap
@@ -2685,21 +2744,16 @@ fn past_prefix_store(pads: (usize, usize), past: usize) -> Arc<StoreService> {
 /// committed: where the read without the `c`s is answered, the read with them is answered. And
 /// the case is reached: some such read leaves the 3 `c`s unresolved, with the 3 `a`s refuted by
 /// the labels and `:b0` by its test, and a reason naming the request's memory envelope.
+/// By default, the reached band admits tenth steps. `NRESE_CHECK_TIER=nightly` keeps fiftieth steps.
 #[test]
 fn a_batch_past_the_capped_prefix_without_room_leaves_its_rows_unresolved() {
     use nrese_dl::limits::Limit;
-    let read = |past: usize, limit: usize| {
-        unions_read_of(
-            &past_prefix_store((100_000, 100_000), past),
-            PROMOTED,
-            Some(limit),
-        )
-    };
-    let (mut limit, mut reached) = (64usize << 10, Vec::new());
-    while limit <= 2 << 20 {
+    let read = first_reads(|past| past_prefix_store((100_000, 100_000), past), PROMOTED);
+    let mut reached = Vec::new();
+    let divisor = if nightly() { 50 } else { 10 };
+    for limit in geometric_limits(64 << 10, 2 << 20, divisor) {
         if read(0, limit).is_err() {
             println!("{limit}: failed without the `c`s");
-            limit += limit / 50;
             continue;
         }
         let (status, detail) = match read(3, limit) {
@@ -2725,7 +2779,6 @@ fn a_batch_past_the_capped_prefix_without_room_leaves_its_rows_unresolved() {
         {
             reached.push(limit);
         }
-        limit += limit / 50;
     }
     println!("the `c`s without room, the read answered, under {reached:?}");
     assert!(!reached.is_empty(), "no limit reaches the case");
@@ -2766,12 +2819,25 @@ fn a_row_costlier_than_the_capped_batches_is_left_unresolved_and_named() {
 /// the 3 `a`s refuted by the labels and both `:b0` and `:c0` unresolved (`:b0`'s batch without
 /// room for its run), its reasons name the request's memory envelope and "the next candidate's
 /// row costs more than". And the case is reached.
+/// By default, probe the first answer and both refutation switches.
+/// With `NRESE_CHECK_TIER=nightly` the test uses the geometric sweep.
 #[test]
 fn a_stop_past_the_capped_rows_is_named_beside_an_earlier_reason() {
-    let (mut limit, mut reached) = (4usize << 10, Vec::new());
-    while limit <= 2 << 20 {
-        let store = past_prefix_store((0, 100_000), 1);
-        if let Ok((_, Some((status, detail)))) = unions_read_of(&store, PROMOTED, Some(limit)) {
+    let read = first_reads(|()| past_prefix_store((0, 100_000), 1), PROMOTED);
+    let mut reached = Vec::new();
+    let (low, top) = (4 << 10, 2 << 20);
+    let limits = if nightly() {
+        geometric_limits(low, top, 50).collect()
+    } else {
+        let read = |limit| read((), limit);
+        let first = least_limit(low, top, LIMIT_STEP, |limit| read(limit).is_ok());
+        // The interval between these switches may be narrower than a band step.
+        let labels = detail_limit(low, top, 1, read, |d| d.refuted_by_labels == 3);
+        let decided = detail_limit(low, top, 1, read, |d| d.refuted == 4);
+        focused_limits(low, first, [labels, decided])
+    };
+    for limit in limits {
+        if let Ok((_, Some((status, detail)))) = read((), limit) {
             let reasons: Vec<_> = status.reasons.iter().map(|r| r.text.as_str()).collect();
             let counts = (detail.refuted_by_labels, detail.refuted, detail.proved);
             println!(
@@ -2787,7 +2853,6 @@ fn a_stop_past_the_capped_rows_is_named_beside_an_earlier_reason() {
                 reached.push(limit);
             }
         }
-        limit += limit / 50;
     }
     println!("`:b0` unresolved, then `:c0` stopped, both named, under {reached:?}");
     assert!(!reached.is_empty(), "no limit reaches the case");
