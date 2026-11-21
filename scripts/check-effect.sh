@@ -81,7 +81,7 @@ BEGIN {
     allow["main.rs|store.use_dl("] = "CLI store startup"
     allow["main.rs|.clear_inferred()"] = "CLI store startup"
     allow["main.rs|store.rematerialise(program)"] = "CLI rematerialisation"
-    allow["main.rs|let report = store.bulk_load(&request).context(\"bulk load failed\")?;"] = "CLI import"
+    allow["main.rs|let report = store.bulk_load(&request).map_err(|error| match error {"] = "CLI import"
     allow["replication.rs|let applied = store.apply_replication_log(&frames, &expected, &stop);"] = "v1.6 replication apply"
     allow["http/api_v1.rs|tokio::task::spawn_blocking(move || store.rematerialise(program))"] = "v1.6 rematerialisation"
     allow["http/api_v1.rs|store.bulk_load(&request).map_err(|error| match error {"] = "synchronous import through effect::untracked"
