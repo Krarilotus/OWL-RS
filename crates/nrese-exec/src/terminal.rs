@@ -9,6 +9,7 @@
 //! cloned after the lock is released, and wakers are woken after it.
 
 use std::future::poll_fn;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::pin::pin;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::task::{Poll, Waker, ready};
@@ -151,13 +152,16 @@ impl<O: Clone> Terminal<O> {
 /// `Clone`.
 pub struct Guard<O> {
     shared: Shared<O>,
-    /// Taken when the guard is dropped.
+    /// Taken by `finish` or when the guard is dropped.
     fallback: Option<Fallback<O>>,
 }
 
 impl<O> Guard<O> {
     /// Records `outcome` if nothing is recorded yet, and wakes the waiters. Returns whether
     /// this end was the one recorded.
+    ///
+    /// The fallback's captures stay until the guard drops. Use [`Self::finish`] for a final
+    /// end that releases them before waking the waiters.
     pub fn end(&self, outcome: O) -> bool {
         let (state, ended) = &*self.shared;
         let mut state = lock(state);
@@ -173,10 +177,16 @@ impl<O> Guard<O> {
     }
 
     /// Releases the fallback's captures, then records `outcome` and wakes the waiters.
-    /// Returns whether this end was the one recorded.
+    /// Returns whether this end was the one recorded. If dropping a capture unwinds, the
+    /// outcome is recorded and the waiters are woken before the unwind resumes.
     pub fn finish(mut self, outcome: O) -> bool {
-        drop(self.fallback.take());
-        self.end(outcome)
+        let fallback = self.fallback.take();
+        let dropped = catch_unwind(AssertUnwindSafe(|| drop(fallback)));
+        let recorded = self.end(outcome);
+        if let Err(panic) = dropped {
+            resume_unwind(panic);
+        }
+        recorded
     }
 
     /// A reader of the same end.
@@ -263,7 +273,7 @@ mod tests {
 
     // Spec: the worker's final end wakes a waiter after its fallback captures are released.
     #[test]
-    fn request_release_releases_fallback_captures_before_waking_a_waiter() {
+    fn finish_releases_fallback_captures_before_waking_a_waiter() {
         struct AtWake {
             capture: Arc<()>,
             count: AtomicUsize,
@@ -296,6 +306,38 @@ mod tests {
             Poll::Ready(Some(Outcome::Committed))
         );
         assert_eq!(witness.count.load(Ordering::SeqCst), 1);
+    }
+
+    // Spec: finish records the outcome and wakes the waiter even when capture cleanup panics.
+    #[test]
+    fn finish_records_the_outcome_when_dropping_a_fallback_capture_panics() {
+        struct Capture;
+
+        impl Drop for Capture {
+            fn drop(&mut self) {
+                panic!("dropping a fallback capture");
+            }
+        }
+
+        let capture = Capture;
+        let (reader, guard) = terminal(move || {
+            drop(capture);
+            Outcome::Unknown
+        });
+        let (wakes, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut waiter = pin!(reader.wait_or(pending()));
+        assert!(waiter.as_mut().poll(&mut cx).is_pending());
+
+        let finished = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            guard.finish(Outcome::Committed)
+        }));
+        assert!(finished.is_err());
+        assert_eq!(
+            waiter.as_mut().poll(&mut cx),
+            Poll::Ready(Some(Outcome::Committed))
+        );
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
     }
 
     /// A guard dropped before any end records its fallback; until then there is no end.
