@@ -196,6 +196,11 @@ impl AccessControl {
         self.writer.lock().expect("writer").next == 1
     }
 
+    /// The system store's recorded maintenance error, once its worker has ended.
+    pub fn maintenance_error(&self) -> Option<nrese_engine::EngineError> {
+        self.store.maintenance_error()
+    }
+
     /// What `principal` may read and write in `repository`.
     pub fn view(&self, principal: &Principal, repository: &str) -> AccessView {
         self.state().view(principal, repository)

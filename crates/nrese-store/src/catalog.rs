@@ -658,6 +658,31 @@ impl Catalog {
         list.into_iter().collect()
     }
 
+    /// Maintenance workers that ended, including the default repository's worker.
+    pub fn maintenance_errors(&self) -> Vec<(String, nrese_engine::EngineError)> {
+        let stores = {
+            let others = self.others.read();
+            std::iter::once((DEFAULT_REPOSITORY, &self.default))
+                .chain(
+                    others
+                        .iter()
+                        .map(|(id, repository)| (id.as_str(), repository)),
+                )
+                .map(|(id, repository)| {
+                    (
+                        id.to_owned(),
+                        Arc::clone(repository.pipeline.read().store()),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        // The first read of an end can log, outside both the catalog and pipeline locks.
+        stores
+            .into_iter()
+            .filter_map(|(id, store)| store.maintenance_error().map(|error| (id, error)))
+            .collect()
+    }
+
     /// Reserves `id` for a creation or removal: refused while another holds it.
     fn reserve(&self, id: &str) -> Result<Reservation<'_>, CatalogError> {
         let key = id.to_ascii_lowercase();

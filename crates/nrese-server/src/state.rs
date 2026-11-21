@@ -234,8 +234,7 @@ impl AppState {
         self.shared.default_unavailable.get().map(String::as_str)
     }
 
-    /// The repositories that can't serve: `id: unavailable` each, the default first (for
-    /// `/readyz`, which stays ready for the others).
+    /// Detailed health diagnostics for unavailable repositories and stopped maintenance workers.
     pub fn degraded(&self) -> Vec<String> {
         self.default_unavailable()
             .map(|_| DEFAULT_REPOSITORY.to_owned())
@@ -248,6 +247,19 @@ impl AppState {
                     .map(|(id, _)| id),
             )
             .map(|id| format!("{id}: unavailable"))
+            .chain(
+                self.shared
+                    .repositories
+                    .maintenance_errors()
+                    .into_iter()
+                    .map(|(id, error)| format!("{id}: {error}")),
+            )
+            .chain(
+                self.shared
+                    .access
+                    .maintenance_error()
+                    .map(|error| format!("system (access): {error}")),
+            )
             .collect()
     }
 

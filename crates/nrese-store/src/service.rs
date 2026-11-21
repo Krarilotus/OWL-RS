@@ -771,10 +771,16 @@ impl StoreService {
     }
 
     /// Waits until the engine's background maintenance has nothing requested or running
-    /// ([`Engine::settle`]): for measurements of what the store holds.
+    /// ([`Engine::settle`]), or reports that the worker ended: for measurements of what the
+    /// store holds.
     #[doc(hidden)]
-    pub fn settle(&self) {
-        self.engine.settle();
+    pub fn settle(&self) -> StoreResult<()> {
+        self.engine.settle().map_err(Into::into)
+    }
+
+    /// The background maintenance worker's recorded error, once it has ended.
+    pub fn maintenance_error(&self) -> Option<EngineError> {
+        self.engine.maintenance_error()
     }
 
     pub(crate) fn engine(&self) -> &Engine {

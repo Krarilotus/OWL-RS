@@ -177,7 +177,7 @@ pub fn measure(
     let mut tag = 0;
     // A fresh process may reopen a store an earlier one changed: its delta goes first.
     commit(SMALL.reset("r0"))?;
-    store.settle();
+    store.settle()?;
     let (mut levels_json, mut all_ok) = (Vec::new(), true);
     for &held in levels {
         let base = format!("r{tag}");
@@ -264,7 +264,7 @@ pub fn measure(
         let revision = snapshot.revision();
         drop(snapshot);
         // What the views retain: the live bytes dropping them frees on this thread.
-        store.settle();
+        store.settle()?;
         let retained = crate::bytes_freed_by(|| drop(views));
         let (a50, a99, amax) = percentiles(&mut acquire);
         let acquire_ns = format!("{:.1}, {:.1}, {:.1}", a50 * 1e6, a99 * 1e6, amax * 1e6);
@@ -331,7 +331,7 @@ fn staggered_views(
         rows,
     };
     commit(big.reset("b0"))?;
-    store.settle();
+    store.settle()?;
     let (mut views, mut commits) = (Vec::with_capacity(count), Vec::with_capacity(count));
     for k in 0..count {
         views.push(store.read_snapshot(None)?);
@@ -349,7 +349,7 @@ fn staggered_views(
         && big.held_by(&current) == big.quads(&format!("b{count}"));
     let revisions: Vec<String> = views.iter().map(|v| v.revision().to_string()).collect();
     drop(current);
-    store.settle();
+    store.settle()?;
     let freed: Vec<Option<i64>> = views
         .into_iter()
         .map(|view| crate::bytes_freed_by(|| drop(view)))
