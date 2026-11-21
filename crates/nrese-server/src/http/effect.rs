@@ -16,12 +16,12 @@ enum End<T> {
     Fallback(Option<MutationState>),
 }
 
-// If the queued task never runs, field drop order releases the work and value
-// before the guard records the fallback end.
+// If the queued task never runs, field drop order releases the work, records
+// the fallback end, then releases the held value (lifecycle rule 5).
 struct Held<T, H, W> {
     work: W,
-    value: Option<H>,
     guard: Guard<End<T>>,
+    value: Option<H>,
     #[cfg(test)]
     pause: Option<tests::PauseAfterEnd>,
 }
@@ -31,21 +31,22 @@ where
     W: FnOnce(Option<&mut H>) -> End<T>,
 {
     fn finish(self) {
-        // On unwind, the bindings drop in reverse order so the guard records the end last.
+        // On unwind, the bindings drop in reverse order so the guard records the end
+        // before releasing the held value.
         let Self {
-            guard,
             mut value,
+            guard,
             work,
             #[cfg(test)]
             pause,
         } = self;
         let outcome = work(value.as_mut());
-        drop(value);
         guard.finish(outcome);
         #[cfg(test)]
         if let Some(pause) = pause {
             pause.wait();
         }
+        drop(value);
     }
 }
 
@@ -57,8 +58,8 @@ fn spawn<T: Clone + Send + Sync + 'static, H: Send + 'static>(
     let (end, guard) = terminal(fallback);
     let held = Held {
         work,
-        value: held,
         guard,
+        value: held,
         #[cfg(test)]
         pause: tests::PAUSE_AFTER_END.take(),
     };

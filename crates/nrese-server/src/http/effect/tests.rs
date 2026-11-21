@@ -1,7 +1,6 @@
 use std::cell::Cell;
 use std::future::poll_fn;
 use std::pin::pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::task::Poll;
 
@@ -11,6 +10,7 @@ use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
 use nrese_store::{
     MutationCommand, MutationPipeline, Requester, SparqlUpdateRequest, StoreConfig, StoreService,
 };
+use tokio::sync::oneshot;
 
 use super::*;
 use crate::ai::AiSuggestionService;
@@ -25,7 +25,7 @@ thread_local! {
 }
 
 pub(super) struct PauseAfterEnd {
-    reached: tokio::sync::oneshot::Sender<()>,
+    reached: oneshot::Sender<()>,
     release: mpsc::Receiver<()>,
 }
 
@@ -36,11 +36,19 @@ impl PauseAfterEnd {
     }
 }
 
-fn pause_next_worker() -> (tokio::sync::oneshot::Receiver<()>, mpsc::Sender<()>) {
-    let (reached, waiting) = tokio::sync::oneshot::channel();
+fn pause_next_worker() -> (oneshot::Receiver<()>, mpsc::Sender<()>) {
+    let (reached, waiting) = oneshot::channel();
     let (resume, release) = mpsc::channel();
     PAUSE_AFTER_END.set(Some(PauseAfterEnd { reached, release }));
     (waiting, resume)
+}
+
+async fn resume_worker(waiting: oneshot::Receiver<()>, resume: mpsc::Sender<()>) {
+    tokio::time::timeout(Duration::from_secs(30), waiting)
+        .await
+        .expect("worker did not reach the pause in time")
+        .expect("worker dropped the pause");
+    resume.send(()).expect("worker was still paused");
 }
 
 // Spec: after an answered write, dropping the state allows an immediate reopen.
@@ -83,45 +91,52 @@ async fn request_release_allows_reopening_the_system_store() {
                 .map_err(|error| ApiError::internal(error.to_string()))
         },
     )
-    .await
-    .unwrap();
-    assert!(matches!(report, MutationCommitReport::Applied { .. }));
-    waiting.await.unwrap();
+    .await;
     drop(state);
     let reopened = open();
-    resume.send(()).expect("worker was still paused at reopen");
+    resume_worker(waiting, resume).await;
+    assert!(matches!(
+        report.unwrap(),
+        MutationCommitReport::Applied { .. }
+    ));
     reopened.expect("reopen after the write answer");
 }
 
-// Spec: returning the worker's answer releases its held value.
+// Spec: lifecycle rule 5 keeps the held value until after the normal end.
 #[tokio::test]
-async fn request_release_drops_the_held_value_by_the_answer() {
-    struct HeldValue(Arc<AtomicBool>);
+async fn held_value_is_dropped_after_the_normal_end() {
+    struct HeldValue(Option<oneshot::Sender<()>>);
 
     impl Drop for HeldValue {
         fn drop(&mut self) {
-            self.0.store(true, Ordering::SeqCst);
+            if let Some(dropped) = self.0.take() {
+                let _ = dropped.send(());
+            }
         }
     }
 
-    let dropped = Arc::new(AtomicBool::new(false));
+    let (notify_drop, mut dropped) = oneshot::channel();
     let (waiting, resume) = pause_next_worker();
     let answer = run(
         MutationTicket::new(),
         Duration::from_secs(30),
         "timeout",
         LostCancel::AwaitEnd,
-        Some(HeldValue(Arc::clone(&dropped))),
+        Some(HeldValue(Some(notify_drop))),
         |_, _| Err(ApiError::bad_request("write refused")),
     )
     .await;
+    let held_at_the_answer = matches!(dropped.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+    resume_worker(waiting, resume).await;
     assert!(matches!(answer, Err(ApiError::BadRequest(_))));
-    waiting.await.unwrap();
-    let dropped_by_the_answer = dropped.load(Ordering::SeqCst);
-    resume
-        .send(())
-        .expect("worker was still paused at the answer");
-    assert!(dropped_by_the_answer, "the worker still held the value");
+    assert!(
+        held_at_the_answer,
+        "the worker released the value before answering"
+    );
+    tokio::time::timeout(Duration::from_secs(30), dropped)
+        .await
+        .expect("worker did not drop the held value in time")
+        .unwrap();
 }
 
 fn publish_at_gate(
@@ -184,7 +199,10 @@ async fn a_disconnected_request_does_not_publish() {
         },
     ));
     let _ = poll_fn(|cx| Poll::Ready(request.as_mut().poll(cx))).await;
-    waiting.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), waiting)
+        .await
+        .expect("worker did not reach the cancellation gate in time")
+        .unwrap();
     drop(request);
     release.send(()).unwrap();
     let applied = result.await.unwrap();
@@ -199,32 +217,29 @@ async fn a_disconnected_request_does_not_publish() {
     ));
 }
 
-// Spec: even a worker that panics releases its held value before recording its answer.
+// Spec: lifecycle rule 5 records the fallback end before the held value drops on panic.
 #[tokio::test]
-async fn request_release_drops_the_held_value_before_the_fallback_end() {
+async fn held_value_is_dropped_after_the_end_is_recorded() {
     struct HeldValue {
         terminal: mpsc::Receiver<Terminal<End<()>>>,
-        released_first: tokio::sync::mpsc::UnboundedSender<bool>,
+        recorded: tokio::sync::mpsc::UnboundedSender<bool>,
     }
 
     impl Drop for HeldValue {
         fn drop(&mut self) {
-            let released_first = self
+            let recorded = self
                 .terminal
                 .try_recv()
-                .is_ok_and(|terminal| terminal.get().is_none());
-            let _ = self.released_first.send(released_first);
+                .is_ok_and(|terminal| matches!(terminal.get(), Some(End::Fallback(None))));
+            let _ = self.recorded.send(recorded);
         }
     }
 
     let (send_terminal, terminal) = mpsc::channel();
-    let (released_first, mut observed) = tokio::sync::mpsc::unbounded_channel();
+    let (recorded, mut observed) = tokio::sync::mpsc::unbounded_channel();
     let (release, gate) = mpsc::channel();
     let end = spawn(
-        Some(HeldValue {
-            terminal,
-            released_first,
-        }),
+        Some(HeldValue { terminal, recorded }),
         || End::Fallback(None),
         move |_| {
             // The work is held at a gate until the observer has the terminal.
@@ -239,8 +254,11 @@ async fn request_release_drops_the_held_value_before_the_fallback_end() {
         .await;
     assert!(matches!(answer, Some(End::Fallback(None))));
     assert!(
-        observed.recv().await.unwrap(),
-        "the fallback end was recorded before the held value was released"
+        tokio::time::timeout(Duration::from_secs(30), observed.recv())
+            .await
+            .expect("worker did not drop the held value in time")
+            .unwrap(),
+        "the worker released the value before recording the fallback end"
     );
 }
 
