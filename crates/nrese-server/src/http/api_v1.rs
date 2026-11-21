@@ -805,7 +805,8 @@ fn invalid_statements(
         ("invalid" = Option<String>, Query, description = "Statements with syntax errors: `quarantine` (the rest loads) or `strict` (the load stops); the repository's setting without")),
     request_body(content = String, description = "An RDF document (`Content-Type` names its format)"),
     responses((status = 200, description = "Loaded, inferences recomputed", body = ImportReport),
-        (status = 400, description = "Unreadable data", body = crate::http::openapi::Problem)))]
+        (status = 400, description = "Unreadable data", body = crate::http::openapi::Problem),
+        (status = 500, description = "Server error during import", body = crate::http::openapi::Problem)))]
 /// Bulk-loads the RDF document in the body (its format from `Content-Type`): into the
 /// graph `graph` for triple formats (the default graph without), replacing the
 /// repository's statements with `replace=true`. Statements with syntax errors go into the
@@ -881,10 +882,9 @@ pub async fn import(
     let loaded = super::effect::untracked(move || {
         let _file = file;
         store.bulk_load(&request).map_err(|error| match error {
-            nrese_store::StoreError::LoadPublished { .. } => ApiError::internal(error.to_string()),
-            // Keep the released answer when only the quarantine record could have changed.
-            nrese_store::StoreError::LoadQuarantineNotRecorded(_) => {
-                ApiError::bad_request(error.to_string())
+            nrese_store::StoreError::LoadPublished { .. }
+            | nrese_store::StoreError::LoadQuarantineNotRecorded(_) => {
+                ApiError::internal(error.to_string())
             }
             error if error.is_request_error() => ApiError::bad_request(error.to_string()),
             _ => super::effect::unknown(),

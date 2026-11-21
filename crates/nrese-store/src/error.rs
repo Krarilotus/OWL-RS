@@ -96,7 +96,9 @@ pub enum StoreError {
         reason: std::io::Error,
     },
     /// The quarantine record could not be kept and the load published no changes.
-    #[error("i/o error: {0}")]
+    #[error(
+        "the load published nothing. The quarantine record couldn't be kept: {0}. It's safe to send it again."
+    )]
     LoadQuarantineNotRecorded(#[source] std::io::Error),
     /// A classification or realisation request gave up waiting for the computation under
     /// way for its revision, which runs on and is kept.

@@ -617,6 +617,7 @@ fn bulk_load(store: &StoreService, load: LoadCommand) -> Result<()> {
         nrese_store::StoreError::LoadPublished { revision, reason } => anyhow::anyhow!(
             "the load completed at published revision {revision}. Its quarantine record couldn't be kept: {reason}. Don't load it again."
         ),
+        error @ nrese_store::StoreError::LoadQuarantineNotRecorded(_) => anyhow::Error::new(error),
         error => anyhow::Error::new(error).context("bulk load failed"),
     })?;
     let seconds = report.elapsed.as_secs_f64();
