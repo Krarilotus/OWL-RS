@@ -851,7 +851,8 @@ fn a_reader_whose_stop_fired_builds_nothing_and_a_kept_value_joins_no_build() {
             wrong.push("kept, a build under way");
         }
     }
-    // Case 4: a cold slot, its stop fired before the claim: nothing built, kept or claimed.
+    // Case 4: a cold slot, its stop fired before the claim: nothing built, kept or claimed
+    // (a claim let go at once would end abandoned).
     {
         let slot: Slot<u64> = Slot::default();
         let built = AtomicUsize::new(0);
@@ -859,7 +860,11 @@ fn a_reader_whose_stop_fired_builds_nothing_and_a_kept_value_joins_no_build() {
             built.fetch_add(1, SeqCst);
             3
         });
-        if got.is_some() || built.load(SeqCst) > 0 || slot.get().is_some() || !slot.build.is_idle()
+        if got.is_some()
+            || built.load(SeqCst) > 0
+            || slot.get().is_some()
+            || !slot.build.is_idle()
+            || slot.build.ends().abandoned != 0
         {
             wrong.push("cold, stopped before the claim");
         }
