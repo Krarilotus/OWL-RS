@@ -1829,8 +1829,17 @@ mod budget_tests {
     use super::*;
     use crate::batch::{self, Schema};
     use crate::delta::policy::{Plan, Policy};
-    use crate::ir::Vocabulary;
+    use crate::ir::{Atom, Term, Vocabulary};
     use crate::vocabulary::LocalVocabulary;
+
+    fn implication(name: &str, body: Vec<Atom>, head: Atom) -> Rule {
+        Rule {
+            name: name.into(),
+            body,
+            guards: Vec::new(),
+            head: Head::Facts(vec![head]),
+        }
+    }
 
     thread_local! {
         static POOL_EXPANSIONS: RefCell<Option<Arc<AtomicUsize>>> = const { RefCell::new(None) };
@@ -1853,14 +1862,23 @@ mod budget_tests {
         let mut vocab = LocalVocabulary::default();
         // Two mutually recursive rules over a cyclic graph so each candidate triggers a
         // deep proof search when its root support is deleted.
-        let rules_text = concat!(
-            "r1: (?x rdfs:e ?y), (?y rdfs:p ?z) -> (?x rdfs:p ?z)\n",
-            "r2: (?x rdfs:seed ?y) -> (?x rdfs:p ?y)\n",
-        );
-        let rules = crate::ir::parse_rules(rules_text, &mut vocab).unwrap();
+        let e = vocab.iri("http://example.com/e");
+        let p = vocab.iri("http://example.com/p");
+        let seed = vocab.iri("http://example.com/seed");
+        let [x, y, z] = [0, 1, 2].map(Term::Var);
+        let rules = [
+            implication(
+                "r1",
+                vec![Atom([x, Term::Const(e), y]), Atom([y, Term::Const(p), z])],
+                Atom([x, Term::Const(p), z]),
+            ),
+            implication(
+                "r2",
+                vec![Atom([x, Term::Const(seed), y])],
+                Atom([x, Term::Const(p), y]),
+            ),
+        ];
         let schema = Schema::owl(&mut vocab);
-        let e = vocab.iri("http://www.w3.org/2000/01/rdf-schema#e");
-        let seed = vocab.iri("http://www.w3.org/2000/01/rdf-schema#seed");
         let nodes = 40usize;
         let targets = 60usize;
         let mut asserted = Vec::new();
@@ -1963,16 +1981,32 @@ mod budget_tests {
     #[test]
     fn budget_exhaustion_does_not_report_preexisting_clash_as_introduced() {
         let mut vocab = LocalVocabulary::default();
-        let rules_text = concat!(
-            "reach: (?x rdfs:e ?y), (?y rdfs:p ?z) -> (?x rdfs:p ?z)\n",
-            "disjoint: (?x rdfs:p ?z), (?x rdfs:mark ?z) -> (?x owl:disjointWith ?z)\n",
-            "cax-dw: (?c owl:disjointWith ?d), (?x rdf:type ?c), (?x rdf:type ?d) -> false\n",
-        );
-        let rules = crate::ir::parse_rules(rules_text, &mut vocab).unwrap();
+        let e = vocab.iri("http://example.com/e");
+        let p = vocab.iri("http://example.com/p");
+        let mark = vocab.iri("http://example.com/mark");
+        let disjoint = vocab.iri("http://www.w3.org/2002/07/owl#disjointWith");
+        let [x, y, z] = [0, 1, 2].map(Term::Var);
+        let mut rules = crate::ir::parse_rules(
+            "cax-dw: (?c owl:disjointWith ?d), (?x rdf:type ?c), (?x rdf:type ?d) -> false",
+            &mut vocab,
+        )
+        .unwrap();
+        rules.extend([
+            implication(
+                "reach",
+                vec![Atom([x, Term::Const(e), y]), Atom([y, Term::Const(p), z])],
+                Atom([x, Term::Const(p), z]),
+            ),
+            implication(
+                "disjoint",
+                vec![
+                    Atom([x, Term::Const(p), y]),
+                    Atom([x, Term::Const(mark), y]),
+                ],
+                Atom([x, Term::Const(disjoint), y]),
+            ),
+        ]);
         let schema = Schema::owl(&mut vocab);
-        let e = vocab.iri("http://www.w3.org/2000/01/rdf-schema#e");
-        let p = vocab.iri("http://www.w3.org/2000/01/rdf-schema#p");
-        let mark = vocab.iri("http://www.w3.org/2000/01/rdf-schema#mark");
         let rdf_type = vocab.iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
 
         let root = vocab.iri("http://example.com/root");
