@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 
 use super::batch::{self, Schema};
-use super::ir::{Atom, Term, Violations, Vocabulary};
+use super::ir::{Violations, Vocabulary};
 use super::lists::ListVocabulary;
 use super::naive::{Triple, Violation, materialise};
 use super::rulesets::Ruleset;
@@ -3448,7 +3448,7 @@ fn a_list_reads_member_pairs_across_aliased_walks() {
     let lists = ListVocabulary::new(&mut vocabulary);
     let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
     let schema = Schema::owl(&mut vocabulary);
-    let close = |input| batch::materialise(input, &rules, Some(&lists), &schema);
+    let close = |input: &[Triple]| batch::materialise(input, &rules, Some(&lists), &schema);
     let before = close(&input);
     assert!(before.violations.consistent());
     assert!(before.diagnostics.is_empty(), "{:?}", before.diagnostics);
