@@ -394,6 +394,27 @@ fn accepting_walk_survives_incomplete_branches() {
 }
 
 #[test]
+fn accepting_walk_survives_a_side_loop() {
+    // Spec: Table 3 matches walks ending at rdf:nil. A branch with no exit
+    // contributes no walk and leaves the Table 5 prp-spo2 result intact.
+    check(
+        case(
+            "side-loop",
+            ["ex:a", "ex:out", "ex:c"],
+            vec![chain_with(
+                "
+                ex:h rdf:rest ex:loop
+                ex:loop rdf:first ex:r
+                ex:loop rdf:rest ex:loop
+                ",
+            )],
+        ),
+        &[true],
+        &[true],
+    );
+}
+
+#[test]
 #[ignore = "documented limit reasoning-semantics.md:63-65: asserting an entailed shortcut changes the first load's chain answer"]
 fn redundant_list_premise_leaves_chain_unchanged() {
     // Spec: Table 9 scm-spo and Table 5 prp-spo1 and prp-spo2 give the same
