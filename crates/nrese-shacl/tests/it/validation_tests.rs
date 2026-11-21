@@ -2442,3 +2442,79 @@ fn a_constraint_s_filled_message_comes_before_the_shape_s() {
         [(ex("a"), vec!["\"1 is wrong\"".to_owned()])]
     );
 }
+
+/// SHACL 1.0 §5.3.2: message blocks name "SELECT result variables via {?varName} or
+/// {$varName}", and a variable's name is any SPARQL 1.1 `VARNAME`, which may hold `·`
+/// (U+00B7) and letters beyond ASCII. Such a block is filled in as any other.
+#[test]
+fn a_block_naming_any_sparql_variable_is_filled() {
+    let engine = engine(
+        "ex:a ex:p 1 .",
+        "ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:sparql ex:Q .
+         ex:Q sh:message \"{?wert·größe} is wrong\" ;
+           sh:select '''SELECT $this ?wert·größe WHERE { $this <http://example.com/p> ?wert·größe }''' .",
+    );
+    let snapshot = engine.snapshot();
+    let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
+    assert_eq!(
+        messages_by_focus(&report),
+        [(ex("a"), vec!["\"1 is wrong\"".to_owned()])]
+    );
+}
+
+/// A change that leaves a result's messages in effect as they were introduces nothing: the
+/// messages are the same whether the shape gives them (§2.1.5) or the query binds the same
+/// literal as `?message` (§5.3.2). Before the change ex:a has no ex:m, so the result has the
+/// shape's message "same"; the change binds `?message` to "same".
+#[test]
+fn a_change_that_keeps_the_messages_in_effect_introduces_nothing() {
+    let store = engine(
+        "ex:a ex:p 1 .",
+        "ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:message \"same\" ;
+           sh:sparql [ sh:select '''SELECT $this ?message WHERE {
+             $this <http://example.com/p> ?o . OPTIONAL { $this <http://example.com/m> ?message } }''' ] .",
+    );
+    let (before, changed, after) = inserting(&store, "ex:a ex:m \"same\" .", None);
+    let introduced = nrese_shacl::validate_changes(
+        &before,
+        &after,
+        &compiled(&before),
+        DEFAULT,
+        &changed,
+        &Resources::default(),
+    )
+    .expect("nothing stops it");
+    assert!(
+        introduced.results.is_empty(),
+        "the same message, bound: {:?}",
+        introduced.results
+    );
+}
+
+/// A template's expansion counts against the validation's memory: 2,000 blocks naming a
+/// 4 KiB value expand to 8 MB, which a 1 MiB envelope refuses, so the validation stops with
+/// the envelope's refusal instead of a report.
+#[test]
+fn a_template_expansion_past_the_envelope_stops_the_validation() {
+    let blocks = "{?x}".repeat(2000);
+    let value = "v".repeat(4096);
+    let store = engine(
+        &format!("ex:a ex:p \"{value}\" ."),
+        &format!(
+            "ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:sparql ex:Q .
+             ex:Q sh:message \"{blocks}\" ;
+               sh:select '''SELECT $this ?x WHERE {{ $this <http://example.com/p> ?x }}''' ."
+        ),
+    );
+    let snapshot = store.snapshot();
+    let resources = Resources {
+        memory: nrese_exec::Envelope::new(Some(1 << 20), None),
+        ..Resources::default()
+    };
+    let outcome = nrese_shacl::validate(&snapshot, &compiled(&snapshot), DEFAULT, &resources);
+    assert!(
+        matches!(outcome, Err(QueryEvaluationError::MemoryLimit(_))),
+        "{:?}",
+        outcome.map(|report| report.results.len())
+    );
+}

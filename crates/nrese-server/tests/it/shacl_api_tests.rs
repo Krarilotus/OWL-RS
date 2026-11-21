@@ -436,22 +436,27 @@ async fn the_report_carries_sparql_constraint_messages() -> TestResult {
     )
     .await?;
     let report = report(&app, "/dataset/shacl").await?;
-    let mut messages: Vec<String> = report["results"]
+    // Each result's own messages: one result per constraint, each with its one message.
+    let mut messages: Vec<Vec<String>> = report["results"]
         .as_array()
         .expect("results")
         .iter()
-        .flat_map(|result| {
+        .map(|result| {
             result["resultMessage"]
                 .as_array()
-                .cloned()
-                .unwrap_or_default()
+                .into_iter()
+                .flatten()
+                .filter_map(|message| message.as_str().map(str::to_owned))
+                .collect()
         })
-        .filter_map(|message| message.as_str().map(str::to_owned))
         .collect();
     messages.sort();
     assert_eq!(
         messages,
-        ["Bob is not a full name", "add a surname to Bob"],
+        [
+            vec!["Bob is not a full name".to_owned()],
+            vec!["add a surname to Bob".to_owned()]
+        ],
         "{report}"
     );
     Ok(())
@@ -502,5 +507,46 @@ async fn a_shacl_reject_names_the_result_s_message() -> TestResult {
         detail.contains("message \"Bob is not a full name\""),
         "{detail}"
     );
+    Ok(())
+}
+
+/// A refusal lists a result's messages by their text, not by the order the store happened to
+/// learn the literals in, which other graphs decide: here the data's "zz" is learnt before the
+/// shape's "aa", and the detail still lists "aa" first.
+#[tokio::test]
+async fn a_shacl_reject_lists_messages_by_their_text() -> TestResult {
+    let config = StoreConfig {
+        shacl_gate: ShaclGate::Enforce(GateSeverity::Violation),
+        ..StoreConfig::default()
+    };
+    let app =
+        test_app_with_store_config(config, PolicyConfig::default(), ReasonerConfig::default())?;
+    put(&app, "http://example.com/other", "ex:x ex:note \"zz\" .").await?;
+    let shapes = format!(
+        "{PREFIXES}ex:Named a sh:NodeShape ; sh:targetClass ex:Person ;
+           sh:property [ sh:path ex:name ; sh:minCount 1 ; sh:message \"zz\" , \"aa\" ] ."
+    );
+    let turtle = [("content-type", "text/turtle")];
+    let response = send(
+        &app,
+        Method::PUT,
+        "/api/v1/repositories/nrese/shapes",
+        &turtle,
+        shapes,
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = send(
+        &app,
+        Method::POST,
+        "/dataset/update",
+        &[("content-type", "application/sparql-update")],
+        "INSERT DATA { <http://example.com/bob> a <http://example.com/Person> }",
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let problem: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
+    let detail = problem["detail"].as_str().expect("a detail");
+    assert!(detail.contains("message \"aa\", \"zz\""), "{detail}");
     Ok(())
 }
