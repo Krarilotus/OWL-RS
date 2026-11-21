@@ -643,6 +643,7 @@ def version(system: str) -> str:
     return IMAGES[system].rsplit(":", 1)[-1] if ":" in IMAGES[system] else "-"
 
 
+@hosts.run_snapshot
 def cmd_run(args):
     import datetime
     import platform
@@ -650,7 +651,7 @@ def cmd_run(args):
         raise SystemExit("set NRESE_BIN to the nrese-server binary")
     if args.qualified and not Path(args.qualified).is_file():
         raise SystemExit(f"no qualified totals at {args.qualified}: the qualifying run hasn't passed; nothing timed")
-    results = Path(args.results)
+    results = hosts.evidence_path(Path(args.results), hosts.private_session(), ROOT)
     results.mkdir(parents=True, exist_ok=True)
     args.date = datetime.datetime.now().isoformat(timespec="minutes")
     args.host = platform.node()

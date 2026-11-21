@@ -81,6 +81,10 @@ GATE_HOST=${GATE_HOST:-${FLEET_HOST:-}}
 anchored() { case $1 in /* | [A-Za-z]:[/\\]*) printf '%s' "$1" ;; *) printf '%s/%s' "$PWD" "$1" ;; esac; }
 GATE=$(anchored "$GATE") GATE_BIN=$(anchored "$GATE_BIN") OUT=$(anchored "$OUT")
 SPARQL_DATA=$(anchored "$SPARQL_DATA") SHARED=$(anchored "$SHARED")
+if [ -n "${FLEET_HOST:-}${GATE_HOST:-}${NRESE_BENCH_PRIVATE:-}${BENCH_INPUTS_GIT:-}${NRESE_BENCH_HOSTS+x}${NRESE_BENCH_FLOORS+x}${NRESE_BENCH_OVERLAY_REV+x}" ]; then
+  GATE_HOST="$GATE_HOST" uv run --no-project python -I benches/suite/suitekit/hosts.py evidence \
+    "$GATE" "$GATE_BIN" "$OUT" "$OUT/gate.log" "$SPARQL_DATA" "$SHARED" || exit 2
+fi
 mkdir -p "$GATE" "$GATE_BIN" "$OUT"
 # A desktop's file indexer (GNOME's localsearch on the timed host indexes all of $HOME) reads every
 # file the gate writes, during the passes: these directories are excluded from it (Tracker's

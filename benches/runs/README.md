@@ -11,7 +11,7 @@ With no overlay checkout, a private result gives an error.
 
 ```sh
 python benches/suite/suite.py ledger benches/suite/results/<run>   # write or refresh a suite run's record
-python benches/suite/suite.py ledger --all                         # every local results directory
+python benches/suite/suite.py ledger --all                         # the default public and private results directories
 python benches/suite/suite.py status --write                       # regenerate ../STATUS.md
 python benches/suite/suite.py standings --write                    # regenerate ../STANDINGS.md
 ```

@@ -163,9 +163,7 @@ def machine(runtime: str, root: Path | None = None) -> dict:
     from . import hosts
     overlay = hosts.resolve_overlay()
     out["overlay"] = overlay.identity if overlay else None
-    registry = hosts.public_registry()
-    if overlay:
-        registry = hosts.merged(registry, overlay.registry)
+    registry = hosts.load()  # the run snapshot, when recording an invocation
     host = hosts.run_identity(out, None, registry)
     out.update(host_key=host["host"], host_config=host["config"])
     # What changes timings on the host, as the run found it (hosts.toml `config` records the
@@ -328,6 +326,10 @@ class Manifest:
     directory, from here to finish() or close() (or its process's end): a second is refused."""
 
     def __init__(self, results: Path, root: Path, argv: list[str], args, runtime: str, settings: dict):
+        from . import hosts
+        if hosts.private_session():
+            for name in ("manifest.json", "manifest.json.tmp", "manifest.lock", ATTEMPTS):
+                hosts.private_output(results / name, root)
         self.path, self._owner = results / "manifest.json", contextlib.ExitStack()
         try:
             self._owner.enter_context(lock(results / "manifest.lock", wait=False))

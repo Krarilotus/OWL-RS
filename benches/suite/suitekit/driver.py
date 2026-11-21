@@ -191,12 +191,17 @@ class Suite:
         self.date = now.isoformat(timespec="minutes")
         self.stamp = now.strftime("%Y%m%d-%H%M%S-%f")
         self.host = socket.gethostname()
-        scratch_root = Path(self.settings.get("NRESE_BENCH_SCRATCH") or root / "tmp")
+        private = hosts.private_session()
+        scratch_root = Path(self.settings.get("NRESE_BENCH_SCRATCH") or
+                            (hosts.private_home() / "scratch" if private else root / "tmp"))
         self.scratch = scratch_root.resolve() / f"{ns.name('suite', root)}-{self.stamp}"
-        self.results = Path(args.results or root / "benches/suite/results" / now.strftime("%Y-%m-%d")).resolve()
+        results_home = hosts.private_home() / "results/suite" if private else root / "benches/suite/results"
+        self.results = Path(args.results or results_home / now.strftime("%Y-%m-%d")).resolve()
         if args.dry_run:
             # A dry run writes nothing that stays: its rows and logs go with the scratch.
             self.results = self.scratch / "dry-run-results"
+        self.scratch = hosts.evidence_path(self.scratch, private, root)
+        self.results = hosts.evidence_path(self.results, private, root)
         self.keep = args.keep or bool(self.settings.get("NRESE_BENCH_KEEP"))
         self.tools_installed = (root / ".cache/bench-toolbox").exists()
         if args.runtime == "docker":
@@ -892,7 +897,8 @@ class Suite:
         self.say(f"\n{','.join(keys)} / {plan.workload} {plan.tier}: the kit's driver")
         failed = None
         for n, step in enumerate(plan.driver, start=1):
-            rc = self.host_command([part.format(**values) for part in step], logs / f"step-{n}.txt")
+            rc = self.host_command([part.format(**values) for part in step], logs / f"step-{n}.txt",
+                                   env=hosts.run_environment(os.environ))
             if rc != 0:
                 failed = f"step {n} exit {rc}: log {(logs / f'step-{n}.txt').relative_to(self.results)}"
                 break
@@ -1606,6 +1612,7 @@ def images(argv: list[str], systems: dict, root: Path) -> int:
     return 0
 
 
+@hosts.run_snapshot
 def main(argv: list[str], systems: dict, workloads: dict, root: Path) -> int:
     args = arguments(argv)
     suite = Suite(args, systems, workloads, root)

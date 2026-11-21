@@ -198,6 +198,7 @@ def request(members):
     return set_id, token, 1
 
 
+@hosts.run_snapshot
 def member(root, systems):
     """Fleet step glue only: existing build/data helpers, then the unchanged suite run."""
     payload = json.loads(os.environ["SUITE_CELL"])
@@ -210,14 +211,13 @@ def member(root, systems):
         if why := publication_problem(key, systems.get(key, {})):
             print(f"{key}: {why}", file=sys.stderr)
             return 2
-    landing = Path(payload["result_root"]).expanduser() / payload["member"]
-    if landing.resolve().is_relative_to(root.resolve()):
-        raise ValueError("private result root must be outside the checkout")
+    landing = hosts.private_output(Path(payload["result_root"]).expanduser() / payload["member"], root)
+    out = hosts.private_output(Path(os.environ["FLEET_OUT"]), root)
     landing.mkdir(parents=True, exist_ok=True)
     (landing / "identity.json").write_text(json.dumps({**payload["identity"], "nrese": payload["nrese"], "harness": payload["harness"],
         "git": manifest.git(root), "machine": manifest.machine("process"), "classification": "private/free"}, indent=2), encoding="utf-8")
-    out = Path(os.environ["FLEET_OUT"])
-    env = {**os.environ, "PATH": str(Path.home() / ".cargo/bin") + os.pathsep + os.environ["PATH"]}
+    env = hosts.run_environment(os.environ)
+    env["PATH"] = str(Path.home() / ".cargo/bin") + os.pathsep + os.environ["PATH"]
     env.pop("DOCKER_CPUS", None)
     gate = Path(env["NRESE_GATE_DIR"]).expanduser()
     env.update(NRESE_GATE_DIR=str(gate), SPARQL_DATA=str(abba.rg.sparql_data()))

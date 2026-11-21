@@ -1102,6 +1102,12 @@ def pass_inputs(passes: list[dict], expected: dict | None = None) -> tuple[dict 
     return inputs, []
 
 
+def private_report(report: dict) -> bool:
+    return (hosts_registry.private_run(report.get("machine") or {})
+            or (report.get("timing_inputs") or {}).get("overlay") is not None
+            or bool((report.get("context") or {}).get("host")))
+
+
 def round_input_errors(parts: list[list[dict]]) -> list[str]:
     readings = [[report.get("timing_inputs") for report in rounds] for rounds in parts]
     if any(not valid_round_inputs(inputs) for rounds in readings for inputs in rounds):
@@ -1713,6 +1719,9 @@ CANT_INVALIDATE = 3
 def publish(path: Path, data: dict) -> None:
     """DATA as PATH's JSON, whole or not at all: written beside it, then renamed over it."""
     part = path.with_name(path.name + ".partial")
+    if data.get("receipt") and hosts_registry.private_session():
+        path = hosts_registry.private_output(path)
+        part = hosts_registry.private_output(part)
     part.write_text(json.dumps(data, indent=1), encoding="utf-8")
     os.replace(part, path)
 
@@ -3545,7 +3554,7 @@ def main() -> int:
     s.add_argument("--no-batch", action="store_true", help="no batched timing for the microsecond cases")
     s.add_argument("--keep", type=Path, help="the calibration the passes ran with: its runs stay, only blocks are new")
     s.add_argument("--sides", type=Path, help="a real gate's passes: each case's time on every side, for the budget")
-    s.add_argument("--out", type=Path, default=ROOT / "benches" / "fast" / "measure.toml")
+    s.add_argument("--out", type=Path, help="destination for the calibration")
     s = sub.add_parser("blocks", help="each block's plan of a gate (release-gate.sh plan-blocks)")
     s.add_argument("--plan", type=Path, required=True)
     s.add_argument("--measure", type=Path, required=True)
@@ -3596,6 +3605,9 @@ def main() -> int:
         passes = load_passes(args.passes)
         family = json.loads(args.family.read_text(encoding="utf-8")).get("family") if args.family else None
         context = {k: v for k, v in pairs(args.context, "--context").items()}
+        private = bool(context.get("host")) or any(private_report(p["report"]) for p in passes)
+        output = hosts_registry.evidence_path(args.out, private) if args.out else None
+        json_output = hosts_registry.evidence_path(args.json, private) if args.json else None
         timing, errors = pass_inputs(passes)
         floor = timing["floor"] if timing else None
         if args.floor and (not args.floor.is_file() or read_floor(args.floor) != floor):
@@ -3619,28 +3631,33 @@ def main() -> int:
         summary["attempt"] = record["attempt"] if record else None
         text = render(summary)
         print(text)
-        if args.out:
-            args.out.write_text(text, encoding="utf-8")
-        if args.json:
-            args.json.write_text(json.dumps(summary, indent=1, default=str), encoding="utf-8")
+        if output:
+            output.write_text(text, encoding="utf-8")
+        if json_output:
+            json_output.write_text(json.dumps(summary, indent=1, default=str), encoding="utf-8")
         return 0 if summary["passed"] else 1
     if args.command == "floor":
         summary = json.loads(args.report.read_text(encoding="utf-8"))
         floor = noise_floor(summary)
         private = hosts_registry.private_dir()
         floors = (private or ROOT / "benches" / "fast") / "noise-floor"
-        if (summary.get("timing_inputs") or {}).get("overlay") or private:
+        out = floors / f"{args.host}.toml"
+        if private_report(summary) or private:
             if private is None:
                 raise SystemExit("a private floor needs a private overlay checkout")
-            hosts_registry.private_output(floors / f"{args.host}.toml")
-        floors.mkdir(exist_ok=True)
-        out = floors / f"{args.host}.toml"
+            out = hosts_registry.private_output(out)
+        out.parent.mkdir(exist_ok=True)
         source = f"{summary['context'].get('gate_name') or args.report.parent.name} round {summary['context'].get('round', 0)}"
         out.write_text(write_floor(floor, source), encoding="utf-8")
         print(f"{out}: {sum(len(d) for d in floor['cases'].values())} dimensions of {len(floor['cases'])} cases, "
               f"{floor['blocks']} blocks")
         return 0
     if args.command in ("w3c", "guards") and args.run:
+        if hosts_registry.private_session():
+            log = args.logs if args.command == "w3c" else args.log
+            for output in (log, args.json):
+                if output:
+                    hosts_registry.private_output(output)
         # A run's earlier result (and the W3C receipt) goes before anything that can fail, its setup
         # included: a run stopped at any point leaves none, never one that speaks for what it didn't run.
         # Its own is published only once it is whole (publish()).
@@ -3717,6 +3734,9 @@ def main() -> int:
             m = PASS_FILE.search(f.name)
             found.append({"n": int(m.group(1)) if m else i, "side": m.group(2) if m else "?", "path": f.name,
                           "report": json.loads(f.read_text(encoding="utf-8"))})
+        private = any(private_report(p["report"]) for p in found)
+        home = hosts_registry.private_home() if private else ROOT / "benches" / "fast"
+        out = hosts_registry.evidence_path(args.out or home / "measure.toml", private)
         result = calibrate(cases_registry.load(), found, args.budget_min, args.max_blocks, m=args.family_size,
                            batch=not args.no_batch,
                            keep=read_measure(args.keep.read_text(encoding="utf-8")) if args.keep else None,
@@ -3726,7 +3746,8 @@ def main() -> int:
                                for i, f in enumerate(sorted(args.sides.glob("*.json")))]) if args.sides else None)
         hosts_ = sorted({str((p["report"].get("machine") or {}).get("host")) for p in found})
         source = f"{len(found)} passes on {', '.join(hosts_)} ({', '.join(sorted({p['path'] for p in found})[:2])} ...)"
-        args.out.write_text(write_measure(result, source), encoding="utf-8")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(write_measure(result, source), encoding="utf-8")
         under = {c: e for c, e in result["cases"].items() if e.get("power", 1) < TARGET_POWER}
         print(f"{len(result['cases'])} cases, family m = {result['m']}; timed part {result['minutes']} min; "
               f"blocks at most {result['cap']}; "
@@ -3827,7 +3848,8 @@ def main() -> int:
                                    [newest_attempt(path.parent, "timed") for path in args.timed])
     print(text)
     if args.out:
-        args.out.write_text(text, encoding="utf-8")
+        hosts_registry.evidence_path(args.out, any(private_report(report) for report in timed),
+                                     args.checkout).write_text(text, encoding="utf-8")
     return 0 if passed else 1
 
 

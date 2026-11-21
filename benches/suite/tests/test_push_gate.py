@@ -109,6 +109,10 @@ class Repo(unittest.TestCase):
             PATH=(self.fake / "bin").as_posix() + os.pathsep + os.environ.get("PATH", ""),
             FAKE=self.fake.as_posix(), NRESE_FLEET_BIN=(self.fake / "fleet").as_posix(),
             FLEET_OWNER="t3:test", NRESE_GATE_START_S="0", NRESE_GATE_POLL_S="0")
+        policy = self.root / "empty-policy"
+        policy.mkdir()
+        (policy / "hosts.toml").write_text("[fleet]\ngate_unconfirmed = []\n", encoding="utf-8")
+        self.env["NRESE_BENCH_PRIVATE"] = policy.as_posix()
         self.origin = self.root / "origin.git"
         self.git(self.root, "init", "-q", "--bare", str(self.origin))
         self.repo = self.root / "repo"

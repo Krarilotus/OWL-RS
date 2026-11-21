@@ -105,9 +105,11 @@ def parse(log: str) -> dict:
     return found
 
 
+@kit.hosts.run_snapshot
 def steps(args) -> int:
     subsets, shapes, engines = (args.subsets.split(","), args.shapes.split(","), args.engines.split(","))
-    out = Path(args.results or kit.RESULTS / args.label).resolve()
+    out = kit.result_dir(args.results, args.label)
+    manifest_path = kit.hosts.evidence_path(out / "manifest.json", kit.hosts.private_session(), kit.ROOT)
     (out / "reports").mkdir(parents=True, exist_ok=True)
     (out / "logs").mkdir(exist_ok=True)
     writer = kit.Writer(out / "results.csv", echo=print)
@@ -119,7 +121,7 @@ def steps(args) -> int:
                       {"runs": args.runs, "memory": args.memory, "heap": args.heap, "timeout_s": args.timeout_s,
                        "scenario": f"matched: every engine in one container capped at {args.memory} without swap, "
                                    f"all host CPUs; JVM heap {args.heap}"})
-    (out / "manifest.json").write_text(json.dumps({"invocations": [entry]}, indent=1), encoding="utf-8")
+    manifest_path.write_text(json.dumps({"invocations": [entry]}, indent=1), encoding="utf-8")
     date = entry["started"][:16]
     try:
         for rep, (subset, shape, engine) in plan:

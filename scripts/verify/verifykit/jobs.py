@@ -26,7 +26,7 @@ def host() -> str:
     Stops without it: a /verify job anywhere else could land on a timed host."""
     from suitekit import hosts  # verify.py puts benches/suite on the path
     named = hosts.fleet("verify")
-    if len(named) != 1:
+    if not named or len(named) != 1:
         raise SystemExit(f"no checks host for /verify: the private overlay's [fleet] verify names {named or 'none'} "
                          f"({hosts.PRIVATE} names the overlay)")
     return named[0]

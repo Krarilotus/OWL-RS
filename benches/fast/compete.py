@@ -56,7 +56,10 @@ SUITE_SYSTEMS = {"qlever", "oxigraph", "virtuoso", "jena", "rdf4j", "nemo", "owl
 DL_SYSTEMS = {"hermit", "openllet", "konclude", "elk"}
 LICENSED = {"graphdb", "rdfox", "stardog", "anzograph"}
 # A queue job's results directory when it runs as one (the measurement queue before the fleet), else here.
-RESULTS = Path(os.environ["QUEUE_RESULTS"]) if os.environ.get("QUEUE_RESULTS") else fast.HERE / "results"
+def results_home() -> Path:
+    private = fast.hosts.private_session()
+    default = fast.hosts.private_home() / "results/fast" if private else fast.HERE / "results"
+    return fast.hosts.evidence_path(Path(os.environ.get("QUEUE_RESULTS") or default), private, fast.ROOT)
 # The systems whose answers the others are compared with, in order (answers.py): Jena's ARQ
 # (the oracle kit's), then the next that answered; never NRESE.
 ANSWER_REFERENCES = "jena,oxigraph,virtuoso,qlever"
@@ -156,7 +159,7 @@ def copy_volume_files(case: dict):
     for spec in [case["data"], *case.get("extra", [])]:
         if spec.startswith("volume:"):
             name = fast_data_name(spec)
-            fast.docker(["run", "--rm", "-v", f"{fast.BENCH_VOLUME}:/data:ro", "-v", f"{fast.DATA_VOLUME}:/fast",
+            fast.docker(["run", "--rm", "-v", f"{fast.bench_volume()}:/data:ro", "-v", f"{fast.data_volume()}:/fast",
                          "alpine", "sh", "-c", f"test -s /fast/{name} || cp /data/{name} /fast/{name}"])
 
 
@@ -164,7 +167,7 @@ def export_closure(case: dict) -> str | None:
     """NRESE's closure of the case's data (asserted and inferred), for the stores without
     reasoning; None if it fails."""
     target = f"/fast/{case['name']}.closure.nt"
-    found = fast.docker(["run", "--rm", "-v", f"{fast.DATA_VOLUME}:/fast", "alpine", "test", "-s", target])
+    found = fast.docker(["run", "--rm", "-v", f"{fast.data_volume()}:/fast", "alpine", "test", "-s", target])
     if found.returncode == 0:
         return target
     loads = [x for f in [case["data"], *case.get("extra", [])] for x in ("--load", fast.data_file(f))]
@@ -186,7 +189,7 @@ def suite_run(case: dict, semantics: str, systems: list[str], runs: int, stamp: 
     once; `cache` the result-cache modes of the systems that have one (`off,on` for a
     replayed log)."""
     tier = f"{case['name']}~{semantics}"
-    out = RESULTS / stamp / (tier.replace("~", "-") + (f"-{track}" if track else ""))
+    out = results_home() / stamp / (tier.replace("~", "-") + (f"-{track}" if track else ""))
     cap = int(fast.capped(max(int(case["cap_gb"]), 8)))
     env = {**fast.ENV, "DOCKER_MEMORY": f"{cap}g",
            "JAVA_HEAP": f"{max(cap - 2, 2)}g", "CARGO_BUILD_JOBS": os.environ.get("CARGO_BUILD_JOBS", "4"),
@@ -204,14 +207,14 @@ def suite_run(case: dict, semantics: str, systems: list[str], runs: int, stamp: 
     command = [sys.executable, str(fast.ROOT / "benches/suite/suite.py"), "run",
                "--systems", ",".join(["nrese", *systems]), "--workloads", "fast", "--tier", f"fast={tier}",
                "--runs", str(runs), "--query-runs", "2", "--cache", cache, "--skip-build",
-               "--data", f"volume:{fast.DATA_VOLUME}", "--results", str(out), "--query-timeout-s", "120",
+               "--data", f"volume:{fast.data_volume()}", "--results", str(out), "--query-timeout-s", "120",
                "--timeout-s", "900", "--answers", "full",
                "--answers-reference", ",".join((case.get("expect") or {}).get("answers") or [ANSWER_REFERENCES])]
     print(f"  suite: {tier} on nrese, {', '.join(systems)}", flush=True)
     log = out.with_suffix(".log")
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(log, "w", encoding="utf-8") as f, fast.quiet_slot(f"compete {tier} {track}".strip()):
-        subprocess.run(command, stdout=f, stderr=subprocess.STDOUT, env=env, cwd=fast.ROOT)
+        subprocess.run(command, stdout=f, stderr=subprocess.STDOUT, env=fast.hosts.run_environment(env), cwd=fast.ROOT)
     path = out / "results.csv"
     if not path.exists():
         print(f"  no results; see {log}")
@@ -326,7 +329,7 @@ def dl_run(case: dict, systems: list[str], nrese_ms: float | None, stamp: str) -
     manifest_path = f"/work/{work}.manifest.tsv"
     script = (f"printf '%s' '{lines}' > {manifest_path} && rm -f /work/{work}.results.tsv /work/{work}.part.tsv && "
               f"mkdir -p /work/{work}-tax")
-    fast.docker(["run", "--rm", "-v", f"{fast.DATA_VOLUME}:/work", "alpine", "sh", "-c", script])
+    fast.docker(["run", "--rm", "-v", f"{fast.data_volume()}:/work", "alpine", "sh", "-c", script])
     started = time.monotonic()
     # One JVM per batch; after a timeout the runner exits (3) for a fresh one, so the rest
     # of the manifest runs again until every reasoner has a result (as reference.py does).
@@ -335,12 +338,12 @@ def dl_run(case: dict, systems: list[str], nrese_ms: float | None, stamp: str) -
         rest = (f"cut -f1,2 /work/{work}.results.tsv 2>/dev/null > /tmp/done; "
                 f"grep -v -F -f /tmp/done {manifest_path} > /work/{work}.rest.tsv || true; "
                 f"test -s /tmp/done || cp {manifest_path} /work/{work}.rest.tsv; wc -l < /work/{work}.rest.tsv")
-        left = fast.docker(["run", "--rm", "-v", f"{fast.DATA_VOLUME}:/work", "alpine", "sh", "-c", rest])
+        left = fast.docker(["run", "--rm", "-v", f"{fast.data_volume()}:/work", "alpine", "sh", "-c", rest])
         if left.stdout.strip() in ("", "0"):
             break
         with fast.quiet_slot(f"compete {case['name']} dl"):
             done = fast.docker(["run", "--rm", *fast.ns.name_args(work, fast.ROOT, fast.OWNER), f"--memory={DL_MEMORY_GB}g",
-                                f"--memory-swap={DL_MEMORY_GB}g", *fast.cpu_args(), "-v", f"{fast.DATA_VOLUME}:/work",
+                                f"--memory-swap={DL_MEMORY_GB}g", *fast.cpu_args(), "-v", f"{fast.data_volume()}:/work",
                                 fast.pinned(fast.dl_image()), "batch", f"/work/{work}.rest.tsv", f"/work/{work}.part.tsv",
                                 f"/work/{work}-tax", str(timeout_s)], timeout=timeout_s * len(systems) + 300)
         # Results so far, and a timeout for the task the runner stopped at.
@@ -354,9 +357,9 @@ def dl_run(case: dict, systems: list[str], nrese_ms: float | None, stamp: str) -
                  f"if [ {done.returncode} -eq 137 ] && [ -n \"$next\" ]; then "
                  f"echo \"$next\" | awk -F'\\t' -v OFS='\\t' '{{print $1,$2,$3,\"memory-limit\",0,\"killed at {DL_MEMORY_GB} GB\"}}' "
                  f">> /work/{work}.results.tsv; fi")
-        fast.docker(["run", "--rm", "-v", f"{fast.DATA_VOLUME}:/work", "alpine", "sh", "-c", merge])
+        fast.docker(["run", "--rm", "-v", f"{fast.data_volume()}:/work", "alpine", "sh", "-c", merge])
     wall = time.monotonic() - started
-    out = fast.docker(["run", "--rm", "-v", f"{fast.DATA_VOLUME}:/work", "alpine", "sh", "-c",
+    out = fast.docker(["run", "--rm", "-v", f"{fast.data_volume()}:/work", "alpine", "sh", "-c",
                        f"cat /work/{work}.results.tsv; for f in /work/{work}-tax/*.tax; do [ -e \"$f\" ] || continue; "
                        f"echo \"TAX $(basename $f) $(sha256sum < $f | cut -c1-16)\"; done"])
     results = {}
@@ -379,7 +382,7 @@ def dl_run(case: dict, systems: list[str], nrese_ms: float | None, stamp: str) -
         # for EL cases, else the first reasoner's that classified.
         keep = next((r for r in ("elk", "konclude", "hermit", "openllet") if results.get(r, {}).get("status") == "classified"), None)
         if keep and case.get("reference"):
-            fast.docker(["run", "--rm", "-v", f"{fast.DATA_VOLUME}:/work", "alpine", "sh", "-c",
+            fast.docker(["run", "--rm", "-v", f"{fast.data_volume()}:/work", "alpine", "sh", "-c",
                          f"mkdir -p /work/ref && cp /work/{work}-tax/{case['name']}.{keep}.tax "
                          f"/work/{case['reference'].removeprefix('/fast/')}"])
     return out
@@ -395,7 +398,7 @@ def nrese_taxonomy(case: dict, work: str, results: dict) -> str | None:
     reference = next((r for r, v in results.items() if v.get("status") == "classified"), None)
     if reference is None or not closure.exists():
         return None
-    tax = fast.docker(["run", "--rm", "-v", f"{fast.DATA_VOLUME}:/work", "alpine", "cat",
+    tax = fast.docker(["run", "--rm", "-v", f"{fast.data_volume()}:/work", "alpine", "cat",
                        f"/work/{work}-tax/{case['name']}.{reference}.tax"])
     if tax.returncode != 0:
         return None
@@ -415,7 +418,7 @@ def nemo_custom(case: dict) -> dict:
     with fast.quiet_slot(f"compete {case['name']} nemo"):
         started = time.monotonic()
         done = fast.docker(["run", "--rm", f"--memory={case['cap_gb']}g", f"--memory-swap={case['cap_gb']}g",
-                            *fast.cpu_args(), "-v", f"{fast.DATA_VOLUME}:/fast", "-v", f"{rules.parent.as_posix()}:/rules:ro",
+                            *fast.cpu_args(), "-v", f"{fast.data_volume()}:/fast", "-v", f"{rules.parent.as_posix()}:/rules:ro",
                             "--entrypoint", "sh", fast.pinned(fast.hosts.image("nrese-bench/nemo")), "-c", script], timeout=900)
         wall = time.monotonic() - started
     text = done.stdout
@@ -461,16 +464,19 @@ def split(summary: dict[str, dict], case: str) -> dict[str, dict]:
     return out
 
 
+@fast.hosts.run_snapshot
 def compete(args) -> int:
     cases = fast.select(fast.load_cases(), args)
     only = set(args.systems.split(",")) if args.systems else None
     stamp = datetime.datetime.now().strftime("%Y-%m-%d-%H%M")
     report = {"started": stamp, "git": fast.manifest.git(fast.ROOT), "cases": {}}
     licensed = getattr(args, "licensed", False)
-    (RESULTS / stamp).mkdir(parents=True, exist_ok=True)
+    batch = fast.hosts.evidence_path(results_home() / stamp, fast.hosts.private_session(), fast.ROOT)
+    report_path = fast.hosts.evidence_path(batch / "compete.json", fast.hosts.private_session(), fast.ROOT)
+    batch.mkdir(parents=True, exist_ok=True)
 
     def save():
-        (RESULTS / stamp / "compete.json").write_text(json.dumps(report, indent=1), encoding="utf-8")
+        report_path.write_text(json.dumps(report, indent=1), encoding="utf-8")
 
     # Every image the comparisons' containers run, pinned before the first one (fast.pin_images);
     # the suite's systems are pinned by the suite's own run.
@@ -600,13 +606,12 @@ def compete(args) -> int:
                                           "no_runner": []})
         save()
     save()
-    runs = sorted((RESULTS / stamp).glob("*/answers.json"))
+    runs = sorted(batch.glob("*/answers.json"))
     if runs:
         # One verdict per distinct query over every run of this batch (restricted systems left out).
         from suitekit import answers
         print()
-        answers.main([*map(str, runs), "--write", str(RESULTS / stamp / "answers.json")])
-    batch = RESULTS / stamp
+        answers.main([*map(str, runs), "--write", str(batch / "answers.json")])
     shown = batch.relative_to(fast.ROOT).as_posix() if batch.is_relative_to(fast.ROOT) else batch.as_posix()
     print(f"\nresults: {shown}/compete.json")
     print(f"record: python benches/suite/suite.py ledger {shown}"

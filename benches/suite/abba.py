@@ -857,8 +857,8 @@ def main() -> int:
             harness = os.environ.get("ABBA_HARNESS") or git(ROOT, "rev-parse", "HEAD")
             manifest = manifest_of(family, harness, int(os.environ.get("ABBA_ROUND", "1")), host,
                                    os.environ.get("FLEET_JOB", ""))
-            (Path(os.environ["FLEET_OUT"]) / "abba-manifest.json").write_text(json.dumps(manifest, indent=1),
-                                                                              encoding="utf-8")
+            path = rg.hosts_registry.private_output(Path(os.environ["FLEET_OUT"]) / "abba-manifest.json", ROOT)
+            path.write_text(json.dumps(manifest, indent=1), encoding="utf-8")
         return 0
     if args.command == "jobs":
         harness = git(Path(args.checkout), "rev-parse", args.harness or family["sides"]["b"])
@@ -876,11 +876,13 @@ def main() -> int:
         print(f"  submit: fleet submit {path}   wait: fleet wait set:{set_id}")
         return 0
     code, text, out = report(family, args.results)
+    output = rg.hosts_registry.private_output(args.out, ROOT) if args.out else None
+    data = rg.hosts_registry.private_output(args.json, ROOT) if args.json else None
     print(text)
-    if args.out:
-        args.out.write_text(text, encoding="utf-8")
-    if args.json:
-        args.json.write_text(json.dumps(out, indent=1, default=str), encoding="utf-8")
+    if output:
+        output.write_text(text, encoding="utf-8")
+    if data:
+        data.write_text(json.dumps(out, indent=1, default=str), encoding="utf-8")
     return code
 
 

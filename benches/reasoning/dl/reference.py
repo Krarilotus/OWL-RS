@@ -23,7 +23,6 @@ from suitekit import hosts, ns  # noqa: E402
 ROOT = pathlib.Path(__file__).resolve().parents[3]  # the checkout: the containers' namespace
 
 # The image, or its verified preserved alias on a host whose Docker has only that (hosts.toml).
-IMAGE = hosts.image("nrese-bench/dl-reference")
 GRACE = 30
 MEMORY, CPUS = "12g", "8"
 
@@ -45,11 +44,13 @@ def key(line):
     return (f[0], f[1])
 
 
+@hosts.run_snapshot
 def run(cases, timeout, cpus, memory, name=None):
+    image = hosts.image("nrese-bench/dl-reference")
     name = name or ns.name("dl-reference", ROOT)
     # The reasoners' image, resolved to its ID before the first task and run by it (ns.pin_images).
     try:
-        ns.pin_images([IMAGE], ROOT)
+        ns.pin_images([image], ROOT)
     except ns.ImageError as error:
         raise SystemExit(str(error))
     cases = pathlib.Path(cases).resolve()
@@ -66,7 +67,7 @@ def run(cases, timeout, cpus, memory, name=None):
         subprocess.run([ns.executable(), "rm", "-f", name], capture_output=True)
         subprocess.run(
             [ns.executable(), *ns.run_args(ROOT, "reasoning", name=name, memory=memory, cpus=cpus), "-d",
-             "-v", f"{cases.as_posix()}:/work", ns.image_id(IMAGE, ROOT), "batch", "/work/manifest.rest.tsv",
+             "-v", f"{cases.as_posix()}:/work", ns.image_id(image, ROOT), "batch", "/work/manifest.rest.tsv",
              "/work/results.part.tsv", "/work/tax", str(timeout)],
             check=True, capture_output=True)
         seen, last = 0, time.monotonic()

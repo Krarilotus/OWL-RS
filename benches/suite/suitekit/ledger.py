@@ -242,7 +242,8 @@ def main(argv: list[str], root: Path) -> int:
     args = p.parse_args(argv)
     directories = list(args.directories)
     if args.all:
-        directories += sorted(d for d in (root / "benches/suite/results").iterdir()
+        homes = (root / "benches/suite/results", hosts.private_home() / "results/suite")
+        directories += sorted(d for home in homes if home.is_dir() for d in home.iterdir()
                               if (d / "results.csv").exists())
     if not directories:
         p.error("name results directories, or --all")

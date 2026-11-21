@@ -63,8 +63,13 @@ from suitekit.workloads import fast_data_name  # noqa: E402
 from suitekit import ns  # noqa: E402
 
 # The volumes (benches/hosts.toml [volumes]; NRESE_FAST_VOLUME and NRESE_BENCH_VOLUME name others).
-DATA_VOLUME = hosts.volume("fast")
-BENCH_VOLUME = hosts.volume("data")
+def data_volume() -> str:
+    return hosts.volume("fast")
+
+
+def bench_volume() -> str:
+    return hosts.volume("data")
+
 # This checkout's own build volume, and its containers' and scratch's names: the job's
 # namespace (suitekit/ns.py); the Cargo registry is a cache every job shares.
 TARGET_VOLUME = ns.name("target", ROOT)
@@ -75,10 +80,6 @@ VOLUME_SCRATCH = f"/fast/scratch/{ns.name('scratch', ROOT)}"
 # The host lock under which shared fast data is made (generated or concatenated): one job at a time.
 FAST_LOCK = ns.lock_dir() / "fast-data.lock"
 SCRATCH = ROOT / "tmp" / "fast"
-# The compact records: in the private overlay's baselines/fast where one is set (our hosts' times),
-# else in this tree's.
-BASELINES = Path(os.environ.get("NRESE_FAST_BASELINES")
-                 or (hosts.private_dir() or ROOT / "benches") / "baselines" / "fast")
 # The full reports, outside git (the same path on the development machine and the shared host).
 REPORTS = Path(os.environ.get("NRESE_BENCH_REPORTS") or Path.home() / "nrese-bench" / "reports") / "fast"
 CASE_TIMEOUT_S = 900
@@ -138,7 +139,12 @@ def select(cases: list[dict], args) -> list[dict]:
 # Docker (benches/hosts.toml): the binaries a build host made (NRESE_FAST_BIN, laid out as a
 # target directory), the datasets from the verified inputs (read-only), generated data in a
 # directory of the host's (NRESE_FAST_DATA), peak memory from the scope's cgroup.
-RUNTIME = os.environ.get("NRESE_FAST_RUNTIME") or ("native" if hosts.lacking(["docker"]) else "docker")
+RUNTIME = os.environ.get("NRESE_FAST_RUNTIME")
+
+
+def runtime() -> str:
+    return RUNTIME or ("native" if hosts.lacking(["docker"]) else "docker")
+
 FAST_DATA = Path(os.environ.get("NRESE_FAST_DATA") or Path.home() / "nrese-bench" / "fast-data")
 # A container path at the start of a word: the native runtime's directory for it.
 CONTAINER_PATH = re.compile(r"(?<![\w./:-])(/target|/fast|/data|/src|/out|/inputs|/ore)(?=/|\s|'|\"|;|$)")
@@ -157,8 +163,8 @@ def native_dirs() -> dict[str, Path]:
                            "directory (release/examples/perf_lab, release/nrese-server, ...)")
     data = hosts.input_path("general")
     return {"/target": Path(binaries), "/fast": FAST_DATA, "/data": data or FAST_DATA / "no-datasets",
-            "/src": ROOT, "/out": SCRATCH, "/inputs": FAST_INPUTS or FAST_DATA / "no-inputs",
-            "/ore": ORE_DIR or FAST_DATA / "no-ore"}
+            "/src": ROOT, "/out": SCRATCH, "/inputs": fast_inputs() or FAST_DATA / "no-inputs",
+            "/ore": ore_dir() or FAST_DATA / "no-ore"}
 
 
 def native(text: str, dirs: dict[str, Path] | None = None) -> str:
@@ -170,13 +176,13 @@ def native(text: str, dirs: dict[str, Path] | None = None) -> str:
 def files(script: str) -> subprocess.CompletedProcess:
     """A shell script over the fast data (/fast), the datasets (/data, read-only) and the
     verified inputs (/inputs, read-only): in an Alpine container, or natively."""
-    if RUNTIME == "native":
+    if runtime() == "native":
         FAST_DATA.mkdir(parents=True, exist_ok=True)
         return subprocess.run(["sh", "-c", native(script)], capture_output=True, text=True, encoding="utf-8",
                               errors="replace")
-    mounts = ["-v", f"{DATA_VOLUME}:/fast", "-v", f"{BENCH_VOLUME}:/data:ro"]
-    if FAST_INPUTS is not None:
-        mounts += ["-v", f"{host_path(FAST_INPUTS)}:/inputs:ro"]
+    mounts = ["-v", f"{data_volume()}:/fast", "-v", f"{bench_volume()}:/data:ro"]
+    if fast_inputs() is not None:
+        mounts += ["-v", f"{host_path(fast_inputs())}:/inputs:ro"]
     return docker(["run", "--rm", *mounts, "alpine", "sh", "-c", script])
 
 
@@ -243,12 +249,12 @@ def container(kind: str, cap_gb: float, command: list[str], env: dict | None = N
     name = ns.name(f"fast-{kind}", ROOT)
     cap_gb = capped(cap_gb)
     SCRATCH.mkdir(parents=True, exist_ok=True)
-    if RUNTIME == "native":
+    if runtime() == "native":
         return process(name, cap_gb, command, env, timeout, measured)
     argv = ["run", "--rm", *ns.name_args(name, ROOT, OWNER), f"--memory={cap_gb}g", f"--memory-swap={cap_gb}g", *cpu_args(),
             *quiet_label(),
-            "-v", f"{TARGET_VOLUME}:/target:ro", "-v", f"{DATA_VOLUME}:/fast",
-            "-v", f"{BENCH_VOLUME}:/data:ro", "-v", f"{host_path(ROOT)}:/src:ro",
+            "-v", f"{TARGET_VOLUME}:/target:ro", "-v", f"{data_volume()}:/fast",
+            "-v", f"{bench_volume()}:/data:ro", "-v", f"{host_path(ROOT)}:/src:ro",
             "-v", f"{host_path(SCRATCH)}:/out"]
     for key, value in (env or {}).items():
         argv += ["-e", f"{key}={value}"]
@@ -484,7 +490,7 @@ BUILD = [
 
 
 def build(args) -> int:
-    if RUNTIME == "native":
+    if runtime() == "native":
         sys.exit("the native runtime builds nothing: a build host's binaries come in NRESE_FAST_BIN "
                  "(scripts/cargo-guarded.sh build --release --locked with the packages of fast.py BUILD)")
     pin_images([rust_image()])
@@ -521,8 +527,13 @@ def data_file(spec: str) -> str:
 
 # Verified inputs on this host (benches/hosts.toml; the variables override): the ORE corpus,
 # and a read-only copy of the data volume's converted ontologies and reference taxonomies.
-ORE_DIR = hosts.input_path("ore")
-FAST_INPUTS = hosts.input_path("fast")
+def ore_dir() -> Path | None:
+    return hosts.input_path("ore")
+
+
+def fast_inputs() -> Path | None:
+    return hosts.input_path("fast")
+
 
 
 def seed_from_inputs(target: str) -> bool:
@@ -532,9 +543,9 @@ def seed_from_inputs(target: str) -> bool:
     if files(f"test -s {target}").returncode == 0:
         return True
     relative = target.removeprefix("/fast/")
-    if FAST_INPUTS is None or not (FAST_INPUTS / relative).is_file():
+    if fast_inputs() is None or not (fast_inputs() / relative).is_file():
         return False
-    print(f"  copying {relative} from {FAST_INPUTS}", flush=True)
+    print(f"  copying {relative} from {fast_inputs()}", flush=True)
     parent = Path(target).parent.as_posix()
     files(f"mkdir -p {parent} && for f in /inputs/{relative} /inputs/{relative}.*; do "
           f"[ -e \"$f\" ] && cp -r \"$f\" {parent}/; done; true")
@@ -602,7 +613,7 @@ def warm_inputs(case: dict) -> int:
     """Reads a warm case's input files once before its timing, so that every pass meets them
     in the page cache whatever ran before (a large case evicting them, the first pass after
     prepare); the bytes read. Cold runs empty the cache themselves (drop_page_cache)."""
-    if RUNTIME != "native" or "cold" in case.get("page_cache", ["warm"]):
+    if runtime() != "native" or "cold" in case.get("page_cache", ["warm"]):
         return 0
     total = 0
     for path in input_files(case):
@@ -628,7 +639,7 @@ def pinned_cpus() -> str | None:
 def host_state() -> dict | None:
     """The host's state now (scripts/hosts/hygiene.py): frequency policy, THP, load, others
     busy; None off Linux."""
-    if RUNTIME != "native" or not Path("/proc/self").exists():
+    if runtime() != "native" or not Path("/proc/self").exists():
         return None
     cpus = pinned_cpus()
     done = subprocess.run([sys.executable, str(ROOT / "scripts" / "hosts" / "hygiene.py"),
@@ -716,17 +727,17 @@ def ensure_ore(name: str):
     target = f"/fast/ore/{name}.nt"
     if seed_from_inputs(target):
         return
-    if ORE_DIR is None or not (ORE_DIR / f"{name}.owl").exists():
-        raise RuntimeError(f"missing input: {name}.owl, ORE 2015 corpus at {ORE_DIR or 'no path'} "
+    if ore_dir() is None or not (ore_dir() / f"{name}.owl").exists():
+        raise RuntimeError(f"missing input: {name}.owl, ORE 2015 corpus at {ore_dir() or 'no path'} "
                            "(benches/hosts.toml inputs.ore, or NRESE_ORE_DIR)")
-    if RUNTIME == "native":
+    if runtime() == "native":
         raise RuntimeError(f"missing input: ore/{name}.nt (the native runtime converts no ontology: the DL kit's "
                            "converter runs in Docker; the verified inputs, hosts.toml inputs.fast, hold the converted ones)")
     print(f"  converting {name} to N-Triples", flush=True)
     script = (f"mkdir -p /fast/ore && cp /ore/{name}.owl /fast/ore/{name}.owl && "
               f"printf '{name}\\tconvert\\tntriples\\t/fast/ore/{name}.owl\\n' > /fast/ore/{name}.manifest.tsv")
-    docker(["run", "--rm", "-v", f"{DATA_VOLUME}:/fast", "-v", f"{host_path(ORE_DIR)}:/ore:ro", "alpine", "sh", "-c", script])
-    docker(["run", "--rm", "--memory=10g", "-v", f"{DATA_VOLUME}:/fast", pinned(dl_image()), "batch",
+    docker(["run", "--rm", "-v", f"{data_volume()}:/fast", "-v", f"{host_path(ore_dir())}:/ore:ro", "alpine", "sh", "-c", script])
+    docker(["run", "--rm", "--memory=10g", "-v", f"{data_volume()}:/fast", pinned(dl_image()), "batch",
             f"/fast/ore/{name}.manifest.tsv", f"/fast/ore/{name}.results.tsv", "/fast/ore", "600"], timeout=900)
     files(f"rm -f /fast/ore/{name}.owl /fast/ore/{name}.manifest.tsv /fast/ore/{name}.results.tsv")
     if files(f"test -s {target}").returncode != 0:
@@ -823,7 +834,7 @@ def queries_path(case: dict, expect: dict) -> str | None:
         # set kept with the data (NRESE_FAST_QUERY_SETS/NAME: WatDiv's, never committed; their
         # SHA-256 in benches/sparql/queries.sha256, checked by release-gate.sh prepare).
         kept = os.environ.get("NRESE_FAST_QUERY_SETS")
-        if kept and RUNTIME == "native" and (Path(kept) / name[1:]).is_dir():
+        if kept and runtime() == "native" and (Path(kept) / name[1:]).is_dir():
             return (Path(kept) / name[1:]).as_posix()
         return f"/src/benches/competitors/queries/{name[1:]}"
     if name in ("lubm", "owl2bench"):
@@ -1120,7 +1131,7 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
             if code != 0:
                 break
         # The tool names each file as it was given: natively, by its host path.
-        named = native(data) if RUNTIME == "native" else data
+        named = native(data) if runtime() == "native" else data
         main = [r for r in rows if r["file"] == named]
         alt = [r for r in rows if r["file"] != named]
         result = dict(main[0]) if main else {}
@@ -1894,7 +1905,7 @@ def loaded_digest(key: str) -> str | None:
         container = data_file(f"volume:{key}")
     try:
         # The Docker runtime reads them from a volume this process can't hash: unknown, said so.
-        path = Path(native(container)) if RUNTIME == "native" else None
+        path = Path(native(container)) if runtime() == "native" else None
         stat = path.stat() if path else None
     except (OSError, RuntimeError):
         stat = None
@@ -1969,16 +1980,22 @@ def share(paths: list[Path], index: dict, shared: Path, data: Path) -> None:
         index[next(iter(group))] = group
 
 
+@hosts.run_snapshot
 def prepare(args) -> int:
     """`prepare`: the selected cases' data, generated once by this perf lab (NRESE_FAST_BIN:
     the harness revision's, for every side of a gate), and FAST_DATA/PREPARED.json: every file
     the cases read, generated or a dataset, with its size, modification time and SHA-256.
     `run --prepared` then generates nothing and checks the files before and after its pass."""
-    if RUNTIME != "native":
+    if runtime() != "native":
         sys.exit("prepare is the native runtime's (a release gate's host)")
     cases = select(load_cases(), args)
     entries, failed = {}, {}
+    private = hosts.private_session()
+    manifest_path = hosts.evidence_path(FAST_DATA / PREPARED, private, ROOT)
     index_path = SHARED / "index" / f"{generator_key()}.json" if SHARED else None
+    if index_path:
+        index_path = hosts.evidence_path(index_path, private, ROOT)
+        index_part = hosts.evidence_path(index_path.with_suffix(".partial"), private, ROOT)
     index = json.loads(index_path.read_text(encoding="utf-8")) if index_path and index_path.is_file() else {}
     adopted = 0
     for case in cases:
@@ -2007,10 +2024,9 @@ def prepare(args) -> int:
             print(f"NOT prepared {case['name']}: {failed[case['name']]}", flush=True)
     if index_path:
         index_path.parent.mkdir(parents=True, exist_ok=True)
-        index_path.with_suffix(".partial").write_text(json.dumps(index, indent=0), encoding="utf-8")
-        os.replace(index_path.with_suffix(".partial"), index_path)
+        index_part.write_text(json.dumps(index, indent=0), encoding="utf-8")
+        os.replace(index_part, index_path)
         print(f"shared data ({SHARED}): {adopted} data files linked in, not generated")
-    manifest_path = FAST_DATA / PREPARED
     manifest_path.write_text(json.dumps({"git": manifest.git(ROOT), "binaries": binaries(),
                                          "cases": [c["name"] for c in cases if c["name"] not in failed],
                                          "failed": failed, "files": entries}, indent=1), encoding="utf-8")
@@ -2098,8 +2114,9 @@ def suite_rows(report: dict, cases: list[dict]) -> list:
     return rows
 
 
+@hosts.run_snapshot
 def run(args) -> int:
-    if RUNTIME == "native":
+    if runtime() == "native":
         try:
             native_dirs()
         except RuntimeError as error:
@@ -2109,10 +2126,6 @@ def run(args) -> int:
                  "the cases as host processes")
     catalog = load_cases()
     cases = select(catalog, args)
-    if RUNTIME != "native":
-        # Every image the cases' containers use, pinned before the first case (pin_images).
-        ore = any(spec.startswith("ore:") for c in cases for spec in [c["data"], *c.get("extra", [])])
-        pin_images([rust_image(), *([dl_image()] if ore else [])])
     OPTIONS.update(prepared=getattr(args, "prepared", False), routes=not getattr(args, "no_routes", False),
                    empty_queries=getattr(args, "empty_queries", False))
     # A timed gate's pass (scripts/release-gate.sh sets NRESE_TIMED_GATE) reads prepared data
@@ -2126,7 +2139,7 @@ def run(args) -> int:
     if getattr(args, "measure", None):
         found, OPTIONS["measure"] = load_measure(Path(args.measure))
         MEASURE.update(found)
-    OPTIONS["cpus"] = pinned_cpus() if RUNTIME == "native" else None
+    OPTIONS["cpus"] = pinned_cpus() if runtime() == "native" else None
     prepared = None
     if OPTIONS["prepared"]:
         prepared = prepared_inputs(cases)
@@ -2135,13 +2148,21 @@ def run(args) -> int:
             return 2
     label = args.label or (manifest.git(ROOT).get("commit") or "nrese")[:8]
     started = datetime.datetime.now()
-    # The full report outside git; the repository keeps its compact record (README, "What is kept").
-    REPORTS.mkdir(parents=True, exist_ok=True)
-    BASELINES.mkdir(parents=True, exist_ok=True)
-    out = (Path(args.out) if args.out else REPORTS / f"{started:%Y-%m-%d}-{label}.json").resolve()
+    machine = manifest.machine(runtime(), ROOT)
+    private = hosts.private_run(machine)
+    out = hosts.evidence_path(Path(args.out) if args.out else REPORTS / f"{started:%Y-%m-%d}-{label}.json",
+                              private, ROOT).resolve()
+    home = (hosts.private_dir() or hosts.private_home()) if private else ROOT / "benches"
+    baselines = Path(os.environ.get("NRESE_FAST_BASELINES") or home / "baselines" / "fast")
+    compact_path = hosts.evidence_path(baselines / out.name, private, ROOT)
+    rows = hosts.evidence_path(Path(args.rows), private, ROOT) if getattr(args, "rows", None) else None
+    if runtime() != "native":
+        ore = any(spec.startswith("ore:") for c in cases for spec in [c["data"], *c.get("extra", [])])
+        pin_images([rust_image(), *([dl_image()] if ore else [])])
     out.parent.mkdir(parents=True, exist_ok=True)
+    compact_path.parent.mkdir(parents=True, exist_ok=True)
     report = {"label": label, "started": started.isoformat(timespec="seconds"), "started_ns": time.time_ns(),
-              "git": manifest.git(ROOT), "machine": manifest.machine(RUNTIME, ROOT), "runtime": RUNTIME,
+              "git": manifest.git(ROOT), "machine": machine, "runtime": runtime(),
               "reps": args.reps, "planned_cases": [c["name"] for c in cases],
               "all_cases": [c["name"] for c in catalog], "case_manifest": case_manifest(catalog),
               "options": dict(OPTIONS), "records": []}
@@ -2150,7 +2171,7 @@ def run(args) -> int:
     # The host as the pass met it, and as it left it: a governor, boost or another user's work
     # that differs between passes is in the passes' own reports (release_gate.py reports it).
     report["host_state"] = host_state()
-    if RUNTIME == "native":
+    if runtime() == "native":
         # What the binaries are: they come from a build host, not from this checkout.
         report["binaries"] = binaries()
     else:
@@ -2193,21 +2214,21 @@ def run(args) -> int:
             out.write_text(json.dumps(report, indent=1), encoding="utf-8")
     report["git_finished"] = manifest.git(ROOT)
     report["host_state_finished"] = host_state()
-    if RUNTIME == "native":
+    if runtime() == "native":
         report["binaries_finished"] = binaries()
     if prepared:
         # The prepared data must be what it was at the start of the pass, file by file.
         report["prepared"]["changed"] = changed_inputs(prepared["files"])
-    if RUNTIME != "native":
+    if runtime() != "native":
         report["images"] = ns.pinned(ROOT)  # what the cases ran: the job's image IDs
     report["finished_ns"] = time.time_ns()
     report["finished"] = datetime.datetime.now().isoformat(timespec="seconds")
     report["duration_s"] = round((datetime.datetime.now() - started).total_seconds(), 1)
     out.write_text(json.dumps(report, indent=1), encoding="utf-8")
-    kept = write_compact(out, BASELINES / out.name)
-    if getattr(args, "rows", None):
+    kept = write_compact(out, compact_path)
+    if rows:
         from suitekit.schema import Writer
-        writer = Writer(Path(args.rows))
+        writer = Writer(rows)
         for row in suite_rows(report, cases):
             writer.write(row)
     bad = not_as_expected(report["records"], getattr(args, "off_route_ok", False))
@@ -2324,6 +2345,7 @@ def use_side(side: dict) -> None:
     OPTIONS.update(routes=side["routes"], empty_queries=side["empty_queries"], timing=side["timing"])
 
 
+@hosts.run_snapshot
 def block(args) -> int:
     """`block`: one block of a release gate: every case run on every side as a palindrome
     (palindrome()), the runs written as one report per side and run, `pass-<n>-<side>.json`
@@ -2331,7 +2353,7 @@ def block(args) -> int:
     and nanosecond start and end. `--seed`: the orientation and the cases' order drawn from it;
     `--fresh-copies DIR`: every side's binaries timed from a copy made for this block
     (fresh_copies()), removed after it."""
-    if RUNTIME != "native":
+    if runtime() != "native":
         sys.exit("block is the native runtime's (a release gate's host)")
     sides = [parse_side(s) for s in args.side]
     catalog = load_cases()
@@ -2366,6 +2388,7 @@ def absent_sides(catalog: list[dict]) -> dict[tuple[str, str], str]:
     return release_gate.declared_absent(catalog, policy)
 
 
+@hosts.run_snapshot
 def timed_block(args, sides: list[dict], catalog: list[dict], cases: list[dict], prepared: dict,
                 order: list[tuple[str, int]], place: dict, seed: str | None,
                 absent: dict[tuple[str, str], str] | None = None) -> int:
@@ -2375,10 +2398,13 @@ def timed_block(args, sides: list[dict], catalog: list[dict], cases: list[dict],
     absent = absent or {}
     by_name = {s["name"]: s for s in sides}
     started = time.time_ns()
-    machine = manifest.machine(RUNTIME)
+    machine = manifest.machine(runtime())
     timing_inputs = round_inputs(os.environ.get("GATE_HOST") or machine.get("fleet_host") or machine["host"])
+    private = hosts.private_run(machine) or timing_inputs["overlay"] is not None
+    paths = {(name, run): hosts.evidence_path(args.out / f"pass-{place[(name, run)]}-{name}.json", private, ROOT)
+             for name, run in order}
     common = {"started": datetime.datetime.now().isoformat(timespec="seconds"), "git": manifest.git(ROOT),
-              "machine": machine, "timing_inputs": timing_inputs, "runtime": RUNTIME, "reps": 1, "block": args.block,
+              "machine": machine, "timing_inputs": timing_inputs, "runtime": runtime(), "reps": 1, "block": args.block,
               "layout": args.layout, "planned_cases": [c["name"] for c in cases], "seed": seed,
               "orientation": [name for name, run in order if run == 1],
               "case_manifest": case_manifest(catalog), "host_state": host_state(),
@@ -2425,7 +2451,7 @@ def timed_block(args, sides: list[dict], catalog: list[dict], cases: list[dict],
                       started_ns=min((r["started_ns"] for r in records), default=started),
                       finished_ns=max((r["finished_ns"] for r in records), default=time.time_ns()))
         report["prepared"] = {**report["prepared"], "changed": changed}
-        (args.out / f"pass-{place[(name, run)]}-{name}.json").write_text(json.dumps(report, indent=1), encoding="utf-8")
+        paths[(name, run)].write_text(json.dumps(report, indent=1), encoding="utf-8")
         bad += len(not_as_expected(records))
     print(f"block {args.block}: {len(cases)} cases x {len(order)} runs, layout {args.layout}; {bad} runs not as expected")
     return 1 if bad else 0
@@ -2442,10 +2468,11 @@ def write_compact(full: Path, target: Path) -> Path:
     and where the full report is, with its hash."""
     data = full.read_bytes()
     report = json.loads(data)
+    target = hosts.evidence_path(target, hosts.private_run(report.get("machine") or {}), ROOT)
     home = Path.home()
     where = f"~/{full.relative_to(home).as_posix()}" if full.is_relative_to(home) else full.as_posix()
     keep = {k: v for k, v in report.items() if k != "records"}
-    keep["full_report"] = {"path": where, "host": socket.gethostname(), "bytes": len(data),
+    keep["full_report"] = {"path": where, "host": (report.get("machine") or {}).get("host"), "bytes": len(data),
                            "sha256": hashlib.sha256(data).hexdigest()}
     keep["records"] = [compact_record(r) for r in report["records"]]
     target.write_text(json.dumps(keep, indent=1), encoding="utf-8")
@@ -2533,7 +2560,7 @@ def clean(args) -> int:
     volume only with `--data`, by hand, and never while a container uses it: it is shared by
     every job on the host and holds copies of the verified inputs besides the generated data."""
     import shutil
-    if RUNTIME == "native":
+    if runtime() == "native":
         shutil.rmtree(SCRATCH, ignore_errors=True)
         files(f"rm -rf {VOLUME_SCRATCH}")
         print(f"removed {SCRATCH} and {VOLUME_SCRATCH}")
@@ -2546,14 +2573,14 @@ def clean(args) -> int:
     shutil.rmtree(SCRATCH, ignore_errors=True)
     print(f"removed {SCRATCH} and {VOLUME_SCRATCH}" + (f"; this checkout's {', '.join(removed)}" if removed else ""))
     if not args.data:
-        print(f"kept the volume {DATA_VOLUME} (shared; `clean --data` removes it)")
+        print(f"kept the volume {data_volume()} (shared; `clean --data` removes it)")
         return 0
-    users = docker(["ps", "-a", "--filter", f"volume={DATA_VOLUME}", "--format", "{{.Names}}"]).stdout.split()
+    users = docker(["ps", "-a", "--filter", f"volume={data_volume()}", "--format", "{{.Names}}"]).stdout.split()
     if users:
-        print(f"kept the volume {DATA_VOLUME}: in use by {', '.join(users)}")
+        print(f"kept the volume {data_volume()}: in use by {', '.join(users)}")
         return 1
-    done = docker(ns.volume("rm", DATA_VOLUME))
-    print(f"removed the volume {DATA_VOLUME}" if done.returncode == 0 else f"volume {DATA_VOLUME}: {done.stderr.strip()}")
+    done = docker(ns.volume("rm", data_volume()))
+    print(f"removed the volume {data_volume()}" if done.returncode == 0 else f"volume {data_volume()}: {done.stderr.strip()}")
     return done.returncode
 
 

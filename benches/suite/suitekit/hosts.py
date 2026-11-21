@@ -23,6 +23,7 @@ from a private overlay, the hosts themselves and the verified inputs on those th
 """
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 import os
@@ -31,7 +32,9 @@ import socket
 import subprocess
 import tomllib
 from collections.abc import Iterable
+from contextvars import ContextVar
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 
 HOSTS = Path(__file__).resolve().parents[2] / "hosts.toml"
@@ -42,6 +45,8 @@ PRIVATE = "NRESE_BENCH_PRIVATE"
 # A fleet job carries this envelope because fleet stages only the job's checkout.
 HOSTS_TEXT, FLOORS_TEXT, OVERLAY_REV = "NRESE_BENCH_HOSTS", "NRESE_BENCH_FLOORS", "NRESE_BENCH_OVERLAY_REV"
 CHANNELS = (HOSTS_TEXT, FLOORS_TEXT, OVERLAY_REV)
+UNBOUND = object()
+_run_overlay = ContextVar("run_overlay", default=UNBOUND)
 
 
 def git(where: Path, *args: str) -> str:
@@ -124,6 +129,8 @@ def git_overlay(repo: Path) -> tuple[str, str]:
 
 def resolve_overlay(environ: dict | None = None) -> Overlay | None:
     """Resolve an envelope, an explicit live folder, or the inputs repository's HEAD."""
+    if environ is None and (bound := _run_overlay.get()) is not UNBOUND:
+        return bound[0]
     env = os.environ if environ is None else environ
     explicit, repo = env.get(PRIVATE), env.get("BENCH_INPUTS_GIT")
     folder = None
@@ -157,6 +164,51 @@ def resolve_overlay(environ: dict | None = None) -> Overlay | None:
             not isinstance(table, dict) for table in readings.values()):
         raise ValueError("the private bench overlay must contain TOML tables")
     return Overlay(folder, text, floors, registry, readings)
+
+
+def run_snapshot(run):
+    """Every host lookup in a run, including its manifest, sees one overlay."""
+    @wraps(run)
+    def wrapped(*args, **kwargs):
+        if _run_overlay.get() is not UNBOUND:
+            return run(*args, **kwargs)
+        overlay = resolve_overlay()
+        registry = public_registry()
+        if overlay:
+            registry = merged(registry, overlay.registry)
+        token = _run_overlay.set((overlay, datetime.datetime.now().isoformat(timespec="seconds"), registry))
+        try:
+            return run(*args, **kwargs)
+        finally:
+            _run_overlay.reset(token)
+    return wrapped
+
+
+def run_environment(environ):
+    """Pass the run's resolved overlay to a nested benchmark process."""
+    child = dict(environ)
+    for key in (*CHANNELS, PRIVATE, "BENCH_INPUTS_GIT"):
+        child.pop(key, None)
+    overlay = resolve_overlay()
+    if overlay:
+        child.update(overlay.environment())
+    return child
+
+
+def private_run(machine: dict) -> bool:
+    return machine.get("overlay") is not None or bool(machine.get("fleet_host"))
+
+
+def private_session() -> bool:
+    return resolve_overlay() is not None or bool(os.environ.get("FLEET_HOST"))
+
+
+def private_home() -> Path:
+    return Path.home() / "owlrs" / "private"
+
+
+def evidence_path(path: Path, private: bool, checkout: str | Path = ROOT) -> Path:
+    return private_output(path, checkout) if private else path
 
 
 def private_dir(environ: dict | None = None) -> Path | None:
@@ -197,7 +249,8 @@ def private_output(path: Path, checkout: str | Path = ROOT) -> Path:
     absolute = Path(os.path.abspath(path))
     if any(resolved.is_relative_to(root) or absolute.is_relative_to(root)
            for root in (ROOT.resolve(), Path(checkout).resolve())) or any(
-           (parent / "benches" / "suite" / "suitekit" / "hosts.py").is_file() for parent in resolved.parents):
+           (parent / "benches" / "suite" / "suitekit" / "hosts.py").is_file()
+           for candidate in (resolved, absolute) for parent in (candidate, *candidate.parents)):
         raise ValueError(f"private benchmark output belongs outside the public checkout: {path}")
     return resolved
 
@@ -233,6 +286,8 @@ def merged(public: dict, overlay: dict) -> dict:
 
 
 def load(path: Path = HOSTS, environ: dict | None = None) -> dict:
+    if path == HOSTS and environ is None and (bound := _run_overlay.get()) is not UNBOUND:
+        return bound[2]
     registry = public_registry(path)
     overlay = resolve_overlay(environ)
     return merged(registry, overlay.registry) if overlay else registry
@@ -325,9 +380,11 @@ def configuration(key: str, at: str | None = None, registry: dict | None = None)
     """Host `key`'s configuration in force at `at` (an ISO time, the host's local time; now
     if None): the newest `config` entry whose `since` isn't after it, or None if hosts.toml
     lists none for the host (or `at` is before the first)."""
-    import datetime
     registry = load() if registry is None else registry
-    at = (at or datetime.datetime.now().isoformat(timespec="seconds"))[:19]
+    if not at:
+        bound = _run_overlay.get()
+        at = datetime.datetime.now().isoformat(timespec="seconds") if bound is UNBOUND else bound[1]
+    at = at[:19]
     entries = sorted(registry.get("host", {}).get(key, {}).get("config", []), key=lambda c: c["since"], reverse=True)
     return next((c for c in entries if c["since"][:19] <= at), None)
 
@@ -349,10 +406,13 @@ def run_identity(machine: dict, started: str | None, registry: dict | None = Non
     return {"host": key, "config": config, "governor": machine.get("governor"), **overlay}
 
 
-def fleet(name: str, registry: dict | None = None) -> list[str]:
-    """The overlay's [fleet] list `name` (host keys), empty without one."""
-    registry = load() if registry is None else registry
-    keys = registry.get("fleet", {}).get(name, [])
+def fleet(name: str) -> list[str] | None:
+    """A configured fleet list, or None if its source or key is absent."""
+    overlay = resolve_overlay()
+    table = overlay.registry.get("fleet", {}) if overlay else {}
+    if name not in table:
+        return None
+    keys = table[name]
     if not isinstance(keys, list) or any(not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", key)
                                         for key in keys):
         raise ValueError(f"invalid fleet host list: {name}")
@@ -361,9 +421,17 @@ def fleet(name: str, registry: dict | None = None) -> list[str]:
 
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) != 3 or sys.argv[1] != "fleet":
-        sys.exit("usage: hosts.py fleet NAME")
     try:
-        print(" ".join(fleet(sys.argv[2])))
+        if len(sys.argv) == 3 and sys.argv[1] == "fleet":
+            keys = fleet(sys.argv[2])
+            if keys is None:
+                sys.exit(f"no private fleet policy for {sys.argv[2]}")
+            print(" ".join(keys))
+        elif len(sys.argv) >= 3 and sys.argv[1] == "evidence":
+            if private_session() or os.environ.get("GATE_HOST"):
+                for name in sys.argv[2:]:
+                    private_output(Path(name))
+        else:
+            sys.exit("usage: hosts.py fleet NAME | evidence PATH...")
     except (OSError, ValueError) as error:
         sys.exit(str(error))

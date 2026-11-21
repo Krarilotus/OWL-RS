@@ -35,8 +35,8 @@
 # never formally verified) is reported as unconfirmed and the gate runs again on another host
 # (NRESE_GATE_CONFIRM_HOSTS, default its gate_confirm, for windows gate_confirm_windows;
 # benches/suite/suitekit/hosts.py fleet). The tree fails only if that run fails too; if it
-# passes, the pass counts and both jobs are named as a possible fault of the first host. Without
-# the overlay every failure counts.
+# passes, the pass counts and both jobs are named as a possible fault of the first host.
+# Without a configured unconfirmed-host list or an explicit override there is no verdict.
 #
 # Exit: 0 passed (WHERE then names the job, its host and the CPU), 1 failed (its log is shown),
 # 75 no verdict: no FLEET_OWNER, the fleet refused or didn't answer, no host started it within
@@ -56,7 +56,7 @@ fleet_label="fleet gate"
 . scripts/lib/fleet-job.sh
 start_s=${NRESE_GATE_START_S:-180}
 max_s=${NRESE_GATE_MAX_S:-10800}
-# fleet_hosts NAME: the overlay's [fleet] list NAME, space-separated (none without the overlay).
+# fleet_hosts NAME: a configured [fleet] list, space-separated. An absent list fails.
 fleet_hosts() { uv run --no-project python -I benches/suite/suitekit/hosts.py fleet "$1"; }
 no_verdict() {
   fleet_say "$*: no verdict, so no pass"

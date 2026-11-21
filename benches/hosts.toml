@@ -20,7 +20,8 @@
 # CPU governor, profiling, page-cache control). compare refuses to set runs of two configurations
 # side by side (suitekit/compare.py), or of two overlays (a run records the overlay content digest).
 # The overlay's [fleet]: lists of host keys OWL-RS's own scripts choose among the fleet's hosts,
-# each read by the script its comment names (hosts.py fleet NAME); without the overlay, none.
+# each read by the script its comment names (hosts.py fleet NAME). An explicit [] permits an empty
+# policy; admission stops when the source or requested list is absent.
 # A fleet job reads the overlay on its host from its environment: the job writers, on the machine
 # that has the overlay, put its hosts.toml in NRESE_BENCH_HOSTS, its A-A' noise floors in
 # NRESE_BENCH_FLOORS, and the digest of both in NRESE_BENCH_OVERLAY_REV (hosts.py overlay_env).

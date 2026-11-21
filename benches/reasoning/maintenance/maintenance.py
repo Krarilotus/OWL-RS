@@ -353,8 +353,9 @@ class Run:
                                        note=f"no reader report: {e}"))
 
 
+@hosts.run_snapshot
 def cmd_run(args):
-    results = Path(args.results)
+    results = hosts.evidence_path(Path(args.results), hosts.private_session(), ROOT)
     results.mkdir(parents=True, exist_ok=True)
     args.date = datetime.datetime.now().isoformat(timespec="minutes")
     args.stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
