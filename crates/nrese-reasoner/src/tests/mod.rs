@@ -3444,18 +3444,23 @@ fn a_list_reads_member_pairs_across_aliased_walks() {
         }
     }
     let mut vocabulary = LocalVocabulary::default();
-    let (_, every) = replicated_closure(&mut vocabulary, &text);
+    let input = load(&mut vocabulary, &text);
     let lists = ListVocabulary::new(&mut vocabulary);
-    let (rules, diagnostics) = super::lists::instantiate(&lists, &SliceFacts(&every));
-    assert!(diagnostics.is_empty(), "{diagnostics:?}");
-    let [left, _, right] =
-        load(&mut vocabulary, "ex:m1-alias1 owl:sameAs ex:m3-alias4")[0].map(Term::Const);
-    assert!(rules.iter().any(|r| {
-        r.name == "eq-diff2"
-            && r.body
-                .iter()
-                .any(|Atom([s, _, o])| (*s, *o) == (left, right) || (*s, *o) == (right, left))
-    }));
+    let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
+    let schema = Schema::owl(&mut vocabulary);
+    let close = |input| batch::materialise(input, &rules, Some(&lists), &schema);
+    let before = close(&input);
+    assert!(before.violations.consistent());
+    assert!(before.diagnostics.is_empty(), "{:?}", before.diagnostics);
+    let mut input = input;
+    input.extend(load(
+        &mut vocabulary,
+        "ex:m1-alias1 owl:sameAs ex:m3-alias4",
+    ));
+    assert!(
+        !close(&input).violations.consistent(),
+        "the aliased members clash"
+    );
 }
 
 /// A list within the cap over its closure is read as the closure gives it, the written

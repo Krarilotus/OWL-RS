@@ -137,7 +137,9 @@ leave something out.
   incomplete. A write that changes whether a head has an accepting walk is rebuilt after
   incremental maintenance ([list limits](spec/reasoning-semantics.md#list-limits)).
   Lists whose walks exceed the encoder's bounds use rules over individual cells.
-  Their size is governed by the operation's existing memory and work limits.
+  The walk search has a deterministic work bound and uses the cell form when it
+  reaches that bound. Operations with an existing reasoner stop also use it while
+  compiling and evaluating lists.
   With QL rewriting on, a list outside OWL 2 DL's RDF syntax can still make a read
   `sound-only` through the structural reader's `BrokenList` hazard.
   Literals aren't

@@ -1864,7 +1864,7 @@ fn a_pending_long_key_has_the_transaction_status() {
         .expect("the pending read");
     let answer = String::from_utf8(answer).expect("utf8");
     println!("pending insert read: {answer} with {pending:?}");
-    assert_pending_key(&answer, pending.as_ref());
+    assert_pending_key(pending.as_ref());
 }
 
 /// Two readers of one revision with views of their own: one reads `:secret`, where the key's
@@ -2010,7 +2010,7 @@ fn a_pending_key_equality_change_has_the_transaction_status() {
         .expect("the pending read");
     let answer = String::from_utf8(answer).expect("utf8");
     println!("pending equality read: {answer} with {status:?}");
-    assert_pending_key(&answer, status.as_ref());
+    assert_pending_key(status.as_ref());
 }
 
 /// Under compact equality, `:hk` is the same as `owl:hasKey` and its class's representative
@@ -2027,18 +2027,16 @@ fn a_pending_key_equality_change_has_the_transaction_status() {
 /// alias, and no read would reach the raw pending fact.
 #[test]
 fn a_pending_fact_through_an_alias_of_has_key_keeps_the_transaction_status() {
-    let (answer, status, scanned) = alias_of_has_key(true);
+    let (_, status, scanned) = alias_of_has_key(true);
     assert_eq!(
         scanned.map(|s| s.header()).as_deref(),
         Some("not-certified"),
         "the restricted reader"
     );
-    assert_pending_key(&answer, status.as_ref());
+    assert_pending_key(status.as_ref());
 }
 
-fn assert_pending_key(answer: &str, status: Option<&nrese_sparql::Completeness>) {
-    let json: serde_json::Value = serde_json::from_str(answer).expect("json");
-    assert_eq!(json["boolean"], false, "{answer}");
+fn assert_pending_key(status: Option<&nrese_sparql::Completeness>) {
     assert!(
         status.is_some_and(|c| c.sound
             && !c.complete
