@@ -382,9 +382,10 @@ fn a_refused_message_template_holds_less_than_its_text() {
 
 /// A filled message's dictionary lookup is charged before it runs. 96 `{?x}` blocks naming
 /// a 4 KiB value fill in to 384 KiB, whose lookup copies the text into a key grown by
-/// doubling. Under a 1 MiB envelope the validation is refused before it makes the text or
-/// its key: it holds at most well under the text's 384 KiB beside its key, so a run that
-/// charged less than the lookup takes (and made both) fails here.
+/// doubling. Under a 1 MiB envelope the validation makes the text (its charge fits) and is
+/// refused before the lookup allocates the key: it holds the text and little else, well
+/// under the text beside its key, so a run that charged less than the lookup takes (and
+/// made both) fails here.
 #[test]
 fn a_refused_message_lookup_holds_less_than_its_text_and_key() {
     if !measure::alone() {
@@ -423,4 +424,81 @@ fn a_refused_message_lookup_holds_less_than_its_text_and_key() {
         "{outcome:?}"
     );
     assert!(bytes < 640 << 10, "held {bytes} bytes");
+}
+
+/// A message the query binds comes first (SHACL §5.3.2), so the constraint's templates are
+/// not filled and the values they name are not copied. The solution's 8 MiB `?x`, named by
+/// a `{?x}` template, is held once while the row is read: the validation holds well under
+/// two copies of it, so a run that copied it for the unused template fails here.
+#[test]
+fn a_message_the_query_binds_copies_no_value_the_templates_name() {
+    if !measure::alone() {
+        return;
+    }
+    let turtle = format!(
+        "@prefix ex: <http://example.com/> . @prefix sh: <http://www.w3.org/ns/shacl#> .
+         ex:a ex:p \"{}\" .
+         ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:sparql [ sh:message \"{{?x}}\" ;
+           sh:select \"SELECT $this ?x (\\\"bound\\\" AS ?message) WHERE {{ $this <http://example.com/p> ?x }}\" ] .",
+        "v".repeat(8 << 20)
+    );
+    let snapshot = load(&turtle);
+    let graph = snapshot
+        .lookup(NamedNodeRef::new_unchecked(SHAPES).into())
+        .expect("the shapes graph");
+    let shapes =
+        compile(&snapshot, Selection::asserted(GraphSelector::Exact(graph))).expect("shapes");
+    // The data is the same graph as the shapes.
+    let data = Selection::of(GraphSelector::Exact(graph));
+    let resources = nrese_sparql::Resources::default();
+    let (outcome, bytes) = measure::measure(|| {
+        nrese_shacl::validate(&snapshot, &shapes, data, &resources)
+            .map(|report| report.results.len())
+    });
+    eprintln!("bound-message validation held at most {bytes} bytes: {outcome:?}");
+    assert!(matches!(outcome, Ok(1)), "{outcome:?}");
+    assert!(bytes < 12 << 20, "held {bytes} bytes");
+}
+
+/// A filled message's language tag is charged with its text, before either is made. A
+/// `{?x}` template tagged with a 2 MiB private-use language tag, under a 1 MiB envelope, is
+/// refused before the tag is copied: the validation holds well under the tag, so a run that
+/// charged the text alone (and copied the tag) fails here.
+#[test]
+fn a_refused_message_holds_less_than_its_language_tag() {
+    if !measure::alone() {
+        return;
+    }
+    let turtle = format!(
+        "@prefix ex: <http://example.com/> . @prefix sh: <http://www.w3.org/ns/shacl#> .
+         ex:a ex:p \"v\" .
+         ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:sparql [ sh:message \"{{?x}}\"@x{} ;
+           sh:select \"SELECT $this ?x WHERE {{ $this <http://example.com/p> ?x }}\" ] .",
+        "-abcdefgh".repeat(233_017)
+    );
+    let snapshot = load(&turtle);
+    let graph = snapshot
+        .lookup(NamedNodeRef::new_unchecked(SHAPES).into())
+        .expect("the shapes graph");
+    let shapes =
+        compile(&snapshot, Selection::asserted(GraphSelector::Exact(graph))).expect("shapes");
+    // The data is the same graph as the shapes.
+    let data = Selection::of(GraphSelector::Exact(graph));
+    let resources = nrese_sparql::Resources {
+        memory: nrese_exec::Envelope::new(Some(1 << 20), None),
+        ..nrese_sparql::Resources::default()
+    };
+    let (outcome, bytes) = measure::measure(|| {
+        nrese_shacl::validate(&snapshot, &shapes, data, &resources)
+            .map(|report| report.results.len())
+    });
+    eprintln!("refused tagged validation held at most {bytes} bytes: {outcome:?}");
+    assert!(
+        matches!(
+            outcome,
+            Err(nrese_sparql::QueryEvaluationError::MemoryLimit(_))
+        ),
+        "{outcome:?}"
+    );
+    assert!(bytes < 1 << 20, "held {bytes} bytes");
 }
