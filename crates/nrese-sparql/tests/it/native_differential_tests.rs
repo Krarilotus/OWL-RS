@@ -5131,20 +5131,20 @@ fn eager_aggregation_refuses_a_variable_its_side_may_leave_unbound() {
         ("AVG", "UNDEF".to_owned()),
         ("COUNT", typed("1", "integer")),
     ];
-    let variants: [(&str, &str, bool, &[(&str, String)]); 3] = [
+    let variants = [
         (
             a,
             "{ VALUES ?s { 10 20 } OPTIONAL { VALUES (?s ?x) { (30 1) } } }",
             false,
-            &bound,
+            &bound[..],
         ),
         (
             "VALUES (?g ?s ?x) { (1 10 2) (1 20 UNDEF) }",
             "VALUES (?s ?x) { (10 UNDEF) (20 UNDEF) }",
             false,
-            &mixed,
+            &mixed[..],
         ),
-        (a, "{ VALUES (?s ?x) { (10 5) (20 7) } }", true, &bound),
+        (a, "{ VALUES (?s ?x) { (10 5) (20 7) } }", true, &bound[..]),
     ];
     let never = |_: &nrese_sparql::plan::Plan, _: &[nrese_rdf::Variable]| false;
     for (a, b, rewritten, answers) in variants {
