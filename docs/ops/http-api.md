@@ -416,6 +416,18 @@ Every error is an `application/problem+json` document ([RFC 9457](https://www.rf
 
 A server that doesn't start answers nothing, and its errors are in the log and its exit status ([startup errors](server-setup.md#startup-errors), such as a [locked data directory](server-setup.md#err-data-directory-locked) or an [address that can't be bound](server-setup.md#err-failed-to-bind)).
 
+For a write answered with `500`, follow the response's `detail`.
+
+| Detail | What to do |
+|---|---|
+| `not run: nothing of this write was applied; send it again` | Send the write again. |
+| `nothing of this write was published` | The write can be sent again once the failure is resolved. |
+| `whether it was applied is unknown: read the data before sending it again` | Check the data first. Send the write again only if it still needs to be applied. |
+
+A synchronous import can also answer `500` with the revision at which the load completed.
+If it says the quarantine record could not be kept or reasoning failed, do not send the upload again.
+An unknown-outcome import uses the same read-before-resending instruction as a write.
+
 ### Example: a SPARQL syntax error
 
 ```bash

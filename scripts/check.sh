@@ -379,6 +379,9 @@ side_steps() {
 # Of those, the guards that build nothing (the quick tier's too).
 guards() {
   local files=("$@")
+  if printf '%s\n' "${files[@]}" | grep -qE '^(crates/nrese-(server/src/|store/src/mutation/)|scripts/(check|check-effect)\.sh$)'; then
+    step "effectful work" bash scripts/check-effect.sh
+  fi
   if printf '%s\n' "${files[@]}" | grep -qE '(^|/)Cargo\.(toml|lock)$'; then
     step locks bash scripts/check-locks.sh
     # No test-only feature in a product build (scripts/check-features.sh, DUR-4).

@@ -6,8 +6,11 @@ use std::thread::LocalKey;
 
 /// A reader of a snapshot ([`IMAGE_READER`]).
 pub(crate) type Reader = Box<dyn FnMut(&crate::Snapshot)>;
+type Tail = Box<dyn FnOnce() -> crate::EngineResult<()>>;
 
 thread_local! {
+    /// Runs after a commit publishes and releases the WAL and compaction slots.
+    pub(crate) static COMMIT_TAIL: RefCell<Option<Tail>> = const { RefCell::new(None) };
     /// [`Wal::rotate`](super::wal::Wal::rotate) fails before it changes anything.
     pub(crate) static FAIL_ROTATE: Cell<bool> = const { Cell::new(false) };
     /// A checkpoint's directory sync fails after its rename.
