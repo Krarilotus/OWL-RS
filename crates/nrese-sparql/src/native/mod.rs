@@ -6953,9 +6953,9 @@ impl<'a> Context<'a> {
                             }
                             Plan::Total { column, .. } => {
                                 let id = table.get(row, *column);
-                                state.count += 1;
                                 match known(a, id) {
                                     Some(Number::Value(number)) => {
+                                        state.count += 1;
                                         state.total =
                                             state.total.and_then(|total| total.add(*number));
                                     }
