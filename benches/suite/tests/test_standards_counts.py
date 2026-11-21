@@ -1,6 +1,7 @@
 """The standards table of docs/what-it-covers.md says the counts the release gate requires
 (benches/fast/w3c-expected.toml): each suite's expected passes, and its known skips and
-disputes, stand in a row that links its kit's runner. A count changed on one side only fails here.
+disputes, stand in the row that names the suite in its first column and links its kit's runner.
+A count changed on one side only, or moved to another suite's row, fails here.
 
     python -m unittest discover benches/suite/tests
 """
@@ -25,10 +26,19 @@ def standards_rows(page: str) -> list[str]:
     return [line for line in section.splitlines() if line.startswith("|")]
 
 
+def text(markdown: str) -> str:
+    """What a reader sees of `markdown`: links as their text."""
+    return re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", markdown)
+
+
 def numbers(row: str) -> set[int]:
-    """The numbers a reader sees in `row`: its text without link targets (`1,234` is 1234)."""
-    text = re.sub(r"\]\([^)]*\)", "]", row)
-    return {int(n.replace(",", "")) for n in re.findall(r"\d[\d,]*", text)}
+    """The numbers a reader sees in `row` (`1,234` is 1234)."""
+    return {int(n.replace(",", "")) for n in re.findall(r"\d[\d,]*", text(row))}
+
+
+def names(row: str, suite: str) -> bool:
+    """Whether `row`'s first column names `suite`."""
+    return suite in text(row.split("|")[1])
 
 
 def runner_link(kit) -> str:
@@ -49,20 +59,21 @@ class StandardsTable(unittest.TestCase):
             if not kit.suites:
                 continue
             link = runner_link(kit)
-            linked = [row for row in rows if f"]({link})" in row]
-            self.assertTrue(linked, f"{kit.name}: no row of the standards table links {link}")
-            shown = set().union(*(numbers(row) for row in linked))
             for suite in kit.suites:
+                own = [row for row in rows if f"]({link})" in row and names(row, suite)]
+                self.assertEqual(len(own), 1, f"{suite}: rows naming it and linking {link}: {own}")
                 for key in ("passed", "skipped", "disputed"):
                     if want := expected[suite].get(key):
                         checked += 1
-                        self.assertIn(want, shown, f"{suite}: the gate requires {key} = {want}; "
-                                      f"the rows linking {link} say {sorted(shown)}")
+                        self.assertIn(want, numbers(own[0]), f"{suite}: the gate requires {key} = "
+                                      f"{want}; its row says {sorted(numbers(own[0]))}")
         self.assertGreater(checked, 0)
 
-    def test_a_row_reads_its_numbers_without_its_links(self):
-        row = "| [SPARQL 1.2](https://www.w3.org/TR/sparql12-query/) | x | 1,271 tests ([runner](../a/b2)) |"
+    def test_a_row_reads_as_its_reader_sees_it(self):
+        row = "| [SPARQL 1.2](https://www.w3.org/TR/sparql12-query/) drafts | x | 1,271 tests ([runner](../a/b2)) |"
         self.assertEqual(numbers(row), {1, 2, 1271})
+        self.assertTrue(names(row, "SPARQL 1.2"))
+        self.assertFalse(names(row, "SPARQL 1.1"))
 
 
 if __name__ == "__main__":

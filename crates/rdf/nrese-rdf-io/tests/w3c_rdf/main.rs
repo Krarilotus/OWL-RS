@@ -24,9 +24,11 @@
 //!   3 and 8 chunks by the exact splitter and parsed chunk by chunk: the same statements.
 //! - **Expected failures** are listed with their reasons in `expected-failures.txt`. The run
 //!   fails on any failure not in the list, and on any listed test that now passes.
-//! - **Implementation reports.** The run writes one EARL report per specification
+//! - **Implementation reports.** The run writes one EARL report per RDF 1.2 specification
 //!   (`rdf12-turtle.ttl`, …; `tests/support/earl.rs`): one assertion per manifest entry, an
-//!   entry this runner doesn't run reported untested with its reason.
+//!   entry this runner doesn't run reported untested with its reason. None for RDF 1.1: its
+//!   manifests name their tests relative to their location, and the IRIs W3C's RDF 1.1 reports
+//!   use (`http://www.w3.org/2013/TurtleTests/…`) aren't those this runner reads them under.
 
 #[path = "../support/earl.rs"]
 mod earl;
@@ -411,12 +413,13 @@ fn w3c_rdf_syntax_suites() {
         })
         .collect();
     let (mut failures, mut failed_iris) = (Vec::new(), BTreeSet::new());
-    // The implementation reports, one per specification (`rdf12/rdf-turtle`), in order.
+    // The implementation reports, one per specification (`rdf12/rdf-turtle`), in order; only
+    // RDF 1.2's are written (the module's doc says why).
     let mut reports: BTreeMap<&str, earl::Report> = BTreeMap::new();
     println!("W3C RDF syntax suites: passed / failed");
     for suite in SUITES {
         let manifest = read_manifest(&root, suite);
-        assert!(!manifest.tests.is_empty(), "no tests in {suite}");
+        assert!(manifest.entries > 0, "no entries in {suite}");
         // `rdf12/rdf-turtle/syntax` and `…/eval` are one specification's, `rdf11/rdf-turtle` one.
         let spec = &suite[..suite
             .match_indices('/')
@@ -469,7 +472,10 @@ fn w3c_rdf_syntax_suites() {
         }
         println!("  {suite}: {passed} / {failed}");
     }
-    for (spec, report) in &reports {
+    for (spec, report) in reports
+        .iter()
+        .filter(|(spec, _)| spec.starts_with("rdf12/"))
+    {
         let path = earl::write(&spec.replace("/rdf-", "-"), report);
         println!("implementation report: {}", path.display());
     }
