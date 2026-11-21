@@ -610,13 +610,21 @@ pub fn maintain_with(
         });
         let pending = tx.pending_snapshot();
         let judged = redeclared && !uses_rebuilt_report;
+        // A fact the change retracts and the rebuild still derives was known before: it moves
+        // from asserted to inferred, and is not new to the state (the delta executor's
+        // restored facts). Any other fact the rebuild newly stores as inferred is new.
+        let retracted: HashSet<Triple> = match judged {
+            true => tx.deleted().map(triple).collect(),
+            false => HashSet::new(),
+        };
         let mut new_inferred = Vec::new();
         let (added, dropped) =
             install_closure(&pending, &mut closure.inferred, |fact, add| match add {
                 true => {
                     let new = tx.insert_inferred(fact);
-                    if new && judged {
-                        new_inferred.push(triple(fact.in_default_graph()));
+                    let fact = triple(fact.in_default_graph());
+                    if new && judged && !retracted.contains(&fact) {
+                        new_inferred.push(fact);
                     }
                     new
                 }

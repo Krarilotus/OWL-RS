@@ -749,11 +749,16 @@ fn a_declaration_counts_where_it_is_asserted_not_where_it_is_inferred() {
 /// disjoint `:A` and `:B`, loaded past the gates), each commit below is refused when it brings a
 /// clash and applied when it doesn't, whatever annotation property it declares or retracts: a
 /// clash (`:alice` in `:Doc`, disjoint from her `:Person`) alone or with an unrelated
-/// declaration; a declaration of `:note` used at once, whose domain then types nothing; and the
-/// retraction of an irreflexive `:note`'s declaration, after which `:y :note :y` clashes.
+/// declaration; a declaration of `:note` used at once, whose domain then types nothing; the
+/// retraction of an irreflexive `:note`'s declaration, after which `:y :note :y` clashes; and,
+/// where `:alice a :Doc` clashes both asserted and derived (`:wrote`'s domain), its retraction
+/// alone, with an unrelated declaration, or with an unrelated retraction: the fact stays derived,
+/// so the clash held before and is not the commit's own.
 #[test]
 fn a_redeclaring_commit_in_quarantine_is_judged_by_its_own_clashes() {
     let disjoint = ":Doc owl:disjointWith :Person . :alice a :Person . ";
+    let derived_clash = format!("{disjoint}:alice a :Doc ; :wrote :w . :wrote rdfs:domain :Doc . ");
+    let derived_clash = derived_clash.as_str();
     let mut wrong = Vec::new();
     for (name, base, update, outcome) in [
         (
@@ -779,6 +784,24 @@ fn a_redeclaring_commit_in_quarantine_is_judged_by_its_own_clashes() {
             ":note a owl:AnnotationProperty , owl:IrreflexiveProperty . :y :note :y .".to_owned(),
             "DELETE DATA { :note a owl:AnnotationProperty . }",
             "refused",
+        ),
+        (
+            "a fact retracted and still derived",
+            derived_clash.to_owned(),
+            "DELETE DATA { :alice a :Doc . }",
+            "applied",
+        ),
+        (
+            "a fact retracted and still derived, and a declaration",
+            derived_clash.to_owned(),
+            "DELETE DATA { :alice a :Doc . } ; INSERT DATA { :other a owl:AnnotationProperty . }",
+            "applied",
+        ),
+        (
+            "a fact retracted and still derived, and a retraction",
+            format!("{derived_clash}:other a owl:AnnotationProperty ."),
+            "DELETE DATA { :alice a :Doc . :other a owl:AnnotationProperty . }",
+            "applied",
         ),
     ] {
         let (store, reasoning) = rebuilt(
