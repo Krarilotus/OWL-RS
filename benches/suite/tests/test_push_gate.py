@@ -1296,8 +1296,11 @@ class WindowsJob(Repo):
         nextest_entry = cache / "tools" / f"nextest-{pinned_nextest}"
         pinned, other = f'echo "cargo-nextest {pinned_nextest} (stand-in)"', 'echo "cargo-nextest 0.9.1 (stand-in)"'
         failing, absent = f'echo "cargo-nextest {pinned_nextest}"; exit 1', None
-        # The pinned one, answering the job's check and not the run's (or gone in between).
+        # The pinned one, answering the job's check and not the run's (or gone in between); or another
+        # version answering inside the run (one put first on cargo's path in between).
         split = f'[ -z "$NRESE_ON_BUILD_HOST" ] || exit 1; echo "cargo-nextest {pinned_nextest} (stand-in)"'
+        swapped = (f'[ -z "$NRESE_ON_BUILD_HOST" ] || {{ echo "cargo-nextest 0.9.1 (stand-in)"; exit 0; }}; '
+                   f'echo "cargo-nextest {pinned_nextest} (stand-in)"')
         cases = [  # tree sent, STUB_FAIL, stdin closed, toolchain, Python gone, nextest -> exit, a record, stdin
             (tree, "", False, there, False, pinned, 0, True, "valid"),
             ("0" * 40, "", False, there, False, pinned, 3, False, None),         # another tree checked out: no verdict
@@ -1320,6 +1323,7 @@ class WindowsJob(Repo):
             (tree, "", False, there, False, failing, 3, False, None),
             # Accepted by the job, then not answering inside the run: no verdict, never cargo test.
             (tree, "", False, there, False, split, 3, False, None),
+            (tree, "", False, there, False, swapped, 3, False, None),
             # The declared Python isn't here and can't be had (the host's own ran the suite): no verdict.
             (tree, "", False, there, True, pinned, 3, False, None),
         ]
@@ -1354,11 +1358,11 @@ class WindowsJob(Repo):
             self.assertEqual(calls, [] if toolchain is there else
                              ["toolchain install 1.98.1 --no-self-update --profile minimal --component rustfmt,clippy"],
                              f"SPEC windows-toolchain: case {case}")
-            if not recorded and nextest is split:
+            if not recorded and nextest in (split, swapped):
                 ran = (out / "guarded").read_text().splitlines()
                 self.assertFalse((out / "gate.json").exists(), f"SPEC windows-nextest: case {case}")
-                self.assertEqual([c for c in ran if c.split()[0] == "test" and "--doc" not in c.split()], [],
-                                 f"SPEC windows-nextest: cargo test ran in nextest's place: case {case}")
+                self.assertEqual([c for c in ran if c.split()[0] in ("test", "nextest") and "--doc" not in c.split()],
+                                 [], f"SPEC windows-nextest: tests ran without the pinned nextest: case {case}")
                 continue
             if not recorded:
                 self.assertFalse((out / "gate.json").exists() or (out / "check.log").exists(), f"case {case}")

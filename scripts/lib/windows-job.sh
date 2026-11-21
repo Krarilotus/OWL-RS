@@ -155,10 +155,10 @@ run() {
   export TMPDIR=$temp TEMP=$temp TMP=$temp CARGO_TARGET_DIR NRESE_BASH PYTHONUTF8=1
   local began=$SECONDS code
   # check.sh's own output, whole: its summary is the evidence, step by step.
-  # The tier runs its tests under that runner or ends with 3 (check.sh's nextest).
-  NRESE_ON_BUILD_HOST=1 NRESE_NEXTEST_REQUIRED=1 bash scripts/check.sh windows 2>&1 | tee "$out/check.log"
+  # The tier runs its tests under that version or ends with 3 (check.sh's nextest).
+  NRESE_ON_BUILD_HOST=1 NRESE_NEXTEST_REQUIRED=$want bash scripts/check.sh windows 2>&1 | tee "$out/check.log"
   code=${PIPESTATUS[0]}
-  [ "$code" -ne 3 ] || infra "cargo-nextest $want didn't answer inside the run: no verdict"
+  [ "$code" -ne 3 ] || infra "cargo nextest wasn't the pinned $want inside the run: no verdict"
   [ $stdin = valid ] || echo "stdin: the fleet gave this step none it could use (fleet backlog I14); it ran with /dev/null"
 
   # The runtime as the run left it: a run that changed its environment ran with no declared one.

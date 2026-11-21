@@ -56,8 +56,8 @@
 #
 # Exit: 0 passed, 1 failed; 75 no verdict: the fleet gave none (push, windows), or the PC's
 # guard held or stopped a build (scripts/cargo-guarded.sh's 75), which isn't the tree's
-# failure; 2 a usage error, or nothing to check; 3 no verdict: a required cargo-nextest didn't
-# answer.
+# failure; 2 a usage error, or nothing to check; 3 no verdict: cargo didn't run the required
+# cargo-nextest.
 #
 # The W3C suites run with their test data required (NRESE_W3C_REQUIRED=1, the data fetched
 # first by scripts/fetch-w3c-tests.sh): a suite without its data fails instead of passing by
@@ -83,12 +83,16 @@ step() {
   results+=("$code  $name ($((SECONDS - start)) s)")
   echo "=== $name: exit $code"
 }
-# Where the run's job requires it (NRESE_NEXTEST_REQUIRED, scripts/lib/windows-job.sh), a runner that
-# doesn't answer ends the run with 3, no verdict: never cargo test in its place.
+# Where the run's job requires a version (NRESE_NEXTEST_REQUIRED, scripts/lib/windows-job.sh), cargo
+# must run exactly that one, asked right before the tests; any other, or none, ends the run with 3, no
+# verdict: never cargo test or another runner in its place.
 nextest() {
-  cargo nextest --version > /dev/null 2>&1 && return 0
-  [ -z "${NRESE_NEXTEST_REQUIRED:-}" ] || { echo "cargo-nextest is required here and doesn't answer: no verdict" >&2; exit 3; }
-  return 1
+  local got
+  got=$(cargo nextest --version 2> /dev/null) || got=""
+  [ -n "${NRESE_NEXTEST_REQUIRED:-}" ] || { [ -n "$got" ]; return; }
+  [ "$(printf '%s\n' "$got" | tr -d '\r' | awk 'NR == 1 { print $2 }')" = "$NRESE_NEXTEST_REQUIRED" ] && return 0
+  echo "cargo-nextest $NRESE_NEXTEST_REQUIRED is required here; cargo runs ${got:-none}: no verdict" >&2
+  exit 3
 }
 # Python under either name: Windows has `python`, some Linux hosts only `python3`. A missing
 # interpreter fails the gate; it must never shrink the gate to nothing.
