@@ -22,11 +22,6 @@ pub enum Datatypes {
     Published,
 }
 
-// reasoning-semantics.md:47 counts 58 fixed rules. The omitted table names none of these.
-pub const KNOWN_DEVIATION: &str =
-    "Table 5 prp-ap and Table 6 cls-thing and cls-nothing1 are not derived";
-const OMITTED_RULES: &[&str] = &["5 prp-ap", "6 cls-thing", "6 cls-nothing1"];
-
 #[derive(Clone, Copy)]
 enum Term {
     Constant(Id),
@@ -217,10 +212,6 @@ impl Rule {
 
 pub fn evaluate(asserted: &Facts, datatypes: Datatypes) -> Model {
     evaluate_with(asserted, datatypes, &[], false)
-}
-
-pub fn without_known_deviation(asserted: &Facts) -> Facts {
-    evaluate_with(asserted, Datatypes::Standard, OMITTED_RULES, false).facts
 }
 
 pub fn without_eq_ref(asserted: &Facts) -> Facts {
