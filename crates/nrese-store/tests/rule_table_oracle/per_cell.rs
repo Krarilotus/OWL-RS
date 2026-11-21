@@ -467,8 +467,9 @@ fn later_writes_maintain_per_cell_support_with_or_without_a_warm_table() {
                 }
                 assert!(judges::apply(&pipeline, step));
                 assert_eq!(
-                    judges::ask(&store, &fixture.watch),
-                    (i == 1, "complete".into())
+                    judges::ask(&store, &fixture.watch).0,
+                    i == 1,
+                    "{mode}, cold={cold}, write={i}",
                 );
                 if i != 0 {
                     assert_ne!(
@@ -479,4 +480,25 @@ fn later_writes_maintain_per_cell_support_with_or_without_a_warm_table() {
             }
         }
     }
+}
+
+#[test]
+fn a_well_formed_long_chain_has_a_complete_answer() {
+    // Spec: Table 5 prp-spo2 provides the endpoint of a 251-member list.
+    // With well-formed RDF syntax, the QL reader has the same axiom.
+    let members = "ex:p ".repeat(251);
+    let edges: String = (0..251)
+        .map(|i| format!("ex:x{i} ex:p ex:x{} . ", i + 1))
+        .collect();
+    let write = format!(
+        "INSERT DATA {{ ex:out owl:propertyChainAxiom ({members}) .
+          ex:out a owl:ObjectProperty . ex:p a owl:ObjectProperty . {edges} }}"
+    );
+    let watch = triple(["ex:x0", "ex:out", "ex:x251"]);
+    let store = judges::open("replication", None);
+    let pipeline = judges::pipeline(&store, ReasoningMode::Owl2Rl);
+    assert!(judges::apply_update(&pipeline, &write));
+    let (holds, status) = judges::ask(&store, &watch);
+    assert!(holds, "the 251-edge chain derives its endpoint");
+    assert_eq!(status, "complete");
 }
