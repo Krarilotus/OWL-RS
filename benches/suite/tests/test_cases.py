@@ -18,6 +18,10 @@ sys.path.insert(0, str(HERE.parent))
 import isolation  # noqa: E402
 from suitekit import cases  # noqa: E402
 
+READS = ("benches/CATALOG.md", "benches/cases/core.toml", "benches/cases/sparql.toml", "benches/datasets.toml",
+         "benches/fast/fast.py", "benches/hosts.toml", "benches/suite/suitekit/*",
+         "benches/suite/systems.toml", "benches/suite/workloads.toml")
+
 SUITE = HERE.parent
 
 

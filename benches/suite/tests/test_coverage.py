@@ -24,6 +24,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import isolation  # noqa: E402
 from suitekit import adapters, coverage, driver, receipts, runtime, summary  # noqa: E402
 
+READS = ("benches/suite/suitekit/*",)
+
 DECLARED = "ecbf6dde5a5864f088eee3b0836ad6adba1d623b"  # the fixture Dockerfile's MDB_COMMIT
 OTHER = "ecbf6dd" + "0" * 33  # its first seven characters, another commit
 RUST_PIN = "sha256:" + "1" * 64

@@ -7,6 +7,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+READS = ("benches/", "crates/nrese-shacl/tests/*", "crates/nrese-sparql/tests/geosparql_compliance/*",
+         "crates/nrese-sparql/tests/w3c_sparql11/*", "crates/nrese-store/tests/w3c_owl2_rl/*", "scripts/")
+
 SUITE = Path(__file__).resolve().parents[1]
 # An entry as Python runs a script by path (its directory first on sys.path, run as __main__),
 # then `queue` imported as any later module imports it; prints where it came from.

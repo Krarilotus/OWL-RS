@@ -17,6 +17,10 @@ sys.path.insert(0, str(ROOT / "benches/fast"))
 import fast  # noqa: E402
 from suitekit import cases  # noqa: E402
 
+READS = ("benches/cases/core.toml", "benches/cases/sparql.toml", "benches/fast/compete.py",
+         "benches/fast/fast.py", "benches/fast/release_gate.py", "benches/hosts.toml",
+         "benches/suite/suitekit/*")
+
 DATA = "dl-transitive-400.owl"
 # The tableau's own stop on this case, measured from its process start, reading and normalising
 # included: 30.21 s to 31.65 s on its 30 s limit (benches/baselines/fast/2026-10-06-*.json and

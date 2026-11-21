@@ -28,6 +28,9 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "benches" / "suite"))
 from suitekit.lock import lock  # noqa: E402
 
+READS = (".gitattributes", ".githooks/pre-push", "benches/fast/release_gate.py", "benches/suite/suitekit/",
+         "rust-toolchain.toml", "scripts/cargo-guarded.sh", "scripts/check.sh", "scripts/lib/*")
+
 BASH = shutil.which("bash")
 # Run from a git hook or inside a gate job, the caller's variables (git's own: isolation.inherit()
 # drops them; the gate's, the fleet's, the thread counts, the Windows job's RUSTUP_AUTO_INSTALL)

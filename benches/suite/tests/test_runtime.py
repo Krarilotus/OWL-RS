@@ -12,6 +12,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from suitekit.runtime import run_quiet  # noqa: E402
 
+READS = ("benches/suite/suitekit/__init__.py", "benches/suite/suitekit/lock.py",
+         "benches/suite/suitekit/ns.py", "benches/suite/suitekit/runtime.py")
+
 
 class RunQuiet(unittest.TestCase):
     def test_output_is_read_as_utf8_whatever_the_console_code_page(self):

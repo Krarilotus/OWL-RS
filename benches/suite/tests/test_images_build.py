@@ -16,6 +16,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import isolation  # noqa: E402
 from test_job_namespace import BASH  # noqa: E402
 
+READS = ("benches/competitors/gcare/Dockerfile", "benches/competitors/millenniumdb/Dockerfile",
+         "benches/sparql/images.sh", "benches/suite/suitekit/__init__.py",
+         "benches/suite/suitekit/dockerfile.py", "benches/suite/suitekit/lock.py",
+         "benches/suite/suitekit/manifest.py", "benches/suite/suitekit/ns.py",
+         "benches/suite/suitekit/runtime.py", "benches/suite/tests/test_job_namespace.py", "scripts/lib/ns.sh")
+
 ROOT = Path(__file__).resolve().parents[3]
 FAKE_DOCKER = '#!/bin/sh\nprintf "%s\\n" "$*" >> "$DOCKER_LOG"\nexit 0\n'
 

@@ -24,6 +24,14 @@ import abba  # noqa: E402
 import isolation  # noqa: E402
 import test_release_gate as fixture  # noqa: E402  (the gate's pass fixtures)
 
+READS = ("benches/cases/core.toml", "benches/cases/sparql.toml", "benches/competitors/queries/",
+         "benches/datasets.toml", "benches/fast/fast.py", "benches/fast/measurement-sides.toml",
+         "benches/fast/noise-floor/phuoc-yu.toml", "benches/fast/queries/", "benches/fast/release_gate.py",
+         "benches/hosts.toml", "benches/reasoning/prepare-lubm.sh", "benches/reasoning/prepare-owl2bench.sh",
+         "benches/reasoning/queries/lubm/", "benches/reasoning/queries/owl2bench/",
+         "benches/sparql/prepare.sh", "benches/suite/abba.py", "benches/suite/suitekit/*",
+         "benches/suite/tests/test_release_gate.py", "scripts/lib/ns.sh")
+
 A, B = "a" * 40, "b" * 40
 # The real reader of a harness's dataset metadata; the tests' fake harnesses (A, B) read as this tree's
 # (Abba's patch), as PR #139's tests patched makers_at().

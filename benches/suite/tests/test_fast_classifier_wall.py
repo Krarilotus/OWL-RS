@@ -11,6 +11,9 @@ from unittest.mock import patch
 
 from test_runtime_lifetime import load_fast
 
+READS = ("benches/fast/fast.py", "benches/hosts.toml", "benches/suite/suitekit/*",
+         "benches/suite/tests/test_runtime_lifetime.py")
+
 CASE = dict(name="w", data="none", args=[], queries="", metric="whole_ms", cap_gb=2, tool="classify-el")
 PROFILE = "profile read=10.0 normalise=10.0 prepare=0.0 saturate=60.0 assemble=10.0 write=10.0"
 

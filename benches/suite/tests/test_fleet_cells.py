@@ -15,6 +15,10 @@ import abba
 import suite
 import isolation
 
+READS = ("benches/", "crates/nrese-shacl/tests/*", "crates/nrese-sparql/tests/geosparql_compliance/*",
+         "crates/nrese-sparql/tests/w3c_sparql11/*", "crates/nrese-store/tests/w3c_owl2_rl/*",
+         "scripts/lib/ns.sh")
+
 A = "a" * 40
 
 

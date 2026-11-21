@@ -22,6 +22,10 @@ import unittest
 import isolation
 import test_push_gate as fixture  # the push gate's scratch repository and fleet stand-in (its tests aren't rerun here)
 
+READS = (".githooks/pre-push", "benches/suite/suitekit/__init__.py", "benches/suite/suitekit/lock.py",
+         "benches/suite/tests/test_push_gate.py", "rust-toolchain.toml", "scripts/cargo-guarded.sh",
+         "scripts/check.sh", "scripts/lib/*")
+
 ROOT = fixture.ROOT
 BASH = fixture.BASH
 ZERO = fixture.ZERO

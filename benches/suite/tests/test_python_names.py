@@ -23,6 +23,8 @@ import unittest
 
 import isolation  # the suite's git environment policy (inherit())
 
+READS = ("scripts/check-python-names.py", "scripts/check.sh")
+
 ROOT = Path(__file__).resolve().parents[3]
 BASH = shutil.which("bash")
 CHECKER = ROOT / "scripts" / "check-python-names.py"

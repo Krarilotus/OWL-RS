@@ -28,6 +28,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from suitekit import driver, ledger, manifest, receipts, schema  # noqa: E402
 from suitekit.workloads import Plan  # noqa: E402
 
+READS = ("benches/competitors/millenniumdb/Dockerfile", "benches/hosts.toml",
+         "benches/nrese-bench-harness/src/**/*.rs", "benches/suite/adjudications.tsv",
+         "benches/suite/suitekit/", "crates/**/build.rs", "crates/**/src/**/*.rs")
+
 ROOT = Path(__file__).resolve().parents[3]  # this repository
 
 

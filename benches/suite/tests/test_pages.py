@@ -20,6 +20,8 @@ import suite  # noqa: E402
 from suitekit import standings, status  # noqa: E402
 from suitekit.ledger import load_records  # noqa: E402
 
+READS = ("benches/",)
+
 GENERATED = re.compile(r"^Generated (\d{4}-\d{2}-\d{2}) ", re.MULTILINE)
 
 

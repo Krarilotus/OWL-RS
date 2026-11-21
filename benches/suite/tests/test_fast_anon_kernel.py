@@ -14,6 +14,9 @@ from unittest.mock import patch
 
 from test_runtime_lifetime import load_fast
 
+READS = ("benches/fast/fast.py", "benches/hosts.toml", "benches/suite/suitekit/*",
+         "benches/suite/tests/test_runtime_lifetime.py")
+
 
 class Sampler(unittest.TestCase):
     def sample(self, scope_found_s: float, spike: tuple[float, float], stop_s: float):

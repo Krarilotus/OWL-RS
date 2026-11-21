@@ -22,6 +22,8 @@ import zipfile
 
 import isolation  # the suite's git environment policy (inherit())
 
+READS = ("benches/suite/suitekit/lock.py", "scripts/lib/gate-node.sh", "scripts/lib/ns.sh", "scripts/lib/suite-python.sh")
+
 ROOT = Path(__file__).resolve().parents[3]
 BASH = shutil.which("bash")
 LEAKS = ("NRESE_", "FLEET_")

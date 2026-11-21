@@ -32,6 +32,14 @@ import isolation
 import test_release_gate as fixtures  # the gate's pass and round fixtures (a module: its tests aren't rerun here)
 from suitekit import driver  # noqa: E402 (on the path through the gate's module)
 
+READS = (".gitignore", "benches/cases/core.toml", "benches/cases/sparql.toml", "benches/competitors/queries/",
+         "benches/datasets.toml", "benches/fast/fast.py", "benches/fast/queries/",
+         "benches/fast/release_gate.py", "benches/fast/w3c-expected.toml", "benches/hosts.toml",
+         "benches/reasoning/queries/lubm/", "benches/reasoning/queries/owl2bench/",
+         "benches/release-tradeoffs.toml", "benches/suite/suitekit/",
+         "benches/suite/tests/test_release_gate.py", "docs/design/performance.md", "scripts/lib/",
+         "scripts/release-gate.sh")
+
 ROOT = Path(__file__).resolve().parents[3]
 GATE = ROOT / "benches/fast/release_gate.py"
 gate_module = fixtures.gate_module
