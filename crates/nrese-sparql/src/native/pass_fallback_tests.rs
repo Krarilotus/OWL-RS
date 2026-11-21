@@ -406,41 +406,102 @@ fn evaluated(
     (answer, ctx.budget.used())
 }
 
+/// 16 subjects with `k`, each with 512 rows (`has`); row `i` has `g` `i % 1,024` and `v`
+/// `i`: the join is 8,192 rows in 1,024 groups of `?g`, eight values each, from the 16 rows
+/// of its smallest pattern, which a streamed GROUP BY takes in one morsel however it sizes
+/// them ([`Context::group_streamed`]: the first has 16 rows).
+fn seeded() -> Snapshot {
+    let config = EngineConfig {
+        background_maintenance: false,
+        ..EngineConfig::default()
+    };
+    let engine = Engine::new(config).unwrap();
+    let node = |name: String| nrese_rdf::NamedNode::new_unchecked(format!("urn:{name}"));
+    let integer = |n: u32| Literal::new_typed_literal(n.to_string(), xsd::INTEGER);
+    let mut tx = engine.transaction();
+    let mut insert = |s: String, p: &str, o: Term| {
+        let quad = nrese_rdf::Quad::new(
+            node(s),
+            node(p.to_owned()),
+            o,
+            nrese_rdf::GraphName::DefaultGraph,
+        );
+        tx.insert(quad.as_ref());
+    };
+    for c in 0..16u32 {
+        insert(format!("c{c}"), "k", integer(c).into());
+        for j in 0..512 {
+            let i = c * 512 + j;
+            insert(format!("c{c}"), "has", node(format!("r{i}")).into());
+            insert(format!("r{i}"), "g", integer(i % 1_024).into());
+            insert(format!("r{i}"), "v", integer(i).into());
+        }
+    }
+    tx.commit().unwrap();
+    engine.snapshot()
+}
+
 /// Spec: a GROUP BY refused directly and answered in morsels instead ([`Context::group`])
-/// is answered from what the query held before the direct attempt: with the morsels' answer,
-/// the budget then reads what the streamed route alone leaves (its results' terms), not
-/// that and what the direct attempt kept (its numbers and terms). Over limits from 200 kB
-/// to 4 MB: where the query as written (direct only, no retry) is refused and the query
-/// answers, the retry ran; at least one limit must be such.
+/// is answered from what the query held before the direct attempt: where both answer, as
+/// the streamed route alone answers (4,096-row morsels); where the query as written (direct
+/// only, no retry) is refused, the budget then reads what the streamed route alone leaves,
+/// not that and what the direct attempt kept. Over limits from 200 kB to 4 MB, two shapes:
+/// - `AVG(?x * 2)` over [`joined`]: the direct attempt is refused at its join, before it
+///   makes a number or a term. At least one limit must retry: the direct attempt refused,
+///   the query answered.
+/// - `AVG(xsd:double(?v))` over [`seeded`]: the direct attempt's pass finds 8,192 numbers
+///   (933,888 bytes) and can be refused after them, at its results' 1,024 doubles: numbers
+///   the streamed route never makes (it aggregates the expression's `COUNT` a column at a
+///   time). Its one morsel is the same under either sizing, so the retry is refused only
+///   where the streamed route alone is.
 #[test]
 fn a_streamed_retry_holds_nothing_of_the_refused_direct_attempt() {
-    let snapshot = joined();
-    let text = "SELECT ?y (AVG(?x * 2) AS ?a) \
-                WHERE { ?s <urn:p0> ?x . ?s <urn:p1> ?y } GROUP BY ?y";
-    let query = SparqlParser::new().parse_query(text).unwrap();
+    let shapes = [
+        (
+            "joined",
+            joined(),
+            "SELECT ?y (AVG(?x * 2) AS ?a) \
+             WHERE { ?s <urn:p0> ?x . ?s <urn:p1> ?y } GROUP BY ?y"
+                .to_owned(),
+        ),
+        (
+            "seeded",
+            seeded(),
+            format!(
+                "SELECT ?g (AVG({XSD_DOUBLE}(?v)) AS ?a) WHERE {{ ?c <urn:k> ?k . \
+                 ?c <urn:has> ?r . ?r <urn:g> ?g . ?r <urn:v> ?v }} GROUP BY ?g"
+            ),
+        ),
+    ];
     let with = |limit: usize, as_written: bool, stream_rows: Option<usize>| QueryOptions {
         as_written,
         stream_rows,
         ..options(Some(limit))
     };
     let (mut wrong, mut retried) = (Vec::new(), 0);
-    for limit in (2..=40).map(|k| k * 100_000) {
-        let (general, after) = evaluated(&snapshot, &query, &with(limit, false, None));
-        let (streamed, alone) = evaluated(&snapshot, &query, &with(limit, false, Some(4_096)));
-        let (direct, _) = evaluated(&snapshot, &query, &with(limit, true, None));
-        match (&general, &streamed) {
-            (Err(refused), Ok(_)) => wrong.push(format!(
-                "at {limit}: refused ({refused}) where the streamed route answers"
-            )),
-            (Ok(general), Ok(streamed)) if general != streamed => {
-                wrong.push(format!("at {limit}: the routes answer differently"));
+    for (shape, snapshot, text) in &shapes {
+        let query = SparqlParser::new().parse_query(text).unwrap();
+        for limit in (2..=40).map(|k| k * 100_000) {
+            let (general, after) = evaluated(snapshot, &query, &with(limit, false, None));
+            let (streamed, alone) = evaluated(snapshot, &query, &with(limit, false, Some(4_096)));
+            let (direct, _) = evaluated(snapshot, &query, &with(limit, true, None));
+            match (&general, &streamed) {
+                (Err(refused), Ok(_)) if *shape == "seeded" => wrong.push(format!(
+                    "{shape} at {limit}: refused ({refused}) where the streamed route answers"
+                )),
+                (Ok(general), Ok(streamed)) if general != streamed => {
+                    wrong.push(format!("{shape} at {limit}: the routes answer differently"));
+                }
+                (Ok(_), Ok(_)) if direct.is_err() && after != alone => wrong.push(format!(
+                    "{shape} at {limit}: {after} bytes held after the retry, the streamed \
+                     route {alone}"
+                )),
+                _ => {}
             }
-            (Ok(_), Ok(_)) if direct.is_err() && after != alone => wrong.push(format!(
-                "at {limit}: {after} bytes held after the retry, the streamed route {alone}"
-            )),
-            _ => {}
+            if *shape == "joined" {
+                retried += usize::from(general.is_ok() && direct.is_err());
+            }
         }
-        retried += usize::from(general.is_ok() && direct.is_err());
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     assert!(
@@ -500,11 +561,14 @@ fn a_restored_save_point_leaves_the_context_as_it_was() {
     let decimal =
         |lexical: &str| -> Term { Literal::new_typed_literal(lexical, xsd::DECIMAL).into() };
     aggregate(&grouped(&wide(), "(SUM(?v + 0) AS ?t)"));
-    // A thousand terms kept from before the point.
-    for i in 0..1_024 {
-        assert!(ctx.id(&decimal(&format!("{i}.25"))).is_ok());
+    // Terms kept from before the point, one past a power of two: a map's room rounds up to
+    // a power of two of buckets.
+    for i in 0..1_025 {
+        let text = format!("a term made before the point, number {i}");
+        assert!(ctx.id(&Literal::new_simple_literal(text).into()).is_ok());
     }
     let before = counters(&ctx);
+    assert!(before[1] >= 1_025, "the terms are computed: {before:?}");
     let point = ctx.save();
     aggregate(&grouped(&wide(), "(SUM(?v * 3) AS ?t)"));
     aggregate(&grouped(
