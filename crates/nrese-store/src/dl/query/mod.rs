@@ -926,6 +926,50 @@ fn annotation_rule(
     completeness.unsound(source, format!("the query {what} {COPIES}"));
 }
 
+/// Why a read of typed values may miss rows while the rules equate a literal with another
+/// term ([`crate::ReasoningState::literal_equality`]).
+const LITERAL_EQUALITY: &str = "the rules equate two spellings of one value (an owl:sameAs \
+                                between literals, which no store can hold), so a value \
+                                written in a later commit may lack its copy in the other \
+                                spelling";
+
+/// The conditions of the store under which a read that rests on reasoning isn't told
+/// `complete`, whatever its route (the closure, the QL rewriting, the bounds): one list,
+/// applied once, by `StoreService::assess`, to a status under an OWL 2 regime, then the
+/// operator rule ([`negation_rule`]) over what it took away. Each entry: the condition, the
+/// reads it touches, its reason.
+/// - The rules equate a literal with another term (`state`): a read of a property that may
+///   hold typed values in `snapshot` (a variable predicate, any; for a reader of some
+///   graphs, every property, as [`certify`] reads them), [`LITERAL_EQUALITY`].
+pub(crate) fn withhold(
+    completeness: &mut Completeness,
+    (query, reads): (&Query, &Reads),
+    source: &'static str,
+    snapshot: &Snapshot,
+    state: &crate::ReasoningState,
+) {
+    use nrese_sparql::Regime::{Owl2Dl, Owl2Ql, Owl2Rl};
+    if !matches!(completeness.regime, Some(Owl2Dl | Owl2Ql | Owl2Rl)) {
+        return;
+    }
+    let typed = |predicate: &Option<String>| {
+        reads.access.is_some()
+            || match predicate {
+                Some(p) => snapshot
+                    .lookup(NamedNodeRef::new_unchecked(p).into())
+                    .is_some_and(|p| {
+                        snapshot.holds_typed_literals(ReadModel::Materialised, Some(p))
+                    }),
+                None => snapshot.holds_typed_literals(ReadModel::Materialised, None),
+            }
+    };
+    let read = reads.predicates.get_or_init(|| predicates(query));
+    if state.literal_equality && read.iter().any(typed) {
+        completeness.incomplete(source, LITERAL_EQUALITY.to_owned());
+    }
+    negation_rule(completeness, (query, reads), source);
+}
+
 /// Why a read [`annotation_rule`] names may give wrong rows.
 const COPIES: &str = "and the closure may hold the rules' copies of annotation statements (by \
                       an equality or an annotation axiom), which OWL 2 DL doesn't entail";

@@ -388,7 +388,9 @@ impl StoreService {
         if service.engine.snapshot().revision() != before {
             service.invalidate_held(writer)?;
         }
-        if let Some(state) = service.reasoning_state() {
+        if let Some(mut state) = service.reasoning_state() {
+            // The marker doesn't record a literal equality: the stored statements tell.
+            state.literal_equality = service.literal_equality_at_open(tx.base(), &state);
             // The reading isn't on disk: the certified stack's is installed before the store
             // is anyone's, with its certificate. Without one the stack is read as stored.
             service.certify(&tx, state.clone());
@@ -732,6 +734,67 @@ impl StoreService {
         self.marker.store(false, Ordering::Release);
         *self.materialised.lock().unwrap_or_else(|p| p.into_inner()) = None;
         Ok(())
+    }
+
+    /// `certificate` with its state marked as the rules equating a literal with another term
+    /// ([`crate::ReasoningState::literal_equality`]), for the version of a commit that derived
+    /// such a fact; the same object where it is marked already or isn't this store's. The
+    /// state kept in memory is marked too, so a certificate made again (a change of the mode
+    /// or the QL setting) keeps the mark; the marker on disk isn't changed (an open finds the
+    /// equality again, [`Self::literal_equality_at_open`]).
+    pub(crate) fn with_literal_equality(
+        &self,
+        _writer: nrese_engine::WriterHeld<'_>,
+        certificate: nrese_engine::Certificate,
+    ) -> nrese_engine::Certificate {
+        let marked = match certificate.downcast_ref::<Certificate>() {
+            Some(held) if !held.state.literal_equality => {
+                let mut kept = self.materialised.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(kept) = kept.as_mut() {
+                    kept.literal_equality = true;
+                }
+                let state = crate::ReasoningState {
+                    literal_equality: true,
+                    ..held.state.clone()
+                };
+                Some(std::sync::Arc::new(Certificate {
+                    state,
+                    ql: held.ql.clone(),
+                    equality_closed: held.equality_closed,
+                    dl: held.dl,
+                    user_rules: held.user_rules,
+                }) as nrese_engine::Certificate)
+            }
+            _ => None,
+        };
+        marked.unwrap_or(certificate)
+    }
+
+    /// Whether the rules of `state` equate a literal with another term over the statements
+    /// of a store opened without a rematerialisation, whose marker keeps no such record
+    /// ([`crate::ReasoningState::literal_equality`]): asked of the ruleset the marker names.
+    /// A ruleset it can't name (user rules) or a check the process's memory stops is taken
+    /// to equate one: the word is withheld, never given wrongly.
+    fn literal_equality_at_open(
+        &self,
+        snapshot: &nrese_engine::Snapshot,
+        state: &crate::ReasoningState,
+    ) -> bool {
+        use nrese_reasoner::{RuleProgram, rulesets::Ruleset};
+        let Some(ruleset) = Ruleset::from_name(&state.ruleset) else {
+            return true;
+        };
+        let Ok(program) = self.bound_program(snapshot, RuleProgram::builtin(ruleset)) else {
+            return true;
+        };
+        let program = program
+            .by_representatives(self.config.equality_by_representatives)
+            .storing_representatives(self.config.equality_compact);
+        let memory = self.memory_stop();
+        let stop = || memory.exceeded();
+        program
+            .derives_literal_equality(snapshot, &stop)
+            .unwrap_or(true)
     }
 
     /// Certifies `state` for the inferred stack just published, still under the writer slot
@@ -1423,6 +1486,8 @@ impl StoreService {
         } else if certificate.dl {
             crate::dl::query::certify(&mut status, reads, "dl", decided, Some(at.snapshot()));
         }
+        let rules = if certificate.dl { "dl" } else { "rules" };
+        crate::dl::query::withhold(&mut status, reads, rules, snapshot, &certificate.state);
         Some(status)
     }
 
@@ -2621,6 +2686,7 @@ impl StoreService {
         // publication that fails installs nothing, so there is nothing to put back.
         let state = crate::ReasoningState {
             undecided,
+            literal_equality: closure.literal_equality,
             ..crate::ReasoningState::of_with(
                 rules,
                 self.config.hide_unnamed_classes,

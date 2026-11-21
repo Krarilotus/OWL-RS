@@ -15,9 +15,12 @@
 //! Rules match over the union of all graphs and inferences go to the default graph
 //! (design §6.2). OWL 2 RL derives some generalised triples, such as a literal typed by a
 //! datatype property's range; RDF can't store a literal subject or a non-IRI predicate, so
-//! those are dropped. Commits therefore don't see them either, which matters only for
-//! rules that turn them back into storable facts (an `owl:inverseOf` on a datatype
-//! property, which OWL 2 doesn't allow).
+//! those are dropped. Commits therefore don't see them either, which matters for rules
+//! that turn them back into storable facts (an `owl:inverseOf` on a datatype property,
+//! which OWL 2 doesn't allow), and for an `owl:sameAs` between two spellings of one value,
+//! whose copies of a later commit's statements are missing: the closure and each commit
+//! report one ([`Closure::literal_equality`], [`Maintenance::literal_equality`]), and
+//! [`Program::derives_literal_equality`] finds one in a stored state.
 
 mod datatypes;
 mod explain;
@@ -266,6 +269,67 @@ impl Program {
         )
     }
 
+    /// Whether the rules equate a literal with another term over `snapshot`'s statements (an
+    /// `owl:sameAs` with a literal subject), as its closure did and dropped: for a store
+    /// reopened without a rematerialisation, which kept no record of it. Those statements
+    /// are the closure but for such facts and what they would copy, so one step of each rule
+    /// that can conclude one decides. A rule runs only where its conclusion's subject is
+    /// bound at object positions alone (`may_equate_literal`). `Err` once `stop` fires.
+    pub fn derives_literal_equality(
+        &self,
+        snapshot: &Snapshot,
+        stop: crate::eval::Stop<'_>,
+    ) -> Result<bool, delta::Interrupted> {
+        use crate::eval::{Poller, Seg, instantiate_head, plan, walk_until};
+        use crate::ir::Head;
+        let Some(same_as) = self.same_as else {
+            return Ok(false);
+        };
+        let interrupted = || delta::Interrupted::default();
+        let poll = Poller::new(stop).ok_or_else(interrupted)?;
+        let base = explain::SnapshotBase {
+            snapshot,
+            axioms: &self.axioms,
+        };
+        let source = crate::explain::Whole(&base);
+        let ground = self.ground_program(snapshot);
+        for rule in &ground.rules {
+            let Head::Facts(heads) = &rule.head else {
+                continue;
+            };
+            let heads: Vec<_> = (heads.iter())
+                .filter(|head| may_equate_literal(rule, head, same_as))
+                .collect();
+            if heads.is_empty() || rule.body.is_empty() {
+                continue;
+            }
+            let atoms: Vec<usize> = (0..rule.body.len()).collect();
+            let order = plan(&source, rule, &atoms, 0, |_| Seg::All, &poll);
+            let mut bindings = vec![None; rule.variables()];
+            let mut equates = |bindings: &[Option<u64>]| {
+                (heads.iter())
+                    .any(|head| equates_literal(instantiate_head(head, bindings), Some(same_as)))
+            };
+            let found = walk_until(
+                &source,
+                &rule.body,
+                &rule.guards,
+                &order,
+                0,
+                &mut bindings,
+                &poll,
+                &mut equates,
+            );
+            if poll.stopped() {
+                return Err(interrupted());
+            }
+            if found {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// The schema for a run over `snapshot`: with the unnamed classes to leave out, when
     /// the program does.
     fn schema_for(&self, snapshot: &Snapshot) -> Schema {
@@ -367,6 +431,36 @@ pub(crate) fn storable([subject, predicate, _]: Triple) -> bool {
         TermId::from_raw(subject).kind(),
         TermKind::Iri | TermKind::BlankNode
     ) && TermId::from_raw(predicate).kind() == TermKind::Iri
+}
+
+/// Whether `fact` equates a literal with another term: an `owl:sameAs` (`same_as`) between
+/// two different terms whose subject no store holds (a literal: [`storable`]). The rules
+/// derive one where a functional property or an at-most-one restriction holds one value in
+/// two spellings; dropped, it copies nothing into a later commit's statements.
+pub(crate) fn equates_literal([subject, predicate, object]: Triple, same_as: Option<u64>) -> bool {
+    Some(predicate) == same_as
+        && subject != object
+        && !matches!(
+            TermId::from_raw(subject).kind(),
+            TermKind::Iri | TermKind::BlankNode
+        )
+}
+
+/// Whether `head`, a conclusion of `rule`, may equate a literal ([`equates_literal`]): an
+/// `owl:sameAs` whose subject is a variable other than its object's, bound by the body at
+/// object positions alone (no stored statement has a literal subject or predicate).
+fn may_equate_literal(rule: &Rule, head: &crate::ir::Atom, same_as: u64) -> bool {
+    use crate::ir::Term;
+    let [subject, predicate, object] = head.0;
+    let Term::Var(v) = subject else {
+        return false;
+    };
+    predicate == Term::Const(same_as)
+        && object != subject
+        && rule
+            .body
+            .iter()
+            .all(|atom| atom.0[0] != Term::Var(v) && atom.0[1] != Term::Var(v))
 }
 
 pub(crate) fn encode([s, p, o]: Triple) -> EncodedTriple {

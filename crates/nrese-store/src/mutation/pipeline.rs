@@ -288,19 +288,20 @@ impl MutationPipeline {
                 self.store.consistency(),
                 crate::ConsistencyStatus::Consistent
             );
-            let (violations, materialisation, changed) = crate::reasoning::apply_delta(
-                program,
-                cached,
-                &mut tx,
-                &operation,
-                &report_memory,
-                base_consistent,
-            )
-            .map_err(|interrupted| {
-                memory
-                    .error(interrupted)
-                    .map_or(MutationError::Cancelled, &store_error)
-            })?;
+            let (violations, materialisation, changed, literal_equality) =
+                crate::reasoning::apply_delta(
+                    program,
+                    cached,
+                    &mut tx,
+                    &operation,
+                    &report_memory,
+                    base_consistent,
+                )
+                .map_err(|interrupted| {
+                    memory
+                        .error(interrupted)
+                        .map_or(MutationError::Cancelled, &store_error)
+                })?;
             tracing::debug!(?materialisation, "commit-path materialisation");
             // Whether the closure the commit leaves leaves out a list axiom: its program's
             // whole list diagnostics (the report's are only the new ones). With no program at
@@ -473,7 +474,14 @@ impl MutationPipeline {
                 let writer = tx.writer().expect("a transaction holds the writer slot");
                 self.store.invalidate_held(writer).map_err(store_error)?;
             }
-            if let Some(certificate) = tx.base().certificate().cloned() {
+            if let Some(mut certificate) = tx.base().certificate().cloned() {
+                // A commit that equated a literal with another term: its version and every
+                // later one withhold the word from reads of typed values, until a
+                // rematerialisation finds no such equality (`ReasoningState::literal_equality`).
+                if literal_equality {
+                    let writer = tx.writer().expect("a transaction holds the writer slot");
+                    certificate = self.store.with_literal_equality(writer, certificate);
+                }
                 tx.vouch(certificate);
             }
             let summary = match ql {

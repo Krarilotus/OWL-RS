@@ -224,6 +224,10 @@ pub struct Maintenance {
     /// ([`maintain_with`]'s `uses_rebuilt_report`): the rebuild's own violations, charged to
     /// the same budget. Over a state that had none, they are the change's new ones.
     pub rebuilt_violations: Option<Violations>,
+    /// The change derived, or its rebuild holds, a fact equating a literal with another term
+    /// (an `owl:sameAs` with a literal subject): dropped as no store holds it, so a later
+    /// commit's statements miss its copies. Its absence says nothing of the state before.
+    pub literal_equality: bool,
 }
 
 /// Whether `base` holds an inverse property expression (`_:x owl:inverseOf :p`), OWL 2's
@@ -486,6 +490,9 @@ pub fn maintain_with(
         }
     };
     let mut update = update;
+    // A first load's facts no store holds are among them (above).
+    let mut literal_equality =
+        (update.insert.iter()).any(|&fact| super::equates_literal(fact, program.same_as));
     // A list past the cap ([`crate::lists::MAX_VARIANTS`]) in the program after the delta,
     // whether the state before held it or this change's rounds read it: the rules it gave
     // while within the cap are in no program made over the state, so the delta derived
@@ -563,6 +570,7 @@ pub fn maintain_with(
         if operation.fired() {
             return Err(operation.interrupted());
         }
+        literal_equality |= closure.literal_equality;
         rebuilt_violations = uses_rebuilt_report.then(|| {
             let found = std::mem::take(&mut closure.violations);
             // A change rebuilt for a list past the cap, or for a list read otherwise, that
@@ -643,6 +651,7 @@ pub fn maintain_with(
         program: update.program,
         work: update.policy,
         rebuilt_violations,
+        literal_equality,
     })
 }
 

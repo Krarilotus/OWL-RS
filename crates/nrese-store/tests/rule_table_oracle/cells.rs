@@ -721,7 +721,7 @@ fn irreflexive_same_as_is_inconsistent() {
 }
 
 #[test]
-#[ignore = "documented limit reasoning-semantics.md:74: a later write loses equality derived by a functional property between literal forms"]
+#[ignore = "rows, not the word: literal equalities kept beside the store come with v1.6; until then such reads are withheld from complete (it::literal_equality_status_tests)"]
 fn functional_literal_equality_reaches_later_writes() {
     // Spec: Table 5 prp-fp equates the two forms; Table 4 eq-rep-o copies
     // either one into the later row. Table 8 dt-diff sees one data value.
