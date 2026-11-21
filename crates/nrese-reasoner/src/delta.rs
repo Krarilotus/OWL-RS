@@ -36,6 +36,7 @@
 pub mod policy;
 
 use std::borrow::Cow;
+use std::cell::OnceCell;
 
 use hashbrown::HashSet;
 use rayon::prelude::*;
@@ -1375,6 +1376,19 @@ fn update_body<B: Base + ?Sized>(
         .into_iter()
         .filter(|&(c, _)| !is_full[c])
         .collect();
+    // An instance with a changed guard can still give the same witness. Test each
+    // candidate against the old state before recording it in the report.
+    let deleted_facts = OnceCell::new();
+    let was_present = |name: &str, bindings: &[Option<u64>], poll: &Poller<'_>| {
+        let before = Overlay {
+            base,
+            hidden: &inserted_set,
+            extra: deleted_facts.get_or_init(|| Store::new(deleted.to_vec())),
+        };
+        old_program.has_witness(&before, name, bindings, poll)
+    };
+    let exclude_old = (!deleted.is_empty() && !old_program.consistency.is_empty())
+        .then_some(&was_present as &super::batch::WitnessFilter<'_>);
     let mut found = Violations::new(Arc::clone(memory));
     check(
         &state,
@@ -1383,6 +1397,7 @@ fn update_body<B: Base + ?Sized>(
         &variants,
         &mut found,
         stop,
+        exclude_old,
     )?;
     check_stop()?;
     result.violations = found;
@@ -1506,6 +1521,7 @@ fn introduced_violations_body<B: Base + ?Sized>(
         &variants,
         &mut found,
         stop,
+        None,
     )?;
     Ok(found)
 }

@@ -2597,6 +2597,45 @@ impl GroundProgram {
         self.consistency_known.contains(&key)
     }
 
+    /// Whether any instance emits this rule name and binding in `source`. The schema
+    /// bindings were checked when the program was grounded; probe the remaining atoms.
+    pub(crate) fn has_witness<S: Source + ?Sized>(
+        &self,
+        source: &S,
+        name: &str,
+        bindings: &[Option<u64>],
+        poll: &Poller<'_>,
+    ) -> Result<bool, Stopped> {
+        'instances: for (rule, grounded) in &self.consistency {
+            if poll.tick() {
+                return Err(Stopped);
+            }
+            if rule.name != name
+                || grounded.substitution.len() != bindings.len()
+                || grounded
+                    .substitution
+                    .iter()
+                    .zip(bindings)
+                    .any(|(bound, value)| bound.is_some() && bound != value)
+            {
+                continue;
+            }
+            for atom in &grounded.rule.body {
+                let [Some(s), Some(p), Some(o)] = pattern(atom, bindings) else {
+                    continue 'instances;
+                };
+                if !source.contains([s, p, o], poll)? {
+                    continue 'instances;
+                }
+            }
+            if guards_hold(&grounded.rule.guards, bindings, poll) {
+                return Ok(true);
+            }
+        }
+        poll.ended()?;
+        Ok(false)
+    }
+
     /// Grounds `rules` (fact and consistency rules) over all of `source`.
     pub fn ground<S: Source + ?Sized>(&mut self, source: &S, schema: &Schema, rules: &[Rule]) {
         for rule in rules {

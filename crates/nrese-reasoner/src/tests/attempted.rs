@@ -280,6 +280,7 @@ fn filtered_driver_positions_count_towards_the_stop() {
         &[],
         &mut found,
         &stop,
+        None,
     );
     assert_eq!(result.err(), Some(Interrupted::default()));
     let ranges = source.ranges.load(Ordering::Relaxed);
