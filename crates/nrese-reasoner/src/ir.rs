@@ -12,10 +12,7 @@
 //! prp-fp:  (?p rdf:type owl:FunctionalProperty), (?x ?p ?y1), (?x ?p ?y2), ?y1 != ?y2
 //!          -> (?y1 owl:sameAs ?y2)
 //! cax-dw:  (?c1 owl:disjointWith ?c2), (?x rdf:type ?c1), (?x rdf:type ?c2) -> false
-//! prp-dom: (?p rdfs:domain ?c), (?x ?p ?y), ?p !annotation -> (?x rdf:type ?c)
 //! ```
-//!
-//! `?p !annotation`: `?p` is no annotation property of the data ([`Guard::NotAnnotation`]).
 //!
 //! Prefixes `rdf:`, `rdfs:`, `owl:` and `xsd:` are built in; literals are written
 //! `"lexical"^^xsd:type`. A rule ends at the next line starting with a name and `:`.
@@ -66,7 +63,8 @@ pub enum Guard {
     SameList(Term, Term, SharedListIndex),
     /// The term's id must not be one of the annotation properties: those of the data, read
     /// as the OWL reader reads them when a run starts and fixed for the run, so the rule
-    /// stays monotone within it (`engine::Program`). As parsed, the set is empty.
+    /// stays monotone within it (`engine::Program`). Put on built-in rules at their compile
+    /// (`rulesets::guard_annotation_readings`), the set empty until a run fills it.
     NotAnnotation(Term, AnnotationIds),
     /// A rule's guards where it runs over representatives of `owl:sameAs` classes: they
     /// hold where members of the classes of their variables' values, and their constants
@@ -448,9 +446,6 @@ fn parse_rule(name: &str, source: &str, vocabulary: &mut impl Vocabulary) -> Res
                 term(a.trim(), &mut variables, vocabulary)?,
                 term(b.trim(), &mut variables, vocabulary)?,
             ));
-        } else if let Some(a) = part.strip_suffix("!annotation") {
-            let a = term(a.trim(), &mut variables, vocabulary)?;
-            guards.push(Guard::NotAnnotation(a, AnnotationIds::default()));
         } else {
             body.push(atom(&part, &mut variables, vocabulary)?);
         }

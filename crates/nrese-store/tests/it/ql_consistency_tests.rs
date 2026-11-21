@@ -462,6 +462,35 @@ fn no_owl2_ql_rule_reads_an_annotation_as_an_axiom() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Spec: a store with a custom program answers what that program entails, and the user's
+/// rules are the user's choice (as `equality_rule_names_tests` states of their names); the
+/// guard against annotation readings is on `owl2-ql`'s built-in rules only (D16-1112). On
+/// `owl2-ql`, a user rule `(?p rdfs:subPropertyOf ?q), (?x ?p ?y)
+/// -> (?x ?q ?y)` applies to `:note`, declared an annotation property: with
+/// `:note rdfs:subPropertyOf :q` and `:x :note :v` committed, `:x :q :v` is read `true`.
+#[test]
+fn a_user_rule_on_owl2_ql_reads_an_annotation_property_as_written() {
+    let rules = nrese_reasoner::UserRules::n3(
+        "user.n3",
+        "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         { ?p rdfs:subPropertyOf ?q . ?x ?p ?y } => { ?x ?q ?y } .",
+    )
+    .expect("the rules compile");
+    let config = ReasonerConfig::for_mode(ReasoningMode::Owl2Ql)
+        .with_rules(Some(Arc::new(rules)))
+        .expect("rules on a ruleset");
+    let store = store(QlRewritingMode::Auto);
+    let reasoning =
+        MutationPipeline::new(Arc::clone(&store), Arc::new(ReasonerService::new(config)));
+    let data = ":note a owl:AnnotationProperty ; rdfs:subPropertyOf :q . :x :note :v .";
+    let committed = commit(&reasoning, data);
+    let after = read(&store, ":x :q :v");
+    assert!(
+        committed == "applied" && after.starts_with("true, "),
+        "committed: {committed}, read {after}"
+    );
+}
+
 /// A property's domain, with `:alice` using it: `:alice a :Doc` follows while `:note` isn't
 /// declared an annotation property (the OWL reader reads the domain as an object property's),
 /// and doesn't once it is.

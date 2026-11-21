@@ -21,7 +21,7 @@
 //! | `rdfs-full` | every RDFS entailment rule (RDF 1.1 Semantics §9.2) and the finite RDF and RDFS axiomatic triples |
 //! | `rdfs-plus` | `rdfs` with equality, inverse, symmetric, transitive, functional and inverse functional properties, equivalent classes and properties |
 //! | `owl-horst` | `rdfs-plus` with `hasValue`, `someValuesFrom` and `allValuesFrom` (ter Horst's pD*) |
-//! | `owl2-ql` | what OWL 2 QL axioms entail without inventing individuals: hierarchies, domains and ranges (an annotation property's entail nothing), inverses, reflexive properties, `someValuesFrom owl:Thing`, and checks for disjointness, complements and an empty `owl:Thing` |
+//! | `owl2-ql` | what OWL 2 QL axioms entail without inventing individuals: hierarchies, domains, ranges, inverses, reflexive properties, `someValuesFrom owl:Thing`, and checks for disjointness, complements and an empty `owl:Thing`; no rule reads what the OWL reader reads as an annotation: an annotation property's assertions, domains, ranges and sub-property links (Direct Semantics §1; `guard_annotation_readings`); user rules on top are left as written |
 //! | `owl2-rl` | the OWL 2 RL/RDF rules |
 //!
 //! Every ruleset is validated by the tests: it parses, every rule is safe, and the
@@ -30,7 +30,8 @@
 use std::sync::OnceLock;
 
 use super::ir::{
-    ParseError, Rule, RuleSource, Vocabulary, parse_rules, parse_sources, rule_sources,
+    AnnotationIds, Atom, Guard, ParseError, Rule, RuleSource, Term, Vocabulary, parse_rules,
+    parse_sources, rule_sources,
 };
 
 /// The named rulesets.
@@ -68,6 +69,7 @@ pub const ALL: [Ruleset; 6] = [
 /// - A [`SemanticPart`] covers what only some user rulesets use. A user ruleset's
 ///   fingerprint feeds the version of each part its validating compile reports using
 ///   ([`crate::RuleProgram::fingerprint`]), so bumping a part rebuilds only those stores.
+///   A built-in ruleset's fingerprint feeds the parts its compile uses ([`Ruleset::parts`]).
 ///   A new part starts at 1.
 ///
 /// The fingerprint also covers the rule text and the relations a GraphDB ruleset's contexts
@@ -98,7 +100,7 @@ pub const ALL: [Ruleset; 6] = [
 /// rules of a list's walks to `rdf:nil`. An older store rematerialises once.
 pub const SEMANTICS_VERSION: u32 = 8;
 
-/// A part of the evaluation semantics only some user rulesets use ([`SEMANTICS_VERSION`]).
+/// A part of the evaluation semantics only some rulesets use ([`SEMANTICS_VERSION`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SemanticPart {
     /// Rules with guards, run over representatives of `owl:sameAs` classes. 1 (26 Oct 2026):
@@ -109,6 +111,11 @@ pub enum SemanticPart {
     /// 2026): the equality module stands in for the rules that say what those say, whatever
     /// their names (`equality_rules`), not for the rules so named.
     EqualityRules,
+    /// A built-in ruleset's rules guarded at compile against what the OWL reader reads as an
+    /// annotation (`guard_annotation_readings`); its fingerprint feeds this part
+    /// ([`Ruleset::parts`]). 1 (21 Nov 2026): `owl2-ql`'s rules no longer read an annotation
+    /// property's assertions, domains, ranges or sub-properties, so its stores rebuild once.
+    AnnotationReadings,
 }
 
 impl SemanticPart {
@@ -117,13 +124,15 @@ impl SemanticPart {
         match self {
             Self::GuardsOverClasses => ("guards-over-classes", 1),
             Self::EqualityRules => ("equality-rules", 1),
+            Self::AnnotationReadings => ("annotation-readings", 1),
         }
     }
 }
 
 impl Ruleset {
     /// Identifies what this ruleset derives: FNV-1a over [`SEMANTICS_VERSION`], the name,
-    /// the rule text, and the name and text of every OWL 2 RL rule it adds (the bodies it
+    /// the rule text, the name and text of every OWL 2 RL rule it adds, its axioms, and the
+    /// versions of the semantic parts its compile uses ([`Self::parts`]) (the bodies it
     /// compiles, so editing one changes the fingerprint of every ruleset using it: the
     /// review of 3 October 2026, C6). Stable across builds and platforms (no std hasher,
     /// which may change).
@@ -153,7 +162,20 @@ impl Ruleset {
             feed(rule.source.as_bytes());
         }
         feed(self.axioms().as_bytes());
+        for part in self.parts() {
+            let (name, version) = part.version();
+            feed(name.as_bytes());
+            feed(&version.to_le_bytes());
+        }
         hash
+    }
+
+    /// The semantic parts the ruleset's compile uses beyond its text ([`SemanticPart`]).
+    pub fn parts(self) -> &'static [SemanticPart] {
+        match self {
+            Self::Owl2Ql => &[SemanticPart::AnnotationReadings],
+            _ => &[],
+        }
     }
 
     pub fn name(self) -> &'static str {
@@ -215,6 +237,9 @@ impl Ruleset {
     pub fn rules(self, vocabulary: &mut impl Vocabulary) -> Result<Vec<Rule>, ParseError> {
         let mut rules = parse_rules(self.text(), vocabulary)?;
         rules.extend(parse_sources(self.added_rules(), vocabulary)?);
+        if self.parts().contains(&SemanticPart::AnnotationReadings) {
+            guard_annotation_readings(&mut rules, vocabulary);
+        }
         Ok(rules)
     }
 
@@ -249,6 +274,40 @@ impl Ruleset {
             );
         }
         Ok(out)
+    }
+}
+
+/// Guards `rules` against what the OWL reader reads as an annotation: annotations "have no
+/// semantic meaning in OWL 2" (Direct Semantics §1), so no rule may consume one. Each variable
+/// in a body position the reader reads as an annotation when it names an annotation property
+/// gets one [`Guard::NotAnnotation`] (filled with the data's set per run, `engine::Program`):
+/// 1. the predicate of any atom, `(?x ?p ?y)`: an annotation assertion;
+/// 2. the subject of an `rdfs:domain` or `rdfs:range` atom: an annotation axiom;
+/// 3. either end of an `rdfs:subPropertyOf` atom: an annotation axiom.
+///
+/// Constants aren't guarded. Applied to a built-in ruleset's own rules at their compile
+/// ([`SemanticPart::AnnotationReadings`]); a user's rules on top keep what they wrote.
+fn guard_annotation_readings(rules: &mut [Rule], vocabulary: &mut impl Vocabulary) {
+    let rdfs = |local: &str| format!("{}{local}", super::ir::RDFS);
+    let [domain, range, sub] =
+        ["domain", "range", "subPropertyOf"].map(|local| Term::Const(vocabulary.iri(&rdfs(local))));
+    for rule in rules {
+        let mut read = Vec::new();
+        for &Atom([s, p, o]) in &rule.body {
+            read.push(p);
+            if p == domain || p == range {
+                read.push(s);
+            } else if p == sub {
+                read.extend([s, o]);
+            }
+        }
+        for term in read {
+            let guarded = |g: &Guard| matches!(g, Guard::NotAnnotation(t, _) if *t == term);
+            if matches!(term, Term::Var(_)) && !rule.guards.iter().any(guarded) {
+                rule.guards
+                    .push(Guard::NotAnnotation(term, AnnotationIds::default()));
+            }
+        }
     }
 }
 
@@ -414,11 +473,6 @@ pub const OWL_HORST: &[&str] = &[
 /// subject, a declared named individual. Without them OWL2Bench QL's q01 (`?x :knows ?y`)
 /// missed the 3,677 pairs `a :knows a` (GraphDB's 5,104 rows; office batch B, 5 October
 /// 2026).
-///
-/// And OWL 2 RL's `prp-dom` and `prp-rng` where the property is no annotation property
-/// (`?p !annotation`, as the OWL reader reads the data's): annotations "have no semantic
-/// meaning in OWL 2" (Direct Semantics §1), so an annotation property's domain and range
-/// entail nothing. OWL 2 RL's own keep them, as the RDF-Based Semantics does.
 pub const OWL2_QL_OWN: &str = r#"
 prp-refl-c: (?p rdf:type owl:ReflexiveProperty), (?x rdf:type ?c), (?c rdf:type owl:Class)
             -> (?x ?p ?x)
@@ -428,13 +482,13 @@ prp-refl-d: (?p rdf:type owl:ReflexiveProperty), (?x ?q ?v), (?q rdf:type owl:Da
             -> (?x ?p ?x)
 prp-refl-i: (?p rdf:type owl:ReflexiveProperty), (?x rdf:type owl:NamedIndividual)
             -> (?x ?p ?x)
-prp-dom:    (?p rdfs:domain ?c), (?x ?p ?y), ?p !annotation -> (?x rdf:type ?c)
-prp-rng:    (?p rdfs:range ?c), (?x ?p ?y), ?p !annotation -> (?y rdf:type ?c)
 "#;
 
 /// OWL 2 QL, materialised: its axioms without the existentials on the right of
 /// `SubClassOf` (they would invent individuals), and its consistency checks.
 pub const OWL2_QL: &[&str] = &[
+    "prp-dom",
+    "prp-rng",
     "prp-spo1",
     "prp-eqp1",
     "prp-eqp2",
@@ -623,8 +677,9 @@ mod tests {
     }
 
     /// A ruleset's fingerprint is FNV-1a (64-bit) over the semantics version, its name, its
-    /// text, the name and text of each OWL 2 RL rule it adds, and its axioms, in that order:
-    /// the value stored reasoning states carry, whether computed now or remembered.
+    /// text, the name and text of each OWL 2 RL rule it adds, its axioms, and the name and
+    /// version of each semantic part its compile uses, in that order: the value stored
+    /// reasoning states carry, whether computed now or remembered.
     #[test]
     fn every_fingerprint_is_the_fnv1a_of_its_parts() {
         fn fnv1a(parts: &[&[u8]]) -> u64 {
@@ -647,10 +702,34 @@ mod tests {
                 parts.push(rule.source.as_bytes());
             }
             parts.push(ruleset.axioms().as_bytes());
+            // The parts' versions, little-endian, as `SEMANTICS_VERSION`'s.
+            let versions: Vec<(&str, [u8; 4])> = (ruleset.parts().iter())
+                .map(|part| (part.version().0, part.version().1.to_le_bytes()))
+                .collect();
+            for (name, version) in &versions {
+                parts.push(name.as_bytes());
+                parts.push(version);
+            }
             // Asked twice: the remembered value is the computed one.
             for _ in 0..2 {
                 assert_eq!(ruleset.fingerprint(), fnv1a(&parts), "{}", ruleset.name());
             }
         }
+    }
+
+    /// Spec (reasoning-semantics.md, "Freshness": a build that changes what a ruleset derives
+    /// rebuilds its stores once; one that doesn't keeps them): `owl2-ql`'s rules no longer
+    /// read an annotation (D16-1112), so its fingerprint differs from the one the build before
+    /// stored, `091ff2fcfe077a51` (1e8720666's, computed from that build's rule text outside
+    /// the crate); `owl2-rl`'s derives the same and keeps that build's, `d21b78c6c05606e7`.
+    #[test]
+    fn only_owl2_qls_fingerprint_changes_with_its_annotation_readings() {
+        let [ql, rl] =
+            [Ruleset::Owl2Ql, Ruleset::Owl2Rl].map(|r| format!("{:016x}", r.fingerprint()));
+        assert_ne!(ql, "091ff2fcfe077a51", "owl2-ql's stores must rebuild once");
+        assert_eq!(
+            rl, "d21b78c6c05606e7",
+            "owl2-rl's stores keep their closure"
+        );
     }
 }
