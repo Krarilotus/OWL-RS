@@ -1028,7 +1028,9 @@ fn update_body<B: Base + ?Sized>(
                     candidates.push(f);
                 }
             }
-            candidates.retain(|&f| !mentions(&region, f));
+            // Only RDF facts are bulk-overdeleted with the equality region.
+            // Table facts still need to follow their deleted premises.
+            candidates.retain(|&f| internal(f[1]) || !mentions(&region, f));
             drop(jobs);
             // Equalities about to be overdeleted (their premises gone) may split classes
             // too: the policy may recompute them, from the start.
@@ -1285,7 +1287,7 @@ fn update_body<B: Base + ?Sized>(
     let candidates: Vec<Triple> = overdeleted
         .iter()
         .copied()
-        .filter(|f| !mentions(&region, *f))
+        .filter(|f| internal(f[1]) || !mentions(&region, *f))
         .chain(deleted.iter().copied())
         .collect();
     let settled: &GroundProgram = &program;
