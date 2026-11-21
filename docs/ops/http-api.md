@@ -427,7 +427,7 @@ For a write answered with `500`, follow the response's `detail`.
 | `whether it was applied is unknown: read the data before sending it again` | Check the data first. Send the write again only if it still needs to be applied. |
 
 If the detail names a published revision, do not send the upload again, even if quarantine recording or reasoning failed.
-If it also names a load ID, that load's quarantined statements are listed, but a power loss may lose them.
+If it also names a load ID, that load's quarantined statements are listed under it (or, where the detail says so, may be), and a power loss may lose them.
 An unknown-outcome import uses the same read-before-resending instruction as a write.
 
 ### Example: a SPARQL syntax error

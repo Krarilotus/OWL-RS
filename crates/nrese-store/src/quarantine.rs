@@ -1042,6 +1042,8 @@ pub enum QuarantineCommitError {
         load: String,
         /// The load's file under its listed name, as the store named it.
         file: PathBuf,
+        /// The file was seen under that name, and its records are listed and counted.
+        seen: bool,
     },
 }
 
@@ -1065,14 +1067,19 @@ impl QuarantineCommitError {
         )
     }
 
-    /// For a load that published: a sentence naming the load its records are listed under,
-    /// with a leading space, or nothing if none is.
+    /// For a load that published: a sentence naming the load its records are (or, its file
+    /// unseen, may be) listed under, with a leading space, or nothing if none is.
     pub fn published_note(&self) -> String {
         match self {
             Self::NotListed(_) => String::new(),
-            Self::PossiblyListed { load, .. } => format!(
+            Self::PossiblyListed {
+                load, seen: true, ..
+            } => format!(
                 " This load's records are listed under load ID {load}, but a power loss may lose them."
             ),
+            Self::PossiblyListed { load, .. } => {
+                format!(" This load's records may be listed under load ID {load}.")
+            }
         }
     }
 }
@@ -1235,30 +1242,37 @@ impl Collector<'_> {
             // load of only invalid statements publishes nothing else.
             let listed = partial.with_extension("jsonl");
             let dir = partial.parent().expect("in the quarantine directory");
+            // On failure, also whether the file was seen under its listed name.
             let placed = match self.rename_into_place(partial, &listed) {
+                Ok(()) => self.sync_placement(dir).map_err(|reason| (reason, true)),
                 // A rename that reports an error may have moved the file anyway (Windows'
-                // write-through move): listed, it is a placement not made durable.
-                Err(error) if matches!(self.listed_exists(&listed), Ok(false)) => {
-                    return Err(error.into());
-                }
-                placed => placed.and_then(|()| self.sync_placement(dir)),
+                // write-through move): listed, it is a placement not made durable. If
+                // looking for it fails, it may be listed, but it wasn't seen.
+                Err(error) => match self.listed_exists(&listed) {
+                    Ok(false) => return Err(error.into()),
+                    seen => Err((error, seen.is_ok())),
+                },
             };
-            if let Err(reason) = placed {
+            if let Err((reason, seen)) = placed {
                 #[cfg(any(test, feature = "fault-points"))]
                 self.pause_at_placement_failure();
                 let withdrawal = match published {
                     true => Withdrawal::Kept,
                     false => self.withdraw(&listed, dir),
                 };
-                match withdrawal {
+                let seen = match withdrawal {
                     Withdrawal::Done => return Err(reason.into()),
-                    Withdrawal::Unsynced => {}
-                    Withdrawal::Kept => state.total += count,
+                    Withdrawal::Unsynced => false,
+                    Withdrawal::Kept => seen,
+                };
+                if seen {
+                    state.total += count;
                 }
                 return Err(QuarantineCommitError::PossiblyListed {
                     reason,
                     load: self.load.clone(),
                     file: listed,
+                    seen,
                 });
             }
         }
