@@ -270,11 +270,13 @@ class QuickTier(unittest.TestCase):
         # benches/suite/ or .githooks/ runs the suite contracts in quick as in push. The cases are the
         # gate files of two changes whose contracts failed only in the push gate (21 Nov 2026): the
         # effect check added to the guards, its stand-in missing from this file's fixture; the
-        # runner check that took a silent `cargo nextest --version` for no runner.
+        # runner check that took a silent `cargo nextest --version` for no runner. And each of the other
+        # two folders alone: a contract, a hook.
         cases = {"effect check": ["scripts/check-effect.sh", "scripts/check.sh"],
                  "runner check": ["benches/suite/tests/test_push_gate.py",
                                   "benches/suite/tests/test_push_tier_monotone.py", "scripts/check.sh",
-                                  "scripts/lib/gate-tools.txt", "scripts/lib/windows-job.sh"]}
+                                  "scripts/lib/gate-tools.txt", "scripts/lib/windows-job.sh"],
+                 "a contract": ["benches/suite/tests/test_push_gate.py"], "a hook": [".githooks/pre-push"]}
         for name, files in cases.items():
             for mode in ("quick", "push"):
                 with self.subTest(case=name, mode=mode):
