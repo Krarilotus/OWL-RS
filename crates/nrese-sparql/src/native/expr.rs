@@ -186,12 +186,16 @@ impl Evaluator {
             .capacity()
     }
 
-    /// Lets `alias` go ([`Self::register_alias`]).
-    pub(crate) fn forget_alias(&self, alias: &str) {
-        self.aliases
+    /// Lets `forgotten` go ([`Self::register_alias`]), with the map's room for them.
+    pub(crate) fn forget_aliases(&self, forgotten: &[String]) {
+        let mut aliases = self
+            .aliases
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(alias);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for alias in forgotten {
+            aliases.remove(alias);
+        }
+        aliases.shrink_to_fit();
     }
 
     /// The compiled `pattern` with `flags`, cached per query; `None` if it doesn't compile.

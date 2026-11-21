@@ -2206,11 +2206,19 @@ impl<'a> Context<'a> {
         // The numbers, then their charge.
         since.truncate(point.depth - 1);
         drop(since);
+        if !point.aliases_refused {
+            self.aliases_refused.set(None);
+        }
+        let mut computed = self.computed.borrow_mut();
+        if computed.len() == point.terms {
+            return;
+        }
         // An alias names its term by id: the aliases of the terms let go go first, before
         // their ids are made again.
-        let mut computed = self.computed.borrow_mut();
         let mut bytes = 0usize;
-        self.aliases.borrow_mut().retain(|alias, &mut id| {
+        let mut forgotten = Vec::new();
+        let mut aliases = self.aliases.borrow_mut();
+        aliases.retain(|alias, &mut id| {
             let Some(index) = computed_index(id).filter(|&index| index as usize >= point.terms)
             else {
                 return true;
@@ -2218,21 +2226,21 @@ impl<'a> Context<'a> {
             if let Some(term) = computed.get(index as usize) {
                 bytes = bytes.saturating_add(alias_bytes(alias, term));
             }
-            self.evaluator.forget_alias(alias);
+            forgotten.push(alias.clone());
             false
         });
-        if !point.aliases_refused {
-            self.aliases_refused.set(None);
+        if !forgotten.is_empty() {
+            aliases.shrink_to_fit();
+            self.evaluator.forget_aliases(&forgotten);
         }
         let mut ids = self.computed_ids.borrow_mut();
         for term in computed.drain(point.terms..) {
             bytes = bytes.saturating_add(computed_bytes(&term));
             ids.remove(&term);
         }
-        // What stays allocated is what the terms kept are charged for ([`computed_bytes`]).
-        let terms = computed.len();
-        computed.shrink_to(2 * terms);
-        ids.shrink_to(2 * terms);
+        // What stays allocated is what is still charged ([`computed_bytes`], [`alias_bytes`]).
+        computed.shrink_to_fit();
+        ids.shrink_to_fit();
         self.kept.borrow_mut().release(bytes);
     }
 
