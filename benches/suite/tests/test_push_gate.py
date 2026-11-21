@@ -1243,7 +1243,8 @@ class WindowsJob(Repo):
         # pinned version; `other`: another version; `failing`: the pinned one, but the command fails;
         # `split`: not inside the tier's run; `swapped`: another version inside it). Two archives of it as
         # get.nexte.st serves them (curl copies STUB_ARCHIVE): the tree pins the first and the executable
-        # it holds by their sha256 (cargo-nextest-windows); the second holds another executable.
+        # it holds by their sha256 (cargo-nextest-windows); the second holds that same executable and a
+        # file more, so only the archive's own sha256 tells it apart.
         tools_txt = self.repo / "scripts/lib/gate-tools.txt"
         pinned_nextest = re.search(r"^cargo-nextest (\S+)$", tools_txt.read_text(), re.M).group(1)
         v = pinned_nextest
@@ -1254,12 +1255,14 @@ class WindowsJob(Repo):
                   f'  swapped) [ -n "$NRESE_ON_BUILD_HOST" ] && v=0.9.1 || v={v}; echo "cargo-nextest $v (stand-in)" ;;\n'
                   f'  *) echo "cargo-nextest {v} (stand-in)" ;;\nesac\n')
         archives = []
-        for which, body in (("pinned", runner), ("another", runner + "# another\n")):
-            member = tarfile.TarInfo("cargo-nextest")
-            member.size, member.mode = len(body.encode()), 0o755
+        for which, members in (("pinned", {"cargo-nextest": runner}),
+                               ("another", {"cargo-nextest": runner, "extra.txt": "not in the release\n"})):
             path = self.root / f"nextest-{which}.tar.gz"
             with tarfile.open(path, "w:gz") as tar:
-                tar.addfile(member, io.BytesIO(body.encode()))
+                for name, body in members.items():
+                    member = tarfile.TarInfo(name)
+                    member.size, member.mode = len(body.encode()), 0o755
+                    tar.addfile(member, io.BytesIO(body.encode()))
             archives.append(path)
         good_archive, bad_archive = archives
         good_sum = hashlib.sha256(good_archive.read_bytes()).hexdigest()
@@ -1363,8 +1366,9 @@ class WindowsJob(Repo):
             # An entry whose executable isn't the pinned one is never run: made again from the pinned
             # archive, which runs.
             (tree, "", False, there, False, tampered, 0, True, "valid"),
-            # A runner of the host's own where cargo looks first: no verdict.
-            (tree, "", False, there, False, host_own, 3, False, None),
+            # A runner of the host's own where cargo looks first: no verdict, before anything is installed
+            # (the toolchain is missing here, and rustup isn't called).
+            (tree, "", False, missing, False, host_own, 3, False, None),
             # The declared Python isn't here and can't be had (the host's own ran the suite): no verdict.
             (tree, "", False, there, True, pinned, 3, False, None),
         ]
@@ -1409,7 +1413,7 @@ class WindowsJob(Repo):
             # rustup only to install the tree's pinned release, and only where it is missing: never
             # `default`, `update`, `self update` or `uninstall` (the host's rustup home is shared).
             calls = rustup.read_text().splitlines() if rustup.exists() else []
-            self.assertEqual(calls, [] if toolchain is there else
+            self.assertEqual(calls, [] if toolchain is there or nextest == host_own else
                              ["toolchain install 1.98.1 --no-self-update --profile minimal --component rustfmt,clippy"],
                              f"SPEC windows-toolchain: case {case}")
             if not recorded and nextest in (split, swapped):

@@ -93,6 +93,11 @@ run() {
   echo "$attempt" > "$out/attempt"
 
   [ "$(git rev-parse 'HEAD^{tree}' 2> /dev/null)" = "$tree" ] || infra "the checkout isn't tree $tree"
+  # A host's own cargo-nextest where cargo runs one first, before any on PATH, would stand in for the
+  # pinned one whatever its version says: no verdict, before anything is installed.
+  local home=${CARGO_HOME:-$HOME/.cargo}
+  [ ! -e "$home/bin/cargo-nextest.exe" ] && [ ! -e "$home/bin/cargo-nextest" ] \
+    || infra "the host's own cargo-nextest in $home/bin would run in place of the pinned one: no verdict"
   # shellcheck source=gate-key.sh
   . scripts/lib/gate-key.sh
   # shellcheck source=suite-python.sh
@@ -144,17 +149,13 @@ run() {
   # The pinned cargo-nextest, each version and archive in a directory of its own under the cache (named
   # by both), first on PATH. Then the one the tier gets: cargo looks in $CARGO_HOME/bin before PATH,
   # where a host's own would stand in. Its version counts only from a version command that succeeded.
-  local want sum exe_sum nextest runner home=${CARGO_HOME:-$HOME/.cargo}
+  local want sum exe_sum nextest runner
   want=$(sed -n 's/^cargo-nextest //p' scripts/lib/gate-tools.txt | tr -d '\r')
   [ -n "$want" ] || infra "the tree pins no cargo-nextest (scripts/lib/gate-tools.txt)"
   read -r sum exe_sum < <(awk -v v="$want" '$1 == "cargo-nextest-windows" && $2 == v { print $3, $4 }' \
     scripts/lib/gate-tools.txt | tr -d '\r')
   [[ ${sum:-} =~ ^[0-9a-f]{64}$ && ${exe_sum:-} =~ ^[0-9a-f]{64}$ ]] \
     || infra "the tree pins no sha256 of cargo-nextest $want's Windows archive and executable (scripts/lib/gate-tools.txt)"
-  # A host's own runner there, which cargo runs before any on PATH, would stand in for the pinned one
-  # whatever its version says.
-  [ ! -e "$home/bin/cargo-nextest.exe" ] && [ ! -e "$home/bin/cargo-nextest" ] \
-    || infra "the host's own cargo-nextest in $home/bin would run in place of the pinned one: no verdict"
   nextest=$(NRESE_PYTHON=python suite_python_entry "$cache/tools/nextest-$want-${sum:0:12}" windows_job_nextest_is \
     windows_job_nextest_unpack "$want" "$sum" "$exe_sum") || infra "no cargo-nextest $want"
   export PATH="$nextest:$PATH"
