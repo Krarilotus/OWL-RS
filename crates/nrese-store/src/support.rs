@@ -1747,23 +1747,29 @@ fn get_or_build<T: Clone + Send + Sync + 'static>(
         return Some(T::clone(value));
     }
     let builder = loop {
+        if stop() {
+            return None;
+        }
         // Kept meanwhile: the claim reads it again under the cell's lock.
         let kept = || slot.kept.get().map(|value| Some(Arc::clone(value)));
         match slot.build.claim((), Kind::Opaque, kept) {
-            Claim::Build(builder) => break Some(builder),
+            Claim::Build(builder) => {
+                if stop() {
+                    // Let go unrun: it ends abandoned, and its waiters claim again.
+                    drop(builder);
+                    return None;
+                }
+                break Some(builder);
+            }
             Claim::Wait(flight) => match flight.join(None, stop) {
                 Joined::Told(Ended::End(End::Kept(value) | End::Unkept(Some(value)))) => {
                     return Some(T::clone(&value));
                 }
                 // Its builder named no end (a panic), or one these builders never name: the
-                // next claim builds, unless this caller's stop fired.
+                // next claim builds, unless this caller's stop fired (asked before it).
                 Joined::Told(
                     Ended::End(End::Empty | End::Later | End::Unkept(None)) | Ended::Abandoned,
-                ) => {
-                    if stop() {
-                        return None;
-                    }
-                }
+                ) => {}
                 Joined::Busy => {
                     if stop() {
                         return None;

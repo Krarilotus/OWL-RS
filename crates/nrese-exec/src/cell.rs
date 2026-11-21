@@ -284,7 +284,7 @@ impl<V> Build<V> {
     /// them before each slice it takes, so it leaves at most one slice past them. They are
     /// asked with no lock of the build's held (`stop` may read the cell), and the end is read
     /// after them: an end recorded by the time they fired is told, not left. [`Busy`] at once
-    /// on a pool thread for an opaque build.
+    /// on a pool thread for an opaque build, unless they have fired (`Left`).
     pub fn join(&self, deadline: Option<Instant>, stop: &dyn Fn() -> bool) -> Joined<V> {
         let left = || deadline.is_some_and(|at| Instant::now() >= at) || stop();
         loop {
@@ -297,11 +297,12 @@ impl<V> Build<V> {
                     if let Some(end) = self.end.get() {
                         return Joined::Told(end);
                     }
-                    if rayon::current_thread_index().is_some() {
-                        return Joined::Busy;
-                    }
+                    // Before `Busy`: a waiter past its stop builds nothing of its own.
                     if gone {
                         return Joined::Left;
+                    }
+                    if rayon::current_thread_index().is_some() {
+                        return Joined::Busy;
                     }
                     self.waiting.fetch_add(1, Ordering::SeqCst);
                     let end = self.end.wait_until(slice_end(deadline));
