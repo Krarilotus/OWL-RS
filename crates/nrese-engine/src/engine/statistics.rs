@@ -75,6 +75,32 @@ impl Sets {
     }
 }
 
+/// A model's rebuild asked for, reset where its thread unwinds or never runs (a failed
+/// spawn drops the closure that holds it), so the next drifted planner asks again. Disarmed
+/// where the thread returns, which resets the flag itself: then it can't clear a later
+/// rebuild's. It takes `sets`: never made or dropped while they are held.
+struct ResetRebuilding {
+    statistics: Arc<Statistics>,
+    model: ReadModel,
+    armed: bool,
+}
+
+impl ResetRebuilding {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ResetRebuilding {
+    fn drop(&mut self) {
+        if self.armed
+            && let Some(kept) = self.statistics.sets.lock().get_mut(&self.model)
+        {
+            kept.rebuilding = false;
+        }
+    }
+}
+
 /// How a planner came by the sets ([`Statistics::kept_sets`]).
 enum Kept {
     /// Kept for its size, or kept and drifted (a rebuild started if none was).
@@ -401,26 +427,40 @@ impl Statistics {
     /// The sets of `model` kept, or read from their file if none are; drifted ones by more
     /// than a quarter from `size` too, with one rebuild started for them.
     fn kept_sets(self: &Arc<Self>, state: &SharedState<'_>, model: ReadModel, size: u64) -> Kept {
-        let mut sets = self.sets.lock();
-        let kept = match sets.entry(model) {
-            std::collections::hash_map::Entry::Occupied(kept) => kept.into_mut(),
-            std::collections::hash_map::Entry::Vacant(vacant) => {
-                let Some((built, at)) = self.load_sets(state, model) else {
-                    return Kept::Cold;
-                };
-                // Over the budget: none until the next build (there were none before).
-                vacant.insert(Sets {
-                    built: built.and_then(|sets| self.keep(sets).ok()),
-                    at,
-                    rebuilding: false,
-                })
+        // Decided under `sets`, started after it is let go: the start takes `sets` again
+        // where it fails (D16-1039).
+        let (found, rebuild) = {
+            let mut sets = self.sets.lock();
+            let kept = match sets.entry(model) {
+                std::collections::hash_map::Entry::Occupied(kept) => kept.into_mut(),
+                std::collections::hash_map::Entry::Vacant(vacant) => {
+                    let Some((built, at)) = self.load_sets(state, model) else {
+                        return Kept::Cold;
+                    };
+                    // Over the budget: none until the next build (there were none before).
+                    vacant.insert(Sets {
+                        built: built.and_then(|sets| self.keep(sets).ok()),
+                        at,
+                        rebuilding: false,
+                    })
+                }
+            };
+            let rebuild = !kept.fits(size) && !kept.rebuilding;
+            if rebuild {
+                kept.rebuilding = true;
             }
+            (kept.sets(), rebuild)
         };
-        if !kept.fits(size) && !kept.rebuilding {
-            kept.rebuilding = true;
-            self.rebuild(state, model);
+        if rebuild {
+            // First thing after `sets` is let go: no unwind falls between the flag and it.
+            let reset = ResetRebuilding {
+                statistics: Arc::clone(self),
+                model,
+                armed: true,
+            };
+            self.rebuild(state, model, reset);
         }
-        Kept::Sets(kept.sets())
+        Kept::Sets(found)
     }
 
     /// `sets` as kept, built into vectors charged to the budget ([`Gathered::kept`]); an
@@ -438,8 +478,15 @@ impl Statistics {
     /// thread alone, and replaces them when done; planners go on with the old ones. The
     /// thread owns a clone of the token's snapshot and takes its own token from it for
     /// every later stage: the sets are that snapshot's, whatever
-    /// is published meanwhile.
-    fn rebuild(self: &Arc<Self>, state: &SharedState<'_>, model: ReadModel) {
+    /// is published meanwhile. `reset` goes with the thread: it asks for the rebuild again
+    /// at the next drifted use where the thread unwinds, or never starts. Called with no
+    /// lock held.
+    fn rebuild(
+        self: &Arc<Self>,
+        state: &SharedState<'_>,
+        model: ReadModel,
+        reset: ResetRebuilding,
+    ) {
         let (statistics, snapshot) = (Arc::clone(self), state.snapshot().clone());
         let started = self.spawn(move || {
             // A clone keeps its publication: never `None`, so never left asked for.
@@ -447,18 +494,19 @@ impl Statistics {
                 if let Some(kept) = statistics.sets.lock().get_mut(&model) {
                     kept.rebuilding = false;
                 }
+                reset.disarm();
                 return;
             };
             let builder = statistics.claim_anyway(model);
             let pattern = QuadPattern::in_graph(TermId::DEFAULT_GRAPH);
             let size = state.snapshot().count_in(model, &pattern).at_least();
             statistics.build_sets(&builder, &state, model, size, false);
+            // `build_sets` reset the flag: a later rebuild's may be set by now.
+            reset.disarm();
         });
-        if started.is_err()
-            && let Some(kept) = self.sets.lock().get_mut(&model)
-        {
-            // Asked again at the next drifted use.
-            kept.rebuilding = false;
+        if let Err(error) = started {
+            // `reset` went with the closure, unrun: asked again at the next drifted use.
+            tracing::warn!(%error, ?model, "characteristic sets not rebuilt: no thread");
         }
     }
 
