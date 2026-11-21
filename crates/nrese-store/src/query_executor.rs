@@ -317,34 +317,15 @@ impl PreparedQuery {
         self.dataset.is_some() || self.query.dataset().is_some()
     }
 
-    /// Whether the query's effective dataset (protocol parameters taking precedence over
-    /// query `FROM` / `FROM NAMED`, matching `nrese_sparql::dataset::ResolvedDataset::resolve`)
-    /// leaves out the store's default graph (where inferred statements live). Scoped
-    /// inference (`inference-scope=dataset`) builds its own inferred layer, so returns `false`.
+    /// Whether the dataset this query reads by leaves out the store's default graph, where
+    /// the inferred statements are kept: the evaluator's own rule, on the same protocol
+    /// dataset and query dataset it resolves ([`nrese_sparql::dataset::omits_store_default_graph`];
+    /// a dataset of scoped inference, `inference-scope=dataset`, has its own inferred layer).
     pub(crate) fn omits_default_graph(&self) -> bool {
-        if self.inference_scope.is_some() {
-            return false;
-        }
-        let effective = self
-            .dataset
-            .as_ref()
-            .cloned()
-            .or_else(|| self.query.dataset().cloned().map(Into::into))
-            .filter(|dataset| !dataset.is_default_dataset());
-        let Some(dataset) = effective else {
-            return false;
-        };
-        let is_default = |graph: &GraphName| match graph {
-            GraphName::DefaultGraph => true,
-            GraphName::NamedNode(node) => nrese_sparql::compat::names_default_graph(node.as_str()),
-            GraphName::BlankNode(_) => false,
-        };
-        match dataset.default_graph_graphs() {
-            Some(graphs) => !graphs.iter().any(is_default),
-            None => dataset
-                .excluded_default_graphs()
-                .is_some_and(|excluded| excluded.iter().any(is_default)),
-        }
+        nrese_sparql::dataset::omits_store_default_graph(
+            self.dataset.as_ref(),
+            self.query.dataset(),
+        )
     }
 
     /// Explanation when the query's dataset omits the store's default graph from its default

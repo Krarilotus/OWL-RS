@@ -11,6 +11,10 @@ use nrese_sparql_syntax::algebra::QueryDataset;
 use crate::results::QueryDatasetSpecification;
 use crate::view::ReadView;
 
+#[cfg(test)]
+#[path = "dataset_tests.rs"]
+mod tests;
+
 /// The graphs a user may read (graph-level access control): named graphs by IRI or IRI
 /// prefix, and whether the store's default graph. A query of such a user evaluates over
 /// its dataset restricted to them: the others are absent, not forbidden (`GRAPH ?g` never
@@ -122,6 +126,50 @@ impl GraphSet {
     }
 }
 
+/// The dataset a request reads by: the protocol's if there is one, else the query's own
+/// (`FROM`, `FROM NAMED`; for an update `USING`, `WITH`); `None` where that leaves the
+/// store's dataset as it is. [`ResolvedDataset::resolve`] and [`omits_store_default_graph`]
+/// both take it from here.
+fn effective(
+    protocol: Option<&QueryDatasetSpecification>,
+    own: Option<&QueryDataset>,
+) -> Option<QueryDatasetSpecification> {
+    protocol
+        .cloned()
+        .or_else(|| own.cloned().map(Into::into))
+        .filter(|specification| !specification.is_default_dataset())
+}
+
+/// Whether the dataset a request reads by ([`effective`]) leaves the store's default graph,
+/// where the inferred statements are kept, out of its default graph: names it neither by
+/// its own name nor by another store's ([`crate::compat`]), as [`ResolvedDataset::resolve`]
+/// reads them. A dataset with the scoped inferred layer has inferred statements of its own:
+/// never.
+pub fn omits_store_default_graph(
+    protocol: Option<&QueryDatasetSpecification>,
+    own: Option<&QueryDataset>,
+) -> bool {
+    let Some(specification) = effective(protocol, own) else {
+        return false;
+    };
+    if specification.scoped_inference {
+        return false;
+    }
+    let names_it = |name: &GraphName| match name {
+        GraphName::DefaultGraph => true,
+        GraphName::NamedNode(n) => {
+            matches!(crate::compat::graph_named(n), GraphNameRef::DefaultGraph)
+        }
+        GraphName::BlankNode(_) => false,
+    };
+    match specification.default_graph_graphs() {
+        Some(graphs) => !graphs.iter().any(names_it),
+        None => specification
+            .excluded_default_graphs()
+            .is_some_and(|left_out| left_out.iter().any(names_it)),
+    }
+}
+
 /// What a query reads (SPARQL 1.1 §13.2): its default graph, and the graphs `GRAPH` may
 /// name (`None`: every named graph of the store).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,11 +206,7 @@ impl ResolvedDataset {
         protocol: Option<&QueryDatasetSpecification>,
         own: Option<&QueryDataset>,
     ) -> Self {
-        let specification = protocol
-            .cloned()
-            .or_else(|| own.cloned().map(Into::into))
-            .filter(|specification| !specification.is_default_dataset());
-        let Some(specification) = specification else {
+        let Some(specification) = effective(protocol, own) else {
             return Self::of_store(union_default_graph);
         };
         // A graph the store doesn't hold contributes nothing.
