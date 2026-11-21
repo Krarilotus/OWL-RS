@@ -586,7 +586,8 @@ impl Running {
     }
 
     /// After [`Self::add`] of `id`, in a column of several datatypes: of equal values of two
-    /// datatypes (two terms), the extremes `value::order` puts first and last.
+    /// datatypes (two terms), the extremes `value::order` puts first and last. The same id
+    /// is the same term, so only another id compares datatypes.
     fn add_tie(&mut self, id: u64) {
         if id == UNDEF {
             return;
@@ -596,12 +597,14 @@ impl Running {
         };
         if let Some((m, mid)) = self.min
             && m == value
+            && id != mid
             && inline_order(&id, &mid).is_lt()
         {
             self.min = Some((value, id));
         }
         if let Some((m, mid)) = self.max
             && m == value
+            && id != mid
             && inline_order(&id, &mid).is_gt()
         {
             self.max = Some((value, id));
