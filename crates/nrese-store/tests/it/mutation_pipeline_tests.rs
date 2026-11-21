@@ -2433,6 +2433,57 @@ fn long_intersection(n: usize) -> String {
     data
 }
 
+/// Spec: reasoning-semantics.md, what may be complete, "Operators": where answers may be
+/// missing, `EXISTS` makes them `unsound`. Under `owl2-rl` with the QL rewriting on, a list
+/// axiom past the rules' cap is left out of the closure, so answers may be missing, and a
+/// `FILTER NOT EXISTS` read is `unsound` in its status, its QL report and its plan. With the
+/// blocker the list's rule entails, the one row kept is one the certain answers drop. The
+/// rule is the query's, so the read with an unrelated blocker is `unsound` too.
+#[test]
+fn a_negation_over_a_list_left_out_is_unsound() {
+    let property = "a <http://www.w3.org/2002/07/owl#ObjectProperty> .";
+    let mut chain = long_chain(251);
+    for link in (1..=251).map(|i| format!("p{i}")).chain(["chain".into()]) {
+        chain.push_str(&format!(" <{EX}{link}> {property}"));
+    }
+    let mut wrong = Vec::new();
+    for (data, subject, blocker) in [
+        (long_key(128), "x", format!("?x <{EX}name> \"Y\"")),
+        (chain, "a0", format!("?x <{EX}chain> <{EX}a251>")),
+        (long_intersection(257), "x", format!("?x a <{EX}C>")),
+    ] {
+        let pipeline = ql_pipeline(in_memory_store_config());
+        let ticket = MutationTicket::new();
+        (pipeline.apply(insert(&data), &nrese_store::Requester::all(), &ticket)).expect("data");
+        let store = pipeline.store();
+        for blocked_by in [blocker, format!("?x <{EX}unrelated> <{EX}unused>")] {
+            let request = nrese_store::SparqlQueryRequest::all(format!(
+                "SELECT ?x {{ VALUES ?x {{ <{EX}{subject}> }} FILTER NOT EXISTS {{ {blocked_by} }} }}"
+            ));
+            let answer = store.execute_query(&request).expect("answered");
+            let prepared = store.prepare_query(&request).expect("prepared");
+            let token = nrese_store::CancellationToken::new();
+            let planned = store.plan_query(&prepared, &token).expect("planned");
+            let label = |c: Option<&nrese_sparql::Completeness>| c.map(|c| c.as_str());
+            let labels = [
+                label(answer.completeness.as_ref()),
+                label(answer.ql.as_ref().map(|r| &r.completeness)),
+                label(planned.completeness.as_ref()),
+                label(planned.ql.as_ref().map(|r| &r.completeness)),
+            ];
+            let json: serde_json::Value = serde_json::from_slice(&answer.payload).expect("json");
+            let rows: Vec<_> = (json["results"]["bindings"].as_array().expect("rows"))
+                .iter()
+                .map(|row| row["x"]["value"].as_str().expect("an IRI").to_owned())
+                .collect();
+            if labels != [Some("unsound"); 4] || rows != [format!("{EX}{subject}")] {
+                wrong.push((blocked_by, labels, rows));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// An intersection of 256 members is one rule; one of 257 is either one too or reported
 /// and not built, never a panic and never a failed commit, under `owl2-rl` and `owl2-dl`.
 #[test]
