@@ -26,6 +26,7 @@
 //! validator, else of the component), their `{?name}` and `{$name}` blocks filled in
 //! ([`Template`]); a result with neither has its shape's messages, if any (§2.1.5).
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -203,8 +204,8 @@ enum Part {
 }
 
 impl Template {
-    /// The template of `literal`, if it has a block: `{`, `?` or `$`, a variable name (SPARQL
-    /// `VARNAME`, read here as letters, digits and `_`), `}`.
+    /// The template of `literal`, if it has a block: `{`, `?` or `$`, a SPARQL `VARNAME`
+    /// ([`Variable::new`]), `}`.
     pub(crate) fn parse(literal: &Literal) -> Option<Self> {
         let text = literal.value();
         let mut parts = Vec::new();
@@ -212,10 +213,8 @@ impl Template {
         let mut at = 0;
         while let Some(open) = text[at..].find('{').map(|i| at + i) {
             let block = text[open + 1..].strip_prefix(['?', '$']).and_then(|rest| {
-                let name_len = rest
-                    .find(|c: char| !(c.is_alphanumeric() || c == '_'))
-                    .unwrap_or(rest.len());
-                (name_len > 0 && rest[name_len..].starts_with('}')).then(|| &rest[..name_len])
+                let name = &rest[..rest.find('}')?];
+                Variable::new(name).is_ok().then_some(name)
             });
             match block {
                 Some(name) => {
@@ -253,21 +252,37 @@ impl Template {
         })
     }
 
+    /// Each part's text as [`Template::fill`] writes it, with `value` giving the variables'
+    /// terms.
+    fn pieces<'s, 't: 's>(
+        &'s self,
+        value: &'s impl Fn(&str) -> Option<&'t Term>,
+    ) -> impl Iterator<Item = Cow<'s, str>> {
+        self.parts.iter().map(move |part| match part {
+            Part::Text(plain) => Cow::Borrowed(plain.as_str()),
+            Part::Variable { name, block } => match value(name) {
+                Some(Term::Literal(literal)) => Cow::Borrowed(literal.value()),
+                Some(Term::NamedNode(iri)) => Cow::Borrowed(iri.as_str()),
+                Some(other) => Cow::Owned(other.to_string()),
+                None => Cow::Borrowed(block.as_str()),
+            },
+        })
+    }
+
+    /// The length of the text [`Template::fill`] makes from `value`, found without making
+    /// it, so that it can be charged first.
+    pub(crate) fn filled_len<'t>(&self, value: &impl Fn(&str) -> Option<&'t Term>) -> usize {
+        self.pieces(value).map(|piece| piece.len()).sum()
+    }
+
     /// The message with each block replaced by the text of `value`'s term for its variable: a
     /// literal's lexical form, an IRI's text, any other term as N-Triples writes it. A block
-    /// whose variable has no value is left as written.
-    pub(crate) fn fill<'t>(&self, value: impl Fn(&str) -> Option<&'t Term>) -> Literal {
-        let mut text = String::new();
-        for part in &self.parts {
-            match part {
-                Part::Text(plain) => text.push_str(plain),
-                Part::Variable { name, block } => match value(name) {
-                    Some(Term::Literal(literal)) => text.push_str(literal.value()),
-                    Some(Term::NamedNode(iri)) => text.push_str(iri.as_str()),
-                    Some(other) => text.push_str(&other.to_string()),
-                    None => text.push_str(block),
-                },
-            }
+    /// whose variable has no value is left as written. Its text holds exactly
+    /// [`Template::filled_len`] bytes, with no spare capacity.
+    pub(crate) fn fill<'t>(&self, value: &impl Fn(&str) -> Option<&'t Term>) -> Literal {
+        let mut text = String::with_capacity(self.filled_len(value));
+        for piece in self.pieces(value) {
+            text.push_str(&piece);
         }
         let literal = &self.literal;
         match (literal.language(), literal.direction()) {
@@ -430,7 +445,8 @@ pub(crate) fn found(solution: QuerySolution, check: &SparqlCheck) -> Found {
         Some(Term::NamedNode(path)) => Some(path),
         _ => None,
     };
-    // A message is a literal (§2.1.5); another term bound to `?message` is none.
+    // A report's messages are literals (`ValidationResult::messages`): another term bound to
+    // `?message` isn't carried, and the declared messages apply.
     let message = match take(message_at) {
         Some(Term::Literal(message)) => Some(message),
         _ => None,

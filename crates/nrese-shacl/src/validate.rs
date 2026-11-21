@@ -1177,14 +1177,18 @@ impl<'a, V: ReadView> Validator<'a, V> {
                 Ok(sparql::Outcome::Failed(failed)) => {
                     // An ASK validator's solution is `$this` and `$value` (SHACL §6.3).
                     for value in failed {
-                        let messages = self.sparql_messages(
+                        let Ok(messages) = self.sparql_messages(
                             check,
                             None,
                             Vec::new(),
                             parameters,
                             focus,
                             Some(value),
-                        );
+                            shape,
+                            &mut results.held,
+                        ) else {
+                            return ControlFlow::Break(());
+                        };
                         self.keep(
                             results,
                             raw(
@@ -1234,14 +1238,18 @@ impl<'a, V: ReadView> Validator<'a, V> {
                             .path
                             .map(|path| self.result_path(path))
                             .or_else(|| shape.path.clone().map(ResultPath::Path));
-                        let messages = self.sparql_messages(
+                        let Ok(messages) = self.sparql_messages(
                             check,
                             found.message,
                             found.bindings,
                             parameters,
                             focus,
                             None,
-                        );
+                            shape,
+                            &mut results.held,
+                        ) else {
+                            return ControlFlow::Break(());
+                        };
                         self.keep(results, raw(value, path, messages));
                     }
                 }
@@ -1253,8 +1261,18 @@ impl<'a, V: ReadView> Validator<'a, V> {
     /// A SHACL-SPARQL result's messages (SHACL §5.3.2, "executed from top to bottom, so that
     /// the first bound value will be used"): `bound`, the solution's `?message`; else
     /// `check`'s `sh:message`s, each template filled in from the solution's `bindings`, then
-    /// the `parameters`, `$this` (the `focus`) and, for an ASK validator, `$value`. None where
-    /// there is neither, so the shape's messages apply (§2.1.5).
+    /// the `parameters`, `$this` (the `focus`) and, for an ASK validator, `$value`; else the
+    /// shape's (§2.1.5).
+    ///
+    /// In one form for one set of messages, so that results compare by the messages in
+    /// effect ([`RawResult`]'s order, the changes' comparisons): sorted, each once, and None
+    /// where they are the `shape`'s (whose ids are sorted and distinct, as every node's values
+    /// are). A filled-in text is charged to `held` before it is made, and returned once made
+    /// (keeping the result charges it again); a refusal is the validation's stop: `Err`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one result's message sources: the check, the solution's message and bindings, the pre-bound terms, the shape's messages and the task's charge"
+    )]
     fn sparql_messages(
         &self,
         check: &SparqlCheck,
@@ -1263,12 +1281,26 @@ impl<'a, V: ReadView> Validator<'a, V> {
         parameters: &[(nrese_rdf::Variable, TermId)],
         focus: TermId,
         value: Option<TermId>,
-    ) -> Option<Vec<ResultTerm>> {
+        shape: &Shape,
+        held: &mut Reservation,
+    ) -> Result<Option<Vec<ResultTerm>>, ()> {
+        let canonical = |mut messages: Vec<ResultTerm>| {
+            messages.sort();
+            messages.dedup();
+            let the_shape_s = messages
+                .iter()
+                .map(|message| match message {
+                    ResultTerm::Stored(id) => Some(*id),
+                    ResultTerm::Computed(_) => None,
+                })
+                .eq(shape.messages.iter().copied().map(Some));
+            (!the_shape_s).then_some(messages)
+        };
         if let Some(message) = bound {
-            return Some(vec![self.result_term(message.into())]);
+            return Ok(canonical(vec![self.result_term(message.into())]));
         }
         if check.messages.is_empty() {
-            return None;
+            return Ok(None);
         }
         if check
             .messages
@@ -1292,16 +1324,25 @@ impl<'a, V: ReadView> Validator<'a, V> {
                 .find(|(bound, _)| bound == name)
                 .map(|(_, term)| term)
         };
-        Some(
-            check
-                .messages
-                .iter()
-                .map(|message| match &message.template {
-                    None => ResultTerm::Stored(message.id),
-                    Some(template) => self.result_term(template.fill(value_of).into()),
-                })
-                .collect(),
-        )
+        let mut messages = Vec::with_capacity(check.messages.len());
+        let mut charged = 0;
+        for message in &check.messages {
+            messages.push(match &message.template {
+                None => ResultTerm::Stored(message.id),
+                Some(template) => {
+                    let len = template.filled_len(&value_of);
+                    if let Err(refused) = held.charge(len) {
+                        held.release(charged);
+                        let _ = self.stop.set(QueryEvaluationError::MemoryLimit(refused));
+                        return Err(());
+                    }
+                    charged += len;
+                    self.result_term(template.fill(&value_of).into())
+                }
+            });
+        }
+        held.release(charged);
+        Ok(canonical(messages))
     }
 }
 

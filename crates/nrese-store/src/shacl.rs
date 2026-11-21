@@ -310,12 +310,15 @@ fn introduced_in<A: ReadView + Sync, B: ReadView + Sync>(
 }
 
 /// A result as a refusal names it: its focus node and component, and its messages
-/// (`sh:resultMessage`) where it has any.
+/// (`sh:resultMessage`) where it has any, in the order of their text: the report's order is
+/// the dictionary's, which statements in graphs a committer may not read can decide.
 pub(crate) fn described(result: &nrese_shacl::ValidationResult) -> String {
     let mut text = format!("focus node {}, {}", result.focus_node, result.component);
-    for (i, message) in result.messages.iter().enumerate() {
+    let mut messages: Vec<String> = result.messages.iter().map(ToString::to_string).collect();
+    messages.sort_unstable();
+    for (i, message) in messages.iter().enumerate() {
         text.push_str(if i == 0 { ", message " } else { ", " });
-        text.push_str(&message.to_string());
+        text.push_str(message);
     }
     text
 }
