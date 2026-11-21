@@ -51,6 +51,7 @@ mod support_cap_tests;
 mod support_round_tests;
 mod transfer_memory_tests;
 mod unkept_facts_tests;
+mod unread_import_status_tests;
 mod update_memory_tests;
 mod upload_rejection_tests;
 mod upload_staging_tests;
