@@ -1737,13 +1737,17 @@ impl<V> std::fmt::Debug for Slot<V> {
 /// fires (`None`: this caller left; that build goes on and keeps its value). A builder keeps
 /// its value, a failure too, before its waiters are told it. One that ends with none (a
 /// panic) leaves the next claim to build. On a Rayon worker, which never waits, it builds
-/// its own and keeps nothing.
+/// its own and keeps nothing. Once `stop` has fired, it claims and builds nothing.
 fn get_or_build<T: Clone + Send + Sync + 'static>(
     slot: &Slot<T>,
     stop: &dyn Fn() -> bool,
     build: impl FnOnce() -> T,
 ) -> Option<T> {
+    if let Some(value) = slot.kept.get() {
+        return Some(T::clone(value));
+    }
     let builder = loop {
+        // Kept meanwhile: the claim reads it again under the cell's lock.
         let kept = || slot.kept.get().map(|value| Some(Arc::clone(value)));
         match slot.build.claim((), Kind::Opaque, kept) {
             Claim::Build(builder) => break Some(builder),
@@ -1752,11 +1756,20 @@ fn get_or_build<T: Clone + Send + Sync + 'static>(
                     return Some(T::clone(&value));
                 }
                 // Its builder named no end (a panic), or one these builders never name: the
-                // next claim builds.
+                // next claim builds, unless this caller's stop fired.
                 Joined::Told(
                     Ended::End(End::Empty | End::Later | End::Unkept(None)) | Ended::Abandoned,
-                ) => {}
-                Joined::Busy => break None,
+                ) => {
+                    if stop() {
+                        return None;
+                    }
+                }
+                Joined::Busy => {
+                    if stop() {
+                        return None;
+                    }
+                    break None;
+                }
                 Joined::Left => return None,
             },
         }
@@ -2815,7 +2828,8 @@ impl Supports {
         if !seen.same_version(snapshot) {
             return;
         }
-        if let Some(view) = view {
+        // A view's slot whose computation failed; one under way, another reader's, stays.
+        if let Some(view) = view.filter(|view| matches!(view.get(), Some(Err(_)))) {
             views.retain(|(_, kept)| !kept.ptr_eq(view));
         }
         let failed = (latest.ptr_eq(cell) && matches!(cell.get(), Some(Err(_))))

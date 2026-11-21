@@ -281,8 +281,10 @@ impl<V> Build<V> {
     /// The build's end, waited for until `deadline` or until `stop` fires (`Left`; the build
     /// goes on). An end already recorded is told first. Every sleep ends within `STOP_POLL`,
     /// and `stop` and `deadline` are asked after it; a waiter helping with a sliced build asks
-    /// them before each slice it takes, so it leaves at most one slice past them. [`Busy`] at
-    /// once on a pool thread for an opaque build.
+    /// them before each slice it takes, so it leaves at most one slice past them. They are
+    /// asked with no lock of the build's held (`stop` may read the cell), and the end is read
+    /// after them: an end recorded by the time they fired is told, not left. [`Busy`] at once
+    /// on a pool thread for an opaque build.
     pub fn join(&self, deadline: Option<Instant>, stop: &dyn Fn() -> bool) -> Joined<V> {
         let left = || deadline.is_some_and(|at| Instant::now() >= at) || stop();
         loop {
@@ -291,10 +293,14 @@ impl<V> Build<V> {
             }
             match self.kind {
                 Kind::Opaque => {
+                    let gone = left();
+                    if let Some(end) = self.end.get() {
+                        return Joined::Told(end);
+                    }
                     if rayon::current_thread_index().is_some() {
                         return Joined::Busy;
                     }
-                    if left() {
+                    if gone {
                         return Joined::Left;
                     }
                     self.waiting.fetch_add(1, Ordering::SeqCst);
@@ -309,13 +315,14 @@ impl<V> Build<V> {
                     if let Some(work) = &work {
                         work.help(&|| !left());
                     }
+                    let gone = left();
                     // The end is recorded under `state`, then `changed` notified: read under it,
                     // no wake is missed.
                     let state = lock(&self.state);
                     if let Some(end) = self.end.get() {
                         return Joined::Told(end);
                     }
-                    if left() {
+                    if gone {
                         return Joined::Left;
                     }
                     let same = match (&state.work, &work) {
