@@ -353,12 +353,14 @@ fn other_properties_domains_keep_their_meaning() {
 }
 
 /// Each `owl2-ql` rule beside `prp-dom` / `prp-rng` that can consume what the OWL reader reads
-/// as an annotation: an annotation property's assertion (`:x :note :v`), or an
-/// `rdfs:subPropertyOf` with an annotation property at either end. `:note` is declared an
-/// annotation property, `:p` and `:q` object properties. The case's name is the rule; the
+/// as an annotation: an annotation property's assertion (`:x :note :v`), its domain or range,
+/// or an `rdfs:subPropertyOf` with an annotation property at either end. `:note` is declared
+/// an annotation property, `:p` and `:q` object properties. The case's name is the rule; the
 /// data has a model; the question (where there is one) is a consequence only an annotation
-/// would give, so it isn't an answer.
-const ANNOTATION_READINGS: [(&str, &str, Option<&str>); 14] = [
+/// would give, so it isn't an answer. The last four each reach the closure through one of
+/// those positions alone (a domain or range's subject; a sub-property statement's subject;
+/// its object), so each position is stated on its own.
+const ANNOTATION_READINGS: [(&str, &str, Option<&str>); 18] = [
     (
         "prp-spo1",
         ":note rdfs:subPropertyOf :q . :x :note :v .",
@@ -430,11 +432,31 @@ const ANNOTATION_READINGS: [(&str, &str, Option<&str>); 14] = [
         ":note rdfs:range :Doc . :p rdfs:subPropertyOf :note . :x :p :v .",
         Some(":v a :Doc"),
     ),
+    (
+        "scm-dom1",
+        ":note rdfs:domain :Doc . :Doc rdfs:subClassOf :Top .",
+        Some(":note rdfs:domain :Top"),
+    ),
+    (
+        "scm-rng1",
+        ":note rdfs:range :Doc . :Doc rdfs:subClassOf :Top .",
+        Some(":note rdfs:range :Top"),
+    ),
+    (
+        "scm-spo, from an annotation property",
+        ":note rdfs:subPropertyOf :p . :p rdfs:subPropertyOf :q .",
+        Some(":note rdfs:subPropertyOf :q"),
+    ),
+    (
+        "prp-spo1, into an annotation property",
+        ":p rdfs:subPropertyOf :note . :x :p :v .",
+        Some(":x :note :v"),
+    ),
 ];
 
 /// Spec (module docs, Direct Semantics §1; the OWL reader's readings: an annotation
-/// property's assertion, and an `rdfs:subPropertyOf` with an annotation property at either
-/// end, are annotations, with no axiom): under `owl2-ql`, each of [`ANNOTATION_READINGS`] is
+/// property's assertion, its domain and range, and an `rdfs:subPropertyOf` with an annotation
+/// property at either end, are annotations, with no axiom): under `owl2-ql`, each of [`ANNOTATION_READINGS`] is
 /// applied as a commit, and its question, if it has one, is read `false`; loaded and rebuilt,
 /// the store is consistent, not in quarantine, and the question is `false` again, the QL
 /// rewriting on or as configured.
