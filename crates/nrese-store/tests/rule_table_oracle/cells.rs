@@ -330,6 +330,56 @@ fn mixed_rest_spellings_link_the_same_list() {
     check_rest_alias(rest_alias_fixture("rdf:rest"));
 }
 
+#[test]
+fn alias_only_rest_edits_maintain_chain_answers() {
+    // Spec: Tables 3–5 add the new walk's answer when an alias of rdf:rest
+    // connects it and retract it when that edge goes, even after reopening.
+    let mut fixture = rest_alias_fixture("rdf:rest");
+    fixture.writes[1].insert.extend(
+        insert(
+            "
+            ex:u rdf:first ex:s
+            ex:u ex:r rdf:nil
+            ex:b ex:s ex:d
+            ",
+        )
+        .insert,
+    );
+    fixture.writes.push(insert("ex:h ex:r ex:u"));
+    fixture.writes.push(delete("ex:h ex:r ex:u"));
+    let added = crate::triple(["ex:a", "ex:out", "ex:d"]);
+    let steps = sweep::steps(&fixture);
+    let rl = nrese_reasoner::ReasoningMode::Owl2Rl;
+    for &mode in judges::MODES {
+        for cold in [false, true] {
+            let temp = tempfile::tempdir().expect("private store directory");
+            let open = || judges::open(mode, Some(temp.path()));
+            let mut store = open();
+            let raw = judges::pipeline(&store, nrese_reasoner::ReasoningMode::Disabled);
+            assert!(judges::apply(&raw, &fixture.writes[0]));
+            drop(raw);
+            let mut pipeline = judges::pipeline(&store, rl);
+            for (index, step) in steps.iter().enumerate().skip(1) {
+                if cold && index > 1 {
+                    drop(pipeline);
+                    drop(store);
+                    store = open();
+                    pipeline = judges::pipeline(&store, rl);
+                }
+                assert!(judges::apply(&pipeline, &fixture.writes[index]));
+                let rows = judges::rows(&store).0;
+                for row in [&fixture.watch, &added] {
+                    assert_eq!(
+                        rows.contains(row),
+                        step.model.facts.contains(row),
+                        "{mode} cold={cold} write={index} row={row:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn check_rest_alias(fixture: Case) {
     check_vocabulary_alias(fixture, "http://example.org/r", nrese_rdf::vocab::rdf::REST);
 }
