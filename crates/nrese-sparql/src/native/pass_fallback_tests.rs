@@ -327,3 +327,108 @@ fn a_pass_that_falls_back_leaves_nothing_charged() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+/// 20,000 subjects, each with `p0` its number modulo 100 and `p1` its number modulo 2,000:
+/// their join is 20,000 rows in 2,000 groups of `?y`.
+fn joined() -> Snapshot {
+    let config = EngineConfig {
+        background_maintenance: false,
+        ..EngineConfig::default()
+    };
+    let engine = Engine::new(config).unwrap();
+    let node = |name: &str| nrese_rdf::NamedNode::new_unchecked(format!("urn:{name}"));
+    let mut tx = engine.transaction();
+    for i in 0..20_000u32 {
+        for (p, o) in [("p0", i % 100), ("p1", i % 2_000)] {
+            let o = Literal::new_typed_literal(o.to_string(), xsd::INTEGER);
+            let quad = nrese_rdf::Quad::new(
+                node(&format!("s{i}")),
+                node(p),
+                o,
+                nrese_rdf::GraphName::DefaultGraph,
+            );
+            tx.insert(quad.as_ref());
+        }
+    }
+    tx.commit().unwrap();
+    engine.snapshot()
+}
+
+/// `query` under `options` in a context of its own: its rows as text (sorted), or the
+/// refusal; and what the context holds once the rows are let go and its cache of decoded
+/// terms too.
+fn evaluated(
+    snapshot: &Snapshot,
+    query: &Query,
+    options: &QueryOptions,
+) -> (Result<Vec<String>, String>, usize) {
+    let Query::Select { pattern, .. } = query else {
+        panic!("a SELECT")
+    };
+    let ctx = Context::new(snapshot, options, None, None);
+    let answer = match ctx.eval(pattern) {
+        Ok(solutions) => {
+            let table = &solutions.table;
+            let text = |id: u64| ctx.term(id).map_or("-".to_owned(), |term| term.to_string());
+            let mut rows: Vec<String> = (0..table.len())
+                .map(|r| {
+                    let row = (0..table.width()).map(|c| text(table.get(r, c)));
+                    row.collect::<Vec<_>>().join(" ")
+                })
+                .collect();
+            rows.sort();
+            ctx.consumed(solutions);
+            Ok(rows)
+        }
+        Err(error) => match QueryEvaluationError::from(error) {
+            QueryEvaluationError::MemoryLimit(refused) => Err(format!("{refused:?}")),
+            other => panic!("{other:?}"),
+        },
+    };
+    *ctx.decoded.borrow_mut() =
+        decode_cache::DecodeCache::new(&ctx.budget, DECODE_CACHE_ENTRIES, 1);
+    (answer, ctx.budget.used())
+}
+
+/// Spec: a GROUP BY refused directly and answered in morsels instead ([`Context::group`])
+/// is answered from what the query held before the direct attempt: with the morsels' answer,
+/// the budget then reads what the streamed route alone leaves (its results' terms), not
+/// that and what the direct attempt kept (its numbers and terms). Over limits from 200 kB
+/// to 4 MB: where the query as written (direct only, no retry) is refused and the query
+/// answers, the retry ran; at least one limit must be such.
+#[test]
+fn a_streamed_retry_holds_nothing_of_the_refused_direct_attempt() {
+    let snapshot = joined();
+    let text = "SELECT ?y (AVG(?x * 2) AS ?a) \
+                WHERE { ?s <urn:p0> ?x . ?s <urn:p1> ?y } GROUP BY ?y";
+    let query = SparqlParser::new().parse_query(text).unwrap();
+    let with = |limit: usize, as_written: bool, stream_rows: Option<usize>| QueryOptions {
+        as_written,
+        stream_rows,
+        ..options(Some(limit))
+    };
+    let (mut wrong, mut retried) = (Vec::new(), 0);
+    for limit in (2..=40).map(|k| k * 100_000) {
+        let (general, after) = evaluated(&snapshot, &query, &with(limit, false, None));
+        let (streamed, alone) = evaluated(&snapshot, &query, &with(limit, false, Some(4_096)));
+        let (direct, _) = evaluated(&snapshot, &query, &with(limit, true, None));
+        match (&general, &streamed) {
+            (Err(refused), Ok(_)) => wrong.push(format!(
+                "at {limit}: refused ({refused}) where the streamed route answers"
+            )),
+            (Ok(general), Ok(streamed)) if general != streamed => {
+                wrong.push(format!("at {limit}: the routes answer differently"));
+            }
+            (Ok(_), Ok(_)) if direct.is_err() && after != alone => wrong.push(format!(
+                "at {limit}: {after} bytes held after the retry, the streamed route {alone}"
+            )),
+            _ => {}
+        }
+        retried += usize::from(general.is_ok() && direct.is_err());
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    assert!(
+        retried > 0,
+        "no limit had the direct attempt refused and the query answered"
+    );
+}
