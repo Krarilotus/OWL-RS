@@ -146,12 +146,13 @@ leave something out.
   equated by value (`"1"^^xsd:integer` and `"01"^^xsd:integer` stay two terms): compare
   values in a `FILTER` (`?v = 1`), which SPARQL does by value. Otherwise none known.
 - Under `owl2-rl` with the QL rewriting on, over a store holding a list axiom past the
-  [list limits](spec/reasoning-semantics.md#list-limits), v1.5.0 tells a read under `NOT EXISTS`,
-  `MINUS`, `OPTIONAL` or another operator [the rule](spec/reasoning-semantics.md#what-may-be-complete)
-  names `sound-only` in its status and in its plan's status, and `complete` in its QL report
-  (`ql`, in the run, EXPLAIN and the plan) and in the printed query's status, where each should
-  be `unsound`: it can return a row that the left-out axiom's conclusions would remove. From
-  v1.5.1 all of them say `unsound`.
+  [list limits](spec/reasoning-semantics.md#list-limits), v1.5.0 tells a committed read under
+  `NOT EXISTS`, `MINUS`, `OPTIONAL` or another operator
+  [the rule](spec/reasoning-semantics.md#what-may-be-complete) names, whose QL report would
+  otherwise be `complete`, `sound-only` in its status, its plan's status and EXPLAIN's
+  `completeness`, and `complete` in its QL report (`ql`: the run's, the plan's and EXPLAIN's)
+  and in the printed query's status, where each should be `unsound`: it can return a row that
+  the left-out axiom's conclusions would remove. From v1.5.1 all of them say `unsound`.
 - Without the OWL 2 QL rewriting, every answer over a
   ruleset's closure is `sound-only`. The rewriting runs by default under `owl2-ql` only;
   under `owl2-rl`, `reasoner.ql_rewriting = "on"` checks each query as under `owl2-ql`.
