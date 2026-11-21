@@ -1120,10 +1120,12 @@ fn a_statement_of_a_reification_role_is_told_as_a_fresh_read_tells_it() {
 /// reader the base's declarations fix, `bounds::listed`): each change found so far to alter
 /// what the reader reports while a carry-over took it is refused (a reified main triple
 /// deleted and inserted again, a retyping deletion and insertion, a statement of a
-/// reification's role, an annotation on the rules route); the list's own changes, a member
-/// of a declared class and a value of a declared object and of a declared data property,
-/// inserted and deleted, take the base's clean record, and are told what their own ontology
-/// tells.
+/// reification's role, an annotation on the rules route), and so are the list's edges (a
+/// property declared a class too, by the reader's `rdfs:Class`; `owl:Thing` and
+/// `sh:NodeShape` as a subject); the list's own changes, a member of a declared class (one
+/// declared a class twice over too) and a value of a declared object and of a declared data
+/// property, inserted and deleted, take the base's clean record, and are told what their own
+/// ontology tells.
 #[test]
 fn a_pending_read_takes_its_bases_record_only_for_changes_on_the_list() {
     use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term};
@@ -1132,6 +1134,7 @@ fn a_pending_read_takes_its_bases_record_only_for_changes_on_the_list() {
             Some(("", local)) => ("urn:test:", local),
             Some(("rdfs", local)) => ("http://www.w3.org/2000/01/rdf-schema#", local),
             Some(("owl", local)) => ("http://www.w3.org/2002/07/owl#", local),
+            Some(("sh", local)) => ("http://www.w3.org/ns/shacl#", local),
             _ => ("http://www.w3.org/1999/02/22-rdf-syntax-ns#", "type"),
         };
         NamedNode::new_unchecked(format!("{ns}{local}"))
@@ -1153,7 +1156,7 @@ fn a_pending_read_takes_its_bases_record_only_for_changes_on_the_list() {
     let rules = ":Pet a owl:Class . :tib a :Pet ; rdfs:label \"tib\" ; owl:versionInfo \"1\" . ";
     // (the case, the base, inserted, deleted, whether it takes the record)
     type Change = &'static [[&'static str; 3]];
-    let cases: [(&str, String, Change, Change, bool); 11] = [
+    let cases: [(&str, String, Change, Change, bool); 15] = [
         (
             "a member",
             declared.clone(),
@@ -1187,28 +1190,28 @@ fn a_pending_read_takes_its_bases_record_only_for_changes_on_the_list() {
             true,
         ),
         (
-            "V1: a reified main triple deleted",
+            "a reified main triple deleted",
             format!("{OFF_ROUTE}:owner a owl:ObjectProperty . :tib :owner :ann . {axiom}"),
             &[],
             &[[":tib", ":owner", ":ann"]],
             false,
         ),
         (
-            "W3: a reified main triple inserted again",
+            "a reified main triple inserted again",
             format!("{OFF_ROUTE}:owner a owl:ObjectProperty . {axiom}"),
             &[[":tib", ":owner", ":ann"]],
             &[],
             false,
         ),
         (
-            "D2: a retyping deletion",
+            "a retyping deletion",
             format!("{OFF_ROUTE}{typed}:s :p :o . "),
             &[],
             &[[":s", ":p", ":o"]],
             false,
         ),
         (
-            "D3: a statement of a reification's role",
+            "a statement of a reification's role",
             format!(
                 "{OFF_ROUTE}:Pet rdfs:subClassOf [ a owl:Restriction ; \
                  owl:onProperty owl:annotatedSource ; owl:someValuesFrom :Dog ] . "
@@ -1218,32 +1221,60 @@ fn a_pending_read_takes_its_bases_record_only_for_changes_on_the_list() {
             false,
         ),
         (
-            "E1: a retyping insertion",
+            "a retyping insertion",
             format!("{OFF_ROUTE}:p owl:inverseOf :q . {typed}"),
             &[[":s", ":p", ":o"]],
             &[],
             false,
         ),
         (
-            "E2: a label on the rules route",
+            "a label on the rules route",
             rules.to_owned(),
             &[[":rex", "rdfs:label", "\"rex\""]],
             &[],
             false,
         ),
         (
-            "E2: a version on the rules route",
+            "a version on the rules route",
             rules.to_owned(),
             &[[":tib", "owl:versionInfo", "\"2\""]],
             &[],
             false,
+        ),
+        (
+            "a value of a property declared a class too",
+            ":knows a owl:ObjectProperty , rdfs:Class . :tib :knows :ann . ".to_owned(),
+            &[[":rex", ":knows", ":bone"]],
+            &[],
+            false,
+        ),
+        (
+            "a value about owl:Thing",
+            declared.clone(),
+            &[["owl:Thing", ":owns", ":bone"]],
+            &[],
+            false,
+        ),
+        (
+            "a value about sh:NodeShape",
+            declared.clone(),
+            &[["sh:NodeShape", ":owns", ":bone"]],
+            &[],
+            false,
+        ),
+        (
+            "a member of a class declared twice, as one kind",
+            format!("{declared}:Pet a rdfs:Class . "),
+            &[[":rex", "a", ":Pet"]],
+            &[],
+            true,
         ),
     ];
     let mut wrong = Vec::new();
     for (case, base, inserted, deleted, takes) in cases {
         let (store, _pipeline) = opened(crate::StoreConfig::in_memory(), &base);
         let route = store.dl_bounds().last;
-        if case.starts_with("E2") && route != "rules" {
+        if case.ends_with("on the rules route") && route != "rules" {
             wrong.push(format!(
                 "{case}: setup: the base is off the rules route ({route})"
             ));
