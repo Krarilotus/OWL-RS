@@ -2436,17 +2436,19 @@ fn long_intersection(n: usize) -> String {
 /// Spec: reasoning-semantics.md, what may be complete, "Operators": where answers may be
 /// missing, `EXISTS` makes them `unsound`. Under `owl2-rl` with the QL rewriting on, a list
 /// axiom past the rules' cap is left out of the closure, so answers may be missing, and a
-/// `FILTER NOT EXISTS` read is `unsound` in its status, its QL report and its plan. With the
-/// blocker the list's rule entails, the one row kept is one the certain answers drop. The
+/// `FILTER NOT EXISTS` read is `unsound` in its status, its QL report, its plan and, where it
+/// prints, the printed query's status (the status this store gives the same answers). With
+/// the blocker the list's rule entails, the one row kept is one the certain answers drop. The
 /// rule is the query's, so the read with an unrelated blocker is `unsound` too.
 #[test]
 fn a_negation_over_a_list_left_out_is_unsound() {
+    use nrese_sparql::ql::{PrintForm, Printed};
     let property = "a <http://www.w3.org/2002/07/owl#ObjectProperty> .";
     let mut chain = long_chain(251);
     for link in (1..=251).map(|i| format!("p{i}")).chain(["chain".into()]) {
         chain.push_str(&format!(" <{EX}{link}> {property}"));
     }
-    let mut wrong = Vec::new();
+    let (mut wrong, mut printed_any) = (Vec::new(), false);
     for (data, subject, blocker) in [
         (long_key(128), "x", format!("?x <{EX}name> \"Y\"")),
         (chain, "a0", format!("?x <{EX}chain> <{EX}a251>")),
@@ -2457,9 +2459,10 @@ fn a_negation_over_a_list_left_out_is_unsound() {
         (pipeline.apply(insert(&data), &nrese_store::Requester::all(), &ticket)).expect("data");
         let store = pipeline.store();
         for blocked_by in [blocker, format!("?x <{EX}unrelated> <{EX}unused>")] {
-            let request = nrese_store::SparqlQueryRequest::all(format!(
+            let text = format!(
                 "SELECT ?x {{ VALUES ?x {{ <{EX}{subject}> }} FILTER NOT EXISTS {{ {blocked_by} }} }}"
-            ));
+            );
+            let request = nrese_store::SparqlQueryRequest::all(text.clone());
             let answer = store.execute_query(&request).expect("answered");
             let prepared = store.prepare_query(&request).expect("prepared");
             let token = nrese_store::CancellationToken::new();
@@ -2476,12 +2479,70 @@ fn a_negation_over_a_list_left_out_is_unsound() {
                 .iter()
                 .map(|row| row["x"]["value"].as_str().expect("an IRI").to_owned())
                 .collect();
-            if labels != [Some("unsound"); 4] || rows != [format!("{EX}{subject}")] {
-                wrong.push((blocked_by, labels, rows));
+            let printed = match store.print_query(&text, PrintForm::Paths) {
+                Ok(Printed::Query { completeness, .. }) => Some(completeness.as_str()),
+                _ => None,
+            };
+            printed_any |= printed.is_some();
+            let printed_wrong = printed.is_some_and(|label| label != "unsound");
+            if labels != [Some("unsound"); 4] || printed_wrong || rows != [format!("{EX}{subject}")]
+            {
+                wrong.push((blocked_by, labels, printed, rows));
             }
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
+    assert!(
+        printed_any,
+        "setup: no read printed, so the printed status went unchecked"
+    );
+}
+
+/// Spec: the operator rule (reasoning-semantics.md, "Operators") holds once per read: a read
+/// inside a transaction, under `FILTER NOT EXISTS`, over a store whose committed key of 128
+/// properties is left out, is `unsound`, and its status names the operator once, not once for
+/// the QL report and again for the pending operations (the DL lead's P0 round 2, S2).
+#[test]
+fn a_pending_negation_over_a_list_left_out_names_the_operator_once() {
+    let pipeline = ql_pipeline(in_memory_store_config());
+    let store = pipeline.store();
+    let ticket = MutationTicket::new();
+    (pipeline.apply(
+        insert(&long_key(128)),
+        &nrese_store::Requester::all(),
+        &ticket,
+    ))
+    .expect("the data");
+    let read = format!(
+        "SELECT ?x {{ VALUES ?x {{ <{EX}x> }} FILTER NOT EXISTS {{ ?x <{EX}unrelated> <{EX}unused> }} }}"
+    );
+    let prepared =
+        (store.prepare_query(&nrese_store::SparqlQueryRequest::all(read))).expect("prepared");
+    let add = format!("INSERT DATA {{ <{EX}w> <{EX}name> \"W\" }}");
+    let ops = vec![nrese_store::StatementOp::Update(SparqlUpdateRequest::new(
+        add,
+    ))];
+    let mut pending = None;
+    store
+        .run_query_pending_reporting(
+            &nrese_store::StatementsRequest::new(ops),
+            &prepared,
+            &nrese_store::CancellationToken::new(),
+            &mut Vec::<u8>::new(),
+            |status, _| {
+                pending = status;
+                None
+            },
+        )
+        .expect("the pending read");
+    let status = pending.expect("a status");
+    let operator = (status.reasons.iter())
+        .filter(|r| {
+            r.text
+                .starts_with("the query uses EXISTS over answers that may be missing")
+        })
+        .count();
+    assert_eq!((status.as_str(), operator), ("unsound", 1), "{status:#?}");
 }
 
 /// An intersection of 256 members is one rule; one of 257 is either one too or reported
