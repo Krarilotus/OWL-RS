@@ -4914,6 +4914,47 @@ fn numeric_values_keep_their_sparql_semantics() {
     }
 }
 
+/// SPARQL 1.1 §18.5.1.2 drops erring arguments from Count, and §18.5.1.4 gives
+/// Avg(M) = "0"^^xsd:integer where Count(M) = 0: the means where every argument errs (an
+/// unbound variable, a division by zero, arithmetic on strings, and grouped), each answer
+/// whole (a group's key with its mean), as written and with the executor's own plan.
+#[test]
+fn avg_where_every_argument_errs_is_integer_zero_as_written_and_planned() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let snapshot = engine.snapshot();
+    let zero = "\"0\"^^<http://www.w3.org/2001/XMLSchema#integer>";
+    let one = "\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>";
+    let cases = [
+        (
+            "SELECT (AVG(?u) AS ?a) WHERE { VALUES ?x { 1 2 } }",
+            zero.to_owned(),
+        ),
+        (
+            "SELECT (AVG(?x / 0) AS ?a) WHERE { VALUES ?x { 1 2 } }",
+            zero.to_owned(),
+        ),
+        (
+            r#"SELECT (AVG(?x * 1) AS ?a) WHERE { VALUES ?x { "a" "b" } }"#,
+            zero.to_owned(),
+        ),
+        (
+            "SELECT ?g (AVG(?u) AS ?a) WHERE { VALUES (?g ?x) { (1 1) (1 2) } } GROUP BY ?g",
+            format!("{one}\t{zero}"),
+        ),
+    ];
+    for as_written in [true, false] {
+        let options = QueryOptions {
+            as_written,
+            ..QueryOptions::default()
+        };
+        for (text, expected) in &cases {
+            let query = SparqlParser::new().parse_query(text).unwrap();
+            let found = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
+            assert_eq!(found, [expected.clone()], "as written {as_written}: {text}");
+        }
+    }
+}
+
 /// SPARQL 1.1 §18.5.1.4: AVG(M) = "0"^^xsd:integer whenever Count(M) = 0, including when
 /// every row in the group evaluates the argument to an error (unbound variable, division
 /// by zero, type error). Mixed value + error and bound non-numeric literals stay unbound,
