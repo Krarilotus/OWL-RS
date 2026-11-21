@@ -54,7 +54,7 @@ fn get(uri: &str) -> Result<Request<Body>, axum::http::Error> {
         .body(Body::empty())
 }
 
-fn encode(value: &str) -> String {
+pub(crate) fn encode(value: &str) -> String {
     value
         .bytes()
         .map(|b| match b {

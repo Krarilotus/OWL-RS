@@ -51,3 +51,4 @@ mod status_header_cache_tests;
 mod tell_api_tests;
 mod u1_limit_tests;
 mod upgrade_tests;
+mod whole_answer_tests;
