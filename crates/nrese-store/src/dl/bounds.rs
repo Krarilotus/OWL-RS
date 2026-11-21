@@ -65,6 +65,8 @@ pub(crate) mod seam {
         Change,
         /// U1 built afresh for a read, not begun.
         Build,
+        /// Make the next read's U1 build start past its deadline.
+        BuildDeadline,
         /// The TBox's taxonomy for a read, not begun.
         Taxonomy,
         /// A revision's read view, not begun.
@@ -87,7 +89,7 @@ pub(crate) mod seam {
         hooks.push((key(bounds), point, Box::new(hook)));
     }
 
-    pub(crate) fn at(bounds: &super::Bounds, point: Point) {
+    pub(crate) fn at(bounds: &super::Bounds, point: Point) -> bool {
         let hook = {
             let mut hooks = HOOKS.lock().unwrap_or_else(|p| p.into_inner());
             let at = hooks
@@ -97,7 +99,9 @@ pub(crate) mod seam {
         };
         if let Some((_, _, hook)) = hook {
             hook();
+            return true;
         }
+        false
     }
 }
 
@@ -1053,6 +1057,12 @@ fn afresh(
     }
     let normalised = nrese_owl::normalise(&ontology);
     let deadline = Deadline::after(store.config().dl.timeout);
+    #[cfg(test)]
+    let deadline = if seam::at(&store.dl().bounds, seam::Point::BuildDeadline) {
+        Deadline::at(std::time::Instant::now())
+    } else {
+        deadline
+    };
     let memory = store.memory_stop();
     // Whether the memory watch stopped U1: then it is refused, never kept (REAS-3, C17).
     let memory_hit = std::sync::atomic::AtomicBool::new(false);

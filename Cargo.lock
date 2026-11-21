@@ -1267,6 +1267,7 @@ dependencies = [
  "nrese-rdf",
  "nrese-rdf-io",
  "nrese-reasoner",
+ "nrese-server",
  "nrese-sparql",
  "nrese-sparql-results",
  "nrese-store",
