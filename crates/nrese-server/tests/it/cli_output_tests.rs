@@ -152,14 +152,14 @@ fn kept_quarantine_without_publication_says_when_to_load_again()
         panic!("{}", output.stderr);
     };
     let load = line
-        .split_once("under load ID ")
-        .and_then(|(_, rest)| rest.split_once(". "))
+        .split_once("quarantine/load-")
+        .and_then(|(_, rest)| rest.split_once(".jsonl"))
         .map(|(load, _)| load)
         .expect(line);
     assert_eq!(
         line,
         format!(
-            "Error: the load published nothing. The quarantine record couldn't be kept: the quarantine's directory sync failed (a test's). This load's records may be listed under load ID {load}. If they are, its quarantine is kept: don't load it again. If they aren't, loading it again is safe."
+            "Error: the load published nothing. The quarantine record couldn't be kept: the quarantine's directory sync failed (a test's). This load's quarantine may have been kept as quarantine/load-{load}.jsonl in the server's data directory. If that file is there, don't load it again. If it isn't, loading it again is safe."
         )
     );
     assert!(!output.status.success(), "{}", output.status);

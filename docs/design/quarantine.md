@@ -86,9 +86,10 @@ error. Re-admitting one takes the fixed text.
   durable. A load that published nothing then takes its file back: it removes the file
   and syncs the directory again, so that sending it again doesn't quarantine its
   statements twice. Only when both hold does its error call sending it again safe;
-  otherwise the error names the load, whose records may be listed. A load that published
-  keeps its file, listed and counted, so that its statements can still be reviewed; its
-  error names the load, and a power loss may lose the file.
+  otherwise the error names the file the load's quarantine may have been kept as: if
+  that file is there, the load isn't sent again; if it isn't, sending it again is safe.
+  A load that published keeps its file, listed and counted, so that its statements can
+  still be reviewed; its error names the load, and a power loss may lose the file.
 - `resolutions.jsonl`: append-only, one record per resolved statement (`outcome`
   `readmitted` with the commit's revision, or `discarded`; when; the repairs; the text
   admitted where it isn't the quarantined one; a note). On open, an incomplete final

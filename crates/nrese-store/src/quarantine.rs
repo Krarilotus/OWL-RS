@@ -1022,7 +1022,7 @@ impl QuarantineCommitError {
                 format!("It's safe to {retry_action} it again once the cause is resolved.")
             }
             Self::PossiblyListed { load, .. } => format!(
-                "This load's records may be listed under load ID {load}. If they are, its quarantine is kept: don't {retry_action} it again. If they aren't, {retry_action}ing it again is safe."
+                "This load's quarantine may have been kept as quarantine/load-{load}.jsonl in the server's data directory. If that file is there, don't {retry_action} it again. If it isn't, {retry_action}ing it again is safe."
             ),
         };
         format!(
@@ -1737,7 +1737,7 @@ mod tests {
     /// The advice of a load that published nothing and whose records may be listed.
     fn may_be_listed(load: &str) -> String {
         format!(
-            "This load's records may be listed under load ID {load}. If they are, its quarantine is kept: don't send it again. If they aren't, sending it again is safe."
+            "This load's quarantine may have been kept as quarantine/load-{load}.jsonl in the server's data directory. If that file is there, don't send it again. If it isn't, sending it again is safe."
         )
     }
 

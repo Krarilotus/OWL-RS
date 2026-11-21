@@ -1099,7 +1099,7 @@ async fn kept_quarantine_without_publication_says_when_to_send_again() {
     assert_eq!(
         detail,
         format!(
-            "the load published nothing. The quarantine record couldn't be kept: the quarantine's directory sync failed (a test's). This load's records may be listed under load ID {load}. If they are, its quarantine is kept: don't send it again. If they aren't, sending it again is safe."
+            "the load published nothing. The quarantine record couldn't be kept: the quarantine's directory sync failed (a test's). This load's quarantine may have been kept as quarantine/load-{load}.jsonl in the server's data directory. If that file is there, don't send it again. If it isn't, sending it again is safe."
         )
     );
 }
