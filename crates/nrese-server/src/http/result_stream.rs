@@ -60,8 +60,10 @@ tokio::task_local! {
     static WHOLE: bool;
 }
 
-/// For a read without an envelope of its own (stored statements, the export): one of a
-/// query's size (`budgets.query_memory`), opened only if its answer is held whole.
+/// For an answer read without a query (stored statements, the export): an envelope of a
+/// query's size (`budgets.query_memory`) for the answer held whole, opened only if it is.
+/// It holds the answer only: what the read needs besides is its own (a transaction's
+/// pending changes, applied for its read in an envelope of their own).
 pub fn read_envelope(state: &AppState) -> impl FnOnce() -> Envelope + use<> {
     let store = state.store();
     let limit = state.policy().limits.max_query_memory_bytes;
@@ -266,6 +268,8 @@ pub async fn stream_blocking(
     timeout_message: &'static str,
     produce: impl FnOnce(&mut ChannelWriter) -> Result<(), ApiError> + Send + 'static,
 ) -> Result<Response, ApiError> {
+    // Set for every request of the server's router (`app::screen`), which is reached only
+    // through `build_app`; unset only for a handler a test calls without it, which streams.
     let whole = WHOLE.try_with(|whole| *whole).unwrap_or(false);
     // How long an answer held whole waits for its client to take each frame: a stall
     // bound's own, or the time a query was given.
