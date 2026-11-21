@@ -1100,6 +1100,8 @@ const DATA_CONSTRUCTORS: [&str; 6] = [
     "unionOf",
 ];
 const RL_CONSTRUCTORS: [&str; 2] = ["datatype", "intersectionOf"];
+/// Kept by hand: [`Fillers::classes`] chooses by chance, not from this list, so a constructor
+/// added there must be added here too.
 const CLASS_CONSTRUCTORS: [&str; 4] = ["class", "intersectionOf", "unionOf", "complementOf"];
 
 /// Fillers in Turtle, from a seed. Each composite node is written in place (`[ … ]`) or as
@@ -1357,6 +1359,7 @@ fn generated_fillers_are_read_by_their_kind_seed_5eedda7a() {
         use std::collections::BTreeSet;
         let witnesses = [
             (
+                "data",
                 &DATA_CONSTRUCTORS[..],
                 data_witnesses
                     .iter()
@@ -1364,18 +1367,21 @@ fn generated_fillers_are_read_by_their_kind_seed_5eedda7a() {
                     .collect::<BTreeSet<_>>(),
             ),
             (
+                "class",
                 &CLASS_CONSTRUCTORS[..],
                 class_witnesses.iter().map(|row| row.0).collect(),
             ),
             (
+                "rl",
                 &RL_CONSTRUCTORS[..],
                 rl_witnesses.iter().map(|row| row.0).collect(),
             ),
         ];
-        for (constructors, pinned) in witnesses {
+        for (stream, constructors, pinned) in witnesses {
             assert_eq!(
                 constructors.iter().copied().collect::<BTreeSet<_>>(),
-                pinned
+                pinned,
+                "the {stream} stream's constructors and its pinned witnesses"
             );
         }
     }

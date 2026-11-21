@@ -2683,7 +2683,8 @@ fn the_candidate_limit_is_named_only_where_that_many_were_tested() {
 /// each request memory limit from 16 KiB to 4 MiB (steps of a fiftieth), and in steps of 256
 /// bytes over the 16 KiB from the least limit the read is answered under with the labels off
 /// (found to 256 bytes), every read the first of a store just committed, a read answered with
-/// the labels off is answered with them on.
+/// the labels off is answered with them on. And the case is reached: under some compared limit
+/// the labels refute the 60 `a`s.
 /// By default, probe the least-answering limit and the switch where labels refute 60.
 /// With `NRESE_CHECK_TIER=nightly` the geometric sweep covers the switch.
 #[test]
