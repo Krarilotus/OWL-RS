@@ -5,11 +5,17 @@
 # are the suites whose counts its own log (or its `table`, which it writes as NRESE_W3C_OUT) reports.
 # A kit that didn't run whole fails, whatever its log says. Every suite below is one kit's.
 #
-# Per suite at least `passed`, no failure beyond `failed` (0), at most the known `skipped` and
-# `disputed`. A suite without counts (its data missing, its kit not run) fails. The numbers are the
-# v2 merge gate's (docs/plan/2026-10-05-v2-merge-checklist.md §4: no wrong answers), as measured on
-# the shared host on 14 Oct 2026 (v15-gate-w3c-3, v15-gate-w3c-dl). A suite that grows raises its count
-# here in the same commit.
+# Per suite at least `passed` (or `checked`, for a runner that counts what it checked, its listed
+# failures among them), no failure beyond `failed` (0), at most the known `skipped` and `disputed`,
+# and exactly `known` listed failures (the runner's expected-failures list; 0 when not given): a list
+# that grows or shrinks changes `known` here in the same commit. A suite without counts (its data
+# missing, its kit not run) fails. The numbers are the v2 merge gate's
+# (docs/plan/2026-10-05-v2-merge-checklist.md §4: no wrong answers), as measured on the shared host
+# on 14 Oct 2026 (v15-gate-w3c-3, v15-gate-w3c-dl); the kits after OWL 2 DL as measured on 21 Nov 2026
+# at w3c/rdf-tests 56076c0. A suite that grows raises its count here in the same commit.
+#
+# Check every count here without the gate's receipts (no verdict), after scripts/fetch-w3c-tests.sh:
+#     python3 benches/fast/release_gate.py w3c target/w3c-local --expected benches/fast/w3c-expected.toml --local
 
 [kit."nrese-sparql:w3c_sparql11"]
 suites = ["SPARQL 1.1", "SPARQL 1.2"]
@@ -27,12 +33,29 @@ suites = ["OWL 2 RL"]
 suites = ["OWL 2 DL"]
 table = "tableau-w3c.tsv"
 
-# Their counts aren't parsed: the kit's own assertions are its verdict (exit 0, summaries ok).
 [kit."nrese-owl:w3c_owl2"]
-suites = []
+suites = ["OWL 2 RDF/XML round trip", "OWL 2 profiles", "OWL 2 functional syntax"]
 
 [kit."nrese-reasoner:w3c_n3_reasoner"]
-suites = []
+suites = ["N3 reasoner"]
+
+[kit."nrese-store:w3c_owl2_ql"]
+suites = ["OWL 2 QL"]
+
+[kit."nrese-rdf-io:w3c_rdf"]
+suites = ["RDF 1.1 syntax", "RDF 1.2 syntax"]
+
+[kit."nrese-rdf-io:w3c_jsonld"]
+suites = ["JSON-LD 1.1"]
+
+[kit."nrese-rdf-io:w3c_rdfc"]
+suites = ["RDFC-1.0"]
+
+[kit."nrese-rdf-io:w3c_n3"]
+suites = ["N3 parser"]
+
+[kit."nrese-sparql-syntax:w3c_syntax"]
+suites = ["SPARQL syntax"]
 
 [suite."SPARQL 1.1"]
 passed = 531
@@ -61,3 +84,50 @@ disputed = 1
 [suite."GeoSPARQL"]
 passed = 194
 disputed = 18
+
+# OWL 2 (nrese-owl w3c_owl2): what each check covered, its own listed failures among them (the
+# runner fails on any other failure, and on a listed case that passes).
+[suite."OWL 2 RDF/XML round trip"]
+checked = 403
+
+[suite."OWL 2 profiles"]
+checked = 295
+
+[suite."OWL 2 functional syntax"]
+checked = 77
+
+# N3 reasoner: 76 tests out of scope (cwm options and built-ins it doesn't run).
+[suite."N3 reasoner"]
+passed = 13
+skipped = 76
+
+# OWL 2 QL (Direct Semantics): 9 listed failures (crates/nrese-store/tests/w3c_owl2_ql/
+# expected-failures.txt) and 2 skips. The list is about to shrink: `known` changes in the same commit
+# as the list, whichever change lands second.
+[suite."OWL 2 QL"]
+passed = 51
+known = 9
+skipped = 2
+
+[suite."RDF 1.1 syntax"]
+passed = 993
+
+[suite."RDF 1.2 syntax"]
+passed = 351
+
+# JSON-LD 1.1 (toRdf, expand, fromRdf): 22 not run (JSON-LD 1.0-only tests and generalized RDF).
+[suite."JSON-LD 1.1"]
+passed = 884
+skipped = 22
+
+[suite."RDFC-1.0"]
+passed = 86
+
+# N3 parser: 1 listed failure (crates/rdf/nrese-rdf-io/tests/w3c_n3/expected-failures.txt).
+[suite."N3 parser"]
+passed = 1084
+known = 1
+
+# SPARQL 1.0, 1.1 and 1.2 syntax tests, one per query file and kind.
+[suite."SPARQL syntax"]
+passed = 1318

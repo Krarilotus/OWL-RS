@@ -1367,6 +1367,8 @@ def load_w3c_expected(text: str) -> tuple[dict, list[Kit], list[str]]:
         kits.append(Kit(name, tuple(names), entry.get("table")))
     errors += [f"{suite}: no kit reports it" for suite in suites if suite not in owners]
     errors += [f"{suite}: {owners[suite]}'s, with no expectation" for suite in owners if suite not in suites]
+    errors += [f"{suite}: no passed or checked count" for suite, want in suites.items()
+               if "passed" not in want and "checked" not in want]
     if not kits:
         errors.append("no kit declared")
     return suites, kits, errors
@@ -1391,9 +1393,16 @@ def kit_counts(logs: Path, kits: list[Kit]) -> dict[str, dict]:
 
 
 def log_counts(text: str) -> dict[str, dict]:
-    """The suites' counts one kit's log reports, and its libtest summaries' sums ("test results")."""
+    """The suites' counts one kit's log reports, and its libtest summaries' sums ("test results").
+    `known` is a runner's listed failures (its expected-failures list), counted apart from `failed`;
+    a runner that reports per manifest is summed under its suite."""
     out: dict[str, dict] = {}
-    title = None
+    title, section = None, None
+
+    def add(suite: str, **got: int) -> None:
+        for key, n in got.items():
+            out.setdefault(suite, {})[key] = out.get(suite, {}).get(key, 0) + n
+
     for line in text.splitlines():
         if m := re.match(r"W3C (.+) on engine v2: passed / failed / skipped", line):
             title = m.group(1)
@@ -1402,8 +1411,36 @@ def log_counts(text: str) -> dict[str, dict]:
             title = None
         elif m := re.match(r"(W3C SHACL[^:]*): (\d+) of (\d+) pass", line):
             out[m[1].removeprefix("W3C ")] = {"passed": int(m[2]), "failed": int(m[3]) - int(m[2]), "skipped": 0}
-        elif m := re.match(r"W3C (OWL 2 RL)[^:]*: (\d+) passed, (\d+) failed \((\d+) expected\), (\d+) skipped", line):
-            out[m[1]] = {"passed": int(m[2]), "failed": int(m[3]) - int(m[4]), "skipped": int(m[5])}
+        elif m := re.match(r"W3C (OWL 2 (?:RL|QL))[^:]*: (\d+) passed, (\d+) failed \((\d+) expected\), (\d+) skipped",
+                           line):
+            out[m[1]] = {"passed": int(m[2]), "failed": int(m[3]) - int(m[4]), "known": int(m[4]),
+                         "skipped": int(m[5])}
+        elif m := re.match(r"W3C RDFC-1\.0: (\d+) of (\d+) passed$", line):
+            out["RDFC-1.0"] = {"passed": int(m[1]), "failed": int(m[2]) - int(m[1])}
+        elif m := re.match(r"N3 reasoner tests: (\d+) in scope, (\d+) passed; (\d+) out of scope:", line):
+            out["N3 reasoner"] = {"passed": int(m[2]), "failed": int(m[1]) - int(m[2]), "skipped": int(m[3])}
+        # The runner fails on any failure its list doesn't name, so what it counts as failed is listed.
+        elif m := re.match(r"(sparql1\d) (?:Positive|Negative)(?:Query|Update): (\d+)/(\d+)$", line):
+            add("SPARQL syntax", passed=int(m[2]), known=int(m[3]) - int(m[2]))
+        elif m := re.match(r"(\d+) ontologies of species DL checked$", line):
+            out["OWL 2 RDF/XML round trip"] = {"checked": int(m[1])}
+        elif m := re.match(r"(\d+) test cases compared$", line):
+            out["OWL 2 profiles"] = {"checked": int(m[1])}
+        elif m := re.match(r"(\d+) ontologies in both syntaxes compared", line):
+            out["OWL 2 functional syntax"] = {"checked": int(m[1])}
+        elif re.match(r"W3C RDF syntax suites: passed / failed$", line):
+            section = "rdf"
+        elif re.match(r"W3C JSON-LD 1\.1 suites: passed / failed / not run$", line):
+            section = "jsonld"
+        elif re.match(r"W3C N3 parser suites: passed / failed \(expected failures\)$", line):
+            section = "n3"
+        elif section == "rdf" and (m := re.match(r"  rdf1([12])/\S+: (\d+) / (\d+)$", line)):
+            # As above: the runner fails on an unlisted failure.
+            add(f"RDF 1.{m[1]} syntax", passed=int(m[2]), known=int(m[3]))
+        elif section == "jsonld" and (m := re.match(r"  \S+\.jsonld: (\d+) / (\d+) / (\d+)$", line)):
+            add("JSON-LD 1.1", passed=int(m[1]), failed=int(m[2]), skipped=int(m[3]))
+        elif section == "n3" and (m := re.match(r"  \S+\.ttl: (\d+) / (\d+) \((\d+)\)$", line)):
+            add("N3 parser", passed=int(m[1]), failed=int(m[2]) - int(m[3]), known=int(m[3]))
         elif m := re.match(r"GeoSPARQL compliance benchmark: (\d+) of (\d+) queries match the reference, "
                            r"(\d+) don't \((\d+) disputed\)", line):
             out["GeoSPARQL"] = {"passed": int(m[1]), "failed": int(m[3]) - int(m[4]), "disputed": int(m[4])}
@@ -1425,7 +1462,9 @@ def table_counts(text: str) -> dict[str, dict]:
 
 def w3c_check(counts: dict, expected: dict) -> list[str]:
     """Every expected suite present (its data was there: a suite without it fails, never
-    skips), no failure, at least its passes, at most its known skips and disputes."""
+    skips), no failure, at least its passes (or, for a runner that counts only what it checked,
+    its checks), at most its known skips and disputes, and exactly its listed failures (`known`):
+    a list that grows or shrinks changes the count here in the same commit."""
     errors = []
     for suite, want in expected.items():
         got = counts.get(suite)
@@ -1434,11 +1473,15 @@ def w3c_check(counts: dict, expected: dict) -> list[str]:
             continue
         if got.get("failed", 0) > want.get("failed", 0):
             errors.append(f"{suite}: {got['failed']} failed")
-        if got.get("passed", 0) < want["passed"]:
-            errors.append(f"{suite}: {got.get('passed', 0)} passed, at least {want['passed']} required")
+        for key in ("passed", "checked"):
+            if key in want and got.get(key, 0) < want[key]:
+                errors.append(f"{suite}: {got.get(key, 0)} {key}, at least {want[key]} required")
         for key in ("skipped", "disputed", "open"):
             if got.get(key, 0) > want.get(key, 0):
                 errors.append(f"{suite}: {got[key]} {key}, at most {want.get(key, 0)} known")
+        if got.get("known", 0) != want.get("known", 0):
+            errors.append(f"{suite}: {got.get('known', 0)} listed failures, {want.get('known', 0)} stated "
+                          "(w3c-expected.toml changes with the list)")
     if counts.get("test results", {}).get("failed"):
         errors.append(f"{counts['test results']['failed']} W3C test functions failed")
     return errors
@@ -1669,7 +1712,12 @@ def publish(path: Path, data: dict) -> None:
 
 
 def run_w3c(logs: Path, kits: list[Kit], identity: str, attempt: str) -> CheckReceipt:
-    """Every declared kit, in order, through this checkout's scripts/cargo-guarded.sh; each kit's log
+    """launch_kits(), with the receipt that binds the outcomes to this checkout's tree and build."""
+    return checkout_receipt("w3c", identity, attempt, launch_kits(logs, kits))
+
+
+def launch_kits(logs: Path, kits: list[Kit]) -> list[Outcome]:
+    """Every kit of `kits`, in order, through this checkout's scripts/cargo-guarded.sh; each kit's log
     and table its own, an earlier attempt's removed first."""
     outcomes = []
     for kit in kits:
@@ -1681,7 +1729,7 @@ def run_w3c(logs: Path, kits: list[Kit], identity: str, attempt: str) -> CheckRe
                                 "--test", kit.test, "--", "--nocapture"], logs / f"{kit.test}.log", env)
         print(f"w3c {kit.name}: exit {o.exit}{'' if o.summary else ', no passing summary'}", file=sys.stderr)
         outcomes.append(o)
-    return checkout_receipt("w3c", identity, attempt, outcomes)
+    return outcomes
 
 
 # --- the host each pass met --------------------------------------------------------------------
@@ -3440,6 +3488,9 @@ def main() -> int:
                                                       "outcome recorded in LOGS/receipt.json")
     s.add_argument("--identity", help="with --run: the build identity (scripts/lib/gate-key.sh gate_identity)")
     s.add_argument("--attempt", help="with --run: its step's attempt (release_gate.py attempt), in result and receipt")
+    s.add_argument("--local", action="store_true", help="launch the kits in this checkout and check every count, "
+                                                        "writing no receipt or result: no verdict")
+    s.add_argument("--kits", help="with --local: only these kits (CRATE:TEST,...) and their suites")
     s.add_argument("--json", type=Path)
     s = sub.add_parser("guards", help="the §0 guards, run (release-gate.sh guards)")
     s.add_argument("--names", type=Path, help="one guard per line; default: performance.md §0's")
@@ -3593,6 +3644,25 @@ def main() -> int:
         if args.list_kits:
             print("\n".join(kit.name for kit in kits))
             return 0
+        if args.local:
+            # Every count the gate checks, here, after scripts/fetch-w3c-tests.sh: no receipt, no result
+            # file, so nothing the gate's verdict could ever read.
+            if args.logs is None or args.run or args.json:
+                p.error("w3c --local: LOGDIR for the kits' logs, without --run or --json")
+            names = args.kits.split(",") if args.kits else [kit.name for kit in kits]
+            if unknown := sorted(set(names) - {kit.name for kit in kits}):
+                p.error(f"w3c --local --kits: {', '.join(unknown)} not declared in {args.expected}")
+            chosen = [kit for kit in kits if kit.name in names]
+            os.environ["NRESE_W3C_REQUIRED"] = "1"  # as release-gate.sh w3c: missing data fails
+            outcomes = launch_kits(args.logs, chosen)
+            counts = kit_counts(args.logs, chosen)
+            errors = (outcome_errors(tuple(outcomes), [kit.name for kit in chosen])
+                      + w3c_check(counts, {suite: expected[suite] for kit in chosen for suite in kit.suites}))
+            print(json.dumps(counts, indent=1))
+            print("\n".join(errors) if errors else "every count as w3c-expected.toml states")
+            print("w3c --local: a local check, not a verdict: no receipt binds it to a tree or a build, and "
+                  "the release gate never reads it")
+            return 0 if not errors else 1
         if args.logs is None or (args.run and not (args.identity and args.attempt)):
             p.error("w3c: LOGDIR, and with --run its --identity and --attempt")
         recorded = args.logs / "receipt.json"
