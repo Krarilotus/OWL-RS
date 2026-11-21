@@ -157,16 +157,9 @@ fn merges_carry_their_dependencies() {
 
 /// Random 3-SAT through nominals, around the hard ratio of clauses to variables, against
 /// brute force: every merge choice and its backtracking.
-/// By default, this test checks pinned satisfiable and unsatisfiable cases at every size. With `NRESE_CHECK_TIER=nightly`, it checks 60 rounds.
+/// By default, this test checks pinned satisfiable and unsatisfiable cases at every size. With `NRESE_CHECK_TIER=nightly` or `NRESE_FUZZ_SEED` set, it checks 60 rounds.
 #[test]
 fn random_sat_through_nominals() {
-    let full = crate::support::nightly();
-    let count = std::env::var("NRESE_FUZZ_CASES")
-        .ok()
-        .and_then(|n| n.parse::<u64>().ok());
-    let seed = std::env::var("NRESE_FUZZ_SEED")
-        .ok()
-        .and_then(|n| n.parse::<u64>().ok());
     // Round 0 is the satisfiable case the faulty backtracking refuted.
     let witnesses = [
         (0, true),
@@ -178,13 +171,12 @@ fn random_sat_through_nominals() {
         (13, false),
         (24, false),
     ];
-    let pinned = !full && count.is_none() && seed.is_none();
-    let cases = if pinned {
-        25
-    } else {
-        count.unwrap_or(60).max(4)
-    };
-    let mut state = (0x9e37_79b9_7f4a_7c15 ^ seed.unwrap_or(0)).max(1);
+    // Any tier, seed or count gives the line's 60 rounds (whose stream reads no seed).
+    let pinned = !crate::support::nightly()
+        && std::env::var_os("NRESE_FUZZ_SEED").is_none()
+        && std::env::var_os("NRESE_FUZZ_CASES").is_none();
+    let cases = if pinned { 25 } else { 60 };
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
     let mut next = |n: u64| {
         state ^= state << 13;
         state ^= state >> 7;

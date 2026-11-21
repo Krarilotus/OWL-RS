@@ -19,18 +19,6 @@ static ALLOCATOR: measure::Measured<std::alloc::System> = measure::Measured(std:
 #[path = "it/support.rs"]
 mod check_tier;
 
-fn test_cases(default: usize, full: usize) -> usize {
-    let cases = if crate::check_tier::nightly() {
-        full
-    } else {
-        default
-    };
-    std::env::var("NRESE_FUZZ_CASES")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(cases)
-}
-
 /// A large space is searched through its graph and finds what the exact scan finds.
 /// By default, this test uses 140 radii above the threaded build threshold. With `NRESE_CHECK_TIER=nightly`, it uses 200.
 #[test]
@@ -48,7 +36,11 @@ fn large_spaces_are_searched_through_a_graph() {
         ..EngineConfig::default()
     })
     .expect("engine");
-    let points = test_cases(140, 200).max(140) * 360;
+    let points = if crate::check_tier::nightly() {
+        200
+    } else {
+        140
+    } * 360;
     let mut tx = engine.transaction();
     for i in 0..points {
         let angle = ((i % 360) as f32 + (i / 360) as f32 * 0.001).to_radians();

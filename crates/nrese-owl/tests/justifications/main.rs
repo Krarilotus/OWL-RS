@@ -66,7 +66,7 @@ fn brute(g: &ProofGraph<u32, u32>, axioms: u32) -> Vec<Vec<u32>> {
     out
 }
 
-/// By default, this test checks pinned graphs with no, one or several justifications and every inference arity. With `NRESE_CHECK_TIER=nightly`, it checks 3,000 graphs.
+/// By default, this test checks pinned graphs with no, one or several justifications and every inference arity. With `NRESE_CHECK_TIER=nightly` or `NRESE_FUZZ_SEED` set, it checks 3,000 graphs.
 #[test]
 fn the_enumeration_equals_a_brute_force_mus_enumerator() {
     let full = support::nightly();
@@ -75,7 +75,7 @@ fn the_enumeration_equals_a_brute_force_mus_enumerator() {
         .and_then(|v| v.parse().ok());
     // Case 5 exposed the missing alternatives when enumeration stopped at one.
     let witnesses = [(1, 1), (3, 0), (5, 6)];
-    let pinned = !full && count.is_none();
+    let pinned = !full && count.is_none() && std::env::var_os("NRESE_FUZZ_SEED").is_none();
     let cases = if pinned { 6 } else { count.unwrap_or(3_000u64) };
     let mut next = rng(0x2026_1003_0240);
     let mut arities = BTreeSet::new();

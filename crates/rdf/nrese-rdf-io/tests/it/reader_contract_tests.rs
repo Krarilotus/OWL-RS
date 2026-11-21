@@ -706,17 +706,11 @@ fn recovery_knows_every_bracket_open_wherever_a_statement_fails() {
 #[test]
 fn recovery_over_large_malformed_input() {
     let after = triple("urn:after", "urn:p", iri("urn:o"));
-    let (default_n, default_quotes) = if crate::support::nightly() {
+    let (n, quotes) = if crate::support::nightly() {
         (100_000, 5_000)
     } else {
         (1_000, 100)
     };
-    let n = std::env::var("NRESE_FUZZ_CASES")
-        .ok()
-        .and_then(|n| n.parse::<usize>().ok())
-        .unwrap_or(default_n)
-        .max(1);
-    let quotes = (n.saturating_mul(default_quotes) / default_n).max(1);
     let documents: [(&str, Vec<u8>); 3] = [
         (
             "unmatched closers",

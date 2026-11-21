@@ -2033,19 +2033,23 @@ fn set_query_with(
     )
 }
 
-fn cases(default: usize, full: usize) -> usize {
-    let cases = if crate::support::nightly() {
+/// A fixture's size: `default`, or the line's `full` one with `NRESE_CHECK_TIER=nightly`.
+fn size(default: usize, full: usize) -> usize {
+    if crate::support::nightly() {
         full
     } else {
         default
-    };
-    std::env::var("NRESE_FUZZ_CASES")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|&count| count > 0)
-        .unwrap_or(cases)
+    }
 }
 
+/// A random test's count: `default` for its pinned witnesses, else the line's `full` one. A
+/// seeded run is the full draw from that seed.
+fn cases(default: usize, full: usize) -> usize {
+    if pinned_cases() { default } else { full }
+}
+
+/// Whether a random test replays its pinned witnesses: only with no tier, no seed
+/// (`NRESE_FUZZ_SEED`) and no count (`NRESE_FUZZ_CASES`). Any of them gives the full draw.
 fn pinned_cases() -> bool {
     !crate::support::nightly()
         && std::env::var_os("NRESE_FUZZ_CASES").is_none()
@@ -2058,7 +2062,7 @@ fn pinned_cases() -> bool {
 /// `SAMPLE`'s column left out, `GROUP_CONCAT`'s parts sorted (the planner may join in
 /// another order than as written, and SPARQL leaves the order of concatenation open; seed
 /// 2051 of the fuzz campaign). Mutation-checked.
-/// By default, this test checks fixed witnesses for every set-query family. With `NRESE_CHECK_TIER=nightly`, it draws 60 datasets.
+/// By default, this test checks fixed witnesses for every set-query family. With `NRESE_CHECK_TIER=nightly` or `NRESE_FUZZ_SEED` set, it draws 60 datasets.
 #[test]
 fn duplicate_insensitive_queries_equal_both_evaluations() {
     let witnesses = [
@@ -2345,7 +2349,7 @@ fn count_star_of_one_pattern_reads_the_index() {
 
 /// Cyclic BGPs (triangles, 4-cycles, with types, constants, repeated variables and a
 /// variable predicate) over dense graphs: the worst-case-optimal join equals the reference evaluator.
-/// By default, this test compares rows and counts for every cycle shape with and without a type. With `NRESE_CHECK_TIER=nightly`, it draws 40 datasets.
+/// By default, this test compares rows and counts for every cycle shape with and without a type. With `NRESE_CHECK_TIER=nightly` or `NRESE_FUZZ_SEED` set, it draws 40 datasets.
 #[test]
 fn cyclic_bgps_equal_the_reference() {
     let witnesses = [
@@ -2594,7 +2598,7 @@ fn parallel_probe_join_equals_the_reference() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
     let mut tx = engine.transaction();
     let rdf_type = NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
-    let subjects = cases(9_000, 12_000).max(9_000);
+    let subjects = size(9_000, 12_000);
     for i in 0..subjects {
         let quad = Quad::new(
             ex(&format!("t{i}")),
@@ -2823,7 +2827,7 @@ fn explain_reports_the_plan() {
 fn parallel_filters_and_aggregates_equal_the_reference() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
     let mut tx = engine.transaction();
-    for i in 0..cases(30_000, 40_000).max(30_000) {
+    for i in 0..size(30_000, 40_000) as u32 {
         let s = ex(&format!("s{i}"));
         let values: [Term; 3] = [
             Literal::new_typed_literal((i % 997).to_string(), xsd::INTEGER).into(),
@@ -3711,7 +3715,7 @@ fn merged_default_graph_shortcuts_count_statements_once() {
             }
         }
     };
-    let subjects = cases(1_000, 3_000).max(8);
+    let subjects = size(1_000, 3_000);
     for i in 0..subjects {
         insert(ex(&format!("t{i}")), rdf_type.clone(), ex("T"), i);
         for j in 0..(i % 4) {

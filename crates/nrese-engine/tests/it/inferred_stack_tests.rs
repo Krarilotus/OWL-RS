@@ -607,28 +607,16 @@ fn run_random_transactions(
     witnessed
 }
 
-fn test_cases(default: usize, full: usize) -> usize {
-    let cases = if crate::support::nightly() {
-        full
-    } else {
-        default
-    };
-    std::env::var("NRESE_FUZZ_CASES")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|&count| count > 0)
-        .unwrap_or(cases)
-}
-
-/// By default, this test replays committed and aborted edits of both stacks. With `NRESE_CHECK_TIER=nightly`, it draws 25 seeds.
+/// By default, this test replays committed and aborted edits of both stacks. With `NRESE_CHECK_TIER=nightly` or `NRESE_FUZZ_SEED` set, it draws 25 seeds.
 #[test]
 fn both_stacks_match_the_model_with_compaction() {
     let pinned = !crate::support::nightly()
         && std::env::var_os("NRESE_FUZZ_CASES").is_none()
         && std::env::var_os("NRESE_FUZZ_SEED").is_none();
     let mut kinds = BTreeSet::new();
-    for seed in (0..test_cases(8, 25) as u64).filter(|seed| !pinned || [0, 2, 4, 7].contains(seed))
-    {
+    // Any of the tier, a seed or a count gives the line's full draw.
+    let seeds = if pinned { 8 } else { 25 };
+    for seed in (0..seeds).filter(|seed| !pinned || [0, 2, 4, 7].contains(seed)) {
         let engine = engine(); // inline compaction after every commit
         let mut rng = Rng(fuzz(seed));
         let mut committed = Model::default();

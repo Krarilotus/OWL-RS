@@ -250,7 +250,11 @@ mod tests {
     #[test]
     fn a_partition_equals_a_sort_for_every_derivable_pair_and_chain() {
         let mut derived_pairs = 0;
-        let cases = crate::index::test_cases(40_000, 100_000).max(40_000);
+        let cases = if crate::check_tier::nightly() {
+            100_000
+        } else {
+            40_000
+        };
         for graphs in [1, 3, 50] {
             let quads = quads(cases, graphs);
             for base in Permutation::ALL {

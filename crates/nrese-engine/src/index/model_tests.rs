@@ -222,13 +222,21 @@ fn assert_matches_model(version: &IndexVersion, model: &BTreeSet<EncodedQuad>, c
     );
 }
 
+/// Whether the pinned seeds run: only with no tier, no seed and no count. Any of them gives
+/// the full draw.
 fn pinned_compactions() -> bool {
     !crate::check_tier::nightly()
         && std::env::var_os("NRESE_FUZZ_CASES").is_none()
         && std::env::var_os("NRESE_FUZZ_SEED").is_none()
 }
 
-/// By default, this test replays policy compactions in each layout. With `NRESE_CHECK_TIER=nightly`, it draws 40 seeds per layout.
+/// Seeds per layout: 10 for the pinned ones, else the line's 40 (a seeded run is the full
+/// draw from that seed).
+fn seeds() -> u64 {
+    if pinned_compactions() { 10 } else { 40 }
+}
+
+/// By default, this test replays policy compactions in each layout. With `NRESE_CHECK_TIER=nightly` or `NRESE_FUZZ_SEED` set, it draws 40 seeds per layout.
 #[test]
 fn random_commits_with_policy_compaction_match_the_model() {
     let policy = CompactionPolicy {
@@ -236,7 +244,7 @@ fn random_commits_with_policy_compaction_match_the_model() {
         ..CompactionPolicy::default()
     };
     let pinned = pinned_compactions();
-    let cases = super::test_cases(10, 40) as u64;
+    let cases = seeds();
     for layout in LAYOUTS {
         let mut compacted = false;
         // Seed 0 exposes the loss of tombstones during compaction.
@@ -268,11 +276,11 @@ fn random_commits_with_policy_compaction_match_the_model() {
     }
 }
 
-/// By default, this test replays fixed windows that touch or leave either boundary in each layout. With `NRESE_CHECK_TIER=nightly`, it draws 40 seeds per layout.
+/// By default, this test replays fixed windows that touch or leave either boundary in each layout. With `NRESE_CHECK_TIER=nightly` or `NRESE_FUZZ_SEED` set, it draws 40 seeds per layout.
 #[test]
 fn arbitrary_compaction_windows_preserve_contents() {
     let pinned = pinned_compactions();
-    let cases = super::test_cases(10, 40) as u64;
+    let cases = seeds();
     for layout in LAYOUTS {
         let mut windows = BTreeSet::new();
         for seed in (100..100 + cases).filter(|seed| !pinned || [100, 103, 109].contains(seed)) {

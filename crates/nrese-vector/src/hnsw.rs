@@ -501,17 +501,14 @@ fn with_visited<R>(nodes: usize, f: impl FnOnce(&mut Visited<'_>) -> R) -> R {
     result
 }
 
+/// A test graph's size: `default`, or the line's `full` one with `NRESE_CHECK_TIER=nightly`.
 #[cfg(test)]
-fn test_cases(default: usize, full: usize) -> usize {
-    let cases = if crate::tests::nightly() {
+fn test_size(default: usize, full: usize) -> usize {
+    if crate::tests::nightly() {
         full
     } else {
         default
-    };
-    std::env::var("NRESE_FUZZ_CASES")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(cases)
+    }
 }
 
 #[cfg(test)]
@@ -598,7 +595,7 @@ mod tests {
     /// By default, this test extends 2,500 vectors to 5,000 for both metrics. With `NRESE_CHECK_TIER=nightly`, it extends 10,000 to 20,000.
     #[test]
     fn hnsw_finds_nearly_all_nearest_neighbours() {
-        let count = super::test_cases(5_000, 20_000).max(5_000);
+        let count = super::test_size(5_000, 20_000);
         let vectors = random_vectors(count, 16, 3);
         for metric in [Metric::Cosine, Metric::L2] {
             let mut graph = Hnsw::new(metric, HnswParameters::default());
@@ -765,7 +762,7 @@ mod growth_tests {
             .num_threads(1)
             .build()
             .unwrap();
-        let count = super::test_cases(1_500, 6_000).max(1_500);
+        let count = super::test_size(1_500, 6_000);
         let prefix_len = count * 2 / 3;
         let tail_query = (count * 5 / 6) as u32;
         let all = random_vectors(count, 8, 11);

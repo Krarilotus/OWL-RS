@@ -856,25 +856,37 @@ pub(crate) fn store(
     store
 }
 
+/// The QL cases: `NRESE_QL_CASES`, else 50 for the pinned ones, else the line's 150 (a seeded
+/// run is the full draw from that seed).
 fn cases() -> usize {
-    let default = if crate::support::nightly() { 150 } else { 50 };
+    let default = if pinned() { 50 } else { 150 };
     std::env::var("NRESE_QL_CASES")
         .ok()
         .and_then(|n| n.parse().ok())
         .unwrap_or(default)
 }
 
+/// Whether the pinned QL cases run: only with no tier, seed or count (QL's or the fuzz ones).
+fn pinned() -> bool {
+    !crate::support::nightly()
+        && [
+            "NRESE_QL_CASES",
+            "NRESE_QL_SEED",
+            "NRESE_FUZZ_CASES",
+            "NRESE_FUZZ_SEED",
+        ]
+        .iter()
+        .all(|knob| std::env::var_os(knob).is_none())
+}
+
 // Includes the three red cases (0 for printing, 1 for certain answers, 22 for EXISTS).
 fn ql_witnesses() -> Option<&'static [usize]> {
-    (!crate::support::nightly()
-        && std::env::var_os("NRESE_QL_CASES").is_none()
-        && std::env::var_os("NRESE_QL_SEED").is_none())
-    .then_some(&[
+    pinned().then_some(&[
         0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 15, 17, 19, 20, 22, 24, 26, 29, 31, 33, 41, 46,
     ])
 }
 
-/// By default, this test compares fixed QL witnesses across both store profiles. With `NRESE_CHECK_TIER=nightly`, it draws 150 cases.
+/// By default, this test compares fixed QL witnesses across both store profiles. With `NRESE_CHECK_TIER=nightly` or a seed (`NRESE_QL_SEED`, `NRESE_FUZZ_SEED`) set, it draws 150 cases.
 #[test]
 fn rewritten_answers_are_the_certain_answers_of_random_ql_cases() {
     let cases = cases();
@@ -2400,7 +2412,7 @@ fn rewritten_answers_follow_the_readers_graph_access() {
 /// with reasoning (`owl2-rl`, the rewriting on) does: the same rows, as bags and with
 /// DISTINCT, and the same completeness. On the pure and the mixed random cases; what the
 /// printer can't write exactly it says, and those are counted.
-/// By default, this test checks fixed pure and mixed cases in both printed forms. With `NRESE_CHECK_TIER=nightly`, it draws 150 cases.
+/// By default, this test checks fixed pure and mixed cases in both printed forms. With `NRESE_CHECK_TIER=nightly` or a seed (`NRESE_QL_SEED`, `NRESE_FUZZ_SEED`) set, it draws 150 cases.
 #[test]
 fn printed_queries_answer_on_a_store_without_reasoning_as_nrese_with_it() {
     use nrese_sparql::ql::{PrintForm, Printed};
@@ -2617,7 +2629,7 @@ fn inclusions_through_inverse_expressions_are_materialised() {
 /// where it hasn't), by the chase. Pure QL: exactly those, complete. Mixed ontologies: an
 /// answer that isn't the chase's says `unsound`, a missing one says so too (the
 /// negation's pattern may miss what makes an answer wrong).
-/// By default, this test checks fixed pure and mixed cases for EXISTS, NOT EXISTS and MINUS. With `NRESE_CHECK_TIER=nightly`, it draws 150 cases.
+/// By default, this test checks fixed pure and mixed cases for EXISTS, NOT EXISTS and MINUS. With `NRESE_CHECK_TIER=nightly` or a seed (`NRESE_QL_SEED`, `NRESE_FUZZ_SEED`) set, it draws 150 cases.
 #[test]
 fn negation_and_exists_answer_as_the_chase() {
     let cases = cases();

@@ -1545,17 +1545,3 @@ mod bound_tests;
 mod count_tests;
 #[cfg(test)]
 mod model_tests;
-
-#[cfg(test)]
-pub(super) fn test_cases(default: usize, full: usize) -> usize {
-    let cases = if crate::check_tier::nightly() {
-        full
-    } else {
-        default
-    };
-    std::env::var("NRESE_FUZZ_CASES")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|&count| count > 0)
-        .unwrap_or(cases)
-}
