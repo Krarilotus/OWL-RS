@@ -585,28 +585,30 @@ impl Running {
         }
     }
 
-    /// After [`Self::add`] of `id`, in a column of several datatypes: of equal values of two
-    /// datatypes (two terms), the extremes `value::order` puts first and last. The same id
-    /// is the same term, so only another id compares datatypes.
-    fn add_tie(&mut self, id: u64) {
+    /// [`Self::add`] in a column of several datatypes: of equal values of two datatypes (two
+    /// terms), the extremes `value::order` puts first and last. One decode a row; the same
+    /// id is the same term, so only an equal value of another id compares datatypes.
+    fn add_mixed(&mut self, id: u64) {
         if id == UNDEF {
+            self.unbound = true;
             return;
         }
+        self.count += 1;
         let Some(value) = TermId::from_raw(id).as_inline_integer() else {
             return;
         };
-        if let Some((m, mid)) = self.min
-            && m == value
-            && id != mid
-            && inline_order(&id, &mid).is_lt()
-        {
+        match self.sum.checked_add(value) {
+            Some(sum) => self.sum = sum,
+            None => self.overflow = true,
+        }
+        if self.min.is_none_or(|(m, mid)| {
+            value < m || (value == m && id != mid && inline_order(&id, &mid).is_lt())
+        }) {
             self.min = Some((value, id));
         }
-        if let Some((m, mid)) = self.max
-            && m == value
-            && id != mid
-            && inline_order(&id, &mid).is_gt()
-        {
+        if self.max.is_none_or(|(m, mid)| {
+            value > m || (value == m && id != mid && inline_order(&id, &mid).is_gt())
+        }) {
             self.max = Some((value, id));
         }
     }
@@ -916,8 +918,8 @@ fn one_pass_plan(
 }
 
 /// [`aggregate_in_one_pass`]'s pass over the rows where a MIN or MAX column holds several
-/// datatypes: [`Running::add`], then [`Running::add_tie`]. Out of line and cold, so the
-/// ordinary pass keeps its code; its state is per group, like that pass's, never per row.
+/// datatypes, with [`Running::add_mixed`]. Out of line and cold, so the ordinary pass keeps
+/// its code; its state is per group, like that pass's, never per row.
 #[cold]
 #[inline(never)]
 fn mixed_pass(
@@ -932,10 +934,7 @@ fn mixed_pass(
         rows[group] += 1;
         for (a, (column, _)) in plan.iter().enumerate() {
             if let Some(column) = column {
-                let id = solutions.table.get(row, *column);
-                let running = &mut running[group * plan.len() + a];
-                running.add(id);
-                running.add_tie(id);
+                running[group * plan.len() + a].add_mixed(solutions.table.get(row, *column));
             }
         }
     }
