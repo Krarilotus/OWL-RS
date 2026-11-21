@@ -313,8 +313,10 @@ impl ListVocabulary {
         if !conjunctive && cut {
             return None;
         }
-        // Count attempted prefixes, back edges, and the work of copying each
-        // finished walk. A densely connected graph may have very few exits.
+        // Count attempted prefixes and back edges. A densely connected graph may
+        // have very few exits. A walk that reaches nil gives back the steps of
+        // its path, so only dead ends use up the allowance; at most
+        // MAX_VARIANTS walks do, and their copies are bounded the same way.
         let mut work_left = cells
             .values()
             .fold(cells.len(), |n, cell| {
@@ -337,7 +339,8 @@ impl ListVocabulary {
                 if variants.len() == MAX_VARIANTS || members.len() > kind.member_limit() {
                     return None;
                 }
-                work_left = work_left.checked_sub(members.len())?;
+                // Each cell of the path is entered and left once, and so is nil.
+                work_left = work_left.saturating_add(2 * (members.len() + 1));
                 variants.push((members.clone(), used.clone()));
             } else if let Some(&member) = cell.firsts.get(*first)
                 && let Some(&next) = cell.rests.get(*rest)
