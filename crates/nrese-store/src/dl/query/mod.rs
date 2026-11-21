@@ -316,7 +316,10 @@ pub(crate) fn plan_status(
 
 /// Reason when the DL bounds view isn't used (`PART`, `LATER`, `DEADLINE`): a whole-dataset
 /// reader whose query dataset leaves out the store's default graph is not reading the RL
-/// closure, so the dataset-omission explanation replaces `LATER` / `DEADLINE`.
+/// closure, so the dataset-omission explanation replaces `LATER` / `DEADLINE`. A reader of
+/// some graphs keeps [`PART`]: it never reads the bounds, and under `owl2-dl` it is told
+/// `not-certified` whatever the reason (`status_for_its_reader` in `service.rs`), so no
+/// reason here reaches it.
 fn fallback_reason(prepared: &PreparedQuery, why: &'static str) -> &'static str {
     if prepared.access().is_none()
         && let Some(reason) = prepared.dataset_omission_reason()
