@@ -50,9 +50,11 @@ pub(crate) fn supported(expr: &Expression) -> bool {
         Expression::Not(a) => supported(a),
         Expression::If(a, b, c) => supported(a) && supported(b) && supported(c),
         Expression::Coalesce(list) => list.iter().all(supported),
+        // Every argument first, whatever the function: an `EXISTS` behind a cast is one the
+        // evaluator can't answer either.
         Expression::FunctionCall(function, args) => {
             args.iter().all(supported)
-                && matches!(
+                && (matches!(
                     function,
                     Function::Str
                         | Function::Lang
@@ -112,7 +114,7 @@ pub(crate) fn supported(expr: &Expression) -> bool {
                 )
                 // Casts, GeoSPARQL; any other IRI is an unknown function: an error.
                 || matches!(function, Function::Custom(_))
-                || (matches!(function, Function::BNode) && args.len() <= 1)
+                || (matches!(function, Function::BNode) && args.len() <= 1))
         }
         _ => false,
     }
