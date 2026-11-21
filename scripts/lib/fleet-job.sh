@@ -95,8 +95,10 @@ if j.get("state"):
         cancelled | blocked) fleet_say "it was $fleet_state"; fleet_id=""; return 75 ;;
       esac
     fi
-    [ $SECONDS -lt $fleet_end_by ] || { fleet_say "past $max_s s"; fleet_cancel; return 75; }
     sleep "$poll_s"
+    # No call starts after a deadline: the silence's cap or MAX_S passed while it slept ends the wait.
+    [ -z "$quiet" ] || fleet_silent "$quiet" || { fleet_cancel; return 75; }
+    [ $SECONDS -lt $fleet_end_by ] || { fleet_say "past $max_s s"; fleet_cancel; return 75; }
   done
 }
 
@@ -111,8 +113,8 @@ fleet_results() {
   local quiet=$SECONDS dir
   until dir=$(timeout --kill-after=10 300 "$fleet_bin" results "$fleet_id" 2> /dev/null) && dir=${dir//$'\r'/} &&
     [ -n "${dir##*$'\n'}" ]; do
-    fleet_silent "$quiet" || return 75
     sleep "${NRESE_FLEET_POLL_S:-10}"
+    fleet_silent "$quiet" || return 75
   done
   echo "${dir##*$'\n'}"
 }

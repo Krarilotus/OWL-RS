@@ -95,6 +95,22 @@ class FleetFollow(push.Repo):
                                  f"SPEC silence-cap: not one cancel at the cap\n{err}")
                 self.assertIn("gate-1: the fleet didn't answer for", err, "SPEC silence-cap: the job isn't named")
 
+    def test_no_fleet_call_starts_after_the_cap_or_the_gates_limit(self):
+        """A poll longer than what is left of the wait: the next status or results call would start
+        after the silence's cap or after MAX_S, so the wait ends there instead, with one cancel,
+        whatever that call would have answered."""
+        self.env["NRESE_GATE_POLL_S"] = "2"
+        for silent_s, max_s, status, results in (("1", "10800", [state("running"), "", state("done")], []),
+                                                 ("30", "1", [state("done")], [""])):
+            with self.subTest(silent_s=silent_s, max_s=max_s):
+                self.reset()
+                self.env.update(NRESE_FLEET_SILENT_S=silent_s, NRESE_GATE_MAX_S=max_s)
+                self.play("status", *status)
+                self.play("results", *results, self.results())
+                code, where, _, err = self.gate()
+                self.assertEqual((code, where, self.cancels()), (75, "", ["gate-1"]),
+                                 f"SPEC no-call-after-deadline: a call after the deadline gave the verdict\n{err}")
+
     def test_a_job_that_ended_while_the_fleet_was_silent_is_judged_by_its_result(self):
         """The job fails on its host while the fleet doesn't answer; once it answers again, inside
         the cap, the gate reads the job's result, and the verdict is the result's."""
