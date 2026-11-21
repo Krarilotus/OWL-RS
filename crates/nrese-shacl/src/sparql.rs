@@ -26,8 +26,8 @@
 //! validator, else of the component), their `{?name}` and `{$name}` blocks filled in
 //! ([`Template`]); a result with neither has its shape's messages, if any (§2.1.5).
 
-use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 
 use nrese_engine::TermId;
@@ -205,31 +205,46 @@ enum Part {
 
 impl Template {
     /// The template of `literal`, if it has a block: `{`, `?` or `$`, a SPARQL `VARNAME`
-    /// ([`Variable::new`]), `}`.
+    /// ([`Variable::new`]), `}`. One pass: a block's name is read up to the next `}`, or up to
+    /// the next `{`, where the search goes on, so no stretch of the text is read more than
+    /// twice.
     pub(crate) fn parse(literal: &Literal) -> Option<Self> {
         let text = literal.value();
         let mut parts = Vec::new();
         let mut plain = 0;
         let mut at = 0;
         while let Some(open) = text[at..].find('{').map(|i| at + i) {
-            let block = text[open + 1..].strip_prefix(['?', '$']).and_then(|rest| {
-                let name = &rest[..rest.find('}')?];
-                Variable::new(name).is_ok().then_some(name)
-            });
+            // `{` and the sigil are one byte each.
+            let start = open + 2;
+            let sigil = matches!(text.as_bytes().get(open + 1), Some(b'?' | b'$'));
+            let end = text[(open + 1).min(text.len())..]
+                .find(['{', '}'])
+                .map(|i| open + 1 + i);
+            let block = match end {
+                Some(close) if sigil && close > start && text.as_bytes()[close] == b'}' => {
+                    let name = &text[start..close];
+                    Variable::new(name).is_ok().then_some((name, close))
+                }
+                _ => None,
+            };
             match block {
-                Some(name) => {
+                Some((name, close)) => {
                     if plain < open {
                         parts.push(Part::Text(text[plain..open].to_owned()));
                     }
-                    // `{`, the sigil, the name and `}`.
-                    at = open + name.len() + 3;
+                    at = close + 1;
                     parts.push(Part::Variable {
                         name: name.to_owned(),
                         block: text[open..at].to_owned(),
                     });
                     plain = at;
                 }
-                None => at = open + 1,
+                // Not a block: the search goes on at the next `{`, if any, or past the `}`.
+                None => match end {
+                    Some(next) if text.as_bytes()[next] == b'{' => at = next,
+                    Some(next) => at = next + 1,
+                    None => break,
+                },
             }
         }
         if parts.is_empty() {
@@ -252,27 +267,41 @@ impl Template {
         })
     }
 
-    /// Each part's text as [`Template::fill`] writes it, with `value` giving the variables'
-    /// terms.
-    fn pieces<'s, 't: 's>(
-        &'s self,
-        value: &'s impl Fn(&str) -> Option<&'t Term>,
-    ) -> impl Iterator<Item = Cow<'s, str>> {
-        self.parts.iter().map(move |part| match part {
-            Part::Text(plain) => Cow::Borrowed(plain.as_str()),
-            Part::Variable { name, block } => match value(name) {
-                Some(Term::Literal(literal)) => Cow::Borrowed(literal.value()),
-                Some(Term::NamedNode(iri)) => Cow::Borrowed(iri.as_str()),
-                Some(other) => Cow::Owned(other.to_string()),
-                None => Cow::Borrowed(block.as_str()),
-            },
-        })
+    /// Writes the filled-in text to `out`, with `value` giving the variables' terms; another
+    /// term than a literal or an IRI is written as N-Triples writes it, streamed, not made
+    /// first.
+    fn write<'t>(
+        &self,
+        value: &impl Fn(&str) -> Option<&'t Term>,
+        out: &mut impl fmt::Write,
+    ) -> fmt::Result {
+        for part in &self.parts {
+            match part {
+                Part::Text(plain) => out.write_str(plain)?,
+                Part::Variable { name, block } => match value(name) {
+                    Some(Term::Literal(literal)) => out.write_str(literal.value())?,
+                    Some(Term::NamedNode(iri)) => out.write_str(iri.as_str())?,
+                    Some(other) => write!(out, "{other}")?,
+                    None => out.write_str(block)?,
+                },
+            }
+        }
+        Ok(())
     }
 
-    /// The length of the text [`Template::fill`] makes from `value`, found without making
-    /// it, so that it can be charged first.
+    /// The length of the text [`Template::fill`] makes from `value`, counted without making
+    /// it or any part of it, so that it can be charged first.
     pub(crate) fn filled_len<'t>(&self, value: &impl Fn(&str) -> Option<&'t Term>) -> usize {
-        self.pieces(value).map(|piece| piece.len()).sum()
+        struct Count(usize);
+        impl fmt::Write for Count {
+            fn write_str(&mut self, text: &str) -> fmt::Result {
+                self.0 += text.len();
+                Ok(())
+            }
+        }
+        let mut count = Count(0);
+        let _ = self.write(value, &mut count);
+        count.0
     }
 
     /// The message with each block replaced by the text of `value`'s term for its variable: a
@@ -281,9 +310,7 @@ impl Template {
     /// [`Template::filled_len`] bytes, with no spare capacity.
     pub(crate) fn fill<'t>(&self, value: &impl Fn(&str) -> Option<&'t Term>) -> Literal {
         let mut text = String::with_capacity(self.filled_len(value));
-        for piece in self.pieces(value) {
-            text.push_str(&piece);
-        }
+        let _ = self.write(value, &mut text);
         let literal = &self.literal;
         match (literal.language(), literal.direction()) {
             (Some(language), Some(direction)) => {
@@ -445,8 +472,12 @@ pub(crate) fn found(solution: QuerySolution, check: &SparqlCheck) -> Found {
         Some(Term::NamedNode(path)) => Some(path),
         _ => None,
     };
-    // A report's messages are literals (`ValidationResult::messages`): another term bound to
-    // `?message` isn't carried, and the declared messages apply.
+    // Only a literal bound to `?message` is carried; another term isn't, and the declared
+    // messages apply. §5.3.2 gives "The binding for the variable message" with no condition,
+    // and §3.6.2.7 doesn't limit a result's messages to literals: it calls them "additional
+    // textual details to humans", of which "there should not be two values with the same
+    // language tag". This is ours: a report's messages are literals
+    // (`ValidationResult::messages`).
     let message = match take(message_at) {
         Some(Term::Literal(message)) => Some(message),
         _ => None,

@@ -1177,7 +1177,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
                 Ok(sparql::Outcome::Failed(failed)) => {
                     // An ASK validator's solution is `$this` and `$value` (SHACL §6.3).
                     for value in failed {
-                        let Ok(messages) = self.sparql_messages(
+                        let Ok((messages, charged)) = self.sparql_messages(
                             check,
                             None,
                             Vec::new(),
@@ -1197,6 +1197,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
                                 messages,
                             ),
                         );
+                        results.held.release(charged);
                     }
                 }
                 Ok(sparql::Outcome::Solutions(solutions)) => {
@@ -1238,7 +1239,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
                             .path
                             .map(|path| self.result_path(path))
                             .or_else(|| shape.path.clone().map(ResultPath::Path));
-                        let Ok(messages) = self.sparql_messages(
+                        let Ok((messages, charged)) = self.sparql_messages(
                             check,
                             found.message,
                             found.bindings,
@@ -1251,6 +1252,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
                             return ControlFlow::Break(());
                         };
                         self.keep(results, raw(value, path, messages));
+                        results.held.release(charged);
                     }
                 }
             }
@@ -1267,8 +1269,10 @@ impl<'a, V: ReadView> Validator<'a, V> {
     /// In one form for one set of messages, so that results compare by the messages in
     /// effect ([`RawResult`]'s order, the changes' comparisons): sorted, each once, and None
     /// where they are the `shape`'s (whose ids are sorted and distinct, as every node's values
-    /// are). A filled-in text is charged to `held` before it is made, and returned once made
-    /// (keeping the result charges it again); a refusal is the validation's stop: `Err`.
+    /// are). A filled-in text is charged to `held` before it is made, twice its length (for
+    /// its dictionary lookup too); that charge, returned with the messages, is the caller's to
+    /// return once the result is kept (and charged as a whole) or dropped. A refusal is the
+    /// validation's stop: `Err`.
     #[expect(
         clippy::too_many_arguments,
         reason = "one result's message sources: the check, the solution's message and bindings, the pre-bound terms, the shape's messages and the task's charge"
@@ -1283,7 +1287,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
         value: Option<TermId>,
         shape: &Shape,
         held: &mut Reservation,
-    ) -> Result<Option<Vec<ResultTerm>>, ()> {
+    ) -> Result<(Option<Vec<ResultTerm>>, usize), ()> {
         let canonical = |mut messages: Vec<ResultTerm>| {
             messages.sort();
             messages.dedup();
@@ -1297,10 +1301,10 @@ impl<'a, V: ReadView> Validator<'a, V> {
             (!the_shape_s).then_some(messages)
         };
         if let Some(message) = bound {
-            return Ok(canonical(vec![self.result_term(message.into())]));
+            return Ok((canonical(vec![self.result_term(message.into())]), 0));
         }
         if check.messages.is_empty() {
-            return Ok(None);
+            return Ok((None, 0));
         }
         if check
             .messages
@@ -1330,7 +1334,9 @@ impl<'a, V: ReadView> Validator<'a, V> {
             messages.push(match &message.template {
                 None => ResultTerm::Stored(message.id),
                 Some(template) => {
-                    let len = template.filled_len(&value_of);
+                    // The text, and as much again for the dictionary lookup of it
+                    // ([`Validator::result_term`]), which may copy it.
+                    let len = 2 * template.filled_len(&value_of);
                     if let Err(refused) = held.charge(len) {
                         held.release(charged);
                         let _ = self.stop.set(QueryEvaluationError::MemoryLimit(refused));
@@ -1341,8 +1347,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
                 }
             });
         }
-        held.release(charged);
-        Ok(canonical(messages))
+        Ok((canonical(messages), charged))
     }
 }
 
