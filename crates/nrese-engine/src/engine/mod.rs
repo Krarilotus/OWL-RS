@@ -32,6 +32,8 @@ mod equality;
 #[cfg(test)]
 mod lock_tests;
 #[cfg(test)]
+mod maintenance_tests;
+#[cfg(test)]
 mod own_state_tests;
 mod pending_traits;
 mod private;
@@ -741,13 +743,21 @@ impl Shared {
     /// for a running merge or checkpoint); the requests stay set for it.
     fn maintain(&self) -> Again {
         let mut again = Again::default();
-        if self.wants_compaction.swap(false, Ordering::AcqRel)
-            && self.versions.compact(false) == CompactionOutcome::Deferred
-        {
-            self.wants_compaction.store(true, Ordering::Release);
-            again.merge = true;
+        if self.wants_compaction.swap(false, Ordering::AcqRel) {
+            #[cfg(any(test, feature = "fault-points"))]
+            if let Some(durable) = &self.durable {
+                crate::fault_points::panic_in_maintenance(durable.root(), "compaction");
+            }
+            if self.versions.compact(false) == CompactionOutcome::Deferred {
+                self.wants_compaction.store(true, Ordering::Release);
+                again.merge = true;
+            }
         }
         if self.wants_checkpoint.swap(false, Ordering::AcqRel) {
+            #[cfg(any(test, feature = "fault-points"))]
+            if let Some(durable) = &self.durable {
+                crate::fault_points::panic_in_maintenance(durable.root(), "checkpoint");
+            }
             match self.checkpoint() {
                 Ok(_) => {}
                 // Another checkpoint is being written; it may be of an older revision than
