@@ -631,6 +631,8 @@ leave something out.
 
 ## Storage and transactions
 
+- If the background maintenance worker ends, extended health reports where it stopped
+  and the write-ahead log keeps growing with new commits until restart.
 - A commit holds at most 4 GiB of log payload, about 130 M quads.
   Larger loads go through the bulk loader
   ([storage](spec/02-storage-and-transactions.md#limits)).

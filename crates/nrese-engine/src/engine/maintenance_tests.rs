@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad};
 
 use super::{CompactionPolicy, DurabilityConfig, Engine, EngineConfig};
+use crate::EngineResult;
 use crate::fault_points::MaintenancePanic;
 
 const DEADLINE: Duration = Duration::from_secs(10);
@@ -34,11 +35,11 @@ fn commit(engine: &Engine, n: u32) {
     tx.commit().expect("commit");
 }
 
-fn bounded_settle(engine: &Engine) -> String {
+fn bounded_settle(engine: &Engine) -> EngineResult<()> {
     let (answer, answered) = mpsc::sync_channel(1);
     let engine = engine.clone();
     std::thread::spawn(move || {
-        let _ = answer.send(format!("{:?}", engine.settle()));
+        let _ = answer.send(engine.settle());
     });
     answered
         .recv_timeout(DEADLINE)
@@ -54,9 +55,8 @@ fn stops_after_panic(step: &'static str, checkpoint_threshold: u64, commits: u32
     }
     fault.wait(DEADLINE);
 
-    let answer = bounded_settle(&engine);
-    assert!(answer.starts_with("Err("), "settle returned {answer}");
-    assert!(answer.contains(step), "settle omitted {step}: {answer}");
+    let answer = bounded_settle(&engine).expect_err("settle reported success");
+    assert_eq!(answer.to_string(), format!("maintenance ended: {step}"));
     let worker = engine
         .inner
         .worker
@@ -72,7 +72,14 @@ fn stops_after_panic(step: &'static str, checkpoint_threshold: u64, commits: u32
     assert!(worker.is_finished(), "the worker survived the panic");
 
     commit(&engine, commits);
-    assert_eq!(bounded_settle(&engine), answer);
+    assert_eq!(
+        bounded_settle(&engine).unwrap_err().to_string(),
+        answer.to_string()
+    );
+    assert_eq!(
+        engine.maintenance_error().unwrap().to_string(),
+        answer.to_string()
+    );
     assert_eq!(engine.stats().checkpoints, 0);
     assert_eq!(engine.stats().compactions, 0);
 }
@@ -98,6 +105,6 @@ fn maintenance_settle_waits_for_a_successful_checkpoint() {
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::open(dir.path(), config(1)).unwrap();
     commit(&engine, 0);
-    bounded_settle(&engine);
+    bounded_settle(&engine).unwrap();
     assert_eq!(engine.stats().checkpoints, 1);
 }

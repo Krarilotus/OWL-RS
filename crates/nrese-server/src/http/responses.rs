@@ -44,6 +44,8 @@ pub struct ReadyResponse {
     /// the others, so that a load balancer keeps it.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub degraded: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maintenance_error: Option<String>,
 }
 
 /// The `owl2-dl` mode's status.
@@ -163,6 +165,8 @@ pub struct ExtendedHealthResponse {
     pub reasoning_mode: &'static str,
     pub reasoning_profile: &'static str,
     pub ontology_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maintenance_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -196,8 +200,8 @@ pub fn build_ready_response(
     identity: &crate::auth::Identity,
 ) -> Result<ReadyResponse, ApiError> {
     super::guard::whole_read_scope(state.access_view(identity))?;
-    let stats = state
-        .store()
+    let store = state.store();
+    let stats = store
         .stats()
         .map_err(|error| ApiError::internal(error.to_string()))?;
     let posture = state.runtime_posture();
@@ -250,6 +254,7 @@ pub fn build_ready_response(
                 },
             }),
         degraded: state.degraded(),
+        maintenance_error: store.maintenance_error().map(|error| error.to_string()),
     })
 }
 
@@ -366,6 +371,7 @@ pub fn build_extended_health_response(
         reasoning_mode: ready.reasoning_mode,
         reasoning_profile: ready.reasoning_profile,
         ontology_path: ready.ontology_path,
+        maintenance_error: ready.maintenance_error,
     }
 }
 
