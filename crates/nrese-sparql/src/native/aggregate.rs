@@ -6,7 +6,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use nrese_engine::TermId;
+use nrese_engine::{TermId, TermKind};
 use nrese_exec::group::{Groups, group_rows};
 use nrese_exec::{Budget, BudgetExceeded, Grant, IdTable, Reservation, UNDEF};
 use nrese_rdf::vocab::xsd;
@@ -577,16 +577,10 @@ impl Running {
             Some(sum) => self.sum = sum,
             None => self.overflow = true,
         }
-        if self
-            .min
-            .is_none_or(|(m, mid)| value < m || (value == m && inline_order(&id, &mid).is_lt()))
-        {
+        if self.min.is_none_or(|(m, _)| value < m) {
             self.min = Some((value, id));
         }
-        if self
-            .max
-            .is_none_or(|(m, mid)| value > m || (value == m && inline_order(&id, &mid).is_gt()))
-        {
+        if self.max.is_none_or(|(m, _)| value > m) {
             self.max = Some((value, id));
         }
     }
@@ -603,9 +597,9 @@ fn inline_order(a: &u64, b: &u64) -> Ordering {
 
 /// Every aggregate of every group in one pass over the rows, where each is `COUNT(*)`,
 /// or `COUNT`, `SUM`, `AVG`, `MIN` or `MAX` (without DISTINCT) of a variable holding only
-/// inline integers (`COUNT`: any terms): the results [`Aggregator::aggregate_ids`] gives,
-/// without a list of rows per group. `None` for other aggregates. DBpedia q12 summed 1 M
-/// goals into 35 k teams.
+/// inline integers (`COUNT`: any terms; `MIN` and `MAX`: of one datatype): the results
+/// [`Aggregator::aggregate_ids`] gives, without a list of rows per group. `None` for other
+/// aggregates. DBpedia q12 summed 1 M goals into 35 k teams.
 /// Once it applies, and before it allocates, it calls `reserve` with what it holds at most
 /// ([`pass_bytes`]); a refusal ends it.
 pub(super) fn aggregate_in_one_pass(
@@ -875,12 +869,36 @@ fn one_pass_plan(
                 {
                     return None;
                 }
+                // Running keeps the first of equal values, the term `value::order` picks only
+                // where equal values are one term: one datatype ("1"^^xsd:integer sorts before
+                // "1"^^xsd:nonNegativeInteger). Mixed datatypes take `aggregate_ids`.
+                if matches!(name, AggregateFunction::Min | AggregateFunction::Max)
+                    && !one_datatype(solutions.table.column(column))
+                {
+                    return None;
+                }
                 plan.push((Some(column), name.clone()));
             }
             _ => return None,
         }
     }
     Some(plan)
+}
+
+/// Whether the inline integers `ids` (unbound ones aside) are of one datatype.
+fn one_datatype(ids: &[u64]) -> bool {
+    let mut bound = ids
+        .iter()
+        .filter(|&&id| id != UNDEF)
+        .map(|&id| TermId::from_raw(id));
+    let Some(first) = bound.next() else {
+        return true;
+    };
+    if first.kind() == TermKind::Integer {
+        return bound.all(|id| id.kind() == TermKind::Integer);
+    }
+    let datatype = first.inline_datatype_iri();
+    bound.all(|id| id.inline_datatype_iri() == datatype)
 }
 
 /// GROUP_CONCAT (SPARQL 1.1 §18.5.1.7): string literals only (anything else makes the
