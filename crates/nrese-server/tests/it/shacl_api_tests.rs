@@ -410,3 +410,97 @@ async fn a_commit_the_shacl_gate_rejects_is_a_shacl_reject() -> TestResult {
     assert_eq!(problem["title"], "SHACL Reject", "{problem}");
     Ok(())
 }
+
+/// SHACL-SPARQL constraints with messages (SHACL 1.0 §5.3.2): one whose `sh:message` names
+/// the solution's `?name`, one whose query binds `?message`. Every person needs a full name.
+const SPARQL_SHAPES: &str = "ex:FullName a sh:NodeShape ; sh:targetClass ex:Person ;
+  sh:sparql [ sh:message \"{?name} is not a full name\" ;
+    sh:select '''SELECT $this ?name WHERE {
+      $this <http://example.com/name> ?name . FILTER (!CONTAINS(?name, \" \")) }''' ] ;
+  sh:sparql [ sh:message \"never shown\" ;
+    sh:select '''SELECT $this ?message WHERE {
+      $this <http://example.com/name> ?name . FILTER (!CONTAINS(?name, \" \"))
+      BIND (CONCAT(\"add a surname to \", ?name) AS ?message) }''' ] .";
+
+/// The report of `GET /dataset/shacl` carries a SHACL-SPARQL result's message as §5.3.2 gives
+/// it: the constraint's `sh:message` with the solution's value filled in, and a message the
+/// query binds in place of the constraint's.
+#[tokio::test]
+async fn the_report_carries_sparql_constraint_messages() -> TestResult {
+    let app = test_app()?;
+    put(&app, SHAPES_GRAPH, SPARQL_SHAPES).await?;
+    put(
+        &app,
+        "http://example.com/data",
+        "ex:bob a ex:Person ; ex:name \"Bob\" .",
+    )
+    .await?;
+    let report = report(&app, "/dataset/shacl").await?;
+    let mut messages: Vec<String> = report["results"]
+        .as_array()
+        .expect("results")
+        .iter()
+        .flat_map(|result| {
+            result["resultMessage"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .filter_map(|message| message.as_str().map(str::to_owned))
+        .collect();
+    messages.sort();
+    assert_eq!(
+        messages,
+        ["Bob is not a full name", "add a surname to Bob"],
+        "{report}"
+    );
+    Ok(())
+}
+
+/// A commit the SHACL gate refuses names the first result's message in its detail, filled
+/// in as the report has it: the committer is told what the shape says is wrong.
+#[tokio::test]
+async fn a_shacl_reject_names_the_result_s_message() -> TestResult {
+    let config = StoreConfig {
+        shacl_gate: ShaclGate::Enforce(GateSeverity::Violation),
+        ..StoreConfig::default()
+    };
+    let app =
+        test_app_with_store_config(config, PolicyConfig::default(), ReasonerConfig::default())?;
+    let only_filled = "ex:FullName a sh:NodeShape ; sh:targetClass ex:Person ;
+      sh:sparql [ sh:message \"{?name} is not a full name\" ;
+        sh:select '''SELECT $this ?name WHERE {
+          $this <http://example.com/name> ?name . FILTER (!CONTAINS(?name, \" \")) }''' ] .";
+    let shapes = format!("{PREFIXES}{only_filled}");
+    let turtle = [("content-type", "text/turtle")];
+    let response = send(
+        &app,
+        Method::PUT,
+        "/api/v1/repositories/nrese/shapes",
+        &turtle,
+        shapes,
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = send(
+        &app,
+        Method::POST,
+        "/dataset/update",
+        &[("content-type", "application/sparql-update")],
+        "INSERT DATA { <http://example.com/bob> a <http://example.com/Person> ;
+           <http://example.com/name> \"Bob\" }",
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let problem: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
+    assert_eq!(
+        problem["type"], "https://nrese.dev/problems/shacl-reject",
+        "{problem}"
+    );
+    let detail = problem["detail"].as_str().expect("a detail");
+    assert!(
+        detail.contains("message \"Bob is not a full name\""),
+        "{detail}"
+    );
+    Ok(())
+}
