@@ -7,11 +7,13 @@ Run: python benches/suite/tests/isolation.py discover -s benches/suite/tests -p 
 An assertion tagged `SPEC <tag>` states the behaviour its test is for.
 """
 
+from fnmatch import fnmatch
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -77,22 +79,23 @@ class QuickOnTheFleet(fixture.Repo):
 
     def test_a_pass_is_its_tiers_by_tree_and_never_opens_a_push(self):
         # Spec (design §3, §6): a verified quick pass is recorded under tier quick, keyed as push's
-        # (tree, file list, toolchain), naming the commit first; the same tree and files then pass at
-        # once; a push of that commit is still gated on its own, and another tree runs again.
+        # (tree, file list, toolchain), naming the commit first; a push of that commit is still gated on
+        # its own; the same tree and files then pass at once, and another tree runs again.
         tip = self.commit("a.txt", "a changed\n")
         self.fleet("done", self.tree(tip), ["a.txt"], tier="quick")
+        host = json.loads((self.fake / "results" / "out" / "gate.json").read_text())["fleet_host"]
         done = self.quick()
         self.assertEqual(done.returncode, 0, f"SPEC quick-verified: {done.stderr}")
-        record = self.passes()
-        self.assertEqual(len(record), 1, record)
-        self.assertRegex(record[0], rf"^quick {self.tree(tip)} [0-9a-f]{{40}} rustc-\S+ flags=\S* tools=\S+ fleet"
-                                    rf" \| {tip} fleet:gate-1@office-pc cpu=znver3$", "SPEC quick-record")
-        self.fleet("pending")
-        again = self.quick()
-        self.assertEqual((again.returncode, len(self.submitted())), (0, 1), f"SPEC quick-verified: {again.stderr}")
         pushed = self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", ZERO))
         self.assertEqual((pushed.returncode != 0, [m for m, _, _ in self.submitted()]), (True, ["quick", "push"]),
                          f"SPEC quick-not-push: a quick pass let a push through\n{pushed.stderr}")
+        record = self.passes()
+        self.assertEqual(len(record), 1, record)
+        self.assertRegex(record[0], rf"^quick {self.tree(tip)} [0-9a-f]{{40}} rustc-\S+ flags=\S* tools=\S+ fleet"
+                                    rf" \| {tip} fleet:gate-1@{re.escape(host)} cpu=znver3$", "SPEC quick-record")
+        self.fleet("pending")
+        again = self.quick()
+        self.assertEqual((again.returncode, len(self.submitted())), (0, 2), f"SPEC quick-verified: {again.stderr}")
         other = self.commit("b.txt", "b changed\n")
         self.quick()
         self.assertEqual([(m, t) for m, t, _ in self.submitted()][-1], ("quick", self.tree(other)),
@@ -118,23 +121,50 @@ class QuickOnTheFleet(fixture.Repo):
             self.assertNotIn("=== fmt", done.stdout, "SPEC quick-fleet-only: a step ran here")
         self.assertEqual((len(self.submitted()), self.passes()), (2, []), "SPEC quick-fleet-only")
 
+    def test_a_commit_whose_runner_has_no_quick_mode_is_refused_before_any_job(self):
+        # Spec (review r1, 1): the job runs the commit's own gate-job.sh; one from before quick's own
+        # entries (under the cache's quick/) would run push's, or leave quick's where older sweeps remove
+        # them. Such a commit, named (NRESE_PUSH_COMMIT) or HEAD, is refused: exit 2, nothing submitted.
+        current = (self.repo / "scripts/lib/gate-job.sh").read_text()
+        self.commit("a.txt", "a changed\n")
+        old = self.commit("scripts/lib/gate-job.sh", "#!/usr/bin/env bash\n# a gate job from before quick/\n")
+        self.commit("scripts/lib/gate-job.sh", current)
+        self.fleet("pending")
+        named = self.quick(NRESE_PUSH_COMMIT=old)
+        self.assertEqual((named.returncode, "has no quick check" in named.stderr, self.submitted()), (2, True, []),
+                         f"SPEC quick-runner: {named.stdout}{named.stderr}")
+        head = self.quick()  # the control: HEAD's runner has the quick mode
+        self.assertEqual((head.returncode, len(self.submitted())), (75, 1), f"SPEC quick-runner: {head.stderr}")
+
 
 # The build host's side: check.sh's tiers over a file list, with stand-ins, each call one line in $CALLS.
-# A workspace of alpha, beta depending on alpha, and nrese-server (the generated views' crate); alpha
-# has probes. HAS_NEXTEST says whether cargo-nextest is there; a build admission call holding FAIL fails.
+# A workspace of alpha, beta depending on alpha, gamma nested under crates/rdf/, and nrese-server (the
+# generated views' crate); alpha and gamma have probes. HAS_NEXTEST says whether cargo-nextest is there;
+# TREE_FAILS makes cargo tree fail; a build admission call holding FAIL fails, one holding EMPTY selects no
+# test (nextest then fails, 4, unless told --no-tests=pass; cargo test passes, 0 passed).
 CARGO = """#!/bin/sh
 echo "cargo $*" >> "$CALLS"
 case "$1" in
-  metadata) echo '{"packages":[{"name":"alpha"},{"name":"beta"},{"name":"nrese-server"}]}' ;;
+  metadata) echo '{"packages":[{"name":"alpha"},{"name":"beta"},{"name":"gamma"},{"name":"nrese-server"}]}' ;;
   nextest) [ -n "${HAS_NEXTEST:-}" ] || exit 1 ;;
-  tree) case "$3" in alpha) printf 'alpha v0.1.0\\nbeta v0.1.0\\n' ;; *) printf '%s v0.1.0\\n' "$3" ;; esac ;;
+  tree) [ -z "${TREE_FAILS:-}" ] || exit 101
+    case "$3" in alpha) printf 'alpha v0.1.0\\nbeta v0.1.0\\n' ;; *) printf '%s v0.1.0\\n' "$3" ;; esac ;;
+esac
+exit 0
+"""
+GUARDED = """#!/bin/sh
+echo "guarded${NRESE_FUZZ_SEED:+ seed=$NRESE_FUZZ_SEED} $*" >> "$CALLS"
+case "$*" in *"${FAIL:-no failure planted}"*) exit 1 ;; esac
+case "$*" in
+  *"${EMPTY:-no empty selection}"*)
+    case "$*" in nextest*--no-tests=pass*) ;; nextest*) exit 4 ;; *) echo "test result: ok. 0 passed; 0 failed" ;; esac ;;
+  test*) echo "test result: ok. 1 passed; 0 failed" ;;
 esac
 exit 0
 """
 RECORD = '#!/bin/sh\necho "{name} $*" >> "$CALLS"\nexit 0\n'
 STUBS = {
-    "scripts/cargo-guarded.sh": '#!/bin/sh\necho "guarded${NRESE_FUZZ_SEED:+ seed=$NRESE_FUZZ_SEED} $*" >> "$CALLS"\n'
-                                'case "$*" in *"${FAIL:-no failure planted}"*) exit 1 ;; esac\nexit 0\n',
+    "scripts/cargo-guarded.sh": GUARDED,
     "scripts/fetch-w3c-tests.sh": RECORD.format(name="w3c"),
     "scripts/check-locks.sh": RECORD.format(name="locks"),
     "scripts/check-features.sh": RECORD.format(name="features"),
@@ -149,6 +179,8 @@ STUBS = {
     "crates/alpha/Cargo.toml": '[package]\nname = "alpha"\n',
     "crates/alpha/tests/it/probes/mod.rs": "mod topic;\n",
     "crates/beta/Cargo.toml": '[package]\nname = "beta"\n',
+    "crates/rdf/gamma/Cargo.toml": '[package]\nname = "gamma"\n',
+    "crates/rdf/gamma/tests/it/probes.rs": "\n",
     "crates/nrese-server/Cargo.toml": '[package]\nname = "nrese-server"\n',
 }
 ALPHA = ["crates/alpha/src/lib.rs"]
@@ -216,10 +248,11 @@ class QuickTier(unittest.TestCase):
                     "guarded seed=SEED test --locked -q -p alpha --lib -- random",
                     "guarded test --locked -q -p beta --lib -- explore::"]
         nextest = ["guarded clippy --locked -p alpha --all-targets",
-                   "guarded nextest run --locked --no-fail-fast -p alpha --lib",
-                   "guarded nextest run --locked --no-fail-fast -p alpha -E (binary_id(alpha::it)) & test(probes::)",
-                   "guarded nextest run --locked --no-fail-fast -p nrese-server -E (binary_id(nrese-server::it)) "
-                   "& test(generated_views)",
+                   "guarded nextest run --locked --no-fail-fast --no-tests=pass -p alpha --lib",
+                   "guarded nextest run --locked --no-fail-fast --no-tests=pass -p alpha -E (binary_id(alpha::it)) "
+                   "& test(probes::)",
+                   "guarded nextest run --locked --no-fail-fast --no-tests=fail -p nrese-server "
+                   "-E (binary_id(nrese-server::it)) & test(generated_views)",
                    "guarded seed=SEED nextest run --locked --no-fail-fast -p alpha -E (binary_id(alpha) & test(random))",
                    "guarded nextest run --locked --no-fail-fast -p beta -E (binary_id(beta) & test(explore::))"]
         steps = {"fmt", "message strings", "clippy", "unit tests", "probes", "generated views", "seeds", "explorer"}
@@ -231,109 +264,243 @@ class QuickTier(unittest.TestCase):
                                  f"SPEC quick-steps: the build admission's calls\n{out}")
                 self.assertEqual(set(got), steps, f"SPEC quick-steps: the summary\n{out}")
 
-    def test_its_one_seed_is_the_push_tiers_first(self):
-        # Spec (design §1): one seed, the first of push's three, so a failure replays in push.
+    def test_its_one_seed_is_the_push_tiers_first_whatever_the_environment_says(self):
+        # Spec (design §1; review r1, 6): one seed, the first of push's three, so a failure replays in
+        # push; each tier's count is its own, never the caller's NRESE_SEEDS.
         seeds = {}
-        for mode in ("push", "quick"):
-            _, _, calls, out = self.tier(mode, ALPHA)
+        for mode, inherited in (("push", "1"), ("quick", "3")):
+            _, _, calls, out = self.tier(mode, ALPHA, NRESE_SEEDS=inherited)
             seeds[mode] = [re.search(r"seed=(\d+)", c).group(1) for c in calls if "seed=" in c and "-p alpha" in c]
-        self.assertEqual(len(seeds["push"]), 3, seeds)
+        self.assertEqual(len(seeds["push"]), 3, f"SPEC push-seeds: {seeds}")
         self.assertEqual(seeds["quick"], seeds["push"][:1], "SPEC quick-seed")
 
     def test_it_selects_the_crates_push_selects(self):
         # Spec (design §2): changed_crates on the same list, unchanged: a crate's file, one depending on
         # it, a workspace-wide file (every crate), no crate at all.
         for files, want in ((ALPHA, "alpha"), (["crates/beta/src/lib.rs", "docs/a.md"], "beta"),
-                            (["Cargo.lock"], "alpha beta nrese-server"), (["docs/a.md"], "none")):
+                            (["Cargo.lock"], "alpha beta gamma nrese-server"), (["docs/a.md"], "none")):
             with self.subTest(files=files):
-                lines = [re.search(r"(?m)^=== changed: ([^;\n]*)", self.tier(mode, files)[3]).group(1)
-                         for mode in ("push", "quick")]
+                lines = []
+                for mode in ("push", "quick"):
+                    said = re.search(r"(?m)^=== changed: ([^;\n]*)", self.tier(mode, files)[3])
+                    lines.append(said.group(1) if said else "no changed: line")
                 self.assertEqual(lines, [want, want], "SPEC quick-same-crates")
 
-    def test_a_crate_without_probes_is_skipped_quietly(self):
-        # Spec (design §5): probes run where the crate has a probes module; elsewhere no step at all.
-        code, steps, calls, out = self.tier("quick", ["crates/beta/src/lib.rs"])
-        self.assertEqual((code, "probes" in steps, any("probes::" in c for c in calls)), (0, False, False), out)
+    def test_probes_run_where_a_crate_has_them_at_any_depth_and_nowhere_else(self):
+        # Spec (design §5; review r1, 4): probes run where the changed crate has a probes module, a crate
+        # nested under crates/ (crates/rdf/) included; elsewhere no step at all.
+        for files, crate in ((["crates/rdf/gamma/src/lib.rs"], "gamma"), (["crates/beta/src/lib.rs"], None)):
+            with self.subTest(crate=crate):
+                code, steps, calls, out = self.tier("quick", files)
+                ran = [c for c in calls if "probes::" in c]
+                want = [f"guarded test --locked --no-fail-fast -p {crate} --test it -- probes::"] if crate else []
+                self.assertEqual((code, steps.get("probes"), ran), (0, 0 if crate else None, want),
+                                 f"SPEC quick-probes\n{out}")
 
     def test_a_failing_clippy_or_drift_step_fails_the_tier(self):
-        # Spec (design §8): a planted clippy finding and a planted drift each fail the tier; the drift
-        # tests run whatever changed, a document alone included. Controls: nothing planted, it passes.
+        # Spec (design §8): a planted clippy finding and a planted drift each fail the tier at that step;
+        # the drift tests run whatever changed, a document alone included. Controls: nothing planted, it
+        # passes.
         cases = ((ALPHA, None, 0, "clippy"), (ALPHA, "clippy", 1, "clippy"),
                  (ALPHA, None, 0, "generated views"), (ALPHA, "generated_views", 1, "generated views"),
                  (["docs/a.md"], None, 0, "generated views"), (["docs/a.md"], "generated_views", 1, "generated views"))
         for files, plant, want, step in cases:
             with self.subTest(files=files, plant=plant):
                 code, steps, _, out = self.tier("quick", files, **({"FAIL": plant} if plant else {}))
-                self.assertEqual((code, steps.get(step) == 0), (want, want == 0), f"SPEC quick-fails\n{out}")
+                self.assertIn(step, steps, f"SPEC quick-fails: no {step} step\n{out}")
+                self.assertEqual((code, steps[step] != 0), (want, want != 0), f"SPEC quick-fails\n{out}")
+
+    def test_no_unit_tests_or_probes_pass_and_no_drift_test_fails_under_both_runners(self):
+        # Spec (review r1, 3): a changed crate with no unit tests, or a probes module with none, passes
+        # those steps; the generated views' test gone fails its step; the same under nextest and cargo test.
+        cases = (("-p alpha --lib", 0, "unit tests"), ("probes::", 0, "probes"),
+                 ("generated_views", 1, "generated views"))
+        for has in ("", "1"):
+            for empty, want, step in cases:
+                with self.subTest(nextest=bool(has), empty=empty):
+                    code, steps, _, out = self.tier("quick", ALPHA, HAS_NEXTEST=has, EMPTY=empty)
+                    self.assertEqual((code, step in steps, steps.get(step) == 0), (want, True, want == 0),
+                                     f"SPEC quick-empty\n{out}")
+
+    def test_targets_that_cant_be_told_fail_their_step(self):
+        # Spec (review r1, 5): a failed lookup of the dependents and a target list that can't be read
+        # fail their step, never select nothing; a readable list naming none of the crates passes.
+        code, steps, _, out = self.tier("quick", ALPHA, TREE_FAILS="1")
+        self.assertEqual((code, steps.get("explorer", 0) != 0), (1, True), f"SPEC quick-discovery: cargo tree\n{out}")
+        for rel, step in (("scripts/lib/explorer-targets.txt", "explorer"), ("scripts/lib/fuzz-targets.txt", "seeds")):
+            with self.subTest(missing=rel):
+                path = self.repo / rel
+                path.rename(path.with_name("away"))
+                try:
+                    code, steps, _, out = self.tier("quick", ALPHA)
+                finally:
+                    path.with_name("away").rename(path)
+                self.assertEqual((code, steps.get(step, 0) != 0), (1, True), f"SPEC quick-discovery: {rel}\n{out}")
+        code, steps, _, out = self.tier("quick", ["crates/nrese-server/src/lib.rs"])
+        self.assertEqual((code, steps.get("seeds"), "explorer" in steps), (0, 0, False),
+                         f"SPEC quick-discovery: lists naming no changed crate\n{out}")
+
+
+# The sweeps of every runner before this one, push's and /verify's: these entries at the cache's root
+# (and wt/target).
+OLDER_SWEEPS = ("bin-*", "target-*", "py-*", "node-*")
 
 
 @unittest.skipUnless(BASH and shutil.which("flock"), "the gate job runs on Linux fleet hosts (flock)")
 class QuickGateJob(fixture.Repo):
     """scripts/lib/gate-job.sh mode quick on its host, with stand-ins for its tools (as test_push_gate's
-    GateJob)."""
+    GateJob). Each job runs in a process group of its own, stopped with its tree at the test's end."""
 
-    def test_it_has_its_own_lock_worktree_and_target_and_sweeps_only_alone(self):
-        # Spec (design §3): wt-quick, target-quick-<release>, lock-quick: a quick check never waits
-        # behind a push gate's lock; the host's one sweep never runs while the other gate does.
+    HOST = "host-a"
+
+    def setUp(self):
+        super().setUp()
         stubs = self.root / "stubs"
         stubs.mkdir()
         for name, body in {
             "rustup": "exit 0",
             "rustc": '[ "${1#+}" != "$1" ] && shift; case "$1" in -vV) echo "release: 1.98.1"; echo "commit-hash: abcdef1234567890" ;;'
                      ' --print) echo "    native - Select the CPU of the current host (currently znver3)." ;; esac',
-            "cargo": 'echo "cargo-nextest 0.9.146"',
+            "cargo": '[ "$1" = nextest ] && exec cargo-nextest "$@"; exit 0',
+            "curl": fixture.CURL_NEXTEST,
             "cc": 'while [ $# -gt 0 ]; do [ "$1" = -o ] && { shift; : > "$1"; }; shift; done',
         }.items():
             (stubs / name).write_text("#!/bin/sh\n" + body + "\n")
             (stubs / name).chmod(0o755)
-        cache, seen = self.root / "cache", self.root / "seen"
-        check = ('echo "target=$CARGO_TARGET_DIR" > "$SEEN"\necho "wt=$PWD" >> "$SEEN"\n'
+        self.stubs, self.cache, self.seen = stubs, self.root / "cache", self.root / "seen"
+        # check.sh: where it builds and runs, its files and Python; held (HOLD) until told to go, at most
+        # 30 s; then the cargo-nextest it runs.
+        check = ('s="$SEEN-$1"\n'
+                 'printf "target=%s\\nwt=%s\\nfiles=%s\\npython=%s\\n" "$CARGO_TARGET_DIR" "$PWD" "$NRESE_FILES_FROM"'
+                 ' "$(command -v python)" > "$s"\n'
+                 'if [ -n "${HOLD:-}" ]; then : > "$HOLD.ready"; n=0\n'
+                 '  while [ ! -e "$HOLD.go" ] && [ $n -lt 600 ]; do sleep 0.05; n=$((n + 1)); done; fi\n'
+                 'echo "nextest=$(cargo nextest --version | cut -d" " -f2)" >> "$s"\n'
                  'printf "=== summary\\n  0  fmt (1 s)\\n"\n')
         for rel, body in {"scripts/check.sh": check, "scripts/cargo-guarded.sh": 'echo "-C target-cpu=native"\n',
                           "rust-toolchain.toml": '[toolchain]\nchannel = "1.98.1"\n',
                           "benches/suite/requirements.txt": ""}.items():
             (self.repo / rel).parent.mkdir(parents=True, exist_ok=True)
             (self.repo / rel).write_text(body)
-        empty = self.git(self.repo, "hash-object", "/dev/null")
-        python = cache / f"py-{empty[:12]}" / "bin"
-        python.mkdir(parents=True)
-        (python / "python").write_text('#!/bin/sh\nexec python3 "$@"\n')
-        (python / "python").chmod(0o755)
-        shutil.copy(ROOT / "scripts/lib/gate-job.sh", self.repo / "scripts/lib/gate-job.sh")
+        self.empty = self.git(self.repo, "hash-object", "/dev/null")
+        for home in (self.cache, self.cache / "quick"):  # the suite's Python, made already in each mode's place
+            python = home / f"py-{self.empty[:12]}" / "bin"
+            python.mkdir(parents=True)
+            (python / "python").write_text('#!/bin/sh\nexec python3 "$@"\n')
+            (python / "python").chmod(0o755)
         self.git(self.repo, "add", "-A")
         self.git(self.repo, "commit", "-q", "-m", "two")
-        tree = self.tree("HEAD")
-        old = cache / "target-old"  # another toolchain's, unused for long: the sweep's to remove
-        old.mkdir()
-        (old / ".last-used").write_text("0")
-        # A push gate running: the push lock held until its stdin closes.
-        holder = subprocess.Popen(["flock", str(cache / "lock"), "cat"], stdin=subprocess.PIPE,
-                                  stdout=subprocess.DEVNULL)
-        self.addCleanup(holder.kill)
-        while subprocess.run(["flock", "-n", str(cache / "lock"), "true"]).returncode == 0:
+        self.sent = self.tree("HEAD")
+        self.jobs = 0
+
+    def start(self, mode, **env):
+        """gate-job.sh MODE, started in a process group of its own."""
+        self.jobs += 1
+        out = self.root / f"out-{self.jobs}"
+        out.mkdir()
+        log = open(self.root / f"job-{self.jobs}.log", "w")
+        job = subprocess.Popen(
+            [BASH, "scripts/lib/gate-job.sh", mode, self.sent, self.empty, "--"], cwd=self.repo, stdout=log,
+            stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True,
+            env={**self.env, "FLEET_OUT": str(out), "NRESE_GATE_CACHE": str(self.cache), "SEEN": str(self.seen),
+                 "HOME": str(self.root), "PATH": f"{self.stubs}:{os.environ['PATH']}", "NRESE_GATE_CC": "cc",
+                 "FLEET_JOB": f"gate-{self.jobs}", "FLEET_STEP": "1", "FLEET_HOST": self.HOST, **env})
+        self.addCleanup(self.stop, job, log)
+        return job
+
+    @staticmethod
+    def stop(job, log):
+        if job.poll() is None:
+            os.killpg(job.pid, signal.SIGKILL)
+        job.wait(timeout=30)
+        log.close()
+
+    @staticmethod
+    def ended(job, seconds=30):
+        """The job's exit, or None if it is still running after SECONDS."""
+        try:
+            return job.wait(timeout=seconds)
+        except subprocess.TimeoutExpired:
+            return None
+
+    def said(self, mode):
+        path = Path(f"{self.seen}-{mode}")
+        return dict(line.split("=", 1) for line in path.read_text().splitlines()) if path.exists() else {}
+
+    def run_job(self, mode, **env):
+        job = self.start(mode, **env)
+        code = self.ended(job)
+        self.assertEqual(code, 0, f"{mode} job\n{(self.root / f'job-{self.jobs}.log').read_text()}")
+
+    @staticmethod
+    def appeared(path, seconds=30):
+        deadline = time.monotonic() + seconds
+        while not path.exists() and time.monotonic() < deadline:
             time.sleep(0.05)
+        return path.exists()
 
-        def job(n):
-            out = self.root / f"out-{n}"
-            out.mkdir()
-            return subprocess.run(
-                [BASH, "scripts/lib/gate-job.sh", "quick", tree, empty, "--"], cwd=self.repo, capture_output=True,
-                text=True, timeout=60,
-                env={**self.env, "FLEET_OUT": str(out), "NRESE_GATE_CACHE": str(cache), "SEEN": str(seen),
-                     "HOME": str(self.root), "PATH": f"{stubs}:{os.environ['PATH']}", "NRESE_GATE_CC": "cc",
-                     "FLEET_JOB": f"gate-{n}", "FLEET_STEP": "1", "FLEET_HOST": "office-pc"})
+    def test_it_runs_and_ends_while_a_push_gate_holds_its_lock(self):
+        # Spec (design §3): a quick check never waits behind a push gate's lock.
+        holder = subprocess.Popen(["flock", str(self.cache / "lock"), "cat"], stdin=subprocess.PIPE,
+                                  stdout=subprocess.DEVNULL, start_new_session=True)
 
-        beside = job(1)
-        self.assertEqual(beside.returncode, 0, f"SPEC quick-own-lock\n{beside.stdout}{beside.stderr}")
-        said = dict(line.split("=", 1) for line in seen.read_text().split())
-        self.assertEqual((Path(said["target"]), Path(said["wt"]).resolve()),
-                         (cache / "target-quick-1.98.1", (cache / "wt-quick").resolve()), "SPEC quick-own-cache")
-        self.assertTrue(old.exists(), "SPEC quick-sweep-alone: swept while the push gate ran")
-        holder.stdin.close()
-        holder.wait(timeout=30)
-        alone = job(2)
-        self.assertEqual((alone.returncode, old.exists()), (0, False),
-                         f"SPEC quick-sweep-alone: no sweep with the host to itself\n{alone.stdout}")
+        def release():
+            holder.stdin.close()
+            try:
+                holder.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(holder.pid, signal.SIGKILL)
+                holder.wait(timeout=10)
+        self.addCleanup(release)
+        deadline = time.monotonic() + 10
+        while subprocess.run(["flock", "-n", str(self.cache / "lock"), "true"]).returncode == 0:
+            self.assertLess(time.monotonic(), deadline, "the stand-in push gate didn't take its lock")
+            time.sleep(0.05)
+        job = self.start("quick")
+        code = self.ended(job)
+        self.assertEqual((code, "target" in self.said("quick"), holder.poll()), (0, True, None),
+                         f"SPEC quick-own-lock: quick didn't run its check and end while the push lock was held\n"
+                         f"{(self.root / 'job-1.log').read_text()}")
+
+    def test_its_entries_are_out_of_every_other_sweep_and_its_sweep_leaves_theirs(self):
+        # Spec (design §3; review r1, 1): what quick uses (target, worktree, files, Python) is in quick/,
+        # which no older runner's or /verify's sweep matches, nor push's now: an over-budget push sweep
+        # leaves it; quick's sweep removes its own stale entries only, never push's.
+        self.run_job("quick")
+        used = {k: Path(v).resolve() for k, v in self.said("quick").items() if k != "nextest"}
+        cache = self.cache.resolve()
+        matched = [k for k, p in used.items() if p.relative_to(cache).parts[0] != "quick"
+                   or any(fnmatch(p.relative_to(cache).parts[0], g) for g in OLDER_SWEEPS)
+                   or p.relative_to(cache).parts[:2] == ("wt", "target")]
+        self.assertEqual(matched, [], f"SPEC quick-out-of-older-sweeps: {used}")
+        stale = self.cache / "target-old", self.cache / "quick" / "target-old"
+        for old in stale:
+            old.mkdir()
+            (old / ".last-used").write_text("0")
+        self.run_job("push", NRESE_HOST_CACHE_GB="0")
+        self.assertEqual(([k for k, p in used.items() if not p.exists()], stale[0].exists()), ([], False),
+                         "SPEC quick-out-of-older-sweeps: push's sweep, over budget")
+        pushed = [Path(p) for k, p in self.said("push").items() if k in ("target", "python")]
+        self.run_job("quick", NRESE_HOST_CACHE_GB="0")
+        self.assertEqual(([p for p in pushed if not p.exists()], stale[1].exists()), ([], False),
+                         "SPEC quick-sweeps-its-own: quick's sweep, over budget")
+
+    def test_each_job_runs_the_nextest_its_checkout_pins(self):
+        # Spec (review r1, 2): two jobs pinning different cargo-nextest versions, the second installing
+        # its own while the first runs: each runs its own version.
+        pins = self.repo / "scripts/lib/gate-tools.txt"
+        pins.write_text("cargo-nextest 0.9.1\n")
+        hold = self.root / "hold"
+        first = self.start("quick", HOLD=str(hold))
+        self.assertTrue(self.appeared(Path(f"{hold}.ready")), "the quick job didn't reach its check")
+        pins.write_text("cargo-nextest 0.9.2\n")
+        second = self.start("push")
+        pushed = self.ended(second)
+        Path(f"{hold}.go").touch()
+        quick = self.ended(first)
+        self.assertEqual((quick, self.said("quick").get("nextest"), pushed, self.said("push").get("nextest")),
+                         (0, "0.9.1", 0, "0.9.2"), "SPEC tools-per-version\n"
+                         f"{(self.root / 'job-1.log').read_text()}{(self.root / 'job-2.log').read_text()}")
 
 
 if __name__ == "__main__":

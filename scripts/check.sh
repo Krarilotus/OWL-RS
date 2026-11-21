@@ -159,17 +159,21 @@ workspace_packages() {
 if [ "$mode" = crates ]; then shift; changed_crates "$@"; exit; fi
 
 # The workspace crates depending on any of the given ones (directly or not, dev-
-# dependencies included: their tests must still compile), the given ones excluded.
+# dependencies included: their tests must still compile), the given ones excluded. Fails (2) where
+# cargo can't tell: never "none" for a lookup that failed.
 dependents_of() {
-  local name
+  local name found="" tree
   declare -A given=()
   for name in "$@"; do given[$name]=1; done
   for name in "$@"; do
-    cargo tree -i "$name" --workspace --prefix none -e normal,build,dev --offline 2>/dev/null \
-      | sed 's/ (\*)//; s/ .*//'
-  done | sort -u | while read -r dep; do
+    tree=$(cargo tree -i "$name" --workspace --prefix none -e normal,build,dev --offline 2>/dev/null) \
+      || { echo "cargo tree can't tell what depends on $name" >&2; return 2; }
+    found+=$tree$'\n'
+  done
+  printf '%s' "$found" | sed 's/ (\*)//; s/ .*//' | sort -u | while read -r dep; do
     [ -n "$dep" ] && [ -z "${given[$dep]:-}" ] && echo "$dep"
   done
+  return 0
 }
 
 package_args() { local name; for name in "$@"; do printf -- '-p %s ' "$name"; done; }
@@ -184,14 +188,19 @@ lint() {
 # Tests of `all` crates, with the slow binaries of `fast_only` left out. Python's output is
 # read without carriage returns: Windows writes them, and cargo rejects names with them.
 # The quick tier's narrower runs, named first: `--lib`, the crates' unit tests alone; `--in TARGET
-# FILTER`, the tests of their test binary TARGET whose names hold FILTER.
+# FILTER`, the tests of their test binary TARGET whose names hold FILTER; `--empty pass|fail`, what
+# a run that selects no test is, the same under nextest (--no-tests) and cargo test.
 run_tests() {
   local -a all=() fast_only=() only=()
-  local into=all arg target="" name=""
-  case ${1:-} in
-    --lib) only=(--lib); shift ;;
-    --in) target=$2 name=$3; shift 3 ;;
-  esac
+  local into=all arg target="" name="" empty=""
+  while :; do
+    case ${1:-} in
+      --lib) only=(--lib); shift ;;
+      --in) target=$2 name=$3; shift 3 ;;
+      --empty) empty=$2; shift 2 ;;
+      *) break ;;
+    esac
+  done
   for arg in "$@"; do
     if [ "$arg" = -- ]; then into=fast_only; continue; fi
     if [ $into = all ]; then all+=("$arg"); else fast_only+=("$arg"); fi
@@ -206,17 +215,17 @@ run_tests() {
       filter="($(IFS='|'; echo "${binaries[*]}")) & test($name)"
     fi
     # shellcheck disable=SC2046
-    "$guarded" nextest run --locked --no-fail-fast $(package_args "${all[@]}") "${only[@]}" \
-      ${filter:+-E "$filter"}
+    "$guarded" nextest run --locked --no-fail-fast ${empty:+--no-tests=$empty} $(package_args "${all[@]}") \
+      "${only[@]}" ${filter:+-E "$filter"}
   else
     local code=0 line
     declare -A fast=()
     for arg in "${fast_only[@]}"; do fast[$arg]=1; done
     for arg in "${all[@]}"; do
       if [ -n "$target" ]; then
-        "$guarded" test --locked --no-fail-fast -p "$arg" --test "$target" -- "$name" || code=$?
+        cargo_test "$empty" --locked --no-fail-fast -p "$arg" --test "$target" -- "$name" || code=$?
       elif [ ${#only[@]} -gt 0 ]; then
-        "$guarded" test --locked --no-fail-fast -p "$arg" "${only[@]}" || code=$?
+        cargo_test "$empty" --locked --no-fail-fast -p "$arg" "${only[@]}" || code=$?
       elif [ -n "${fast[$arg]:-}" ]; then
         line=$(python scripts/lib/test-targets.py fast "$arg") || return 2
         line=$(printf '%s' "$line" | tr -d '\r')
@@ -231,13 +240,25 @@ run_tests() {
   fi
 }
 
+# EMPTY ARGS...: cargo test ARGS; with EMPTY fail, a run in which no test ran fails (4, as nextest's).
+cargo_test() {
+  local empty=$1 out code=0
+  shift
+  [ "$empty" = fail ] || { "$guarded" test "$@"; return; }
+  out=$("$guarded" test "$@" 2>&1) || code=$?
+  printf '%s\n' "$out"
+  [ $code -ne 0 ] || grep -qE '^test result: [A-Za-z]+\. [1-9]' <<< "$out" \
+    || { echo "no test ran: cargo test $*" >&2; code=4; }
+  return $code
+}
+
 # The random tests of the given crates (scripts/lib/fuzz-targets.txt) with a few more seeds
-# than the one they run with otherwise: NRESE_SEEDS of them (3; the quick tier's 1 is the first of
-# push's), drawn from the commit, so each push tries new ones and a failure replays
-# (NRESE_FUZZ_SEED=<seed>). The fuzz campaign runs many more.
+# than the one they run with otherwise: COUNT of them (push 3; quick 1, the first of push's), drawn
+# from the commit, so each push tries new ones and a failure replays (NRESE_FUZZ_SEED=<seed>). The
+# fuzz campaign runs many more.
 run_seeds() {
-  local count=${NRESE_SEEDS:-3} n seeds="" head
-  [[ $count =~ ^[1-9][0-9]*$ ]] || { echo "NRESE_SEEDS is a count of seeds, not '$count'" >&2; return 2; }
+  local count=$1 n seeds="" head
+  shift
   # The first six hex digits of the full id: an abbreviation (--short) grows where another object
   # shares the prefix, so the same commit would draw other seeds on another host (stable_seeds_at
   # reads this line).
@@ -255,6 +276,8 @@ run_targets() {
   local -A wanted=()
   local -a crates=() targets=() filters=() exprs=()
   local name crate target filter seed binary code=0 expr out i how
+  # A list that can't be read fails: it never selects nothing.
+  [ -r "$list" ] || { echo "$what: no list $list" >&2; return 2; }
   for name in "$@"; do wanted[$name]=1; done
   while IFS=: read -r crate target filter; do
     [ -n "${wanted[$crate]:-}" ] || continue
@@ -294,24 +317,30 @@ run_targets() {
 }
 
 # The crates whose state-explorer targets (scripts/lib/explorer-targets.txt) a change of the given
-# crates runs: each listed crate that is one of them or depends on one (dependents_of).
+# crates runs: each listed crate that is one of them or depends on one (dependents_of). Fails (2)
+# where the list can't be read or the dependents can't be told.
 explorer_crates() {
+  local list=scripts/lib/explorer-targets.txt dependents
   local -a listed=()
-  mapfile -t listed < <(grep -v '^#' scripts/lib/explorer-targets.txt | tr -d '\r' | grep . | cut -d: -f1 | sort -u)
+  [ -r "$list" ] || { echo "no list $list" >&2; return 2; }
+  mapfile -t listed < <(grep -v '^#' "$list" | tr -d '\r' | grep . | cut -d: -f1 | sort -u)
   [ ${#listed[@]} -gt 0 ] || return 0
-  { printf '%s\n' "$@"; dependents_of "$@"; } | sort -u | grep -Fx -f <(printf '%s\n' "${listed[@]}")
+  dependents=$(dependents_of "$@") || return 2
+  printf '%s\n' "$@" "$dependents" | sort -u | grep -Fx -f <(printf '%s\n' "${listed[@]}")
+  return 0
 }
 
 # The given crates with probes: a `probes` module in their `it` test binary (tests/it/probes/ or
-# tests/it/probes.rs), where a reviewer's probe that found a fault is filed as the crate's test.
+# tests/it/probes.rs), where a reviewer's probe that found a fault is filed as the crate's test. A
+# crate at any depth under crates/, as crates_of finds them.
 probe_crates() {
   local manifest dir name
-  for manifest in crates/*/Cargo.toml; do
+  while IFS= read -r manifest; do
     dir=${manifest%/Cargo.toml}
     [ -d "$dir/tests/it/probes" ] || [ -f "$dir/tests/it/probes.rs" ] || continue
     name=$(sed -n 's/^name = "\(.*\)"/\1/p' "$manifest" | head -1)
     printf '%s\n' "$@" | grep -qFx -- "$name" && echo "$name"
-  done
+  done < <(find crates -name Cargo.toml)
   return 0
 }
 
@@ -454,6 +483,11 @@ if [ "$mode" = quick ] && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
     || { echo "no commit ${NRESE_PUSH_COMMIT:-HEAD} to check" >&2; exit 2; }
   push_base=${NRESE_PUSH_BASE:-$(git merge-base "$push_commit" refs/remotes/origin/refactor/engine-v2 2> /dev/null)}
   [ -n "$push_base" ] || { echo "no base for the branch: no origin/refactor/engine-v2 (fetch it)" >&2; exit 2; }
+  # Its job runs the commit's own gate-job.sh: one from before its quick mode (its entries under the
+  # cache's quick/, out of every older sweep) would run push's in its place, or have them swept.
+  git show "$push_commit:scripts/lib/gate-job.sh" 2> /dev/null | grep -qF 'home=$cache/quick' \
+    || { echo "$(git rev-parse --short "$push_commit") has no quick check (scripts/lib/gate-job.sh): it can't be checked" >&2
+         exit 2; }
 fi
 # The Windows part checks one commit, whole: COMMIT, else HEAD, by its own tier, so a commit from
 # before the tier can't be checked.
@@ -596,7 +630,7 @@ case "$mode" in
       step clippy lint "${changed[@]}"
       w3c_data
       step test run_tests "${changed[@]}" "${dependents[@]}" -- "${dependents[@]}"
-      step seeds run_seeds "${changed[@]}"
+      step seeds run_seeds 3 "${changed[@]}"
       step locks bash scripts/check-locks.sh
       step features bash scripts/check-features.sh
     fi
@@ -621,20 +655,26 @@ case "$mode" in
     echo "=== changed: ${changed[*]:-none}"
     step fmt cargo fmt --all --check
     step "message strings" message_strings
+    # A crate without unit tests or probes passes those steps (nothing selected); a build or test
+    # failure fails them.
     if [ ${#changed[@]} -gt 0 ]; then
       step clippy lint "${changed[@]}"
-      step "unit tests" run_tests --lib "${changed[@]}"
+      step "unit tests" run_tests --empty pass --lib "${changed[@]}"
       mapfile -t probed < <(probe_crates "${changed[@]}")
-      [ ${#probed[@]} -eq 0 ] || step probes run_tests --in it probes:: "${probed[@]}"
+      [ ${#probed[@]} -eq 0 ] || step probes run_tests --empty pass --in it probes:: "${probed[@]}"
     fi
     # The committed generated views against the code that generates them (nrese-server's
-    # generated_views_tests.rs): always, as a changed document can drift as well as the code.
-    step "generated views" run_tests --in it generated_views nrese-server
+    # generated_views_tests.rs): always, as a changed document can drift as well as the code; and
+    # failing where that test is gone.
+    step "generated views" run_tests --empty fail --in it generated_views nrese-server
     if [ ${#changed[@]} -gt 0 ]; then
-      NRESE_SEEDS=1 step seeds run_seeds "${changed[@]}"
-      mapfile -t explored < <(explorer_crates "${changed[@]}")
-      [ ${#explored[@]} -eq 0 ] \
-        || step explorer run_targets "explorer tests" scripts/lib/explorer-targets.txt "" "${explored[@]}"
+      step seeds run_seeds 1 "${changed[@]}"
+      if ! found=$(explorer_crates "${changed[@]}"); then
+        step explorer false  # its targets couldn't be told (above): never a pass that ran none
+      elif [ -n "$found" ]; then
+        mapfile -t explored <<< "$found"
+        step explorer run_targets "explorer tests" scripts/lib/explorer-targets.txt "" "${explored[@]}"
+      fi
     fi
     guards "${files[@]}"
     ;;
