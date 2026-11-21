@@ -4,9 +4,10 @@ use nrese_dl::limits::Deadline;
 /// The check tier (`NRESE_CHECK_TIER`): `landing` (the default) or `nightly`.
 pub(crate) fn nightly() -> bool {
     match std::env::var("NRESE_CHECK_TIER").as_deref() {
-        Err(_) | Ok("landing") => false,
+        Err(std::env::VarError::NotPresent) | Ok("landing") => false,
         Ok("nightly") => true,
         Ok(other) => panic!("NRESE_CHECK_TIER={other:?}: expected `landing` or `nightly`"),
+        Err(error) => panic!("NRESE_CHECK_TIER: {error}"),
     }
 }
 
@@ -2278,7 +2279,6 @@ fn without_model_labels_a_read_is_decided_by_its_tests_alone() {
 /// The sweep and the fallback band are unchanged by `NRESE_CHECK_TIER`.
 #[test]
 fn a_read_answered_without_model_labels_is_answered_with_them_under_every_memory_limit() {
-    nightly();
     let first = first_reads(|labels| unions_store(labels, 400), "?x a <urn:test:U0>");
     let (low, top) = (16 << 10, 64 << 20);
     let (answered, failed) = compare_first_reads(&first, geometric_limits(low, top, 10), |_, _| {});
