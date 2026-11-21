@@ -105,6 +105,14 @@ changed_crates() {
   fi
 }
 
+# Whether none of the files can reach a workspace crate in changed_crates (nothing under crates/,
+# no workspace-wide file): added to a push tier's files, they leave its workspace builds, lints and
+# tests as they were (one cargo run over the same crates; cargo resolves features across the crates
+# a run selects, so a run over more crates isn't the same check of each) and only add steps of
+# their own (side_steps). A pass covers a narrower push of its commit only across such files
+# (scripts/lib/gate-key.sh gate_covering; benches/suite/tests/test_push_tier_monotone.py).
+reaches_no_crate() { ! printf '%s\n' "$@" | grep -qE "$EVERY_CRATE|^crates/"; }
+
 # The workspace crates (directories with a Cargo.toml under crates/) that `files` touch.
 crates_of() {
   local file dir name
@@ -376,8 +384,9 @@ if { [ "$mode" = windows ] || [ "$mode" = push ]; } && [ -z "${NRESE_ON_BUILD_HO
   list_hash=$(git hash-object "$list")
   identity=$(gate_identity "$push_commit") || { echo "the gate can't name its toolchain and flags (above): no $mode pass" >&2; exit 2; }
   # The Windows part's pass belongs to the commit's inputs, not its tree: a later commit with the
-  # same inputs carries it (scripts/lib/gate-key.sh windows_inputs), and its record names the commit.
-  keyed=$tree on=""
+  # same inputs carries it (scripts/lib/gate-key.sh windows_inputs). Either record names the commit
+  # first.
+  keyed=$tree on="$push_commit "
   if [ "$mode" = windows ]; then
     keyed=inputs-$(windows_inputs "$push_commit") || { echo "no inputs of $push_commit to key its pass" >&2; exit 2; }
     # And the Python runtime the commit declares for the suite: a pass under another, or one from
@@ -386,7 +395,6 @@ if { [ "$mode" = windows ] || [ "$mode" = push ]; } && [ -z "${NRESE_ON_BUILD_HO
       || { echo "$(git rev-parse --short "$push_commit") declares no Python runtime for the suite" \
              "(scripts/lib/gate-tools.txt python-windows): it can't be checked" >&2; exit 2; }
     identity="$identity $(gate_python "$runtime")"
-    on="$push_commit "
   fi
   key=$(gate_key "$mode" "$keyed" "$list_hash" "$identity")
   if record=$(gate_pass "$key"); then
@@ -397,15 +405,16 @@ if { [ "$mode" = windows ] || [ "$mode" = push ]; } && [ -z "${NRESE_ON_BUILD_HO
     fi
     exit 0
   fi
-  # A pass for this tree on more files covers these: the tier never runs fewer checks for more
-  # files (scripts/lib/gate-key.sh gate_covering).
-  if [ "$mode" = push ] && record=$(gate_covering "$mode" "$keyed" "$list" "$identity"); then
-    echo "=== $mode: $(git rev-parse --short "$push_commit") passed on the fleet before (its tree, files including these)"
+  # A pass of this commit on more files covers these when its other files reach no crate: its
+  # workspace builds, lints and tests were these files' own, and the other files only added steps
+  # (scripts/lib/gate-key.sh gate_covering, reaches_no_crate above).
+  if [ "$mode" = push ] && record=$(gate_covering "$mode" "$keyed" "$list" "$identity" "$push_commit" reaches_no_crate); then
+    echo "=== $mode: $(git rev-parse --short "$push_commit") passed on the fleet before (this commit, these files and others reaching no crate)"
     exit 0
   fi
   bash scripts/lib/fleet-gate.sh "$mode" "$list" "$tree" "$list_hash" "$identity" "$where" "$push_commit" "${push_base:-}"
   case $? in
-    0) [ "$mode" != push ] || gate_list_keep "$list"
+    0) [ "$mode" != push ] || gate_list_keep "$list" "$list_hash"
        gate_record "$key" "$on$(cat "$where")"; exit 0 ;;
     1) exit 1 ;;
     *) echo "no fleet verdict for $(git rev-parse --short "$push_commit") (tree $tree): no $mode pass; the $mode" \

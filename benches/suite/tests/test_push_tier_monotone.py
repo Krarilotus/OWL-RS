@@ -1,13 +1,15 @@
-"""The push tier given more files never runs fewer checks (scripts/check.sh push, as a build host
-runs it over the gate's file list). scripts/lib/gate-key.sh gate_covering relies on it: a pass for a
-tree on a file list covers a push of that tree whose files the list holds (21 Nov 2026). A step that
-ran less for more files would make such a pass cover checks that never ran; this contract fails
-first.
+"""Files that reach no crate only add steps to the push tier (scripts/check.sh push, as a build host
+runs it over the gate's file list; check.sh reaches_no_crate). scripts/lib/gate-key.sh gate_covering
+relies on it: a pass of a commit covers a narrower push of that commit when the pass's other files
+reach no crate (21 Nov 2026). Were a run over more crates the same check of each, more would do;
+it isn't: cargo resolves features across the crates one run selects (review r1 of 21 Nov 2026).
 
-"Fewer checks" is read on what the tier does: the steps of its summary; the crates linted; the
-crates tested, each fully or with its fast tests only (fully includes fast); the crates whose random
-tests run; the Python files whose names are checked. For every two file lists of the table, one
-holding the other, everything the smaller list's tier does, the larger list's does too.
+So the contract is exact where it must be: for two file lists, one holding the other with only
+files that reach no crate besides, the tier's workspace cargo runs are the same runs, in the same
+order with the same arguments, and every other check the smaller list's tier makes (a step of its
+summary, a Python file whose names are checked), the larger list's makes too. A step that ran less
+for more such files, or a workspace run that changed with them, fails here before a pass can cover
+checks that never ran.
 
 Run: python benches/suite/tests/isolation.py discover -s benches/suite/tests -p test_push_tier_monotone.py
 An assertion tagged `SPEC <tag>` states the behaviour its test is for.
@@ -59,13 +61,37 @@ STUBS = {
     "apps/nrese-console/package.json": "{}\n",
 }
 TOOLS = {"cargo": CARGO, "npm": RECORD.format(name="npm"), "npx": RECORD.format(name="npx")}
-# One changed file for each kind of selection the tier makes: a crate others depend on, the crate
-# depending on it, a workspace-wide file (every crate, the lock and feature checks), the gate's own
-# Python (the suite contracts, its names, the Docker names), the bench harness, the console.
-UNIVERSE = ("crates/alpha/src/lib.rs", "crates/beta/src/lib.rs", "Cargo.toml", "scripts/gate.py",
-            "benches/nrese-bench-harness/src/main.rs", "apps/nrese-console/src/App.tsx")
-# The lists compared: none, each file alone, each two of them, all of them.
-TABLE = [frozenset(c) for n in (0, 1, 2, len(UNIVERSE)) for c in combinations(UNIVERSE, n)]
+# The crate part of a list, fixed within a comparison: none, a crate others depend on, the crate
+# depending on it, a workspace-wide file (every crate).
+CRATE_PARTS = (frozenset(), frozenset({"crates/alpha/src/lib.rs"}), frozenset({"crates/beta/src/lib.rs"}),
+               frozenset({"Cargo.toml"}))
+# Files that reach no crate, one for each kind of step they select: the gate's own Python (the suite
+# contracts, its names, the Docker names), the bench harness and its lock file (the lock and feature
+# checks), the console, a document (nothing).
+SIDE = ("scripts/gate.py", "benches/nrese-bench-harness/Cargo.lock",
+        "benches/nrese-bench-harness/src/main.rs", "apps/nrese-console/src/App.tsx", "docs/notes.md")
+# Every crate part with every set of those files.
+TABLE = [part | frozenset(side) for part in CRATE_PARTS for n in range(len(SIDE) + 1)
+         for side in combinations(SIDE, n)]
+
+
+def workspace_runs(calls):
+    """The tier's workspace cargo runs, in order, as called: cargo itself (but a separate project's,
+    named by --manifest-path) and the build admission (scripts/cargo-guarded.sh), which runs every
+    build, lint and test."""
+    return [line for line in calls
+            if line.split()[0] in ("cargo", "guarded") and "--manifest-path" not in line.split()]
+
+
+def side_checks(stdout, calls):
+    """The tier's other checks, as a set: each step of its summary, each Python file whose names are
+    checked."""
+    done = {("step", m) for m in re.findall(r"(?m)^ +\d+  (.+) \(\d+ s\)$", stdout)}
+    for line in calls:
+        words = line.split()
+        if words[0] == "python-names":
+            done |= {("python names", f) for f in words[1:]}
+    return frozenset(done)
 
 
 def facts(stdout, calls):
@@ -137,30 +163,36 @@ class PushTierMonotone(unittest.TestCase):
         done = subprocess.run([BASH, "scripts/check.sh", "push"], cwd=cls.repo, capture_output=True, text=True,
                               env=env, timeout=120, stdin=subprocess.DEVNULL)
         lines = calls.read_text().splitlines() if calls.exists() else []
-        return done.returncode, facts(done.stdout, lines), done.stdout + done.stderr
+        return done.returncode, done.stdout, lines, done.stdout + done.stderr
 
     def test_every_list_runs_through(self):
-        for files, (code, _, out) in self.runs.items():
+        for files, (code, _, _, out) in self.runs.items():
             with self.subTest(files=sorted(files)):
                 self.assertEqual(code, 0, out)
 
     def test_one_crates_file_runs_its_checks_and_its_dependents_fast_tests(self):
         # Worked by hand from the push tier's description (scripts/check.sh's header): alpha changed,
-        # beta depends on it.
-        _, done, out = self.runs[frozenset({"crates/alpha/src/lib.rs"})]
+        # beta depends on it. The fixture's reading of a run, checked once.
+        _, stdout, calls, out = self.runs[frozenset({"crates/alpha/src/lib.rs"})]
         steps = {"fmt", "clippy", "W3C data", "test", "seeds", "locks", "features"}
         expected = {("step", s) for s in steps} | {("clippy", "alpha"), ("test", "alpha", "full"),
                                                    ("test", "alpha", "fast"), ("test", "beta", "fast"),
                                                    ("seeds", "alpha")}
-        self.assertEqual(done, expected, f"SPEC push-tier-selection: the facts are read from the run\n{out}")
+        self.assertEqual(facts(stdout, calls), expected, f"SPEC push-tier-selection: the run as read\n{out}")
 
-    def test_more_files_never_mean_fewer_checks(self):
+    def test_files_reaching_no_crate_only_add_checks(self):
         for smaller, larger in ((s, t) for s in TABLE for t in TABLE if s < t):
-            with self.subTest(smaller=sorted(smaller), larger=sorted(larger)):
-                lost = self.runs[smaller][1] - self.runs[larger][1]
-                self.assertEqual(lost, frozenset(),
-                                 f"SPEC push-tier-monotone: checks the smaller list ran and the larger didn't\n"
-                                 f"{self.runs[larger][2]}")
+            if larger - smaller <= frozenset(SIDE):  # the same crate part, more files reaching none
+                with self.subTest(smaller=sorted(smaller), larger=sorted(larger)):
+                    _, small_out, small_calls, _ = self.runs[smaller]
+                    _, large_out, large_calls, out = self.runs[larger]
+                    self.assertEqual(workspace_runs(large_calls), workspace_runs(small_calls),
+                                     f"SPEC covering-same-runs: files reaching no crate changed the workspace "
+                                     f"runs\n{out}")
+                    lost = side_checks(small_out, small_calls) - side_checks(large_out, large_calls)
+                    self.assertEqual(lost, frozenset(),
+                                     f"SPEC covering-only-adds: checks the smaller list made and the larger "
+                                     f"didn't\n{out}")
 
 
 if __name__ == "__main__":

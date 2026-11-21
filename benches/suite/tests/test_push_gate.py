@@ -322,11 +322,19 @@ class PushGate(Repo):
         self.assertNotEqual(done.returncode, 0, f"SPEC pushed-tree: a tree passed on another's result\n{done.stderr}")
         self.assertEqual([tree for _, tree, _ in self.jobs()], [self.tree(first), self.tree(second)])
 
+    def add(self, name, text):
+        """A commit adding NAME (or changing it) with TEXT; its id."""
+        (self.repo / name).parent.mkdir(parents=True, exist_ok=True)
+        (self.repo / name).write_text(text, newline="\n")
+        self.git(self.repo, "add", name)
+        self.git(self.repo, "commit", "-q", "-m", f"add {name}")
+        return self.git(self.repo, "rev-parse", "HEAD")
+
     def test_a_pass_on_more_files_covers_a_narrower_push_of_its_tree(self):
-        """Spec (21 Nov 2026): a pass for the same tree whose recorded file list contains the
-        pushed range's files lets the push through with no job: the push tier never runs fewer
-        checks for more files (test_push_tier_monotone.py). The second of two approved branches,
-        gated on top of the first, lands on that pass once the first has landed."""
+        """Spec (21 Nov 2026): a pass of the same commit whose recorded file list contains the
+        pushed range's files, its other files reaching no crate, lets the push through with no job:
+        those files only add steps of their own (test_push_tier_monotone.py). The second of two
+        approved branches, gated on top of the first, lands on that pass once the first has landed."""
         first = self.commit("a.txt", "a changed\n")
         tip = self.commit("b.txt", "b changed\n")
         self.fleet("done", self.tree(tip), ["a.txt", "b.txt"])
@@ -364,6 +372,58 @@ class PushGate(Repo):
         self.assertEqual((later.returncode != 0, [tree for _, tree, _ in self.jobs()]),
                          (True, [self.tree(second), self.tree(third)]),
                          f"SPEC covering-pass: another tree passed on a wider list's pass\n{later.stderr}")
+
+    def test_a_pass_whose_other_files_reach_a_crate_covers_nothing_narrower(self):
+        """Review r1 (21 Nov 2026): cargo resolves features across the crates one run selects, so a
+        run over more crates isn't the same check of each; and a workspace-wide file selects every
+        crate. A pass whose files beyond the push's reach a crate (under crates/, or workspace-wide)
+        doesn't cover it: the push is gated on its own (here refused: no verdict)."""
+        cases = (("crates/alpha/src/lib.rs", "b.txt"), ("Cargo.lock", "c.txt"))
+        start = self.base
+        for n, (other, own) in enumerate(cases):
+            with self.subTest(other=other):
+                first = self.add(other, f"{other} changed\n")
+                tip = self.commit(own, f"{own} changed\n")
+                self.fleet("done", self.tree(tip), sorted([other, own]))
+                done = self.push((f"refs/heads/pkg/x{n}", tip, f"refs/heads/pkg/x{n}", start))
+                self.assertEqual(done.returncode, 0, f"SPEC verified: {done.stderr}")
+                self.fleet("pending")
+                narrower = self.push((f"refs/heads/pkg/x{n}", tip, f"refs/heads/pkg/x{n}", first))
+                self.assertEqual((narrower.returncode != 0, len(self.jobs())), (True, 2 * n + 2),
+                                 f"SPEC covering-crates: a pass whose {other} reaches a crate covered "
+                                 f"[{own}]\n{narrower.stderr}")
+                start = tip
+
+    def test_a_pass_covers_only_its_own_commit(self):
+        """Review r1 (21 Nov 2026): the push tier draws its random seeds from the commit, and the
+        fleet checks out the commit. Another commit with the same tree and a narrower range isn't
+        covered by the pass: it is gated on its own (here refused: no verdict)."""
+        first = self.commit("a.txt", "a changed\n")
+        tip = self.commit("b.txt", "b changed\n")
+        self.fleet("done", self.tree(tip), ["a.txt", "b.txt"])
+        done = self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", ZERO))
+        self.assertEqual(done.returncode, 0, f"SPEC verified: {done.stderr}")
+        twin = self.git(self.repo, "commit-tree", self.tree(tip), "-p", first, "-m", "the same tree again")
+        self.fleet("pending")
+        again = self.push(("refs/heads/pkg/y", twin, "refs/heads/pkg/y", first))
+        self.assertEqual((again.returncode != 0, [rev for rev, _, _ in self.jobs()]), (True, [tip, twin]),
+                         f"SPEC covering-commit: another commit of the tree passed on the pass\n{again.stderr}")
+
+    def test_a_record_without_its_provenance_covers_nothing(self):
+        """Review r1 (21 Nov 2026): a line in the pass file that is a bare key, with no record of
+        where it ran, is no pass, though its file list is kept: the push is gated on its own."""
+        first = self.commit("a.txt", "a changed\n")
+        tip = self.commit("b.txt", "b changed\n")
+        kept = subprocess.run(["git", "hash-object", "-w", "--stdin"], input=b"a.txt\nb.txt\n", capture_output=True,
+                              cwd=self.repo, env=self.env, check=True).stdout.decode().strip()
+        identity = subprocess.run([BASH, "-c", ". scripts/lib/gate-key.sh && gate_identity HEAD"], cwd=self.repo,
+                                  capture_output=True, text=True, env=self.env).stdout.strip()
+        common = Path(self.git(self.repo, "rev-parse", "--absolute-git-dir"))
+        (common / "nrese-gate-passed").write_text(f"push {self.tree(tip)} {kept} {identity} fleet\n", newline="\n")
+        self.fleet("pending")
+        done = self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", first))
+        self.assertEqual((done.returncode != 0, len(self.jobs())), (True, 1),
+                         f"SPEC covering-record: a bare key covered the push\n{done.stderr}")
 
     def test_the_files_come_from_the_pushed_range(self):
         """The gate is told the files of the pushed range, from where the remote has the branch
@@ -442,6 +502,21 @@ class PushGate(Repo):
         again = self.push(landing)
         self.assertEqual((again.returncode, len(list(self.fake.glob("job-*.toml")))), (0, 3),
                          f"SPEC landing-windows-reuse: the merge check's pass didn't serve the push\n{again.stderr}")
+
+    def test_a_hook_that_cant_tell_whether_a_ref_lands_refuses_it(self):
+        """Review r1 (21 Nov 2026): the hook asks scripts/lib/gate-key.sh's landing_ref whether a
+        ref lands. Where the helper lacks it (a hook and helper of different versions), a push to
+        the line is refused, not let through without the Windows part; a deletion still goes."""
+        tip = self.commit("a.txt", "a changed\n")
+        self.fleet("done", self.tree(tip), ["a.txt"])  # the push tier would pass
+        with (self.repo / "scripts/lib/gate-key.sh").open("a", newline="\n") as helper:
+            helper.write("unset -f landing_ref\n")
+        landing = self.push(("refs/heads/refactor/engine-v2", tip, "refs/heads/refactor/engine-v2", self.base))
+        self.assertNotEqual(landing.returncode, 0, f"SPEC landing-unknown: the line took a commit with no Windows "
+                                                   f"part\n{landing.stderr}")
+        self.assertIn("landing_ref", landing.stderr, "SPEC landing-unknown: the refusal names the cause")
+        deletion = self.push(("(delete)", ZERO, "refs/heads/plan/old", self.base))
+        self.assertEqual(deletion.returncode, 0, f"SPEC deletions: {deletion.stderr}")
 
     def test_landing_on_a_release_branch_takes_the_windows_part_too(self):
         """Spec (21 Nov 2026): a release is cut as its own branch, release/<name>, at the freeze; a
