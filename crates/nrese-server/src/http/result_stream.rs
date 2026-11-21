@@ -940,24 +940,37 @@ mod tests {
     }
 
     /// Over HTTP/1.0, a stall bound's first deadline bounds the whole read: a producer still
-    /// going past it gets 408, though it wrote before it (streamed, that would have started a
-    /// 200 the stall bound then keeps going).
+    /// going past it gets 408, though it wrote before it and keeps writing well within the
+    /// stall bound (streamed, that would have started a 200 the stall bound then keeps
+    /// going, to its end).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_held_reads_first_deadline_bounds_all_of_it() {
         let memory = Envelope::new(Some(1 << 30), None);
         let token = CancellationToken::new();
-        let ((wrote, _), (ended, _)) = (std::sync::mpsc::channel(), std::sync::mpsc::channel());
+        let stop = token.clone();
         let held = memory.clone();
         let stopped = WHOLE
             .scope(
                 true,
                 stream_blocking(
-                    Pace::stalled_after(Duration::from_millis(300)),
-                    token.clone(),
+                    Pace::stalled_after(Duration::from_secs(1)),
+                    token,
                     move || held,
                     "text/plain",
                     "timeout",
-                    written_then_stopped(CHUNK_BYTES, token, wrote, ended),
+                    // A chunk every 50 ms for 4 s: far past the first deadline, never near
+                    // the stall bound.
+                    move |writer| {
+                        for _ in 0..80 {
+                            if stop.is_cancelled() {
+                                return Err(ApiError::timeout("stopped"));
+                            }
+                            io::Write::write_all(writer, &[b'x'; CHUNK_BYTES])
+                                .map_err(|error| ApiError::internal(error.to_string()))?;
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
+                        Ok(())
+                    },
                 ),
             )
             .await
