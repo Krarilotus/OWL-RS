@@ -214,12 +214,12 @@ pub(crate) fn bulk_load(
     let quarantined = collector
         .map(Collector::commit)
         .transpose()
-        .map_err(|reason| match published {
+        .map_err(|error| match published {
             true => StoreError::LoadPublished {
                 revision: summary.revision,
-                reason,
+                reason: error.into_io(),
             },
-            false => StoreError::LoadQuarantineNotRecorded(reason),
+            false => StoreError::LoadQuarantineNotRecorded(error),
         })?
         .unwrap_or_default();
     if quarantined.count > 0 {

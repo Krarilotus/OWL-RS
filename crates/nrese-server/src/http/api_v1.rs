@@ -956,6 +956,7 @@ fn start_import(
         job.phase("loading");
         let store = state.store();
         let loaded = store.bulk_load_with(&request, job.progress());
+        let uploaded = remove.is_some();
         drop(remove);
         if let Err(nrese_store::StoreError::LoadPublished { revision, reason }) = &loaded {
             let warning = format!("the quarantine record couldn't be kept: {reason}");
@@ -964,7 +965,12 @@ fn start_import(
             return;
         }
         let outcome = loaded
-            .map_err(|error| error.to_string())
+            .map_err(|error| match error {
+                nrese_store::StoreError::LoadQuarantineNotRecorded(error) if !uploaded => {
+                    error.unpublished_message("load")
+                }
+                error => error.to_string(),
+            })
             .and_then(|loaded| {
                 job.phase("reasoning");
                 let reasoning = match state.pipeline().reasoner().config().materialised_program() {

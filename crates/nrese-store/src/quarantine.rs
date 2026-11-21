@@ -390,7 +390,12 @@ impl Quarantine {
             }
             return Ok(());
         };
-        for path in load_files(dir, "jsonl")? {
+        // Enumerate only after any collector has finished placing or removing its file.
+        let paths = {
+            let _state = self.state();
+            load_files(dir, "jsonl")?
+        };
+        for path in paths {
             for line in BufReader::new(File::open(&path)?).lines() {
                 let line = line?;
                 if line.is_empty() {
@@ -958,6 +963,44 @@ pub(crate) struct LoadFile {
     pub base: Option<String>,
 }
 
+/// An I/O failure committing one load's quarantine records.
+#[derive(Debug, thiserror::Error)]
+pub enum QuarantineCommitError {
+    /// No finished record file remains visible.
+    #[error(transparent)]
+    NotListed(#[from] io::Error),
+    /// The record file was placed but could not be synced or removed.
+    #[error("{reason}")]
+    PossiblyListed {
+        #[source]
+        reason: io::Error,
+        load: String,
+    },
+}
+
+impl QuarantineCommitError {
+    pub(crate) fn into_io(self) -> io::Error {
+        match self {
+            Self::NotListed(reason) | Self::PossiblyListed { reason, .. } => reason,
+        }
+    }
+
+    /// Tells the caller what happened when the load published no RDF changes.
+    pub fn unpublished_message(&self, retry_action: &str) -> String {
+        let advice = match self {
+            Self::NotListed(_) => {
+                format!("It's safe to {retry_action} it again once the cause is resolved.")
+            }
+            Self::PossiblyListed { load, .. } => format!(
+                "This load's records may still be listed under load ID {load}. Check the quarantine before retrying."
+            ),
+        };
+        format!(
+            "the load published nothing. The quarantine record couldn't be kept: {self}. {advice}"
+        )
+    }
+}
+
 /// The quarantine of one load: its statements go to a file named for the load until it
 /// commits ([`Self::commit`]); dropped before, the load leaves nothing.
 pub(crate) struct Collector<'q> {
@@ -1073,27 +1116,47 @@ impl Collector<'_> {
     }
 
     /// The load committed: its statements join the quarantine. Returns what it quarantined.
-    pub(crate) fn commit(self) -> io::Result<Quarantined> {
+    pub(crate) fn commit(self) -> Result<Quarantined, QuarantineCommitError> {
         let count = self.count.load(Ordering::Relaxed);
         #[cfg(feature = "fault-points")]
         if count > 0 && self.quarantine.fail_commit.swap(false, Ordering::Relaxed) {
-            return Err(io::Error::other("simulated failure"));
+            return Err(io::Error::other("simulated failure").into());
         }
         let mut inner =
             std::mem::take(&mut *self.inner.lock().unwrap_or_else(PoisonError::into_inner));
         if count == 0 {
             return Ok(Quarantined::default());
         }
-        if let (Some(out), Some(partial)) = (inner.out.take(), &self.partial) {
+        let partial = if let (Some(out), Some(partial)) = (inner.out.take(), &self.partial) {
             let file = out.into_inner().map_err(|error| error.into_error())?;
             file.sync_data()?;
             drop(file);
+            Some(partial)
+        } else {
+            None
+        };
+        let mut state = self.quarantine.state();
+        if let Some(partial) = partial {
             // Durably named before the load is acknowledged: a
             // load of only invalid statements publishes nothing else.
-            nrese_engine::place::rename(partial, &partial.with_extension("jsonl"))?;
-            nrese_engine::place::sync_dir(partial.parent().expect("in the quarantine directory"))?;
+            let listed = partial.with_extension("jsonl");
+            nrese_engine::place::rename(partial, &listed)?;
+            if let Err(reason) = nrese_engine::place::sync_dir(
+                partial.parent().expect("in the quarantine directory"),
+            ) {
+                if let Err(cleanup) = fs::remove_file(&listed)
+                    && cleanup.kind() != io::ErrorKind::NotFound
+                {
+                    state.total += count;
+                    tracing::warn!(load = %self.load, %cleanup, "couldn't remove an unsynced quarantine record");
+                    return Err(QuarantineCommitError::PossiblyListed {
+                        reason,
+                        load: self.load.clone(),
+                    });
+                }
+                return Err(reason.into());
+            }
         }
-        let mut state = self.quarantine.state();
         state.held.append(&mut inner.held);
         state.total += count;
         drop(state);
