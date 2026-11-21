@@ -905,3 +905,37 @@ fn an_explanation_takes_no_step_through_an_annotation_property() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// Spec (module docs, Direct Semantics §1): a store's first commit, which the engine
+/// materialises at once (a first load), reads the annotation properties it declares itself, as
+/// a later commit does, and the program it leaves for the next commit reads them too. Under
+/// `owl2-ql`, a first commit declaring `:note` an annotation property with the domain `:Doc`
+/// (disjoint from `:Person`) and an irreflexive characteristic, used by `:alice`, a `:Person`,
+/// and by `:y :note :y`, is applied and types no one a `:Doc`; nor does a second commit
+/// using `:note` again.
+#[test]
+fn a_first_load_reads_the_annotation_properties_it_declares() {
+    let store = store(QlRewritingMode::Auto);
+    let reasoning = pipeline(&store, ReasoningMode::Owl2Ql);
+    let mut wrong = Vec::new();
+    for (step, data) in [
+        (
+            "first load",
+            ":note a owl:AnnotationProperty , owl:IrreflexiveProperty ; rdfs:domain :Doc . \
+             :Doc owl:disjointWith :Person . :alice a :Person ; :note \"x\" . :y :note :y .",
+        ),
+        ("next commit", ":bob a :Person ; :note \"y\" ."),
+    ] {
+        let committed = commit(&reasoning, data);
+        if committed != "applied" {
+            wrong.push(format!("{step}: {committed}"));
+        }
+    }
+    for question in [":alice a :Doc", ":y a :Doc", ":bob a :Doc"] {
+        let answer = read(&store, question);
+        if !answer.starts_with("false, ") {
+            wrong.push(format!("{question}: {answer}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
