@@ -309,6 +309,68 @@ fn a_deeply_nested_xml_literal_is_classified() {
     }
 }
 
+/// The shapes of a chain `ex:s0`, `ex:s1`, … `ex:s{length}`, each but the last referring to
+/// the next by `link(next)` (Turtle for the referring shape's own statements), the first
+/// targeting `ex:a`. With `property`, `ex:s1` on are property shapes, with a path as a
+/// property shape must have (SHACL §2.3), and the node shape `ex:s0` has `ex:s1` as its
+/// `sh:property`.
+fn chain(length: usize, property: bool, link: &dyn Fn(&str) -> String) -> String {
+    let mut turtle = String::from(
+        "@prefix ex: <http://example.com/> . @prefix sh: <http://www.w3.org/ns/shacl#> .
+         ex:s0 a sh:NodeShape ; sh:targetNode ex:a .\n",
+    );
+    for i in 0..=length {
+        let path = if property && i > 0 {
+            " ; sh:path ex:p"
+        } else {
+            ""
+        };
+        let next = match i {
+            _ if i == length => String::new(),
+            0 if property => " ; sh:property ex:s1".to_owned(),
+            _ => format!(" ; {}", link(&format!("ex:s{}", i + 1))),
+        };
+        turtle.push_str(&format!("ex:s{i} ex:in ex:chain{path}{next} .\n"));
+    }
+    turtle
+}
+
+/// A shapes graph is well-formed however long a chain of shapes referring to each other
+/// (SHACL §2: a shape's `sh:node`, `sh:property`, `sh:not`, `sh:and`, `sh:or`, `sh:xone` and
+/// `sh:qualifiedValueShape` values are shapes, with no limit on how they nest), so it
+/// compiles, every shape of the chain counted. 100,000 shapes: a compiler that recursed once
+/// per referenced shape would need far more than a test thread's 2 MiB of stack (a frame
+/// per shape), overflow it, and end the process, which fails this test. Run alone, in a
+/// process of its own, one chain per kind of reference: a walk that left one kind recursive
+/// still fails.
+#[test]
+fn a_long_chain_of_shapes_compiles_whatever_refers_to_the_next() {
+    if !measure::alone() {
+        return;
+    }
+    let length = 100_000;
+    let kinds: [(&str, bool, &dyn Fn(&str) -> String); 7] = [
+        ("sh:node", false, &|next| format!("sh:node {next}")),
+        ("sh:property", true, &|next| format!("sh:property {next}")),
+        ("sh:not", false, &|next| format!("sh:not {next}")),
+        ("sh:and", false, &|next| format!("sh:and ( {next} )")),
+        ("sh:or", false, &|next| format!("sh:or ( {next} )")),
+        ("sh:xone", false, &|next| format!("sh:xone ( {next} )")),
+        ("sh:qualifiedValueShape", true, &|next| {
+            format!("sh:qualifiedValueShape {next} ; sh:qualifiedMinCount 1")
+        }),
+    ];
+    for (kind, property, link) in kinds {
+        let snapshot = load(&chain(length, property, link));
+        let graph = snapshot
+            .lookup(NamedNodeRef::new_unchecked(SHAPES).into())
+            .expect("the shapes graph");
+        let shapes = compile(&snapshot, Selection::asserted(GraphSelector::Exact(graph)))
+            .unwrap_or_else(|errors| panic!("{kind}: {errors:?}"));
+        assert_eq!(shapes.len(), length + 1, "{kind}");
+    }
+}
+
 /// Doubling the values of each parameter at most doubles what compiling the shapes holds at
 /// once (it adds as many statements); built once per combination, it would hold eight times
 /// as much.
