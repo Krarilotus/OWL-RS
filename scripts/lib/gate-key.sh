@@ -106,6 +106,17 @@ gate_runtime() {
 # gate_python RUNTIME: the key's name of RUNTIME (gate_runtime), `python=<id>`.
 gate_python() { printf 'python=%s\n' "$(printf '%s\n' "$1" | git hash-object --stdin | cut -c1-12)"; }
 
+# landing_ref REF: whether a push to REF lands its commit: on the line, refactor/engine-v2, or on a
+# release branch cut from it at a freeze, release/<name>. Such a push takes the merge check's
+# Windows part besides its push tier (.githooks/pre-push), and both tiers' jobs are merge gates on
+# the fleet (scripts/lib/fleet-gate.sh).
+landing_ref() {
+  case $1 in
+    refs/heads/refactor/engine-v2 | refs/heads/release/?*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 gate_passed_file() { printf '%s/nrese-gate-passed\n' "$(git rev-parse --git-common-dir)"; }
 
 # gate_pass KEY: the record of a pass for KEY (where it ran), if one is recorded.

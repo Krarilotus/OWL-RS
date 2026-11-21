@@ -22,8 +22,9 @@
 #                                  hand: HEAD, from its upstream (else from where it left
 #                                  origin's refactor/engine-v2), so a push then finds the pass;
 #                                  NRESE_PUSH_REF names the ref it will go to, as the hook's
-#                                  does (a merge check: refs/heads/refactor/engine-v2, which
-#                                  makes its job a merge gate on the fleet). A value the
+#                                  does (a merge check: refs/heads/refactor/engine-v2, or a
+#                                  release branch refs/heads/release/<name>, which makes its
+#                                  job a merge gate on the fleet). A value the
 #                                  caller's environment already holds is that caller's word.
 #        scripts/check.sh windows [COMMIT]
 #                                  the merge check's Windows part, on the fleet only
@@ -35,7 +36,8 @@
 #                                  passed before, under the Python runtime it declares
 #                                  (gate_runtime), carries that pass: "carried from <commit>".
 #                                  NRESE_PUSH_REF as for push: the merge check's Windows part
-#                                  for refactor/engine-v2 is a merge gate, a package's isn't.
+#                                  for refactor/engine-v2 or a release branch is a merge gate,
+#                                  a package's isn't.
 #        scripts/check.sh [all]    milestones and CI: everything, both Cargo workspaces,
 #                                  doc tests, cargo-deny, the console.
 #        scripts/check.sh crates FILE...

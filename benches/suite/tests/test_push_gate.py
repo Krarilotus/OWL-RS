@@ -443,6 +443,28 @@ class PushGate(Repo):
         self.assertEqual((again.returncode, len(list(self.fake.glob("job-*.toml")))), (0, 3),
                          f"SPEC landing-windows-reuse: the merge check's pass didn't serve the push\n{again.stderr}")
 
+    def test_landing_on_a_release_branch_takes_the_windows_part_too(self):
+        """Spec (21 Nov 2026): a release is cut as its own branch, release/<name>, at the freeze; a
+        fix pushed there lands as on the line: the push tier and the merge check's Windows part,
+        both merge gates. A package whose name holds "release" takes neither."""
+        gate = 'priority_class = "merge-gate"'
+        tip = self.commit("a.txt", "a changed\n")
+        self.fleet("done", self.tree(tip), ["a.txt"], separate=True)
+        self.fleet("done", self.tree(tip), tier="windows", separate=True)
+        package = self.push(("refs/heads/pkg/release-notes", tip, "refs/heads/pkg/release-notes", ZERO))
+        landing = self.push(("refs/heads/r", tip, "refs/heads/release/v1.5.1", self.base))
+        diagnostics = "\n".join(f"hook {i}: rc={d.returncode}\nstderr:\n{d.stderr}"
+                                for i, d in enumerate((package, landing), 1))
+        self.assertEqual([package.returncode, landing.returncode], [0, 0], diagnostics)
+        jobs = [("windows" if "windows-job.ps1" in path.read_text() else "push",
+                 re.findall(r"^priority_class = .*$", path.read_text(), re.M))
+                for path in sorted(self.fake.glob("job-*.toml"))]
+        # The package's push tier; the release branch's push tier passed before for this tree and
+        # these files, then its Windows part.
+        self.assertEqual(jobs, [("push", []), ("windows", [gate])],
+                         "SPEC release-landing: the release branch's push took no Windows part, or not as a merge "
+                         "gate\n" + diagnostics)
+
 
 class FleetGate(Repo):
     """scripts/lib/fleet-gate.sh on its own, against a stand-in for the fleet's CLI that keeps several
@@ -574,6 +596,12 @@ esac
             ("push", chained, v2, gate),
             ("push", integrated, "refs/heads/pkg/integrated", None),
             ("push", chained, None, None),  # by hand, naming no ref
+            # A release branch, cut from the line at a freeze, lands its fixes as the line does
+            # (21 Nov 2026); a package's name holding "release" is still a package.
+            ("push", chained, "refs/heads/release/v1.5.1", gate),
+            ("windows", chained, "refs/heads/release/v1.5.1", gate),
+            ("push", integrated, "refs/heads/pkg/release-notes", None),
+            ("push", integrated, "refs/heads/release", None),
         ]
         for mode, commit, ref, want in cases:
             self.reset()
