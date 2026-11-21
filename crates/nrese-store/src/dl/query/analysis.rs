@@ -354,6 +354,21 @@ pub(super) fn negation(query: &Query) -> Option<&'static str> {
     found
 }
 
+/// Whether `query` may read the store's default graph by `GRAPH`, whatever its dataset: a
+/// `GRAPH` naming it by another store's name for it ([`nrese_sparql::compat`]), or a variable,
+/// which `VALUES` or `BIND` may bind to such a name. One walk.
+pub(super) fn may_read_store_default_by_graph(query: &Query) -> bool {
+    let mut found = false;
+    pattern_of(query).find(&mut |node| {
+        found = matches!(node, Node::Pattern(GraphPattern::Graph { name, .. }) if match name {
+            NamedNodePattern::NamedNode(n) => nrese_sparql::compat::names_default_graph(n.as_str()),
+            NamedNodePattern::Variable(_) => true,
+        });
+        found
+    });
+    found
+}
+
 /// The first value `query` matches against the data by its spelling, where it may be a
 /// typed literal: a literal that is no string (simple or language-tagged) at a pattern's or
 /// a path's end; or a variable at such an end, anywhere in the query, that `VALUES` binds to

@@ -1395,7 +1395,13 @@ impl StoreService {
         let mut status = route?;
         let source = if certificate.dl { "dl" } else { "transaction" };
         if let Revision::Pending(_, deletes) = at {
-            let closure = if certificate.dl { CLOSURE } else { "" };
+            // A read whose dataset leaves out the default graph reads no committed closure.
+            let reads_closure = prepared.dataset_omission_reason().is_none();
+            let closure = if certificate.dl && reads_closure {
+                CLOSURE
+            } else {
+                ""
+            };
             status.incomplete(source, format!("{PENDING}{closure}"));
             if deletes {
                 status.unsound("transaction", DELETES.to_owned());

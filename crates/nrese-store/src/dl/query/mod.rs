@@ -309,24 +309,26 @@ pub(crate) fn plan_status(
     let decided = decided(store, snapshot, prepared, cancellation)?;
     let completeness = match decided.as_ref() {
         Ok(at) => plan_status_built(store, prepared, &analysis, at).completeness,
-        Err(why) => Status::sound_only(fallback_reason(prepared, why)).completeness,
+        Err(why) => fallback(prepared, why).completeness,
     };
     Ok(composed(store, prepared, snapshot, &decided, completeness))
 }
 
-/// Reason when the DL bounds view isn't used (`PART`, `LATER`, `DEADLINE`): a whole-dataset
-/// reader whose query dataset leaves out the store's default graph is not reading the RL
-/// closure, so the dataset-omission explanation replaces `LATER` / `DEADLINE`. A reader of
-/// some graphs keeps [`PART`]: it never reads the bounds, and under `owl2-dl` it is told
-/// `not-certified` whatever the reason (`status_for_its_reader` in `service.rs`), so no
-/// reason here reaches it.
-fn fallback_reason(prepared: &PreparedQuery, why: &'static str) -> &'static str {
+/// The status when the DL bounds view isn't used ([`PART`], [`LATER`], [`DEADLINE`]): `why`,
+/// and, for a reader of every graph whose dataset leaves out the store's default graph and
+/// whose query doesn't read it by `GRAPH` either, that it reads none of the closure there. A
+/// reader of some graphs keeps [`PART`] alone: it never reads the bounds, and under `owl2-dl`
+/// it is told `not-certified` whatever the reason (`status_for_its_reader` in `service.rs`),
+/// so no reason here reaches it.
+fn fallback(prepared: &PreparedQuery, why: &str) -> Status {
+    let mut status = Status::sound_only(why);
     if prepared.access().is_none()
         && let Some(reason) = prepared.dataset_omission_reason()
+        && !may_read_store_default_by_graph(prepared.query())
     {
-        return reason;
+        status.add(reason.to_owned());
     }
-    why
+    status
 }
 
 /// The bounds' view of `snapshot` its answers and their status are decided on, or
@@ -1032,9 +1034,7 @@ pub(crate) fn answer(
     let read = (cancellation, deadline_of(store, prepared));
     let mut outcome = match decided.as_ref() {
         Ok(at) => decide_answers(store, prepared, &analysis, at, read, memory, mode)?,
-        Err(why) => {
-            Status::sound_only(fallback_reason(prepared, why)).stream(Read::At(snapshot.clone()))
-        }
+        Err(why) => fallback(prepared, why).stream(Read::At(snapshot.clone())),
     };
     #[cfg(test)]
     crate::service::hooks::run(&crate::service::hooks::AFTER_DECIDED);
