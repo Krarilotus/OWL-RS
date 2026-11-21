@@ -504,16 +504,21 @@ fn a_refused_message_holds_less_than_its_language_tag() {
 }
 
 /// A change's validation looks the filled message of the state before up in the state
-/// after's dictionary (its frontier), charged by its bound before. The state after is a
-/// transaction's pending state, as every caller passes it: its lookup is the shared
-/// dictionary's, here on a compressed base (the checkpoint maps it so; a failed mapping
-/// would only be logged). A private view's overlay, which makes its own key as well, is
-/// not measured here: no caller validates a change against one. A 1 MiB message that
-/// neither state stores, the same before and after the change. What the validation holds
-/// beyond its charge stays under 64 KiB (2,708 bytes measured), so a lookup charged
-/// nothing, or less than its key (the message's length), fails here. A charge spent later
-/// in the validation can hide less than that much (the measurement is the largest gap
-/// over the whole run).
+/// after's dictionary (its frontier), charged by its bound before: the frontier code both
+/// `validate_changes` and `validate_shapes_change` use. The state after is a transaction's
+/// pending state, as every caller passes it: its lookup is the shared dictionary's, on a
+/// compressed base (assumed: the checkpoint maps it so, and a failed mapping would only be
+/// logged). The message is 1 MiB, the same before and after the change, and neither state
+/// stores it. What the validation holds beyond its charge stays under 64 KiB (a few KiB
+/// measured).
+///
+/// What this catches and what it doesn't: the message compresses well, so its lookup holds
+/// about 4 × its length; a charge below that fails here, one between it and the engine's
+/// bound for this path (7 × the encoded length) does not. Not measured: a message the
+/// compressor makes longer than itself, and a private view's overlay, which makes its own
+/// key as well (no caller validates a change against one). Charge reserved but not yet
+/// spent when the lookup runs could hide an undercount; here there is next to none (a
+/// bound of the message's length alone holds 3 × its length beyond its charge).
 #[test]
 fn a_message_looked_up_through_the_frontier_is_charged_for_its_lookup() {
     if !measure::alone() {
@@ -566,7 +571,8 @@ fn a_message_looked_up_through_the_frontier_is_charged_for_its_lookup() {
         GraphNameRef::DefaultGraph,
     );
     tx.commit().expect("commit");
-    // The dictionary's base, compressed from here on.
+    // The dictionary's base, compressed from here on if its mapping succeeds (a failure is
+    // only logged).
     engine.checkpoint().expect("checkpoint");
     let before = engine.snapshot();
     let graph = before
