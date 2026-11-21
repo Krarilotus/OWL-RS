@@ -658,6 +658,13 @@ fn query(
     }
 }
 
+/// FNV-1a (64-bit) of `text`: fixed by its definition, the same on every Rust version.
+fn fnv1a(text: &str) -> u64 {
+    text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
 /// Check one fixed query per generator family. The disjoint case keeps the exact input
 /// from seed 15, where a false completeness claim hid two certain rows.
 fn pinned_oracle_witnesses(expiry: &Expiry) {
@@ -678,20 +685,27 @@ fn pinned_oracle_witnesses(expiry: &Expiry) {
         disjoint.query,
     );
     let mut witnessed = BTreeSet::from([disjoint.name]);
-    // Family, exact generation seed (after any redraw), query index. Each witness is compared
-    // in both regimes, `Agree` or `Reported`: which of the two is the rulesets' precision.
-    for (family, seed, query) in [
-        ("asserted", 23, 0),
-        ("bounded", 37, 0),
-        ("left", 7, 0),
-        ("review", 21, 0),
-        ("self-nominal", 42_880_953_483_324, 0),
-        ("sol", 8, 0),
-        ("uniform", 2_199_023_255_552, 0),
-        ("universal", 8_796_093_022_283, 1),
+    // Family, exact generation seed (after any redraw), query index, and the FNV-1a hash of the
+    // N-Triples, a newline and the query, so that a changed generator can't swap the input
+    // unnoticed. Each witness is compared in both regimes, `Agree` or `Reported`: which of the
+    // two is the rulesets' precision.
+    for (family, seed, query, frozen) in [
+        ("asserted", 23, 0, 0x460b_e6cd_97bf_a9f0),
+        ("bounded", 37, 0, 0x182f_54eb_af35_b1be),
+        ("left", 7, 0, 0x0aa7_f7c3_dd0c_f526),
+        ("review", 21, 0, 0xbd85_4fd0_82e2_5720),
+        ("self-nominal", 42_880_953_483_324, 0, 0x389d_f3df_b226_82fb),
+        ("sol", 8, 0, 0xe691_5290_cd3f_146c),
+        ("uniform", 2_199_023_255_552, 0, 0x1965_0058_b34c_146f),
+        ("universal", 8_796_093_022_283, 1, 0x230b_a045_7987_9ca4),
     ] {
         let (turtle, actual_family, queries) = generated(seed);
         assert_eq!(actual_family, family, "pinned seed {seed}");
+        assert_eq!(
+            fnv1a(&format!("{turtle}\n{}", queries[query])),
+            frozen,
+            "pinned seed {seed} ({family}) generates another input: choose its witness again"
+        );
         let case = Case {
             name: family,
             turtle: &turtle,
