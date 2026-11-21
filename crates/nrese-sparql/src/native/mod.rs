@@ -6770,9 +6770,9 @@ impl<'a> Context<'a> {
                 column: usize,
                 expr: &'e Expression,
             },
-            /// `COUNT` of an expression beside a `SUM` or `AVG` of it (that plan's index):
-            /// that one's count, as a term that is no number ends the pass and an error
-            /// counts in neither.
+            /// `COUNT` of a variable or an expression beside a `SUM` or `AVG` of it (that
+            /// plan's index): that one's count, as a bound variable is a value, a term that
+            /// is no number ends the pass, and an error counts in neither.
             CountOf(usize),
         }
         // The one column `expr` reads, if it reads one.
@@ -6832,13 +6832,23 @@ impl<'a> Context<'a> {
             return Ok(None);
         }
         for a in 0..plans.len() {
-            if let Plan::Counted { column, expr } = plans[a] {
-                let twin = plans.iter().position(|plan| {
-                    matches!(plan, Plan::Total { column: c, expr: e, .. } if *c == column && **e == *expr)
-                });
-                if let Some(twin) = twin {
-                    plans[a] = Plan::CountOf(twin);
-                }
+            let twin = plans.iter().position(|plan| match (&plans[a], plan) {
+                (
+                    Plan::Counted { column, expr },
+                    Plan::Total {
+                        column: c, expr: e, ..
+                    },
+                ) => c == column && e == expr,
+                (
+                    Plan::Bound(column),
+                    Plan::Total {
+                        column: c, expr, ..
+                    },
+                ) => c == column && matches!(expr, Expression::Variable(_)),
+                _ => false,
+            });
+            if let Some(twin) = twin {
+                plans[a] = Plan::CountOf(twin);
             }
         }
         #[derive(Clone, Copy)]
