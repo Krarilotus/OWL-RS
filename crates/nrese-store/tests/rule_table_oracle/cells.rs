@@ -470,47 +470,60 @@ fn chain_with(extra: &str) -> generator::Write {
 }
 
 #[test]
-fn an_oversized_walk_leaves_out_the_whole_chain() {
-    // The tables derive the one-cell exit. The enumerated form leaves the
-    // whole head out when another accepting walk exceeds the encoder limit.
+fn oversized_walks_keep_their_short_alternatives() {
+    // Tables 5, 6 and 9 derive the short alternatives' chain, membership and
+    // subclass rows. Diagnose only the oversized walk in each case.
     use nrese_reasoner::{ReasonerConfig, ReasoningMode};
 
-    let mut input = generator::long_chain(251).writes.remove(0);
-    input
-        .insert
-        .extend(insert("ex:c0 rdf:rest rdf:nil\nex:a ex:p ex:b").insert);
-    let watch = crate::triple(["ex:a", "ex:out", "ex:b"]);
-    let model = oracle::evaluate(
-        &input.insert.iter().cloned().collect(),
-        oracle::Datatypes::Standard,
-    );
-    assert!(model.facts.contains(&watch));
-
     let rl = ReasoningMode::Owl2Rl;
-    for &mode in judges::MODES {
-        let store = judges::open(mode, None);
-        let raw = judges::pipeline(&store, ReasoningMode::Disabled);
-        assert!(judges::apply(&raw, &insert("rdf:nil ex:marker ex:seed")));
-        assert!(judges::apply(&raw, &input));
-        let snapshot = store.read_snapshot(None).unwrap();
-        let id = |name| {
-            snapshot
-                .lookup(nrese_rdf::NamedNodeRef::new(name).unwrap().into())
-                .unwrap()
-                .raw()
-        };
-        assert!(id(nrese_rdf::vocab::rdf::NIL.as_str()) < id("http://example.org/c1"));
-        let _reader = judges::pipeline(&store, rl);
-        let program = ReasonerConfig::for_mode(rl).materialised_program().unwrap();
-        let report = store.rematerialise(program).unwrap();
-        assert!(
-            report.diagnostics.iter().any(|d| d.kind == "list-too-long"),
-            "{mode}"
+    for (length, axiom, data, answers) in [
+        (
+            257,
+            "owl:intersectionOf",
+            "ex:a rdf:type ex:p",
+            "ex:a rdf:type ex:out\nex:out rdfs:subClassOf ex:p",
+        ),
+        (
+            251,
+            "owl:propertyChainAxiom",
+            "ex:a ex:p ex:b",
+            "ex:a ex:out ex:b",
+        ),
+    ] {
+        let mut input = generator::long_chain(length).writes.remove(0);
+        input.insert[0][1] = axiom.into();
+        input
+            .insert
+            .extend(insert(&format!("ex:c0 rdf:rest rdf:nil\n{data}")).insert);
+        let answers = generator::rows(answers);
+        let model = oracle::evaluate(
+            &input.insert.iter().cloned().collect(),
+            oracle::Datatypes::Standard,
         );
-        assert!(
-            !judges::ask(&store, &watch).0,
-            "{mode}: short exit survived"
-        );
+        assert!(answers.iter().all(|answer| model.facts.contains(answer)));
+
+        for &mode in judges::MODES {
+            let store = judges::open(mode, None);
+            let raw = judges::pipeline(&store, ReasoningMode::Disabled);
+            assert!(judges::apply(&raw, &insert("rdf:nil ex:marker ex:seed")));
+            assert!(judges::apply(&raw, &input));
+            let snapshot = store.read_snapshot(None).unwrap();
+            let id = |name| {
+                let iri = nrese_rdf::NamedNodeRef::new(name).unwrap();
+                snapshot.lookup(iri.into()).unwrap().raw()
+            };
+            assert!(id(nrese_rdf::vocab::rdf::NIL.as_str()) < id("http://example.org/c1"));
+            let _reader = judges::pipeline(&store, rl);
+            let program = ReasonerConfig::for_mode(rl).materialised_program().unwrap();
+            let report = store.rematerialise(program).unwrap();
+            for answer in &answers {
+                assert!(judges::ask(&store, answer).0, "{mode}: missing {answer:?}");
+            }
+            assert!(
+                report.diagnostics.iter().any(|d| d.kind == "list-too-long"),
+                "{mode}: {axiom} must report its oversized walk"
+            );
+        }
     }
 }
 

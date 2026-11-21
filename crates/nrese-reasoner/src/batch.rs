@@ -3339,6 +3339,8 @@ fn run_body(
                 schema.list_projection().or(lists),
                 &mut result.diagnostics,
             );
+            // Replacement-rule removal can change the template prefix only without a projection.
+            debug_assert!(equality.is_none() || schema.list_projection().is_none());
             if let Some(equality) = &equality {
                 source.retain(|r| !is_replacement_rule(r, equality.same_as));
             }

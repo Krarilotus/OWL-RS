@@ -7,7 +7,8 @@
 //! the `rdf:first`/`rdf:rest` helper rules that generic rulesets need.
 //!
 //! Lists are read from the facts: each cell on a walk to `rdf:nil` supplies one
-//! `rdf:first` and one `rdf:rest`. Only cells on such a walk contribute rules.
+//! `rdf:first` and one `rdf:rest`. Only cells on such a walk contribute enumerated
+//! rules. Past the 64-walk cap, the pairwise fallback still reads cells as written.
 //! A head with no walk is diagnosed. For a cycle the reader marks the axiom
 //! incomplete and keeps the rules of walks previously read up to `rdf:nil`.
 //!
@@ -677,8 +678,6 @@ pub(crate) fn instantiate_projected(
                 };
                 match read {
                     Ok(variants) => {
-                        let rules_before = rules.len();
-                        let premises_before = premises.len();
                         let most = kind.member_limit();
                         for (members, used) in variants {
                             let before = rules.len();
@@ -694,14 +693,8 @@ pub(crate) fn instantiate_projected(
                                     members: members.len(),
                                     most,
                                 });
-                                if cycle.is_some() {
-                                    rules.truncate(before);
-                                    continue;
-                                }
-                                // Every walk of this head has to fit the enumerated form.
-                                rules.truncate(rules_before);
-                                premises.truncate(premises_before);
-                                break;
+                                rules.truncate(before);
+                                continue;
                             }
                             let mut facts_used = used;
                             facts_used.push([subject, predicate, head]);
