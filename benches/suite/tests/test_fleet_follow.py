@@ -185,6 +185,25 @@ class FleetFollow(push.Repo):
                                  f"SPEC cap-at-once: not no verdict with one cancel\n{err}")
                 self.assertLess(took, 25, f"SPEC cap-at-once: it slept a poll after the deadline ({took:.1f} s)\n{err}")
 
+    def test_no_poll_is_slept_after_a_slow_host_passed_the_deadline(self):
+        """A timely `running` answer, but taking it in on a slow host (the host's name read from it,
+        here an `awk` that takes 5 s) outlasts MAX_S: the wait ends there, with no verdict and one
+        cancel, and doesn't sleep its 30 s poll first. The bound of 25 s leaves room for a slow host's
+        start-up."""
+        shim = self.fake / "bin" / "awk"
+        shim.write_text("#!/bin/sh\n[ \"$1\" = '{ print $2 }' ] && sleep 5\nexec /usr/bin/awk \"$@\"\n", newline="\n")
+        shim.chmod(0o755)
+        self.addCleanup(shim.unlink)
+        self.env.update(NRESE_GATE_POLL_S="30", NRESE_GATE_MAX_S="4")
+        self.play("status", state("running"))
+        self.play("results", self.results())
+        began = time.monotonic()
+        code, where, _, err = self.gate()
+        took = time.monotonic() - began
+        self.assertEqual((code, where, self.cancels(), self.calls("status")), (75, "", ["gate-1"], 1),
+                         f"SPEC cap-at-once: not no verdict with one cancel after one status call\n{err}")
+        self.assertLess(took, 25, f"SPEC cap-at-once: it slept a poll after MAX_S ({took:.1f} s)\n{err}")
+
     def test_a_job_that_ended_while_the_fleet_was_silent_is_judged_by_its_result(self):
         """The job fails on its host while the fleet doesn't answer; once it answers again, inside
         the cap, the gate reads the job's result, and the verdict is the result's."""

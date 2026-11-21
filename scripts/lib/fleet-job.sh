@@ -18,8 +18,8 @@
 # end: the job is neither judged nor cancelled for it, and a pending job's start window doesn't run
 # meanwhile. A spell of it ends the wait only once it has lasted NRESE_FLEET_SILENT_S seconds
 # (default 600) or MAX_S has passed; then the job is cancelled. Both are checked before every fleet
-# call and again when it returns: no call starts after either, and an answer that came after either
-# isn't taken. A job is never submitted again.
+# call, again when it returns, and before every sleep: no call starts and no sleep begins after
+# either, and an answer that came after either isn't taken. A job is never submitted again.
 fleet_bin=${NRESE_FLEET_BIN:-$(git config --get nrese.fleetBin || echo ${HOME:+"$HOME"/Documents/fleet-scheduler/state/owlrs/bin/fleet.exe})}
 fleet_id=""
 fleet_state=""
@@ -104,13 +104,15 @@ if j.get("state"):
         cancelled | blocked) fleet_say "it was $fleet_state"; fleet_id=""; return 75 ;;
       esac
     fi
+    # And before the sleep: taking the answer in can itself outlast MAX_S on a slow host.
+    fleet_may_wait "$quiet" || { fleet_cancel; return 75; }
     sleep "$poll_s"
   done
 }
 
 # fleet_may_wait [SINCE]: whether the wait may go on: MAX_S not passed and, where a silence began at
-# SINCE (in SECONDS), that silence still under its cap. Asked before every fleet call, and after it
-# returns, before its answer is taken.
+# SINCE (in SECONDS), that silence still under its cap. Asked before every fleet call, after it
+# returns (before its answer is taken), and before every sleep.
 fleet_may_wait() {
   local since=${1:-}
   if [ $SECONDS -ge $fleet_end_by ]; then
