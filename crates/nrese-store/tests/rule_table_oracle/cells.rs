@@ -415,6 +415,35 @@ fn accepting_walk_survives_a_side_loop() {
 }
 
 #[test]
+fn accepting_walk_is_maintained_when_a_branch_changes() {
+    // Spec: Tables 3 and 5 keep the first branch's conclusion through all
+    // writes. Completing the other branch adds its conclusion until its
+    // last edge is deleted, including after the store has been reopened.
+    let mut fixture = case(
+        "edit-incomplete-branch",
+        ["ex:a", "ex:out", "ex:c"],
+        vec![
+            chain_with(
+                "
+                ex:h rdf:rest ex:branch
+                ex:branch rdf:first ex:r
+                ex:b ex:r ex:d
+                ",
+            ),
+            delete("ex:h rdf:rest ex:branch"),
+            insert("ex:h rdf:rest ex:branch"),
+            insert("ex:branch rdf:rest rdf:nil"),
+            delete("ex:branch rdf:rest rdf:nil"),
+        ],
+    );
+    let accepted = &[true; 5];
+    let kept = matches_oracle(&fixture, accepted, &[true; 5]);
+    fixture.watch = crate::triple(["ex:a", "ex:out", "ex:d"]);
+    let changed = matches_oracle(&fixture, accepted, &[false, false, false, true, false]);
+    assert!(kept && changed, "branch edits differ from the oracle");
+}
+
+#[test]
 #[ignore = "documented limit reasoning-semantics.md:63-65: asserting an entailed shortcut changes the first load's chain answer"]
 fn redundant_list_premise_leaves_chain_unchanged() {
     // Spec: Table 9 scm-spo and Table 5 prp-spo1 and prp-spo2 give the same
