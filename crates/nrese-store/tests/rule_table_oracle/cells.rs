@@ -264,7 +264,7 @@ fn unnamed_union_membership_is_visible_when_consumed() {
     }
 }
 
-fn check(cell: Case, accepted: &[bool], present: &[bool]) {
+pub(super) fn check(cell: Case, accepted: &[bool], present: &[bool]) {
     assert!(
         matches_oracle(&cell, accepted, present),
         "{} differs from the oracle",
