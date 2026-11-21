@@ -1386,25 +1386,22 @@ fn update_body<B: Base + ?Sized>(
         .into_iter()
         .filter(|&(c, _)| !is_full(c))
         .collect();
-    // An instance with a changed guard can still give the same witness. Test each
-    // candidate against the old state before recording it in the report.
     let deleted_facts = OnceCell::new();
-    let old_witnesses = OnceCell::new();
-    let was_present = |name: &str, bindings: &[Option<u64>], poll: &Poller<'_>| {
-        let Some(index) = old_witnesses
-            .get_or_init(|| WitnessIndex::new(old_program, memory, operation, poll).ok())
-        else {
-            return Err(Stopped);
-        };
-        let before = Overlay {
+    let was_present = old_witness_filter(
+        old_program,
+        || Overlay {
             base,
             hidden: &inserted_set,
             extra: deleted_facts.get_or_init(|| Store::new(deleted.to_vec())),
-        };
-        index.contains(&before, name, bindings, poll)
-    };
-    let exclude_old = (!deleted.is_empty() && !old_program.consistency.is_empty())
-        .then_some(&was_present as &super::batch::WitnessFilter<'_>);
+        },
+        memory,
+        operation,
+    );
+    // An instance evaluated in full can report an old witness even on an insert,
+    // for example when adding a list member changes its guard.
+    let exclude_old = (!old_program.consistency.is_empty()
+        && (!deleted.is_empty() || first_full < program.consistency.len()))
+    .then_some(&was_present as &super::batch::WitnessFilter<'_>);
     let mut found = Violations::new(Arc::clone(memory));
     check(
         &state,
@@ -1416,7 +1413,7 @@ fn update_body<B: Base + ?Sized>(
         exclude_old,
     )?;
     // The index borrows the old program, which may be moved into the result below.
-    drop(old_witnesses);
+    drop(was_present);
     check_stop()?;
     result.violations = found;
     lap(4, &mut result);
@@ -1441,6 +1438,23 @@ fn update_body<B: Base + ?Sized>(
     Ok(result)
 }
 
+/// Probe the before state only when there is a candidate witness to report.
+fn old_witness_filter<'a, S: Source>(
+    program: &'a GroundProgram,
+    before: impl Fn() -> S + 'a,
+    memory: &'a Budget,
+    operation: &'a super::eval::OperationStop<'_>,
+) -> impl Fn(&str, &[Option<u64>], &Poller<'_>) -> Result<bool, Stopped> + 'a {
+    let old_witnesses = OnceCell::new();
+    move |name, bindings, poll| {
+        let index = old_witnesses
+            .get_or_init(|| WitnessIndex::new(program, memory, operation, poll).ok())
+            .as_ref()
+            .ok_or(Stopped)?;
+        index.contains(&before(), name, bindings, poll)
+    }
+}
+
 /// The consistency violations a change that only inserts introduces, given the facts it
 /// adds: `inserted` (asserted, new to the state) and `derived` (inferred, not visible
 /// before). [`update_with`]'s own last phase without its insert rounds, for a caller that
@@ -1458,16 +1472,8 @@ pub fn introduced_violations<B: Base + ?Sized>(
     operation: &super::eval::OperationStop<'_>,
     memory: &Arc<Budget>,
 ) -> Result<Violations, Interrupted> {
-    introduced_violations_body(
-        base,
-        inserted,
-        derived,
-        rules,
-        cache,
-        &|| operation.fired(),
-        memory,
-    )
-    .map_err(|_| operation.interrupted())
+    introduced_violations_body(base, inserted, derived, rules, cache, operation, memory)
+        .map_err(|_| operation.interrupted())
 }
 
 fn introduced_violations_body<B: Base + ?Sized>(
@@ -1476,18 +1482,18 @@ fn introduced_violations_body<B: Base + ?Sized>(
     derived: &[Triple],
     rules: Rules<'_>,
     cache: Option<&GroundProgram>,
-    stop: Stop<'_>,
+    operation: &super::eval::OperationStop<'_>,
     memory: &Arc<Budget>,
 ) -> Result<Violations, Interrupted> {
+    let stop: Stop<'_> = &|| operation.fired();
     let inserted_set: HashSet<Triple> = inserted.iter().copied().collect();
     let empty = Store::default();
-    let computed: Option<GroundProgram> = cache.is_none().then(|| {
-        rules.program(&Overlay {
-            base,
-            hidden: &inserted_set,
-            extra: &empty,
-        })
-    });
+    let before = || Overlay {
+        base,
+        hidden: &inserted_set,
+        extra: &empty,
+    };
+    let computed = cache.is_none().then(|| rules.program(&before()));
     let old_program: &GroundProgram = cache.or(computed.as_ref()).expect("one of them");
     let settled_consistency = old_program.consistency.len();
     let mut new_facts: Vec<Triple> = inserted.iter().chain(derived).copied().collect();
@@ -1530,6 +1536,9 @@ fn introduced_violations_body<B: Base + ?Sized>(
         .into_iter()
         .filter(|&(c, _)| c < settled_consistency)
         .collect();
+    let was_present = old_witness_filter(old_program, before, memory, operation);
+    let exclude_old = (settled_consistency > 0 && settled_consistency < program.consistency.len())
+        .then_some(&was_present as &super::batch::WitnessFilter<'_>);
     let mut found = Violations::new(Arc::clone(memory));
     // It asks the latched stop again before its report is made: the variants above too.
     check(
@@ -1539,7 +1548,7 @@ fn introduced_violations_body<B: Base + ?Sized>(
         &variants,
         &mut found,
         stop,
-        None,
+        exclude_old,
     )?;
     Ok(found)
 }
