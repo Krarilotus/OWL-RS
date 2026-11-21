@@ -411,12 +411,16 @@ async fn hold(
 }
 
 /// The refusal of an answer held whole past `bound`, its envelope's limit; or, where the
-/// memory all queries share is taken, the 503 any request gets that can't have its memory.
+/// memory all queries share is taken, a 503 that may be retried; or, where the process's
+/// memory couldn't be read, a 503 without a hint.
 fn too_large(refused: BudgetExceeded, bound: usize) -> ApiError {
-    if refused.shared || refused.unread {
-        return ApiError::unavailable(format!(
-            "{refused} (budgets.total_query_memory, NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES)"
-        ));
+    let shared =
+        || format!("{refused} (budgets.total_query_memory, NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES)");
+    if refused.unread {
+        return ApiError::unavailable(shared());
+    }
+    if refused.shared {
+        return ApiError::busy(shared());
     }
     ApiError::payload_too_large(format!(
         "This answer is larger than the {} an HTTP/1.0 request can be answered with: HTTP/1.0 \
