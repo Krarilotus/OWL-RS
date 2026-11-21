@@ -252,6 +252,8 @@ fn parse_dl(source: &dyn ConfigSource) -> Result<nrese_store::DlConfig> {
             names::DL_MODEL_LABELS,
             defaults.model_labels,
         )?,
+        // The library's setting only: the server keeps its defaults.
+        treatments: defaults.treatments,
     })
 }
 

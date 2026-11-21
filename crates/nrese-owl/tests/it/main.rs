@@ -3,8 +3,10 @@
 //! on a sample ontology and on random ones.
 
 mod functional;
+mod list_cells;
 mod order;
 mod ql_status;
+mod typing;
 
 use std::collections::HashMap;
 

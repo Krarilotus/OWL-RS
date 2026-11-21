@@ -8,18 +8,19 @@
 //! key feeding only duplicate-insensitive aggregates) work on representatives
 //! ([`super::sets`]).
 //!
-//! A published snapshot's classes (one with a [`SharedState`]) are built at their first use
-//! and kept, process-wide, while it is the latest published snapshot queried; any snapshot of
-//! the same version reads them. An unpublished snapshot's (a transaction's pending state, a
-//! private or an added-to view) are built for its query alone, charged to the query's
-//! budget, and kept nowhere else (published-only admission).
+//! A published snapshot's classes (one with a [`SharedState`]) are built at their first use,
+//! charged to the building query's budget while it runs, and kept, process-wide, while it is
+//! the latest published snapshot queried; any snapshot of the same version reads them. An
+//! unpublished snapshot's (a transaction's pending state, a private or an added-to view) are
+//! built for its query alone, charged to the query's budget, and kept nowhere else
+//! (published-only admission).
 
 use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, SharedState, Snapshot};
-use nrese_exec::Reservation;
+use nrese_exec::{Budget, Reservation};
 use nrese_rdf::NamedNodeRef;
 
 use super::{Context, GraphScope};
@@ -36,8 +37,8 @@ static CACHE: Mutex<Option<(Snapshot, Arc<Representatives>)>> = Mutex::new(None)
 const SHARED: usize = 2 * size_of::<usize>() + size_of::<Representatives>();
 
 /// A query's representatives ([`Context::representatives`]), found at their first use: the
-/// published entry's, or built for the query alone and held with their charge to its budget;
-/// `None` where the budget had no room for them.
+/// published entry's, or built by the query and held with their charge to its budget; `None`
+/// where the budget had no room for them.
 #[derive(Default)]
 pub(super) struct Found(OnceCell<Option<(Arc<Representatives>, Option<Reservation>)>>);
 
@@ -48,6 +49,23 @@ thread_local! {
     /// its caller's thread.
     static BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static REFUSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// What the next build on this thread runs first: a guard's hold on a build in progress.
+    static ON_BUILD: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Runs `hold` at the start of the next build on this thread ([`ON_BUILD`]), once.
+#[cfg(test)]
+pub(super) fn on_build(hold: impl FnOnce() + 'static) {
+    ON_BUILD.set(Some(Box::new(hold)));
+}
+
+/// Runs the hold a guard set for this thread's build ([`on_build`]), if any.
+#[cfg(test)]
+fn held() {
+    if let Some(hold) = ON_BUILD.take() {
+        hold();
+    }
 }
 
 /// Builds begun on this thread ([`BUILDS`]).
@@ -110,6 +128,8 @@ fn bound(snapshot: &Snapshot) -> usize {
 fn build(snapshot: &Snapshot) -> Representatives {
     #[cfg(test)]
     BUILDS.with(|builds| builds.set(builds.get() + 1));
+    #[cfg(test)]
+    held();
     let mut out = HashMap::new();
     // A store kept over representatives knows its classes; its `sameAs` relation, read
     // expanded, would list every pair of each class.
@@ -138,17 +158,56 @@ fn build(snapshot: &Snapshot) -> Representatives {
     out
 }
 
-/// `state`'s representatives admitted to the process-wide entry, replacing what it held: the
-/// entry's only writer, for published state alone. They are built from the token's own
-/// snapshot and kept with it.
-fn admit(
-    cache: &mut Option<(Snapshot, Arc<Representatives>)>,
+/// `snapshot`'s representatives, built for a query and held with their charge to its
+/// `budget`; `None` where the budget has no room for them. One charge before anything is
+/// made: the most the map's tables hold while it grows to its bound, its last table beside
+/// the one it replaces; trimmed to what it holds.
+fn charged(snapshot: &Snapshot, budget: &Arc<Budget>) -> Option<(Representatives, Reservation)> {
+    let mut held = Reservation::new(Arc::clone(budget));
+    let table = super::spatial::map_bytes::<u64, u64>;
+    let growing = table(bound(snapshot)).saturating_mul(2);
+    if held.charge(SHARED.saturating_add(growing)).is_err() {
+        #[cfg(test)]
+        REFUSED.with(|refused| refused.set(refused.get() + 1));
+        return None;
+    }
+    let representatives = build(snapshot);
+    let holds = SHARED + table(representatives.capacity());
+    held.release(held.bytes().saturating_sub(holds));
+    Some((representatives, held))
+}
+
+/// `state`'s representatives admitted to the process-wide entry `cache`: the entry's only
+/// writer, for published state alone. They are built from the token's own snapshot without
+/// the lock, so no other query waits for this build, and charged to the building query's
+/// `budget` while it runs (none where it has no room: then nothing is built or published);
+/// once published they are kept uncharged. Builds that race for one version each build; the
+/// first to publish wins, and the others are dropped with their charges. An entry for a
+/// later revision of the same engine stays: published snapshots of one engine share its
+/// dictionary, and no two engines share one.
+pub(super) fn admit(
+    cache: &Mutex<Option<(Snapshot, Arc<Representatives>)>>,
     state: &SharedState<'_>,
-) -> Arc<Representatives> {
+    budget: &Arc<Budget>,
+) -> Option<(Arc<Representatives>, Option<Reservation>)> {
     let snapshot = state.snapshot();
-    let representatives = Arc::new(build(snapshot));
-    *cache = Some((snapshot.clone(), Arc::clone(&representatives)));
-    representatives
+    let (built, held) = charged(snapshot, budget)?;
+    let built = Arc::new(built);
+    let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((kept, representatives)) = cache.as_ref() {
+        if kept.same_version(snapshot) {
+            return Some((Arc::clone(representatives), None));
+        }
+        if kept.shares_dictionary_with(snapshot) && kept.revision() > snapshot.revision() {
+            return Some((built, Some(held)));
+        }
+    }
+    // A tie on revision can't be ordered (no public commit time): the last writer wins.
+    let evicted = cache.replace((snapshot.clone(), Arc::clone(&built)));
+    // Freed without the lock.
+    drop(cache);
+    drop(evicted);
+    Some((built, Some(held)))
 }
 
 impl Context<'_> {
@@ -179,39 +238,22 @@ impl Context<'_> {
     /// The published entry's representatives for this query's version; else, for a published
     /// snapshot, its own admitted; else built for this query alone.
     fn find_representatives(&self) -> Option<(Arc<Representatives>, Option<Reservation>)> {
-        let mut cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
+        let cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some((kept, representatives)) = cache.as_ref()
             && kept.same_version(&self.snapshot)
         {
             return Some((Arc::clone(representatives), None));
         }
-        if let Some(state) = self.snapshot.shared_state() {
-            return Some((admit(&mut cache, &state), None));
-        }
         drop(cache);
-        // Unpublished: built for this query alone and kept nowhere else, what they hold
-        // charged to the query's budget before it is allocated. Where the budget has no room
-        // for them, the query goes on without: they only let a join run on one identity per
-        // class where its aggregates can't tell, and the join on every identity gives the same
-        // answer.
-        // One charge before anything is made: the most the map's tables hold while it grows to
-        // its bound, its last table beside the one it replaces; trimmed to what it holds.
-        let mut held = Reservation::new(Arc::clone(&self.budget));
-        let table = super::spatial::map_bytes::<u64, u64>;
-        let growing = table(bound(&self.snapshot)).saturating_mul(2);
-        match held.charge(SHARED.saturating_add(growing)) {
-            Ok(()) => {
-                let representatives = build(&self.snapshot);
-                let holds = SHARED + table(representatives.capacity());
-                held.release(held.bytes().saturating_sub(holds));
-                Some((Arc::new(representatives), Some(held)))
-            }
-            Err(_) => {
-                #[cfg(test)]
-                REFUSED.with(|refused| refused.set(refused.get() + 1));
-                None
-            }
+        // Where the query's budget has no room for them, it goes on without: they only let a
+        // join run on one identity per class where its aggregates can't tell, and the join on
+        // every identity gives the same answer.
+        if let Some(state) = self.snapshot.shared_state() {
+            return admit(&CACHE, &state, &self.budget);
         }
+        // Unpublished: built for this query alone and kept nowhere else.
+        let (representatives, held) = charged(&self.snapshot, &self.budget)?;
+        Some((Arc::new(representatives), Some(held)))
     }
 }
 

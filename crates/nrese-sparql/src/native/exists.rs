@@ -229,9 +229,13 @@ fn walk_pattern(pattern: &GraphPattern, out: &mut Walk) {
                 walk_expression(e, out);
             }
         }
-        GraphPattern::Project { variables, .. } => {
+        GraphPattern::Project { variables, inner } => {
             for v in variables {
                 push(out, v);
+            }
+            // A subquery's variables stay inside it, but a draw there is evaluated per row.
+            if out.draws == Some(false) {
+                out.draws = Some(inner.find(&mut pushdown::draw));
             }
         }
         GraphPattern::Distinct { inner }
@@ -270,15 +274,13 @@ pub(super) fn deep_variables(expression: &Expression) -> Vec<Variable> {
 }
 
 /// [`deep_variables`], and whether `expression` draws a new value per evaluation
-/// (`RAND`, `UUID`, `STRUUID`, `BNODE`), in an `EXISTS` too: one walk for both, so a query
-/// that draws nothing walks nothing more. A subquery in an `EXISTS` is not looked into, as
-/// for its variables: an `EXISTS` is evaluated once per distinct value of the row's
-/// variables it mentions ([`Context::exists`]), so rows passed in from outside cannot
-/// make its body draw more often.
-pub(super) fn reads_and_draws(expression: &Expression) -> (Vec<Variable>, bool) {
+/// (`RAND`, `UUID`, `STRUUID`, `BNODE`), in an `EXISTS` and its subqueries too: one walk
+/// for both. Where the query draws nothing (`query_draws` false) it doesn't look for draws,
+/// so it walks nothing more.
+pub(super) fn reads_and_draws(expression: &Expression, query_draws: bool) -> (Vec<Variable>, bool) {
     let mut out = Walk {
         variables: Vec::new(),
-        draws: Some(false),
+        draws: query_draws.then_some(false),
     };
     walk_expression(expression, &mut out);
     (out.variables, out.draws == Some(true))
@@ -433,19 +435,26 @@ impl Context<'_> {
             "anti join"
         };
         let (conjuncts, inner) = top_filters(pattern);
-        let correlated = conjuncts
-            .iter()
-            .any(|c| !self.local(c, pattern) && self.reads_outer(c, &solutions));
+        // A pattern that draws is evaluated for each row it tests, as SPARQL's substitution
+        // does: never once for all, nor once per distinct value.
+        let per_row = self.draws_in(pattern);
+        let correlated = !per_row
+            && conjuncts
+                .iter()
+                .any(|c| !self.local(c, pattern) && self.reads_outer(c, &solutions));
         let mask = if correlated {
             self.exists_mask(&solutions, pattern)?
         } else {
-            if !correlation_safe(inner, &solutions.vars) {
-                let mask = self.exists_substituted(&solutions, pattern)?;
+            if per_row || !correlation_safe(inner, &solutions.vars) {
+                let mask = self.exists_substituted(&solutions, pattern, per_row)?;
                 solutions
                     .table
                     .retain_mask(&mask.iter().map(|m| *m == keep_matching).collect::<Vec<_>>());
-                let detail = "the pattern per distinct value of the row it reads".to_owned();
-                note("exists per value", detail, solutions.table.len());
+                let detail = match per_row {
+                    true => "the pattern per row, as it draws",
+                    false => "the pattern per distinct value of the row it reads",
+                };
+                note("exists per value", detail.to_owned(), solutions.table.len());
                 return Ok(solutions);
             }
             // One evaluation, one semi- or anti-join. Only the shared variables' distinct
@@ -513,11 +522,12 @@ impl Context<'_> {
 
     /// Per row of `solutions`, whether `EXISTS { pattern }` holds, by substitution
     /// ([`super::substitute`]): the pattern with the row's values put in, evaluated once
-    /// per distinct value of the outer variables it mentions.
+    /// per distinct value of the outer variables it mentions, or once per row if `per_row`.
     fn exists_substituted(
         &self,
         solutions: &Solutions,
         pattern: &GraphPattern,
+        per_row: bool,
     ) -> NativeResult<Vec<bool>> {
         let visible = mentioned(pattern);
         let columns: Vec<(usize, Variable)> = solutions
@@ -545,7 +555,7 @@ impl Context<'_> {
                 .map(|c| solutions.table.get(row, c))
                 .filter(|&id| id != UNDEF);
             key.push(graph.unwrap_or(UNDEF));
-            if let Some(&holds) = answers.get(&key) {
+            if let Some(&holds) = answers.get(&key).filter(|_| !per_row) {
                 mask.push(holds);
                 continue;
             }
@@ -575,7 +585,9 @@ impl Context<'_> {
             };
             let holds = !found.table.is_empty();
             self.consumed(found);
-            answers.insert(key, holds);
+            if !per_row {
+                answers.insert(key, holds);
+            }
             mask.push(holds);
         }
         Ok(mask)
@@ -591,8 +603,9 @@ impl Context<'_> {
             return Ok(Vec::new());
         }
         let (conjuncts, inner) = top_filters(pattern);
-        if !correlation_safe(inner, &solutions.vars) {
-            return self.exists_substituted(solutions, pattern);
+        let per_row = self.draws_in(pattern);
+        if per_row || !correlation_safe(inner, &solutions.vars) {
+            return self.exists_substituted(solutions, pattern, per_row);
         }
         let (local, correlated): (Vec<&Expression>, Vec<&Expression>) = conjuncts
             .into_iter()

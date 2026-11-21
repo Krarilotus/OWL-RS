@@ -382,7 +382,10 @@ impl StoreService {
         let snapshot = self.engine().snapshot();
         let memory = self.envelope(None);
         // Undecided where the request's envelope can't take reading the premise (SYN-61).
-        let Ok((premise, read_statements)) = source::read_premise(&snapshot, memory.clone()) else {
+        let treatments = &self.config().dl.treatments;
+        let Ok((premise, read_statements)) =
+            source::read_premise(&snapshot, memory.clone(), treatments)
+        else {
             let why = source::refused("the premise");
             return Ok(DlEntailment {
                 answer: Entailed::Unknown(format!("the premise: {why}")),

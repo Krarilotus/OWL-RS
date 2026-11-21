@@ -20,7 +20,9 @@ use nrese_exec::{Budget, Envelope};
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term};
 use nrese_sparql_syntax::Query;
 
-use super::equality::{builds, kept_for, kept_is_published, refused};
+use super::equality::{
+    Representatives, admit, builds, kept_for, kept_is_published, on_build, refused, representative,
+};
 use crate::{QueryOptions, QueryResults, ReadView};
 
 const EX: &str = "http://example.com/";
@@ -542,18 +544,10 @@ fn classes_kept_for_one_engine_are_not_anothers() {
     }
 }
 
-/// An unpublished request's classes are charged to its query's budget,
-/// and where it has no room for them, the query is answered without them.
-///
-/// - Input: compact equality, one class of 20,000 identities read canonically (the query reads
-///   a row per class, the classes a pair per identity), a writer's pending change; the least
-///   budget that answers the query (a search: answering is monotone in the budget), and an
-///   ample one.
-/// - Expected: under the least budget the classes are refused, being an entry per identity
-///   beyond what the query holds, and the query answers as written without them; under the
-///   ample one they are built and none is refused. Nothing is kept for the pending version.
-#[test]
-fn a_refused_request_build_answers_without_classes() {
+/// Compact equality, one class of 20,000 identities: `k1 p0 a`, `a p1 "1"`, each alias
+/// `sameAs a` (inferred). Read canonically, the query reads a row per class, the classes a
+/// pair per identity.
+fn one_large_class() -> (Engine, Ids) {
     let engine = Engine::new(config()).unwrap();
     let mut tx = engine.transaction();
     let i = Ids::interned(&tx, SAME_AS);
@@ -566,6 +560,58 @@ fn a_refused_request_build_answers_without_classes() {
     }
     tx.commit().unwrap();
     engine.transaction().install(Some(i.link), None);
+    (engine, i)
+}
+
+/// A budget no query here comes near.
+const AMPLE: usize = 1 << 30;
+
+/// `view`'s answers to [`QUERY`] under `options` within `limit` bytes, as [`answers`] gives
+/// them; `None` where the budget refuses the query.
+fn within<V: ReadView>(view: &V, options: &QueryOptions, limit: usize) -> Option<Vec<String>> {
+    let query = Query::parse(QUERY, None).unwrap();
+    let mut options = options.clone();
+    options.resources.memory = Envelope::new(Some(limit), None);
+    let Ok(QueryResults::Solutions(rows)) = crate::evaluate_query(view, &query, &options) else {
+        return None;
+    };
+    let rows = rows.collect::<Result<Vec<_>, _>>().ok()?;
+    let mut got: Vec<String> = rows
+        .iter()
+        .map(|row| format!("{} {}", row.get("k").unwrap(), count(row.get("n"))))
+        .collect();
+    got.sort();
+    Some(got)
+}
+
+/// The least budget up to [`AMPLE`] under which `answers` holds (a search: answering is
+/// monotone in the budget).
+fn least(mut answers: impl FnMut(usize) -> bool) -> usize {
+    let (mut low, mut high) = (0, AMPLE);
+    while high - low > 1 {
+        let middle = low + (high - low) / 2;
+        if answers(middle) {
+            high = middle;
+        } else {
+            low = middle;
+        }
+    }
+    high
+}
+
+/// An unpublished request's classes are charged to its query's budget,
+/// and where it has no room for them, the query is answered without them.
+///
+/// - Input: compact equality, one class of 20,000 identities read canonically (the query reads
+///   a row per class, the classes a pair per identity), a writer's pending change; the least
+///   budget that answers the query (a search: answering is monotone in the budget), and an
+///   ample one.
+/// - Expected: under the least budget the classes are refused, being an entry per identity
+///   beyond what the query holds, and the query answers as written without them; under the
+///   ample one they are built and none is refused. Nothing is kept for the pending version.
+#[test]
+fn a_refused_request_build_answers_without_classes() {
+    let (engine, i) = one_large_class();
     let mut writer = engine.transaction();
     assert!(writer.insert_encoded(asserted(i.k2, i.p0, i.a)));
     let pending = writer.pending_snapshot();
@@ -585,36 +631,12 @@ fn a_refused_request_build_answers_without_classes() {
         ["<http://example.com/k1> 1", "<http://example.com/k2> 1"],
         "the fixture's answer"
     );
-    let query = Query::parse(QUERY, None).unwrap();
-    // The answer under `limit` bytes, `None` where the budget refuses the query.
-    let under = |limit: usize| -> Option<Vec<String>> {
-        let mut options = canonical.clone();
-        options.resources.memory = Envelope::new(Some(limit), None);
-        let Ok(QueryResults::Solutions(rows)) = crate::evaluate_query(&pending, &query, &options)
-        else {
-            return None;
-        };
-        let rows = rows.collect::<Result<Vec<_>, _>>().ok()?;
-        let mut got: Vec<String> = rows
-            .iter()
-            .map(|row| format!("{} {}", row.get("k").unwrap(), count(row.get("n"))))
-            .collect();
-        got.sort();
-        Some(got)
-    };
-    let ample = 1 << 30;
+    let under = |limit: usize| within(&pending, &canonical, limit);
     let (before, built) = (refused(), builds());
-    assert_eq!(under(ample).as_deref(), Some(&expected[..]), "ample");
+    assert_eq!(under(AMPLE).as_deref(), Some(&expected[..]), "ample");
     assert_eq!(refused(), before, "ample: nothing refused");
     assert!(builds() > built, "ample: the classes were built");
-    let (mut low, mut high) = (0, ample);
-    while high - low > 1 {
-        let middle = low + (high - low) / 2;
-        match under(middle) {
-            Some(_) => high = middle,
-            None => low = middle,
-        }
-    }
+    let high = least(|limit| under(limit).is_some());
     let before = refused();
     assert_eq!(
         under(high).as_deref(),
@@ -627,4 +649,176 @@ fn a_refused_request_build_answers_without_classes() {
     );
     assert!(!kept_for(&pending), "nothing kept for the pending version");
     assert!(kept_is_published(), "only published state kept");
+}
+
+/// A published build doesn't stop another repository's query.
+///
+/// - Input: one engine's published query held inside the build of its classes; while it is
+///   held, a query on another engine's published snapshot (another repository).
+/// - Expected: the second query answers, with classes it built itself, before the first is
+///   let go ([`ORDINARY`], as written); then the first answers [`ORDINARY`] too.
+#[test]
+fn a_held_published_build_does_not_stop_another_repositorys_query() {
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    let first = ordinary();
+    let held = first.snapshot();
+    let (entered, began) = channel();
+    let (release, released) = channel::<()>();
+    let holder = std::thread::spawn(move || {
+        on_build(move || {
+            entered.send(()).unwrap();
+            // Bounded: a guard that fails drops its sender and ends the hold at once.
+            let _ = released.recv_timeout(Duration::from_secs(60));
+        });
+        answers(&held, &closed())
+    });
+    began
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the first query's build began");
+
+    let second = ordinary();
+    let other = second.snapshot();
+    let (sent, answered) = channel();
+    let reader = std::thread::spawn(move || {
+        let before = builds();
+        let got = answers(&other, &closed());
+        sent.send((got, builds() - before)).unwrap();
+    });
+    let during = answered.recv_timeout(Duration::from_secs(5));
+    release.send(()).unwrap();
+    let first_answer = holder.join().unwrap();
+    reader.join().unwrap();
+
+    let (got, built) = during.expect("another repository's query answered during the build");
+    assert_eq!(got, ORDINARY, "another repository's answers");
+    assert_eq!(
+        built, 1,
+        "another repository's classes, built for its own version"
+    );
+    assert_eq!(first_answer, ORDINARY, "the held query's answers");
+}
+
+/// A late build of an older version leaves a newer version's entry in place.
+///
+/// - Input: an engine's version, then a commit's later one, whose entry the slot holds; the
+///   older version's classes admitted after it (a build that began before the commit and
+///   ended after the newer entry was made).
+/// - Expected: the slot still holds the newer version's entry, the same one; the older
+///   version's query still gets its own classes (`a` and `b` one identity, `a` the least).
+#[test]
+fn a_late_build_of_an_older_version_leaves_the_newer_entry() {
+    let engine = ordinary();
+    let older = engine.snapshot();
+    let i = ids(&engine);
+    let mut writer = engine.transaction();
+    change(&mut writer, &i);
+    writer.commit().unwrap();
+    let newer = engine.snapshot();
+    assert!(
+        newer.revision() > older.revision(),
+        "the fixture: a later revision"
+    );
+    assert!(
+        i.a.raw() < i.b.raw(),
+        "the fixture: `a` the least of its class"
+    );
+
+    // The newer version's entry: a stand-in, told apart by its pointer.
+    let entry = Arc::new(Representatives::new());
+    let slot = std::sync::Mutex::new(Some((newer.clone(), Arc::clone(&entry))));
+    let state = older.shared_state().expect("a published snapshot");
+    let got = admit(&slot, &state, &budget()).expect("room for them").0;
+
+    let kept = slot.lock().unwrap();
+    let (at, held) = kept.as_ref().expect("an entry");
+    assert!(at.same_version(&newer), "the newer version's entry is kept");
+    assert!(Arc::ptr_eq(held, &entry), "the same entry");
+    assert_eq!(
+        representative(&got, i.b.raw()),
+        i.a.raw(),
+        "the older query's classes"
+    );
+    assert_eq!(
+        representative(&got, i.a.raw()),
+        i.a.raw(),
+        "the older query's classes"
+    );
+}
+
+/// The first build of a version to publish wins: a build that ends after it gets the
+/// published entry, and its own is dropped.
+///
+/// - Input: a slot holding an entry for a published version (a stand-in, told apart by its
+///   pointer); that version's classes admitted again.
+/// - Expected: the reader gets the published entry, holding no charge: its own build was
+///   charged to its budget and dropped with the charge, which is back where it was. The slot
+///   still holds the entry.
+#[test]
+fn a_build_that_ends_second_gets_the_published_entry() {
+    let engine = ordinary();
+    let snapshot = engine.snapshot();
+    let entry = Arc::new(Representatives::new());
+    let slot = std::sync::Mutex::new(Some((snapshot.clone(), Arc::clone(&entry))));
+    let state = snapshot.shared_state().expect("a published snapshot");
+    let charged = budget();
+    let before = charged.used();
+    let (got, held) = admit(&slot, &state, &charged).expect("room for them");
+
+    assert!(
+        Arc::ptr_eq(&got, &entry),
+        "the reader gets the published entry"
+    );
+    assert!(held.is_none(), "the reader holds no charge");
+    assert!(charged.peak() > before, "its own build was charged");
+    assert_eq!(charged.used(), before, "and its charge released");
+    let kept = slot.lock().unwrap();
+    let (_, held) = kept.as_ref().expect("an entry");
+    assert!(Arc::ptr_eq(held, &entry), "the slot still holds it");
+}
+
+/// A published snapshot's classes are charged to the query that builds them; where it has no
+/// room for them, the query is answered without them and nothing is published.
+///
+/// - Input: [`one_large_class`]'s published snapshot read canonically, each budget on a fresh
+///   engine (an entry one query published would serve the next); the least budget that
+///   answers the query.
+/// - Expected: under it the query answers as written (`k1` 1), no entry is kept for its
+///   version, and the classes were refused, being an entry per identity beyond what the query
+///   holds.
+#[test]
+fn a_refused_published_build_answers_without_classes_and_publishes_nothing() {
+    let canonical = QueryOptions {
+        equality_canonical: true,
+        ..closed()
+    };
+    // A fresh engine's published snapshot, and its answers within `limit` bytes.
+    let under = |limit: usize| {
+        let snapshot = one_large_class().0.snapshot();
+        let got = within(&snapshot, &canonical, limit);
+        (snapshot, got)
+    };
+    let high = least(|limit| under(limit).1.is_some());
+    let before = refused();
+    let (snapshot, got) = under(high);
+
+    let written = answers(
+        &snapshot,
+        &QueryOptions {
+            as_written: true,
+            ..canonical.clone()
+        },
+    );
+    assert_eq!(
+        written,
+        ["<http://example.com/k1> 1"],
+        "the fixture's answer"
+    );
+    assert_eq!(got.as_deref(), Some(&written[..]), "under {high} bytes");
+    assert!(!kept_for(&snapshot), "nothing published for its version");
+    assert!(
+        refused() > before,
+        "under the least budget ({high} bytes) the classes were refused"
+    );
 }

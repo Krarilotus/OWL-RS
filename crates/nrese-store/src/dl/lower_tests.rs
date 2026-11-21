@@ -71,7 +71,9 @@ fn by_point_reads(snapshot: &Snapshot, taxonomy: &Taxonomy, rdf_type: u64) -> Ve
 fn both(store: &StoreService) -> (Snapshot, u64, Vec<Triple>, Vec<Triple>) {
     let snapshot = store.engine().snapshot();
     let budget = Arc::new(nrese_exec::Budget::unlimited());
-    let ontology = super::super::source::read_snapshot(&snapshot, Arc::clone(&budget)).unwrap();
+    let treatments = Default::default();
+    let ontology =
+        super::super::source::read_snapshot(&snapshot, Arc::clone(&budget), &treatments).unwrap();
     let taxonomy = tbox_taxonomy(store, &ontology);
     let rdf_type = id(&snapshot, "http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
     let scanned = memberships(&snapshot, &taxonomy, rdf_type, &budget)
@@ -184,7 +186,8 @@ fn member_lists_past_the_budget_refuse_the_memberships() {
     let c0 = typed(&snapshot, rdf_type, None, id(&snapshot, "C0"));
     assert!(scanned.is_empty() && !c0.is_empty(), "{scanned:?}, {c0:?}");
     let unlimited = Arc::new(nrese_exec::Budget::unlimited());
-    let ontology = super::super::source::read_snapshot(&snapshot, unlimited).unwrap();
+    let treatments = Default::default();
+    let ontology = super::super::source::read_snapshot(&snapshot, unlimited, &treatments).unwrap();
     let taxonomy = tbox_taxonomy(&store, &ontology);
     let none = Arc::new(nrese_exec::Budget::new(0));
     assert!(memberships(&snapshot, &taxonomy, rdf_type, &none).is_err());

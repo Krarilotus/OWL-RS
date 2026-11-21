@@ -59,10 +59,13 @@ fn of(name: AggregateFunction, expr: Expression) -> AggregateExpression {
 }
 
 impl<'a> Plan<'a> {
-    /// The plan for a GROUP BY of `aggregates` over `inner`, if it can stream.
+    /// The plan for a GROUP BY of `aggregates` over `inner`, if it can stream. Not for an
+    /// `AVG` whose argument draws, in a query that `draws`: its sum and count would each
+    /// evaluate the argument, drawing twice per row.
     pub(super) fn of(
         inner: &'a GraphPattern,
         aggregates: &[(Variable, AggregateExpression)],
+        draws: bool,
     ) -> Option<Self> {
         let (patterns, filter) = match inner {
             GraphPattern::Bgp { patterns } => (patterns, None),
@@ -117,6 +120,9 @@ impl<'a> Plan<'a> {
                         partials.push((p.clone(), aggregate.clone()));
                         merges.push((p.clone(), of(name.clone(), Expression::Variable(p.clone()))));
                         finals.push(Final::Copy(target.clone(), p));
+                    }
+                    AggregateFunction::Avg if draws && expr.find(&mut super::pushdown::draw) => {
+                        return None;
                     }
                     AggregateFunction::Avg => {
                         let (sum, count) = (column(), column());

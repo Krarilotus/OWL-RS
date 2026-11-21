@@ -199,7 +199,7 @@ impl Context<'_> {
                 self.bgp_from(seed, patterns, &mut Vec::new())
             }
             GraphPattern::Filter { expr, inner } => {
-                let (read, draws) = reads_and_draws(expr);
+                let (read, draws) = reads_and_draws(expr, self.draws);
                 if draws {
                     return self.drawn_from_keys(seed, pattern, inner, |keys| {
                         self.filter_from(keys, expr, inner)
@@ -249,7 +249,7 @@ impl Context<'_> {
                 let mut read = mentioned(right);
                 let mut draws = false;
                 if let Some(expression) = expression {
-                    let (variables, drawn) = reads_and_draws(expression);
+                    let (variables, drawn) = reads_and_draws(expression, self.draws);
                     read.extend(variables);
                     draws = drawn;
                 }
@@ -269,7 +269,7 @@ impl Context<'_> {
                 let mut draws = false;
                 let inside = bindings.iter().all(|(variable, expression)| {
                     seed.column(variable).is_none() && {
-                        let (read, drawn) = reads_and_draws(expression);
+                        let (read, drawn) = reads_and_draws(expression, self.draws);
                         draws = drawn;
                         !drawn && reads_only_bound(&read, &pushdown::certain(inner), &seed)
                     }
