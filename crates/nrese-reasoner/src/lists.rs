@@ -36,14 +36,6 @@ pub trait Facts {
     fn stopped(&self) -> bool {
         false
     }
-
-    /// Counts `units` of work, such as premise facts about to be copied, on the reader's
-    /// stop: true once it has fired. The stop reads the operation's memory, so memory
-    /// that grows with the work is refused as it grows.
-    fn charge(&self, units: usize) -> bool {
-        let _ = units;
-        self.stopped()
-    }
 }
 
 /// The vocabulary ids the list rules use.
@@ -395,9 +387,7 @@ impl ListVocabulary {
                 let offset = prefix.len();
                 prefix.extend(suffix);
                 for &member in &cell.firsts {
-                    // A member's premises run along a whole path: charged, as a
-                    // long list gives as many paths as members.
-                    if facts.charge(prefix.len()) {
+                    if facts.stopped() {
                         return;
                     }
                     prefix[offset][2] = member;
@@ -715,8 +705,6 @@ pub(crate) fn compile(
                         }
                     }
                     debug_assert!(rules[before..].iter().all(Rule::fits));
-                    // Each rule keeps its own copy; a stop ends the reading after it.
-                    facts.charge(used.len() * (rules.len() - before));
                     for _ in before..rules.len() {
                         premises.push(used.clone());
                     }
