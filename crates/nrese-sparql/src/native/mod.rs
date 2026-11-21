@@ -66,6 +66,8 @@ mod lone_pattern_tests;
 mod optimise_tests;
 #[cfg(test)]
 mod overlap_tests;
+#[cfg(test)]
+mod pass_fallback_tests;
 pub(crate) mod ql;
 mod ranges;
 mod reads;
