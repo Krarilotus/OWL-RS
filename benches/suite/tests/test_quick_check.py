@@ -392,12 +392,18 @@ class QuickGateJob(fixture.Repo):
             "rustc": '[ "${1#+}" != "$1" ] && shift; case "$1" in -vV) echo "release: 1.98.1"; echo "commit-hash: abcdef1234567890" ;;'
                      ' --print) echo "    native - Select the CPU of the current host (currently znver3)." ;; esac',
             "cargo": '[ "$1" = nextest ] && exec cargo-nextest "$@"; exit 0',
-            "curl": fixture.CURL_NEXTEST,
+            # get.nexte.st/<version>/linux: the stand-in archive of that version (pin() below).
+            "curl": 'for a; do url=$a; done; v=${url#https://get.nexte.st/}; v=${v%%/*}\n'
+                    'STUB_ARCHIVE="$STUB_ARCHIVES/$v.tar.gz"; [ -e "$STUB_ARCHIVE" ] || STUB_ARCHIVE=\n'
+                    + fixture.CURL_ARCHIVE.removeprefix("#!/bin/sh\n"),
             "cc": 'while [ $# -gt 0 ]; do [ "$1" = -o ] && { shift; : > "$1"; }; shift; done',
         }.items():
             (stubs / name).write_text("#!/bin/sh\n" + body + "\n")
             (stubs / name).chmod(0o755)
         self.stubs, self.cache, self.seen = stubs, self.root / "cache", self.root / "seen"
+        self.archives = self.root / "archives"
+        self.archives.mkdir()
+        self.pin("0.9.146")
         # check.sh: where it builds and runs, its files and Python; held (HOLD) until told to go, at most
         # 30 s; then the cargo-nextest it runs.
         check = ('s="$SEEN-$1"\n'
@@ -423,6 +429,17 @@ class QuickGateJob(fixture.Repo):
         self.sent = self.tree("HEAD")
         self.jobs = 0
 
+    def pin(self, version):
+        """The checkout's scripts/lib/gate-tools.txt pinning cargo-nextest VERSION: a stand-in runner of that
+        version, in an archive get.nexte.st serves (the curl stand-in), both by their sha256."""
+        made = self.archives / version
+        made.mkdir(exist_ok=True)
+        archive, _, archive_sum, exe_sum = fixture.nextest_archives(
+            made, f'#!/bin/sh\necho "cargo-nextest {version}"\n')
+        shutil.copy(archive, self.archives / f"{version}.tar.gz")
+        (self.repo / "scripts/lib/gate-tools.txt").write_text(
+            f"cargo-nextest {version}\ncargo-nextest-linux {version} {archive_sum} {exe_sum}\n")
+
     def start(self, mode, **env):
         """gate-job.sh MODE, started in a process group of its own."""
         self.jobs += 1
@@ -434,6 +451,7 @@ class QuickGateJob(fixture.Repo):
             stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True,
             env={**self.env, "FLEET_OUT": str(out), "NRESE_GATE_CACHE": str(self.cache), "SEEN": str(self.seen),
                  "HOME": str(self.root), "PATH": f"{self.stubs}:{os.environ['PATH']}", "NRESE_GATE_CC": "cc",
+                 "STUB_ARCHIVES": str(self.archives), "CARGO_HOME": str(self.root / "no-cargo-home"),
                  "FLEET_JOB": f"gate-{self.jobs}", "FLEET_STEP": "1", "FLEET_HOST": self.HOST, **env})
         self.addCleanup(self.stop, job, log)
         return job
@@ -518,12 +536,11 @@ class QuickGateJob(fixture.Repo):
     def test_each_job_runs_the_nextest_its_checkout_pins(self):
         # Spec (review r1, 2): two jobs pinning different cargo-nextest versions, the second installing
         # its own while the first runs: each runs its own version.
-        pins = self.repo / "scripts/lib/gate-tools.txt"
-        pins.write_text("cargo-nextest 0.9.1\n")
+        self.pin("0.9.1")
         hold = self.root / "hold"
         first = self.start("quick", HOLD=str(hold))
         self.assertTrue(self.appeared(Path(f"{hold}.ready")), "the quick job didn't reach its check")
-        pins.write_text("cargo-nextest 0.9.2\n")
+        self.pin("0.9.2")
         second = self.start("push")
         pushed = self.ended(second)
         Path(f"{hold}.go").touch()
@@ -533,27 +550,29 @@ class QuickGateJob(fixture.Repo):
                          f"{(self.root / 'job-1.log').read_text()}{(self.root / 'job-2.log').read_text()}")
 
     def test_a_job_whose_cargo_runs_another_nextest_than_the_pinned_one_has_no_verdict(self):
-        # Spec (review r2, 1; r3, 1): real Cargo runs `cargo nextest` from $CARGO_HOME/bin before PATH. With
-        # another version there, or the pinned one's text from a version command that fails (check.sh
-        # would fall back to cargo test), the job ends with no verdict (3) before its check; with the
-        # pinned one it runs it.
+        # Spec (review r2, 1; r3, 1; the pinned runner by its sha256): real Cargo runs `cargo nextest` from
+        # $CARGO_HOME/bin before PATH. Any runner there (another version, the pinned one's text from a
+        # version command that fails, or the pinned version itself, which isn't the pinned executable)
+        # ends the job with no verdict (3) before its check; with none there, cargo runs the pinned one.
         cargo = real_cargo()
         if cargo is None:
             self.skipTest("no Cargo here")
         (self.stubs / "cargo").write_text(f'#!/bin/sh\n[ "$1" = nextest ] && exec "{cargo}" "$@"\nexit 0\n')
-        (self.repo / "scripts/lib/gate-tools.txt").write_text("cargo-nextest 0.9.2\n")
+        self.pin("0.9.2")
         got = {}
-        for case, version, status in (("other", "0.9.1", 0), ("failing", "0.9.2", 1), ("pinned", "0.9.2", 0)):
+        for case, version, status in (("other", "0.9.1", 0), ("failing", "0.9.2", 1), ("same-version", "0.9.2", 0),
+                                      ("none", None, None)):
             home = self.root / f"cargo-home-{case}"
             (home / "bin").mkdir(parents=True)
-            (home / "bin" / "cargo-nextest").write_text(f'#!/bin/sh\necho "cargo-nextest {version}"\nexit {status}\n')
-            (home / "bin" / "cargo-nextest").chmod(0o755)
+            if version:
+                (home / "bin" / "cargo-nextest").write_text(f'#!/bin/sh\necho "cargo-nextest {version}"\nexit {status}\n')
+                (home / "bin" / "cargo-nextest").chmod(0o755)
             Path(f"{self.seen}-quick").unlink(missing_ok=True)
             job = self.start("quick", CARGO_HOME=str(home))
             got[case] = (self.ended(job), self.said("quick").get("nextest"))
-        self.assertEqual(got, {"other": (3, None), "failing": (3, None), "pinned": (0, "0.9.2")},
+        self.assertEqual(got, {"other": (3, None), "failing": (3, None), "same-version": (3, None), "none": (0, "0.9.2")},
                          f"SPEC cargo-runs-the-pinned-nextest ({cargo})\n"
-                         + "".join((self.root / f"job-{n}.log").read_text() for n in (1, 2, 3)))
+                         + "".join((self.root / f"job-{n}.log").read_text() for n in (1, 2, 3, 4)))
 
 
 if __name__ == "__main__":

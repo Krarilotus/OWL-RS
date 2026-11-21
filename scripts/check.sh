@@ -60,7 +60,7 @@
 # Tests run under cargo-nextest (every test of every binary in parallel, with the features of
 # the crates the run selects): the fleet's gate jobs install the pinned one
 # (scripts/lib/gate-tools.txt; scripts/lib/gate-job.sh, scripts/lib/windows-job.sh), and the
-# Windows job gives no verdict without it (NRESE_NEXTEST_REQUIRED). A run without it elsewhere
+# gate jobs give no verdict without it (NRESE_NEXTEST_REQUIRED). A run without it elsewhere
 # uses cargo test, crate by crate. So the push tier checks that each crate it tests compiles
 # alone, with its own features (crates_alone).
 # Builds go through scripts/cargo-guarded.sh. Every step runs; the summary lists
@@ -95,7 +95,8 @@ step() {
   results+=("$code  $name ($((SECONDS - start)) s)")
   echo "=== $name: exit $code"
 }
-# Where the run's job requires a version (NRESE_NEXTEST_REQUIRED, scripts/lib/windows-job.sh), cargo
+# Where the run's job requires a version (NRESE_NEXTEST_REQUIRED, scripts/lib/gate-job.sh and
+# scripts/lib/windows-job.sh), cargo
 # must run exactly that one, asked right before the tests; any other, or none, ends the run with 3, no
 # verdict: never cargo test or another runner in its place.
 nextest() {

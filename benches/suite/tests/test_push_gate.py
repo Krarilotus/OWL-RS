@@ -989,10 +989,13 @@ class GateJob(Repo):
         self.assertEqual(pin_nextest(tools_txt, "linux", good_sum, exe_sum), 1,
                          "the tree pins the Linux archive of cargo-nextest and its executable by their sha256")
         cache, seen = self.root / "cache", self.root / "seen"
-        # check.sh: says whether an old cache entry was still there while it ran, where it builds, and
-        # prints its summary.
+        # check.sh: says whether an old cache entry was still there while it ran, where it builds and which
+        # cargo-nextest the job requires of it, and prints its summary; or ends as STUB_CHECK says (3: cargo
+        # didn't run the required one, as its nextest() ends).
         check = ('echo "old=$(test -d "$NRESE_GATE_CACHE/target-old" && echo there)" > "$SEEN"\n'
                  'echo "target=$CARGO_TARGET_DIR" >> "$SEEN"\n'
+                 'echo "required=${NRESE_NEXTEST_REQUIRED:-none}" >> "$SEEN"\n'
+                 '[ -z "$STUB_CHECK" ] || exit "$STUB_CHECK"\n'
                  'printf "=== summary\\n  0  fmt (1 s)\\n"\n')
         for rel, body in {"scripts/check.sh": check, "scripts/cargo-guarded.sh": 'echo "-C target-cpu=native"\n',
                           "rust-toolchain.toml": '[toolchain]\nchannel = "1.98.1"\n',
@@ -1010,13 +1013,19 @@ class GateJob(Repo):
         self.git(self.repo, "commit", "-q", "-m", "two")
         tree = self.tree("HEAD")
         # The cargo-nextest the tree pins, in the host's cache as the job lays it out
-        # (tools/nextest-<version>-<archive sha256, 12>): the pinned one; one whose version command prints
-        # the pinned version and fails; or none there, and an archive to fetch (the pinned one, or another
-        # holding the same runner). `tampered`: an entry whose executable isn't the pinned one, with the
-        # pinned archive to fetch. `host-own`: the pinned archive to fetch, and a runner of the host's own
-        # in $CARGO_HOME/bin, which cargo would run first.
+        # (tools/nextest-<version>-<archive sha256, 12>): the pinned one; or none there, and an archive to
+        # fetch (the pinned one, or another holding the same runner). `failing`: the pinned one there, its
+        # version command printing the pinned version and failing (as a runner that can't run just now);
+        # `cold-failing`: none there, and the pinned archive's runner answering so. `tampered`: an entry
+        # whose executable isn't the pinned one; `mixed`: an entry holding the pinned executable as
+        # cargo-nextest.exe and another as cargo-nextest, which cargo runs on Linux; both with the pinned
+        # archive to fetch. `host-own`, `gate-own`: the pinned archive to fetch, and a runner in
+        # $CARGO_HOME/bin, or in the gate's own cargo home (made where a host has no rustup), which cargo
+        # would run first. `late-3`: the pinned one there, and the tier ending with 3 (cargo didn't run it
+        # inside the run).
         nextest_entry = cache / "tools" / f"nextest-{v}-{good_sum[:12]}"
-        pinned, failing, tampered, host_own = "pinned", "failing", "tampered", "host-own"
+        pinned, failing, cold_failing, tampered, mixed = "pinned", "failing", "cold-failing", "tampered", "mixed"
+        host_own, gate_own, late_3 = "host-own", "gate-own", "late-3"
         cargo_home, tampered_ran = self.root / "cargo-home", self.root / "tampered-ran"
         cases = [  # tree sent, C compiler, nextest -> exit
             # None there: the archive the tree pins by its sha256 is fetched, installed and runs.
@@ -1027,12 +1036,19 @@ class GateJob(Repo):
             (tree, "cc-links", pinned, 0),       # the pinned one there: it runs
             # Another archive, holding a runner of the pinned version all the same, installs nothing: no verdict.
             (tree, "cc-links", bad_archive, 3),
-            # One whose version command fails, whatever it printed: not used, and none to fetch: no verdict.
+            # The pinned one there, but its version command fails: no verdict, and it stays (another job may
+            # be running it). From the pinned archive, such a runner is never installed.
             (tree, "cc-links", failing, 3),
-            # An entry whose executable isn't the pinned one never runs: made again from the pinned archive.
+            (tree, "cc-links", cold_failing, 3),
+            # An entry whose executable cargo would run isn't the pinned one: never run, made again from the
+            # pinned archive.
             (tree, "cc-links", tampered, 0),
-            # A runner of the host's own where cargo looks first: no verdict, before anything is installed.
+            (tree, "cc-links", mixed, 0),
+            # A runner where cargo looks first: no verdict, before anything is installed.
             (tree, "cc-links", host_own, 3),
+            (tree, "cc-links", gate_own, 3),
+            # The tier ends with 3: no verdict, nothing recorded.
+            (tree, "cc-links", late_3, 3),
         ]
         for case, (sent, linker, nextest, code) in enumerate(cases):
             old = cache / "target-old"  # another toolchain's, unused for long
@@ -1041,17 +1057,23 @@ class GateJob(Repo):
             out = self.root / f"out-{case}"
             out.mkdir()
             shutil.rmtree(nextest_entry.parent, ignore_errors=True)
+            shutil.rmtree(cache / "cargo", ignore_errors=True)
             shutil.rmtree(cargo_home, ignore_errors=True)
             (cargo_home / "bin").mkdir(parents=True)
-            fetched = nextest if isinstance(nextest, Path) else good_archive if nextest in (tampered, host_own) else None
-            if nextest in (pinned, failing, tampered):
+            fetched = (nextest if isinstance(nextest, Path) else
+                       good_archive if nextest in (cold_failing, tampered, mixed, host_own, gate_own) else None)
+            if nextest in (pinned, failing, tampered, mixed, late_3):
                 nextest_entry.mkdir(parents=True)
-                body = runner + (f': > "{tampered_ran}"\n' if nextest == tampered else "")
+                body = runner + (f': > "{tampered_ran}"\n' if nextest in (tampered, mixed) else "")
                 (nextest_entry / "cargo-nextest").write_text(body, newline="\n")
                 (nextest_entry / "cargo-nextest").chmod(0o755)
-            if nextest == host_own:
-                (cargo_home / "bin" / "cargo-nextest").write_text(runner, newline="\n")
-                (cargo_home / "bin" / "cargo-nextest").chmod(0o755)
+                if nextest == mixed:
+                    (nextest_entry / "cargo-nextest.exe").write_text(runner, newline="\n")
+            own = {host_own: cargo_home / "bin", gate_own: cache / "cargo" / "bin"}.get(nextest)
+            if own:
+                own.mkdir(parents=True, exist_ok=True)
+                (own / "cargo-nextest").write_text(runner, newline="\n")
+                (own / "cargo-nextest").chmod(0o755)
             done = subprocess.run(
                 [BASH, "scripts/lib/gate-job.sh", "push", sent, empty, "--"], cwd=self.repo, capture_output=True,
                 text=True, timeout=120,
@@ -1059,16 +1081,22 @@ class GateJob(Repo):
                      "HOME": str(self.root), "PATH": f"{stubs}:{os.environ['PATH']}", "NRESE_GATE_CC": linker,
                      "FLEET_JOB": f"gate-{case}", "FLEET_STEP": "1", "FLEET_HOST": "office-pc",
                      "CARGO_HOME": str(cargo_home), "STUB_ARCHIVE": str(fetched) if fetched else "",
-                     "STUB_NEXTEST": nextest if nextest == failing else ""})
+                     "STUB_NEXTEST": "failing" if nextest in (failing, cold_failing) else "",
+                     "STUB_CHECK": "3" if nextest == late_3 else ""})
             self.assertEqual(done.returncode, code, f"SPEC job: case {case}\n{done.stdout}{done.stderr}")
-            if nextest == tampered:
+            if nextest in (tampered, mixed):
                 self.assertFalse(tampered_ran.exists(), f"SPEC gate-nextest: a cached runner not the pinned one ran: case {case}")
-            if fetched is bad_archive or nextest == host_own:
+            if fetched is bad_archive or nextest in (cold_failing, host_own, gate_own):
                 self.assertEqual([p.name for p in nextest_entry.parent.glob("nextest-*")], [],
                                  f"SPEC gate-nextest: a cargo-nextest was installed: case {case}")
+            if nextest == failing:
+                self.assertTrue((nextest_entry / "cargo-nextest").exists(),
+                                f"SPEC gate-nextest: the pinned runner was removed: case {case}")
             if code:
                 self.assertFalse((out / "gate.json").exists(), f"case {case}")
                 continue
+            self.assertEqual(dict(line.split("=", 1) for line in seen.read_text().split())["required"], v,
+                             f"SPEC gate-nextest: the tier isn't required to run the pinned cargo-nextest: case {case}")
             result = json.loads((out / "gate.json").read_text())
             self.assertEqual({k: result[k] for k in ("tier", "tree", "code", "cpu", "tracked_changes", "job",
                                                      "fleet_host", "summary")},

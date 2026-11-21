@@ -77,10 +77,6 @@ if ! git -C "$wt" checkout -q -f --detach "$sha" 2> /dev/null; then
 fi
 git -C "$wt" clean -q -fd
 [ "$(git -C "$wt" rev-parse 'HEAD^{tree}')" = "$tree" ] || infra "the checkout isn't tree $tree"
-# A host's own cargo-nextest where cargo runs one first, before any on PATH, would stand in for the
-# pinned one whatever its version says: no verdict, before anything is installed.
-[ ! -e "${CARGO_HOME:-$HOME/.cargo}/bin/cargo-nextest" ] \
-  || infra "the host's own cargo-nextest in ${CARGO_HOME:-$HOME/.cargo}/bin would run in place of the pinned one: no verdict"
 files=$home/files
 if [ $# -gt 0 ]; then
   printf '%s\n' "$@" > "$files"
@@ -89,6 +85,14 @@ else
 fi
 [ "$(git hash-object "$files")" = "$list_hash" ] || infra "the file list isn't $list_hash"
 cd "$wt" || infra "no worktree"
+# A cargo-nextest where cargo runs one first, before any on PATH, would stand in for the pinned one
+# whatever its version says: no verdict, before anything is installed. Cargo's home here: the host's
+# (a relative one from this worktree, as cargo resolves it), or the gate's own below, made where the
+# host has no rustup.
+for cargo_home in "${CARGO_HOME:-$HOME/.cargo}" "$cache/cargo"; do
+  [ ! -e "$cargo_home/bin/cargo-nextest" ] \
+    || infra "a cargo-nextest in $cargo_home/bin would run in place of the pinned one: no verdict"
+done
 
 # Rust links through the system's C compiler: a host without one can't run a gate, and that is
 # the host's failure, not the tree's (the development machine's WSL VM, 20 Oct 2026: every build script failed).
@@ -225,9 +229,12 @@ EOF
 
 echo "=== gate $mode of tree $tree on $(hostname) ($identity)"
 began=$SECONDS
-# check.sh's own output, whole: its summary is the gate's evidence, step by step.
-NRESE_ON_BUILD_HOST=1 NRESE_FILES_FROM="$files" bash scripts/check.sh "$mode" 2>&1 | tee "$out/check.log"
+# check.sh's own output, whole: its summary is the gate's evidence, step by step. The tier runs its tests
+# under the pinned version or ends with 3 (check.sh's nextest): no verdict, and nothing recorded.
+NRESE_ON_BUILD_HOST=1 NRESE_FILES_FROM="$files" NRESE_NEXTEST_REQUIRED=$want bash scripts/check.sh "$mode" 2>&1 \
+  | tee "$out/check.log"
 code=${PIPESTATUS[0]}
+[ "$code" -ne 3 ] || infra "cargo nextest wasn't the pinned $want inside the run: no verdict"
 # The memory the step's slice (FLEET_SLICE) held at most: the gate's whole peak on this host.
 peak=""
 cgroup=/sys/fs/cgroup$(awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup 2> /dev/null)
