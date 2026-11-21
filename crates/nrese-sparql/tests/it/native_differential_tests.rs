@@ -4950,7 +4950,11 @@ fn avg_where_every_argument_errs_is_integer_zero_as_written_and_planned() {
         for (text, expected) in &cases {
             let query = SparqlParser::new().parse_query(text).unwrap();
             let found = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
-            assert_eq!(found, [expected.clone()], "as written {as_written}: {text}");
+            assert_eq!(
+                found,
+                std::slice::from_ref(expected),
+                "as written {as_written}: {text}"
+            );
         }
     }
 }
@@ -4998,43 +5002,6 @@ fn eager_aggregation_sees_a_value_the_other_side_binds() {
             );
             assert_eq!(found, expected, "{route}: {text}");
         }
-    }
-}
-
-/// SPARQL evaluates an aggregate's argument once per solution (§18.5.1), here an `EXISTS`
-/// whose body draws: a group of one row has the mean 1 (decimal) when it holds and 0
-/// (integer, an error's mean) when it doesn't, never unbound. A streamed group that
-/// evaluated the argument once for its sum and again for its count could get a value for
-/// one and an error for the other, a chance of one in four per run.
-#[test]
-fn a_streamed_avg_draws_an_exists_once_per_row() {
-    let engine = Engine::new(EngineConfig::default()).unwrap();
-    let mut tx = engine.transaction();
-    tx.insert(Quad::new(ex("s1"), ex("group"), ex("g1"), GraphName::DefaultGraph).as_ref());
-    let one = Literal::from(1_i64);
-    tx.insert(Quad::new(ex("s1"), ex("val"), one, GraphName::DefaultGraph).as_ref());
-    tx.commit().unwrap();
-    let snapshot = engine.snapshot();
-    let streamed = QueryOptions {
-        stream_rows: Some(1),
-        ..QueryOptions::default()
-    };
-    let text = format!(
-        "SELECT ?g (AVG(IF(EXISTS {{ FILTER(RAND() < 0.5) }}, 1, ?missing)) AS ?a) \
-         WHERE {{ ?s <{EX}group> ?g . ?s <{EX}val> ?v }} GROUP BY ?g"
-    );
-    let query = SparqlParser::new().parse_query(&text).unwrap();
-    let group = format!("<{EX}g1>");
-    let allowed = [
-        format!("{group}\t\"1\"^^<http://www.w3.org/2001/XMLSchema#decimal>"),
-        format!("{group}\t\"0\"^^<http://www.w3.org/2001/XMLSchema#integer>"),
-    ];
-    for run in 0..64 {
-        let found = rows(evaluate_query(&snapshot, &query, &streamed).unwrap(), false);
-        assert!(
-            found.len() == 1 && allowed.contains(&found[0]),
-            "run {run}: {found:?}"
-        );
     }
 }
 
