@@ -5038,6 +5038,60 @@ fn a_streamed_avg_draws_an_exists_once_per_row() {
     }
 }
 
+/// Eager aggregation where an aggregate reads a join variable that B, the input grouped
+/// early, binds in every solution (`?product`, in B's triple pattern): the join keeps B's
+/// value, so the early group reads what the join gives, and the planner keeps the rewrite
+/// where it pays (four offers per product). EXPLAIN shows it; each team has 4 products with
+/// 4 offers priced 1 to 4, so 16 offers totalling 40, as the reference gives too.
+#[test]
+fn eager_aggregation_stays_where_its_side_binds_the_join_variable_it_reads() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let add = |tx: &mut nrese_engine::Transaction, s: String, p: &str, o: Term| {
+        tx.insert(Quad::new(ex(&s), ex(p), o, GraphName::DefaultGraph).as_ref());
+    };
+    for product in 0..12 {
+        let team = ex(&format!("t{}", product % 3));
+        add(&mut tx, format!("product{product}"), "team", team.into());
+        for offer in 0..4_i64 {
+            let name = format!("offer{product}_{offer}");
+            let of = ex(&format!("product{product}"));
+            add(&mut tx, name.clone(), "product", of.into());
+            add(&mut tx, name, "price", Literal::from(offer + 1).into());
+        }
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let text = format!(
+        "PREFIX : <{EX}> SELECT ?team (COUNT(?product) AS ?offers) (SUM(?price) AS ?total) \
+         WHERE {{ ?product :team ?team . ?offer :product ?product ; :price ?price }} GROUP BY ?team"
+    );
+    let query = SparqlParser::new().parse_query(&text).unwrap();
+    let explained = explain_query(&snapshot, &query, &QueryOptions::default()).unwrap();
+    assert!(
+        explained.rewrites.contains(&"eager-aggregation"),
+        "{:?}",
+        explained.rewrites
+    );
+    let integer = |n: u32| format!("\"{n}\"^^<http://www.w3.org/2001/XMLSchema#integer>");
+    let expected: Vec<String> = (0..3)
+        .map(|t| format!("<{EX}t{t}>\t{}\t{}", integer(16), integer(40)))
+        .collect();
+    let native = rows(
+        evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+        false,
+    );
+    assert_eq!(native, expected);
+    let as_written = QueryOptions {
+        as_written: true,
+        ..QueryOptions::default()
+    };
+    assert_eq!(
+        rows(reference(&snapshot, &query, &as_written).unwrap(), false),
+        expected
+    );
+}
+
 /// SPARQL 1.1 §18.5.1.4: AVG(M) = "0"^^xsd:integer whenever Count(M) = 0, including when
 /// every row in the group evaluates the argument to an error (unbound variable, division
 /// by zero, type error). Mixed value + error and bound non-numeric literals stay unbound,
