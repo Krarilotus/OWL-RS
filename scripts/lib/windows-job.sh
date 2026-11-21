@@ -62,12 +62,17 @@ windows_job_nextest_is() {
   echo "$1"
 }
 
-# PART VERSION: nexte.st's Windows build of cargo-nextest VERSION, unpacked at PART. The cache's one
-# entry maker (scripts/lib/suite-python.sh suite_python_entry) runs it under the cache's lock, aside,
-# and moves PART into place whole once windows_job_nextest_is passes on it; curl's deadline bounds it.
+# PART VERSION SHA256: nexte.st's Windows build of cargo-nextest VERSION, unpacked at PART, taken only
+# if its archive's sha256 is SHA256 (scripts/lib/gate-tools.txt cargo-nextest-windows): another
+# archive is never unpacked. The cache's one entry maker (scripts/lib/suite-python.sh
+# suite_python_entry) runs it under the cache's lock, aside, and moves PART into place whole once
+# windows_job_nextest_is passes on it; curl's deadline bounds it.
 windows_job_nextest_unpack() {
+  local got
   curl -fsSL --max-time 300 -o "$1/nextest.tar.gz" "https://get.nexte.st/$2/windows-tar" \
     || { echo "get.nexte.st's cargo-nextest $2 didn't download" >&2; return 1; }
+  got=$(sha256sum -b < "$1/nextest.tar.gz" | cut -c1-64)
+  [ "$got" = "$3" ] || { echo "cargo-nextest $2's archive has sha256 $got, not the pinned $3: not installed" >&2; return 1; }
   tar -xzf "$1/nextest.tar.gz" -C "$1" && rm -f -- "$1/nextest.tar.gz"
 }
 
@@ -131,14 +136,16 @@ run() {
   nodebin=$(NRESE_PYTHON=python gate_node "$cache" scripts/lib/gate-tools.txt) || infra "no Node for the console"
   echo "$EPOCHSECONDS" > "$nodebin/.last-used"
   export PATH="$nodebin:$PATH"
-  # The pinned cargo-nextest, each version in a directory of its own under the cache, first on PATH.
-  # Then the one the tier gets: cargo looks in $CARGO_HOME/bin before PATH, where a host's own would
-  # stand in. Its version counts only from a version command that succeeded.
-  local want nextest runner
+  # The pinned cargo-nextest, each version and archive in a directory of its own under the cache (named
+  # by both), first on PATH. Then the one the tier gets: cargo looks in $CARGO_HOME/bin before PATH,
+  # where a host's own would stand in. Its version counts only from a version command that succeeded.
+  local want sum nextest runner
   want=$(sed -n 's/^cargo-nextest //p' scripts/lib/gate-tools.txt | tr -d '\r')
   [ -n "$want" ] || infra "the tree pins no cargo-nextest (scripts/lib/gate-tools.txt)"
-  nextest=$(NRESE_PYTHON=python suite_python_entry "$cache/tools/nextest-$want" windows_job_nextest_is \
-    windows_job_nextest_unpack "$want") || infra "no cargo-nextest $want"
+  sum=$(awk -v v="$want" '$1 == "cargo-nextest-windows" && $2 == v { print $3 }' scripts/lib/gate-tools.txt | tr -d '\r')
+  [[ $sum =~ ^[0-9a-f]{64}$ ]] || infra "the tree pins no sha256 of cargo-nextest $want's Windows archive (scripts/lib/gate-tools.txt)"
+  nextest=$(NRESE_PYTHON=python suite_python_entry "$cache/tools/nextest-$want-${sum:0:12}" windows_job_nextest_is \
+    windows_job_nextest_unpack "$want" "$sum") || infra "no cargo-nextest $want"
   export PATH="$nextest:$PATH"
   runner=$(cargo nextest --version 2> /dev/null) || runner=""
   [ "$(printf '%s\n' "$runner" | tr -d '\r' | awk 'NR == 1 { print $2 }')" = "$want" ] \
