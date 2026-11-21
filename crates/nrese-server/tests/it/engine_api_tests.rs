@@ -868,6 +868,8 @@ async fn finished(app: &Router, path: &str) -> serde_json::Value {
 
 const MIXED_UPLOAD: &str =
     "<urn:a> <urn:p> \"one\" .\nthis is not a statement\n_:b <urn:p> \"two\" .\n";
+const INVALID_UPLOAD: &str = "this is not a statement\n";
+const UNPUBLISHED_QUARANTINE_FAILURE: &str = "the load published nothing. The quarantine record couldn't be kept: simulated failure. It's safe to send it again.";
 
 fn import_with_quarantine_failure() -> (Router, std::sync::Arc<StoreService>) {
     let state = crate::support::test_state_with_store_config(
@@ -940,7 +942,8 @@ async fn quarantine_commit_failure_async_import_completes_with_warning() {
 #[tokio::test]
 async fn published_answer_followup_only_reports_actual_publications() {
     let (app, store) = import_with_quarantine_failure();
-    let upload = "this is not a statement\n";
+    let initial_revision = store.current_revision();
+    let upload = INVALID_UPLOAD;
     let path = "/api/v1/repositories/nrese/import";
     eprintln!("POST {path}\nContent-Type: application/n-triples\n\n{upload}");
     let (status, body) = send(
@@ -952,12 +955,10 @@ async fn published_answer_followup_only_reports_actual_publications() {
     )
     .await;
     eprintln!("{status}: {body}");
-    assert!(
-        status == StatusCode::BAD_REQUEST
-            && body.contains("i/o error: simulated failure")
-            && !body.contains("published"),
-        "{status}: {body}"
-    );
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    let problem: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(problem["detail"], UNPUBLISHED_QUARANTINE_FAILURE, "{body}");
+    assert_eq!(store.current_revision(), initial_revision);
 
     let seed = "<urn:a> <urn:p> \"one\" .\n";
     eprintln!("POST {path}\nContent-Type: application/n-triples\n\n{seed}");
@@ -991,6 +992,26 @@ async fn published_answer_followup_only_reports_actual_publications() {
         "{status}: {body}"
     );
     assert_eq!(store.current_revision(), revision);
+}
+
+#[tokio::test]
+async fn quarantine_commit_failure_without_publication_fails_import_job() {
+    let (app, store) = import_with_quarantine_failure();
+    let initial_revision = store.current_revision();
+    let (status, body) = send(
+        &app,
+        Method::POST,
+        "/api/v1/repositories/nrese/import?async=true",
+        Some("application/n-triples"),
+        INVALID_UPLOAD,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let started: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let job = finished(&app, started["path"].as_str().expect(&body)).await;
+    assert_eq!(job["state"], "failed", "{job}");
+    assert_eq!(job["error"], UNPUBLISHED_QUARANTINE_FAILURE, "{job}");
+    assert_eq!(store.current_revision(), initial_revision);
 }
 
 /// Imports run as jobs: an uploaded document with `async=true`, and files from the
