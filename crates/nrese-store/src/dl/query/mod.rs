@@ -726,18 +726,34 @@ pub(crate) fn certify_closure(
     certify(completeness, (query, reads), source, false, snapshot);
 }
 
-/// The QL rewriting's own report as it leaves nrese-sparql (run, EXPLAIN and plan), with
-/// the whole composition ([`certify_closure`]) on it: the answer's status is this report
-/// (`StoreService::status_outside_dl`), so the two are one value.
+/// The QL rewriting's own report as it leaves nrese-sparql (run, EXPLAIN, plan and the printed
+/// query), with the whole composition ([`certify_closure`]) on it: the answer's status is this
+/// report (`StoreService::status_outside_dl`), so the two are one value. Under `owl2-rl`, where
+/// the closure leaves out a list axiom (`lists_left_out`, asked only of a report still
+/// `complete` after the composition's other steps, so an earlier reason keeps its place), whose
+/// conclusions an answer may miss, it isn't `complete` ([`LIST`]); then the operator rule, last.
 pub(crate) fn certify_report(
     completeness: Option<&mut Completeness>,
     query: (&Query, &Reads),
     snapshot: Option<&Snapshot>,
+    lists_left_out: impl FnOnce() -> bool,
 ) {
-    if let Some(completeness) = completeness {
-        certify_closure(completeness, query, "ql", snapshot);
+    let Some(completeness) = completeness else {
+        return;
+    };
+    if !lowerings(completeness, query, "ql", false, snapshot) {
+        return;
     }
+    let rl = completeness.regime == Some(nrese_sparql::Regime::Owl2Rl);
+    if completeness.complete && rl && lists_left_out() {
+        completeness.incomplete("rules", LIST.to_owned());
+    }
+    negation_rule(completeness, query, "ql");
 }
+
+/// Why a QL report under `owl2-rl` isn't `complete` where the closure leaves out a list.
+const LIST: &str =
+    "a list axiom the rules can't build is left out of the closure (a list diagnostic)";
 
 /// What [`certify`] reads of a query, which depends on the query and its reader alone, as the
 /// reasons it gives: each found on its first use and kept with the prepared query
@@ -773,14 +789,28 @@ impl Reads {
 /// [`certify_closure`], on the bounds' path where `bounds` (what [`denied`] allows there).
 pub(crate) fn certify(
     completeness: &mut Completeness,
-    (query, reads): (&Query, &Reads),
+    query: (&Query, &Reads),
     source: &'static str,
     bounds: bool,
     snapshot: Option<&Snapshot>,
 ) {
+    if lowerings(completeness, query, source, bounds, snapshot) {
+        negation_rule(completeness, query, source);
+    }
+}
+
+/// [`certify`]'s steps before the operator rule; `false` (none taken) where the regime isn't
+/// one of OWL 2's.
+fn lowerings(
+    completeness: &mut Completeness,
+    (query, reads): (&Query, &Reads),
+    source: &'static str,
+    bounds: bool,
+    snapshot: Option<&Snapshot>,
+) -> bool {
     use nrese_sparql::Regime::{Owl2Dl, Owl2Ql, Owl2Rl};
     if !matches!(completeness.regime, Some(Owl2Dl | Owl2Ql | Owl2Rl)) {
-        return;
+        return false;
     }
     let read = reads.denied[usize::from(bounds)].get_or_init(|| {
         denied(query, bounds).map(|what| format!("the query reads {what}: {DENIED}"))
@@ -832,7 +862,7 @@ pub(crate) fn certify(
         completeness.incomplete(source, QUARANTINE.to_owned());
     }
     annotation_rule(completeness, (query, reads), source, given);
-    negation_rule(completeness, (query, reads), source);
+    true
 }
 
 /// Where the status speaks of the OWL 2 Direct Semantics (`owl2-dl`, or the QL rewriting's,
@@ -924,7 +954,9 @@ fn copied<'a>(
 
 /// Where rows may be missing, an operator under which a missing row can make a returned
 /// one wrong makes the answers unsound ([`negation`]): the last step of [`certify`], and of
-/// a read inside a transaction whatever the regime, whose pending rows the closure lacks.
+/// a read inside a transaction whatever the regime, whose pending rows the closure lacks. Its
+/// reason is given once: a read it already lowered (its route's composition, before the
+/// pending operations') isn't told it again from another source.
 pub(crate) fn negation_rule(
     completeness: &mut Completeness,
     (query, reads): (&Query, &Reads),
@@ -938,7 +970,8 @@ pub(crate) fn negation_rule(
             format!("the query uses {op} over answers that may be missing: a row may be wrong")
         })
     });
-    if let Some(reason) = operator {
+    let given = |reason: &String| completeness.reasons.iter().any(|r| r.text == *reason);
+    if let Some(reason) = operator.as_ref().filter(|reason| !given(reason)) {
         completeness.unsound(source, reason.clone());
     }
 }
