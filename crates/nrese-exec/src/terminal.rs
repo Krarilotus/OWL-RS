@@ -1,5 +1,5 @@
 //! One operation's end, recorded once ([`terminal`]). The [`Guard`] goes with the work (a
-//! `spawn_blocking` task, a store's build thread); its first [`Guard::end`] is the end, and a
+//! `spawn_blocking` task, a store's build thread); it records the first end, and a
 //! guard dropped before any end records what its fallback returns then, so a panic, a
 //! cancelled task or an early return still ends the operation. Readers ([`Terminal`]) read it
 //! or wait for it, on a thread or in a task, always with a deadline of their own.
@@ -172,6 +172,13 @@ impl<O> Guard<O> {
         true
     }
 
+    /// Releases the fallback's captures, then records `outcome` and wakes the waiters.
+    /// Returns whether this end was the one recorded.
+    pub fn finish(mut self, outcome: O) -> bool {
+        drop(self.fallback.take());
+        self.end(outcome)
+    }
+
     /// A reader of the same end.
     pub fn terminal(&self) -> Terminal<O> {
         Terminal {
@@ -283,7 +290,7 @@ mod tests {
         let mut waiter = pin!(reader.wait_or(pending()));
         assert!(waiter.as_mut().poll(&mut cx).is_pending());
 
-        assert!(guard.end(Outcome::Committed));
+        assert!(guard.finish(Outcome::Committed));
         assert_eq!(
             waiter.as_mut().poll(&mut cx),
             Poll::Ready(Some(Outcome::Committed))

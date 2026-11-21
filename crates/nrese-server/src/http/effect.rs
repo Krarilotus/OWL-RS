@@ -16,19 +16,34 @@ enum End<T> {
     Fallback(Option<MutationState>),
 }
 
-// Fields drop in declaration order, including when the queued task never runs.
-struct Held<T, H> {
-    guard: Guard<End<T>>,
+// If the queued task never runs, field drop order releases the work and value
+// before the guard records the fallback end.
+struct Held<T, H, W> {
+    work: W,
     value: Option<H>,
+    guard: Guard<End<T>>,
     #[cfg(test)]
     pause: Option<tests::PauseAfterEnd>,
 }
 
-impl<T, H> Held<T, H> {
-    fn finish(mut self, work: impl FnOnce(Option<&mut H>) -> End<T>) {
-        self.guard.end(work(self.value.as_mut()));
+impl<T, H, W> Held<T, H, W>
+where
+    W: FnOnce(Option<&mut H>) -> End<T>,
+{
+    fn finish(self) {
+        // On unwind, the bindings drop in reverse order so the guard records the end last.
+        let Self {
+            guard,
+            mut value,
+            work,
+            #[cfg(test)]
+            pause,
+        } = self;
+        let outcome = work(value.as_mut());
+        drop(value);
+        guard.finish(outcome);
         #[cfg(test)]
-        if let Some(pause) = self.pause.take() {
+        if let Some(pause) = pause {
             pause.wait();
         }
     }
@@ -41,12 +56,13 @@ fn spawn<T: Clone + Send + Sync + 'static, H: Send + 'static>(
 ) -> Terminal<End<T>> {
     let (end, guard) = terminal(fallback);
     let held = Held {
-        guard,
+        work,
         value: held,
+        guard,
         #[cfg(test)]
         pause: tests::PAUSE_AFTER_END.take(),
     };
-    drop(tokio::task::spawn_blocking(move || held.finish(work)));
+    drop(tokio::task::spawn_blocking(move || held.finish()));
     end
 }
 
