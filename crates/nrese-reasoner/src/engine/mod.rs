@@ -374,12 +374,13 @@ impl<E> Vocabulary for Constants<'_, E> {
 
 /// Whether RDF can store the triple: an IRI or blank node subject and an IRI predicate.
 pub(crate) fn storable(fact @ [subject, predicate, _]: Triple) -> bool {
-    !fact.into_iter().any(crate::lists::internal)
-        && matches!(
-            TermId::from_raw(subject).kind(),
-            TermKind::Iri | TermKind::BlankNode
-        )
-        && TermId::from_raw(predicate).kind() == TermKind::Iri
+    if fact.into_iter().any(crate::lists::internal) {
+        return false;
+    }
+    matches!(
+        TermId::from_raw(subject).kind(),
+        TermKind::Iri | TermKind::BlankNode
+    ) && TermId::from_raw(predicate).kind() == TermKind::Iri
 }
 
 pub(crate) fn encode([s, p, o]: Triple) -> EncodedTriple {

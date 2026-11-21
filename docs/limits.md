@@ -139,7 +139,7 @@ leave something out.
   Lists whose walks exceed the encoder's bounds use rules over individual cells.
   Their size is governed by the operation's existing memory and work limits.
   With QL rewriting on, a list outside OWL 2 DL's RDF syntax can still make a read
-  `sound-only` through the structural reader's broken-list hazard.
+  `sound-only` through the structural reader's `BrokenList` hazard.
   Literals aren't
   equated by value (`"1"^^xsd:integer` and `"01"^^xsd:integer` stay two terms): compare
   values in a `FILTER` (`?v = 1`), which SPARQL does by value. Otherwise none known.

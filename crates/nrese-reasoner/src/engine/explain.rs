@@ -50,6 +50,7 @@ pub fn explain_violation(
     };
     let mut withheld = 0usize;
     let mut evidence: Vec<crate::RejectEvidence> = Vec::new();
+    let mut list_evidence = Vec::new();
     let mut via = Vec::new();
     if let Some(rule) = program
         .rules
@@ -92,7 +93,7 @@ pub fn explain_violation(
                     .skip(1)
                     .filter(|step| step.origin == "asserted")
                 {
-                    evidence.push(crate::RejectEvidence {
+                    list_evidence.push(crate::RejectEvidence {
                         role: "premise",
                         subject: step.subject,
                         predicate: step.predicate,
@@ -115,6 +116,7 @@ pub fn explain_violation(
                 .flatten()
         })
         .unwrap_or_default();
+    evidence.extend(list_evidence);
     let premises: Vec<String> = evidence
         .iter()
         .map(|e| format!("{} {} {} ({})", e.subject, e.predicate, e.object, e.origin))

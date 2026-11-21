@@ -151,6 +151,11 @@ impl ListVocabulary {
                 .contains(&o))
     }
 
+    fn nil_is_cell(&self, facts: &impl Facts) -> bool {
+        !facts.objects(self.nil, self.first).is_empty()
+            && !facts.objects(self.nil, self.rest).is_empty()
+    }
+
     pub(crate) fn leaves_out(&self, facts: &impl Facts) -> bool {
         let nil_is_cell = std::cell::OnceCell::new();
         [
@@ -165,10 +170,7 @@ impl ListVocabulary {
         .into_iter()
         .any(|p| {
             facts.pairs(p).into_iter().any(|(_, head)| {
-                let nil_is_cell = *nil_is_cell.get_or_init(|| {
-                    !facts.objects(self.nil, self.first).is_empty()
-                        && !facts.objects(self.nil, self.rest).is_empty()
-                });
+                let nil_is_cell = *nil_is_cell.get_or_init(|| self.nil_is_cell(facts));
                 if !nil_is_cell && let Some(linear) = self.linear_list(facts, head) {
                     return linear.is_err();
                 }
@@ -193,9 +195,7 @@ impl ListVocabulary {
             return self.accepting_cells(facts, head).map(List::Cells);
         }
         let cells = self.accepting_cells(facts, head)?;
-        let conjunctive = matches!(kind, ListKind::Key | ListKind::Intersection);
-        if (conjunctive || check_acyclic(facts, &cells, head).is_ok())
-            && let Some(walks) = self.enumerate(facts, &cells, head, kind.member_limit())
+        if let Some(walks) = self.enumerate(facts, &cells, head, kind)
             && kind.fits(&walks, self.same_as)
         {
             return Ok(List::Walks(walks));
@@ -291,8 +291,13 @@ impl ListVocabulary {
         facts: &impl Facts,
         cells: &HashMap<u64, Cell>,
         head: u64,
-        most: usize,
+        kind: ListKind,
     ) -> Option<Vec<Variant>> {
+        let conjunctive = matches!(kind, ListKind::Key | ListKind::Intersection);
+        // An outgoing accepting edge from nil lets a walk return there.
+        if !conjunctive && !cells[&self.nil].rests.is_empty() {
+            return None;
+        }
         let mut variants = Vec::new();
         let (mut members, mut used) = (Vec::new(), Vec::new());
         let mut active = HashSet::from([head]);
@@ -303,7 +308,12 @@ impl ListVocabulary {
                 return None;
             }
             let cell = &cells[&*node];
-            if let Some(&member) = cell.firsts.get(*first)
+            if *node == self.nil && !members.is_empty() {
+                if variants.len() == MAX_VARIANTS || members.len() > kind.member_limit() {
+                    return None;
+                }
+                variants.push((members.clone(), used.clone()));
+            } else if let Some(&member) = cell.firsts.get(*first)
                 && let Some(&next) = cell.rests.get(*rest)
             {
                 *rest += 1;
@@ -311,20 +321,15 @@ impl ListVocabulary {
                     *first += 1;
                     *rest = 0;
                 }
-                if next == self.nil || active.insert(next) {
-                    members.push(member);
-                    used.extend([[*node, self.first, member], [*node, self.rest, next]]);
-                    if next == self.nil {
-                        if variants.len() == MAX_VARIANTS || members.len() > most {
-                            return None;
-                        }
-                        variants.push((members.clone(), used.clone()));
-                        members.pop();
-                        used.truncate(2 * members.len());
-                    } else {
-                        stack.push((next, 0, 0));
+                if next != self.nil && !active.insert(next) {
+                    if !conjunctive {
+                        return None;
                     }
+                    continue;
                 }
+                members.push(member);
+                used.extend([[*node, self.first, member], [*node, self.rest, next]]);
+                stack.push((next, 0, 0));
                 continue;
             }
             active.remove(node);
@@ -403,37 +408,6 @@ fn first_problem(cells: &HashMap<u64, Cell>, mut node: u64) -> ListProblem {
     ListProblem::Cycle { node }
 }
 
-/// Check the accepting graph independently of the enumeration cap. A repeat
-/// on the current path is a cycle; a previously finished tail can be shared.
-fn check_acyclic(
-    facts: &impl Facts,
-    cells: &HashMap<u64, Cell>,
-    head: u64,
-) -> Result<(), ListProblem> {
-    let mut active = HashSet::from([head]);
-    let mut done = HashSet::new();
-    let mut stack = vec![(head, cells[&head].rests.iter())];
-    while let Some((node, rests)) = stack.last_mut() {
-        if facts.stopped() {
-            return Err(ListProblem::Malformed { node: head });
-        }
-        if let Some(&rest) = rests.next() {
-            if done.contains(&rest) {
-                continue;
-            }
-            if !active.insert(rest) {
-                return Err(ListProblem::Cycle { node: rest });
-            }
-            stack.push((rest, cells[&rest].rests.iter()));
-        } else {
-            active.remove(node);
-            done.insert(*node);
-            stack.pop();
-        }
-    }
-    Ok(())
-}
-
 /// A member sequence of a list, with the facts its path uses.
 type Variant = (Vec<u64>, Vec<[u64; 3]>);
 
@@ -462,8 +436,8 @@ impl ListKind {
         match self {
             Self::Chain => MAX_RULE_MEMBERS,
             Self::Key => MAX_KEY_MEMBERS,
-            Self::Intersection | Self::Union => crate::eval::MAX_RULE_ATOMS,
-            Self::Pairwise => usize::MAX,
+            Self::Intersection => crate::eval::MAX_RULE_ATOMS,
+            Self::Pairwise | Self::Union => usize::MAX,
         }
     }
 }
@@ -628,10 +602,7 @@ pub(crate) fn compile(
                     return;
                 }
                 let axiom = [subject, predicate, head];
-                let nil_is_cell = *nil_is_cell.get_or_init(|| {
-                    !facts.objects(voc.nil, voc.first).is_empty()
-                        && !facts.objects(voc.nil, voc.rest).is_empty()
-                });
+                let nil_is_cell = *nil_is_cell.get_or_init(|| voc.nil_is_cell(facts));
                 let list = match voc.list(facts, head, nil_is_cell, kind) {
                     Ok(list) => list,
                     Err(problem) => {
