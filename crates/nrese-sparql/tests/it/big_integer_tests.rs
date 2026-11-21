@@ -4,7 +4,7 @@
 use nrese_engine::{Engine, EngineConfig, Snapshot};
 use nrese_rdf::vocab::xsd;
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term};
-use nrese_sparql::{QueryOptions, QueryResults, evaluate_query, runs_natively};
+use nrese_sparql::{QueryOptions, QueryResults, evaluate_query, explain_query, runs_natively};
 use nrese_sparql_syntax::SparqlParser;
 
 const BASE: &str = "urn:big-int:";
@@ -565,7 +565,7 @@ fn inline_subtype_tie_in_streamed_and_eager_extrema() {
     assert_eq!(run_both(&snap_min, q_min, &direct, false), expected_min);
     assert_eq!(run_both(&snap_min, q_min, &streamed, false), expected_min);
 
-    // Grouped eager-eligible query with inline subtype tie.
+    // Grouped, with the inline subtype tie.
     let q_grouped =
         "SELECT ?g (MIN(?v) AS ?lo) (MAX(?v) AS ?hi) { ?g :seed ?s . ?s :v ?v } GROUP BY ?g";
     let expected_grouped = vec![vec![
@@ -580,6 +580,53 @@ fn inline_subtype_tie_in_streamed_and_eager_extrema() {
     assert_eq!(
         run_both(&snap_max, q_grouped, &streamed, false),
         expected_grouped
+    );
+}
+
+/// SPARQL 1.1 §18.5.1.5-6: MIN and MAX follow ORDER BY's order, which ranks
+/// `"1"^^xsd:integer` before `"1"^^xsd:nonNegativeInteger`; eager aggregation takes the
+/// extreme of per-key partial extremes, so each partial must keep that order on a tie.
+/// MIN and MAX together fail without it in either row order: a reducer keeping the
+/// first of tied terms gives both the same term.
+#[test]
+fn inline_subtype_tie_through_eager_aggregation() {
+    let int = || Term::from(typed("1", "integer"));
+    let non_negative = || Term::from(typed("1", "nonNegativeInteger"));
+    let mut triples = Vec::new();
+    for (seed, items) in [
+        ("s1", [("a", int()), ("b", non_negative()), ("c", int())]),
+        (
+            "s2",
+            [("d", non_negative()), ("e", int()), ("f", non_negative())],
+        ),
+    ] {
+        triples.push((node("g"), node("seed"), Term::from(node(seed))));
+        for (item, value) in items {
+            triples.push((node(seed), node("item"), Term::from(node(item))));
+            triples.push((node(item), node("v"), value));
+        }
+    }
+    let engine = load(triples);
+    let snapshot = engine.snapshot();
+    let query = "SELECT ?g (MIN(?v) AS ?lo) (MAX(?v) AS ?hi) \
+                 { ?g :seed ?s . ?s :item ?i . ?i :v ?v } GROUP BY ?g";
+    let expected = vec![vec![
+        Some(Term::from(node("g"))),
+        Some(int()),
+        Some(non_negative()),
+    ]];
+    assert_eq!(
+        run_both(&snapshot, query, &QueryOptions::default(), false),
+        expected
+    );
+    let parsed = SparqlParser::new()
+        .parse_query(&format!("{PREFIX}{query}"))
+        .unwrap();
+    let explained = explain_query(&snapshot, &parsed, &QueryOptions::default()).unwrap();
+    assert!(
+        explained.rewrites.contains(&"eager-aggregation"),
+        "{:?}",
+        explained.rewrites
     );
 }
 
@@ -638,7 +685,7 @@ fn big_integer_string_constructor_normalizes_xml_whitespace() {
         Some(Term::from(typed("9223372036854775808", "integer"))),
     );
     check(
-        "xsd:integer(\"\t\n -0009223372036854775809 \r\n\")",
+        r#"xsd:integer("\t\n -0009223372036854775809 \r\n")"#,
         Some(Term::from(typed("-9223372036854775809", "integer"))),
     );
     check(
