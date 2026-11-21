@@ -190,15 +190,16 @@ impl ListVocabulary {
         if !nil_is_cell && let Some(linear) = self.linear_list(facts, head) {
             let walks = linear?;
             if kind.fits(&walks, self.same_as) {
-                return Ok(List::Walks(walks));
+                return Ok(List::Walks(walks, None));
             }
             return self.accepting_cells(facts, head).map(List::Cells);
         }
         let cells = self.accepting_cells(facts, head)?;
-        if let Some(walks) = self.enumerate(facts, &cells, head, kind)
+        if let Some((walks, cut)) = self.enumerate(facts, &cells, head, kind)
             && kind.fits(&walks, self.same_as)
         {
-            return Ok(List::Walks(walks));
+            let extra_members = (cut && matches!(kind, ListKind::Intersection)).then_some(cells);
+            return Ok(List::Walks(walks, extra_members));
         }
         Ok(List::Cells(cells))
     }
@@ -292,18 +293,29 @@ impl ListVocabulary {
         cells: &HashMap<u64, Cell>,
         head: u64,
         kind: ListKind,
-    ) -> Option<Vec<Variant>> {
+    ) -> Option<(Vec<Variant>, bool)> {
         let conjunctive = matches!(kind, ListKind::Key | ListKind::Intersection);
         // An outgoing accepting edge from nil lets a walk return there.
-        if !conjunctive && !cells[&self.nil].rests.is_empty() {
+        let mut cut = !cells[&self.nil].rests.is_empty();
+        if !conjunctive && cut {
             return None;
         }
+        // Count attempted prefixes, back edges, and the work of copying each
+        // finished walk. A densely connected graph may have very few exits.
+        let mut work_left = cells
+            .values()
+            .fold(cells.len(), |n, cell| {
+                n.saturating_add(cell.firsts.len())
+                    .saturating_add(cell.rests.len())
+            })
+            .saturating_mul(8);
         let mut variants = Vec::new();
         let (mut members, mut used) = (Vec::new(), Vec::new());
         let mut active = HashSet::from([head]);
         // Each frame is a cell and the next combination of first and rest at it.
         let mut stack = vec![(head, 0, 0)];
         while let Some((node, first, rest)) = stack.last_mut() {
+            work_left = work_left.checked_sub(1)?;
             if facts.stopped() {
                 return None;
             }
@@ -312,6 +324,7 @@ impl ListVocabulary {
                 if variants.len() == MAX_VARIANTS || members.len() > kind.member_limit() {
                     return None;
                 }
+                work_left = work_left.checked_sub(members.len())?;
                 variants.push((members.clone(), used.clone()));
             } else if let Some(&member) = cell.firsts.get(*first)
                 && let Some(&next) = cell.rests.get(*rest)
@@ -325,6 +338,7 @@ impl ListVocabulary {
                     if !conjunctive {
                         return None;
                     }
+                    cut = true;
                     continue;
                 }
                 members.push(member);
@@ -337,7 +351,34 @@ impl ListVocabulary {
             members.pop();
             used.truncate(2 * members.len());
         }
-        Some(variants)
+        Some((variants, cut))
+    }
+
+    fn each_member(
+        &self,
+        facts: &impl Facts,
+        cells: &HashMap<u64, Cell>,
+        head: u64,
+        mut emit: impl FnMut(u64, Vec<[u64; 3]>),
+    ) {
+        for (&node, cell) in cells {
+            if facts.stopped() {
+                return;
+            }
+            if let Some(mut prefix) = self.path(facts, cells, head, node, false)
+                && let Some(suffix) = self.path(facts, cells, node, self.nil, true)
+            {
+                let offset = prefix.len();
+                prefix.extend(suffix);
+                for &member in &cell.firsts {
+                    if facts.stopped() {
+                        return;
+                    }
+                    prefix[offset][2] = member;
+                    emit(member, prefix.clone());
+                }
+            }
+        }
     }
 
     /// One path as first/rest premises, including a first at each position.
@@ -391,7 +432,9 @@ struct Cell {
 }
 
 enum List {
-    Walks(Vec<Variant>),
+    /// Short walks, with a cell graph when cutting cycles or nil continuations
+    /// can omit members from the outward rules of an intersection.
+    Walks(Vec<Variant>, Option<HashMap<u64, Cell>>),
     Cells(HashMap<u64, Cell>),
 }
 
@@ -588,167 +631,169 @@ pub(crate) fn compile(
     let mut premises: Vec<Vec<[u64; 3]>> = Vec::new();
     let mut diagnostics: Vec<ListDiagnostic> = Vec::new();
     let nil_is_cell = std::cell::OnceCell::new();
-    let mut lists =
-        |predicate, name: &'static str, kind, rules: &mut Vec<Rule>, make: &mut MakeRules| {
-            debug_assert!(voc.is_list_fact([0, predicate, 0]), "read, not a list fact");
-            match (rule_kind, kind) {
-                (RuleKind::Inference, ListKind::Pairwise)
-                | (
-                    RuleKind::Consistency,
-                    ListKind::Chain | ListKind::Key | ListKind::Intersection | ListKind::Union,
-                ) => return,
-                _ => {}
+    let mut lists = |predicate,
+                     name: &'static str,
+                     kind,
+                     rules: &mut Vec<Rule>,
+                     make: &mut MakeRules| {
+        debug_assert!(voc.is_list_fact([0, predicate, 0]), "read, not a list fact");
+        match (rule_kind, kind) {
+            (RuleKind::Inference, ListKind::Pairwise)
+            | (
+                RuleKind::Consistency,
+                ListKind::Chain | ListKind::Key | ListKind::Intersection | ListKind::Union,
+            ) => return,
+            _ => {}
+        }
+        for (subject, head) in facts.pairs(predicate) {
+            if facts.stopped() {
+                return;
             }
-            for (subject, head) in facts.pairs(predicate) {
-                if facts.stopped() {
-                    return;
+            let axiom = [subject, predicate, head];
+            let nil_is_cell = *nil_is_cell.get_or_init(|| voc.nil_is_cell(facts));
+            let list = match voc.list(facts, head, nil_is_cell, kind) {
+                Ok(list) => list,
+                Err(problem) => {
+                    diagnostics.push(ListDiagnostic {
+                        rules: name,
+                        subject,
+                        predicate,
+                        head,
+                        problem,
+                    });
+                    continue;
                 }
-                let axiom = [subject, predicate, head];
-                let nil_is_cell = *nil_is_cell.get_or_init(|| voc.nil_is_cell(facts));
-                let list = match voc.list(facts, head, nil_is_cell, kind) {
-                    Ok(list) => list,
-                    Err(problem) => {
-                        diagnostics.push(ListDiagnostic {
-                            rules: name,
-                            subject,
-                            predicate,
-                            head,
-                            problem,
+            };
+            let classes = if matches!(kind, ListKind::Pairwise) {
+                facts.objects(subject, voc.rdf_type)
+            } else {
+                Vec::new()
+            };
+            let mut make_walk = |members: &[u64], mut used: Vec<[u64; 3]>, unary: bool| {
+                let before = rules.len();
+                make(subject, members, rules);
+                if unary {
+                    if rules
+                        .get(before)
+                        .is_some_and(|rule| rule.name == "cls-int1")
+                    {
+                        rules.remove(before);
+                    }
+                }
+                used.push(axiom);
+                for class in [
+                    voc.all_disjoint_classes,
+                    voc.all_disjoint_properties,
+                    voc.all_different,
+                ] {
+                    if classes.contains(&class) {
+                        used.push([subject, voc.rdf_type, class]);
+                    }
+                }
+                debug_assert!(rules[before..].iter().all(Rule::fits));
+                for _ in before..rules.len() {
+                    premises.push(used.clone());
+                }
+            };
+            match list {
+                List::Walks(walks, extra_members) => {
+                    let mut seen = HashSet::new();
+                    for (members, used) in walks {
+                        if extra_members.is_some() {
+                            seen.extend(members.iter().copied());
+                        }
+                        make_walk(&members, used, false);
+                    }
+                    if let Some(cells) = extra_members {
+                        voc.each_member(facts, &cells, head, |member, used| {
+                            if seen.insert(member) {
+                                make_walk(&[member], used, true);
+                            }
                         });
-                        continue;
                     }
-                };
-                let classes = if matches!(kind, ListKind::Pairwise) {
-                    facts.objects(subject, voc.rdf_type)
-                } else {
-                    Vec::new()
-                };
-                let mut make_walk = |members: &[u64], mut used: Vec<[u64; 3]>, unary: bool| {
-                    let before = rules.len();
-                    make(subject, members, rules);
-                    if unary {
-                        if rules
-                            .get(before)
-                            .is_some_and(|rule| rule.name == "cls-int1")
-                        {
-                            rules.remove(before);
-                        }
+                }
+                List::Cells(cells) => {
+                    if matches!(kind, ListKind::Union | ListKind::Intersection) {
+                        voc.each_member(facts, &cells, head, |member, used| {
+                            make_walk(&[member], used, true);
+                        });
                     }
-                    used.push(axiom);
-                    for class in [
-                        voc.all_disjoint_classes,
-                        voc.all_disjoint_properties,
-                        voc.all_different,
-                    ] {
-                        if classes.contains(&class) {
-                            used.push([subject, voc.rdf_type, class]);
-                        }
-                    }
-                    debug_assert!(rules[before..].iter().all(Rule::fits));
-                    for _ in before..rules.len() {
-                        premises.push(used.clone());
-                    }
-                };
-                match list {
-                    List::Walks(walks) => {
-                        for (members, used) in walks {
-                            make_walk(&members, used, false);
-                        }
-                    }
-                    List::Cells(cells) => {
-                        if matches!(
-                            kind,
-                            ListKind::Union | ListKind::Intersection | ListKind::Pairwise
-                        ) {
-                            for (&node, cell) in &cells {
-                                if facts.stopped() {
-                                    return;
-                                }
-                                let Some(mut prefix) = voc.path(facts, &cells, head, node, false)
+                    if matches!(kind, ListKind::Pairwise) {
+                        for (&node, cell) in &cells {
+                            if facts.stopped() {
+                                return;
+                            }
+                            let Some(prefix) = voc.path(facts, &cells, head, node, false) else {
+                                continue;
+                            };
+                            for (&next, tail) in &cells {
+                                let Some(mut between) = voc.path(facts, &cells, node, next, true)
                                 else {
                                     continue;
                                 };
-                                let offset = prefix.len();
-                                if matches!(kind, ListKind::Pairwise) {
-                                    for (&next, tail) in &cells {
-                                        let Some(mut between) =
-                                            voc.path(facts, &cells, node, next, true)
-                                        else {
-                                            continue;
-                                        };
-                                        let Some(mut suffix) =
-                                            voc.path(facts, &cells, next, voc.nil, true)
-                                        else {
-                                            continue;
-                                        };
-                                        for &a in &cell.firsts {
-                                            between[0][2] = a;
-                                            for &b in &tail.firsts {
-                                                if facts.stopped() {
-                                                    return;
-                                                }
-                                                suffix[0][2] = b;
-                                                let mut used = prefix.clone();
-                                                used.extend_from_slice(&between);
-                                                used.extend_from_slice(&suffix);
-                                                make_walk(&[a, b], used, false);
-                                            }
+                                let Some(mut suffix) = voc.path(facts, &cells, next, voc.nil, true)
+                                else {
+                                    continue;
+                                };
+                                for &a in &cell.firsts {
+                                    between[0][2] = a;
+                                    for &b in &tail.firsts {
+                                        if facts.stopped() {
+                                            return;
                                         }
-                                    }
-                                } else if let Some(suffix) =
-                                    voc.path(facts, &cells, node, voc.nil, true)
-                                {
-                                    prefix.extend(suffix);
-                                    for &member in &cell.firsts {
-                                        prefix[offset][2] = member;
-                                        make_walk(&[member], prefix.clone(), true);
+                                        suffix[0][2] = b;
+                                        let mut used = prefix.clone();
+                                        used.extend_from_slice(&between);
+                                        used.extend_from_slice(&suffix);
+                                        make_walk(&[a, b], used, false);
                                     }
                                 }
                             }
                         }
-                        if matches!(kind, ListKind::Chain)
-                            && let Some(cell) = cells
-                                .get(&head)
-                                .filter(|cell| cell.firsts.contains(&subject))
-                        {
-                            for &rest in &cell.rests {
-                                if cells.get(&rest).is_some_and(|tail| {
-                                    tail.firsts.contains(&subject) && tail.rests.contains(&voc.nil)
-                                }) {
-                                    make_walk(
-                                        &[subject, subject],
-                                        vec![
-                                            [head, voc.first, subject],
-                                            [head, voc.rest, rest],
-                                            [rest, voc.first, subject],
-                                            [rest, voc.rest, voc.nil],
-                                        ],
-                                        false,
-                                    );
-                                }
+                    }
+                    if matches!(kind, ListKind::Chain)
+                        && let Some(cell) = cells
+                            .get(&head)
+                            .filter(|cell| cell.firsts.contains(&subject))
+                    {
+                        for &rest in &cell.rests {
+                            if cells.get(&rest).is_some_and(|tail| {
+                                tail.firsts.contains(&subject) && tail.rests.contains(&voc.nil)
+                            }) {
+                                make_walk(
+                                    &[subject, subject],
+                                    vec![
+                                        [head, voc.first, subject],
+                                        [head, voc.rest, rest],
+                                        [rest, voc.first, subject],
+                                        [rest, voc.rest, voc.nil],
+                                    ],
+                                    false,
+                                );
                             }
                         }
-                        if matches!(
+                    }
+                    if matches!(
+                        kind,
+                        ListKind::Chain | ListKind::Key | ListKind::Intersection
+                    ) {
+                        per_cell::compile(
+                            voc,
                             kind,
-                            ListKind::Chain | ListKind::Key | ListKind::Intersection
-                        ) {
-                            per_cell::compile(
-                                voc,
-                                kind,
-                                axiom,
-                                &cells,
-                                predicates,
-                                &|| facts.stopped(),
-                                |rule, used| {
-                                    rules.push(rule);
-                                    premises.push(used);
-                                },
-                            );
-                        }
+                            axiom,
+                            &cells,
+                            predicates,
+                            &|| facts.stopped(),
+                            |rule, used| {
+                                rules.push(rule);
+                                premises.push(used);
+                            },
+                        );
                     }
                 }
             }
-        };
+        }
+    };
     let ty = voc.rdf_type;
     // prp-spo2: (x0 p1 x1) … (x(n-1) pn xn) -> (x0 p xn)
     lists(
