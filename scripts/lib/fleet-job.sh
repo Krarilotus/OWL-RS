@@ -11,12 +11,12 @@
 #                                 fleet stayed silent too long; the job is cancelled then
 #   fleet_results                 the directory its results were fetched to (nothing: none came)
 #   fleet_cancel                  cancels it, once (also on an interrupt)
+#   q TEXT                        TEXT as a TOML string
 #
 # Silence is a call with no answer: no reply, an error, a timeout or no state. It is unknown, not an
 # end: the job is neither judged nor cancelled for it, and a pending job's start window doesn't run
 # meanwhile. A spell of it ends the wait only once it has lasted NRESE_FLEET_SILENT_S seconds
-# (default 600) or MAX_S has passed; then the job is cancelled. A job never is submitted again.
-#   q TEXT                        TEXT as a TOML string
+# (default 600) or MAX_S has passed; then the job is cancelled. A job is never submitted again.
 fleet_bin=${NRESE_FLEET_BIN:-$(git config --get nrese.fleetBin || echo ${HOME:+"$HOME"/Documents/fleet-scheduler/state/owlrs/bin/fleet.exe})}
 fleet_id=""
 fleet_state=""
