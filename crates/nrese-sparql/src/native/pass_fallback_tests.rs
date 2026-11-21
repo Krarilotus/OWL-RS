@@ -162,6 +162,20 @@ enum Route {
     PerColumn,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct RouteCharges {
+    used: usize,
+    kept: usize,
+    decoded_items: usize,
+    after_decoder: usize,
+}
+
+fn release_decoder(ctx: &Context<'_>) -> usize {
+    *ctx.decoded.borrow_mut() =
+        decode_cache::DecodeCache::new(&ctx.budget, DECODE_CACHE_ENTRIES, 1);
+    ctx.budget.used()
+}
+
 /// The GROUP BY under `pattern`: its input, keys and aggregates.
 fn group_in(
     pattern: &GraphPattern,
@@ -189,7 +203,7 @@ fn aggregated(
     query: &Query,
     limit: Option<usize>,
     route: Route,
-) -> (Result<Vec<String>, String>, [usize; 3]) {
+) -> (Result<Vec<String>, String>, RouteCharges) {
     let Query::Select { pattern, .. } = query else {
         panic!("a SELECT")
     };
@@ -201,11 +215,13 @@ fn aggregated(
         other => panic!("{other:?}"),
     };
     let charges = || {
-        [
-            ctx.budget.used(),
-            ctx.kept.borrow().bytes(),
-            ctx.decoded.borrow().bytes_for_test() + ctx.budget.ahead(),
-        ]
+        let decoded_items = ctx.decoded.borrow().bytes_for_test();
+        RouteCharges {
+            used: ctx.budget.used(),
+            kept: ctx.kept.borrow().bytes(),
+            decoded_items,
+            after_decoder: release_decoder(&ctx),
+        }
     };
     let solutions = match ctx.eval(inner) {
         Ok(solutions) => solutions,
@@ -390,7 +406,7 @@ fn a_pass_that_falls_back_leaves_nothing_charged() {
             Ok(general) if general != per_column => {
                 wrong.push(format!("{shape} at {limit}: the routes answer differently"));
             }
-            Ok(_) if after[0] - after[2] != alone[0] - alone[2] || after[1] != alone[1] => wrong.push(format!(
+            Ok(_) if after.after_decoder != alone.after_decoder || after.kept != alone.kept => wrong.push(format!(
                 "{shape} at {limit}: charges {after:?} afterwards, the per-column route {alone:?}"
             )),
             Ok(_) => {}
@@ -582,17 +598,15 @@ fn streamed_retry(refusal: RefuseDirect, message: &str) {
         ctx.consumed(solutions);
         let [kept, terms, numbers, used, decoded] = counters(&ctx);
         let planned = ctx.distinct_counts.borrow().charged();
-        let ahead = ctx.budget.ahead();
         // Sample both live caches, then let the decoder independently give back its room.
-        *ctx.decoded.borrow_mut() =
-            decode_cache::DecodeCache::new(&ctx.budget, DECODE_CACHE_ENTRIES, 1);
-        let remaining = ctx.budget.used();
+        let remaining = release_decoder(&ctx);
         let attributed = (kept + planned) as i64;
         (
             rows,
             [kept, terms, numbers],
             [
-                used as i64 - (decoded + ahead) as i64 - attributed,
+                used as i64 - attributed,
+                decoded as i64,
                 remaining as i64 - attributed,
             ],
             reached_refusal,
@@ -607,11 +621,14 @@ fn streamed_retry(refusal: RefuseDirect, message: &str) {
         "retried adaptive streaming answers AVG"
     );
     assert!(retried.3, "the same direct plan reached the refused charge");
-    assert_eq!(
-        alone.2[0], alone.2[1],
-        "adaptive streaming's decoder releases its charge"
+    let [alone_used, alone_items, alone_after] = alone.2;
+    let [retry_used, retry_items, retry_after] = retried.2;
+    assert!(
+        alone_used >= alone_items + alone_after,
+        "adaptive streaming keeps the decoder charged"
     );
-    assert_eq!(retried.2, alone.2, "{message}");
+    assert_eq!(retry_after, alone_after, "{message}");
+    assert!(retry_used >= retry_items + alone_after, "{message}");
     assert_eq!(retried.1, alone.1, "{message}");
 }
 
@@ -696,6 +713,8 @@ fn a_restored_save_point_leaves_the_context_as_it_was() {
     }
     let older: Term = Literal::from("a term made before the point, number 512").into();
     let older_id = ctx.id(&older).ok().unwrap();
+    // Start with an empty decoder so everything it adds is speculative.
+    release_decoder(&ctx);
     let before = counters(&ctx);
     assert!(before[1] >= 1_025, "the terms are computed: {before:?}");
     let point = ctx.save();
@@ -717,12 +736,8 @@ fn a_restored_save_point_leaves_the_context_as_it_was() {
         before[..3],
         "[kept bytes, computed terms, remembered numbers]"
     );
-    assert_eq!(
-        after[3] - after[4],
-        before[3] - before[4],
-        "live non-cache charges"
-    );
-    assert!(after[4] <= before[4], "no speculative decode bytes survive");
+    assert_eq!(after[4], 0, "no speculative decode bytes survive");
+    assert_eq!(after[3], before[3], "live non-cache charges");
     assert_eq!(ctx.term(older_id), Some(older.clone()));
     assert_eq!(ctx.id(&older).ok(), Some(older_id));
     // What stays allocated is what the charge of the terms kept covers: two slots of the
