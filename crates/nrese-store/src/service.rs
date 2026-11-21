@@ -122,6 +122,7 @@ pub(crate) struct Certificate {
 const PENDING: &str = "a read inside a transaction: its pending operations aren't reasoned over \
                        before the commit";
 const CLOSURE: &str = " (the committed closure, no DL bounds)";
+const NO_BOUNDS: &str = " (no DL bounds)";
 const DELETES: &str = "the pending operations may delete statements whose inferences remain \
                        until the commit";
 
@@ -1395,12 +1396,15 @@ impl StoreService {
         let mut status = route?;
         let source = if certificate.dl { "dl" } else { "transaction" };
         if let Revision::Pending(_, deletes) = at {
-            // A read whose dataset leaves out the default graph reads no committed closure.
-            let reads_closure = prepared.dataset_omission_reason().is_none();
-            let closure = if certificate.dl && reads_closure {
-                CLOSURE
-            } else {
-                ""
+            // Under `owl2-dl` a pending read has no DL bounds whatever its dataset; it reads the
+            // committed closure unless it leaves the default graph out.
+            let closure = match (
+                certificate.dl,
+                crate::dl::query::reads_store_closure(prepared),
+            ) {
+                (false, _) => "",
+                (true, true) => CLOSURE,
+                (true, false) => NO_BOUNDS,
             };
             status.incomplete(source, format!("{PENDING}{closure}"));
             if deletes {
