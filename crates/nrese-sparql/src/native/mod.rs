@@ -2152,13 +2152,14 @@ impl<'a> Context<'a> {
     /// attempt that may be undone. It covers the terms made new to the query ([`Self::id`]),
     /// the numbers remembered ([`Self::numeric_pass`]) and both their charges. Closed by
     /// [`Self::keep`] (what the attempt added stays) or [`Self::restore`], which is total:
-    /// every term made since is let go with its id and charge, and every number remembered
-    /// since with its charge, so the context holds and is charged exactly what it was at the
-    /// point. Nothing that outlives the attempt may hold an id made since (its tables and
-    /// results are dropped before the restore). Points nest: one closes before any opened
-    /// before it (checked), and a point kept inside another hands its numbers to that one.
-    /// Not covered: the decode cache, which gives way of itself, and the aliases and distinct
-    /// counts, which hold stored ids under their own charges.
+    /// every term made since is let go with its id, its aliases ([`Self::register_alias`]) and
+    /// their charges, every number remembered since with its charge, and an alias refused
+    /// since is forgotten, so the context holds and is charged exactly what it was at the
+    /// point. Nothing else that outlives the attempt may hold an id made since (its tables
+    /// and results are dropped before the restore). Points nest: one closes before any
+    /// opened before it (checked), and a point kept inside another hands its numbers to that
+    /// one. Not covered, as they hold stored terms only: the decode cache, which gives way of
+    /// itself, the aliases of stored terms and the distinct counts, under their own charges.
     fn save(&self) -> SavePoint {
         let mut since = self.since.borrow_mut();
         since.push(Remembered {
@@ -2168,6 +2169,7 @@ impl<'a> Context<'a> {
         SavePoint {
             terms: self.computed.borrow().len(),
             depth: since.len(),
+            aliases_refused: self.aliases_refused.get().is_some(),
         }
     }
 
@@ -2203,12 +2205,34 @@ impl<'a> Context<'a> {
         );
         // The numbers, then their charge.
         since.truncate(point.depth - 1);
-        let mut ids = self.computed_ids.borrow_mut();
+        drop(since);
+        // An alias names its term by id: the aliases of the terms let go go first, before
+        // their ids are made again.
+        let mut computed = self.computed.borrow_mut();
         let mut bytes = 0usize;
-        for term in self.computed.borrow_mut().drain(point.terms..) {
+        self.aliases.borrow_mut().retain(|alias, &mut id| {
+            let Some(index) = computed_index(id).filter(|&index| index as usize >= point.terms)
+            else {
+                return true;
+            };
+            if let Some(term) = computed.get(index as usize) {
+                bytes = bytes.saturating_add(alias_bytes(alias, term));
+            }
+            self.evaluator.forget_alias(alias);
+            false
+        });
+        if !point.aliases_refused {
+            self.aliases_refused.set(None);
+        }
+        let mut ids = self.computed_ids.borrow_mut();
+        for term in computed.drain(point.terms..) {
             bytes = bytes.saturating_add(computed_bytes(&term));
             ids.remove(&term);
         }
+        // What stays allocated is what the terms kept are charged for ([`computed_bytes`]).
+        let terms = computed.len();
+        computed.shrink_to(2 * terms);
+        ids.shrink_to(2 * terms);
         self.kept.borrow_mut().release(bytes);
     }
 
@@ -7430,12 +7454,13 @@ fn merge_numbers(
     }
 }
 
-/// An open save point ([`Context::save`]): the computed terms the context held, and how
-/// many points were open with it.
+/// An open save point ([`Context::save`]): the computed terms the context held, how many
+/// points were open with it, and whether an alias was refused before it.
 #[must_use = "a save point is closed by `keep` or `restore`"]
 struct SavePoint {
     terms: usize,
     depth: usize,
+    aliases_refused: bool,
 }
 
 /// What a number [`Context::numeric_pass`] remembers holds in its map: the id and the

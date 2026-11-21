@@ -177,6 +177,14 @@ impl Evaluator {
             .insert(alias.to_owned(), term);
     }
 
+    /// Lets `alias` go ([`Self::register_alias`]).
+    pub(crate) fn forget_alias(&self, alias: &str) {
+        self.aliases
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(alias);
+    }
+
     /// The compiled `pattern` with `flags`, cached per query; `None` if it doesn't compile.
     /// A clone shares the compiled program, so matching runs outside the lock.
     fn regex(&self, pattern: &str, flags: &str) -> Option<Regex> {
