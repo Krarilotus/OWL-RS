@@ -33,7 +33,9 @@ case "$1" in
 esac
 """
 # Each kind of silence: no reply, a CLI error, an answer without a state, a call that takes a second.
-SILENCE = ["", "!error: the fleet's service is unreachable", '{"host": "office-pc"}', '{"state": null}', "~1"]
+SILENCE = ['{"state": null}', "", "!error: the fleet's service is unreachable", '{"host": "office-pc"}', "~1"]
+# Silence without the wait: six of these in a row are more than the old six-call limit allowed.
+QUICK = SILENCE[1:4] * 2
 FAILING = {"code": 1, "steps": [{"name": "test", "code": 1, "seconds": 1}]}
 
 
@@ -68,10 +70,10 @@ class FleetFollow(push.Repo):
         return path.read_text().split() if path.exists() else []
 
     def test_a_silence_shorter_than_the_cap_is_waited_out(self):
-        """Silence for more polls than the cap has seconds, but for less time: the gate follows the
-        job on, cancels nothing, and passes on its result."""
-        self.env["NRESE_FLEET_SILENT_S"] = "16"
-        self.play("status", state("running"), *SILENCE, *SILENCE[:-1] * 4, state("running"), state("done"))
+        """Silence for many more calls than the old limit of six, but for less time than the cap:
+        the gate follows the job on, cancels nothing, and passes on its result."""
+        self.env["NRESE_FLEET_SILENT_S"] = "120"
+        self.play("status", state("running"), *SILENCE, *QUICK * 4, state("running"), state("done"))
         self.play("results", self.results())
         code, where, _, err = self.gate()
         self.assertEqual((code, where, self.cancels()), (0, "fleet:gate-1@office-pc cpu=znver3", []),
@@ -79,12 +81,15 @@ class FleetFollow(push.Repo):
 
     def test_a_silence_that_reaches_the_cap_or_the_gates_limit_ends_with_one_cancel(self):
         """A silence ends the wait once it has lasted NRESE_FLEET_SILENT_S seconds, or the gate's
-        MAX_S has passed, whichever comes first: no verdict, and the job, named, cancelled once."""
-        for silent_s, max_s in (("1", "10800"), ("600", "3")):
-            with self.subTest(silent_s=silent_s, max_s=max_s):
+        MAX_S has passed, whichever comes first: no verdict, and the job, named, cancelled once. It
+        is counted in seconds, not calls: two slow silent calls outlast a cap of three seconds."""
+        for silent_s, max_s, silence in (("1", "10800", [""]), ("600", "3", [""]),
+                                         ("3", "10800", ["~2", "~2", state("done")])):
+            with self.subTest(silent_s=silent_s, max_s=max_s, silence=silence):
                 self.reset()
                 self.env.update(NRESE_FLEET_SILENT_S=silent_s, NRESE_GATE_MAX_S=max_s)
-                self.play("status", state("running"), "")
+                self.play("status", state("running"), *silence)
+                self.play("results", self.results())
                 code, where, _, err = self.gate()
                 self.assertEqual((code, where, self.cancels()), (75, "", ["gate-1"]),
                                  f"SPEC silence-cap: not one cancel at the cap\n{err}")
@@ -93,7 +98,7 @@ class FleetFollow(push.Repo):
     def test_a_job_that_ended_while_the_fleet_was_silent_is_judged_by_its_result(self):
         """The job fails on its host while the fleet doesn't answer; once it answers again, inside
         the cap, the gate reads the job's result, and the verdict is the result's."""
-        self.play("status", state("running"), *SILENCE * 2, state("failed"))
+        self.play("status", state("running"), *SILENCE, *QUICK, state("failed"))
         self.play("results", self.results(**FAILING))
         code, _, _, err = self.gate()
         self.assertEqual((code, self.cancels()), (1, []),
