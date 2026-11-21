@@ -748,10 +748,10 @@ fn marks_and_passes(
 }
 
 /// A read off the rules route of a store with neither an annotation-property axiom nor an
-/// equality is told no mark, committed and inside a transaction. The committed read's mark
-/// doesn't go to the whole ontology: the store's indexes and the commit's record show there
-/// is neither. The pending read's goes once to its own: its base's record says nothing of
-/// the pending changes.
+/// equality is told no mark, committed and inside a transaction. Neither read's mark goes to
+/// the whole ontology: the store's indexes and the commit's record show there is neither, and
+/// the pending change, a class assertion over the base's signature, keeps the record, as its
+/// commit would (`Bounds::keeps_record`).
 #[test]
 fn a_store_without_annotation_axioms_or_equality_is_marked_without_the_ontology() {
     let (reads, _) = marks_and_passes(
@@ -761,9 +761,75 @@ fn a_store_without_annotation_axioms_or_equality_is_marked_without_the_ontology(
     );
     assert_eq!(
         reads,
-        [(vec![], 0), (vec![], 1)],
+        [(vec![], 0), (vec![], 0)],
         "[committed, pending]: (the mark's reasons, passes over the whole ontology)"
     );
+}
+
+/// Spec (a pending read takes its base's record of what the reader left out only where its
+/// changes keep it, by the tests their commit applies, `Bounds::keeps_record`): a change that
+/// names a reserved name, changes the schema, says something about the ontology's node, or
+/// gives a property an axiom names a second kind (a literal on an object property) may change
+/// what the reader reads. Its pending read passes once over its own ontology and is told what
+/// that tells: the reserved name and the second kind a mark, the schema and the header
+/// statement none. A data-only change over a base whose premise has a break is told the
+/// base's break, from the base's record, without the ontology.
+#[test]
+fn a_pending_read_takes_its_bases_record_only_where_its_changes_keep_it() {
+    let owner = ":tib :owner :ann . ";
+    // (the case, the base past the route's own data, the pending change, a word of the
+    // pending read's one mark (`None`: no mark), its passes over the whole ontology)
+    let cases = [
+        (
+            "a reserved name",
+            String::new(),
+            ":rex :owner rdfs:Resource .",
+            Some("were left out"),
+            1,
+        ),
+        (
+            "a schema change",
+            String::new(),
+            ":Dog rdfs:subClassOf :Pet .",
+            None,
+            1,
+        ),
+        (
+            "a header statement",
+            ":onto a owl:Ontology . ".to_owned(),
+            ":onto :owner :ann .",
+            None,
+            1,
+        ),
+        (
+            "a second kind",
+            ":owner rdfs:domain :Pet . ".to_owned(),
+            ":rex :owner \"Rex\" .",
+            Some("two kinds"),
+            1,
+        ),
+        (
+            "a base with a break",
+            ":ann :owner rdfs:Resource . ".to_owned(),
+            ":rex a :Pet .",
+            Some("were left out"),
+            0,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (case, base, change, word, passes) in cases {
+        let data = format!("{owner}{base}");
+        let (reads, _) = marks_and_passes(crate::StoreConfig::in_memory(), &data, change);
+        let (marks, made) = &reads[1];
+        let told = match word {
+            None => marks.is_empty(),
+            Some(word) => marks.len() == 1 && marks[0].contains(word),
+        };
+        if !told || *made != passes {
+            wrong.push(format!("{case}: (marks, passes) {:?}", reads[1]));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// A revision with no record of what the reader left out (as a reopened store has none; a
