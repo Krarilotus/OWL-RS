@@ -62,8 +62,34 @@ def stands_before(row: str, count: int, words: set[str], stops: set[int]) -> boo
     return False
 
 
-# The gate's counts a row states: its passes or checks, and its known skips, disputes and listed failures.
-KEYS = ("passed", "checked", "skipped", "disputed", "known")
+# The gate's counts a row states: its passes or checks, and its known skips, disputes, open cases and listed failures.
+KEYS = ("passed", "checked", "skipped", "disputed", "open", "known")
+
+# The runners' lists, by the count each one is (test_w3c_list_counts.py's COUNTED, the one home of that mapping).
+_lists = importlib.util.spec_from_file_location("w3c_list_counts", Path(__file__).with_name("test_w3c_list_counts.py"))
+list_counts = importlib.util.module_from_spec(_lists)
+_lists.loader.exec_module(list_counts)
+
+
+def list_links(kit, suite: str) -> dict[str, str]:
+    """The page's links to the lists of `suite`'s counts that only `suite` states, by count: `{key: ../…/file}`."""
+    return {count: f"{runner_link(kit)}/{name}" for (k, name), (_, count, suites) in list_counts.COUNTED.items()
+            if k == kit.name and suites == (suite,)}
+
+
+def link_errors(row: str, suite: str, want: dict, links: dict[str, str]) -> list[str]:
+    """A count with a list of its own is the text a link to that list starts with (`[2 not decided](…/undecided.txt)`),
+    so no other number in the row (`OWL 2`) can stand for it."""
+    errors = []
+    for key, path in links.items():
+        count = want.get(key)
+        if key not in KEYS or not count:
+            continue
+        found = [int(n.replace(",", "")) for n in re.findall(r"\[(\d[\d,]*)\b[^\]]*\]\(" + re.escape(path) + r"\)", row)]
+        if found != [count]:
+            errors.append(f"{suite}: the gate requires {key} = {count}, as the start of the link to {path}; "
+                          f"the row's links to it start with {found}")
+    return errors
 
 
 def row_errors(row: str, suite: str, suites: tuple[str, ...], expected: dict) -> list[str]:
@@ -108,6 +134,7 @@ class StandardsTable(unittest.TestCase):
                 own = [row for row in rows if f"]({link})" in row and names(row, suite)]
                 self.assertEqual(len(own), 1, f"{suite}: rows naming it and linking {link}: {own}")
                 self.assertEqual(row_errors(own[0], suite, kit.suites, expected), [])
+                self.assertEqual(link_errors(own[0], suite, expected[suite], list_links(kit, suite)), [])
                 checked += 1
         self.assertGreater(checked, 0)
 
@@ -154,6 +181,23 @@ class StandardsTable(unittest.TestCase):
         cut = "| [OWL 2 QL](x) | Rules | 51 W3C test cases, 9 known failures |"
         self.assertEqual(row_errors(row, "OWL 2 QL", ("OWL 2 QL",), expected), [])
         self.assertEqual(len(row_errors(cut, "OWL 2 QL", ("OWL 2 QL",), expected)), 1)
+
+    def test_a_count_with_its_own_list_starts_the_link_to_it(self):
+        # Spec: S15's witness: `2 not decided` removed from the OWL 2 DL row must fail, though `OWL 2` holds a 2.
+        want = {"passed": 408, "disputed": 1, "open": 2}
+        links = {"open": "../t/undecided.txt", "disputed": "../t/disputed.txt"}
+        row = ("| OWL 2 DL | x | 408 cases, [2 not decided](../t/undecided.txt) and [1 whose answer is wrong]"
+               "(../t/disputed.txt); 403 round trips (OWL 2 RDF/XML round trip) |")
+        cut = "| OWL 2 DL | x | 408 cases, and [1 whose answer is wrong](../t/disputed.txt); 403 (OWL 2 RDF/XML) |"
+        moved = ("| OWL 2 DL | x | 408 cases, 2 [not decided](../t/undecided.txt) and [1 whose answer is wrong]"
+                 "(../t/disputed.txt) |")
+        self.assertEqual(row_errors(row, "OWL 2 DL", ("OWL 2 DL",), {"OWL 2 DL": want}), [])
+        self.assertEqual(row_errors(cut, "OWL 2 DL", ("OWL 2 DL",), {"OWL 2 DL": want}), [])  # why the link counts
+        self.assertEqual(link_errors(row, "OWL 2 DL", want, links), [])
+        self.assertEqual(len(link_errors(cut, "OWL 2 DL", want, links)), 1)
+        self.assertEqual(len(link_errors(moved, "OWL 2 DL", want, links)), 1)
+        # A list's count stated as 0 needs no link.
+        self.assertEqual(link_errors(cut, "OWL 2 DL", {**want, "open": 0}, links), [])
 
     def test_a_suite_with_no_stated_count_is_no_check(self):
         row = "| SPARQL 1.1 | x | 531 tests |"

@@ -1430,7 +1430,7 @@ def log_counts(text: str) -> dict[str, dict]:
         elif m := re.match(r"(W3C SHACL[^:]*): (\d+) of (\d+) pass$", line):
             put(m[1].removeprefix("W3C "), "summary", passed=int(m[2]), failed=int(m[3]) - int(m[2]), skipped=0)
         elif m := re.match(r"W3C (OWL 2 (?:RL|QL))[^:]*: (\d+) passed, (\d+) failed \((\d+) expected\), (\d+) skipped"
-                           r"(?:; .*)?$", line):
+                           r"(?:; \d+ conclusions asked as queries, \d+ through anonymous individuals)?$", line):
             put(m[1], "summary", passed=int(m[2]), failed=int(m[3]) - int(m[4]), known=int(m[4]), skipped=int(m[5]))
         elif m := re.match(r"W3C RDFC-1\.0: (\d+) of (\d+) passed$", line):
             put("RDFC-1.0", "summary", passed=int(m[1]), failed=int(m[2]) - int(m[1]))
@@ -1464,7 +1464,8 @@ def log_counts(text: str) -> dict[str, dict]:
                 out["GeoSPARQL"] = {"unreadable": "summary: the parts don't add up to the whole"}
             else:
                 put("GeoSPARQL", "summary", passed=int(m[1]), failed=int(m[3]) - int(m[4]), disputed=int(m[4]))
-        elif m := re.match(r"test result: (ok|FAILED)\. (\d+) passed; (\d+) failed;", line):
+        elif m := re.match(r"test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; \d+ ignored; \d+ measured; "
+                           r"\d+ filtered out; finished in \S+$", line):
             out.setdefault("test results", {"passed": 0, "failed": 0})
             out["test results"]["passed"] += int(m[2])
             out["test results"]["failed"] += int(m[3])

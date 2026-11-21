@@ -1892,7 +1892,7 @@ class Parts(unittest.TestCase):
             logs = Path(tmp)
             (logs / "w3c_owl2_rl.log").write_text(
                 "W3C OWL 2 RL test cases (RDF-based semantics): 86 passed, 0 failed (0 expected), 3 skipped\n"
-                "test result: ok. 1 passed; 0 failed; 0 ignored\n")
+                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.50s\n")
             (logs / "w3c_shacl.log").write_text("W3C SHACL Core: 98 of 98 pass\n")
             (logs / "w3c_sparql11.log").write_text(
                 "W3C SPARQL 1.1 on engine v2: passed / failed / skipped (failures shared with the reference)\n"
@@ -2000,6 +2000,13 @@ class Parts(unittest.TestCase):
         garbled = gate_module.log_counts("W3C SPARQL 1.1 on engine v2: passed / failed / skipped\n"
                                          "  total: 531 / 0 / 0bad (0)\n")
         self.assertNotIn("SPARQL 1.1", garbled)
+        # Round 3's witnesses: a QL summary with a tail of its own, and a libtest footer cut short.
+        ql = "W3C OWL 2 QL test cases (Direct Semantics): 51 passed, 9 failed (9 expected), 2 skipped"
+        self.assertIn("OWL 2 QL", gate_module.log_counts(ql + "\n"))
+        self.assertNotIn("OWL 2 QL", gate_module.log_counts(ql + "; garbage\n"))
+        footer = "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.25s"
+        self.assertEqual(gate_module.log_counts(footer + "\n")["test results"], {"passed": 0, "failed": 1})
+        self.assertNotIn("test results", gate_module.log_counts("test result: ok. 0 passed; 0 failed;\n"))
         one_missing = gate_module.log_counts("W3C JSON-LD 1.1 suites: passed / failed / not run\n"
                                              "  toRdf-manifest.jsonld: 900 / 0 / 12\n"
                                              "  expand-manifest.jsonld: 376 / 0 / 9\n")
