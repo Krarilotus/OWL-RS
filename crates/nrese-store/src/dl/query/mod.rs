@@ -387,20 +387,26 @@ fn composed(
 
 /// The data a status is composed for ([`mark`]): the view the answers were decided on, or
 /// the snapshot a read without the bounds ran on, committed or with a transaction's
-/// operations pending (whose revision number is its base's, so it is read afresh), and
-/// whether one of them may delete.
+/// operations pending (whose revision number is its base's, so it is read afresh).
 #[derive(Clone, Copy)]
 pub(crate) enum Revision<'a> {
     Decided(&'a (Snapshot, Arc<View>)),
     Committed(&'a Snapshot),
-    Pending(&'a Snapshot, bool),
+    Pending {
+        snapshot: &'a Snapshot,
+        /// Whether one of the operations may delete.
+        deletes: bool,
+        /// Whether they keep their base's record of what the reader left out
+        /// (`dl::bounds::Bounds::keeps_record`).
+        keeps_record: bool,
+    },
 }
 
 impl Revision<'_> {
     pub(crate) fn snapshot(&self) -> &Snapshot {
         match self {
             Revision::Decided((snapshot, _)) => snapshot,
-            Revision::Committed(snapshot) | Revision::Pending(snapshot, _) => snapshot,
+            Revision::Committed(snapshot) | Revision::Pending { snapshot, .. } => snapshot,
         }
     }
 }
@@ -440,7 +446,7 @@ pub(crate) fn mark(
         any(&by_subject).or_else(|| any(&by_object)).is_some()
     };
     let read = match at {
-        Revision::Pending(..) => read_ontology,
+        Revision::Pending { .. } => read_ontology,
         _ => ontology_at,
     };
     if let Some(iri) = named_outside(prepared.query(), held)
@@ -515,13 +521,18 @@ const ONLY: &str = "OWL 2 DL may not entail what the OWL 2 RL rules found here, 
 /// which both leave (`routed_to_rules` needs neither): what the store's indexes decide
 /// ([`by_index`]), else one read of the ontology `at` ([`ontology_at`], a pending one's of
 /// its own), whose refusal leaves it unknown. First [`left_out`], as recorded (pending: the
-/// base's, taken where it tells something; a pending read never takes its clean record).
+/// base's, taken where it tells something, and where it tells nothing only where the pending
+/// changes keep it, as their commit would).
 fn reads_differently(store: &StoreService, at: Revision<'_>) -> Option<String> {
-    let (snapshot, pending) = match at {
+    let (snapshot, pending, keeps_record) = match at {
         Revision::Decided((_, view)) if view.rules => return None,
-        Revision::Decided((snapshot, _)) => (snapshot, false),
-        Revision::Committed(snapshot) => (snapshot, false),
-        Revision::Pending(snapshot, _) => (snapshot, true),
+        Revision::Decided((snapshot, _)) => (snapshot, false, true),
+        Revision::Committed(snapshot) => (snapshot, false, true),
+        Revision::Pending {
+            snapshot,
+            keeps_record,
+            ..
+        } => (snapshot, true, keeps_record),
     };
     // Named where its commit wrote it: only a reader of every graph is given the status this
     // reason is in (`status_for_its_reader`, service.rs). U1's proof of consistency is no
@@ -529,11 +540,14 @@ fn reads_differently(store: &StoreService, at: Revision<'_>) -> Option<String> {
     let left_out = (store.dl().status())
         .filter(|s| s.revision == snapshot.revision())
         .and_then(|s| s.left_out);
-    // A pending read's record is its base's: one that tells nothing says nothing of the pending
-    // changes (a node typed the ontology reads its statements otherwise), so it reads its own.
+    // A pending read's record is its base's: one that tells nothing says nothing of pending
+    // changes that may change what the reader reads (a node typed the ontology reads its
+    // statements otherwise, a literal gives an object property a second kind), so it reads
+    // its own, but where they keep the record (`Bounds::keeps_record`). The indexes are the
+    // pending state's own.
     match (left_out, by_index(snapshot)) {
         (Some(Some(why)), _) | (_, Some(Some(why))) => return Some(why),
-        (Some(None), Some(None)) if !pending => return None,
+        (Some(None), Some(None)) if keeps_record => return None,
         _ => {}
     }
     let marked = &store.dl().query_ontology.1;

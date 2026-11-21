@@ -24,7 +24,9 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use nrese_engine::{EncodedQuad, EncodedTriple, ReadModel, Snapshot, TermId, Transaction};
+use nrese_engine::{
+    EncodedQuad, EncodedTriple, PendingView, ReadModel, Snapshot, TermId, Transaction,
+};
 use nrese_owl::Ontology;
 use nrese_reasoner::eval::Stop;
 use nrese_reasoner::ir::Triple;
@@ -233,7 +235,7 @@ impl Kinds {
     /// is read. A cell new in the commit has its own pending `rdf:first`, which
     /// [`changes_schema`] already sends to the reader; without `rdf:first` in the dictionary
     /// at the route's revision there was no cell at the base.
-    fn cell(&self, tx: &Transaction<'_>, t: u64) -> bool {
+    fn cell(&self, tx: &impl PendingView, t: u64) -> bool {
         let id = TermId::from_raw(t);
         let Some(first) = self.first else {
             return false;
@@ -263,7 +265,7 @@ impl Kinds {
     /// object property. A statement that names a list's cell ([`Self::cell`]), an annotation
     /// too, is read, and so is one about the ontology's node ([`header`]) but a known
     /// annotation property's.
-    fn keep(&self, tx: &Transaction<'_>, triple @ [s, p, o]: Triple, deleted: bool) -> bool {
+    fn keep(&self, tx: &impl PendingView, triple @ [s, p, o]: Triple, deleted: bool) -> bool {
         let k = &self.signature;
         if self.cell(tx, s) || self.cell(tx, o) {
             return false;
@@ -297,7 +299,7 @@ impl Kinds {
 /// of the committed index). A statement about it is an annotation or an assertion by its
 /// property's declarations (*Mapping to RDF* Table 10), which only the reader tells: so it is
 /// read. A node typed so in the commit itself is read by that statement, OWL's vocabulary.
-fn header(tx: &Transaction<'_>, s: u64) -> bool {
+fn header(tx: &impl PendingView, s: u64) -> bool {
     let id = |iri: &str| tx.lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into());
     let (Some(ty), Some(ontology)) = (
         id("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
@@ -315,7 +317,7 @@ fn header(tx: &Transaction<'_>, s: u64) -> bool {
 
 /// Whether OWL 2 RL admits the literal `o`'s datatype (`nrese_owl::profile::rl_datatype`):
 /// every inline kind's is the map's but `xsd:date`'s; any other literal is read.
-fn rl_literal(tx: &Transaction<'_>, o: u64) -> bool {
+fn rl_literal(tx: &impl PendingView, o: u64) -> bool {
     match TermId::from_raw(o).kind() {
         nrese_engine::TermKind::Date => false,
         nrese_engine::TermKind::TypedLiteral => match tx.decode(TermId::from_raw(o)) {
@@ -391,10 +393,44 @@ impl Bounds {
 
 /// Whether the commit `tx` keeps the RL route `kinds` was decided on: the closure it leaves
 /// leaves out no list axiom, and no asserted change gives a term a new kind ([`Kinds::keep`]).
-fn route_kept(kinds: &Kinds, tx: &Transaction<'_>, lists_left_out: bool) -> bool {
+fn route_kept(kinds: &Kinds, tx: &impl PendingView, lists_left_out: bool) -> bool {
     !lists_left_out
         && tx.inserted().all(|q| kinds.keep(tx, quad_triple(q), false))
         && tx.deleted().all(|q| kinds.keep(tx, quad_triple(q), true))
+}
+
+/// Whether the delta executor changes `upper` for `tx`'s asserted changes, which leave what
+/// the reader reads of the base as it was but for them: each only asserts something about
+/// individuals over U1's signature ([`Upper::is_assertion`], which no schema change passes),
+/// names no reserved name or SHACL property ([`reserved_named`]) and says nothing about the
+/// ontology's node ([`header`]), and no deleted literal may retype its property
+/// ([`may_retype`]). A U1 with equality classes is evaluated afresh (`Upper`'s module docs).
+fn assertions_only(upper: &Upper, tx: &impl PendingView) -> bool {
+    upper.classes().is_empty()
+        && (tx.inserted().chain(tx.deleted()).map(quad_triple))
+            .all(|t| upper.is_assertion(t) && !reserved_named(tx, t) && !header(tx, t[0]))
+        && !tx.deleted().any(|q| may_retype(tx, quad_triple(q)))
+}
+
+impl Bounds {
+    /// Whether what the reader left out at `tx`'s base, as the base's commit recorded it, is
+    /// what it leaves out of the data as `tx`'s changes leave it: where their commit would
+    /// take its record without reading the ontology (the commit's record: the RL route kept,
+    /// or the delta executor's change, [`assertions_only`]), by the same tests: the reader's
+    /// own, no second list. `false` where the bounds describe another revision than the
+    /// base's. The list axioms the closure leaves out are no part of the record.
+    pub(crate) fn keeps_record(&self, tx: &impl PendingView) -> bool {
+        let base = tx.base().revision();
+        let current = lock(&self.state)
+            .as_ref()
+            .filter(|s| s.revision == base)
+            .map(|s| (s.kinds.clone(), s.upper.clone()));
+        match current {
+            Some((Some(kinds), _)) => route_kept(&kinds, tx, false),
+            Some((None, Ok(upper))) => assertions_only(&upper, tx),
+            Some((None, Err(_))) | None => false,
+        }
+    }
 }
 
 impl std::fmt::Debug for Bounds {
@@ -525,14 +561,7 @@ pub(crate) fn prepare(
     // would keep a route the commit may change.
     if let Some((None, upper)) = current {
         match upper.as_deref() {
-            // A U1 with equality classes is evaluated afresh (`Upper`'s module docs).
-            Ok(upper)
-                if upper.classes().is_empty()
-                    && asserted().all(|t| {
-                        upper.is_assertion(t) && !reserved_named(tx, t) && !header(tx, t[0])
-                    })
-                    && !tx.deleted().any(|q| may_retype(tx, quad_triple(q))) =>
-            {
+            Ok(upper) if assertions_only(upper, tx) => {
                 let before = tx.base();
                 let inserted: Vec<Triple> = tx
                     .inserted()
@@ -639,13 +668,13 @@ pub(crate) fn prepare(
 /// or it names a SHACL property (`nrese_owl::shacl_properties`) anywhere, which can change
 /// whether the reader reads SHACL content as content or as any other statement
 /// (`Ontology::shacl`).
-fn reserved_named(tx: &Transaction<'_>, [s, p, o]: Triple) -> bool {
+fn reserved_named(tx: &impl PendingView, [s, p, o]: Triple) -> bool {
     named(tx, s, true) || named(tx, o, true) || named(tx, p, false)
 }
 
 /// Whether the term `t` is a SHACL property (`nrese_owl::shacl_properties`) or, with
 /// `reserved`, a reserved name (`nrese_owl::diagnostics::reserved_name`).
-fn named(tx: &Transaction<'_>, t: u64, reserved: bool) -> bool {
+fn named(tx: &impl PendingView, t: u64, reserved: bool) -> bool {
     match tx.decode(TermId::from_raw(t)) {
         Some(nrese_rdf::Term::NamedNode(n)) => {
             let iri = n.as_str();
@@ -659,7 +688,7 @@ fn named(tx: &Transaction<'_>, t: u64, reserved: bool) -> bool {
 /// Whether deleting a statement may change its property's kind for the reader: a literal
 /// value of a property not declared a data property, which is one only while it has one
 /// (`nrese_owl::profile::Signature::declared_data`, as `Kinds::keep` reads it).
-pub(crate) fn may_retype(tx: &Transaction<'_>, [_, p, o]: Triple) -> bool {
+pub(crate) fn may_retype(tx: &impl PendingView, [_, p, o]: Triple) -> bool {
     let id = |iri: &str| tx.lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into());
     let mut pattern = nrese_engine::QuadPattern::all();
     (pattern.subject, pattern.predicate, pattern.object) = (
@@ -680,7 +709,7 @@ pub(crate) fn may_retype(tx: &Transaction<'_>, [_, p, o]: Triple) -> bool {
 /// Whether a changed statement may change the ontology's schema (and so U1's rules),
 /// judged without U1's signature: a blank node, OWL's, RDF's or RDFS's vocabulary as
 /// predicate (but `rdf:type` with another class, and `owl:sameAs`).
-pub(crate) fn changes_schema(tx: &Transaction<'_>, [s, p, o]: Triple) -> bool {
+pub(crate) fn changes_schema(tx: &impl PendingView, [s, p, o]: Triple) -> bool {
     use nrese_engine::TermKind;
     let kind = |t: u64| TermId::from_raw(t).kind();
     if kind(s) == TermKind::BlankNode || kind(o) == TermKind::BlankNode {

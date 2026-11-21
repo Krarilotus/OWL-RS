@@ -1153,7 +1153,7 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
         .and_then(|value| value.trim().parse().ok())
         .unwrap_or(0);
     let mut r = Draw(fuzz.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x6d61_726b);
-    let (mut wrong, mut refused) = (Vec::new(), 0);
+    let (mut wrong, mut refused, mut keeping) = (Vec::new(), 0, 0);
     // By the indexes: a reason, none, the ontology's to decide; by the whole ontology: an
     // annotation reason, a part left out, a punning one.
     let (mut by_indexes, mut found) = ([0usize; 3], [0usize; 3]);
@@ -1209,9 +1209,16 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
             })
             .collect();
         let pending = tx.pending_snapshot().unwrap();
+        let keeps_record = store.dl().bounds.keeps_record(&tx);
+        keeping += usize::from(keeps_record);
+        let at = Revision::Pending {
+            snapshot: &pending,
+            deletes: true,
+            keeps_record,
+        };
         let reads = [
             ("committed", Revision::Committed(&snapshot), &snapshot),
-            ("pending", Revision::Pending(&pending, true), &pending),
+            ("pending", at, &pending),
         ];
         // What the commit recorded left out; a committed read checks it against the whole.
         let record = store
@@ -1231,8 +1238,9 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
                 ("pending", Some(Some(why))) => Some(why.clone()),
                 ("committed", Some(_)) => full.clone(),
                 // The limit: a part left out that no record tells (a revision the store
-                // didn't check) comes after the indexes' decision. A pending read takes no
-                // clean record from its base: it reads its own data.
+                // didn't check) comes after the indexes' decision. A pending read takes a
+                // clean record from its base only where its changes keep it: the mark is then
+                // still the whole pending ontology's.
                 _ if left => match by_index(read) {
                     Some(Some(why)) => Some(why),
                     _ => full.clone(),
@@ -1284,9 +1292,10 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
         }
     }
     eprintln!(
-        "NRESE_FUZZ_SEED={fuzz}: {CASES} stores, {refused} refused; by the indexes: {} \
-         reasons, {} none, {} to the ontology; by the whole ontology: {} annotation, {} \
-         left-out and {} punning reasons; past what it left out: {} annotation and {} punning",
+        "NRESE_FUZZ_SEED={fuzz}: {CASES} stores, {refused} refused, {keeping} transactions that \
+         keep their base's record; by the indexes: {} reasons, {} none, {} to the ontology; by \
+         the whole ontology: {} annotation, {} left-out and {} punning reasons; past what it \
+         left out: {} annotation and {} punning",
         by_indexes[0],
         by_indexes[1],
         by_indexes[2],

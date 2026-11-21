@@ -1395,7 +1395,7 @@ impl StoreService {
         };
         let mut status = route?;
         let source = if certificate.dl { "dl" } else { "transaction" };
-        if let Revision::Pending(_, deletes) = at {
+        if let Revision::Pending { deletes, .. } = at {
             let closure = if certificate.dl { CLOSURE } else { "" };
             status.incomplete(source, format!("{PENDING}{closure}"));
             if deletes {
@@ -1406,7 +1406,7 @@ impl StoreService {
             crate::dl::query::mark(self, prepared, at, &mut status);
         }
         let (reads, decided) = (prepared.reads(), matches!(at, Revision::Decided(_)));
-        if matches!(at, Revision::Pending(..)) {
+        if matches!(at, Revision::Pending { .. }) {
             crate::dl::query::negation_rule(&mut status, reads, source);
         } else if certificate.dl {
             crate::dl::query::certify(&mut status, reads, "dl", decided, Some(at.snapshot()));
@@ -1461,7 +1461,7 @@ impl StoreService {
             // A read of every statement inside a transaction lacks only the pending
             // operations' reasoning (`Self::assess`); any other read, the DL bounds.
             let mut status = nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Dl);
-            let pending = matches!(at, Revision::Pending(..));
+            let pending = matches!(at, Revision::Pending { .. });
             if prepared.read_model() != ReadModel::Materialised || !pending {
                 status.incomplete(
                     "dl",
@@ -1755,14 +1755,28 @@ impl StoreService {
         cancellation: &CancellationToken,
         read: impl FnOnce(&nrese_engine::Snapshot) -> StoreResult<T>,
     ) -> StoreResult<T> {
+        self.with_pending_record(pending, scope, memory, cancellation, |view, _| read(view))
+    }
+
+    /// [`Self::with_pending`], handing `read` too whether the operations keep their base's
+    /// record of what the reader left out (`dl::bounds::Bounds::keeps_record`), kept with a
+    /// session's view as the view is.
+    fn with_pending_record<T>(
+        &self,
+        pending: &crate::StatementsRequest,
+        scope: &crate::ReadScope,
+        memory: &nrese_exec::Envelope,
+        cancellation: &CancellationToken,
+        read: impl FnOnce(&nrese_engine::Snapshot, bool) -> StoreResult<T>,
+    ) -> StoreResult<T> {
         // The rules the view is decided under, read before it is made: one made under later
         // rules is kept as of these, never the reverse.
         let epoch = self.supports.epoch();
-        if let Some(view) = self
-            .sessions
-            .view(&self.engine.snapshot(), scope, pending, epoch)
+        if let Some((view, keeps_record)) =
+            self.sessions
+                .view(&self.engine.snapshot(), scope, pending, epoch)
         {
-            return read(&view);
+            return read(&view, keeps_record);
         }
         // Never committed: no writer slot, so other clients commit meanwhile. The operations
         // read as the reader may; what they change is checked at the commit (the view is
@@ -1785,6 +1799,7 @@ impl StoreService {
             },
         )
         .map_err(crate::StoreError::refusal_within)?;
+        let keeps_record = self.dl().bounds.keeps_record(&tx);
         let view = match self.reading(scope.access(), memory, Some(cancellation)) {
             Some(reading) => reading.pending(&tx, &budget)?,
             // Operations that touch no input of the list scan (a list fact; under compact
@@ -1803,11 +1818,11 @@ impl StoreService {
             tx.base().clone(),
             scope,
             pending,
-            view.clone(),
+            (view.clone(), keeps_record),
             epoch,
             self.supports.epoch(),
         );
-        read(&view)
+        read(&view, keeps_record)
     }
 
     /// [`run_query`](Self::run_query) on the data as `pending` would leave it.
@@ -1858,28 +1873,38 @@ impl StoreService {
             let run = Err(refusal_for_its_reader(prepared, error));
             return for_its_reader(prepared, crate::EntryPoint::RunPending, run, |_| {});
         }
-        let run = self.with_pending(pending, &scope, &memory, cancellation, |snapshot| {
-            // The status the answers carry, of the pending state `at` they are read from.
-            // Under `owl2-dl` the QL rewriting doesn't run: the status needs no report.
-            let at = Revision::Pending(snapshot, deletes);
-            let status = || self.status_outside_dl(prepared, None, at);
-            self.refuse_exact(prepared, snapshot, status)?;
-            run_query(
-                snapshot,
-                prepared,
-                &self.settings,
-                cancellation,
-                &memory,
-                out,
-                |ql| {
-                    // A transaction's pending state: never answered from the cache.
-                    let status = self.status_outside_dl(prepared, ql, at);
-                    report(self.told(prepared, status, ql.is_some()), None);
-                    (Vec::new(), |_| None)
-                },
-            )
-            .map(|_| ())
-        });
+        let run = self.with_pending_record(
+            pending,
+            &scope,
+            &memory,
+            cancellation,
+            |snapshot, keeps_record| {
+                // The status the answers carry, of the pending state `at` they are read from.
+                // Under `owl2-dl` the QL rewriting doesn't run: the status needs no report.
+                let at = Revision::Pending {
+                    snapshot,
+                    deletes,
+                    keeps_record,
+                };
+                let status = || self.status_outside_dl(prepared, None, at);
+                self.refuse_exact(prepared, snapshot, status)?;
+                run_query(
+                    snapshot,
+                    prepared,
+                    &self.settings,
+                    cancellation,
+                    &memory,
+                    out,
+                    |ql| {
+                        // A transaction's pending state: never answered from the cache.
+                        let status = self.status_outside_dl(prepared, ql, at);
+                        report(self.told(prepared, status, ql.is_some()), None);
+                        (Vec::new(), |_| None)
+                    },
+                )
+                .map(|_| ())
+            },
+        );
         let run = run.map_err(|error| refusal_for_its_reader(prepared, error));
         for_its_reader(prepared, crate::EntryPoint::RunPending, run, |_| {})
     }
