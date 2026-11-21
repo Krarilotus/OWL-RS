@@ -188,6 +188,40 @@ fn an_empty_owl_thing_is_found_under_owl2_rl() {
     found_inconsistent(ReasoningMode::Owl2Rl, &CLASHES[1..]);
 }
 
+/// Spec: a refused write's report names the violated rule and says what its violation means
+/// (docs/ops/http-api.md, "Reasoner Reject": `cax-dw (an instance of two disjoint classes)`).
+/// For an empty `owl:Thing` it names `cls-thing-empty` and says so in its own words, not the
+/// text of an unknown rule, under `owl2-ql` and `owl2-rl`.
+#[test]
+fn a_refused_empty_owl_thing_says_what_it_means() {
+    for mode in [ReasoningMode::Owl2Ql, ReasoningMode::Owl2Rl] {
+        let store = store(QlRewritingMode::Auto);
+        let result = pipeline(&store, mode).apply(
+            MutationCommand::Update(SparqlUpdateRequest::new(format!(
+                "{PREFIXES}INSERT DATA {{ owl:Thing owl:equivalentClass owl:Nothing . }}"
+            ))),
+            &Requester::all(),
+            &MutationTicket::new(),
+        );
+        let reject = match result {
+            Err(MutationError::Rejected(reject)) => reject,
+            other => panic!("{mode:?}: not refused: {other:?}"),
+        };
+        let meaning = reject
+            .detail
+            .split_once("cls-thing-empty (")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(meaning, _)| meaning.to_owned());
+        assert!(
+            meaning
+                .as_deref()
+                .is_some_and(|m| m.contains("owl:Thing") && m.contains("owl:Nothing")),
+            "{mode:?}: {}",
+            reject.detail
+        );
+    }
+}
+
 /// Each case, under `mode`, refused as a commit, and found inconsistent when loaded, with no
 /// read told `complete`.
 fn found_inconsistent(mode: ReasoningMode, cases: &[(&str, &str, &str)]) {
