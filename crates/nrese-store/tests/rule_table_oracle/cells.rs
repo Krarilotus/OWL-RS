@@ -313,6 +313,36 @@ fn nil_alias_terminates_a_list() {
             ),
         ],
     );
+    check_vocabulary_alias(fixture, "http://example.org/x", nrese_rdf::vocab::rdf::NIL);
+}
+
+#[test]
+fn rest_alias_links_list_cells() {
+    // Spec: Table 4 eq-rep-p lets an alias of rdf:rest supply the edge
+    // in the Table 3 list, so Table 5 prp-spo2 derives the chain row.
+    let fixture = case(
+        "rest-alias",
+        ["ex:a", "ex:out", "ex:c"],
+        vec![
+            insert("ex:r ex:marker ex:y"),
+            insert(
+                "
+            rdf:rest owl:sameAs ex:r
+            ex:out owl:propertyChainAxiom ex:h
+            ex:h rdf:first ex:p
+            ex:h ex:r ex:t
+            ex:t rdf:first ex:q
+            ex:t ex:r rdf:nil
+            ex:a ex:p ex:b
+            ex:b ex:q ex:c
+        ",
+            ),
+        ],
+    );
+    check_vocabulary_alias(fixture, "http://example.org/r", nrese_rdf::vocab::rdf::REST);
+}
+
+fn check_vocabulary_alias(fixture: Case, alias: &str, vocabulary: nrese_rdf::NamedNodeRef<'_>) {
     let steps = sweep::steps(&fixture);
     let expected = &steps[1].model;
     assert!(!expected.inconsistent);
@@ -336,14 +366,16 @@ fn nil_alias_terminates_a_list() {
                 assert!(judges::apply(&reasoned, &fixture.writes[1]));
             }
             let snapshot = store.read_snapshot(None).expect("read term dictionary");
-            let x = nrese_rdf::NamedNodeRef::new("http://example.org/x").unwrap();
-            let x = snapshot.lookup(x.into()).expect("the alias is interned");
-            let nil = snapshot
-                .lookup(nrese_rdf::vocab::rdf::NIL.into())
-                .expect("the terminator is interned");
+            let alias = nrese_rdf::NamedNodeRef::new(alias).unwrap();
+            let alias = snapshot
+                .lookup(alias.into())
+                .expect("the alias is interned");
+            let term = snapshot
+                .lookup(vocabulary.into())
+                .expect("the vocabulary term is interned");
             assert!(
-                x.raw() < nil.raw(),
-                "{mode} rebuild={rebuild}: {x:?} >= {nil:?}"
+                alias.raw() < term.raw(),
+                "{mode} rebuild={rebuild}: {alias:?} >= {term:?}"
             );
             if !judges::rows(&store).0.contains(&fixture.watch) {
                 missing.push((mode, rebuild));
