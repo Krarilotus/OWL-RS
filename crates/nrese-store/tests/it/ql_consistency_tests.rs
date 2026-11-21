@@ -16,6 +16,11 @@
 //!   `(:A)C ∩ (:B)C = ∅`.
 //! - `DisjointObjectProperties(:p :q :r)` (n-ary, §3.2.5) with `:x :p :y` and `:x :q :y`:
 //!   Table 6 needs `(:p)OP ∩ (:q)OP = ∅`.
+//!
+//! And the converse: annotations "have no semantic meaning in OWL 2" (Direct Semantics §1), so
+//! an annotation property's domain or range (`AnnotationPropertyDomain` / `Range`, which
+//! OWL 2 QL allows, Profiles §3.2.5) entails no membership, and data clashing only through one
+//! has a model: it is consistent, and its membership isn't an answer.
 
 use std::sync::Arc;
 
@@ -85,6 +90,27 @@ const CONTROLS: [(&str, &str, &str); 3] = [
          :p a owl:ObjectProperty . :q a owl:ObjectProperty . :r a owl:ObjectProperty . \
          :x :p :y . :z :q :y . :y a :C .",
         ":y a :C",
+    ),
+];
+
+/// An annotation property's domain or range (`:note`, declared one) that, read as an object
+/// property's, would put `:alice` (a `:Person`) in `:Doc` and so into a clash. Each has a model
+/// in which `:alice` isn't a `:Doc`.
+const ANNOTATION_AXIOMS: [(&str, &str); 3] = [
+    (
+        "an annotation domain beside a disjointness",
+        ":note a owl:AnnotationProperty ; rdfs:domain :Doc . :Doc a owl:Class . :Person a owl:Class . \
+         :Doc owl:disjointWith :Person . :alice a :Person ; :note \"x\" .",
+    ),
+    (
+        "an annotation domain beside a complement",
+        ":note a owl:AnnotationProperty ; rdfs:domain :Doc . :Doc a owl:Class . :Person a owl:Class . \
+         :Doc rdfs:subClassOf [ owl:complementOf :Person ] . :alice a :Person ; :note \"x\" .",
+    ),
+    (
+        "an annotation range beside a disjointness",
+        ":note a owl:AnnotationProperty ; rdfs:range :Doc . :Doc a owl:Class . :Person a owl:Class . \
+         :Doc owl:disjointWith :Person . :alice a :Person . :bob :note :alice .",
     ),
 ];
 
@@ -260,6 +286,67 @@ fn the_same_axioms_without_a_clash_stay_consistent() {
             if !found.starts_with("consistent, quarantined false, read true, ") {
                 wrong.push(format!("{name}, loaded, {ql:?}: {found}"));
             }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (module docs, Direct Semantics §1): under `owl2-ql` each of [`ANNOTATION_AXIOMS`] is
+/// applied as a commit, after which `:alice a :Doc` is read `false`; loaded and rebuilt, the
+/// store is consistent, not in quarantine, and the read is `false` again, with the QL rewriting
+/// on or as configured.
+#[test]
+fn an_annotation_propertys_domain_and_range_mean_nothing_under_owl2_ql() {
+    let mut wrong = Vec::new();
+    for (name, data) in ANNOTATION_AXIOMS {
+        let store = store(QlRewritingMode::Auto);
+        let committed = commit(&pipeline(&store, ReasoningMode::Owl2Ql), data);
+        let after = read(&store, ":alice a :Doc");
+        if committed != "applied" || !after.starts_with("false, ") {
+            wrong.push(format!("{name}, committed: {committed}, read {after}"));
+        }
+        for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
+            let found = loaded(ReasoningMode::Owl2Ql, ql, data, ":alice a :Doc");
+            if !found.starts_with("consistent, quarantined false, read false, ") {
+                wrong.push(format!("{name}, loaded, {ql:?}: {found}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec: what keeps its meaning beside [`an_annotation_propertys_domain_and_range_mean_nothing_under_owl2_ql`].
+/// Under `owl2-ql` an object property's domain (`ObjectPropertyDomain`, Direct Semantics
+/// Table 6) and an undeclared property's (which the OWL reader reads as an object property's)
+/// still type its subject: `:alice a :Doc` is read `true`. Under `owl2-rl` (RDF-Based Semantics,
+/// where `rdfs:domain` and `rdfs:range` hold for every property: RDFS entailment patterns
+/// rdfs2 and rdfs3) each of [`ANNOTATION_AXIOMS`] is still refused. (Guards against skipping
+/// more than annotation properties: red only when the skip reaches them.)
+#[test]
+fn other_properties_domains_keep_their_meaning() {
+    let mut wrong = Vec::new();
+    for (name, data) in [
+        (
+            "an object property's domain",
+            ":note a owl:ObjectProperty ; rdfs:domain :Doc . :alice :note :x .",
+        ),
+        (
+            "an undeclared property's domain",
+            ":note rdfs:domain :Doc . :alice :note :x .",
+        ),
+    ] {
+        let store = store(QlRewritingMode::Auto);
+        let committed = commit(&pipeline(&store, ReasoningMode::Owl2Ql), data);
+        let after = read(&store, ":alice a :Doc");
+        if committed != "applied" || !after.starts_with("true, ") {
+            wrong.push(format!("{name}, committed: {committed}, read {after}"));
+        }
+    }
+    for (name, data) in ANNOTATION_AXIOMS {
+        let store = store(QlRewritingMode::Auto);
+        let committed = commit(&pipeline(&store, ReasoningMode::Owl2Rl), data);
+        if committed != "refused" {
+            wrong.push(format!("owl2-rl, {name}, committed: {committed}"));
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
