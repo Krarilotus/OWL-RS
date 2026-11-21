@@ -2421,3 +2421,24 @@ fn a_constraint_without_messages_reports_none() {
         [(ex("a"), vec![]), (ex("a"), vec![])]
     );
 }
+
+/// SHACL 1.0 §2.1.5 copies a shape's `sh:message`s into its results, and notes that "in
+/// SHACL-SPARQL, SPARQL-based constraints and SPARQL-based constraint components provide
+/// additional means to declare such messages"; §5.3.2 gives a SPARQL-based constraint's
+/// result "The values of sh:message of the SPARQL-based constraint". A result of a
+/// constraint with its own message has that message, filled in, and not the shape's.
+#[test]
+fn a_constraint_s_filled_message_comes_before_the_shape_s() {
+    let engine = engine(
+        "ex:a ex:p 1 .",
+        "ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:message \"the shape's\" ; sh:sparql ex:Q .
+         ex:Q sh:message \"{?o} is wrong\" ;
+           sh:select '''SELECT $this ?o WHERE { $this <http://example.com/p> ?o }''' .",
+    );
+    let snapshot = engine.snapshot();
+    let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
+    assert_eq!(
+        messages_by_focus(&report),
+        [(ex("a"), vec!["\"1 is wrong\"".to_owned()])]
+    );
+}
