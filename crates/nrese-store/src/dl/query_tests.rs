@@ -832,6 +832,84 @@ fn a_pending_read_takes_its_bases_record_only_where_its_changes_keep_it() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Spec (*Mapping to RDF* Table 17: a reification annotates its main triple, which the graph
+/// states; the reader reports one whose main triple is absent, `Diagnostic::Malformed`):
+/// deleting a triple that a surviving `owl:Axiom` names as its main triple leaves that node
+/// annotating nothing, so the base's record no longer holds. On the rules route and off it, a
+/// read inside a transaction that deletes it, and a committed read after a commit that does,
+/// are each told the mark a fresh read of that data gives: a part left out.
+#[test]
+fn a_deleted_triple_a_surviving_reification_names_is_told_as_a_fresh_read_tells_it() {
+    use crate::{SparqlUpdateRequest, StatementOp, StatementsRequest};
+    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    let reified = ":tib :owner :ann . [ a owl:Axiom ; owl:annotatedSource :tib ; \
+                   owl:annotatedProperty :owner ; owl:annotatedTarget :ann ; \
+                   rdfs:comment \"since 2020\" ] . ";
+    let delete = "DELETE DATA { :tib :owner :ann . }";
+    let left_out = |marks: &[String]| marks.len() == 1 && marks[0].contains("were left out");
+    let mut wrong = Vec::new();
+    for (route, base) in [
+        ("off the route", OFF_ROUTE),
+        ("on the route", ":tib a :Pet . "),
+    ] {
+        let store = Arc::new(StoreService::new(crate::StoreConfig::in_memory()).unwrap());
+        let pipeline = crate::MutationPipeline::new(
+            Arc::clone(&store),
+            Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+                ReasoningMode::Owl2Dl,
+            ))),
+        );
+        commit(&pipeline, &format!("INSERT DATA {{ {base}{reified} }}"));
+        let ask = format!("{MARK_PREFIXES}ASK {{ :tib a :Pet }}");
+        let prepared = || {
+            let request = crate::SparqlQueryRequest::all(ask.clone());
+            store.prepare_query(&request).unwrap()
+        };
+        let marks = |status: Option<nrese_sparql::Completeness>| -> Vec<String> {
+            let reasons = status.expect("a status").reasons.into_iter();
+            reasons
+                .filter(|r| r.text.contains(ONLY))
+                .map(|r| r.text)
+                .collect()
+        };
+        // Inside a transaction that deletes it.
+        let (mut status, cancel) = (None, CancellationToken::new());
+        let update = SparqlUpdateRequest::new(format!("{MARK_PREFIXES}{delete}"));
+        let ops = StatementsRequest::new(vec![StatementOp::Update(update)]);
+        let out = Vec::<u8>::new();
+        let read = store.run_query_pending_reporting(&ops, &prepared(), &cancel, out, |s, _| {
+            status = s;
+            None
+        });
+        read.unwrap();
+        let pending = marks(status);
+        // After a commit that deletes it.
+        commit(&pipeline, delete);
+        let mut status = None;
+        let out = Vec::<u8>::new();
+        let read = store.run_query_reporting(&prepared(), &cancel, out, |s, _| {
+            status = s;
+            None
+        });
+        read.unwrap();
+        let committed = marks(status);
+        // A fresh read of that data.
+        let snapshot = store.engine().snapshot();
+        let whole = read_ontology(&store, &snapshot).expect("the ontology");
+        let fresh = by_ontology(&snapshot, whole.value());
+        if !fresh.as_ref().is_some_and(|f| f.contains("were left out")) {
+            wrong.push(format!("{route}: setup: a fresh read tells {fresh:?}"));
+        }
+        if !left_out(&pending) {
+            wrong.push(format!("{route}: inside the transaction: {pending:?}"));
+        }
+        if !left_out(&committed) {
+            wrong.push(format!("{route}: after the commit: {committed:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// A revision with no record of what the reader left out (as a reopened store has none; a
 /// commit after a delta takes its base's). Committed reads at that revision (a plan, EXPLAIN,
 /// the inferred statements alone), one after another, are each told the same mark, the
@@ -1319,8 +1397,12 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
 /// statements about its individuals that may add or delete (a class membership, a name of the
 /// vocabulary as an individual, a property's value of either kind, an equality), the mark a
 /// pending read is told is the mark it is told where it takes no record and reads its own
-/// ontology. `NRESE_FUZZ_SEED` (default 0) varies them; each run prints how many
-/// transactions kept the record and how many of those the base's clean record answered.
+/// ontology. Each store also has `:a :p :b`, sometimes with a reification of it, and besides a
+/// random transaction two fixed ones: one adding `:c a :A`, one deleting `:a :p :b`; the first
+/// store has nothing random, so each seed has a record taken over by an insert and by a
+/// delete. `NRESE_FUZZ_SEED` (default 0) varies them; each run prints, per kind of
+/// transaction, how many kept the record and how many of those the base's clean record
+/// answered, and how many deletions a reification kept from it.
 #[test]
 fn a_kept_record_marks_a_pending_read_as_its_own_ontology_does() {
     use crate::{MutationCommand, MutationTicket, Requester, SparqlUpdateRequest};
@@ -1353,7 +1435,15 @@ fn a_kept_record_marks_a_pending_read_as_its_own_ontology_does() {
         .and_then(|value| value.trim().parse().ok())
         .unwrap_or(0);
     let mut r = Draw(fuzz.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x6b65_6570);
-    let (mut wrong, mut refused, mut keeping, mut answered) = (Vec::new(), 0, 0, 0);
+    // `:a :p :b`, which every store has and the fixed deletion removes, and its reification.
+    let anchor = Quad::new(ex("a"), ex("p"), ex("b"), GraphName::DefaultGraph);
+    let reification = "[ a owl:Axiom ; owl:annotatedSource :a ; owl:annotatedProperty :p ; \
+                       owl:annotatedTarget :b ; rdfs:comment \"r\" ] . ";
+    let member = Quad::new(ex("c"), rdf_type.clone(), ex("A"), GraphName::DefaultGraph);
+    const KINDS: [&str; 3] = ["random", "insert", "delete"];
+    let (mut wrong, mut refused, mut reified_kept_out) = (Vec::new(), 0, 0);
+    // Per kind of transaction: how many kept the record, how many the clean record answered.
+    let (mut keeping, mut answered) = ([0usize; 3], [0usize; 3]);
     for case in 0..CASES {
         let store = Arc::new(StoreService::new(crate::StoreConfig::in_memory()).unwrap());
         let pipeline = crate::MutationPipeline::new(
@@ -1362,12 +1452,18 @@ fn a_kept_record_marks_a_pending_read_as_its_own_ontology_does() {
                 ReasoningMode::Owl2Dl,
             ))),
         );
-        let data: String = (0..2 + r.below(6))
+        let random = if case == 0 { 0 } else { 2 + r.below(6) };
+        let reified = case > 0 && r.below(3) == 0;
+        let mut data: String = (0..random)
             .map(|_| {
                 let q = statement(&mut r, false);
                 format!("{} {} {} . ", q.subject, q.predicate, q.object)
             })
             .collect();
+        data += ":a :p :b . ";
+        if reified {
+            data += reification;
+        }
         let insert = format!("{MARK_PREFIXES}INSERT DATA {{ {OFF_ROUTE}{schema}{data} }}");
         let committed = pipeline.apply(
             MutationCommand::Update(SparqlUpdateRequest::new(insert)),
@@ -1379,56 +1475,76 @@ fn a_kept_record_marks_a_pending_read_as_its_own_ontology_does() {
             continue;
         }
         let snapshot = store.engine().snapshot();
-        let mut tx = store
-            .engine()
-            .speculative(Arc::new(nrese_exec::Budget::unlimited()));
-        let added: Vec<String> = (0..1 + r.below(3))
-            .map(|_| {
-                let quad = statement(&mut r, true);
-                tx.try_insert(quad.as_ref()).unwrap();
-                quad.to_string()
-            })
-            .collect();
-        let asserted: Vec<_> = snapshot
-            .quads_for_pattern_in(ReadModel::Asserted, &nrese_engine::QuadPattern::all())
-            .collect();
-        let removed: Vec<String> = (0..r.below(2))
-            .map(|_| {
-                let quad = asserted[r.below(asserted.len())];
-                tx.try_remove_encoded(quad).unwrap();
-                format!("{:?}", snapshot.decode_quad(quad))
-            })
-            .collect();
-        let pending = tx.pending_snapshot().unwrap();
-        let keeps_record = store.dl().bounds.keeps_record(&tx);
-        let at = |keeps_record| Revision::Pending {
-            snapshot: &pending,
-            deletes: !removed.is_empty(),
-            keeps_record,
-        };
-        let told = reads_differently(&store, at(keeps_record));
-        let own = reads_differently(&store, at(false));
-        keeping += usize::from(keeps_record);
         let record = (store.dl().status())
             .filter(|s| s.revision == snapshot.revision())
             .and_then(|s| s.left_out);
-        // The base's clean record and the indexes decided it, without the ontology.
-        let by_record = keeps_record && record == Some(None) && by_index(&pending) == Some(None);
-        answered += usize::from(by_record);
-        if told != own {
-            wrong.push(format!(
-                "case {case}: told {told:?}, its own ontology {own:?}\n  committed: {data}\n  \
-                 pending: + {added:?} - {removed:?}"
-            ));
+        for (kind, name) in KINDS.iter().enumerate() {
+            let mut tx = store
+                .engine()
+                .speculative(Arc::new(nrese_exec::Budget::unlimited()));
+            let (mut added, mut removed) = (Vec::new(), Vec::new());
+            match kind {
+                0 => {
+                    for _ in 0..1 + r.below(3) {
+                        let quad = statement(&mut r, true);
+                        tx.try_insert(quad.as_ref()).unwrap();
+                        added.push(quad.to_string());
+                    }
+                    let asserted: Vec<_> = snapshot
+                        .quads_for_pattern_in(
+                            ReadModel::Asserted,
+                            &nrese_engine::QuadPattern::all(),
+                        )
+                        .collect();
+                    for _ in 0..r.below(2) {
+                        let quad = asserted[r.below(asserted.len())];
+                        tx.try_remove_encoded(quad).unwrap();
+                        removed.push(format!("{:?}", snapshot.decode_quad(quad)));
+                    }
+                }
+                1 => {
+                    tx.try_insert(member.as_ref()).unwrap();
+                    added.push(member.to_string());
+                }
+                _ => {
+                    tx.remove(anchor.as_ref()).unwrap();
+                    removed.push(anchor.to_string());
+                }
+            }
+            let pending = tx.pending_snapshot().unwrap();
+            let keeps_record = store.dl().bounds.keeps_record(&tx);
+            let at = |keeps_record| Revision::Pending {
+                snapshot: &pending,
+                deletes: !removed.is_empty(),
+                keeps_record,
+            };
+            let told = reads_differently(&store, at(keeps_record));
+            let own = reads_differently(&store, at(false));
+            keeping[kind] += usize::from(keeps_record);
+            // The base's clean record and the indexes decided it, without the ontology.
+            let by_record =
+                keeps_record && record == Some(None) && by_index(&pending) == Some(None);
+            answered[kind] += usize::from(by_record);
+            reified_kept_out += usize::from(kind == 2 && reified && !keeps_record);
+            if told != own {
+                wrong.push(format!(
+                    "case {case}, {name}: told {told:?}, its own ontology {own:?}\n  \
+                     committed: {data}\n  pending: + {added:?} - {removed:?}"
+                ));
+            }
         }
     }
     eprintln!(
-        "NRESE_FUZZ_SEED={fuzz}: {CASES} stores, {refused} refused, {keeping} transactions that \
-         keep their base's record, {answered} answered clean by it"
+        "NRESE_FUZZ_SEED={fuzz}: {CASES} stores, {refused} refused; kept the record (random, \
+         insert, delete): {keeping:?}; answered clean by it: {answered:?}; deletions of a \
+         reified triple that took no record: {reified_kept_out}"
     );
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     assert!(refused * 4 < CASES, "{refused} of {CASES} stores refused");
-    assert!(answered > 0, "no transaction took its base's clean record");
+    assert!(
+        answered[1] > 0 && answered[2] > 0,
+        "no insert or no delete took its base's clean record: {answered:?}"
+    );
 }
 
 /// A question naming an individual the data doesn't name is decided only where the
