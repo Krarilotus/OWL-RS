@@ -8,8 +8,9 @@
 //! - **The subject is the build.** Its name is the workspace manifest's
 //!   `[workspace.metadata.project] name`; its version, licence and repository are Cargo's; its
 //!   developer is the repository's owner. The commit, whether the tree had local changes and
-//!   the suite's commit are read with git at run time; the suite's only from a git checkout of
-//!   its own, with any change to it said. The assertor is the runner, not a person.
+//!   the suite's commit are read with git at run time (cargo rebuilds the runner from the tree
+//!   it runs in); the suite's only from a git checkout of w3c/rdf-tests itself, with any change
+//!   to it said. The assertor is the runner, not a person.
 //! - **Where.** `NRESE_W3C_REPORTS` names the folder (`scripts/w3c-reports.sh` sets it);
 //!   without it, `w3c-reports` under the target's temp folder.
 
@@ -92,7 +93,7 @@ impl Subject {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let clean = git(
             manifest_dir,
-            &["status", "--porcelain", "--untracked-files=no"],
+            &["status", "--porcelain", "--untracked-files=normal"],
         )
         .map(|status| status.is_empty());
         Self {
@@ -150,15 +151,19 @@ fn git_head(dir: &Path) -> String {
     git(dir, &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_owned())
 }
 
-/// The commit of the suite checkout `dir` is in, claimed only for a git checkout of its own
-/// (not a copy inside this repository, which git would answer for) without changes to it.
+/// The commit of the suite checkout `dir` is in, claimed only for a git checkout of
+/// w3c/rdf-tests itself (not a copy inside this or another repository, which git would answer
+/// for) without changes to it.
 fn suite_commit(dir: &Path) -> String {
     let top = |d: &Path| git(d, &["rev-parse", "--show-toplevel"]);
-    let own = top(dir).filter(|t| Some(t) != top(Path::new(env!("CARGO_MANIFEST_DIR"))).as_ref());
-    match own.and_then(|_| git(dir, &["status", "--porcelain"])) {
+    let suite = git(dir, &["remote", "get-url", "origin"])
+        .is_some_and(|url| url.trim_end_matches(".git").ends_with("/w3c/rdf-tests"));
+    let own = top(dir)
+        .filter(|t| suite && Some(t) != top(Path::new(env!("CARGO_MANIFEST_DIR"))).as_ref());
+    match own.and_then(|_| git(dir, &["status", "--porcelain", "--untracked-files=normal"])) {
         Some(status) if status.is_empty() => git_head(dir),
         Some(_) => format!("{} with local changes", git_head(dir)),
-        None => "unknown (not a git checkout of the suite)".to_owned(),
+        None => "unknown (not a git checkout of w3c/rdf-tests)".to_owned(),
     }
 }
 

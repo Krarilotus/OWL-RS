@@ -41,6 +41,12 @@ def names(row: str, suite: str) -> bool:
     return suite in text(row.split("|")[1])
 
 
+def stands_before(row: str, count: int, words: set[str]) -> bool:
+    """Whether `count` stands in `row` directly before one of `words` (`98 Core`)."""
+    return any(int(n.replace(",", "")) == count and w.strip(",.;:()") in words
+               for n, w in re.findall(r"(\d[\d,]*) (\S+)", text(row)))
+
+
 def runner_link(kit) -> str:
     """The page's link to a kit's runner: `../crates/…/<crate>/tests/<test>`."""
     found = sorted((ROOT / "crates").glob(f"**/{kit.crate}/tests/{kit.test}"))
@@ -62,11 +68,18 @@ class StandardsTable(unittest.TestCase):
             for suite in kit.suites:
                 own = [row for row in rows if f"]({link})" in row and names(row, suite)]
                 self.assertEqual(len(own), 1, f"{suite}: rows naming it and linking {link}: {own}")
+                # A row shared by several suites says each count before its own suite's name.
+                others = [s for s in kit.suites if s != suite and names(own[0], s)]
+                words = set(suite.split()) - {w for s in others for w in s.split()}
                 for key in ("passed", "skipped", "disputed"):
                     if want := expected[suite].get(key):
                         checked += 1
-                        self.assertIn(want, numbers(own[0]), f"{suite}: the gate requires {key} = "
-                                      f"{want}; its row says {sorted(numbers(own[0]))}")
+                        if others:
+                            self.assertTrue(stands_before(own[0], want, words), f"{suite}: the gate "
+                                            f"requires {key} = {want}, before one of {sorted(words)}")
+                        else:
+                            self.assertIn(want, numbers(own[0]), f"{suite}: the gate requires {key} = "
+                                          f"{want}; its row says {sorted(numbers(own[0]))}")
         self.assertGreater(checked, 0)
 
     def test_a_row_reads_as_its_reader_sees_it(self):
@@ -74,6 +87,14 @@ class StandardsTable(unittest.TestCase):
         self.assertEqual(numbers(row), {1, 2, 1271})
         self.assertTrue(names(row, "SPARQL 1.2"))
         self.assertFalse(names(row, "SPARQL 1.1"))
+
+    def test_a_shared_row_binds_each_count_to_its_suite(self):
+        row = "| SHACL Core and SHACL-SPARQL | x | 98 Core and 22 SHACL-SPARQL W3C tests |"
+        self.assertTrue(stands_before(row, 98, {"SHACL", "Core"}))
+        self.assertTrue(stands_before(row, 22, {"SHACL-SPARQL"}))
+        swapped = "| SHACL Core and SHACL-SPARQL | x | 22 Core and 98 SHACL-SPARQL W3C tests |"
+        self.assertFalse(stands_before(swapped, 98, {"SHACL", "Core"}))
+        self.assertFalse(stands_before(swapped, 22, {"SHACL-SPARQL"}))
 
 
 if __name__ == "__main__":
