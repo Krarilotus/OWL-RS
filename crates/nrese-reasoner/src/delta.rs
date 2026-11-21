@@ -1813,6 +1813,8 @@ impl VisitsBase for MemoryBase {
 
 #[cfg(test)]
 mod budget_tests {
+    use std::cell::RefCell;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
@@ -1821,11 +1823,16 @@ mod budget_tests {
     use crate::ir::Vocabulary;
     use crate::vocabulary::LocalVocabulary;
 
-    static EXPANSIONS: AtomicUsize = AtomicUsize::new(0);
-    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    thread_local! {
+        static POOL_EXPANSIONS: RefCell<Option<Arc<AtomicUsize>>> = const { RefCell::new(None) };
+    }
 
     pub(super) fn record_expansion() {
-        EXPANSIONS.fetch_add(1, Ordering::Relaxed);
+        POOL_EXPANSIONS.with(|cell| {
+            if let Some(counter) = cell.borrow().as_ref() {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        });
     }
 
     /// A cyclic graph with many independent overdelete candidates in one pass must bound
@@ -1834,7 +1841,6 @@ mod budget_tests {
     /// as a full rematerialisation across pool widths.
     #[test]
     fn shared_proof_budget_caps_total_expansions_and_matches_rematerialisation() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let mut vocab = LocalVocabulary::default();
         // Two mutually recursive rules over a cyclic graph so each candidate triggers a
         // deep proof search when its root support is deleted.
@@ -1882,8 +1888,17 @@ mod budget_tests {
             .collect();
 
         for threads in [1usize, 4, 8] {
+            let counter = Arc::new(AtomicUsize::new(0));
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
+                .start_handler({
+                    let counter = Arc::clone(&counter);
+                    move |_| {
+                        POOL_EXPANSIONS.with(|cell| {
+                            *cell.borrow_mut() = Some(Arc::clone(&counter));
+                        });
+                    }
+                })
                 .build()
                 .unwrap();
             let base = MemoryBase::new(&after_asserted, &stack);
@@ -1897,7 +1912,6 @@ mod budget_tests {
                 force: Some(Plan::Dred),
                 ..Policy::default()
             };
-            EXPANSIONS.store(0, Ordering::SeqCst);
             let result = pool
                 .install(|| {
                     update_with(
@@ -1911,7 +1925,7 @@ mod budget_tests {
                     )
                 })
                 .expect("never stopped");
-            let used = EXPANSIONS.load(Ordering::SeqCst);
+            let used = counter.load(Ordering::SeqCst);
             assert!(
                 used <= PROOF_BUDGET,
                 "threads={threads}: proof expansions {used} exceeded shared pass budget {PROOF_BUDGET}"
@@ -1930,5 +1944,155 @@ mod budget_tests {
                 "threads={threads}: maintained closure diverged from full rematerialisation"
             );
         }
+    }
+
+    /// When shared proof-budget exhaustion forces a still-supported inferred schema fact
+    /// through overdeletion and phase-3 rederivation, consistency instances that already
+    /// existed in the pre-update program must not be re-evaluated in full and reported as
+    /// newly introduced violations, while a genuinely new clash against the same restored
+    /// consistency instance must still be reported.
+    #[test]
+    fn budget_exhaustion_does_not_report_preexisting_clash_as_introduced() {
+        let mut vocab = LocalVocabulary::default();
+        let rules_text = concat!(
+            "reach: (?x rdfs:e ?y), (?y rdfs:p ?z) -> (?x rdfs:p ?z)\n",
+            "disjoint: (?x rdfs:p ?z), (?x rdfs:mark ?z) -> (?x owl:disjointWith ?z)\n",
+            "cax-dw: (?c owl:disjointWith ?d), (?x rdf:type ?c), (?x rdf:type ?d) -> false\n",
+        );
+        let rules = crate::ir::parse_rules(rules_text, &mut vocab).unwrap();
+        let schema = Schema::owl(&mut vocab);
+        let e = vocab.iri("http://www.w3.org/2000/01/rdf-schema#e");
+        let p = vocab.iri("http://www.w3.org/2000/01/rdf-schema#p");
+        let mark = vocab.iri("http://www.w3.org/2000/01/rdf-schema#mark");
+        let rdf_type = vocab.iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+
+        let root = vocab.iri("http://example.com/root");
+        let anchor = vocab.iri("http://example.com/anchor");
+        let target = vocab.iri("http://example.com/t");
+        let last = vocab.iri("http://example.com/last");
+        let ind = vocab.iri("http://example.com/ind");
+        let ind2 = vocab.iri("http://example.com/ind2");
+
+        let deleted_fact = [root, p, target];
+        let mut asserted = vec![
+            deleted_fact,
+            [anchor, p, target],
+            [last, mark, target],
+            [last, e, anchor],
+            [ind, rdf_type, last],
+            [ind, rdf_type, target],
+        ];
+        let mut l1_first = 0u64;
+        for i in 0..5_000usize {
+            let n = vocab.iri(&format!("http://example.com/l1_{i}"));
+            if i == 0 {
+                l1_first = n;
+            }
+            asserted.push([n, e, root]);
+        }
+        let mut l2_first = 0u64;
+        for i in 0..5_000usize {
+            let n = vocab.iri(&format!("http://example.com/l2_{i}"));
+            if i == 0 {
+                l2_first = n;
+            }
+            asserted.push([n, e, l1_first]);
+        }
+        asserted.push([last, e, l2_first]);
+        asserted.sort_unstable();
+        asserted.dedup();
+
+        let before = batch::materialise(&asserted, &rules, None, &schema);
+        assert!(
+            !before.violations.consistent(),
+            "pre-update state must already carry the cax-dw clash"
+        );
+
+        let after_asserted: Vec<Triple> = asserted
+            .iter()
+            .copied()
+            .filter(|&f| f != deleted_fact)
+            .collect();
+        let after = batch::materialise(&after_asserted, &rules, None, &schema);
+        assert_eq!(
+            before.violations, after.violations,
+            "deleting p(root, t) preserves the exact same violation set"
+        );
+
+        let stack: Vec<Triple> = before
+            .derived
+            .iter()
+            .copied()
+            .filter(|f| after_asserted.binary_search(f).is_err())
+            .collect();
+        let base = MemoryBase::new(&after_asserted, &stack);
+        let compiled = Rules {
+            rules: &rules,
+            lists: None,
+            schema: &schema,
+            equality: None,
+        };
+        let policy = Policy {
+            force: Some(Plan::Dred),
+            ..Policy::default()
+        };
+        let result = update_with(
+            &base,
+            &[],
+            &[deleted_fact],
+            compiled,
+            None,
+            crate::eval::NEVER,
+            policy,
+        )
+        .expect("never stopped");
+
+        assert!(
+            result.violations.consistent(),
+            "pre-existing clash must not be reported as newly introduced: {:?}",
+            result.violations.to_vec()
+        );
+        let removed: HashSet<Triple> = result.remove.iter().copied().collect();
+        let mut maintained: Vec<Triple> = stack
+            .iter()
+            .copied()
+            .filter(|f| !removed.contains(f))
+            .chain(result.insert)
+            .collect();
+        maintained.sort_unstable();
+        maintained.dedup();
+        assert_eq!(
+            maintained, after.derived,
+            "maintained closure after budget exhaustion must restore surviving facts"
+        );
+
+        // Control: when the same update also inserts a genuinely new clashing individual,
+        // the restored pre-existing consistency instance must report ONLY the new clash.
+        let inserted = vec![[ind2, rdf_type, last], [ind2, rdf_type, target]];
+        let mut with_new_asserted = after_asserted.clone();
+        with_new_asserted.extend_from_slice(&inserted);
+        with_new_asserted.sort_unstable();
+        with_new_asserted.dedup();
+        let base_with_new = MemoryBase::new(&with_new_asserted, &stack);
+        let result_with_new = update_with(
+            &base_with_new,
+            &inserted,
+            &[deleted_fact],
+            compiled,
+            None,
+            crate::eval::NEVER,
+            policy,
+        )
+        .expect("never stopped");
+        let reported = result_with_new.violations.to_vec();
+        assert_eq!(
+            reported.len(),
+            1,
+            "expected only the newly introduced clash on ind2, got {reported:?}"
+        );
+        assert!(
+            reported[0].bindings.contains(&ind2) && !reported[0].bindings.contains(&ind),
+            "expected clash for ind2 (not pre-existing ind), got {reported:?}"
+        );
     }
 }
