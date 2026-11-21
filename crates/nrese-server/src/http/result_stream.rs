@@ -492,12 +492,19 @@ struct Held {
 impl Held {
     fn new(holding: Holding, stall: Duration) -> Self {
         let holding = Arc::new(Mutex::new(holding));
-        let watched = Arc::clone(&holding);
+        // Weak: the body alone keeps what it holds, which goes with it when it is dropped,
+        // not later, when the runtime drops the aborted timer.
+        let watched = Arc::downgrade(&holding);
         let watch = tokio::spawn(async move {
             loop {
-                let until = lock(&watched).moved + stall;
+                let Some(until) = watched.upgrade().map(|held| lock(&held).moved + stall) else {
+                    return;
+                };
                 tokio::time::sleep_until(until).await;
-                let mut holding = lock(&watched);
+                let Some(held) = watched.upgrade() else {
+                    return;
+                };
+                let mut holding = lock(&held);
                 if holding.moved + stall <= Instant::now() {
                     holding.cut();
                     return;
