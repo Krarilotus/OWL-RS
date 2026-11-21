@@ -304,6 +304,16 @@ impl Template {
         count.0
     }
 
+    /// The bytes [`Template::fill`] copies besides the text: the message's language tag, else
+    /// its datatype's IRI.
+    pub(crate) fn tag_len(&self) -> usize {
+        let literal = &self.literal;
+        match literal.language() {
+            Some(language) => language.len(),
+            None => literal.datatype().as_str().len(),
+        }
+    }
+
     /// The message with each block replaced by the text of `value`'s term for its variable: a
     /// literal's lexical form, an IRI's text, any other term as N-Triples writes it. A block
     /// whose variable has no value is left as written. Its text holds exactly
@@ -433,8 +443,9 @@ pub(crate) fn run<'a, V: ReadView>(
 
 /// A SELECT check's solution, as a result ([`Outcome::Solutions`] yields them as they are
 /// read: each is decoded, used and dropped before the next). Its terms are moved out of it,
-/// not copied, but for those `check`'s message templates name, which are copied first; a row
-/// that reports `?failure` has its terms dropped with it.
+/// not copied, but for those `check`'s message templates name, which are copied first unless
+/// the row binds `?message` to a literal; a row that reports `?failure` has its terms dropped
+/// with it.
 pub(crate) fn found(solution: QuerySolution, check: &SparqlCheck) -> Found {
     let at = |name: &str| {
         solution
@@ -463,10 +474,19 @@ pub(crate) fn found(solution: QuerySolution, check: &SparqlCheck) -> Found {
             failure: true,
         };
     }
-    let bindings = named
-        .into_iter()
-        .filter_map(|(name, at)| Some((name, values.get(at)?.clone()?)))
-        .collect();
+    // The templates' bindings are copied only where the templates are used: not when the
+    // row binds `?message` to a literal, which comes first.
+    let bound_message = matches!(
+        message_at.and_then(|at| values.get(at)?.as_ref()),
+        Some(Term::Literal(_))
+    );
+    let bindings = match bound_message {
+        true => Vec::new(),
+        false => named
+            .into_iter()
+            .filter_map(|(name, at)| Some((name, values.get(at)?.clone()?)))
+            .collect(),
+    };
     let mut take = |at: Option<usize>| at.and_then(|at| values.get_mut(at)?.take());
     let path = match take(path_at) {
         Some(Term::NamedNode(path)) => Some(path),

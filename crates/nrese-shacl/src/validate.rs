@@ -1356,7 +1356,8 @@ impl<'a, V: ReadView> Validator<'a, V> {
                 messages.push(ResultTerm::Stored(message.id));
                 continue;
             };
-            let len = template.filled_len(&value_of);
+            // The text and the tag or datatype the filled literal copies.
+            let len = template.filled_len(&value_of) + template.tag_len();
             let made = match held.charge(len) {
                 Ok(()) => {
                     let made = self.result_message(template.fill(&value_of), held);
