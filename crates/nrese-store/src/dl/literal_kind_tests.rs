@@ -66,7 +66,7 @@ fn d066_f1_upper_triple_object_requires_recompile() {
     source::intern_vocabulary(&tx);
     let snapshot = tx.base();
     let kept = store.dl().bounds.kept();
-    let ontology = source::read_snapshot(snapshot, Arc::clone(kept)).unwrap();
+    let ontology = source::read_snapshot(snapshot, Arc::clone(kept), &Default::default()).unwrap();
     let normalised = nrese_owl::normalise(&ontology);
     let upper = Upper::build(
         &ontology,

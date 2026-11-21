@@ -974,10 +974,14 @@ const BUILTIN_ANNOTATIONS: [&str; 9] = [
 /// 16) reads the first three as annotation axioms, which the Direct Semantics give no
 /// meaning (1), and matches the fourth to no pattern, so its graph is no OWL 2 DL ontology.
 /// No read is entailed: an answer `true` is told `unsound` with the annotation reason, on
-/// the RL route and off it.
+/// the RL route and off it. The sub-property axiom names both its properties, so it reads
+/// `:p` as an annotation property, and `:p`'s assertion as a data or object property,
+/// declared or not: a name of two kinds an axiom reads (Structural Specification 5.8.1),
+/// and the reason is that one.
 #[test]
 fn every_annotation_property_axiom_entails_nothing_built_in_or_declared() {
     let common = ":C a owl:Class . :x a owl:NamedIndividual . :v a owl:NamedIndividual .";
+    let (annotation, two_kinds) = ("annotation-property axioms", "a name used as two kinds");
     let mut cases = Vec::new();
     for a in BUILTIN_ANNOTATIONS.into_iter().chain([":note"]) {
         let declared = format!("{a} a owl:AnnotationProperty . ");
@@ -992,18 +996,22 @@ fn every_annotation_property_axiom_entails_nothing_built_in_or_declared() {
                 (
                     format!("{decl}{a} rdfs:domain :C . :x {a} \"x\" ."),
                     "ASK { :x a :C }".into(),
+                    annotation,
                 ),
                 (
                     format!("{decl}{a} rdfs:domain :C . :x {a} :v ."),
                     "ASK { :x a :C }".into(),
+                    annotation,
                 ),
                 (
                     format!("{decl}{a} rdfs:range :C . :x {a} :v ."),
                     "ASK { :v a :C }".into(),
+                    annotation,
                 ),
                 (
                     format!("{decl}{a} rdfs:subPropertyOf :sup . {sub} :x {a} :v ."),
                     "ASK { :x :sup :v }".into(),
+                    annotation,
                 ),
             ]);
         }
@@ -1019,20 +1027,20 @@ fn every_annotation_property_axiom_entails_nothing_built_in_or_declared() {
             (":p a owl:ObjectProperty . ", ":v"),
         ] {
             let data = format!("{note}{kind}:p rdfs:subPropertyOf {a} . :x :p {value} .");
-            cases.push((data, format!("ASK {{ :x {a} {value} }}")));
+            cases.push((data, format!("ASK {{ :x {a} {value} }}"), two_kinds));
         }
     }
     let mut wrong = Vec::new();
-    for (data, read) in &cases {
+    for (data, read, reason) in &cases {
         for extra in ["", OUTSIDE_RL] {
             let dl = pipeline();
             insert(&dl, &format!("{data} {common} {extra}")).expect("committed");
             let (rows, status) = query(&dl, read);
             let (label, reasons) = (status.shared.as_str(), status.reasons());
-            let marked = reasons
-                .iter()
-                .any(|r| r.contains("annotation-property axioms"));
-            if rows == ["true"] && !(label == "unsound" && marked) {
+            let marked = reasons.iter().any(|r| r.contains(reason));
+            // The split: a name only an annotation property is no name of two kinds.
+            let split = *reason == two_kinds || !reasons.iter().any(|r| r.contains(two_kinds));
+            if rows == ["true"] && !(label == "unsound" && marked && split) {
                 wrong.push(format!("{data} {extra} / {read}: {label} {reasons:?}"));
             }
         }
@@ -1049,11 +1057,7 @@ fn every_annotation_property_axiom_entails_nothing_built_in_or_declared() {
 /// this release refuses the commit as undecided (`WhyUndecided`), not as an inconsistency.
 /// When OWL 2 DL decides these clashes, the tests that call this expect the commit.
 fn refused_as_undecided(data: &str, extra: &str) {
-    let dl = pipeline();
-    let result = insert(&dl, &format!("{data} {extra}"));
-    let Err(MutationError::Rejected(reject)) = &result else {
-        panic!("expected the refusal, got {result:?}");
-    };
+    let reject = refusal(data, extra);
     assert_eq!(reject.kind, RejectKind::Undecided, "{}", reject.detail);
     assert!(
         reject
@@ -1064,7 +1068,27 @@ fn refused_as_undecided(data: &str, extra: &str) {
         "{}",
         reject.detail
     );
+    // The control on the same words: the plain clash with `extra` is told by them.
+    let plain = refusal(PLAIN_CLASH, extra);
+    assert_eq!(plain.kind, RejectKind::Inconsistent, "{}", plain.detail);
+    assert!(
+        plain.detail.contains("consistency check"),
+        "{}",
+        plain.detail
+    );
 }
+
+/// The refusal of `data` (with `extra`) committed on a fresh store.
+fn refusal(data: &str, extra: &str) -> nrese_store::MutationReject {
+    match insert(&pipeline(), &format!("{data} {extra}")) {
+        Err(MutationError::Rejected(reject)) => *reject,
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// A clash with no annotation axiom and no punned name.
+const PLAIN_CLASH: &str = ":A a owl:Class ; owl:disjointWith :B . :B a owl:Class . \
+     :x a owl:NamedIndividual , :A , :B .";
 
 /// An annotation property's domain says nothing under the OWL 2 Direct Semantics about the
 /// subjects it annotates; the rules' prp-dom puns `:x` into `:C`, disjoint with `:D`.
@@ -1102,22 +1126,26 @@ fn an_equality_of_punned_disjoint_class_names_is_refused_as_undecided_outside_rl
 #[test]
 fn a_plain_clash_is_rejected_as_inconsistent_on_both_routes() {
     for extra in ["", OUTSIDE_RL] {
-        let dl = pipeline();
-        let result = insert(
-            &dl,
-            &format!(
-                ":A a owl:Class ; owl:disjointWith :B . :B a owl:Class . \
-                 :x a owl:NamedIndividual , :A , :B . {extra}"
-            ),
-        );
-        let Err(MutationError::Rejected(reject)) = &result else {
-            panic!("expected a rejection, got {result:?}");
-        };
+        let reject = refusal(PLAIN_CLASH, extra);
         assert_eq!(reject.kind, RejectKind::Inconsistent, "{}", reject.detail);
         assert!(
             !reject.detail.contains("doesn't decide"),
             "{}",
             reject.detail
+        );
+        // The control on the same words: the annotation domain's refusal with `extra` is
+        // told by them.
+        let undecided = refusal(ANNOTATION_DOMAIN, extra);
+        assert_eq!(
+            undecided.kind,
+            RejectKind::Undecided,
+            "{}",
+            undecided.detail
+        );
+        assert!(
+            undecided.detail.contains("doesn't decide"),
+            "{}",
+            undecided.detail
         );
     }
 }
@@ -1472,8 +1500,8 @@ fn intersection(n: usize) -> String {
 /// the same as the first list's. The closure gives each of the chain's nodes two members
 /// and two rests: 2^7 member sequences, more than the reasoner reads (`MAX_VARIANTS`, 64).
 /// With `cycle`, the last node is instead the same as the first: the chain's list returns
-/// to its head through `owl:sameAs`, which the reader, reading the statements as written,
-/// doesn't see.
+/// to its head through `owl:sameAs`. Either way a statement outside the list names its
+/// cells, which the reader reports.
 fn aliased_chain(cycle: bool) -> String {
     const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
     let node = |list: &str, i: usize, member: &str| {
@@ -1549,11 +1577,14 @@ fn a_list_axiom_the_rules_leave_out_leaves_the_rl_route() {
             "ASK { :a0 :p :a7 }",
             false,
         ),
+        // No equality, but its list cells are individuals of an assertion (`:alias`), so
+        // the reader takes them for structures the rules may read more of (`Unused`
+        // `reads_more`), which leave the route as a list left out does.
         (
             "chain 7",
-            aliased_chain(false).replace("owl:sameAs", ":alias"),
+            aliased_chain(false).replace("owl:sameAs _:l", ":alias _:n"),
             "ASK { :a0 :p :a7 }",
-            true,
+            false,
         ),
     ];
     let mut wrong = Vec::new();
@@ -1580,6 +1611,197 @@ fn a_list_axiom_the_rules_leave_out_leaves_the_rl_route() {
             if !honest {
                 wrong.push(line);
             }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The chain `:p ← :q1 ∘ :q2` written cell by cell, its second cell the same as its first
+/// (`_:l2 owl:sameAs _:l1`), and the paths `:a0 :q1 :a1 :q2 :a2` and `:b0 :q1 :b1`. OWL 2 DL
+/// reads no such ontology (*Mapping to RDF* §3: a cell is named only by its list); the rules
+/// equate the cells (`eq-rep-s`, `eq-rep-o`) and read the chain as every word of `:q1` and
+/// `:q2`, so they derive `:b0 :p :b1`, which the chain as written doesn't give. On a commit and
+/// on a read of data that came past the gates, the reader reports the cell: the ontology
+/// leaves the rules' route, the read's status names the report, and `:b0 :p :b1` is never a
+/// sound `true`.
+#[test]
+fn a_list_cell_outside_its_list_leaves_the_rl_route_and_is_told() {
+    const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+    let data = format!(
+        ":p owl:propertyChainAxiom _:l1 . _:l1 <{RDF}first> :q1 ; <{RDF}rest> _:l2 . \
+         _:l2 <{RDF}first> :q2 ; <{RDF}rest> <{RDF}nil> . _:l2 owl:sameAs _:l1 . \
+         :a0 :q1 :a1 . :a1 :q2 :a2 . :b0 :q1 :b1 ."
+    );
+    let mut wrong = Vec::new();
+    for path in ["commit", "read"] {
+        let dl = pipeline();
+        if path == "commit" {
+            insert(&dl, &data).expect("committed");
+        } else {
+            let turtle = format!("{}{data}", super::PREFIXES);
+            crate::support::load_past_the_pipeline(dl.store(), &turtle);
+            dl.store().rematerialise(rl_rules()).expect("rebuilt");
+        }
+        let (rows, status) = query(&dl, "ASK { :b0 :p :b1 }");
+        let route = dl.store().dl_bounds().last;
+        let reasons = status.reasons();
+        let line = format!("{path}: route {route}, {rows:?}, {reasons:?}");
+        eprintln!("CELL {line}");
+        let named = (reasons.iter()).any(|r| r.contains("a list's cell used outside its list"));
+        if route == "rules" || !named || (rows == ["true"] && status.shared.sound) {
+            wrong.push(line);
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A clean chain `:p ← :q1 ∘ :q2` committed first, on the rules' route; then a second commit
+/// that names its head cell outside its list, by each form a commit could keep the route on:
+/// an annotation (`rdfs:comment`), a typing with a class the store knows, an `owl:sameAs` to
+/// a new IRI. Each such commit is read again: the reader reports the cell, the ontology leaves
+/// the rules' route, and the read's status names the report. The control, an annotation on a
+/// named class, keeps the route and its complete `true`.
+#[test]
+fn a_commit_that_names_a_list_cell_is_read_and_leaves_the_rl_route() {
+    let data = ":p owl:propertyChainAxiom ( :q1 :q2 ) . :C a owl:Class . :x a :C . \
+                :a0 :q1 :a1 . :a1 :q2 :a2 .";
+    let cell = "WHERE { :p owl:propertyChainAxiom ?cell }";
+    let rows = [
+        (
+            "annotation",
+            format!("INSERT {{ ?cell rdfs:comment \"outside\" }} {cell}"),
+            false,
+        ),
+        ("typed", format!("INSERT {{ ?cell a :C }} {cell}"), false),
+        (
+            "alias",
+            format!("INSERT {{ ?cell owl:sameAs :n }} {cell}"),
+            false,
+        ),
+        (
+            "control",
+            "INSERT DATA { :C rdfs:comment \"a class\" }".to_owned(),
+            true,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (what, write, kept) in rows {
+        let dl = pipeline();
+        insert(&dl, data).expect("a clean chain");
+        let first = dl.store().dl_bounds().last;
+        super::update(&dl, &write).expect("committed");
+        let (rows, status) = query(&dl, "ASK { :a0 :p :a2 }");
+        let route = dl.store().dl_bounds().last;
+        let reasons = status.reasons();
+        let line = format!("{what}: route {first}, then {route}; {rows:?}, {reasons:?}");
+        eprintln!("CELL COMMIT {line}");
+        let named = (reasons.iter()).any(|r| r.contains("a list's cell used outside its list"));
+        let honest = if kept {
+            route == "rules" && rows == ["true"] && status.is_complete()
+        } else {
+            route != "rules" && named
+        };
+        if first != "rules" || !honest {
+            wrong.push(line);
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A clean ontology committed first, on the rules' route; then one commit that writes a chain's
+/// list and an annotation on its head cell together. The cell is new in that commit, and the
+/// commit is read: the reader reports the cell, the ontology leaves the rules' route, and the
+/// read's status names the report.
+#[test]
+fn a_commit_that_writes_a_list_cell_and_names_it_is_read() {
+    let dl = pipeline();
+    let clean = ":C a owl:Class . :x a :C . :a0 :q1 :a1 . :a1 :q2 :a2 .";
+    insert(&dl, clean).expect("clean");
+    let first = dl.store().dl_bounds().last;
+    const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+    let data = format!(
+        ":p owl:propertyChainAxiom _:l1 . _:l1 <{RDF}first> :q1 ; <{RDF}rest> _:l2 . \
+         _:l2 <{RDF}first> :q2 ; <{RDF}rest> <{RDF}nil> . _:l1 rdfs:comment \"outside\" ."
+    );
+    insert(&dl, &data).expect("committed");
+    let (rows, status) = query(&dl, "ASK { :a0 :p :a2 }");
+    let route = dl.store().dl_bounds().last;
+    let reasons = status.reasons();
+    let line = format!("route {first}, then {route}; {rows:?}, {reasons:?}");
+    eprintln!("CELL SAME COMMIT {line}");
+    let named = (reasons.iter()).any(|r| r.contains("a list's cell used outside its list"));
+    assert!(first == "rules" && route != "rules" && named, "{line}");
+}
+
+/// The route check's cost on blank nodes: after a clean chain on the rules' route, one commit
+/// of 10 000 annotations, each on a fresh blank node that is no list's cell, keeps the route,
+/// and takes no more than three times what the same commit on 10 000 IRIs takes, and 2 s
+/// besides: a check that grows with the commit's other statements per blank node (quadratic
+/// in all) shows here. Both times printed.
+#[test]
+fn a_commit_of_many_blank_node_annotations_keeps_the_rl_route_at_linear_cost() {
+    const N: usize = 10_000;
+    let clean = ":p owl:propertyChainAxiom ( :q1 :q2 ) . :C a owl:Class . :x a :C . \
+                 :a0 :q1 :a1 . :a1 :q2 :a2 .";
+    let mut times = Vec::new();
+    for subject in ["_:b", ":s"] {
+        let dl = pipeline();
+        insert(&dl, clean).expect("a clean chain");
+        let data: String = (0..N)
+            .map(|i| format!("{subject}{i} rdfs:comment \"{i}\" . "))
+            .collect();
+        let started = std::time::Instant::now();
+        insert(&dl, &data).expect("committed");
+        let took = started.elapsed();
+        let route = dl.store().dl_bounds().last;
+        eprintln!("CELL COST {subject}: {N} annotations committed in {took:?}, route {route}");
+        assert_eq!(route, "rules", "{subject}: an annotation keeps the route");
+        times.push(took);
+    }
+    let (blank, iri) = (times[0], times[1]);
+    assert!(
+        blank <= iri * 3 + std::time::Duration::from_secs(2),
+        "blank nodes {blank:?}, IRIs {iri:?}"
+    );
+}
+
+/// The chain `:p ← :q1 ∘ :q2` written cell by cell, its tail cell the same as `_:m`, a cell
+/// whose member is `:q3` (`_:l2 owl:sameAs _:m`): no cycle, and two member sequences, which
+/// the rules build (`eq-rep-s` gives `_:l2` the `rdf:first` `:q3`). The path `:b0 :q1 :b1 :q3
+/// :b2` follows only the sequence the graph doesn't write, so OWL 2 DL doesn't entail `:b0 :p
+/// :b2`, which the rules derive. On a commit and on a read of data that came past the gates,
+/// the reader reports the cell: the ontology leaves the rules' route, the read's status names
+/// the report, and `:b0 :p :b2` is never a sound `true`. Each reading printed (on the rules'
+/// route, before the report, the read answered the rules' `true`).
+#[test]
+fn a_list_cell_aliased_to_another_member_leaves_the_rl_route_and_is_told() {
+    const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+    let data = format!(
+        ":p owl:propertyChainAxiom _:l1 . _:l1 <{RDF}first> :q1 ; <{RDF}rest> _:l2 . \
+         _:l2 <{RDF}first> :q2 ; <{RDF}rest> <{RDF}nil> . _:l2 owl:sameAs _:m . \
+         _:m <{RDF}first> :q3 ; <{RDF}rest> <{RDF}nil> . :b0 :q1 :b1 . :b1 :q3 :b2 ."
+    );
+    let mut wrong = Vec::new();
+    for path in ["commit", "read"] {
+        let dl = pipeline();
+        if path == "commit" {
+            insert(&dl, &data).expect("committed");
+        } else {
+            let turtle = format!("{}{data}", super::PREFIXES);
+            crate::support::load_past_the_pipeline(dl.store(), &turtle);
+            dl.store().rematerialise(rl_rules()).expect("rebuilt");
+        }
+        let (rows, status) = query(&dl, "ASK { :b0 :p :b2 }");
+        let route = dl.store().dl_bounds().last;
+        let reasons = status.reasons();
+        let (sound, complete) = (status.shared.sound, status.shared.complete);
+        let line = format!(
+            "{path}: route {route}, {rows:?} sound {sound} complete {complete}, {reasons:?}"
+        );
+        eprintln!("CELL ALIAS {line}");
+        let named = (reasons.iter()).any(|r| r.contains("a list's cell used outside its list"));
+        if route == "rules" || !named || (rows == ["true"] && sound) {
+            wrong.push(line);
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");

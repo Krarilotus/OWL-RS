@@ -8,6 +8,10 @@
 # COMMIT (its tree TREE) with the changed files of LIST. The job yields to timed work: never
 # started beside it, stopped when a timed job of higher priority wants its host. It runs on a
 # Linux host with the test role.
+# MODE quick: the same, for scripts/check.sh quick: gate-job.sh mode quick, which keeps a worktree,
+# target and lock of its own on the host, so it never waits behind a push gate. Sized by measurement
+# (1 to 5 minutes a changed crate on a warm target): est_min 10, a step deadline of 30 minutes. Never
+# a merge gate: it lands nothing.
 # MODE windows (LIST empty): a job of kind owlrs.any on any Windows host with what the tier uses
 # there (below, `has`, in the fleet config's names), which runs the commit's own
 # scripts/lib/windows-job.ps1 and through it its scripts/check.sh windows.
@@ -19,8 +23,9 @@
 # evidence. The fleet refuses a failed job's rerun without it, and escalates the same failure again.
 #
 # The merge check's jobs are the fleet's merge gates (`priority_class = "merge-gate"`, a class its
-# config ranks): either tier's job when COMMIT is for refactor/engine-v2, i.e. NRESE_PUSH_REF, the
-# ref it goes to, is refs/heads/refactor/engine-v2: the pre-push hook's, or by hand the caller's
+# config ranks): either tier's job when COMMIT lands, i.e. NRESE_PUSH_REF, the ref it goes to, is
+# refs/heads/refactor/engine-v2 or a release branch, refs/heads/release/<name> (gate-key.sh
+# landing_ref): the pre-push hook's, or by hand the caller's
 # word (a merge check run before its push states it for both tiers). A package's push or Windows
 # check isn't one, a merge among its commits or not (PR #69), nor a
 # check by hand that names no ref.
@@ -70,8 +75,13 @@ fi
 # Linux, scripts/cargo-guarded.sh's job object on Windows).
 os=linux kind=owlrs.gate confirm="office-pc phuoc-yu gamergrill"
 reason="the $mode gate of a pushed commit (scripts/check.sh); no push without it"
+deadline=""
 case $mode in
   push) cores=${NRESE_GATE_CORES:-8} ram=${NRESE_GATE_RAM_GB:-12} est=${NRESE_GATE_EST_MIN:-40} ;;
+  quick)
+    cores=${NRESE_GATE_CORES:-8} ram=${NRESE_GATE_RAM_GB:-12} est=${NRESE_GATE_EST_MIN:-10} deadline=30
+    max_s=${NRESE_GATE_MAX_S:-2400}
+    reason="the quick check of a commit before its review (scripts/check.sh quick); it lands nothing" ;;
   windows)
     # 9 GB: the suite's measured peak is 7.5 GB (five runs on the Windows host). The fleet admits a job
     # there only with 16 GB available and its ask within available less the 6.3 GB headroom, so a
@@ -91,9 +101,10 @@ case $mode in
   *) cores=${NRESE_GATE_CORES:-2} ram=${NRESE_GATE_RAM_GB:-4} est=${NRESE_GATE_EST_MIN:-10} ;;
 esac
 priority=${NRESE_GATE_PRIORITY:-600}
-# The merge check's jobs (above): either tier's, for a commit that goes to engine-v2.
+# The merge check's jobs (above): either tier's, for a commit that lands (gate-key.sh landing_ref:
+# engine-v2 or a release branch).
 class=""
-if [ "${NRESE_PUSH_REF:-}" = refs/heads/refactor/engine-v2 ]; then
+if [ "$mode" != quick ] && landing_ref "${NRESE_PUSH_REF:-}"; then
   class=merge-gate
 fi
 # A list longer than a step carries well within the fleet's 64 KB request is made on the host from
@@ -127,6 +138,7 @@ gate() {
     echo "priority_reason = $(q "${NRESE_GATE_REASON:-$reason}")"
     [ -z "$class" ] || echo "priority_class = $(q "$class")"
     echo "est_min = $est"
+    [ -z "$deadline" ] || echo "step_deadline_min = $deadline"
     if [ "$mode" = windows ]; then
       printf 'steps = [["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", %s, %s]]\n' \
         '"scripts/lib/windows-job.ps1"' "$(q "$tree")"

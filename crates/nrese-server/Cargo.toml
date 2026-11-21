@@ -61,6 +61,8 @@ libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
 
 [dev-dependencies]
+# The maintenance integration tests panic at a named step of one on-disk engine.
+nrese-engine = { path = "../nrese-engine", features = ["fault-points"] }
 # Simulated failures at the store's quarantine commit.
 nrese-store = { path = "../nrese-store", features = ["fault-points"] }
 # Measured memory tests (tests/process_memory.rs).

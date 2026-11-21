@@ -19,7 +19,7 @@ const UNION: &str = ":A owl:equivalentClass [ owl:unionOf ( :B :C ) ] . \
 
 /// `A ⊑ ∃r.B ⊓ ∀r.C` with `B`, `C` disjoint: no `A` can exist. Horn; RL needs an `r`
 /// edge to fire `cls-avf`, and the existential gives none.
-const EXISTENTIAL: &str = ":A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; \
+pub(crate) const EXISTENTIAL: &str = ":A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; \
        owl:someValuesFrom :B ] , \
      [ a owl:Restriction ; owl:onProperty :r ; owl:allValuesFrom :C ] . \
      :B owl:disjointWith :C .";

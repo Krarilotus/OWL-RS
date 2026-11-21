@@ -19,12 +19,14 @@
 use nrese_dl::classify::Taxonomy;
 use nrese_dl::limits::Deadline;
 use nrese_exec::ChargedVec;
-use nrese_exec::cell::{BuildCell, Claim, Kind};
+use nrese_exec::cell::{BuildCell, Claim, End, Ended, Joined, Kind};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use nrese_engine::{EncodedQuad, EncodedTriple, ReadModel, Snapshot, TermId, Transaction};
+use nrese_engine::{
+    EncodedQuad, EncodedTriple, PendingView, ReadModel, Snapshot, TermId, Transaction,
+};
 use nrese_owl::Ontology;
 use nrese_reasoner::eval::Stop;
 use nrese_reasoner::ir::Triple;
@@ -199,12 +201,13 @@ fn routed_to_rules(ontology: &Ontology) -> bool {
 /// What the RL route was decided on: the TBox signature as the reader typed it, the
 /// built-in annotation properties among its annotation properties, the SHACL properties
 /// whose statements were read as SHACL content (`Ontology::shacl`), and the ids of
-/// `rdf:type` and `owl:sameAs` (`None`: not in the dictionary then).
+/// `rdf:type`, `owl:sameAs` and `rdf:first` (`None`: not in the dictionary then).
 pub(crate) struct Kinds {
     signature: nrese_owl::profile::Signature,
     shacl: std::collections::BTreeSet<u64>,
     rdf_type: Option<u64>,
     same_as: Option<u64>,
+    first: Option<u64>,
 }
 
 impl Kinds {
@@ -221,7 +224,30 @@ impl Kinds {
             shacl: ontology.shacl.clone(),
             rdf_type: id("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
             same_as: id("http://www.w3.org/2002/07/owl#sameAs"),
+            first: id("http://www.w3.org/1999/02/22-rdf-syntax-ns#first"),
         })
+    }
+
+    /// Whether `t` is a list's cell at `tx`'s base: a blank node with an asserted `rdf:first`
+    /// there (one probe of the committed index; the pending changes aren't scanned, so a
+    /// commit's cost stays linear in its statements). The reader reports a cell that a
+    /// statement outside its list names (`Ontology::list_cell_outside`), so such a statement
+    /// is read. A cell new in the commit has its own pending `rdf:first`, which
+    /// [`changes_schema`] already sends to the reader; without `rdf:first` in the dictionary
+    /// at the route's revision there was no cell at the base.
+    fn cell(&self, tx: &impl PendingView, t: u64) -> bool {
+        let id = TermId::from_raw(t);
+        let Some(first) = self.first else {
+            return false;
+        };
+        if id.kind() != nrese_engine::TermKind::BlankNode {
+            return false;
+        }
+        let mut pattern = nrese_engine::QuadPattern::all();
+        (pattern.subject, pattern.predicate) = (Some(id), Some(TermId::from_raw(first)));
+        let base = tx.base();
+        let mut found = base.quads_for_pattern_in(ReadModel::Asserted, &pattern);
+        found.next().is_some()
     }
 
     /// Whether an asserted triple, inserted or deleted, leaves every term the kinds the
@@ -234,15 +260,24 @@ impl Kinds {
     /// leaves out (`nrese_owl::diagnostics::reserved_name`), as subject or IRI object, and
     /// its predicate is `rdf:type` with a known class, `owl:sameAs`, or a property known
     /// only as the kind its object needs (a literal a data property, an IRI an object
-    /// property). A deleted literal needs a declared data property: one that is data only
-    /// by its literals may lose the last one, and its other axioms then read it as an
-    /// object property.
-    fn keep(&self, tx: &Transaction<'_>, triple @ [s, p, o]: Triple, deleted: bool) -> bool {
+    /// property). A deleted value needs a property declared its kind ([`may_retype`]): one
+    /// that is data only by its literals may lose the last one, and its other axioms then
+    /// read it as an object property, and the other way round. A statement that names a
+    /// list's cell ([`Self::cell`]), an annotation too, is read, and so is one about the
+    /// ontology's node ([`header`]) but a known annotation property's.
+    fn keep(&self, tx: &impl PendingView, triple @ [s, p, o]: Triple, deleted: bool) -> bool {
         let k = &self.signature;
+        if self.cell(tx, s) || self.cell(tx, o) {
+            return false;
+        }
         if self.shacl.contains(&p) || (k.annotations.contains(&p) && !named(tx, p, false)) {
             return true;
         }
-        if changes_schema(tx, triple) || k.names.contains(&s) || reserved_named(tx, triple) {
+        if changes_schema(tx, triple)
+            || k.names.contains(&s)
+            || reserved_named(tx, triple)
+            || header(tx, s)
+        {
             return false;
         }
         let iri = TermId::from_raw(o).kind() == nrese_engine::TermKind::Iri;
@@ -251,18 +286,39 @@ impl Kinds {
         } else if !iri {
             k.data.contains(&p)
                 && !k.objects.contains(&p)
-                && (!deleted || k.declared_data.contains(&p))
+                && !may_retype(tx, triple, deleted)
                 && (deleted || rl_literal(tx, o))
         } else {
             let property = k.objects.contains(&p) && !k.data.contains(&p);
+            let property = property && !may_retype(tx, triple, deleted);
             !k.names.contains(&o) && (Some(p) == self.same_as || property)
         }
     }
 }
 
+/// Whether `s` is the ontology's node at `tx`'s base: typed `owl:Ontology` there (one probe
+/// of the committed index). A statement about it is an annotation or an assertion by its
+/// property's declarations (*Mapping to RDF* Table 10), which only the reader tells: so it is
+/// read. A node typed so in the commit itself is read by that statement, OWL's vocabulary.
+fn header(tx: &impl PendingView, s: u64) -> bool {
+    let id = |iri: &str| tx.lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into());
+    let (Some(ty), Some(ontology)) = (
+        id("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+        id("http://www.w3.org/2002/07/owl#Ontology"),
+    ) else {
+        return false;
+    };
+    let mut pattern = nrese_engine::QuadPattern::all();
+    (pattern.subject, pattern.predicate, pattern.object) =
+        (Some(TermId::from_raw(s)), Some(ty), Some(ontology));
+    let base = tx.base();
+    let mut found = base.quads_for_pattern_in(ReadModel::Asserted, &pattern);
+    found.next().is_some()
+}
+
 /// Whether OWL 2 RL admits the literal `o`'s datatype (`nrese_owl::profile::rl_datatype`):
 /// every inline kind's is the map's but `xsd:date`'s; any other literal is read.
-fn rl_literal(tx: &Transaction<'_>, o: u64) -> bool {
+fn rl_literal(tx: &impl PendingView, o: u64) -> bool {
     match TermId::from_raw(o).kind() {
         nrese_engine::TermKind::Date => false,
         nrese_engine::TermKind::TypedLiteral => match tx.decode(TermId::from_raw(o)) {
@@ -291,7 +347,9 @@ fn not_compiled() -> GaveUp {
 /// [`BuildCell`]: a reader off the pool waits for it; one on a Rayon worker builds its
 /// own (the bounded rule, `research-designs.md` §8). Lock order: the engine's writer slot,
 /// the pipeline's ground cache, then `state` (a leaf); a cell's own lock, then `view` or
-/// `state`; every dictionary lock after them.
+/// `state`; every dictionary lock after them. Inside a build cell, the end of a build nests
+/// the cell's `building` mutex → the build's `state` mutex → its terminal's lock; nothing
+/// takes an outer one of these while holding an inner one.
 #[derive(Default)]
 pub(crate) struct Bounds {
     state: Mutex<Slot>,
@@ -337,11 +395,214 @@ impl Bounds {
 }
 
 /// Whether the commit `tx` keeps the RL route `kinds` was decided on: the closure it leaves
-/// leaves out no list axiom, and no asserted change gives a term a new kind ([`Kinds::keep`]).
-fn route_kept(kinds: &Kinds, tx: &Transaction<'_>, lists_left_out: bool) -> bool {
+/// leaves out no list axiom, no asserted change gives a term a new kind ([`Kinds::keep`]), and
+/// none is a reified triple ([`changes_reified`]).
+fn route_kept(kinds: &Kinds, tx: &impl PendingView, lists_left_out: bool) -> bool {
     !lists_left_out
         && tx.inserted().all(|q| kinds.keep(tx, quad_triple(q), false))
         && tx.deleted().all(|q| kinds.keep(tx, quad_triple(q), true))
+        && !changes_reified(tx)
+}
+
+/// Whether the delta executor changes `upper` for `tx`'s asserted changes, which leave what
+/// the reader reads of the base as it was but for them: the transaction's part
+/// ([`probed_assertions`]) and U1's ([`upper_keeps`]).
+fn assertions_only(upper: &Upper, tx: &impl PendingView) -> bool {
+    probed_assertions(tx).is_some_and(|triples| upper_keeps(upper, &triples))
+}
+
+/// The delta's carry-over as far as the transaction tells it, which reads the engine and the
+/// dictionary: `tx`'s changed triples, inserted and deleted, where none has OWL's, RDF's or
+/// RDFS's vocabulary as predicate but `rdf:type` and `owl:sameAs` ([`vocabulary_predicate`]),
+/// names a reserved name or SHACL property ([`reserved_named`]) or says something about the
+/// ontology's node ([`header`]), no changed value may retype its property ([`may_retype`]),
+/// and none is a reified triple ([`changes_reified`]); `None` otherwise.
+fn probed_assertions(tx: &impl PendingView) -> Option<Vec<Triple>> {
+    let triples: Vec<Triple> = tx.inserted().chain(tx.deleted()).map(quad_triple).collect();
+    let retypes = |q, deleted| may_retype(tx, quad_triple(q), deleted);
+    let probed = triples
+        .iter()
+        .all(|&t| !vocabulary_predicate(tx, t[1]) && !reserved_named(tx, t) && !header(tx, t[0]))
+        && !tx.inserted().any(|q| retypes(q, false))
+        && !tx.deleted().any(|q| retypes(q, true))
+        && !changes_reified(tx);
+    probed.then_some(triples)
+}
+
+/// The delta's carry-over as far as U1 tells it, which reads U1 alone: no equality classes
+/// (one with them is evaluated afresh: `Upper`'s module docs), and each triple only asserts
+/// something about individuals over U1's signature ([`Upper::is_assertion`], which no schema
+/// change passes: its sets and its term ids' kind bits).
+fn upper_keeps(upper: &Upper, triples: &[Triple]) -> bool {
+    upper.classes().is_empty() && triples.iter().all(|&t| upper.is_assertion(t))
+}
+
+/// Whether a changed triple of `tx`, inserted or deleted, is the main triple a node names
+/// (`owl:annotatedSource`, `owl:annotatedProperty`, `owl:annotatedTarget`): an annotated
+/// axiom's reification or an annotation's annotation (*Mapping to RDF* Table 17). Deleting it
+/// leaves the node annotating nothing, which the reader reports (`Diagnostic::Malformed`);
+/// inserting it gives a node that annotated nothing its triple back: either way what the
+/// reader left out changes. Any such node counts, whatever its type: one the reader doesn't
+/// take for a reification only costs a read.
+///
+/// The base's nodes: an edit of a node's role statements uses OWL's vocabulary as predicate,
+/// which both carry-overs refuse beside this ([`changes_schema`], [`vocabulary_predicate`]),
+/// so where this answer counts, the roles are the base's. Its cost: one probe of the base's
+/// indexes per changed triple, and two per node it finds, at most [`REIFIED_CANDIDATES`] of
+/// them; more is told as a reified triple, so the carry-over reads again; none of the
+/// pending changes.
+fn changes_reified(tx: &impl PendingView) -> bool {
+    let base = tx.base();
+    let id = |local: &str| {
+        let iri = format!("http://www.w3.org/2002/07/owl#{local}");
+        base.lookup(nrese_rdf::NamedNodeRef::new_unchecked(&iri).into())
+    };
+    let (Some(source), Some(property), Some(target)) = (
+        id("annotatedSource"),
+        id("annotatedProperty"),
+        id("annotatedTarget"),
+    ) else {
+        return false;
+    };
+    // One past the bound: more than it are told by their count alone.
+    let nodes = |s: u64| -> Vec<TermId> {
+        let mut pattern = nrese_engine::QuadPattern::all();
+        (pattern.predicate, pattern.object) = (Some(source), Some(TermId::from_raw(s)));
+        let found = base.quads_for_pattern_in(ReadModel::Asserted, &pattern);
+        found
+            .map(|q| q.subject)
+            .take(REIFIED_CANDIDATES + 1)
+            .collect()
+    };
+    let holds = |node: TermId, role: TermId, term: u64| {
+        let mut pattern = nrese_engine::QuadPattern::all();
+        (pattern.subject, pattern.predicate, pattern.object) =
+            (Some(node), Some(role), Some(TermId::from_raw(term)));
+        let mut found = base.quads_for_pattern_in(ReadModel::Asserted, &pattern);
+        found.next().is_some()
+    };
+    let mut changed = tx.inserted().chain(tx.deleted()).map(quad_triple);
+    changed.any(|[s, p, o]| {
+        let nodes = nodes(s);
+        nodes.len() > REIFIED_CANDIDATES
+            || nodes
+                .iter()
+                .any(|&node| holds(node, property, p) && holds(node, target, o))
+    })
+}
+
+/// How many nodes naming one subject as their `owl:annotatedSource` [`changes_reified`] checks
+/// per changed triple of it: so many annotated statements of one subject are rare, and past
+/// them a commit reads the ontology, as any other it can't carry over, once.
+const REIFIED_CANDIDATES: usize = 32;
+
+impl Bounds {
+    /// Whether what the reader left out at `tx`'s base, as the base's commit recorded it, is
+    /// what it leaves out of the data as `tx`'s changes leave it: where their commit would
+    /// take its record without reading the ontology (the commit's record: the RL route kept,
+    /// or the delta executor's change, [`assertions_only`]), and every change is on the short
+    /// list whose effect on the reader the base's declarations fix ([`listed`]). `false`
+    /// where the bounds describe another revision than the base's. The list axioms the
+    /// closure leaves out are no part of the record.
+    ///
+    /// Taken as the commit takes it ([`Self::keeps_route`]): no bounds guard is held across
+    /// the engine or the dictionary (`docs/architecture/contracts.md`). Under the state only
+    /// the revision check, the RL route's kinds (an `Arc`, cloned), and U1's part
+    /// ([`upper_keeps`], which reads U1 alone, never keeping it: a commit installs its change
+    /// in place); every probe of the transaction runs without it.
+    pub(crate) fn keeps_record(&self, tx: &impl PendingView) -> bool {
+        let base = tx.base().revision();
+        let kinds = lock(&self.state)
+            .as_ref()
+            .filter(|s| s.revision == base)
+            .map(|s| s.kinds.clone());
+        match kinds {
+            Some(Some(kinds)) => route_kept(&kinds, tx, false) && listed(tx),
+            Some(None) => {
+                let Some(triples) = probed_assertions(tx).filter(|_| listed(tx)) else {
+                    return false;
+                };
+                let state = lock(&self.state);
+                matches!(
+                    state.as_ref().filter(|s| s.revision == base),
+                    Some(State { kinds: None, upper: Ok(upper), .. })
+                        if upper_keeps(upper, &triples)
+                )
+            }
+            None => false,
+        }
+    }
+}
+
+/// Whether every change of `tx`, inserted or deleted, is on the short list whose effect on
+/// what the reader reads the base's declarations fix, so a read inside the transaction may
+/// take its base's clean record ([`Bounds::keeps_record`], beside the commit's own tests):
+/// `s a C` with `C` declared `owl:Class`, `s p o` with `p` declared `owl:ObjectProperty`
+/// and `o` an IRI, `s p "v"` with `p` declared `owl:DatatypeProperty`; each declared so and
+/// as no other kind by the reader's own table (`nrese_owl::DECLARATION_KINDS`: `rdfs:Class`
+/// is a class, `owl:NamedIndividual` an individual), its subject (and its object, an IRI)
+/// named and outside RDF's, RDFS's, OWL's, XSD's and SHACL's namespaces, no reserved or SHACL
+/// name ([`reserved_named`]), not the ontology's node ([`header`]) and not a reification's
+/// node (no `owl:annotatedSource`). The commit's tests already refuse a reified triple
+/// ([`changes_reified`]).
+///
+/// Why a list: the commit's tests prove "the reader reads the data as before" from guards
+/// over the syntax, for any change the RL route or the delta takes, and each review of them
+/// found another change that alters what the reader reports. A change on this list alters
+/// nothing the reader reads but an individual's membership or value under a name whose
+/// kind the base declares; any other reads its own ontology, the cost before the record
+/// was taken at all, never another record.
+fn listed(tx: &impl PendingView) -> bool {
+    use nrese_owl::EntityKind;
+    let base = tx.base();
+    let id = |iri: &str| base.lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into());
+    let owl = |local: &str| id(&format!("http://www.w3.org/2002/07/owl#{local}"));
+    let Some(rdf_type) = id(RDF_TYPE) else {
+        return false;
+    };
+    let source = owl("annotatedSource");
+    // The reader's declaring classes, by id, each with the kind it declares.
+    let declaring: Vec<(TermId, EntityKind)> = (nrese_owl::DECLARATION_KINDS.iter())
+        .filter_map(|&(iri, kind)| id(iri).map(|t| (t, kind)))
+        .collect();
+    let has = |s: u64, p: TermId, o: Option<TermId>| {
+        let mut pattern = nrese_engine::QuadPattern::all();
+        (pattern.subject, pattern.predicate, pattern.object) =
+            (Some(TermId::from_raw(s)), Some(p), o);
+        let mut found = base.quads_for_pattern_in(ReadModel::Asserted, &pattern);
+        found.next().is_some()
+    };
+    // Whether `t` is declared `kind` by `admitting` and by no class of another kind.
+    let only = |t: u64, admitting: Option<TermId>, kind: EntityKind| {
+        admitting.is_some_and(|a| has(t, rdf_type, Some(a)))
+            && (declaring.iter()).all(|&(d, k)| k == kind || !has(t, rdf_type, Some(d)))
+    };
+    let named = |t: u64| {
+        TermId::from_raw(t).kind() == nrese_engine::TermKind::Iri
+            && !iri(tx, t).is_some_and(|i| vocabulary(&i) || own_namespace(&i))
+    };
+    let plain = |t: u64| !header(tx, t) && !source.is_some_and(|source| has(t, source, None));
+    let (class, object, data) = (owl("Class"), owl("ObjectProperty"), owl("DatatypeProperty"));
+    let mut changed = tx.inserted().chain(tx.deleted()).map(quad_triple);
+    changed.all(|triple @ [s, p, o]| {
+        let iri_object = TermId::from_raw(o).kind() == nrese_engine::TermKind::Iri;
+        let kind = || {
+            if TermId::from_raw(p) == rdf_type {
+                named(o) && only(o, class, EntityKind::Class)
+            } else if iri_object {
+                named(o) && only(p, object, EntityKind::ObjectProperty)
+            } else {
+                TermId::from_raw(o).kind().is_literal() && only(p, data, EntityKind::DataProperty)
+            }
+        };
+        named(s) && kind() && plain(s) && (!iri_object || plain(o)) && !reserved_named(tx, triple)
+    })
+}
+
+/// Whether `iri` is in XSD's or SHACL's namespace (beside [`vocabulary`]'s three).
+fn own_namespace(iri: &str) -> bool {
+    iri.starts_with("http://www.w3.org/2001/XMLSchema#")
+        || iri.starts_with("http://www.w3.org/ns/shacl#")
 }
 
 impl std::fmt::Debug for Bounds {
@@ -472,12 +733,7 @@ pub(crate) fn prepare(
     // would keep a route the commit may change.
     if let Some((None, upper)) = current {
         match upper.as_deref() {
-            // A U1 with equality classes is evaluated afresh (`Upper`'s module docs).
-            Ok(upper)
-                if upper.classes().is_empty()
-                    && asserted().all(|t| upper.is_assertion(t) && !reserved_named(tx, t))
-                    && !tx.deleted().any(|q| may_retype(tx, quad_triple(q))) =>
-            {
+            Ok(upper) if assertions_only(upper, tx) => {
                 let before = tx.base();
                 let inserted: Vec<Triple> = tx
                     .inserted()
@@ -536,7 +792,9 @@ pub(crate) fn prepare(
     source::intern_vocabulary(tx);
     #[cfg(test)]
     seam::at(&store.dl().bounds, seam::Point::Read);
-    let Ok(ontology) = source::read_pending(tx, Arc::clone(store.dl().bounds.kept())) else {
+    let treatments = &store.config().dl.treatments;
+    let Ok(ontology) = source::read_pending(tx, Arc::clone(store.dl().bounds.kept()), treatments)
+    else {
         return Preparation {
             base,
             prepared: Prepared::Rebuilt(Box::new(Err(GaveUp::refused(source::refused(
@@ -582,13 +840,13 @@ pub(crate) fn prepare(
 /// or it names a SHACL property (`nrese_owl::shacl_properties`) anywhere, which can change
 /// whether the reader reads SHACL content as content or as any other statement
 /// (`Ontology::shacl`).
-fn reserved_named(tx: &Transaction<'_>, [s, p, o]: Triple) -> bool {
+fn reserved_named(tx: &impl PendingView, [s, p, o]: Triple) -> bool {
     named(tx, s, true) || named(tx, o, true) || named(tx, p, false)
 }
 
 /// Whether the term `t` is a SHACL property (`nrese_owl::shacl_properties`) or, with
 /// `reserved`, a reserved name (`nrese_owl::diagnostics::reserved_name`).
-fn named(tx: &Transaction<'_>, t: u64, reserved: bool) -> bool {
+fn named(tx: &impl PendingView, t: u64, reserved: bool) -> bool {
     match tx.decode(TermId::from_raw(t)) {
         Some(nrese_rdf::Term::NamedNode(n)) => {
             let iri = n.as_str();
@@ -599,53 +857,100 @@ fn named(tx: &Transaction<'_>, t: u64, reserved: bool) -> bool {
     }
 }
 
-/// Whether deleting a statement may change its property's kind for the reader: a literal
-/// value of a property not declared a data property, which is one only while it has one
-/// (`nrese_owl::profile::Signature::declared_data`, as `Kinds::keep` reads it).
-pub(crate) fn may_retype(tx: &Transaction<'_>, [_, p, o]: Triple) -> bool {
+/// Whether deleting (`deleted`) or inserting a statement may change its property's kind for
+/// the reader, which types an undeclared property by its uses, every statement of it counted
+/// (`nrese_owl::mapping`, `is_data_property`): a data property while it has a literal value
+/// and no other, an object property otherwise. So a deleted literal value of a property not
+/// declared a data property may be its last; and a value that is no literal, of a property
+/// not declared an object property, deleted may be its last other one, inserted its first,
+/// where the property has a literal value too (one the reader reads as no assertion, about
+/// the ontology's node for one: [`Kinds::keep`] and [`Upper::is_assertion`] refuse a
+/// property asserted with both). That literal is looked for among at most [`RETYPE_VALUES`]
+/// of its values in the base; past them, it may. An inserted literal makes a data property
+/// only of one with no value, which neither carry-over knows as one. Declared in the base:
+/// deleting a declaration is OWL's vocabulary, which both carry-overs refuse.
+/// `rdf:type` and `owl:sameAs` type no property.
+pub(crate) fn may_retype(tx: &impl PendingView, [_, p, o]: Triple, deleted: bool) -> bool {
     let id = |iri: &str| tx.lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into());
-    let mut pattern = nrese_engine::QuadPattern::all();
-    (pattern.subject, pattern.predicate, pattern.object) = (
-        Some(TermId::from_raw(p)),
-        id("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
-        id("http://www.w3.org/2002/07/owl#DatatypeProperty"),
-    );
-    let declared = || {
-        let found = || {
-            tx.base()
-                .quads_for_pattern_in(ReadModel::Asserted, &pattern)
-        };
-        pattern.predicate.is_some() && pattern.object.is_some() && found().next().is_some()
+    let (rdf_type, same_as) = (id(RDF_TYPE), id(OWL_SAME_AS));
+    let property = Some(TermId::from_raw(p));
+    if property == rdf_type || property == same_as {
+        return false;
+    }
+    let literal = TermId::from_raw(o).kind().is_literal();
+    if literal && !deleted {
+        return false;
+    }
+    let kind = if literal {
+        "http://www.w3.org/2002/07/owl#DatatypeProperty"
+    } else {
+        "http://www.w3.org/2002/07/owl#ObjectProperty"
     };
-    TermId::from_raw(o).kind().is_literal() && !declared()
+    let base = tx.base();
+    let mut pattern = nrese_engine::QuadPattern::all();
+    (pattern.subject, pattern.predicate, pattern.object) = (property, rdf_type, id(kind));
+    let declared = pattern.predicate.is_some()
+        && pattern.object.is_some()
+        && (base.quads_for_pattern_in(ReadModel::Asserted, &pattern))
+            .next()
+            .is_some();
+    if declared || literal {
+        return !declared;
+    }
+    let mut pattern = nrese_engine::QuadPattern::all();
+    pattern.predicate = property;
+    let values: Vec<bool> = (base.quads_for_pattern_in(ReadModel::Asserted, &pattern))
+        .map(|q| q.object.kind().is_literal())
+        .take(RETYPE_VALUES + 1)
+        .collect();
+    values.len() > RETYPE_VALUES || values.contains(&true)
 }
+
+/// How many of an undeclared property's values [`may_retype`] looks through for a literal
+/// one, per changed value: past them a commit reads the ontology, as any other it can't
+/// carry over.
+const RETYPE_VALUES: usize = 32;
 
 /// Whether a changed statement may change the ontology's schema (and so U1's rules),
 /// judged without U1's signature: a blank node, OWL's, RDF's or RDFS's vocabulary as
 /// predicate (but `rdf:type` with another class, and `owl:sameAs`).
-pub(crate) fn changes_schema(tx: &Transaction<'_>, [s, p, o]: Triple) -> bool {
+pub(crate) fn changes_schema(tx: &impl PendingView, [s, p, o]: Triple) -> bool {
     use nrese_engine::TermKind;
     let kind = |t: u64| TermId::from_raw(t).kind();
     if kind(s) == TermKind::BlankNode || kind(o) == TermKind::BlankNode {
         return true;
     }
-    let reserved = |t: u64| match tx.decode(TermId::from_raw(t)) {
-        Some(nrese_rdf::Term::NamedNode(n)) => {
-            let iri = n.as_str();
-            iri.starts_with("http://www.w3.org/1999/02/22-rdf-syntax-ns#")
-                || iri.starts_with("http://www.w3.org/2000/01/rdf-schema#")
-                || iri.starts_with("http://www.w3.org/2002/07/owl#")
-        }
-        _ => false,
-    };
-    let text = |t: u64| match tx.decode(TermId::from_raw(t)) {
-        Some(nrese_rdf::Term::NamedNode(n)) => n.into_string(),
-        _ => String::new(),
-    };
-    match text(p).as_str() {
-        "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" => reserved(o),
-        "http://www.w3.org/2002/07/owl#sameAs" => false,
-        _ => reserved(p),
+    match iri(tx, p).as_deref() {
+        Some(RDF_TYPE) => iri(tx, o).is_some_and(|o| vocabulary(&o)),
+        _ => vocabulary_predicate(tx, p),
+    }
+}
+
+/// Whether `p` is OWL's, RDF's or RDFS's vocabulary as a predicate, but `rdf:type` and
+/// `owl:sameAs`: a statement of it is no assertion about individuals (the role statements
+/// of a reification among them), whatever the reader made of its terms elsewhere.
+fn vocabulary_predicate(tx: &impl PendingView, p: u64) -> bool {
+    match iri(tx, p).as_deref() {
+        Some(RDF_TYPE | OWL_SAME_AS) | None => false,
+        Some(p) => vocabulary(p),
+    }
+}
+
+const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+const OWL_SAME_AS: &str = "http://www.w3.org/2002/07/owl#sameAs";
+
+/// Whether `iri` is in OWL's, RDF's or RDFS's namespace.
+fn vocabulary(iri: &str) -> bool {
+    iri.starts_with("http://www.w3.org/1999/02/22-rdf-syntax-ns#")
+        || iri.starts_with("http://www.w3.org/2000/01/rdf-schema#")
+        || iri.starts_with("http://www.w3.org/2002/07/owl#")
+}
+
+/// The IRI the term `t` is, where it is one.
+fn iri(tx: &impl PendingView, t: u64) -> Option<String> {
+    match tx.decode(TermId::from_raw(t)) {
+        Some(nrese_rdf::Term::NamedNode(n)) => Some(n.into_string()),
+        _ => None,
     }
 }
 
@@ -783,24 +1088,49 @@ pub(crate) fn install(store: &StoreService, preparation: Preparation, revision: 
 pub(crate) fn view(store: &StoreService) -> (Snapshot, Arc<View>) {
     loop {
         let snapshot = store.engine().snapshot();
-        if let Some(view) = view_until(store, &snapshot, None).expect("no stop never gives up") {
-            return (snapshot, view);
+        match view_until(store, &snapshot, None, None) {
+            Some(Ok(view)) => return (snapshot, view),
+            // Again, at the latest snapshot: a build that ended for a later revision or
+            // failed left no entry, so this claim builds.
+            Some(Err(Missing::Later | Missing::Failed)) => {}
+            // Never: no deadline and no stop.
+            None => {}
         }
     }
 }
 
+/// Why a read has no view of its revision ([`view_until`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Missing {
+    /// The bounds describe a later revision than the read's.
+    Later,
+    /// The build of the view failed: it ended with no view (a panic, an early return).
+    Failed,
+}
+
+/// How a view build ended ([`read`]).
+enum ViewEnd {
+    /// Published, and kept for later reads of its revision.
+    Kept(Arc<View>),
+    /// Given to this read and its waiters, not kept: the next read of the revision tries again.
+    Unkept(Arc<View>),
+    /// The bounds describe a later revision.
+    Later,
+}
+
 /// [`view`] of `snapshot` for a request, never another snapshot's (T3 (a)): one already
-/// built whatever `stop` says; else given up (`None`) once `stop` fires, before it claims a
-/// build or while it waits for another read's, polled as `nrese_exec::cell::Build::wait_until`
-/// says; `Some(None)` where the bounds describe a later revision than `snapshot`, or the build
+/// built whatever `stop` says; else given up (`None`) once `deadline` passes or `stop`
+/// fires, before it claims a build or while it waits for another read's (the build's
+/// `join`); `Err` where the bounds describe a later revision than `snapshot`, or the build
 /// failed. The build runs on and is kept; one this read claimed runs to its end whatever its
 /// stop says, as others may wait for it (a classification waiter's way,
 /// `classification::cached`).
 pub(crate) fn view_until(
     store: &StoreService,
     snapshot: &Snapshot,
+    deadline: Option<std::time::Instant>,
     stop: Option<&dyn Fn() -> bool>,
-) -> Option<Option<Arc<View>>> {
+) -> Option<Result<Arc<View>, Missing>> {
     let bounds = &store.dl().bounds;
     let revision = snapshot.revision();
     let cached = || {
@@ -810,33 +1140,53 @@ pub(crate) fn view_until(
             .map(Arc::clone)
     };
     if let Some(view) = cached() {
-        return Some(Some(view));
+        return Some(Ok(view));
     }
-    if stop.is_some_and(|stop| stop()) {
+    let stopped = || stop.is_some_and(|stop| stop());
+    if deadline.is_some_and(|at| std::time::Instant::now() >= at) || stopped() {
         return None;
     }
+    let own = || match read(store, snapshot) {
+        ViewEnd::Kept(view) | ViewEnd::Unkept(view) => Ok(view),
+        ViewEnd::Later => Err(Missing::Later),
+    };
     let built = match bounds
         .views
         .claim(revision, Kind::Opaque, || cached().map(Some))
     {
-        Claim::Build(builder) => {
-            let built = read(store, snapshot);
-            builder.finish(built.clone());
-            built
-        }
-        Claim::Wait(flight) => match flight.wait_until(stop)? {
-            Ok(built) => built,
-            Err(nrese_exec::cell::Busy) => read(store, snapshot),
+        Claim::Build(builder) => match read(store, snapshot) {
+            ViewEnd::Kept(view) => {
+                builder.end(End::Kept(Arc::clone(&view)));
+                Ok(view)
+            }
+            ViewEnd::Unkept(view) => {
+                builder.end(End::Unkept(Some(Arc::clone(&view))));
+                Ok(view)
+            }
+            ViewEnd::Later => {
+                builder.end(End::Later);
+                Err(Missing::Later)
+            }
+        },
+        Claim::Wait(flight) => match flight.join(deadline, &stopped) {
+            Joined::Told(Ended::End(End::Kept(view) | End::Unkept(Some(view)))) => Ok(view),
+            Joined::Told(Ended::End(End::Later)) => Err(Missing::Later),
+            // Never told for a view but a panic's or an early return's.
+            Joined::Told(Ended::End(End::Empty | End::Unkept(None)) | Ended::Abandoned) => {
+                Err(Missing::Failed)
+            }
+            Joined::Busy => own(),
+            Joined::Left => return None,
         },
     };
     Some(built)
 }
 
-/// The view of `snapshot`'s revision, published; `None` if the bounds describe a later
-/// revision. U1 is the bounds' where they describe the revision, read under their state;
-/// else built afresh here and published. No lock is held across U1's build, its taxonomy
-/// or the view's runs (U1-I).
-fn read(store: &StoreService, snapshot: &Snapshot) -> Option<Arc<View>> {
+/// The view of `snapshot`'s revision, published and kept, or given to this read only;
+/// [`ViewEnd::Later`] if the bounds describe a later revision. U1 is the bounds' where they
+/// describe the revision, read under their state; else built afresh here and published. No
+/// lock is held across U1's build, its taxonomy or the view's runs (U1-I).
+fn read(store: &StoreService, snapshot: &Snapshot) -> ViewEnd {
     let bounds = &store.dl().bounds;
     let revision = snapshot.revision();
     // An older revision's view the cache keeps holds its charges: let it go before building
@@ -854,7 +1204,7 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> Option<Arc<View>> {
     let found = {
         let state = lock(&bounds.state);
         match state.as_ref() {
-            Some(s) if s.revision > revision => return None,
+            Some(s) if s.revision > revision => return ViewEnd::Later,
             Some(s) if s.revision == revision => Some((
                 s.compiled,
                 s.kinds.is_some(),
@@ -886,9 +1236,12 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> Option<Arc<View>> {
                 // may change U1 in place once it is let go).
                 Some(lower) => {
                     let state = lock(&bounds.state);
-                    let s = state
+                    let Some(s) = state
                         .as_ref()
-                        .filter(|s| s.revision == revision && s.compiled == compiled)?;
+                        .filter(|s| s.revision == revision && s.compiled == compiled)
+                    else {
+                        return ViewEnd::Later;
+                    };
                     parts(
                         snapshot,
                         s.revision,
@@ -949,7 +1302,7 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> Option<Arc<View>> {
         }
     };
     let Some(parts) = parts else {
-        return Some(Arc::new(refused(snapshot, revision)));
+        return ViewEnd::Unkept(Arc::new(refused(snapshot, revision)));
     };
     #[cfg(test)]
     seam::at(bounds, seam::Point::View);
@@ -957,13 +1310,13 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> Option<Arc<View>> {
     let view = Arc::new(view);
     if !(charged && keep) {
         // Not kept: the next read of the revision tries again.
-        return Some(view);
+        return ViewEnd::Unkept(view);
     }
     let mut cached = lock(&bounds.view);
     if cached.as_ref().is_none_or(|v| v.revision < view.revision) {
         *cached = Some(Arc::clone(&view));
     }
-    Some(view)
+    ViewEnd::Kept(view)
 }
 
 /// Whether the RL rules prove `snapshot`'s data consistent: its version's certificate says
@@ -991,7 +1344,8 @@ fn afresh(
         );
     }
     let latest = store.engine().snapshot();
-    let ontology = match source::read_snapshot(snapshot, Arc::clone(store.dl().bounds.kept())) {
+    let kept = Arc::clone(store.dl().bounds.kept());
+    let ontology = match source::read_snapshot(snapshot, kept, &store.config().dl.treatments) {
         Ok(ontology) => ontology,
         Err(_) => return (Err(GaveUp::refused(source::refused("the revision"))), None),
     };
@@ -1082,7 +1436,8 @@ fn taxonomy(
             Claim::Build(builder) => {
                 let built = build();
                 let Ok(charge) = built else {
-                    // Given to nobody waiting: they read again (the builder's drop wakes them).
+                    // Given to nobody waiting: they read again.
+                    builder.end(End::Unkept(None));
                     return built;
                 };
                 if let Some(s) = lock(&bounds.state).get_mut()
@@ -1090,15 +1445,20 @@ fn taxonomy(
                 {
                     s.taxonomy.get_or_insert_with(|| Arc::clone(&charge));
                 }
-                builder.finish(Some(Arc::clone(&charge)));
+                builder.end(End::Kept(Arc::clone(&charge)));
                 return Ok(charge);
             }
-            Claim::Wait(flight) => match flight.wait() {
+            // The view build it runs in goes to its end: no deadline, no stop.
+            Claim::Wait(flight) => match flight.join(None, &|| false) {
                 // The taxonomy with its charge: kept while this read holds it.
-                Ok(Some(charge)) => return Ok(charge),
-                // The build failed: again.
-                Ok(None) => {}
-                Err(nrese_exec::cell::Busy) => return build(),
+                Joined::Told(Ended::End(End::Kept(charge) | End::Unkept(Some(charge)))) => {
+                    return Ok(charge);
+                }
+                // The build failed, or kept nothing: again.
+                Joined::Told(
+                    Ended::End(End::Empty | End::Later | End::Unkept(None)) | Ended::Abandoned,
+                ) => {}
+                Joined::Busy | Joined::Left => return build(),
             },
         }
     }
@@ -1445,8 +1805,9 @@ pub(crate) fn upper_facts(store: &StoreService, afresh: bool) -> Option<Vec<[Str
         }
         let engine = store.engine();
         let latest = engine.snapshot();
+        let kept = Arc::clone(store.dl().bounds.kept());
         let ontology =
-            source::read_snapshot(&snapshot, Arc::clone(store.dl().bounds.kept())).ok()?;
+            source::read_snapshot(&snapshot, kept, &store.config().dl.treatments).ok()?;
         let normalised = nrese_owl::normalise(&ontology);
         let memory = store.memory_stop();
         let deadline = Deadline::after(store.config().dl.timeout);

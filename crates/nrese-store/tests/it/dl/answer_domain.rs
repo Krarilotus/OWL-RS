@@ -471,15 +471,24 @@ const OBJECT_PROPERTY: &str = "http://www.w3.org/2002/07/owl#ObjectProperty";
 fn a_filtered_read_is_never_told_every_name_answers_it() {
     let dl = pipeline();
     insert(&dl, &format!("{THING} :a0 a :C2 .")).expect("committed");
+    let every = |told: &[String]| {
+        told.iter()
+            .filter(|r| r.contains("holds of every element"))
+            .count()
+    };
     for read in [
         "SELECT ?x { ?x a :C0 FILTER(false) }",
         "SELECT ?x { ?x a :C0 FILTER(?x = :C2) }",
     ] {
         let (_, status) = query_with(&dl, read, None).expect("answers");
         let told = status.reasons();
-        let every = told.iter().filter(|r| r.contains("holds of every element"));
-        assert_eq!(every.count(), 0, "{read}: {told:?}");
+        assert_eq!(every(&told), 0, "{read}: {told:?}");
     }
+    // The control on the same words: the read without a filter earns them (C0 holds of
+    // U1's element).
+    let (_, status) = query_with(&dl, TYPE_C0, None).expect("answers");
+    let told = status.reasons();
+    assert_ne!(every(&told), 0, "{told:?}");
 }
 
 /// An `ASK` the store answers `true` misses nothing, so no name the store has no individual

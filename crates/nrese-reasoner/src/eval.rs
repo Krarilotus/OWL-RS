@@ -17,7 +17,10 @@ use rayon::prelude::*;
 
 use super::ir::Triple;
 use super::ir::{Atom, Guard, Head, OWL, RDF, RDFS, Rule, Term, Vocabulary};
-use super::lists::Facts;
+use super::lists::{Facts, ListVocabulary};
+
+mod witness_index;
+pub(crate) use witness_index::WitnessIndex;
 
 /// Driver matches per parallel work unit.
 pub(crate) const MORSEL: usize = 4096;
@@ -544,6 +547,7 @@ pub struct Schema {
     hidden: HashMap<u64, bool>,
     predicates: HashSet<u64>,
     classes: HashSet<u64>,
+    projected_lists: Option<ListVocabulary>,
 }
 
 impl Schema {
@@ -620,7 +624,17 @@ impl Schema {
             hidden: HashMap::new(),
             predicates,
             classes,
+            projected_lists: None,
         }
+    }
+
+    /// The batch's list vocabulary, named over the current representative view.
+    pub(crate) fn set_list_projection(&mut self, vocabulary: ListVocabulary) {
+        self.projected_lists = Some(vocabulary);
+    }
+
+    pub(crate) fn list_projection(&self) -> Option<&ListVocabulary> {
+        self.projected_lists.as_ref()
     }
 
     /// This schema, with memberships in `hidden` classes not derived: a ground rule that
@@ -665,8 +679,13 @@ impl Schema {
 
     pub fn is_schema_atom(&self, atom: &Atom) -> bool {
         match atom.0 {
-            [_, Term::Const(p), _] if self.predicates.contains(&p) => true,
-            [_, Term::Const(p), Term::Const(c)] => p == self.rdf_type && self.classes.contains(&c),
+            [_, Term::Const(p), Term::Const(c)] => self.is_schema_fact([0, p, c]),
+            [_, Term::Const(p), _] => {
+                self.predicates.contains(&p)
+                    || self
+                        .list_projection()
+                        .is_some_and(|lists| lists.is_list_predicate(p))
+            }
             _ => false,
         }
     }
@@ -674,11 +693,20 @@ impl Schema {
     /// Whether grounding reads relation `p` (schema atoms: a schema predicate, or
     /// `rdf:type` with a schema class), where any order may be needed.
     pub(crate) fn read_in_grounding(&self, p: u64) -> bool {
-        p == self.rdf_type || self.predicates.contains(&p)
+        p == self.rdf_type
+            || self.predicates.contains(&p)
+            || self
+                .list_projection()
+                .is_some_and(|lists| lists.reads_predicate(p))
     }
 
-    pub fn is_schema_fact(&self, [_, p, o]: Triple) -> bool {
-        self.predicates.contains(&p) || (p == self.rdf_type && self.classes.contains(&o))
+    pub fn is_schema_fact(&self, fact: Triple) -> bool {
+        let [_, p, o] = fact;
+        self.predicates.contains(&p)
+            || (p == self.rdf_type && self.classes.contains(&o))
+            || self
+                .list_projection()
+                .is_some_and(|lists| lists.is_list_fact(fact))
     }
 }
 
@@ -2560,6 +2588,16 @@ impl GroundProgram {
             .push(self.consistency.len(), &grounded.rule);
         self.consistency.push((source.clone(), grounded));
         Some(self.consistency.len() - 1)
+    }
+
+    /// Whether this program already contains the exact same ground consistency rule.
+    pub(crate) fn has_consistency(&self, source: &Rule, grounded: &Grounded) -> bool {
+        let key = (
+            source.name.clone(),
+            grounded.substitution.clone(),
+            rule_key(&grounded.rule),
+        );
+        self.consistency_known.contains(&key)
     }
 
     /// Grounds `rules` (fact and consistency rules) over all of `source`.

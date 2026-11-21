@@ -135,7 +135,7 @@ fn a_compaction_on_a_pool_thread_defers_to_a_running_merge() {
     assert_eq!(engine.stats().compactions, 0);
 
     drop(merging);
-    engine.settle();
+    engine.settle().unwrap();
     assert!(
         engine.stats().compactions > 0,
         "the waiting merge ran once the claim ended"

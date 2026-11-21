@@ -353,9 +353,10 @@ impl MutationPipeline {
                 // Under `owl2-dl`, where OWL 2 DL may read the data otherwise, the rules'
                 // clash isn't stated as an inconsistency (`WhyUndecided`).
                 let dl = self.store.dl();
+                let treatments = &self.store.config().dl.treatments;
                 let undecided = dl
                     .active()
-                    .then(|| dl.undecided_after(&tx, lists_left_out))
+                    .then(|| dl.undecided_after(&tx, lists_left_out, treatments))
                     .flatten();
                 let full = || {
                     let count = match violations.complete() {
@@ -417,15 +418,26 @@ impl MutationPipeline {
                 if let Some(reject) = gate.reject.take() {
                     return Err(known_error(MutationError::Rejected(Box::new(reject))));
                 }
-                // What the reader left out, named from the transaction once, here: none where
-                // consistent (`consistency::check`).
+                // What the premise of the rules' closure tells at the revision, named from the
+                // transaction once, here: of the ontology the gate or the bounds read; on the
+                // RL route nothing (the route holds only where the premise does); after a
+                // delta, its base's record (the delta keeps what the reader reads); else no
+                // record, never "nothing".
                 let name = |t| crate::dl::consistency::named(&tx, t);
                 let read = bounds
                     .ontology
                     .take()
                     .map(|o| crate::dl::query::left_out(&o, &name));
-                let consistent = gate.checked.verdict == crate::dl::Verdict::Consistent;
-                Some((gate, bounds, read.or(consistent.then_some(None))))
+                let base = tx.base().revision();
+                let record = read.or_else(|| match &bounds.prepared {
+                    crate::dl::bounds::Prepared::Rules(_) => Some(None),
+                    crate::dl::bounds::Prepared::Delta(_) => (self.store.dl().status())
+                        .filter(|s| s.revision == base)
+                        .and_then(|s| s.left_out),
+                    crate::dl::bounds::Prepared::Rebuilt(_)
+                    | crate::dl::bounds::Prepared::Unavailable => None,
+                });
+                Some((gate, bounds, record))
             } else {
                 None
             };

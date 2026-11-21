@@ -49,6 +49,11 @@ pub mod running;
 mod runtime;
 pub mod scope;
 pub mod service;
+#[allow(
+    dead_code,
+    reason = "the lifecycle is checked before it is wired to sessions"
+)]
+mod session_step;
 pub mod sessions;
 pub mod shacl;
 pub mod statements;

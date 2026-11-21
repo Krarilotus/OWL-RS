@@ -28,7 +28,7 @@ fn kind(d: &Diagnostic) -> String {
         Diagnostic::SharedBlankNode { .. } => "SharedBlankNode".into(),
         Diagnostic::BrokenList { .. } => "BrokenList".into(),
         Diagnostic::UndeclaredProperty { .. } => "UndeclaredProperty".into(),
-        Diagnostic::AmbiguousProperty { .. } => "AmbiguousProperty".into(),
+        Diagnostic::TwoKinds { .. } => "TwoKinds".into(),
         Diagnostic::Unsupported { what, .. } => format!("Unsupported:{what}"),
         Diagnostic::NotOwl { .. } => "NotOwl".into(),
         Diagnostic::Unused { .. } => "Unused".into(),

@@ -28,7 +28,7 @@ BEGIN {
     allow["http/cache_api.rs|let pinning = tokio::task::spawn_blocking(move || store.pin_query(&name, &request, &token));"] = "v1.6 cache pin"
     allow["replication.rs|let applied = tokio::task::spawn_blocking(move || {"] = "v1.6 replication apply"
     allow["replication.rs|let (dir, manifest) = tokio::task::spawn_blocking(move || {"] = "v1.6 replication image staging"
-    allow["state.rs|let principal = tokio::task::spawn_blocking(move || access.login(&user, &password, client))"] = "v1.6 login"
+    allow["state.rs|let principal = tokio::task::spawn_blocking(login)"] = "v1.6 login"
 
     allow["http/access_api.rs|tokio::task::spawn_blocking(move || access.access().history(limit))"] = "access history read"
     allow["http/api_v1.rs|let answer = tokio::task::spawn_blocking(move || {"] = "justification read"

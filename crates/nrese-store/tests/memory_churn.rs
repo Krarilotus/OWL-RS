@@ -178,12 +178,12 @@ fn churn_over_a_bounded_pool_of_terms_holds_the_heap_level() {
     }
     // Each level read with background maintenance settled: a compaction or checkpoint in
     // flight holds its buffers for a while, however far it got.
-    soak.pipeline.store().settle();
+    soak.pipeline.store().settle().unwrap();
     let level = heap::live();
     for _ in 0..3 * rounds {
         soak.round();
     }
-    soak.pipeline.store().settle();
+    soak.pipeline.store().settle().unwrap();
     let after = heap::live();
     let grew = after.saturating_sub(level);
     eprintln!(

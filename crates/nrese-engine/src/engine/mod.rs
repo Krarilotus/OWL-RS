@@ -32,6 +32,8 @@ mod equality;
 #[cfg(test)]
 mod lock_tests;
 #[cfg(test)]
+mod maintenance_tests;
+#[cfg(test)]
 mod own_state_tests;
 mod pending_traits;
 mod private;
@@ -50,7 +52,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
+use nrese_exec::terminal::{Terminal, terminal};
 use parking_lot::{Condvar, Mutex, MutexGuard, RwLock};
 
 use crate::durability::codec::CommitRecord;
@@ -739,15 +743,25 @@ impl Shared {
     /// Runs whatever maintenance was requested: a task of the background worker. Returns what
     /// is to be done again because it couldn't be done now (on a pool thread nothing waits
     /// for a running merge or checkpoint); the requests stay set for it.
-    fn maintain(&self) -> Again {
+    fn maintain(&self, step: &Mutex<&'static str>) -> Again {
         let mut again = Again::default();
-        if self.wants_compaction.swap(false, Ordering::AcqRel)
-            && self.versions.compact(false) == CompactionOutcome::Deferred
-        {
-            self.wants_compaction.store(true, Ordering::Release);
-            again.merge = true;
+        if self.wants_compaction.swap(false, Ordering::AcqRel) {
+            *step.lock() = "compaction";
+            #[cfg(any(test, feature = "fault-points"))]
+            if let Some(durable) = &self.durable {
+                crate::fault_points::panic_in_maintenance(durable.root(), "compaction");
+            }
+            if self.versions.compact(false) == CompactionOutcome::Deferred {
+                self.wants_compaction.store(true, Ordering::Release);
+                again.merge = true;
+            }
         }
         if self.wants_checkpoint.swap(false, Ordering::AcqRel) {
+            *step.lock() = "checkpoint";
+            #[cfg(any(test, feature = "fault-points"))]
+            if let Some(durable) = &self.durable {
+                crate::fault_points::panic_in_maintenance(durable.root(), "checkpoint");
+            }
             match self.checkpoint() {
                 Ok(_) => {}
                 // Another checkpoint is being written; it may be of an older revision than
@@ -809,6 +823,8 @@ struct Lifecycle {
     /// The current task, and the drop under way, if any.
     state: Mutex<(Task, Option<Shutdown>)>,
     changed: Condvar,
+    /// The operation named by the terminal fallback. Released before that operation runs.
+    step: Mutex<&'static str>,
 }
 
 /// Background maintenance. Wakeups are coalesced. While the engine lives, each task (a
@@ -820,6 +836,8 @@ struct Worker {
     wake: Option<mpsc::SyncSender<()>>,
     thread: Option<JoinHandle<()>>,
     life: Arc<Lifecycle>,
+    terminal: Terminal<&'static str>,
+    reported_end: AtomicBool,
 }
 
 impl Worker {
@@ -828,12 +846,16 @@ impl Worker {
         let life = Arc::new(Lifecycle {
             state: Mutex::new((Task::None, None)),
             changed: Condvar::new(),
+            step: Mutex::new("worker"),
         });
+        let fallback = Arc::clone(&life);
+        let (terminal, guard) = terminal(move || *fallback.step.lock());
         let thread = {
             let life = Arc::clone(&life);
             std::thread::Builder::new()
                 .name("nrese-maintenance".to_owned())
                 .spawn(move || {
+                    let _guard = guard;
                     while wakeups.recv().is_ok() {
                         loop {
                             let again = Self::task(&shared, &life);
@@ -855,7 +877,17 @@ impl Worker {
             wake: Some(wake),
             thread: Some(thread),
             life,
+            terminal,
+            reported_end: AtomicBool::new(false),
         })
+    }
+
+    fn end_error(&self, step: &'static str) -> EngineError {
+        // Logging can call a subscriber. Do it in a reader, outside the guard's unwind.
+        if !self.reported_end.swap(true, Ordering::Relaxed) {
+            tracing::error!(step, "maintenance ended");
+        }
+        EngineError::MaintenanceEnded(step)
     }
 
     /// Runs one task and waits for it: on the pool while the engine lives, on this thread
@@ -875,7 +907,7 @@ impl Worker {
         // Before the requests are taken, so that one is always visible ([`Engine::settle`]).
         shared.maintaining.store(true, Ordering::SeqCst);
         if here {
-            let again = shared.maintain();
+            let again = shared.maintain(&life.step);
             shared.maintaining.store(false, Ordering::SeqCst);
             return again;
         }
@@ -896,7 +928,7 @@ impl Worker {
                 let ended = match shared.upgrade() {
                     Some(shared) => {
                         let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            shared.maintain()
+                            shared.maintain(&life.step)
                         }));
                         // Let go of the store before the drop waiting for this task can return.
                         drop(shared);
@@ -919,7 +951,7 @@ impl Worker {
             Task::Ended(Ok(again)) => again,
             Task::Ended(Err(panic)) => std::panic::resume_unwind(panic),
             // The pool may have no thread free to start it (base ran it on this thread).
-            Task::Reclaimed => shared.maintain(),
+            Task::Reclaimed => shared.maintain(&life.step),
             _ => Again::default(),
         };
         shared.maintaining.store(false, Ordering::SeqCst);
@@ -1273,18 +1305,30 @@ impl Engine {
 
     /// Waits until background maintenance has nothing requested or running: a compaction
     /// or checkpoint holds memory and files while it runs. For measurements and tests;
-    /// commits may request more at any time.
-    pub fn settle(&self) {
-        if self.inner.worker.is_none() {
-            return;
-        }
+    /// commits may request more at any time. If the worker ended, returns that error.
+    pub fn settle(&self) -> EngineResult<()> {
+        let Some(worker) = &self.inner.worker else {
+            return Ok(());
+        };
         let shared = &self.inner.shared;
         while shared.wants_compaction.load(Ordering::SeqCst)
             || shared.wants_checkpoint.load(Ordering::SeqCst)
             || shared.maintaining.load(Ordering::SeqCst)
         {
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            if let Some(step) = worker
+                .terminal
+                .wait_until(Instant::now() + Duration::from_millis(1))
+            {
+                return Err(worker.end_error(step));
+            }
         }
+        self.maintenance_error().map_or(Ok(()), Err)
+    }
+
+    /// The background worker's recorded error, once it has ended.
+    pub fn maintenance_error(&self) -> Option<EngineError> {
+        let worker = self.inner.worker.as_ref()?;
+        worker.terminal.get().map(|step| worker.end_error(step))
     }
 
     /// Compacts until the policy is satisfied, waiting for any background merge. On a Rayon

@@ -134,6 +134,11 @@ pub struct DlConfig {
     pub outside_profile: OutsideProfile,
     /// Whether an exact read first refutes candidates by one model of the premise (off: tests).
     pub model_labels: bool,
+    /// What the store does with each kind of part that breaks the premise of the OWL 2 RL
+    /// rules' closure (`nrese_owl::Treatments`). Default: a name used as two kinds that an
+    /// axiom names is fatal, one only assertions name is counted, and a structure no axiom
+    /// uses that the rules may read more of leaves the rules route, its consistency decided.
+    pub treatments: nrese_owl::Treatments,
 }
 
 impl Default for DlConfig {
@@ -155,6 +160,7 @@ impl Default for DlConfig {
             max_join_steps: routes.max_join_steps,
             outside_profile: OutsideProfile::default(),
             model_labels: false,
+            treatments: nrese_owl::Treatments::default(),
         }
     }
 }

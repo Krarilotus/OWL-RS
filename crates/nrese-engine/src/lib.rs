@@ -25,7 +25,7 @@ pub mod cpu;
 mod durability;
 pub mod engine;
 pub mod error;
-#[cfg(feature = "fault-points")]
+#[cfg(any(test, feature = "fault-points"))]
 pub mod fault_points;
 mod index;
 mod mapped;

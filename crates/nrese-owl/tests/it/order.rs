@@ -11,13 +11,17 @@ const OWL: &str = "http://www.w3.org/2002/07/owl#";
 const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
 
-/// The kinds of diagnostic that leave a part of the input out ([`Diagnostic::leaves_out`]).
-const KINDS: [&str; 5] = [
+/// The kinds of diagnostic that leave a part of the input out ([`Diagnostic::leaves_out`]),
+/// and those that break the rules' premise: a name of two kinds and a structure no axiom uses
+/// that the rules may read more of ([`Diagnostic::reads_otherwise`] by their treatment).
+const KINDS: [&str; 7] = [
     "Reserved",
     "NotOwl",
     "Malformed",
     "BrokenList",
     "Unsupported",
+    "TwoKinds",
+    "Unused",
 ];
 
 fn kind(d: &Diagnostic) -> &'static str {
@@ -27,16 +31,38 @@ fn kind(d: &Diagnostic) -> &'static str {
         Diagnostic::Malformed { .. } => "Malformed",
         Diagnostic::BrokenList { .. } => "BrokenList",
         Diagnostic::Unsupported { .. } => "Unsupported",
-        _ => "other",
+        Diagnostic::TwoKinds { .. } => "TwoKinds",
+        Diagnostic::Unused {
+            reads_more: true, ..
+        } => "Unused",
+        Diagnostic::Unused {
+            reads_more: false, ..
+        } => "Unused, saying nothing",
+        Diagnostic::SharedBlankNode { .. } => "SharedBlankNode",
+        Diagnostic::UndeclaredProperty { .. } => "UndeclaredProperty",
+        Diagnostic::NonSimpleProperty { .. } => "NonSimpleProperty",
+        Diagnostic::AnonymousIndividual { .. } => "AnonymousIndividual",
+        Diagnostic::Syntax { .. } => "Syntax",
+        Diagnostic::RepeatedOperand => "RepeatedOperand",
+        Diagnostic::Rule { .. } => "Rule",
     }
 }
 
-/// What `statements`, read in their order, leave out of kind `of`, as a set: each diagnostic
+/// `d` in words, its terms named; a name of two kinds with whether an axiom reads it.
+fn words(d: &Diagnostic, table: &Table) -> String {
+    let described = d.describe(&|t| table.name(t));
+    match d {
+        Diagnostic::TwoKinds { by_axiom, .. } => format!("{described} (by axiom: {by_axiom})"),
+        _ => described,
+    }
+}
+
+/// What `statements`, read in their order, report of kind `of`, as a set: each diagnostic
 /// in words, its terms named.
 fn left_out(statements: &[Statement], table: &Table, of: &str) -> Vec<String> {
     let mut found: Vec<String> = (read(statements, table).diagnostics.iter())
-        .filter(|d| d.leaves_out() && kind(d) == of)
-        .map(|d| d.describe(&|t| table.name(t)))
+        .filter(|d| kind(d) == of)
+        .map(|d| words(d, table))
         .collect();
     found.sort();
     found.dedup();
@@ -80,7 +106,8 @@ fn shown(statements: &[Statement], table: &Table) -> String {
 /// and one a plain name (`owl:complementOf`, or a restriction's `owl:someValuesFrom`; `true`
 /// with them); in about a quarter each, a datatype restriction with a facet reached only through
 /// an anonymous individual's class assertion, its datatype complement given twice (1), valid
-/// OWL 2 DL (2), or its facet node's one statement a class assertion, not a facet (3); then up
+/// OWL 2 DL (2), or its facet node's one statement a class assertion, not a facet (3); a name
+/// of two kinds a domain reads, and a structure no axiom uses with two forms; then up
 /// to twelve statements over names, reserved names and blank nodes, with OWL's structure
 /// predicates.
 fn graph(rng: &mut Rng, table: &mut Table) -> (Vec<Statement>, bool, u64) {
@@ -122,6 +149,11 @@ fn graph(rng: &mut Rng, table: &mut Table) -> (Vec<Statement>, bool, u64) {
         iri(OWL, "complementOf"),
     ];
     let [e, defined_by] = [iri(EX, "E"), iri(RDFS, "isDefinedBy")];
+    let [tk, intersection, all] = [
+        iri(EX, "tk"),
+        iri(OWL, "intersectionOf"),
+        iri(OWL, "allValuesFrom"),
+    ];
     let data_restriction = [
         iri(EX, "dp"),
         iri(OWL, "DatatypeProperty"),
@@ -225,6 +257,23 @@ fn graph(rng: &mut Rng, table: &mut Table) -> (Vec<Statement>, bool, u64) {
             _ => [[cx, ty, types[1]], [rg, ty, datatype]],
         });
     }
+    // A name of two kinds an axiom reads: `:tk`'s domain makes it an object property, its
+    // literal value a data property. A structure no axiom uses with two forms, an
+    // intersection and a restriction, which the rules may read more of.
+    let x = table.id(Literal::new_simple_literal("x").into());
+    let [w, wl, wl2] = ["w", "wl", "wl2"].map(|l| blank(table, l));
+    triples.extend([
+        [tk, domain, c],
+        [a, tk, x],
+        [b, tk, c],
+        [w, intersection, wl],
+        [wl, first, a],
+        [wl, rest, wl2],
+        [wl2, first, b],
+        [wl2, rest, reserved[3]],
+        [w, on_property, p],
+        [w, all, d],
+    ]);
     for _ in 0..rng.below(13) {
         let predicate = pick(rng, &predicates);
         let object = if predicate == ty {
@@ -251,10 +300,13 @@ fn shuffled(statements: &[Statement], rng: &mut Rng) -> Vec<Statement> {
 
 /// Spec ([`read`]: the ontology of a set of statements, of any graphs): the diagnostics that
 /// leave a part of the input out (a reserved name used as an entity, OWL vocabulary outside
-/// the mapping, a malformed structure, a broken list, syntax not read yet) are the same set
+/// the mapping, a malformed structure, a broken list, syntax not read yet) and those that break
+/// the rules' premise (a name of two kinds, whether an axiom reads it; a structure no axiom
+/// uses, whether the rules may read more of it) are the same set
 /// in every order the statements come in. Random small graphs, each with an
 /// `owl:equivalentClass` between two reserved names, the second named by another axiom too,
-/// one structure of each other kind, in about half a structure property given twice (one
+/// one structure of each other kind, a name of two kinds a domain reads, a structure no axiom
+/// uses with two forms, in about half a structure property given twice (one
 /// value a reserved name, one a plain one), and in about a quarter each a datatype restriction
 /// with a facet reached only through an anonymous individual, its datatype complement given
 /// twice, valid OWL 2 DL, or its facet node's statement not a facet, are each read in their

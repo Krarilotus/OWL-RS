@@ -10,7 +10,10 @@ mod resources;
 mod sat;
 mod symmetric_chains;
 
+use std::time::Duration;
+
 use build::Build;
+use nrese_dl::limits::Limit;
 use nrese_dl::tableau::{Answer, Config, consistency, satisfiable};
 use nrese_owl::{Axiom, Characteristic, ClassExpr, DataRange, ExprId, ObjProp, RangeId, normalise};
 
@@ -704,10 +707,18 @@ fn budgets_give_up() {
         max_nodes: Some(1),
         ..Config::default()
     };
-    assert!(matches!(
-        consistency(&b.o, &config).answer,
-        Answer::GaveUp(why) if !why.contains("time budget")
-    ));
+    // The budget a run's give-up names; any other answer fails.
+    let gave_up = |config: &Config| match consistency(&b.o, config).answer {
+        Answer::GaveUp(why) => Limit::named_in(&why),
+        other => panic!("gave up, not {other:?}"),
+    };
+    assert_eq!(gave_up(&config), Some(Limit::Nodes));
+    // The control on the same words: past its deadline, the same run names the clock.
+    let late = Config {
+        timeout: Some(Duration::ZERO),
+        ..config
+    };
+    assert_eq!(gave_up(&late), Some(Limit::Time));
 }
 
 #[test]
