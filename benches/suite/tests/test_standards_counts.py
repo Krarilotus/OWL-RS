@@ -44,9 +44,10 @@ def names(row: str, suite: str) -> bool:
 
 
 def stands_before(row: str, count: int, words: set[str], stops: set[int]) -> bool:
-    """Whether `count` stands in `row` before one of `words`, in the phrase that follows it up to
-    the next of `stops` (`98 Core and 22 …`, `403 ontologies in the OWL 2 RDF/XML round trip, 295 …`)."""
-    tokens = text(row).split()
+    """Whether `count` stands in `row`'s tests column before one of `words`, in the phrase that follows
+    it up to the next of `stops` or the column's end (`98 Core and 22 …`, `403 in the OWL 2 RDF/XML
+    round trip, 295 …`)."""
+    tokens = text(row.split("|")[1:-1][-1]).split()
     number = lambda token: int(token.replace(",", "")) if re.fullmatch(r"\d[\d,]*", token) else None  # noqa: E731
     for i, token in enumerate(tokens):
         if number(token) != count:
@@ -67,10 +68,11 @@ KEYS = ("passed", "checked", "skipped", "disputed", "known")
 
 def row_errors(row: str, suite: str, suites: tuple[str, ...], expected: dict) -> list[str]:
     """What `row` gets wrong of `suite`'s counts (`expected`, the gate's, by suite). A row that names
-    others of its kit's `suites` too says each count before a word only its own suite's name has."""
+    others of its kit's `suites` too says each count before a word only its own suite's name has,
+    before any other count the gate states for a suite the row names."""
     others = [s for s in suites if s != suite and names(row, s)]
     words = set(suite.split()) - {w for s in others for w in s.split()}
-    stops = {expected.get(s, {}).get(key) for s in others for key in KEYS} - {None, 0}
+    stops = {expected[s].get(key) for s in expected if s != suite and names(row, s) for key in KEYS} - {None, 0}
     want = expected.get(suite, {})
     stated = [key for key in KEYS if want.get(key)]
     errors = [] if stated else [f"{suite}: the gate states no count for its row ({', '.join(KEYS)})"]
@@ -129,6 +131,19 @@ class StandardsTable(unittest.TestCase):
         for suite in expected:
             self.assertEqual(row_errors(row, suite, tuple(expected), expected), [])
             self.assertEqual(len(row_errors(swapped, suite, tuple(expected), expected)), 1, suite)
+
+    def test_a_phrase_ends_at_any_count_the_row_states(self):
+        # Spec: S7's witness: the OWL 2 DL row moved `403` before its own `410`; the phrase after 403 must
+        # end at 410 (another kit's stated count), not run on to `RDF/XML`.
+        expected = {"OWL 2 DL": {"passed": 410}, "OWL 2 RDF/XML round trip": {"checked": 403},
+                    "OWL 2 profiles": {"checked": 295}}
+        suites = ("OWL 2 RDF/XML round trip", "OWL 2 profiles")
+        row = ("| OWL 2 DL | x | 410 test cases; 403 in the OWL 2 RDF/XML round trip, "
+               "295 in the OWL 2 profiles check |")
+        moved = ("| OWL 2 DL | x | 403 and 410 test cases; in the OWL 2 RDF/XML round trip, "
+                 "295 in the OWL 2 profiles check |")
+        self.assertEqual(row_errors(row, "OWL 2 RDF/XML round trip", suites, expected), [])
+        self.assertEqual(len(row_errors(moved, "OWL 2 RDF/XML round trip", suites, expected)), 1)
 
     def test_a_suite_with_no_stated_count_is_no_check(self):
         row = "| SPARQL 1.1 | x | 531 tests |"

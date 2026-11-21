@@ -1953,6 +1953,27 @@ class Parts(unittest.TestCase):
         # A per-manifest line counts only under its runner's own heading.
         self.assertNotIn("RDF 1.1 syntax", gate_module.log_counts("  rdf11/rdf-turtle: 290 / 1\n"))
 
+    def test_a_summary_the_gate_cannot_trust_fails_its_suite(self):
+        """Run serially, libtest puts `test NAME ... ` before a test's first line: still counted. A manifest
+        reported twice, or a part larger than its whole, makes the suite unreadable, which fails it, so a
+        duplicate can't make up for a missing line and a negative count can't cancel a failure."""
+        serial = gate_module.log_counts("running 1 test\ntest w3c_rdfc10_suite ... W3C RDFC-1.0: 86 of 86 passed\nok\n")
+        self.assertEqual(serial["RDFC-1.0"], {"passed": 86, "failed": 0})
+        twice = gate_module.log_counts("W3C JSON-LD 1.1 suites: passed / failed / not run\n"
+                                       "  toRdf-manifest.jsonld: 455 / 0 / 12\n  toRdf-manifest.jsonld: 455 / 0 / 12\n")
+        self.assertEqual(twice["JSON-LD 1.1"], {"unreadable": "toRdf-manifest.jsonld reported twice"})
+        for log, suite in (("W3C RDFC-1.0: 86 of 85 passed\n", "RDFC-1.0"),
+                           ("W3C N3 parser suites: passed / failed (expected failures)\n"
+                            "  manifest-parser.ttl: 300 / 1 (1)\n  manifest-extended.ttl: 200 / 1 (2)\n", "N3 parser"),
+                           ("sparql11 PositiveQuery: 12/11\n", "SPARQL syntax")):
+            counts = gate_module.log_counts(log)
+            self.assertIn("unreadable", counts[suite], log)
+            self.assertEqual(gate_module.w3c_check(counts, {suite: {"passed": 1}}),
+                             [f"{suite}: its summary can't be read ({counts[suite]['unreadable']})"])
+        # A kit declared without a suite would pass on its exit code alone.
+        _, _, bad = gate_module.load_w3c_expected('[kit."a:b"]\nsuites = []\n')
+        self.assertIn("at least one", " ".join(bad))
+
     def test_listed_failures_are_counted_exactly_and_checks_at_least(self):
         """A list that grows or shrinks fails until w3c-expected.toml states the new count; a runner that
         counts what it checked must check at least its stated number."""
