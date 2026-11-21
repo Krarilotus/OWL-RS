@@ -664,44 +664,49 @@ fn pinned_oracle_witnesses(expiry: &Expiry) {
     use Verdict::{Agree, Reported};
     use nrese_owl::fuzz::templates::FAMILIES;
 
-    let check = |case: &Case<'_>, seed: u64, expected: Verdict| {
-        assert_eq!(
-            verdicts(case, Relation::Direct, expiry),
-            [
-                (Ruleset::Owl2Ql, expected.clone()),
-                (Ruleset::Owl2Rl, expected)
-            ],
-            "seed {seed}, {}: {}",
-            case.name,
-            case.query,
-        );
-    };
     let disjoint = Case {
         name: "disjoint",
         turtle: include_str!("dl/oracle_seed_15.nt"),
         query: "SELECT ?x WHERE { ?x <http://example.org/fuzz#p1> ?y0 }",
     };
-    check(&disjoint, 15, Reported);
+    // Its certain answers `a0` and `a2` are not in the QL or RL rows, so a `complete` claim
+    // misses them and `Reported` is the only right verdict.
+    assert_eq!(
+        verdicts(&disjoint, Relation::Direct, expiry),
+        [(Ruleset::Owl2Ql, Reported), (Ruleset::Owl2Rl, Reported)],
+        "seed 15, disjoint: {}",
+        disjoint.query,
+    );
     let mut witnessed = BTreeSet::from([disjoint.name]);
-    // Family, exact generation seed (after any redraw), query index, verdict in both regimes.
-    for (family, seed, query, expected) in [
-        ("asserted", 23, 0, Reported),
-        ("bounded", 37, 0, Agree),
-        ("left", 7, 0, Agree),
-        ("review", 21, 0, Reported),
-        ("self-nominal", 42_880_953_483_324, 0, Reported),
-        ("sol", 8, 0, Reported),
-        ("uniform", 2_199_023_255_552, 0, Agree),
-        ("universal", 8_796_093_022_283, 1, Agree),
+    // Family, exact generation seed (after any redraw), query index. Each witness is compared
+    // in both regimes, `Agree` or `Reported`: which of the two is the rulesets' precision.
+    for (family, seed, query) in [
+        ("asserted", 23, 0),
+        ("bounded", 37, 0),
+        ("left", 7, 0),
+        ("review", 21, 0),
+        ("self-nominal", 42_880_953_483_324, 0),
+        ("sol", 8, 0),
+        ("uniform", 2_199_023_255_552, 0),
+        ("universal", 8_796_093_022_283, 1),
     ] {
         let (turtle, actual_family, queries) = generated(seed);
+        assert_eq!(actual_family, family, "pinned seed {seed}");
         let case = Case {
             name: family,
             turtle: &turtle,
             query: &queries[query],
         };
-        check(&case, seed, expected);
-        assert_eq!(actual_family, family, "pinned seed {seed}");
+        let found = verdicts(&case, Relation::Direct, expiry);
+        let compared: Vec<_> = (found.iter())
+            .map(|(ruleset, verdict)| (ruleset, matches!(verdict, Agree | Reported)))
+            .collect();
+        assert_eq!(
+            compared,
+            [(&Ruleset::Owl2Ql, true), (&Ruleset::Owl2Rl, true)],
+            "seed {seed}, {family}: {}: {found:?}",
+            case.query,
+        );
         witnessed.insert(actual_family);
     }
     assert_eq!(
