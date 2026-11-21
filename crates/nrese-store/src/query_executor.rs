@@ -76,9 +76,13 @@ impl StoreSettings {
         nrese_exec::Envelope::new(limit, self.runtime.query_memory())
     }
 
-    /// The envelope of a query request: its memory limit within the catalog's budget.
+    /// The envelope of a query request: the one its transport gave it
+    /// ([`PreparedQuery::draw_from`]), else its memory limit within the catalog's budget.
     pub(crate) fn query_envelope(&self, prepared: &PreparedQuery) -> nrese_exec::Envelope {
-        self.envelope(prepared.memory_limit)
+        prepared
+            .memory
+            .clone()
+            .unwrap_or_else(|| self.envelope(prepared.memory_limit))
     }
 
     pub(crate) fn search_scope(&self) -> nrese_sparql::SearchScope {
@@ -99,6 +103,8 @@ pub struct PreparedQuery {
     pub(crate) inference_scope: Option<std::sync::Arc<nrese_sparql::GraphAccess>>,
     read_model: ReadModel,
     memory_limit: Option<usize>,
+    /// The envelope its runs draw from, if its transport gave one ([`Self::draw_from`]).
+    memory: Option<nrese_exec::Envelope>,
     as_written: bool,
     solutions_format: SolutionsResultFormat,
     graph_format: GraphResultFormat,
@@ -191,6 +197,7 @@ impl PreparedQuery {
                 _ => request.read_model.or(model).unwrap_or_default(),
             },
             memory_limit: request.memory_limit,
+            memory: None,
             as_written: request.as_written,
             solutions_format: request.solutions_format,
             graph_format: request.graph_format,
@@ -204,6 +211,13 @@ impl PreparedQuery {
             on_evaluation: None,
             reads: crate::dl::query::Reads::new(request.scope.access().cloned()),
         })
+    }
+
+    /// Its runs draw on `memory` ([`StoreService::envelope`](crate::StoreService::envelope)),
+    /// not on an envelope of their own: what its transport holds for the request (an answer
+    /// held whole) shares the request's limit with them.
+    pub fn draw_from(&mut self, memory: nrese_exec::Envelope) {
+        self.memory = Some(memory);
     }
 
     /// Calls `entered` whenever the store hands this query to the executor, past the

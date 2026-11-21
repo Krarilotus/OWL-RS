@@ -11,7 +11,7 @@ use crate::http::media::{header_value_str, media_type_matches};
 use crate::http::mutation;
 use crate::http::request_metrics::BackupKind;
 use crate::http::responses::build_admin_restore_response;
-use crate::http::result_stream::{Pace, stream_blocking};
+use crate::http::result_stream::{Pace, read_envelope, stream_blocking};
 use crate::state::AppState;
 
 const BACKUP_FORMAT_HEADER: &str = "x-nrese-backup-format";
@@ -21,7 +21,8 @@ const QUAD_COUNT_HEADER: &str = "x-nrese-quad-count";
 const CHECKSUM_HEADER: &str = "x-nrese-checksum-sha256";
 
 /// The N-Quads export of every asserted statement, streamed as it is read: a whole store in
-/// constant memory, for as long as the client keeps reading. Its revision and statement
+/// constant memory, for as long as the client keeps reading (over HTTP/1.0 held whole, within
+/// `budgets.query_memory`: `result_stream`). Its revision and statement
 /// count go in the headers; its SHA-256 closes the body as a comment
 /// (`# nrese-sha256 <hex>`) and follows it as the trailer [`CHECKSUM_HEADER`], announced in
 /// `Trailer` (HTTP/1.1 clients send `TE: trailers` to receive it).
@@ -40,6 +41,7 @@ pub async fn backup(state: AppState) -> Result<Response, ApiError> {
     let mut response = stream_blocking(
         Pace::stalled_after(state.policy().timeouts.graph_read),
         cancellation,
+        read_envelope(&state),
         "application/n-quads",
         "the export's client stopped reading (timeouts.graph_read)",
         move |out| {

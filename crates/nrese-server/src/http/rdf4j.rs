@@ -469,13 +469,14 @@ async fn statements(
     let store = state.store();
     let (scope, infer) = (access.read_scope(), infer(&pairs));
     // Streamed as read: a whole repository in constant memory, for as long as the client
-    // keeps reading.
+    // keeps reading (over HTTP/1.0 held whole: `result_stream`).
     let pace = super::result_stream::Pace::stalled_after(state.policy().timeouts.graph_read);
     let cancellation = nrese_store::CancellationToken::new();
     let token = cancellation.clone();
     super::result_stream::stream_blocking(
         pace,
         cancellation,
+        super::result_stream::read_envelope(&state),
         media_type,
         "reading the statements exceeded the policy timeout",
         move |out| {

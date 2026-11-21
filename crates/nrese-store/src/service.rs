@@ -1539,8 +1539,9 @@ impl StoreService {
     }
 
     /// A request's memory envelope within the catalog's budget: `limit` bytes of its
-    /// own, or none.
-    pub(crate) fn envelope(&self, limit: Option<usize>) -> nrese_exec::Envelope {
+    /// own, or none. A transport opens one for what it holds for a request, and hands it to
+    /// the request's query ([`PreparedQuery::draw_from`]).
+    pub fn envelope(&self, limit: Option<usize>) -> nrese_exec::Envelope {
         self.settings.envelope(limit)
     }
 

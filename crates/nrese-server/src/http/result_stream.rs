@@ -24,21 +24,53 @@
 //! - **Cancellation.** Reaching the deadline or a stall, or the client disconnecting (the
 //!   body is dropped), cancels the producer's token, so evaluation stops promptly instead of
 //!   running to completion for nobody.
+//! - **HTTP/1.0** has no way to mark a streamed answer as cut: its body ends when the
+//!   connection closes, cut or not. An HTTP/1.0 request's answer is held whole instead
+//!   ([`answering`]), its status chosen at the end and sent with its `Content-Length`, so a
+//!   stop before the end gets its own status. What is held is charged to the request's
+//!   memory envelope (`budgets.query_memory`): past it, 413 ([`too_large`]). Its deadline is
+//!   the first one for all of it, a stall bound's too.
 
+use std::collections::VecDeque;
 use std::io;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::body::{Body, Bytes};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Version, header};
 use axum::response::{IntoResponse, Response};
-use http_body::Frame;
+use http_body::{Frame, SizeHint};
+use nrese_exec::{BudgetExceeded, Envelope, Reservation};
 use nrese_store::CancellationToken;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+use crate::config::units::format_size;
 use crate::error::ApiError;
+use crate::state::AppState;
+
+tokio::task_local! {
+    /// Whether the request being answered gets its answers whole ([`answering`]).
+    static WHOLE: bool;
+}
+
+/// For a read without an envelope of its own (stored statements, the export): one of a
+/// query's size (`budgets.query_memory`), opened only if its answer is held whole.
+pub fn read_envelope(state: &AppState) -> impl FnOnce() -> Envelope + use<> {
+    let store = state.store();
+    let limit = state.policy().limits.max_query_memory_bytes;
+    move || store.envelope((limit > 0).then_some(limit))
+}
+
+/// Answers a request of `version` with `respond`: whole, if it is HTTP/1.0 or older. Every
+/// request passes here (`app::screen`), so every route that streams is covered.
+pub async fn answering<F: Future>(version: Version, respond: F) -> F::Output {
+    let whole = matches!(version, Version::HTTP_09 | Version::HTTP_10);
+    WHOLE.scope(whole, respond).await
+}
 
 const CHUNK_BYTES: usize = 64 * 1024;
 /// Chunks in flight between producer and client (at most ~0.5 MiB per request).
@@ -219,14 +251,17 @@ impl Drop for CancelOnDrop {
 }
 
 /// Runs `produce` on a blocking thread and streams what it writes as the response body,
-/// within `pace`. `produce` must honour `cancellation`.
+/// within `pace`; or holds it whole (HTTP/1.0), charged to the envelope `memory` opens.
+/// `produce` must honour `cancellation`.
 pub async fn stream_blocking(
     pace: Pace,
     cancellation: CancellationToken,
+    memory: impl FnOnce() -> Envelope,
     media_type: &'static str,
     timeout_message: &'static str,
     produce: impl FnOnce(&mut ChannelWriter) -> Result<(), ApiError> + Send + 'static,
 ) -> Result<Response, ApiError> {
+    let whole = WHOLE.try_with(|whole| *whole).unwrap_or(false);
     let (sender, mut receiver) = mpsc::channel::<Message>(CHANNEL_CHUNKS);
     let start = Arc::new(Start::default());
     let outcome = Arc::new(Outcome::default());
@@ -263,6 +298,12 @@ pub async fn stream_blocking(
     .abort_handle();
 
     let guard = CancelOnDrop(cancellation, watchdog);
+    if whole {
+        // The first deadline bounds all of it: no chunk goes out to start a stall bound. On
+        // every exit but the answer's end, `guard` cancels the producer.
+        let held = hold(receiver, &outcome, deadline, memory(), timeout_message).await?;
+        return Ok(respond(Body::new(held), media_type));
+    }
     let first = match tokio::time::timeout_at(deadline, receiver.recv()).await {
         Err(_elapsed) => return Err(ApiError::timeout(timeout_message)), // guard cancels
         Ok(Some(frame)) => Some(frame),
@@ -311,11 +352,103 @@ pub async fn stream_blocking(
     });
 
     let body = Body::new(http_body_util::StreamBody::new(frames));
+    Ok(respond(body, media_type))
+}
+
+fn respond(body: Body, media_type: &'static str) -> Response {
     let mut response = (StatusCode::OK, body).into_response();
     response
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(media_type));
-    Ok(response)
+    response
+}
+
+/// Receives all the producer writes before any of it is sent, charging it to `memory`:
+/// the whole answer, or the status of what stopped it (its deadline, the producer's error, a
+/// refusal of the memory).
+async fn hold(
+    mut receiver: mpsc::Receiver<Message>,
+    outcome: &Outcome,
+    deadline: Instant,
+    memory: Envelope,
+    timeout_message: &'static str,
+) -> Result<Held, ApiError> {
+    let bound = memory.limit();
+    let mut held = Held {
+        frames: VecDeque::new(),
+        left: 0,
+        memory: Reservation::new(memory),
+    };
+    loop {
+        match tokio::time::timeout_at(deadline, receiver.recv()).await {
+            Err(_elapsed) => return Err(ApiError::timeout(timeout_message)),
+            Ok(None) => break,
+            Ok(Some(frame)) => {
+                if let Some(data) = frame.data_ref() {
+                    let bytes = data.len();
+                    held.memory
+                        .charge(bytes)
+                        .map_err(|refused| too_large(refused, bound))?;
+                    held.left += bytes as u64;
+                }
+                held.frames.push_back(frame);
+            }
+        }
+    }
+    outcome.take()?;
+    Ok(held)
+}
+
+/// The refusal of an answer held whole past `bound`, its envelope's limit; or, where the
+/// memory all queries share is taken, the 503 any request gets that can't have its memory.
+fn too_large(refused: BudgetExceeded, bound: usize) -> ApiError {
+    if refused.shared || refused.unread {
+        return ApiError::unavailable(format!(
+            "{refused} (budgets.total_query_memory, NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES)"
+        ));
+    }
+    ApiError::payload_too_large(format!(
+        "This answer is larger than the {} an HTTP/1.0 request can be answered with: HTTP/1.0 \
+         has no way to mark a streamed answer as cut, so the server sends it only whole. Ask \
+         over HTTP/1.1 or HTTP/2, which stream it. Behind a reverse proxy, set the proxy's \
+         upstream HTTP version to 1.1 (for nginx: `proxy_http_version 1.1;`).",
+        format_size(bound as u64)
+    ))
+}
+
+/// An answer held whole: its frames, the bytes of them left to send (its exact length, so it
+/// goes out with a `Content-Length`), and the memory they hold, returned as they go out and
+/// all of it when the body is dropped (sent, or its client gone).
+struct Held {
+    frames: VecDeque<Message>,
+    left: u64,
+    memory: Reservation<Envelope>,
+}
+
+impl http_body::Body for Held {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        let frame = self.frames.pop_front();
+        if let Some(data) = frame.as_ref().and_then(Frame::data_ref) {
+            let bytes = data.len();
+            self.left -= bytes as u64;
+            self.memory.release(bytes);
+        }
+        Poll::Ready(frame.map(Ok))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.left)
+    }
 }
 
 #[cfg(test)]
@@ -332,6 +465,7 @@ mod tests {
         let response = stream_blocking(
             Pace::Total(deadline),
             CancellationToken::new(),
+            Envelope::unlimited,
             "text/plain",
             "timeout",
             |writer| {
@@ -365,6 +499,7 @@ mod tests {
         let response = stream_blocking(
             Pace::Total(deadline),
             cancellation,
+            Envelope::unlimited,
             "text/plain",
             "timeout",
             move |writer| {
@@ -426,6 +561,7 @@ mod tests {
         let response = stream_blocking(
             Pace::stalled_after(stall),
             CancellationToken::new(),
+            Envelope::unlimited,
             "text/plain",
             "timeout",
             move |writer| {
@@ -466,6 +602,7 @@ mod tests {
         let response = stream_blocking(
             Pace::stalled_after(stall),
             CancellationToken::new(),
+            Envelope::unlimited,
             "text/plain",
             "timeout",
             move |writer| {
@@ -520,6 +657,7 @@ mod tests {
         let response = stream_blocking(
             Pace::stalled_after(stall),
             CancellationToken::new(),
+            Envelope::unlimited,
             "text/plain",
             "timeout",
             move |writer| {
@@ -570,6 +708,7 @@ mod tests {
         let response = stream_blocking(
             Pace::stalled_after(Duration::from_secs(30)),
             CancellationToken::new(),
+            Envelope::unlimited,
             "text/plain",
             "timeout",
             |_| Ok(()),
@@ -594,5 +733,142 @@ mod tests {
         assert!(start.late(), "the deadline first: late");
         assert!(!start.begin(), "then the producer may not start");
         assert!(!start.started());
+    }
+
+    /// A producer that writes `bytes`, says so, waits until it is cancelled and ends with the
+    /// stop's error, as a query an operator cancels does; it says when it has ended.
+    fn written_then_stopped(
+        bytes: usize,
+        token: CancellationToken,
+        wrote: std::sync::mpsc::Sender<()>,
+        ended: std::sync::mpsc::Sender<()>,
+    ) -> impl FnOnce(&mut ChannelWriter) -> Result<(), ApiError> + Send + 'static {
+        move |writer| {
+            let written = io::Write::write_all(writer, &vec![b'x'; bytes])
+                .and_then(|()| io::Write::flush(writer));
+            let _ = wrote.send(());
+            while written.is_ok() && !token.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let _ = ended.send(());
+            Err(ApiError::timeout("stopped"))
+        }
+    }
+
+    /// Waits, in real time, until `memory` holds at least `bytes`.
+    async fn until_held(memory: &Envelope, bytes: usize) {
+        for _ in 0..60_000 {
+            if memory.used() >= bytes {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("{} bytes held, not {bytes}", memory.used());
+    }
+
+    /// Over HTTP/1.0, a stop after part of the answer was written gets the stop's status, not
+    /// a 200, and what was held goes back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_answer_stopped_before_its_end_gets_the_stops_status_and_releases_its_memory() {
+        let memory = Envelope::new(Some(1 << 30), None);
+        let token = CancellationToken::new();
+        let ((wrote, written), (ended, _)) =
+            (std::sync::mpsc::channel(), std::sync::mpsc::channel());
+        let held = memory.clone();
+        let answer = tokio::spawn(WHOLE.scope(
+            true,
+            stream_blocking(
+                Pace::Total(Instant::now() + Duration::from_secs(120)),
+                token.clone(),
+                move || held,
+                "text/plain",
+                "timeout",
+                written_then_stopped(3 * CHUNK_BYTES, token.clone(), wrote, ended),
+            ),
+        ));
+        tokio::task::spawn_blocking(move || written.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        until_held(&memory, 3 * CHUNK_BYTES).await;
+        token.cancel();
+        let stopped = answer
+            .await
+            .unwrap()
+            .expect_err("a stopped answer is no answer");
+        assert_eq!(
+            stopped.into_response().status(),
+            StatusCode::REQUEST_TIMEOUT
+        );
+        assert_eq!(memory.used(), 0);
+    }
+
+    /// Over HTTP/1.0, a client that leaves while its answer is held (the request's future is
+    /// dropped) stops the producer, and what was held goes back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_answer_whose_client_leaves_stops_its_producer_and_releases_its_memory() {
+        let memory = Envelope::new(Some(1 << 30), None);
+        let token = CancellationToken::new();
+        let ((wrote, written), (ended, on_end)) =
+            (std::sync::mpsc::channel(), std::sync::mpsc::channel());
+        let held = memory.clone();
+        let answer = tokio::spawn(WHOLE.scope(
+            true,
+            stream_blocking(
+                Pace::Total(Instant::now() + Duration::from_secs(120)),
+                token.clone(),
+                move || held,
+                "text/plain",
+                "timeout",
+                written_then_stopped(3 * CHUNK_BYTES, token, wrote, ended),
+            ),
+        ));
+        tokio::task::spawn_blocking(move || written.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        until_held(&memory, 3 * CHUNK_BYTES).await;
+        answer.abort();
+        assert!(answer.await.unwrap_err().is_cancelled());
+        assert_eq!(memory.used(), 0);
+        let ended = tokio::task::spawn_blocking(move || {
+            on_end.recv_timeout(std::time::Duration::from_secs(120))
+        })
+        .await
+        .unwrap();
+        assert!(
+            ended.is_ok(),
+            "the producer still runs for a client that left"
+        );
+    }
+
+    /// Over HTTP/1.0, a stall bound's first deadline bounds the whole read: a producer still
+    /// going past it gets 408, though it wrote before it (streamed, that would have started a
+    /// 200 the stall bound then keeps going).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_reads_first_deadline_bounds_all_of_it() {
+        let memory = Envelope::new(Some(1 << 30), None);
+        let token = CancellationToken::new();
+        let ((wrote, _), (ended, _)) = (std::sync::mpsc::channel(), std::sync::mpsc::channel());
+        let held = memory.clone();
+        let stopped = WHOLE
+            .scope(
+                true,
+                stream_blocking(
+                    Pace::stalled_after(Duration::from_millis(300)),
+                    token.clone(),
+                    move || held,
+                    "text/plain",
+                    "timeout",
+                    written_then_stopped(CHUNK_BYTES, token, wrote, ended),
+                ),
+            )
+            .await
+            .expect_err("past its deadline, no answer");
+        assert_eq!(
+            stopped.into_response().status(),
+            StatusCode::REQUEST_TIMEOUT
+        );
+        assert_eq!(memory.used(), 0);
     }
 }
