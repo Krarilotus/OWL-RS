@@ -383,6 +383,7 @@ async fn hold(
     timeout_message: &'static str,
 ) -> Result<Holding, ApiError> {
     let bound = memory.limit();
+    let envelope = memory.clone();
     let mut held = Holding {
         frames: VecDeque::new(),
         left: 0,
@@ -406,7 +407,17 @@ async fn hold(
             }
         }
     }
-    outcome.take()?;
+    if let Err(stopped) = outcome.take() {
+        // The producer's own work (a query's) draws on the same envelope: refused while the
+        // hold held part of the answer, it was refused for holding it, as a refusal of the
+        // hold's own charge would be.
+        let beside = held.memory.bytes() > 0 && envelope.refused();
+        return Err(match stopped {
+            ApiError::PayloadTooLarge(_) if beside => too_large_for_http10(bound),
+            ApiError::ServiceUnavailable(detail) if beside => ApiError::busy(detail),
+            stopped => stopped,
+        });
+    }
     Ok(held)
 }
 
@@ -422,6 +433,11 @@ fn too_large(refused: BudgetExceeded, bound: usize) -> ApiError {
     if refused.shared {
         return ApiError::busy(shared());
     }
+    too_large_for_http10(bound)
+}
+
+/// The 413 of an answer held whole past `bound`, its envelope's limit.
+fn too_large_for_http10(bound: usize) -> ApiError {
     ApiError::payload_too_large(format!(
         "This answer is larger than the {} an HTTP/1.0 request can be answered with: HTTP/1.0 \
          has no way to mark a streamed answer as cut, so the server sends it only whole. Ask \
