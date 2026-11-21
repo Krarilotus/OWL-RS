@@ -264,3 +264,30 @@ fn the_same_axioms_without_a_clash_stay_consistent() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// Spec (module docs, §2.2): `owl:Thing` is the whole domain and `owl:Nothing` empty, so
+/// `owl:Nothing` under `owl:Thing`, a class equivalent to `owl:Thing`, and an empty class
+/// under `owl:Nothing` have a model with `:x` in it. Under `owl2-ql` and `owl2-rl` the commit
+/// is applied and, loaded, the store is consistent, not in quarantine, and `:x a :C` is read
+/// `true`. (A guard against the empty-`owl:Thing` check firing on its near misses: it is red
+/// only when that check is wrong, e.g. with its two terms swapped.)
+#[test]
+fn owl_thing_and_owl_nothing_in_their_own_places_stay_consistent() {
+    let data = "owl:Nothing rdfs:subClassOf owl:Thing . :A owl:equivalentClass owl:Thing . \
+                :B rdfs:subClassOf owl:Nothing . :C a owl:Class . :x a :A , :C .";
+    let mut wrong = Vec::new();
+    for mode in [ReasoningMode::Owl2Ql, ReasoningMode::Owl2Rl] {
+        let store = store(QlRewritingMode::Auto);
+        let committed = commit(&pipeline(&store, mode), data);
+        if committed != "applied" {
+            wrong.push(format!("{mode:?}, committed: {committed}"));
+        }
+        for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
+            let found = loaded(mode, ql, data, ":x a :C");
+            if !found.starts_with("consistent, quarantined false, read true, ") {
+                wrong.push(format!("{mode:?}, loaded, {ql:?}: {found}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
