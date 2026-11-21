@@ -8,22 +8,35 @@
 #                                 fleet_host where it ran), 75
 #                                 when no host started it within START_S (again after a host
 #                                 stopped it), it ran past MAX_S, was cancelled or blocked, or the
-#                                 fleet stopped answering; the job is cancelled then
-#   fleet_results                 the directory its results were fetched to
-#   fleet_cancel                  cancels it (also on an interrupt)
+#                                 fleet stayed silent too long; the job is cancelled then
+#   fleet_results                 the directory its results were fetched to (nothing: none came)
+#   fleet_cancel                  cancels it, once (also on an interrupt)
+#
+# Silence is a call with no answer: no reply, an error, a timeout or no state. It is unknown, not an
+# end: the job is neither judged nor cancelled for it, and a pending job's start window doesn't run
+# meanwhile. A spell of it ends the wait only once it has lasted NRESE_FLEET_SILENT_S seconds
+# (default 600) or MAX_S has passed; then the job is cancelled. A job never is submitted again.
 #   q TEXT                        TEXT as a TOML string
 fleet_bin=${NRESE_FLEET_BIN:-$(git config --get nrese.fleetBin || echo ${HOME:+"$HOME"/Documents/fleet-scheduler/state/owlrs/bin/fleet.exe})}
 fleet_id=""
 fleet_state=""
 # The fleet's name for the host the job last ran on (fleet_follow).
 fleet_host=""
+# fleet_follow's end (MAX_S) in SECONDS, which also bounds fleet_results; the job last cancelled.
+fleet_end_by=0
+fleet_cancelled=""
 fleet_label=${fleet_label:-fleet job}
 
 python() {
   if type -P python > /dev/null; then command python "$@"; else command python3 "$@"; fi
 }
 fleet_say() { echo "$fleet_label${fleet_id:+ $fleet_id}: $*" >&2; }
-fleet_cancel() { [ -z "$fleet_id" ] || timeout --kill-after=10 60 "$fleet_bin" cancel "$fleet_id" > /dev/null 2>&1; }
+fleet_cancel() {
+  [ -z "$fleet_id" ] || [ "$fleet_id" = "$fleet_cancelled" ] || {
+    timeout --kill-after=10 60 "$fleet_bin" cancel "$fleet_id" > /dev/null 2>&1
+    fleet_cancelled=$fleet_id
+  }
+}
 trap 'fleet_say interrupted; fleet_cancel; exit 130' INT TERM
 
 # A TOML basic string: backslashes and quotes escaped, and the line breaks and tabs a pasted
@@ -55,32 +68,51 @@ fleet_submit() {
 
 fleet_follow() {
   local start_s=$1 max_s=$2 poll_s=${NRESE_FLEET_POLL_S:-10}
-  local start_by=$((SECONDS + start_s)) end_by=$((SECONDS + max_s)) last="" silent=0 now
+  local start_by=$((SECONDS + start_s)) last="" quiet="" asked now
+  fleet_end_by=$((SECONDS + max_s))
   while :; do
+    asked=$SECONDS
     now=$(timeout --kill-after=10 30 "$fleet_bin" status "$fleet_id" --json 2> /dev/null | python -c '
 import json, sys
 j = json.load(sys.stdin)
-print(j["state"], j.get("host") or "-", j.get("reason") or "")' 2> /dev/null | tr -d '\r')
-    fleet_state=${now%% *}
-    case $now in *" - "* | "") ;; *) fleet_host=$(printf '%s' "$now" | awk '{ print $2 }') ;; esac
+if j.get("state"):
+    print(j["state"], j.get("host") or "-", j.get("reason") or "")' 2> /dev/null | tr -d '\r')
     if [ -z "$now" ]; then
-      silent=$((silent + 1))
-      [ $silent -lt 6 ] || { fleet_say "the fleet doesn't answer"; fleet_cancel; return 75; }
+      quiet=${quiet:-$asked}
+      fleet_silent "$quiet" || { fleet_cancel; return 75; }
     else
-      silent=0
+      [ -z "$quiet" ] || start_by=$((start_by + SECONDS - quiet))
+      quiet=""
+      fleet_state=${now%% *}
+      case $now in *" - "*) ;; *) fleet_host=$(printf '%s' "$now" | awk '{ print $2 }') ;; esac
       [ "$now" = "$last" ] || fleet_say "$now"
       last=$now
+      case $fleet_state in
+        running) start_by=$((SECONDS + start_s)) ;;
+        pending | staging)
+          [ $SECONDS -lt $start_by ] || { fleet_say "no host started it within $start_s s"; fleet_cancel; return 75; } ;;
+        done | failed) return 0 ;;
+        cancelled | blocked) fleet_say "it was $fleet_state"; fleet_id=""; return 75 ;;
+      esac
     fi
-    case $fleet_state in
-      running) start_by=$((SECONDS + start_s)) ;;
-      pending | staging)
-        [ $SECONDS -lt $start_by ] || { fleet_say "no host started it within $start_s s"; fleet_cancel; return 75; } ;;
-      done | failed) return 0 ;;
-      cancelled | blocked) fleet_say "it was $fleet_state"; fleet_id=""; return 75 ;;
-    esac
-    [ $SECONDS -lt $end_by ] || { fleet_say "past $max_s s"; fleet_cancel; return 75; }
+    [ $SECONDS -lt $fleet_end_by ] || { fleet_say "past $max_s s"; fleet_cancel; return 75; }
     sleep "$poll_s"
   done
 }
 
-fleet_results() { timeout --kill-after=10 300 "$fleet_bin" results "$fleet_id" 2> /dev/null | tr -d '\r' | tail -1; }
+# fleet_silent SINCE: whether a silence since SINCE (in SECONDS) may go on.
+fleet_silent() {
+  [ $((SECONDS - $1)) -lt "${NRESE_FLEET_SILENT_S:-600}" ] && [ $SECONDS -lt $fleet_end_by ] && return
+  fleet_say "the fleet didn't answer for $((SECONDS - $1)) s"
+  return 1
+}
+
+fleet_results() {
+  local quiet=$SECONDS dir
+  until dir=$(timeout --kill-after=10 300 "$fleet_bin" results "$fleet_id" 2> /dev/null) && dir=${dir//$'\r'/} &&
+    [ -n "${dir##*$'\n'}" ]; do
+    fleet_silent "$quiet" || return 75
+    sleep "${NRESE_FLEET_POLL_S:-10}"
+  done
+  echo "${dir##*$'\n'}"
+}
