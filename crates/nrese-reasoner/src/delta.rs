@@ -1439,6 +1439,7 @@ fn update_body<B: Base + ?Sized>(
 }
 
 /// Probe the before state only when there is a candidate witness to report.
+/// An insert adding consistency instances can be refused if the old-witness index exceeds the memory budget.
 fn old_witness_filter<'a, S: Source>(
     program: &'a GroundProgram,
     before: impl Fn() -> S + 'a,
