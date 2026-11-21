@@ -1,7 +1,8 @@
 //! Built-in rulesets (reasoner-v2 design §3.3), as data in the [`parse_rules`] syntax.
 //!
 //! `OWL2_RL` is the W3C OWL 2 RL/RDF rule tables (OWL 2 Profiles, 2nd ed., §4.3), with
-//! the W3C rule names. Rules over RDF lists (`prp-spo2`, `prp-key`, `cls-int1/2`, `cls-uni`,
+//! the W3C rule names and one extra check for an empty `owl:Thing`.
+//! Rules over RDF lists (`prp-spo2`, `prp-key`, `cls-int1/2`, `cls-uni`,
 //! `cls-oo`, `scm-int`, `scm-uni`, `cax-adc`, `eq-diff2/3`, `prp-adp`) aren't in the
 //! text: they're instantiated per list axiom by [`super::lists`]. Left out, as in owlrl's
 //! default mode and the reasoning benchmark's normalisation: `eq-ref` (`x sameAs x` for
@@ -20,7 +21,7 @@
 //! | `rdfs-full` | every RDFS entailment rule (RDF 1.1 Semantics §9.2) and the finite RDF and RDFS axiomatic triples |
 //! | `rdfs-plus` | `rdfs` with equality, inverse, symmetric, transitive, functional and inverse functional properties, equivalent classes and properties |
 //! | `owl-horst` | `rdfs-plus` with `hasValue`, `someValuesFrom` and `allValuesFrom` (ter Horst's pD*) |
-//! | `owl2-ql` | what OWL 2 QL axioms entail without inventing individuals: hierarchies, domains, ranges, inverses, reflexive properties, `someValuesFrom owl:Thing`, and the disjointness checks |
+//! | `owl2-ql` | what OWL 2 QL axioms entail without inventing individuals: hierarchies, domains, ranges, inverses, reflexive properties, `someValuesFrom owl:Thing`, and checks for disjointness, complements and an empty `owl:Thing` |
 //! | `owl2-rl` | the OWL 2 RL/RDF rules |
 //!
 //! Every ruleset is validated by the tests: it parses, every rule is safe, and the
@@ -438,7 +439,9 @@ pub const OWL2_QL: &[&str] = &[
     "prp-asyp",
     "prp-irp",
     "prp-pdw",
+    "cls-com",
     "cls-nothing2",
+    "cls-thing-empty",
     "cls-svf2",
     "cax-sco",
     "cax-eqc1",
@@ -459,7 +462,7 @@ pub const OWL2_QL: &[&str] = &[
     "scm-rng2",
 ];
 
-/// OWL 2 RL/RDF, tables 4-7 and 9 (list rules in `lists`).
+/// OWL 2 RL/RDF, tables 4-7 and 9 (list rules in `lists`), with the empty `owl:Thing` check.
 pub const OWL2_RL: &str = r#"
 # Table 4: equality
 eq-sym:   (?x owl:sameAs ?y) -> (?y owl:sameAs ?x)
@@ -494,6 +497,8 @@ prp-npa2: (?x owl:sourceIndividual ?i), (?x owl:assertionProperty ?p),
 
 # Table 6: classes
 cls-nothing2: (?x rdf:type owl:Nothing) -> false
+# Beyond the table: owl:Thing covers the nonempty universe (OWL 2 RDF-Based Semantics, Table 5.2).
+cls-thing-empty: (owl:Thing rdfs:subClassOf owl:Nothing) -> false
 cls-com:  (?c1 owl:complementOf ?c2), (?x rdf:type ?c1), (?x rdf:type ?c2) -> false
 cls-svf1: (?x owl:someValuesFrom ?y), (?x owl:onProperty ?p), (?u ?p ?v), (?v rdf:type ?y)
           -> (?u rdf:type ?x)
@@ -567,6 +572,49 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// OWL 2 Direct Semantics §2.2, OWL 2 RDF-Based Semantics Table 5.2 and RDF 1.1
+    /// Semantics §5: `owl:Thing` is nonempty. Completing a subclass chain that puts it
+    /// inside `owl:Nothing` makes the ontology inconsistent under both profiles.
+    #[test]
+    fn a_subclass_delta_making_owl_thing_empty_is_inconsistent() {
+        use crate::delta::{MemoryBase, Rules, update};
+        use crate::eval::Schema;
+        use crate::ir::parse_triple;
+        use crate::vocabulary::LocalVocabulary;
+
+        let mut vocabulary = LocalVocabulary::default();
+        let schema = Schema::owl(&mut vocabulary);
+        let [thing, subclass, nothing] =
+            parse_triple("owl:Thing rdfs:subClassOf owl:Nothing", &mut vocabulary).unwrap();
+        let middle = vocabulary.iri("http://example.com/A");
+        let left = [thing, subclass, middle];
+        let right = [middle, subclass, nothing];
+        let base = MemoryBase::new(&[left, right], &[]);
+        let same_as = vocabulary.iri("http://www.w3.org/2002/07/owl#sameAs");
+        let consistent = [Ruleset::Owl2Ql, Ruleset::Owl2Rl].map(|ruleset| {
+            let rules = ruleset.rules(&mut vocabulary).unwrap();
+            update(
+                &base,
+                &[right],
+                &[],
+                Rules {
+                    rules: &rules,
+                    lists: None,
+                    schema: &schema,
+                    equality: crate::equality_rules::of(&rules, same_as),
+                },
+                None,
+            )
+            .violations
+            .consistent()
+        });
+        assert_eq!(
+            consistent,
+            [false, false],
+            "completing the subclass chain must make the ontology inconsistent"
+        );
     }
 
     /// A ruleset's fingerprint is FNV-1a (64-bit) over the semantics version, its name, its
