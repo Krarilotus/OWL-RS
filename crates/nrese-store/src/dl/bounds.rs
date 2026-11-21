@@ -260,11 +260,11 @@ impl Kinds {
     /// leaves out (`nrese_owl::diagnostics::reserved_name`), as subject or IRI object, and
     /// its predicate is `rdf:type` with a known class, `owl:sameAs`, or a property known
     /// only as the kind its object needs (a literal a data property, an IRI an object
-    /// property). A deleted literal needs a declared data property: one that is data only
-    /// by its literals may lose the last one, and its other axioms then read it as an
-    /// object property. A statement that names a list's cell ([`Self::cell`]), an annotation
-    /// too, is read, and so is one about the ontology's node ([`header`]) but a known
-    /// annotation property's.
+    /// property). A deleted value needs a property declared its kind ([`may_retype`]): one
+    /// that is data only by its literals may lose the last one, and its other axioms then
+    /// read it as an object property, and the other way round. A statement that names a
+    /// list's cell ([`Self::cell`]), an annotation too, is read, and so is one about the
+    /// ontology's node ([`header`]) but a known annotation property's.
     fn keep(&self, tx: &impl PendingView, triple @ [s, p, o]: Triple, deleted: bool) -> bool {
         let k = &self.signature;
         if self.cell(tx, s) || self.cell(tx, o) {
@@ -286,10 +286,11 @@ impl Kinds {
         } else if !iri {
             k.data.contains(&p)
                 && !k.objects.contains(&p)
-                && (!deleted || k.declared_data.contains(&p))
+                && (!deleted || !may_retype(tx, triple))
                 && (deleted || rl_literal(tx, o))
         } else {
             let property = k.objects.contains(&p) && !k.data.contains(&p);
+            let property = property && (!deleted || !may_retype(tx, triple));
             !k.names.contains(&o) && (Some(p) == self.same_as || property)
         }
     }
@@ -409,15 +410,16 @@ fn assertions_only(upper: &Upper, tx: &impl PendingView) -> bool {
 }
 
 /// The delta's carry-over as far as the transaction tells it, which reads the engine and the
-/// dictionary: `tx`'s changed triples, inserted and deleted, where none names a reserved name
-/// or SHACL property ([`reserved_named`]) or says something about the ontology's node
-/// ([`header`]), no deleted literal may retype its property ([`may_retype`]), and none is a
-/// reified triple ([`changes_reified`]); `None` otherwise.
+/// dictionary: `tx`'s changed triples, inserted and deleted, where none has OWL's, RDF's or
+/// RDFS's vocabulary as predicate but `rdf:type` and `owl:sameAs` ([`vocabulary_predicate`]),
+/// names a reserved name or SHACL property ([`reserved_named`]) or says something about the
+/// ontology's node ([`header`]), no deleted value may retype its property ([`may_retype`]),
+/// and none is a reified triple ([`changes_reified`]); `None` otherwise.
 fn probed_assertions(tx: &impl PendingView) -> Option<Vec<Triple>> {
     let triples: Vec<Triple> = tx.inserted().chain(tx.deleted()).map(quad_triple).collect();
     let probed = triples
         .iter()
-        .all(|&t| !reserved_named(tx, t) && !header(tx, t[0]))
+        .all(|&t| !vocabulary_predicate(tx, t[1]) && !reserved_named(tx, t) && !header(tx, t[0]))
         && !tx.deleted().any(|q| may_retype(tx, quad_triple(q)))
         && !changes_reified(tx);
     probed.then_some(triples)
@@ -439,10 +441,11 @@ fn upper_keeps(upper: &Upper, triples: &[Triple]) -> bool {
 /// reader left out changes. Any such node counts, whatever its type: one the reader doesn't
 /// take for a reification only costs a read.
 ///
-/// The base's nodes: an edit of a node's role statements uses OWL's vocabulary, which both
-/// carry-overs refuse beside this ([`Kinds::keep`] by [`changes_schema`],
-/// [`Upper::is_assertion`]), so where this answer counts, the roles are the base's. Its cost:
-/// one probe of the base's indexes per changed triple, and two per node it finds; none of the
+/// The base's nodes: an edit of a node's role statements uses OWL's vocabulary as predicate,
+/// which both carry-overs refuse beside this ([`changes_schema`], [`vocabulary_predicate`]),
+/// so where this answer counts, the roles are the base's. Its cost: one probe of the base's
+/// indexes per changed triple, and two per node it finds, at most [`REIFIED_CANDIDATES`] of
+/// them; more is told as a reified triple, so the carry-over reads again; none of the
 /// pending changes.
 fn changes_reified(tx: &impl PendingView) -> bool {
     let base = tx.base();
@@ -457,11 +460,15 @@ fn changes_reified(tx: &impl PendingView) -> bool {
     ) else {
         return false;
     };
+    // One past the bound: more than it are told by their count alone.
     let nodes = |s: u64| -> Vec<TermId> {
         let mut pattern = nrese_engine::QuadPattern::all();
         (pattern.predicate, pattern.object) = (Some(source), Some(TermId::from_raw(s)));
         let found = base.quads_for_pattern_in(ReadModel::Asserted, &pattern);
-        found.map(|q| q.subject).collect()
+        found
+            .map(|q| q.subject)
+            .take(REIFIED_CANDIDATES + 1)
+            .collect()
     };
     let holds = |node: TermId, role: TermId, term: u64| {
         let mut pattern = nrese_engine::QuadPattern::all();
@@ -472,11 +479,18 @@ fn changes_reified(tx: &impl PendingView) -> bool {
     };
     let mut changed = tx.inserted().chain(tx.deleted()).map(quad_triple);
     changed.any(|[s, p, o]| {
-        nodes(s)
-            .into_iter()
-            .any(|node| holds(node, property, p) && holds(node, target, o))
+        let nodes = nodes(s);
+        nodes.len() > REIFIED_CANDIDATES
+            || nodes
+                .iter()
+                .any(|&node| holds(node, property, p) && holds(node, target, o))
     })
 }
+
+/// How many nodes naming one subject as their `owl:annotatedSource` [`changes_reified`] checks
+/// per changed triple of it: so many annotated statements of one subject are rare, and past
+/// them a commit reads the ontology, as any other it can't carry over, once.
+const REIFIED_CANDIDATES: usize = 32;
 
 impl Bounds {
     /// Whether what the reader left out at `tx`'s base, as the base's commit recorded it, is
@@ -767,26 +781,55 @@ fn named(tx: &impl PendingView, t: u64, reserved: bool) -> bool {
     }
 }
 
-/// Whether deleting a statement may change its property's kind for the reader: a literal
-/// value of a property not declared a data property, which is one only while it has one
-/// (`nrese_owl::profile::Signature::declared_data`, as `Kinds::keep` reads it).
+/// Whether deleting a statement may change its property's kind for the reader, which types
+/// an undeclared property by its uses, every statement of it counted (`nrese_owl::mapping`,
+/// `is_data_property`): a data property while it has a literal value and no other, an
+/// object property otherwise. So a literal value of a property not declared a data property
+/// may be its last, and a value that is no literal, of a property not declared an object
+/// property, may be its last other one where the property has a literal value too (one the
+/// reader reads as no assertion, about the ontology's node for one: [`Kinds::keep`] and
+/// [`Upper::is_assertion`] refuse a property asserted with both). That literal is looked
+/// for among at most [`RETYPE_VALUES`] of its values in the base; past them, it may. Declared
+/// in the base: deleting a declaration is OWL's vocabulary, which both carry-overs refuse;
+/// and inserting a literal value of an object property is no assertion either refuses.
+/// `rdf:type` and `owl:sameAs` type no property.
 pub(crate) fn may_retype(tx: &impl PendingView, [_, p, o]: Triple) -> bool {
     let id = |iri: &str| tx.lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into());
-    let mut pattern = nrese_engine::QuadPattern::all();
-    (pattern.subject, pattern.predicate, pattern.object) = (
-        Some(TermId::from_raw(p)),
-        id("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
-        id("http://www.w3.org/2002/07/owl#DatatypeProperty"),
-    );
-    let declared = || {
-        let found = || {
-            tx.base()
-                .quads_for_pattern_in(ReadModel::Asserted, &pattern)
-        };
-        pattern.predicate.is_some() && pattern.object.is_some() && found().next().is_some()
+    let (rdf_type, same_as) = (id(RDF_TYPE), id(OWL_SAME_AS));
+    let property = Some(TermId::from_raw(p));
+    if property == rdf_type || property == same_as {
+        return false;
+    }
+    let literal = TermId::from_raw(o).kind().is_literal();
+    let kind = if literal {
+        "http://www.w3.org/2002/07/owl#DatatypeProperty"
+    } else {
+        "http://www.w3.org/2002/07/owl#ObjectProperty"
     };
-    TermId::from_raw(o).kind().is_literal() && !declared()
+    let base = tx.base();
+    let mut pattern = nrese_engine::QuadPattern::all();
+    (pattern.subject, pattern.predicate, pattern.object) = (property, rdf_type, id(kind));
+    let declared = pattern.predicate.is_some()
+        && pattern.object.is_some()
+        && (base.quads_for_pattern_in(ReadModel::Asserted, &pattern))
+            .next()
+            .is_some();
+    if declared || literal {
+        return !declared;
+    }
+    let mut pattern = nrese_engine::QuadPattern::all();
+    pattern.predicate = property;
+    let values: Vec<bool> = (base.quads_for_pattern_in(ReadModel::Asserted, &pattern))
+        .map(|q| q.object.kind().is_literal())
+        .take(RETYPE_VALUES + 1)
+        .collect();
+    values.len() > RETYPE_VALUES || values.contains(&true)
 }
+
+/// How many of an undeclared property's values [`may_retype`] looks through for a literal
+/// one, per deleted value: past them a commit reads the ontology, as any other it can't
+/// carry over.
+const RETYPE_VALUES: usize = 32;
 
 /// Whether a changed statement may change the ontology's schema (and so U1's rules),
 /// judged without U1's signature: a blank node, OWL's, RDF's or RDFS's vocabulary as
@@ -797,23 +840,37 @@ pub(crate) fn changes_schema(tx: &impl PendingView, [s, p, o]: Triple) -> bool {
     if kind(s) == TermKind::BlankNode || kind(o) == TermKind::BlankNode {
         return true;
     }
-    let reserved = |t: u64| match tx.decode(TermId::from_raw(t)) {
-        Some(nrese_rdf::Term::NamedNode(n)) => {
-            let iri = n.as_str();
-            iri.starts_with("http://www.w3.org/1999/02/22-rdf-syntax-ns#")
-                || iri.starts_with("http://www.w3.org/2000/01/rdf-schema#")
-                || iri.starts_with("http://www.w3.org/2002/07/owl#")
-        }
-        _ => false,
-    };
-    let text = |t: u64| match tx.decode(TermId::from_raw(t)) {
-        Some(nrese_rdf::Term::NamedNode(n)) => n.into_string(),
-        _ => String::new(),
-    };
-    match text(p).as_str() {
-        "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" => reserved(o),
-        "http://www.w3.org/2002/07/owl#sameAs" => false,
-        _ => reserved(p),
+    match iri(tx, p).as_deref() {
+        Some(RDF_TYPE) => iri(tx, o).is_some_and(|o| vocabulary(&o)),
+        _ => vocabulary_predicate(tx, p),
+    }
+}
+
+/// Whether `p` is OWL's, RDF's or RDFS's vocabulary as a predicate, but `rdf:type` and
+/// `owl:sameAs`: a statement of it is no assertion about individuals (the role statements
+/// of a reification among them), whatever the reader made of its terms elsewhere.
+fn vocabulary_predicate(tx: &impl PendingView, p: u64) -> bool {
+    match iri(tx, p).as_deref() {
+        Some(RDF_TYPE | OWL_SAME_AS) | None => false,
+        Some(p) => vocabulary(p),
+    }
+}
+
+const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+const OWL_SAME_AS: &str = "http://www.w3.org/2002/07/owl#sameAs";
+
+/// Whether `iri` is in OWL's, RDF's or RDFS's namespace.
+fn vocabulary(iri: &str) -> bool {
+    iri.starts_with("http://www.w3.org/1999/02/22-rdf-syntax-ns#")
+        || iri.starts_with("http://www.w3.org/2000/01/rdf-schema#")
+        || iri.starts_with("http://www.w3.org/2002/07/owl#")
+}
+
+/// The IRI the term `t` is, where it is one.
+fn iri(tx: &impl PendingView, t: u64) -> Option<String> {
+    match tx.decode(TermId::from_raw(t)) {
+        Some(nrese_rdf::Term::NamedNode(n)) => Some(n.into_string()),
+        _ => None,
     }
 }
 
