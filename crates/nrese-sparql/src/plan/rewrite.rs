@@ -145,8 +145,8 @@ impl Plan {
     ///   quotient stays unbound. When every argument in the group errors, the count is zero
     ///   and the quotient yields `"0"^^xsd:integer`.
     ///
-    /// Not with `DISTINCT` for the others, not over expressions that read variables shared
-    /// with `A` (which could be unbound in `B` and bound by the join), not over expressions
+    /// Not with `DISTINCT` for the others, not over expressions that read a variable `B`
+    /// shares with `A` but may leave unbound (the join could bind it), not over expressions
     /// with `EXISTS` or values drawn per row (`RAND`, `BNODE`: the partial rows would draw
     /// fewer), and only where `A` and `B` share a variable (with none, an empty `B` would
     /// still leave one partial row). Other aggregates (`SAMPLE`, `GROUP_CONCAT`) leave the
@@ -253,16 +253,33 @@ fn pre_aggregated(
     }
     let a_vars: Vec<Variable> = with_keys.iter().flat_map(|p| p.variables()).collect();
     let b_vars: Vec<Variable> = without.iter().flat_map(|p| p.variables()).collect();
-    // The aggregates read only B's own variables, never variables of A (a variable shared
-    // with A could be unbound in B and receive a binding from the join after pre-aggregation).
+    // The aggregates read only B's variables, and of those B shares with A only ones B binds
+    // in every solution: one B leaves unbound may get A's value from the join, after the
+    // early group read it unbound.
     let mut reads_a = false;
+    let mut reads_shared = Vec::new();
     for (_, aggregate) in aggregates {
         if let AggregateExpression::FunctionCall { expr, .. } = aggregate {
-            expr.on_used_variable(&mut |v| reads_a |= !b_vars.contains(v) || a_vars.contains(v));
+            expr.on_used_variable(&mut |v| {
+                reads_a |= !b_vars.contains(v);
+                if a_vars.contains(v) {
+                    reads_shared.push(v.clone());
+                }
+            });
         }
     }
     if reads_a {
         return None;
+    }
+    if !reads_shared.is_empty() {
+        // What a join binds in every solution is what any of its inputs does.
+        let bound: Vec<Variable> = without
+            .iter()
+            .flat_map(|p| crate::native::certain(&p.lower()))
+            .collect();
+        if reads_shared.iter().any(|v| !bound.contains(v)) {
+            return None;
+        }
     }
     let mut shared: Vec<Variable> = Vec::new();
     for v in &b_vars {

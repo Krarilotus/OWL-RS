@@ -47,7 +47,7 @@ pub(crate) use preparation::prepare_ql_query;
 use preparation::{ql_rewriting, semantic_pattern};
 use reads::{Buffer, List, Reads};
 mod pushdown;
-pub(crate) use pushdown::per_solution;
+pub(crate) use pushdown::{certain, per_solution};
 #[cfg(test)]
 mod budget_tests;
 #[cfg(test)]
