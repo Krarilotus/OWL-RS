@@ -6738,8 +6738,8 @@ impl<'a> Context<'a> {
     }
 
     /// Every aggregate of every group in one pass over the rows, where each is `COUNT(*)`,
-    /// `COUNT` of a variable, or `SUM` or `AVG` of an expression of one variable whose
-    /// values are numbers (none DISTINCT): each id's number is found once, and the rows
+    /// `COUNT` of a variable or of an expression of one variable, or `SUM` or `AVG` of such
+    /// an expression whose values are numbers (none DISTINCT): each id's number is found once, and the rows
     /// are read in order instead of per group. `None` otherwise (and where a value isn't a
     /// number: the general path decides, durations included). BSBM BI q4: 154 M rows of
     /// `AVG(xsd:float(xsd:string(?price)))` at 80 ns a row per group, now a pass.
@@ -6764,7 +6764,26 @@ impl<'a> Context<'a> {
                 expr: &'e Expression,
                 average: bool,
             },
+            /// `COUNT` of an expression: its values that aren't errors, from the numbers a
+            /// `SUM` or `AVG` of the same expression finds (eager AVG's partial pair).
+            Counted {
+                column: usize,
+                expr: &'e Expression,
+            },
         }
+        // The one column `expr` reads, if it reads one.
+        let one_column = |expr: &Expression| {
+            let mut columns: Vec<usize> = expression_variables(expr)
+                .iter()
+                .filter_map(|v| solutions.column(v))
+                .collect();
+            columns.sort_unstable();
+            columns.dedup();
+            match columns[..] {
+                [column] => Some(column),
+                _ => None,
+            }
+        };
         let mut plans = Vec::with_capacity(aggregates.len());
         let mut totals = 0;
         for (_, aggregate) in aggregates {
@@ -6779,17 +6798,19 @@ impl<'a> Context<'a> {
                     None => return Ok(None),
                 },
                 AggregateExpression::FunctionCall {
+                    name: AggregateFunction::Count,
+                    expr,
+                    distinct: false,
+                } if !pushdown::per_solution(expr) => match one_column(expr) {
+                    Some(column) => Plan::Counted { column, expr },
+                    None => return Ok(None),
+                },
+                AggregateExpression::FunctionCall {
                     name: name @ (AggregateFunction::Sum | AggregateFunction::Avg),
                     expr,
                     distinct: false,
                 } if !pushdown::per_solution(expr) => {
-                    let mut columns: Vec<usize> = expression_variables(expr)
-                        .iter()
-                        .filter_map(|v| solutions.column(v))
-                        .collect();
-                    columns.sort_unstable();
-                    columns.dedup();
-                    let [column] = columns[..] else {
+                    let Some(column) = one_column(expr) else {
                         return Ok(None);
                     };
                     totals += 1;
@@ -6831,7 +6852,7 @@ impl<'a> Context<'a> {
         // Every id's number, found once per query: the chunks of a cross product
         // ([`Self::group_crossed`]) share their values.
         for plan in &plans {
-            let Plan::Total { column, expr, .. } = plan else {
+            let (Plan::Total { column, expr, .. } | Plan::Counted { column, expr }) = plan else {
                 continue;
             };
             // The expression and the variable it reads here: with another one bound, the
@@ -6963,6 +6984,15 @@ impl<'a> Context<'a> {
                                     Some(Number::Other) | None => return None,
                                 }
                             }
+                            // A term that is no number still counts.
+                            Plan::Counted { column, .. } => {
+                                let id = table.get(row, *column);
+                                match known(a, id) {
+                                    Some(Number::Value(_) | Number::Other) => state.count += 1,
+                                    Some(Number::Error) => {}
+                                    None => return None,
+                                }
+                            }
                         }
                     }
                 }
@@ -6990,7 +7020,7 @@ impl<'a> Context<'a> {
         let layers: Vec<Vec<&nrese_exec::IdMap<Number>>> = plans
             .iter()
             .map(|plan| match plan {
-                Plan::Total { expr, column, .. } => {
+                Plan::Total { expr, column, .. } | Plan::Counted { expr, column } => {
                     let key = ((*expr).clone(), solutions.vars[*column].clone());
                     remembered(&numbers, &since, &key).collect()
                 }
@@ -7022,7 +7052,9 @@ impl<'a> Context<'a> {
                         .map(|(a, plan)| {
                             let state = states[group * width + a];
                             match plan {
-                                Plan::Rows | Plan::Bound(_) => integer_agg(state.count as i64),
+                                Plan::Rows | Plan::Bound(_) | Plan::Counted { .. } => {
+                                    integer_agg(state.count as i64)
+                                }
                                 Plan::Total { average, .. } => {
                                     finish_total(state.total, state.error, state.count, *average)
                                 }
