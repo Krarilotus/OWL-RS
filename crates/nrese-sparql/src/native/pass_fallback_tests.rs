@@ -605,31 +605,37 @@ fn a_restore_lets_go_of_an_alias_refused_since_the_point() {
 }
 
 /// Spec: an expression's numbers past the memo's limit ([`NUMBER_MEMO_ENTRIES`]) are let go
-/// with their charge when a pass's point is kept, inside an outer point (a streamed GROUP
-/// BY's direct attempt) as outside one: a pass holds no more numbers within an attempt than
-/// without it. The pass is the one a point holds: one number more than the limit, charged as
-/// [`Context::numeric_pass`] charges them.
+/// with their charge when a pass's point is kept, inside outer points (a streamed GROUP BY's
+/// direct attempt, and a GROUP BY's attempt within it) as outside them, counting what every
+/// point holds for the expression: a pass holds no more numbers within attempts than
+/// without them. The outer attempt holds half the limit from an earlier pass; the pass
+/// finds one number more than the other half, charged as [`Context::numeric_pass`] charges
+/// them.
 #[test]
 fn a_point_kept_inside_another_lets_go_of_numbers_past_the_limit() {
     let snapshot = snapshot();
     let options = options(None);
     let ctx = Context::new(&snapshot, &options, None, None);
     let v = Variable::new_unchecked("v");
-    let before = counters(&ctx);
-    let outer = ctx.save();
-    let pass = ctx.save();
-    {
+    let remember = |layer: usize, ids: std::ops::Range<usize>| {
         let mut since = ctx.since.borrow_mut();
-        let layer = since.last_mut().expect("open");
-        let count = NUMBER_MEMO_ENTRIES + 1;
-        assert!(layer.held.charge(count * number_bytes()).is_ok());
+        let layer = &mut since[layer];
+        assert!(layer.held.charge(ids.len() * number_bytes()).is_ok());
         layer
             .numbers
-            .entry((Expression::Variable(v.clone()), v))
+            .entry((Expression::Variable(v.clone()), v.clone()))
             .or_default()
-            .extend((0..count as u64).map(|id| (id, Number::Error)));
-    }
+            .extend(ids.map(|id| (id as u64, Number::Error)));
+    };
+    let outer = ctx.save();
+    let half = NUMBER_MEMO_ENTRIES / 2;
+    remember(0, 0..half);
+    let before = counters(&ctx);
+    let inner = ctx.save();
+    let pass = ctx.save();
+    remember(2, half..NUMBER_MEMO_ENTRIES + 1);
     ctx.keep(pass);
+    ctx.keep(inner);
     assert_eq!(
         counters(&ctx),
         before,
