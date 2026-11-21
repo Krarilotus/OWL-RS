@@ -87,12 +87,12 @@ fi
 cd "$wt" || infra "no worktree"
 # A cargo-nextest where cargo runs one first, before any on PATH, would stand in for the pinned one
 # whatever its version says: no verdict, before anything is installed. Cargo's home here: the host's
-# (a relative one from this worktree, as cargo resolves it), or the gate's own below, made where the
-# host has no rustup.
-for cargo_home in "${CARGO_HOME:-$HOME/.cargo}" "$cache/cargo"; do
-  [ ! -e "$cargo_home/bin/cargo-nextest" ] \
-    || infra "a cargo-nextest in $cargo_home/bin would run in place of the pinned one: no verdict"
-done
+# where it has rustup (a relative one from this worktree, as cargo resolves it), else the gate's own,
+# made below.
+cargo_home=$cache/cargo
+command -v rustup > /dev/null && cargo_home=${CARGO_HOME:-$HOME/.cargo}
+[ ! -e "$cargo_home/bin/cargo-nextest" ] \
+  || infra "a cargo-nextest in $cargo_home/bin would run in place of the pinned one: no verdict"
 
 # Rust links through the system's C compiler: a host without one can't run a gate, and that is
 # the host's failure, not the tree's (the development machine's WSL VM, 20 Oct 2026: every build script failed).

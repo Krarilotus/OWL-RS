@@ -51,9 +51,9 @@ gate_nextest_runs() {
 }
 
 # PART VERSION SHA256 EXE-SHA256 PLATFORM: nexte.st's PLATFORM build of cargo-nextest VERSION, unpacked
-# at PART, taken only if its archive's sha256 is SHA256 (another archive is never unpacked) and its
-# runner answers as VERSION. curl's deadline bounds it. tar reads the archive on its standard input:
-# GNU tar takes `C:` in an archive's name for a host.
+# at PART, taken only if its archive's sha256 is SHA256 (another archive is never unpacked), its
+# executable's is EXE-SHA256 (checked before it runs) and it answers as VERSION. curl's deadline bounds
+# it. tar reads the archive on its standard input: GNU tar takes `C:` in an archive's name for a host.
 gate_nextest_unpack() {
   local got url=$5
   [ "$5" != windows ] || url=windows-tar
@@ -62,5 +62,7 @@ gate_nextest_unpack() {
   got=$(sha256sum -b < "$1/nextest.tar.gz" | cut -c1-64)
   [ "$got" = "$3" ] || { echo "cargo-nextest $2's archive has sha256 $got, not the pinned $3: not installed" >&2; return 1; }
   tar -xzf - -C "$1" < "$1/nextest.tar.gz" && rm -f -- "$1/nextest.tar.gz" || return 1
+  gate_nextest_has "$@" > /dev/null \
+    || { echo "cargo-nextest $2's archive holds no executable of the pinned sha256 $4: not installed" >&2; return 1; }
   gate_nextest_runs "$1" "$2" "$5" || { echo "cargo-nextest $2 from its pinned archive doesn't answer: not installed" >&2; return 1; }
 }
