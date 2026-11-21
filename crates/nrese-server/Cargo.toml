@@ -69,6 +69,9 @@ nrese-store = { path = "../nrese-store", features = ["fault-points"] }
 nrese-exec = { path = "../nrese-exec", features = ["measure"] }
 # The export's checksum computed independently (tests/it/admin_backup_api_tests.rs).
 sha2 = { workspace = true }
+# Exercise the router over h2c and inspect the peer's stream reset.
+axum = { version = "0.8.8", features = ["http2"] }
+h2 = "0.4"
 tower = { version = "0.5.2", features = ["util"] }
 # A paused clock that tests advance themselves: deadlines decided without real time.
 tokio = { version = "1.48.0", features = ["test-util"] }
