@@ -2436,24 +2436,44 @@ fn long_intersection(n: usize) -> String {
 /// Spec: reasoning-semantics.md, what may be complete, "Operators": where answers may be
 /// missing, `EXISTS` makes them `unsound`. Under `owl2-rl` with the QL rewriting on, a list
 /// axiom past the rules' cap is left out of the closure, so answers may be missing, and a
-/// `FILTER NOT EXISTS` read is `unsound` in its status, its QL report, its plan and, where it
-/// prints, the printed query's status (the status this store gives the same answers). With
+/// `FILTER NOT EXISTS` read is `unsound` in its status, its QL report, its plan and the printed
+/// query's status (the status this store gives the same answers). The printer writes the
+/// chain's reads and the intersection's unrelated one, and finds the others `NotExpressible`
+/// (as a run on the line found; any other outcome fails here, so the status can't go
+/// unchecked). With
 /// the blocker the list's rule entails, the one row kept is one the certain answers drop. The
 /// rule is the query's, so the read with an unrelated blocker is `unsound` too.
 #[test]
 fn a_negation_over_a_list_left_out_is_unsound() {
     use nrese_sparql::ql::{PrintForm, Printed};
-    let (mut wrong, mut printed_any) = (Vec::new(), false);
-    for (data, subject, blocker) in [
-        (long_key(128), "x", format!("?x <{EX}name> \"Y\"")),
-        (declared_chain(), "a0", format!("?x <{EX}chain> <{EX}a251>")),
-        (long_intersection(257), "x", format!("?x a <{EX}C>")),
+    let mut wrong = Vec::new();
+    // Whether each read prints: with the blocker, with the unrelated one.
+    for (data, subject, blocker, prints) in [
+        (
+            long_key(128),
+            "x",
+            format!("?x <{EX}name> \"Y\""),
+            [false, false],
+        ),
+        (
+            declared_chain(),
+            "a0",
+            format!("?x <{EX}chain> <{EX}a251>"),
+            [true, true],
+        ),
+        (
+            long_intersection(257),
+            "x",
+            format!("?x a <{EX}C>"),
+            [false, true],
+        ),
     ] {
         let pipeline = ql_pipeline(in_memory_store_config());
         let ticket = MutationTicket::new();
         (pipeline.apply(insert(&data), &nrese_store::Requester::all(), &ticket)).expect("data");
         let store = pipeline.store();
-        for blocked_by in [blocker, format!("?x <{EX}unrelated> <{EX}unused>")] {
+        let unrelated = format!("?x <{EX}unrelated> <{EX}unused>");
+        for (blocked_by, prints) in [blocker, unrelated].into_iter().zip(prints) {
             let text = format!(
                 "SELECT ?x {{ VALUES ?x {{ <{EX}{subject}> }} FILTER NOT EXISTS {{ {blocked_by} }} }}"
             );
@@ -2475,22 +2495,20 @@ fn a_negation_over_a_list_left_out_is_unsound() {
                 .map(|row| row["x"]["value"].as_str().expect("an IRI").to_owned())
                 .collect();
             let printed = match store.print_query(&text, PrintForm::Paths) {
-                Ok(Printed::Query { completeness, .. }) => Some(completeness.as_str()),
-                _ => None,
+                Ok(Printed::Query { completeness, .. }) => completeness.as_str().to_owned(),
+                Ok(Printed::NotExpressible(_)) => "not expressible".to_owned(),
+                Err(error) => format!("error: {error}"),
             };
-            printed_any |= printed.is_some();
-            let printed_wrong = printed.is_some_and(|label| label != "unsound");
-            if labels != [Some("unsound"); 4] || printed_wrong || rows != [format!("{EX}{subject}")]
+            let expected = if prints { "unsound" } else { "not expressible" };
+            if labels != [Some("unsound"); 4]
+                || printed != expected
+                || rows != [format!("{EX}{subject}")]
             {
                 wrong.push((blocked_by, labels, printed, rows));
             }
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
-    assert!(
-        printed_any,
-        "setup: no read printed, so the printed status went unchecked"
-    );
 }
 
 /// [`long_chain`] of 251 links, past the rules' cap, with the chain and every link declared an
