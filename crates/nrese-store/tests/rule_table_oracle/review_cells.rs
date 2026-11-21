@@ -329,7 +329,7 @@ fn later_writes_agree_with_a_cold_per_cell_key() {
             ["ex:a", "owl:sameAs", "ex:b"],
             vec![setup, insert(edge), remove],
         ),
-        false,
+        true,
     );
 }
 
@@ -354,7 +354,7 @@ fn later_writes_agree_with_a_cold_per_cell_intersection() {
             ["ex:a", "rdf:type", "ex:C"],
             vec![setup, insert(membership), remove],
         ),
-        false,
+        true,
     );
 }
 
