@@ -1503,6 +1503,13 @@ struct Solutions {
     ordered: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Alias {
+    id: u64,
+    /// Registration order for a computed ID. Stored aliases use zero.
+    registered: usize,
+}
+
 impl Solutions {
     fn column(&self, variable: &Variable) -> Option<usize> {
         self.vars.iter().position(|v| v == variable)
@@ -1516,7 +1523,8 @@ struct Context<'a> {
     /// Which statements the query reads (asserted, inferred or both).
     model: ReadModel,
     /// Alias IRIs that stand for blank nodes put into a pattern ([`substitute`]).
-    aliases: RefCell<HashMap<String, u64>>,
+    aliases: RefCell<HashMap<String, Alias>>,
+    alias_mark: Cell<usize>,
     /// An alias reservation refused; checked before any answer is delivered.
     aliases_refused: Cell<Option<nrese_exec::BudgetExceeded>>,
     /// A room question ([`Self::max_rows`]) found the process's limit unread: a join its
@@ -1541,6 +1549,9 @@ struct Context<'a> {
     numbers: RefCell<HashMap<(Expression, Variable), nrese_exec::IdMap<Number>>>,
     /// The numbers remembered since each open save point, innermost last ([`Self::save`]).
     since: RefCell<Vec<Remembered>>,
+    /// Table charges detached from reservations while an attempt can be retried.
+    /// Tables abandoned on an error drop before a restore releases their charge.
+    table_charges: Cell<Option<usize>>,
     cancellation: Option<CancellationToken>,
     budget: Arc<Budget>,
     /// What the context keeps to the query's end, charged to `budget`: its computed terms
@@ -1808,6 +1819,7 @@ impl<'a> Context<'a> {
             model: options.read_model,
             evaluator: Evaluator::with_base(base.cloned()),
             aliases: RefCell::default(),
+            alias_mark: Cell::default(),
             aliases_refused: Cell::new(None),
             room_unread: Cell::new(false),
             computed: RefCell::default(),
@@ -1822,6 +1834,7 @@ impl<'a> Context<'a> {
             decodes: AtomicU64::new(0),
             numbers: RefCell::default(),
             since: RefCell::default(),
+            table_charges: Cell::default(),
             cancellation: options.resources.cancellation.clone(),
             kept: RefCell::new(Reservation::new(Arc::clone(&budget))),
             budget,
@@ -1880,7 +1893,7 @@ impl<'a> Context<'a> {
                 .aliases
                 .borrow()
                 .get(n.as_str())
-                .map(|&id| TermId::from_raw(id));
+                .map(|alias| TermId::from_raw(alias.id));
         }
         self.snapshot.lookup(term)
     }
@@ -1888,7 +1901,13 @@ impl<'a> Context<'a> {
     /// Retains one typed alias, reserved before either map keeps it. Refusal is sticky,
     /// like a refused read during preparation, and every delivery checks it.
     fn register_alias(&self, alias: &str, id: u64) {
-        if self.aliases_refused.get().is_some() || self.aliases.borrow().get(alias) == Some(&id) {
+        if self.aliases_refused.get().is_some()
+            || self
+                .aliases
+                .borrow()
+                .get(alias)
+                .is_some_and(|entry| entry.id == id)
+        {
             return;
         }
         if let Some(term) = self.term(id) {
@@ -1896,7 +1915,14 @@ impl<'a> Context<'a> {
                 self.aliases_refused.set(Some(refused));
                 return;
             }
-            self.aliases.borrow_mut().insert(alias.to_owned(), id);
+            let mut registered = 0;
+            if computed_index(id).is_some() {
+                registered = self.alias_mark.get() + 1;
+                self.alias_mark.set(registered);
+            }
+            self.aliases
+                .borrow_mut()
+                .insert(alias.to_owned(), Alias { id, registered });
             self.evaluator.register_alias(alias, term);
         }
     }
@@ -1960,6 +1986,7 @@ impl<'a> Context<'a> {
             self.budget
                 .charge(bytes)
                 .map_err(QueryEvaluationError::MemoryLimit)?;
+            self.returned_table_charge(bytes);
         }
         Ok(solutions)
     }
@@ -2047,8 +2074,27 @@ impl<'a> Context<'a> {
         let bytes = solutions.table.memory_bytes();
         drop(solutions);
         if bytes > 0 {
+            self.take_table_charge(bytes);
             self.budget.release(bytes);
         }
+    }
+
+    /// The charge of a returned table is released by its consumer, or by a restore
+    /// if evaluation abandoned the table before it reached a consumer.
+    fn returned_table_charge(&self, bytes: usize) {
+        if let Some(held) = self.table_charges.get() {
+            self.table_charges.set(Some(held + bytes));
+        }
+    }
+
+    fn take_table_charge(&self, bytes: usize) {
+        if let Some(held) = self.table_charges.get() {
+            self.table_charges.set(Some(held - bytes));
+        }
+    }
+
+    fn transfer_table_charge(&self, held: Reservation<impl std::ops::Deref<Target = Budget>>) {
+        self.returned_table_charge(held.transfer());
     }
 
     /// A table that `reshape` makes of charged ones, which it takes (filtering in place,
@@ -2062,7 +2108,9 @@ impl<'a> Context<'a> {
         growth: usize,
         reshape: impl FnOnce(T) -> Solutions,
     ) -> NativeResult<Solutions> {
-        let mut held = Reservation::adopt(&*self.budget, from.charged());
+        let bytes = from.charged();
+        self.take_table_charge(bytes);
+        let mut held = Reservation::adopt(&*self.budget, bytes);
         if let Err(error) = held.charge(growth) {
             drop(from);
             return Err(QueryEvaluationError::MemoryLimit(error).into());
@@ -2072,7 +2120,7 @@ impl<'a> Context<'a> {
         self.check()?;
         held.resize(solutions.table.memory_bytes())
             .map_err(QueryEvaluationError::MemoryLimit)?;
-        held.transfer();
+        self.transfer_table_charge(held);
         Ok(solutions)
     }
 
@@ -2091,7 +2139,7 @@ impl<'a> Context<'a> {
         self.check()?;
         held.resize(solutions.table.memory_bytes())
             .map_err(QueryEvaluationError::MemoryLimit)?;
-        held.transfer();
+        self.transfer_table_charge(held);
         Ok(solutions)
     }
 
@@ -2152,22 +2200,25 @@ impl<'a> Context<'a> {
     /// attempt that may be undone. It covers the terms made new to the query ([`Self::id`]),
     /// the numbers remembered ([`Self::numeric_pass`]) and both their charges. Closed by
     /// [`Self::keep`] (what the attempt added stays) or [`Self::restore`], which is total:
-    /// every term made since is let go with its id, its aliases ([`Self::register_alias`]) and
-    /// their charges, every number remembered since with its charge, and an alias refused
-    /// since is forgotten, so the context holds and is charged exactly what it was at the
-    /// point. Nothing else that outlives the attempt may hold an id made since (its tables
-    /// and results are dropped before the restore). Points nest: one closes before any
-    /// opened before it (checked), and a point kept inside another hands its numbers to that
-    /// one. Not covered, as they hold stored terms only: the decode cache, which gives way of
-    /// itself, the aliases of stored terms and the distinct counts, under their own charges.
+    /// terms, computed alias registrations, remembered numbers and their charges go.
+    /// A refused alias is forgotten, and the decode cache gives up any speculative growth.
+    /// Tables and results must drop before restoring, since their IDs may be reused.
+    /// Restore refunds only detached charges for the tables made since the point.
+    /// Points close innermost first. A kept point hands its numbers to its parent.
+    /// Stored aliases and the planner's distinct counts keep their own charges.
     fn save(&self) -> SavePoint {
         let mut since = self.since.borrow_mut();
         since.push(Remembered {
             numbers: HashMap::new(),
             held: Reservation::new(Arc::clone(&self.budget)),
         });
+        let tables = self.table_charges.get();
+        self.table_charges.set(Some(tables.unwrap_or(0)));
         SavePoint {
             terms: self.computed.borrow().len(),
+            aliases: self.alias_mark.get(),
+            decoded: self.decoded.borrow().mark(),
+            tables,
             depth: since.len(),
             aliases_refused: self.aliases_refused.get().is_some(),
         }
@@ -2176,6 +2227,9 @@ impl<'a> Context<'a> {
     /// Closes `point`, keeping what was added since ([`Self::save`]): its numbers go to the
     /// point it was opened in, or to the query's memo ([`Self::keep_numbers`]).
     fn keep(&self, point: SavePoint) {
+        if point.tables.is_none() {
+            self.table_charges.set(None);
+        }
         let mut since = self.since.borrow_mut();
         debug_assert_eq!(
             since.len(),
@@ -2183,6 +2237,9 @@ impl<'a> Context<'a> {
             "save points close innermost first"
         );
         let Some(added) = since.pop() else { return };
+        if added.numbers.is_empty() {
+            return;
+        }
         let Some((outer, earlier)) = since.split_last_mut() else {
             drop(since);
             self.keep_numbers(added);
@@ -2215,41 +2272,44 @@ impl<'a> Context<'a> {
         // The numbers, then their charge.
         since.truncate(point.depth - 1);
         drop(since);
+        let abandoned = self
+            .table_charges
+            .replace(point.tables)
+            .expect("open point");
+        let abandoned = abandoned - point.tables.unwrap_or(0);
+        if abandoned != 0 {
+            self.budget.release(abandoned);
+        }
+        self.decoded.borrow_mut().discard_since(point.decoded);
         if !point.aliases_refused {
             self.aliases_refused.set(None);
         }
         let mut computed = self.computed.borrow_mut();
-        if computed.len() == point.terms {
-            return;
-        }
-        // An alias names its term by id: the aliases of the terms let go go first, before
-        // their ids are made again.
         let mut bytes = 0usize;
-        let mut forgotten = Vec::new();
-        let mut aliases = self.aliases.borrow_mut();
-        aliases.retain(|alias, &mut id| {
-            let Some(index) = computed_index(id).filter(|&index| index as usize >= point.terms)
-            else {
-                return true;
-            };
-            if let Some(term) = computed.get(index as usize) {
-                bytes = bytes.saturating_add(alias_bytes(alias, term));
-            }
-            forgotten.push(alias.clone());
-            false
-        });
-        if !forgotten.is_empty() {
+        if self.alias_mark.replace(point.aliases) != point.aliases {
+            let mut aliases = self.aliases.borrow_mut();
+            let mut forgotten = Vec::new();
+            aliases.retain(|alias, entry| {
+                if entry.registered <= point.aliases {
+                    return true;
+                }
+                let index = computed_index(entry.id).expect("registered computed alias");
+                bytes = bytes.saturating_add(alias_bytes(alias, &computed[index as usize]));
+                forgotten.push(alias.clone());
+                false
+            });
             aliases.shrink_to_fit();
             self.evaluator.forget_aliases(&forgotten);
         }
-        let mut ids = self.computed_ids.borrow_mut();
-        for term in computed.drain(point.terms..) {
-            bytes = bytes.saturating_add(computed_bytes(&term));
-            ids.remove(&term);
+        if computed.len() != point.terms {
+            let mut ids = self.computed_ids.borrow_mut();
+            for term in computed.drain(point.terms..) {
+                bytes = bytes.saturating_add(computed_bytes(&term));
+                ids.remove(&term);
+            }
+            computed.shrink_to_fit();
+            ids.shrink_to_fit();
         }
-        // What stays allocated is what is still charged ([`computed_bytes`], [`alias_bytes`]).
-        computed.shrink_to_fit();
-        ids.shrink_to_fit();
         self.kept.borrow_mut().release(bytes);
     }
 
@@ -3028,6 +3088,7 @@ impl<'a> Context<'a> {
             bytes,
             "a path table's charge is its bytes"
         );
+        self.returned_table_charge(bytes);
         Ok(Solutions {
             vars,
             table,
@@ -3113,6 +3174,7 @@ impl<'a> Context<'a> {
                 let bytes = IdTable::new(0).bytes_for_rows(rows);
                 if bytes > 0 {
                     self.budget.charge(bytes).map_err(refused)?;
+                    self.returned_table_charge(bytes);
                 }
                 Solutions {
                     vars: Vec::new(),
@@ -5018,7 +5080,7 @@ impl<'a> Context<'a> {
         self.check()?;
         held.resize(solutions.table.memory_bytes())
             .map_err(QueryEvaluationError::MemoryLimit)?;
-        held.transfer();
+        self.transfer_table_charge(held);
         Ok(solutions)
     }
 
@@ -5309,7 +5371,7 @@ impl<'a> Context<'a> {
         let ordered = result.ordered;
         // The rows probed from freed, then the result keeps the charge it grew under.
         self.consumed(result);
-        held.transfer();
+        self.transfer_table_charge(held);
         let out = if ordered {
             out
         } else {
@@ -5585,7 +5647,7 @@ impl<'a> Context<'a> {
         out_held
             .resize(solutions.table.memory_bytes())
             .map_err(memory)?;
-        out_held.transfer();
+        self.transfer_table_charge(out_held);
         Ok(Some(match projection {
             Some(variables) => self.project(solutions, variables)?,
             None => solutions,
@@ -6142,24 +6204,12 @@ impl<'a> Context<'a> {
         }
         // A streamed retry starts from what the query held before the direct attempt.
         let point = streamable.is_some().then(|| self.save());
-        let before = self.budget.used();
-        let kept = self.kept.borrow().bytes();
         match (
             self.group_direct(inner, variables, aggregates, having),
             point,
         ) {
             (Err(error), Some(point)) if stream::is_memory_limit(&error) => {
-                // What the context keeps of the attempt (its terms and numbers: the point),
-                // then the tables the attempt charged and no holder keeps any more: its
-                // charges past those of the context's other holders.
                 self.restore(point);
-                let grown = self.kept.borrow().bytes().saturating_sub(kept);
-                self.budget.release(
-                    self.budget
-                        .used()
-                        .saturating_sub(before)
-                        .saturating_sub(grown),
-                );
                 let plan = streamable.as_ref().expect("checked");
                 self.group_streamed(plan, variables, aggregates)
             }
@@ -6758,12 +6808,23 @@ impl<'a> Context<'a> {
             let mut missing: nrese_exec::IdMap<usize> = nrese_exec::IdMap::default();
             {
                 let (numbers, since) = (self.numbers.borrow(), self.since.borrow());
-                let known = remembered(&numbers, &since, &key);
+                let mut known = remembered(&numbers, &since, &key);
+                let first = known.next();
+                let rest = known
+                    .next()
+                    .map(|second| std::iter::once(second).chain(known));
                 for (row, &id) in table.column(*column).iter().enumerate() {
-                    if !known.iter().any(|known| known.contains_key(&id)) {
+                    if !first.is_some_and(|known| known.contains_key(&id))
+                        && !rest
+                            .as_ref()
+                            .is_some_and(|known| known.clone().any(|map| map.contains_key(&id)))
+                    {
                         missing.entry(id).or_insert(row);
                     }
                 }
+            }
+            if missing.is_empty() {
+                continue;
             }
             let missing: Vec<(u64, usize)> = missing.into_iter().collect();
             // Each number found is remembered: charged before (`number_bytes`), however many
@@ -6830,16 +6891,33 @@ impl<'a> Context<'a> {
                 .extend(new);
         }
         let (numbers, since) = (self.numbers.borrow(), self.since.borrow());
-        let known: Vec<Vec<&nrese_exec::IdMap<Number>>> = plans
+        let mut lookup_charge = Reservation::new(&*self.budget);
+        let known: Vec<Option<Cow<'_, nrese_exec::IdMap<Number>>>> = plans
             .iter()
             .map(|plan| match plan {
                 Plan::Total { expr, column, .. } => {
                     let key = ((*expr).clone(), solutions.vars[*column].clone());
-                    remembered(&numbers, &since, &key)
+                    let mut maps = remembered(&numbers, &since, &key);
+                    let Some(first) = maps.next() else {
+                        return Ok(None);
+                    };
+                    let Some(second) = maps.next() else {
+                        return Ok(Some(Cow::Borrowed(first)));
+                    };
+                    // A mixed chunk prepares one lookup per row, regardless of save depth.
+                    let maps = [first, second].into_iter().chain(maps);
+                    let len: usize = maps.clone().map(|map| map.len()).sum();
+                    lookup_charge.charge(len.saturating_mul(number_bytes()))?;
+                    let mut combined = nrese_exec::IdMap::default();
+                    combined.reserve(len);
+                    for map in maps {
+                        combined.extend(map.iter().map(|(&id, &number)| (id, number)));
+                    }
+                    Ok(Some(Cow::Owned(combined)))
                 }
-                _ => Vec::new(),
+                _ => Ok(None),
             })
-            .collect();
+            .collect::<Result<_, BudgetExceeded>>()?;
         // The states of groups `range`, from every row in order; `None` once a value isn't
         // a number.
         let pass = |range: std::ops::Range<usize>| {
@@ -6867,7 +6945,7 @@ impl<'a> Context<'a> {
                         Plan::Total { column, .. } => {
                             let id = table.get(row, *column);
                             state.count += 1;
-                            match known[a].iter().find_map(|known| known.get(&id)) {
+                            match known[a].as_deref().and_then(|known| known.get(&id)) {
                                 Some(Number::Value(number)) => {
                                     state.total = state.total.and_then(|total| total.add(*number));
                                 }
@@ -7425,7 +7503,7 @@ fn alias_bytes(alias: &str, term: &Term) -> usize {
             }
         }
     }
-    let slots = 2 * std::mem::size_of::<(String, u64)>()
+    let slots = 2 * std::mem::size_of::<(String, Alias)>()
         + std::mem::size_of::<(String, Term)>()
         + 6 * std::mem::size_of::<usize>();
     alias
@@ -7447,11 +7525,10 @@ fn remembered<'m>(
     numbers: &'m HashMap<(Expression, Variable), nrese_exec::IdMap<Number>>,
     since: &'m [Remembered],
     key: &(Expression, Variable),
-) -> Vec<&'m nrese_exec::IdMap<Number>> {
+) -> impl Iterator<Item = &'m nrese_exec::IdMap<Number>> + Clone {
     std::iter::once(numbers.get(key))
-        .chain(since.iter().map(|since| since.numbers.get(key)))
+        .chain(since.iter().map(move |since| since.numbers.get(key)))
         .flatten()
-        .collect()
 }
 
 /// `added` into `into`: an expression's map moved where `into` has none for it.
@@ -7487,11 +7564,13 @@ fn past_limit(
     let_go
 }
 
-/// An open save point ([`Context::save`]): the computed terms the context held, how many
-/// points were open with it, and whether an alias was refused before it.
+/// An open save point ([`Context::save`]) and the query state at its start.
 #[must_use = "a save point is closed by `keep` or `restore`"]
 struct SavePoint {
     terms: usize,
+    aliases: usize,
+    decoded: usize,
+    tables: Option<usize>,
     depth: usize,
     aliases_refused: bool,
 }

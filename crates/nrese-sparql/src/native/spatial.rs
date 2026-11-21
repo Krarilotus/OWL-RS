@@ -1476,6 +1476,7 @@ impl Context<'_> {
                 table: charged_table(std::iter::once(literals)),
                 ordered: false,
             };
+            self.returned_table_charge(seed.table.memory_bytes());
             self.check()?;
             return Ok(Some((seed, at)));
         }
@@ -1773,6 +1774,7 @@ impl Context<'_> {
             });
         }
         let table = charged_table(columns.into_iter());
+        self.returned_table_charge(table.memory_bytes());
         drop(working);
         Ok(Solutions {
             vars,

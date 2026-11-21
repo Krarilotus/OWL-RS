@@ -86,7 +86,11 @@ impl super::Context<'_> {
             None => None,
         };
         let child = self.canonical_child();
-        let solutions = child.eval(pattern)?;
+        let result = child.eval(pattern);
+        if let Some(bytes) = child.table_charges.get() {
+            self.returned_table_charge(bytes);
+        }
+        let solutions = result?;
         let decodes = child.decodes.load(std::sync::atomic::Ordering::Relaxed);
         self.decodes
             .fetch_add(decodes, std::sync::atomic::Ordering::Relaxed);
@@ -113,6 +117,7 @@ impl super::Context<'_> {
             snapshot: std::borrow::Cow::Owned(self.snapshot.with_canonical_equality()),
             model: self.model,
             aliases: RefCell::new(self.aliases.borrow().clone()),
+            alias_mark: Cell::new(self.alias_mark.get()),
             aliases_refused: Cell::new(self.aliases_refused.get()),
             room_unread: Cell::new(false),
             evaluator: super::Evaluator::default(),
@@ -129,6 +134,7 @@ impl super::Context<'_> {
             decodes: std::sync::atomic::AtomicU64::new(0),
             numbers: RefCell::default(),
             since: RefCell::default(),
+            table_charges: Cell::new(self.table_charges.get().map(|_| 0)),
             cancellation: self.cancellation.clone(),
             budget: std::sync::Arc::clone(&self.budget),
             kept: RefCell::new(nrese_exec::Reservation::new(std::sync::Arc::clone(
@@ -199,8 +205,9 @@ impl super::Context<'_> {
         // What it makes, charged before it is made, beside the input's charge. A size past
         // `usize` (a saturated total included) is charged as the most bytes there are, which
         // no budget holding the input grants.
-        let mut held =
-            nrese_exec::Reservation::adopt(&*self.budget, solutions.table.memory_bytes());
+        let input_bytes = solutions.table.memory_bytes();
+        self.take_table_charge(input_bytes);
+        let mut held = nrese_exec::Reservation::adopt(&*self.budget, input_bytes);
         let mut charge = |bytes| {
             held.charge(bytes)
                 .map_err(crate::QueryEvaluationError::MemoryLimit)
@@ -262,7 +269,7 @@ impl super::Context<'_> {
         self.check()?;
         held.resize(out.memory_bytes())
             .map_err(crate::QueryEvaluationError::MemoryLimit)?;
-        held.transfer();
+        self.transfer_table_charge(held);
         Ok(super::Solutions {
             vars,
             table: out,

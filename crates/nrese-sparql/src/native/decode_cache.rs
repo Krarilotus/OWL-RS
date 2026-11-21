@@ -29,6 +29,7 @@ pub(super) struct DecodeCache {
     /// `None` once a charge was refused: nothing is kept any more.
     kept: Option<Kept>,
     entries: usize,
+    insertions: usize,
 }
 
 /// What a cache keeps, and its charge.
@@ -61,6 +62,22 @@ impl DecodeCache {
         Self {
             kept: Some(Kept::new(budget, workers)),
             entries,
+            insertions: 0,
+        }
+    }
+
+    pub(super) fn mark(&self) -> usize {
+        self.insertions
+    }
+
+    /// Drop speculative entries as a unit if any were added. A cache that yielded
+    /// or was disabled during the attempt keeps that decision.
+    pub(super) fn discard_since(&mut self, mark: usize) {
+        if self.insertions != mark
+            && let Some(kept) = &self.kept
+            && !kept.terms.is_empty()
+        {
+            self.kept = Some(Kept::new(&kept.budget, kept.workers));
         }
     }
 
@@ -105,7 +122,7 @@ impl DecodeCache {
         match kept.terms.get_or_insert_with(id, || term.clone()) {
             // Kept already: the text it was charged for is the one kept.
             Ok((_, false)) => kept.text.give_back(text),
-            Ok((_, true)) => {}
+            Ok((_, true)) => self.insertions += 1,
             Err(_) => self.kept = None,
         }
     }
