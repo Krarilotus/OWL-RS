@@ -14,7 +14,8 @@
 //! partial frame would turn a recoverable torn tail into mid-log corruption. A new segment
 //! appears under its name only with its magic synced (written under a temporary name, then
 //! renamed): a rotation that fails before the rename leaves the log as it was; one whose
-//! outcome is unknown after it poisons the log.
+//! outcome is unknown after it poisons the log. So does any exit between a bulk publication's
+//! checkpoint and the install of its version ([`PendingInstall`]).
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
@@ -451,10 +452,42 @@ impl Wal {
 
     /// Takes no more appends, rotations or bulk publications until the engine is reopened:
     /// a revision may be on disk that the live state doesn't hold ([`crate::engine::bulk`]).
+    /// Each is refused with [`EngineError::WalPoisoned`]. A reopen recovers what is on disk
+    /// into memory and opens the log unpoisoned.
     pub(crate) fn poison(&mut self) {
         self.poisoned = true;
     }
+}
 
+/// A durable change whose in-memory state isn't installed yet: armed before the change is
+/// put in place, [`disarm`](Self::disarm)ed once the state that names it is installed (or the
+/// change is proven absent). Dropped armed, by a returned error or a panic unwinding past it,
+/// it poisons the log ([`Wal::poison`]): no later commit is then acknowledged against a
+/// durable state the memory doesn't hold. A panic before the change is in place poisons too:
+/// the fence can't tell, and a reopen settles it.
+///
+/// Its drop takes the log's lock: it is made before any guard of that lock its thread holds,
+/// so an unwinding thread lets that guard go first.
+#[must_use = "dropped, it poisons the log"]
+pub(crate) struct PendingInstall<'a>(&'a parking_lot::Mutex<Wal>);
+
+impl<'a> PendingInstall<'a> {
+    pub(crate) fn arm(wal: &'a parking_lot::Mutex<Wal>) -> Self {
+        Self(wal)
+    }
+
+    pub(crate) fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for PendingInstall<'_> {
+    fn drop(&mut self) {
+        self.0.lock().poison();
+    }
+}
+
+impl Wal {
     /// Called after a checkpoint at `revision`: restarts the byte counter and deletes (or
     /// archives) every segment whose records are all covered by the checkpoint. The active
     /// segment stays.
