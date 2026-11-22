@@ -21,7 +21,9 @@ struct Registered {
     #[serde(flatten)]
     entry: Gap,
     says: String,
-    limits: String,
+    /// Only for a deviation documented as a limit.
+    #[serde(default)]
+    limits: Option<String>,
     witness: String,
 }
 
@@ -88,7 +90,15 @@ pub(super) fn verified_gaps() -> Vec<Gap> {
     for record in &registry.gap {
         let gap = &record.entry;
         assert!(ids.insert(&gap.id), "duplicate gap {}", gap.id);
-        assert!(!record.says.is_empty() && record.limits.starts_with("docs/limits.md#"));
+        assert!(!record.says.is_empty(), "{}: says nothing", gap.id);
+        assert!(
+            record
+                .limits
+                .as_ref()
+                .is_none_or(|anchor| anchor.starts_with("docs/limits.md#")),
+            "{}: limits anchor outside docs/limits.md",
+            gap.id
+        );
         assert!(gap.case.starts_with("row:") || gap.case.starts_with("saved:"));
         let path = Path::new(&record.witness);
         assert_eq!(path.file_name(), Some(path.as_os_str()), "witness filename");

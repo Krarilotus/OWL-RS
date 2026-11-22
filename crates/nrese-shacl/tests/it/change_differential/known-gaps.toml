@@ -32,7 +32,6 @@ witness = "sameas-removal-unchecked.toml"
 [[gap]]
 id = "shapes-change-repeats-shared-result"
 says = "A shapes change keeps every later result absent before, so one new result reached from two targets is reported twice."
-limits = "docs/limits.md#shacl"
 case = "row:shapes-shared-target"
 step = 1
 entry = "C2"
@@ -46,7 +45,6 @@ witness = "shapes-change-repeats-shared-result.toml"
 [[gap]]
 id = "excluded-edit-drops-failure"
 says = "A data change whose statements are all outside the selected graphs skips validation, so it reports none of the later validation's failures."
-limits = "docs/limits.md#shacl"
 case = "row:failure-excluded-edit"
 step = 1
 entry = "C1"

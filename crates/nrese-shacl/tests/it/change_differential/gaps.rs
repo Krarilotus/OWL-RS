@@ -98,6 +98,14 @@ impl<'a> Allowances<'a> {
         })?;
         self.used.insert(&gap.id).then_some(&gap.id)
     }
+
+    /// The entries whose case ran in this run but forgave nothing: their gap is closed.
+    pub(crate) fn unused(&self, gaps: &'a [Gap], ran: &BTreeSet<String>) -> Vec<&'a str> {
+        gaps.iter()
+            .filter(|gap| ran.contains(&gap.case) && !self.used.contains(gap.id.as_str()))
+            .map(|gap| gap.id.as_str())
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -218,6 +226,19 @@ mod tests {
             Allowances::default().forgive(&gaps, &location(), Kind::Failure, &deviation),
             None
         );
+    }
+
+    // Spec: an entry whose row ran without deviating is closed, and the run fails on it;
+    // one whose row didn't run is not judged.
+    #[test]
+    fn a_known_gap_row_that_passes_is_closed() {
+        let gaps = [gap()];
+        let ran = BTreeSet::from(["row:missing".to_owned()]);
+        let mut run = Allowances::default();
+        assert_eq!(run.unused(&gaps, &ran), ["missing-result"]);
+        assert_eq!(run.unused(&gaps, &BTreeSet::new()), Vec::<&str>::new());
+        run.forgive(&gaps, &location(), Kind::Result, &result(missed()));
+        assert_eq!(run.unused(&gaps, &ran), Vec::<&str>::new());
     }
 
     // Spec: an entry is stale once its witness stops deviating.

@@ -95,11 +95,13 @@ pub(super) fn run() {
     let gaps = super::witnesses::verified_gaps();
     let mut allowances: [Allowances<'_>; 3] = Default::default();
     let mut checked = 0;
+    let mut ran = BTreeSet::new();
     for row in rows {
         let case_id = format!("row:{}", row.id);
         if selector.as_ref().is_some_and(|wanted| wanted != &case_id) {
             continue;
         }
+        ran.insert(case_id.clone());
         let mut known = BTreeSet::new();
         for (padding, allowance) in allowances.iter_mut().enumerate() {
             let context = format!("{case_id}, padding {padding}: {}", row.description);
@@ -208,6 +210,13 @@ pub(super) fn run() {
         checked += 1;
     }
     assert!(checked != 0, "no matrix row matches {selector:?}");
+    for (padding, allowance) in allowances.iter().enumerate() {
+        let closed = allowance.unused(&gaps, &ran);
+        assert!(
+            closed.is_empty(),
+            "padding {padding}: the rows of {closed:?} pass: fixed, delete the entries"
+        );
+    }
 }
 
 fn recursion() -> Vec<Row> {
