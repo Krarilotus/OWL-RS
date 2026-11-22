@@ -82,8 +82,6 @@ pub fn draws_on(drawn: u64, cases: u64, covered: bool) -> bool {
 pub const RED_SHAPES: &[&str] = &[
     "redundant",
     "cycle",
-    "schema-insert",
-    "schema-delete",
     "equality-member",
     "long-chain",
     "equality-schema",

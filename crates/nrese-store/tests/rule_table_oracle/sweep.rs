@@ -326,10 +326,7 @@ fn required_red<'a>(case: &Case, differences: &'a [Difference]) -> Option<&'a Di
             ("nil-head" | "nil-cell", Answer::Row(row, true)) => {
                 difference.write == 0 && row == &case.watch
             }
-            ("schema-insert" | "literal-functional", Answer::Row(row, true)) => {
-                delta && difference.write == 1 && row == &case.watch
-            }
-            ("schema-delete", Answer::Row(row, false)) => {
+            ("literal-functional", Answer::Row(row, true)) => {
                 delta && difference.write == 1 && row == &case.watch
             }
             ("equality-member" | "equality-schema", Answer::Accept(false)) => difference.write == 1,
