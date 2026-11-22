@@ -74,7 +74,7 @@ impl<V: ReadView> Validator<'_, V> {
 
         let mut check = (shape, focus);
         let mut frame = self.frame(check, None, false);
-        let mut temporary = None;
+        let mut temporary: Option<TaskResults> = None;
         let mut conformed = None;
         loop {
             let (shape, focus) = check;
