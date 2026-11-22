@@ -1,0 +1,11 @@
+# A change along a cycle can change a result several steps from its target.
+@prefix ex: <http://example.com/> .
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+ex:S6 a sh:NodeShape ; sh:targetClass ex:C1 ; sh:property ex:P6 .
+ex:P6 sh:path ex:p1 ; sh:class ex:C0 ; sh:property ex:P6 .
+ex:S7 a sh:NodeShape ; sh:targetSubjectsOf ex:p0 ; sh:property ex:P7 .
+ex:P7 sh:path ex:p2 ; sh:node ex:S8 .
+ex:S8 a sh:NodeShape ; sh:property [ sh:path ex:p3 ; sh:class ex:C2 ] ; sh:property ex:P7 .
+ex:S9 a sh:NodeShape ; sh:targetNode ex:n0 , ex:n1 ; sh:node ex:S10 .
+ex:S10 a sh:NodeShape ; sh:property [ sh:path ex:p1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ex:p0 ; sh:node ex:S9 ] .

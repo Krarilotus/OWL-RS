@@ -564,17 +564,14 @@ leave something out.
 - A commit that changes the shapes is checked against the shapes as they are after it: one
   update that removes the shapes and adds data is checked against none. It needs the right to
   write the shapes graph.
-- The gate follows a recursive shape (one that refers to itself through `sh:node`, inside
-  `sh:or` too) one step back from the changed statements. A write whose new violation lies two
-  or more such steps from the target node is accepted, and a full validation
-  (`GET /dataset/shacl`) reports it afterwards. Where recursive shapes matter, run one after
-  writes.
+- When a target reaches a recursive shape (one that refers to itself through `sh:node` or
+  `sh:property`, inside `sh:or` too), every data commit under the gate validates the whole
+  store, after the commit and, if that finds results, before it too. The cost grows with the
+  store. With LUBM 10's asserted data (1.27 million statements) and one recursive shape, a commit
+  of one new node took 87 ms and peaked at 12 MB on 4 cores. Without the recursive shape, it
+  took 5 ms and 1.7 MB.
 - Under `reasoner.equality = "compact"`, a write of `owl:sameAs` can pass the gate though it
   brings a result ([reasoning](#reasoning)).
-- A write can be refused for a result that was already there: a result reached through a nested
-  shape (a `sh:property` inside a `sh:property`) counts as introduced when a new focus node
-  reaches it, though another focus node reached it before. Repair that result first
-  (`GET /dataset/shacl` lists it).
 - Shapes that don't compile refuse every write, and a validation stopped by its budget fails
   the write, with the gate set to `report` as to `enforce`.
 
