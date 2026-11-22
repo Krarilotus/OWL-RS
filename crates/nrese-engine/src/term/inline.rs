@@ -121,7 +121,7 @@ fn write_lexical(id: TermId, out: &mut impl fmt::Write) -> Option<()> {
 
 /// The datatype of the inline literal `id`; `None` for non-inline kinds and an unknown
 /// derived datatype's code.
-pub(crate) fn inline_datatype(id: TermId) -> Option<nrese_rdf::NamedNodeRef<'static>> {
+fn inline_datatype(id: TermId) -> Option<nrese_rdf::NamedNodeRef<'static>> {
     Some(match id.kind() {
         TermKind::Integer => xsd::INTEGER,
         TermKind::Boolean => xsd::BOOLEAN,
@@ -209,38 +209,6 @@ fn encode_derived(lexical: &str, code: usize) -> Option<u64> {
 pub(crate) fn decode_derived(payload: u64) -> (i64, usize) {
     let value = ((payload >> DERIVED_CODE_BITS) as i64).wrapping_add(DERIVED_MIN);
     (value, (payload & ((1 << DERIVED_CODE_BITS) - 1)) as usize)
-}
-
-/// A derived integer's value offset on the plain integers' scale, less its own.
-const DERIVED_OFFSET: u64 = DERIVED_MIN.wrapping_sub(INT_MIN) as u64;
-
-/// [`TermId::inline_integer_fields`].
-#[inline]
-pub(crate) fn integer_fields(id: TermId) -> Option<(u64, Option<u8>)> {
-    match id.kind() {
-        TermKind::Integer => Some((id.payload(), None)),
-        TermKind::DerivedInteger => {
-            let code = (id.payload() & ((1 << DERIVED_CODE_BITS) - 1)) as u8;
-            ((code as usize) < DERIVED.len()).then(|| {
-                (
-                    (id.payload() >> DERIVED_CODE_BITS) + DERIVED_OFFSET,
-                    Some(code),
-                )
-            })
-        }
-        _ => None,
-    }
-}
-
-/// [`TermId::from_inline_integer_fields`].
-pub(crate) fn from_integer_fields(offset: u64, code: Option<u8>) -> TermId {
-    match code {
-        None => TermId::new(TermKind::Integer, offset),
-        Some(code) => TermId::new(
-            TermKind::DerivedInteger,
-            (offset - DERIVED_OFFSET) << DERIVED_CODE_BITS | code as u64,
-        ),
-    }
 }
 
 /// The derived-integer ids with a value in `low..=high` (clamped to the inline range).

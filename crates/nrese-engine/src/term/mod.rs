@@ -196,24 +196,6 @@ impl TermId {
         }
     }
 
-    /// The datatype IRI of an inline literal term; `None` for non-inline terms.
-    pub fn inline_datatype_iri(self) -> Option<&'static str> {
-        inline::inline_datatype(self).map(|dt| dt.as_str())
-    }
-
-    /// An inline integer's fields: its value's offset above the smallest inline integer
-    /// (below 2^60; one value has one offset in every datatype), and its derived datatype's
-    /// code (`None`: `xsd:integer`). `None` for other ids.
-    #[inline]
-    pub fn inline_integer_fields(self) -> Option<(u64, Option<u8>)> {
-        inline::integer_fields(self)
-    }
-
-    /// The id whose [`Self::inline_integer_fields`] are these; only for fields it gave.
-    pub fn from_inline_integer_fields(offset: u64, code: Option<u8>) -> Self {
-        inline::from_integer_fields(offset, code)
-    }
-
     /// The ids of inline integer-derived literals ([`TermKind::DerivedInteger`]) with a
     /// value in `low..=high`, as one range (the value leads the payload); values beyond
     /// the inline range are clamped to it.

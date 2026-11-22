@@ -592,7 +592,7 @@ fn inline_order(a: &u64, b: &u64) -> Ordering {
     let (a, b) = (TermId::from_raw(*a), TermId::from_raw(*b));
     a.as_inline_integer()
         .cmp(&b.as_inline_integer())
-        .then_with(|| a.inline_datatype_iri().cmp(&b.inline_datatype_iri()))
+        .then_with(|| value::inline_integer_rank(a).cmp(&value::inline_integer_rank(b)))
 }
 
 /// Every aggregate of every group in one pass over the rows, where each is `COUNT(*)`,
@@ -975,8 +975,8 @@ fn one_datatype(ids: &[u64]) -> bool {
     if first.kind() == TermKind::Integer {
         return bound.all(|id| id.kind() == TermKind::Integer);
     }
-    let datatype = first.inline_datatype_iri();
-    bound.all(|id| id.inline_datatype_iri() == datatype)
+    let datatype = value::inline_integer_rank(first);
+    bound.all(|id| value::inline_integer_rank(id) == datatype)
 }
 
 /// GROUP_CONCAT (SPARQL 1.1 §18.5.1.7): string literals only (anything else makes the

@@ -6,7 +6,8 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::str::FromStr;
 
-use nrese_engine::TermId;
+use nrese_engine::term::PAYLOAD_BITS;
+use nrese_engine::{TermId, TermKind};
 use nrese_rdf::vocab::{rdf, xsd};
 use nrese_rdf::{Literal, Term};
 use nrese_xsd::owl::Datatype;
@@ -546,27 +547,52 @@ pub fn order(a: Option<&Term>, b: Option<&Term>) -> Ordering {
 const DERIVED_RANK: [u8; 12] = [6, 4, 3, 1, 8, 0, 5, 11, 10, 12, 9, 7];
 const INTEGER_RANK: u8 = 2;
 
-/// An order key of `id`: its value's offset (`TermId::inline_integer_fields`) above, its
-/// datatype's rank in the low 4 bits. It takes the ids of inline integers (`xsd:integer`
-/// and the datatypes derived from it, each a canonical lexical form), and the comparison of
-/// two keys is [`order`] of the two terms; [`order_key_id`] gives the id back; no key is 0
-/// or `u64::MAX`. `None` for other ids (dictionary literals, other types), whose order is
-/// [`order`]'s own, and for a derived integer's id with a datatype code no datatype has.
+/// The payload layout the engine's typed-literal encoder writes for inline integers
+/// (`encode_integer` and `encode_derived` in `nrese_engine`'s `term::inline`): an
+/// `xsd:integer`'s payload is its value plus 2^59; a derived integer's holds its value
+/// plus 2^55 above a 4-bit datatype code. `DERIVED_OFFSET` moves the second onto the first.
+const CODE_BITS: u32 = 4;
+const DERIVED_OFFSET: u64 = (1 << (PAYLOAD_BITS - 1)) - (1 << (PAYLOAD_BITS - CODE_BITS - 1));
+
+/// An order key of `id`: its value plus 2^59, above its datatype's rank in the low 4 bits.
+/// It takes the ids of inline integers (`xsd:integer` and the datatypes derived from it,
+/// each a canonical lexical form), and the comparison of two keys is [`order`] of the two
+/// terms; [`order_key_id`] gives the id back; no key is 0 or `u64::MAX`. `None` for other
+/// ids (dictionary literals, other types), whose order is [`order`]'s own, and for a
+/// derived integer's id with a datatype code no datatype has.
 #[inline]
 pub(crate) fn order_key(id: TermId) -> Option<u64> {
-    let (offset, code) = id.inline_integer_fields()?;
-    let rank = code.map_or(INTEGER_RANK, |code| DERIVED_RANK[code as usize]);
+    let payload = id.payload();
+    let (offset, rank) = match id.kind() {
+        TermKind::Integer => (payload, INTEGER_RANK),
+        TermKind::DerivedInteger => (
+            (payload >> CODE_BITS) + DERIVED_OFFSET,
+            *DERIVED_RANK.get((payload & ((1 << CODE_BITS) - 1)) as usize)?,
+        ),
+        _ => return None,
+    };
     Some(offset << 4 | rank as u64)
 }
 
 /// The id of an [`order_key`].
 pub(crate) fn order_key_id(key: u64) -> TermId {
+    let offset = key >> 4;
     let rank = (key & 15) as u8;
-    let code = DERIVED_RANK
-        .iter()
-        .position(|&r| r == rank)
-        .map(|code| code as u8);
-    TermId::from_inline_integer_fields(key >> 4, code)
+    TermId::from_raw(match DERIVED_RANK.iter().position(|&r| r == rank) {
+        None => (TermKind::Integer as u64) << PAYLOAD_BITS | offset,
+        Some(code) => {
+            (TermKind::DerivedInteger as u64) << PAYLOAD_BITS
+                | (offset - DERIVED_OFFSET) << CODE_BITS
+                | code as u64
+        }
+    })
+}
+
+/// The rank of an inline integer's datatype among the 13 datatype IRIs ([`order_key`]'s
+/// low bits); `None` where [`order_key`] is.
+#[inline]
+pub(crate) fn inline_integer_rank(id: TermId) -> Option<u64> {
+    order_key(id).map(|key| key & 15)
 }
 
 /// [`order`] of two literals, given their values.
@@ -1024,10 +1050,12 @@ mod tests {
     /// IRIs, gives the term's id back, and compares with every other key as [`order`] compares
     /// the two terms. That comparison is exhaustive over these terms only; values between them
     /// are covered by the key's form, the same affine map (value + 2^59) for every value of
-    /// one datatype, which keeps order and is undone exactly.
+    /// one datatype, which keeps order and is undone exactly. Each id comes from the engine's
+    /// own encoder (a typed literal's lookup), so the key's reading of the layout is checked
+    /// against what the engine writes.
     #[test]
     fn order_key_is_term_order_on_inline_integers() {
-        use nrese_engine::{Engine, EngineConfig, TermKind};
+        use nrese_engine::{Engine, EngineConfig};
         const BY_IRI: [&str; 13] = [
             "byte",
             "int",
