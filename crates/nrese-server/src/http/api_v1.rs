@@ -8,6 +8,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use nrese_store::jobs::JobFailure;
 use serde::Serialize;
 
 use crate::error::ApiError;
@@ -971,19 +972,24 @@ fn start_import(
         }
         let outcome = loaded
             .map_err(|error| match error {
-                nrese_store::StoreError::LoadQuarantineNotRecorded(error) => {
-                    error.unpublished_message(retry, Some(state.repositories().data_dir()))
-                }
-                error => error.to_string(),
+                nrese_store::StoreError::LoadCancelled => JobFailure::Cancelled,
+                nrese_store::StoreError::LoadQuarantineNotRecorded(error) => JobFailure::Failed(
+                    error.unpublished_message(retry, Some(state.repositories().data_dir())),
+                ),
+                error => JobFailure::Failed(error.to_string()),
             })
             .and_then(|loaded| {
                 job.phase("reasoning");
                 let reasoning = match state.pipeline().reasoner().config().materialised_program() {
-                    Some(program) => Some(store.rematerialise(program).map_err(|e| e.to_string())?),
+                    Some(program) => Some(
+                        store
+                            .rematerialise(program)
+                            .map_err(|error| JobFailure::Failed(error.to_string()))?,
+                    ),
                     None => None,
                 };
                 serde_json::to_value(import_report(&loaded, reasoning.as_ref()))
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| JobFailure::Failed(error.to_string()))
             });
         job.finish(outcome);
     });

@@ -22,6 +22,14 @@ pub enum JobState {
     Cancelled,
 }
 
+/// Why a job did not complete.
+pub enum JobFailure {
+    /// The operation stopped in response to cancellation.
+    Cancelled,
+    /// The operation failed with a message for the client.
+    Failed(String),
+}
+
 /// A job as listed.
 #[derive(Debug, Clone, serde::Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -101,10 +109,9 @@ impl Job {
             .update(self.id, |entry| entry.phase = Some(phase.to_owned()));
     }
 
-    /// Ends the job: done with `report`, or failed with an error (cancelled if it was
-    /// cancelled).
-    pub fn finish(self, outcome: Result<serde_json::Value, String>) {
-        let cancelled = self.progress.is_cancelled();
+    /// Ends the job with the operation's outcome, preserving a genuine failure
+    /// even when a cancel request arrived before this call.
+    pub fn finish(self, outcome: Result<serde_json::Value, JobFailure>) {
         self.jobs.update(self.id, |entry| {
             entry.ended = Some(Instant::now());
             entry.phase = None;
@@ -113,8 +120,8 @@ impl Job {
                     entry.state = JobState::Done;
                     entry.report = Some(report);
                 }
-                Err(_) if cancelled => entry.state = JobState::Cancelled,
-                Err(error) => {
+                Err(JobFailure::Cancelled) => entry.state = JobState::Cancelled,
+                Err(JobFailure::Failed(error)) => {
                     entry.state = JobState::Failed;
                     entry.error = Some(error);
                 }
@@ -256,7 +263,7 @@ mod tests {
         };
         let message = error.unpublished_message("send", None);
         jobs.cancel(id);
-        job.finish(Err(message));
+        job.finish(Err(JobFailure::Failed(message)));
 
         let view = serde_json::to_value(jobs.get(id).unwrap()).unwrap();
         assert_eq!(view["state"], "failed", "GET job body: {view}");
@@ -285,12 +292,12 @@ mod tests {
         assert!(jobs.cancel(job.id()));
         assert!(job.progress().is_cancelled());
         let id = job.id();
-        job.finish(Err("the load was cancelled".to_owned()));
+        job.finish(Err(JobFailure::Cancelled));
         assert_eq!(jobs.get(id).unwrap().state, JobState::Cancelled);
 
         let job = jobs.start("import", "nrese", "c.ttl");
         let id = job.id();
-        job.finish(Err("no such file".to_owned()));
+        job.finish(Err(JobFailure::Failed("no such file".to_owned())));
         let view = jobs.get(id).unwrap();
         assert_eq!(view.state, JobState::Failed);
         assert_eq!(view.error.as_deref(), Some("no such file"));
