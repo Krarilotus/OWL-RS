@@ -27,6 +27,8 @@ import unittest
 
 import isolation  # the suite's git environment policy (inherit())
 
+READS = ("scripts/check.sh",)
+
 ROOT = Path(__file__).resolve().parents[3]
 BASH = shutil.which("bash")
 # A caller's gate, fleet or cargo variables would make the tier behave as its caller's does.
@@ -61,6 +63,10 @@ STUBS = {
     "scripts/lib/test-targets.py": 'import sys\nprint("-p " + sys.argv[2] + " --lib")\n',
     "scripts/lib/fuzz-targets.txt": "alpha:lib:random\nbeta:lib:random\n",
     "benches/suite/tests/isolation.py": 'import os\nopen(os.environ["CALLS"], "a").write("suite\\n")\n',
+    # Contracts the tier selects by what they read (benches/suite/tests/contracts.py, copied in as it
+    # is): one of the gate's scripts, and the crate scan, which a crate's sources reach.
+    "benches/suite/tests/test_gate.py": 'READS = ("scripts/",)\n',
+    "benches/suite/tests/crate_scan.py": 'READS = ("crates/**/src/**/*.rs",)\n',
     "crates/alpha/Cargo.toml": '[package]\nname = "alpha"\n',
     "crates/beta/Cargo.toml": '[package]\nname = "beta"\n',
     "apps/nrese-console/package.json": "{}\n",
@@ -161,6 +167,7 @@ class PushTierMonotone(unittest.TestCase):
         for rel, text in STUBS.items():
             (cls.repo / rel).parent.mkdir(parents=True, exist_ok=True)
             (cls.repo / rel).write_text(text, newline="\n")
+        shutil.copy(ROOT / "benches/suite/tests/contracts.py", cls.repo / "benches/suite/tests/contracts.py")
         (cls.repo / "scripts/cargo-guarded.sh").chmod(0o755)  # check.sh runs it, as the tree's is
         for args in (["add", "-A"], ["commit", "-q", "-m", "base"],
                      ["update-ref", "refs/remotes/origin/refactor/engine-v2", "HEAD"]):
@@ -192,9 +199,11 @@ class PushTierMonotone(unittest.TestCase):
 
     def test_one_crates_file_runs_its_checks_and_its_dependents_fast_tests(self):
         # Worked by hand from the push tier's description (scripts/check.sh's header): alpha changed,
-        # beta depends on it. The fixture's reading of a run, checked once.
+        # beta depends on it; a crate's sources reach the crate scan (its own step). The fixture's
+        # reading of a run, checked once.
         _, stdout, calls, out = self.runs[frozenset({"crates/alpha/src/lib.rs"})]
-        steps = {"fmt", "clippy", "W3C data", "test", "seeds", "locks", "features", "crates alone"}
+        steps = {"fmt", "clippy", "W3C data", "test", "seeds", "locks", "features", "crates alone",
+                 "crate scan"}
         expected = {("step", s) for s in steps} | {("clippy", "alpha"), ("test", "alpha", "full"),
                                                    ("test", "alpha", "fast"), ("test", "beta", "fast"),
                                                    ("seeds", "alpha"), ("alone", "alpha"), ("alone", "beta")}

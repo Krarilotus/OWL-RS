@@ -16,9 +16,9 @@
 # test in its full form, in push's worktree, target and lock on the host (one build for both; a push
 # gate there waits for it), of push's fleet kind, placed by the fleet as push's is. Sized by measurement
 # (below). Never a merge gate: it lands nothing.
-# MODE windows (LIST empty): a job of kind owlrs.any on any Windows host with what the tier uses
-# there (below, `has`, in the fleet config's names), which runs the commit's own
-# scripts/lib/windows-job.ps1 and through it its scripts/check.sh windows.
+# MODE windows (LIST: the suite contracts it runs, none listed for all): a job of kind owlrs.any on
+# any Windows host with what the tier uses there (below, `has`, in the fleet config's names), which
+# runs the commit's own scripts/lib/windows-job.ps1 and through it its scripts/check.sh windows.
 # NRESE_GATE_HOSTS: only these hosts. It follows the job and reads its result: valid only when it
 # is for TREE, LIST_HASH, this tier and IDENTITY (the toolchain and the flags,
 # scripts/lib/gate-key.sh) and left no tracked file changed; for windows also only when the suite
@@ -128,7 +128,7 @@ if [ "$mode" != windows ] && [ "$(wc -c < "$list")" -gt 16384 ]; then
   long=1
   [ -n "$base" ] && base=$(git rev-parse -q --verify "$base^{commit}") || no_verdict "a list this long needs its base"
 fi
-from_git='l=$(git -c diff.renames=true -c diff.renameLimit=1000 -c core.quotePath=true diff -O/dev/null --name-only "$4" "$5") || exit 3
+from_git='l=$(git -c core.quotePath=false diff --no-renames -O/dev/null --name-only "$4" "$5") || exit 3
 IFS="
 "; set -f; set -- "$1" "$2" "$3" -- $l; exec bash scripts/lib/gate-job.sh "$@"'
 job=$(mktemp)
@@ -171,6 +171,8 @@ gate() {
     echo "RUST_TEST_THREADS = $(q "$cores")"
     # Windows has no slice: the build's own job object holds it to the ask.
     [ "$mode" != windows ] || echo "NRESE_MEMORY_CAP_GB = $(q "$ram")"
+    # The suite contracts the Windows part runs: LIST's (scripts/check.sh windows_contracts); none, all.
+    [ "$mode" != windows ] || [ ! -s "$list" ] || echo "NRESE_CONTRACTS = $(q "$(paste -sd ' ' "$list")")"
     for var in NRESE_TARGET_CPU RUSTFLAGS NRESE_W3C_OPTIONAL NRESE_GATE_BUDGET_GB; do
       [ -z "${!var:-}" ] || echo "$var = $(q "${!var}")"
     done

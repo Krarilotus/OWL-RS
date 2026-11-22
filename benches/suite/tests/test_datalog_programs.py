@@ -17,6 +17,11 @@ sys.path.insert(0, str(KIT))
 
 import program as P  # noqa: E402
 
+READS = ("benches/reasoning/datalog/program.py", "benches/reasoning/datalog/programs/flowlog/batik.dl",
+         "benches/reasoning/datalog/programs/flowlog/galen.dl",
+         "benches/reasoning/datalog/programs/flowlog/sg.dl",
+         "benches/reasoning/datalog/programs/flowlog/tc.dl")
+
 TYPE = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>"
 
 

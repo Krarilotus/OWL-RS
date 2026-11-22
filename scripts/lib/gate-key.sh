@@ -13,9 +13,11 @@
 # - tree: the pushed commit's tree, what was tested, byte for byte; for `windows`, the hash of the
 #   checked commit's inputs (windows_inputs), so a pass carries to a later commit with the same
 #   inputs;
-# - file list: the hash of the files the tier was selected from (the pushed range's; none for
-#   `windows`, which runs everything); a push pass keeps its list, and covers a push of the same
-#   commit whose files it holds when its other files reach no crate (gate_covering);
+# - file list: the hash of the files the tier was selected from (the pushed range's); for `windows`,
+#   of the suite contracts it ran (gate_contracts_list: those its range reaches, scripts/check.sh
+#   windows_contracts; none listed, all of them, and a pass of all of them stands for any list); a
+#   push pass keeps its list, and covers a push of the same commit whose files it holds when its
+#   other files reach no crate (gate_covering);
 # - the toolchain rustc +<the commit's channel> -vV reports (a host with
 #   another install or an override doesn't match), and the flags rustc gets
 #   (scripts/cargo-guarded.sh --print-rustflags: `-C target-cpu=native` means each machine's own
@@ -107,6 +109,11 @@ gate_runtime() {
   [ -n "$build" ] && [ -n "$pins" ] || return 1
   printf 'python %s\n%s\n' "$build" "$pins"
 }
+
+# gate_contracts_list: the suite contracts a Windows part runs, one per line, as its gate sent them
+# (NRESE_CONTRACTS, scripts/lib/fleet-gate.sh); nothing for all of them. Its hash is the list its
+# record and pass are keyed by.
+gate_contracts_list() { [ -z "${NRESE_CONTRACTS:-}" ] || printf '%s\n' $NRESE_CONTRACTS; }
 
 # gate_python RUNTIME: the key's name of RUNTIME (gate_runtime), `python=<id>`.
 gate_python() { printf 'python=%s\n' "$(printf '%s\n' "$1" | git hash-object --stdin | cut -c1-12)"; }

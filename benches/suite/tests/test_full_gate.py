@@ -10,6 +10,8 @@ import unittest
 
 import isolation
 
+READS = ("scripts/",)
+
 ROOT = Path(__file__).resolve().parents[3]
 CARGO = '''case "$1" in
   metadata) echo '{"packages":[{"name":"fixture"}]}' ;;

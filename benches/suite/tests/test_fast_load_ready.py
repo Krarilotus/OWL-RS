@@ -18,6 +18,11 @@ sys.path.insert(0, str(ROOT / "benches/fast"))
 import fast  # noqa: E402
 import release_gate as rg  # noqa: E402
 
+READS = ("benches/cases/core.toml", "benches/cases/sparql.toml", "benches/competitors/queries/",
+         "benches/datasets.toml", "benches/fast/compete.py", "benches/fast/fast.py", "benches/fast/queries/",
+         "benches/fast/release_gate.py", "benches/hosts.toml", "benches/reasoning/queries/lubm/",
+         "benches/reasoning/queries/owl2bench/", "benches/suite/suitekit/*")
+
 CATALOG = fast.load_cases()
 CASES = {c["name"]: c for c in CATALOG}
 

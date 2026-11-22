@@ -28,6 +28,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from suitekit import driver, ledger, manifest, receipts, schema  # noqa: E402
 from suitekit.workloads import Plan  # noqa: E402
 
+READS = ("benches/competitors/millenniumdb/Dockerfile", "benches/hosts.toml",
+         "benches/suite/adjudications.tsv", "benches/suite/suitekit/*")
+
 ROOT = Path(__file__).resolve().parents[3]  # this repository
 
 
@@ -1036,25 +1039,6 @@ class Driver(unittest.TestCase):
         self.assertIn("deadline", str(late.exception))
         self.assertEqual(len(started), 1)
         self.assertIsNotNone(started[0].poll())  # killed, not left running
-
-    def test_every_compile_time_variable_our_sources_read_is_set_by_cargo_or_never_passed(self):
-        """P2: a variable our Rust sources
-        read at compile time (env!, option_env!) or a build script reads (env::var) changes the binary;
-        each is one cargo sets for the build, or controlled_environment doesn't pass it. A new one
-        fails here until it is one of the two."""
-        import re
-        names = set()
-        sources = [*ROOT.glob("crates/**/src/**/*.rs"), *ROOT.glob("benches/nrese-bench-harness/src/**/*.rs")]
-        for path in sources:
-            names |= set(re.findall(r'(?:option_env|env)!\(\s*"([A-Za-z0-9_]+)"', path.read_text(encoding="utf-8")))
-        for path in ROOT.glob("crates/**/build.rs"):
-            names |= set(re.findall(r'env::var(?:_os)?\(\s*"([A-Za-z0-9_]+)"', path.read_text(encoding="utf-8")))
-        self.assertIn("NRESE_BUILD_REVISION", names)  # the scan finds today's one (draft_check.rs)
-        cargo_sets = re.compile(r"^(CARGO_.*|OUT_DIR|TARGET|HOST|PROFILE|OPT_LEVEL|DEBUG|NUM_JOBS|RUSTC|RUSTDOC)$")
-        for name in sorted(names):
-            if not cargo_sets.match(name):
-                with self.subTest(name):
-                    self.assertNotIn(name, driver.controlled_environment({name: "x"}))
 
     def test_a_run_s_manifest_holds_what_it_built_whether_or_not_a_cell_ran(self):
         """P1e's Windows proof: the build records a cell's receipt copies are in

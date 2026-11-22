@@ -13,6 +13,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+READS = ("scripts/hosts/khaleesi-guard.py",)
+
 spec = importlib.util.spec_from_file_location(
     "khaleesi_guard", Path(__file__).resolve().parents[3] / "scripts" / "hosts" / "khaleesi-guard.py")
 guard = importlib.util.module_from_spec(spec)

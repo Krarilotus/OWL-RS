@@ -20,6 +20,8 @@ import subprocess
 import tempfile
 import unittest
 
+READS = ("scripts/check.sh",)
+
 ROOT = Path(__file__).resolve().parents[3]
 # By its PATH entry: Windows looks in System32 (WSL's bash) before PATH for a bare name.
 BASH = shutil.which("bash")

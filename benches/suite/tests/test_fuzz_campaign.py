@@ -10,6 +10,8 @@ import unittest
 
 import isolation
 
+READS = ("scripts/fuzz-campaign.sh",)
+
 
 def campaign_checkout(root: Path, targets: str) -> Path:
     scripts = root / "scripts"

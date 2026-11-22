@@ -31,6 +31,8 @@ from suitekit.adapters import Endpoint, Step  # noqa: E402
 from suitekit.schema import FIELDS, Result, Writer, read  # noqa: E402
 from suitekit.summary import summarise  # noqa: E402
 
+READS = ("benches/",)
+
 MIB = 1024 * 1024
 
 

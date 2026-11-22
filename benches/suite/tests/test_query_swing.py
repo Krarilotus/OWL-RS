@@ -10,6 +10,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+READS = ("benches/probes/query-swing.py",)
+
 ROOT = Path(__file__).resolve().parents[3]
 spec = importlib.util.spec_from_file_location("query_swing", ROOT / "benches/probes/query-swing.py")
 swing = importlib.util.module_from_spec(spec)
