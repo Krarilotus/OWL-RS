@@ -764,7 +764,9 @@ pub(crate) fn certify_closure(
 /// report (`StoreService::status_outside_dl`), so the two are one value. Under `owl2-rl`, where
 /// the closure leaves out a list axiom (`lists_left_out`, asked only of a report still
 /// `complete` after the composition's other steps, so an earlier reason keeps its place), whose
-/// conclusions an answer may miss, it isn't `complete` ([`LIST`]); then the operator rule, last.
+/// conclusions an answer may miss, it isn't `complete` ([`LIST`]); then the store's conditions
+/// of the certificate `snapshot` carries ([`withhold`], as the answer's composition takes
+/// them, with its sources), and the operator rule, last.
 pub(crate) fn certify_report(
     completeness: Option<&mut Completeness>,
     query: (&Query, &Reads),
@@ -780,6 +782,11 @@ pub(crate) fn certify_report(
     let rl = completeness.regime == Some(nrese_sparql::Regime::Owl2Rl);
     if completeness.complete && rl && lists_left_out() {
         completeness.incomplete("rules", LIST.to_owned());
+    }
+    let certified = snapshot.and_then(|s| crate::service::Certificate::of(s).map(|c| (s, c)));
+    if let Some((snapshot, certificate)) = certified {
+        let source = if certificate.dl { "dl" } else { "rules" };
+        conditions(completeness, query, source, snapshot, &certificate.state);
     }
     negation_rule(completeness, query, "ql");
 }
@@ -934,9 +941,9 @@ const LITERAL_EQUALITY: &str = "the rules equate two literals as one value (an o
 
 /// The conditions of the store under which a read that rests on reasoning isn't told
 /// `complete`, whatever its route (the closure, the QL rewriting, the bounds): one list,
-/// applied once, by `StoreService::assess`, to a status under an OWL 2 regime, then the
-/// operator rule ([`negation_rule`]) over what it took away. Each entry: the condition, the
-/// reads it touches, its reason.
+/// applied by `StoreService::assess`, and by [`certify_report`] to the QL rewriting's report,
+/// to a status under an OWL 2 regime, then the operator rule ([`negation_rule`]) over what it
+/// took away. Each entry: the condition, the reads it touches, its reason.
 /// - The rules equate a literal with another term (`state`): a read of a property that may
 ///   hold literals in `snapshot` ([`holds_literals`]; a variable predicate, any; for a
 ///   reader of some graphs, every property, as [`certify`] reads them), [`LITERAL_EQUALITY`].
@@ -948,9 +955,23 @@ pub(crate) fn withhold(
     snapshot: &Snapshot,
     state: &crate::ReasoningState,
 ) {
+    if conditions(completeness, (query, reads), source, snapshot, state) {
+        negation_rule(completeness, (query, reads), source);
+    }
+}
+
+/// [`withhold`]'s conditions, without the operator rule; `false` (none taken) where the regime
+/// isn't one of OWL 2's.
+fn conditions(
+    completeness: &mut Completeness,
+    (query, reads): (&Query, &Reads),
+    source: &'static str,
+    snapshot: &Snapshot,
+    state: &crate::ReasoningState,
+) -> bool {
     use nrese_sparql::Regime::{Owl2Dl, Owl2Ql, Owl2Rl};
     if !matches!(completeness.regime, Some(Owl2Dl | Owl2Ql | Owl2Rl)) {
-        return;
+        return false;
     }
     let literals = |predicate: &Option<String>| {
         reads.access.is_some()
@@ -974,7 +995,7 @@ pub(crate) fn withhold(
             ),
         );
     }
-    negation_rule(completeness, (query, reads), source);
+    true
 }
 
 /// The W3C vocabulary documents, whose meaning is built in: an import of one counts as read.
