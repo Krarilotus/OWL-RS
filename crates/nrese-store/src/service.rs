@@ -3619,7 +3619,8 @@ mod certificate_tests {
     }
 
     /// Spec: a certificate changed during reads refuses even when
-    /// the replacement is certified, instead of retrying to an answer.
+    /// the replacement is certified, instead of retrying to an answer; the refusal says to ask
+    /// again (undecided), as the closure may be certified already.
     #[test]
     fn an_entailment_refuses_a_certificate_changed_during_its_reads() {
         let dir = tempfile::tempdir().unwrap();
@@ -3640,8 +3641,8 @@ mod certificate_tests {
         )];
         assert!(matches!(
             store.entails(rdfs(), &conclusion),
-            Err(crate::StoreError::Configuration(message))
-                if message == "the inferred statements aren't rdfs's closure: rematerialise first"
+            Err(crate::StoreError::Undecided(message))
+                if message == "the data changed during the entailment check: ask again"
         ));
         assert_eq!(
             store.entails(rdfs(), &conclusion).unwrap(),

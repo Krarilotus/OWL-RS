@@ -2774,7 +2774,9 @@ impl Transitive {
     fn run(
         &mut self,
         store: &Store,
+        program: &GroundProgram,
         representatives: Option<&Representatives>,
+        poll: &Poller<'_>,
         stop: super::eval::Stop<'_>,
     ) -> Option<Vec<Triple>> {
         self.produced.clear();
@@ -2797,14 +2799,10 @@ impl Transitive {
                     continue;
                 }
                 pairs.retain(|&(s, o)| !stale.contains(s) && !stale.contains(o));
-                out.extend(
-                    nrese_exec::graph::transitive_closure_until(&pairs, stop)?
-                        .into_iter()
-                        .filter(|&(s, o)| !relation.contains(s, o))
-                        .map(|(s, o)| [s, p, o]),
-                );
-                self.produced.insert(p, out.len() - before);
-                continue;
+            }
+            if let Some(filter) = program.transitive_filter(p) {
+                pairs.retain(|&(s, o)| !poll.tick() && filter.keeps(s, o, poll));
+                poll.ended().ok()?;
             }
             out.extend(
                 nrese_exec::graph::transitive_closure_until(&pairs, stop)?
@@ -3488,7 +3486,7 @@ fn run_body(
             None,
             segments(
                 transitive
-                    .run(&store, representatives.as_ref(), stop)
+                    .run(&store, &program, representatives.as_ref(), &stage, stop)
                     .ok_or_else(Interrupted::default)?,
             ),
         ));
