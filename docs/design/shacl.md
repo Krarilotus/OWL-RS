@@ -111,10 +111,11 @@ Validate RDF data against SHACL shapes, natively and fast enough to run on every
 - **Memory:** the affected walk charges its seeds, reached sets and returned set to the
   write's memory envelope through the lifetime of each set. It charges path outputs on
   taking ownership. A refused charge stops the commit with `MemoryLimit` in `report` or
-  `enforce` mode. A commit that previously succeeded while holding more memory than the budget
-  allowed can now be refused. Raise
-  [`budgets.query_memory`](../ops/config-reference.md#budgets.query_memory)
-  (`NRESE_MAX_QUERY_MEMORY_BYTES`) to give the write more room.
+  `enforce` mode. The write's envelope has no limit of its own; it draws on the memory all
+  running requests share. A commit that used to be accepted while holding more than is left
+  there can now be refused. Raise
+  [`budgets.total_query_memory`](../ops/config-reference.md#budgets.total_query_memory)
+  (`NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES`) to give the write more room.
 - **Full validation cases.** Closed and SPARQL constraints, changes to `rdfs:subClassOf`,
   and affected sets over 100,000 nodes can require validating a targeted shape whole.
   When any active target can reach a cycle through active shape references, a nonempty
