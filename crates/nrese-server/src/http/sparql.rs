@@ -319,9 +319,10 @@ pub(crate) fn map_query_error(policy: &PolicyConfig, error: StoreError) -> ApiEr
     }
 }
 
-/// The 503 of a read refused for the memory all queries share: it may succeed later.
+/// The 503 of a read refused for the memory all queries share: it may succeed later, so it
+/// says when to try again (`Retry-After: 1`), as an answer refused for it while held does.
 fn server_memory_in_use(error: StoreError) -> ApiError {
-    ApiError::unavailable(format!(
+    ApiError::busy(format!(
         "{error} (budgets.total_query_memory, NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES)"
     ))
 }
