@@ -97,7 +97,8 @@ fn a_version_keeps_the_cell_until_the_watched_graph_changes() {
 }
 
 /// Spec (docs/ops/http-api.md): append and replace keep the count and its revision
-/// when their asserted watched range is unchanged, including a load that spills.
+/// when their asserted watched range is unchanged, and renew them when it changed,
+/// including a load that spills, mapped or not.
 #[test]
 fn a_bulk_load_compares_the_asserted_watched_range() {
     for (label, mode, spill, change, mapped) in [
@@ -116,6 +117,20 @@ fn a_bulk_load_compares_the_asserted_watched_range() {
             true,
             false,
             true,
+        ),
+        (
+            "changed spilled replacement",
+            BulkMode::Replace,
+            true,
+            true,
+            true,
+        ),
+        (
+            "changed spilled replacement, not mapped",
+            BulkMode::Replace,
+            true,
+            true,
+            false,
         ),
     ] {
         let dir = tempfile::tempdir().unwrap();
