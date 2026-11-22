@@ -54,6 +54,7 @@ fn fixture() -> (Engine, PreparedQuery, StoreSettings) {
         equality_closed: false,
         dl: false,
         user_rules: false,
+        ill_typed: Default::default(),
     };
     engine
         .transaction()

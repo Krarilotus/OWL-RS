@@ -281,7 +281,7 @@ impl MutationPipeline {
             let working_memory = || self.store.operation_memory();
             // A rebuild's own report judges only over a state assessed consistent.
             let base_consistent = matches!(
-                self.store.consistency(),
+                self.store.recorded_consistency(),
                 crate::ConsistencyStatus::Consistent
             );
             let (violations, materialisation, changed, literal_equality) =
@@ -507,7 +507,9 @@ impl MutationPipeline {
                 if literal_equality {
                     certificate = StoreService::with_literal_equality(certificate);
                 }
-                tx.vouch(certificate);
+                let memory = self.store.memory_stop();
+                let stop = || memory.exceeded();
+                tx.vouch(StoreService::with_ill_typed(certificate, &tx, &stop));
             }
             let committed = match ql {
                 Some(ql) => publishing(ticket, report, tx, |tx| ql.commit(tx)),

@@ -110,6 +110,11 @@ fn budget_of(
     }
 }
 
+/// Why the data's consistency is unknown where the RL rules prove it but an ill-typed literal
+/// may be held ([`super::bounds::may_hold_ill_typed`]).
+pub(crate) const ILL_TYPED: &str = "the rules find no clash, but the data hold an ill-typed literal \
+                                    (or aren't yet checked for one), which OWL 2 doesn't admit";
+
 /// Checks the state `tx` would commit. Where U1 after the commit proves it consistent
 /// ([`super::bounds::Preparation`]), nothing more runs: the cost of the U1's change.
 /// Otherwise O(asserted statements) for reading the ontology (unless the preparation
@@ -138,7 +143,9 @@ pub(crate) fn check_commit(
     // and their gate has admitted the commit on its own facts, as off the route: no DL check.
     let rules = matches!(preparation.prepared, super::bounds::Prepared::Rules(_));
     if preparation.proves_consistency || rules {
+        let ill_typed = || rules && super::bounds::may_hold_ill_typed_after(store, tx);
         let verdict = match preparation.proves_consistency {
+            true if ill_typed() => Verdict::Unknown(ILL_TYPED.to_owned()),
             true => Verdict::Consistent,
             false => Verdict::Unknown("the rules assessed no clean closure at the base".to_owned()),
         };

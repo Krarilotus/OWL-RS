@@ -171,7 +171,13 @@ pub(crate) struct Certificate {
     /// The `owl2-dl` mode's route, and whether user rules run with it ([`crate::dl::Dl`]).
     pub(crate) dl: bool,
     pub(crate) user_rules: bool,
+    /// Its version's ill-typed literal ([`Self::ill_typed`]): unset until a need finds it, never
+    /// at the open; a cell of its own, or one found for the same statements.
+    pub(crate) ill_typed: std::sync::Mutex<IllTyped>,
 }
+
+/// A version's ill-typed literal, if any: `None` until a search ends.
+pub(crate) type IllTyped = Option<Option<nrese_engine::TermId>>;
 
 /// What a read inside a transaction lacks ([`StoreService::assess`]), under `owl2-dl` with
 /// [`CLOSURE`]; and where its operations may delete, [`DELETES`].
@@ -208,6 +214,21 @@ impl Certificate {
     /// `not-certified` all the same).
     pub(crate) fn route(snapshot: &Snapshot, dl: &crate::dl::Dl) -> (bool, bool) {
         Self::for_rows(snapshot).map_or((dl.active(), dl.user_rules()), |c| (c.dl, c.user_rules))
+    }
+
+    /// The ill-typed literal `data`, this certificate's version, holds: found once, on the first
+    /// need of a published snapshot, by one scan (`dl::query::ill_typed`; concurrent needs wait)
+    /// that `stop` may end, `None` then, kept unset, so the need fails closed. A pending state
+    /// reads the cell as it is. `Some(None)` outside `owl2-dl` and `owl2-ql`.
+    pub(crate) fn ill_typed(&self, data: &Snapshot, stop: &dyn Fn() -> bool) -> IllTyped {
+        if !crate::dl::query::keeps_ill_typed(self.dl, &self.state.ruleset) {
+            return Some(None);
+        }
+        let mut cell = self.ill_typed.lock().unwrap_or_else(|p| p.into_inner());
+        if cell.is_none() && data.shared_state().is_some() {
+            *cell = crate::dl::query::ill_typed(data, stop);
+        }
+        *cell
     }
 }
 
@@ -506,7 +527,8 @@ impl StoreService {
     /// `state`'s certificate under the store's settings now; `kept`, the QL schema to keep
     /// if its closure is the one `state` calls for. Whether the recorded reasoning closes
     /// the data under `owl:sameAs` (a ruleset with the equality rules): queries may then
-    /// rely on it.
+    /// rely on it. Its ill-typed literal isn't looked for until a need asks
+    /// ([`Certificate::ill_typed`]).
     fn certificate(&self, state: crate::ReasoningState, kept: Ql) -> nrese_engine::Certificate {
         std::sync::Arc::new(Certificate {
             ql: self.ql_for(&state, kept),
@@ -514,6 +536,7 @@ impl StoreService {
             dl: self.dl.active(),
             user_rules: self.dl.user_rules(),
             state,
+            ill_typed: Default::default(),
         })
     }
 
@@ -717,7 +740,28 @@ impl StoreService {
     /// Whether the data is consistent under the recorded reasoning (see
     /// [`crate::reasoning_state`] for the quarantine this reports). `Unknown` on a replica:
     /// it reasons nothing, and its primary's records don't say ([`crate::StoreConfig::replica`]).
+    /// `Unknown` for no clash where the current version holds an ill-typed literal under
+    /// `owl2-dl` or `owl2-ql`, which OWL 2 doesn't admit, or the search for one, on this first
+    /// need, stopped ([`Certificate::ill_typed`]).
     pub fn consistency(&self) -> crate::ConsistencyStatus {
+        let ill_typed = || {
+            let (snapshot, memory) = (self.engine.snapshot(), self.memory_stop());
+            let found =
+                Certificate::of(&snapshot).map(|c| c.ill_typed(&snapshot, &|| memory.exceeded()));
+            found.is_some_and(|found| found != Some(None))
+        };
+        match self.recorded_consistency() {
+            crate::ConsistencyStatus::Consistent if ill_typed() => {
+                crate::ConsistencyStatus::Unknown
+            }
+            status => status,
+        }
+    }
+
+    /// [`Self::consistency`] as the recorded reasoning alone says it: what a commit's own
+    /// checks and the quarantine rely on (`MutationPipeline`, [`Self::is_quarantined`]), which
+    /// an ill-typed literal doesn't change.
+    pub(crate) fn recorded_consistency(&self) -> crate::ConsistencyStatus {
         self.reasoning_state()
             .filter(|_| !self.config.replica)
             .map_or(crate::ConsistencyStatus::Unknown, |state| {
@@ -741,7 +785,8 @@ impl StoreService {
         let mark = self.unassessed.load(std::sync::atomic::Ordering::Acquire);
         #[cfg(test)]
         hooks::run(&hooks::BETWEEN_QUARANTINE_READS);
-        let assessed = matches!(self.consistency(), Inconsistent { .. } | Undecided { .. });
+        let recorded = self.recorded_consistency();
+        let assessed = matches!(recorded, Inconsistent { .. } | Undecided { .. });
         assessed
             || mark % 2 == 1
             || mark != self.unassessed.load(std::sync::atomic::Ordering::Acquire)
@@ -837,23 +882,54 @@ impl StoreService {
     pub(crate) fn with_literal_equality(
         certificate: nrese_engine::Certificate,
     ) -> nrese_engine::Certificate {
-        let marked = match certificate.downcast_ref::<Certificate>() {
-            Some(held) if !held.state.literal_equality => {
-                let state = crate::ReasoningState {
-                    literal_equality: true,
-                    ..held.state.clone()
-                };
-                Some(std::sync::Arc::new(Certificate {
-                    state,
-                    ql: held.ql.clone(),
-                    equality_closed: held.equality_closed,
-                    dl: held.dl,
-                    user_rules: held.user_rules,
-                }) as nrese_engine::Certificate)
-            }
-            _ => None,
+        Self::with_state(certificate, |held, ill_typed| {
+            let state = crate::ReasoningState {
+                literal_equality: true,
+                ..held.state.clone()
+            };
+            (!held.state.literal_equality).then_some((state, ill_typed))
+        })
+    }
+
+    /// `certificate` with the state and the ill-typed literal's cell `change` makes of it and
+    /// its cell's value, where it makes them; the same object where it makes none or the
+    /// certificate isn't this store's: the one rebuild of each mark a commit's version takes
+    /// ([`Self::with_literal_equality`], [`Self::with_ill_typed`]).
+    fn with_state(
+        certificate: nrese_engine::Certificate,
+        change: impl FnOnce(&Certificate, IllTyped) -> Option<(crate::ReasoningState, IllTyped)>,
+    ) -> nrese_engine::Certificate {
+        let Some(held) = certificate.downcast_ref::<Certificate>() else {
+            return certificate;
         };
-        marked.unwrap_or(certificate)
+        let cell = *held.ill_typed.lock().unwrap_or_else(|p| p.into_inner());
+        let Some((state, ill_typed)) = change(held, cell) else {
+            return certificate;
+        };
+        std::sync::Arc::new(Certificate {
+            state,
+            ql: held.ql.clone(),
+            equality_closed: held.equality_closed,
+            dl: held.dl,
+            user_rules: held.user_rules,
+            ill_typed: std::sync::Mutex::new(ill_typed),
+        })
+    }
+
+    /// `certificate` with the ill-typed literal ([`Certificate::ill_typed`]) of what the
+    /// maintained commit `tx` publishes, where its base's is found (`dl::query::ill_typed_after`,
+    /// under `stop`); else its own cell, unset. The same object where that is the base's, or the
+    /// certificate isn't this store's or keeps none ([`crate::dl::query::keeps_ill_typed`]).
+    pub(crate) fn with_ill_typed(
+        certificate: nrese_engine::Certificate,
+        tx: &nrese_engine::Transaction<'_>,
+        stop: &dyn Fn() -> bool,
+    ) -> nrese_engine::Certificate {
+        Self::with_state(certificate, |held, base| {
+            let keeps = crate::dl::query::keeps_ill_typed(held.dl, &held.state.ruleset);
+            let found = base.and_then(|base| crate::dl::query::ill_typed_after(tx, base, stop));
+            (keeps && (base.is_none() || found != base)).then(|| (held.state.clone(), found))
+        })
     }
 
     /// Marks the state kept in memory as the rules equating a literal with another term, by a
@@ -1594,7 +1670,7 @@ impl StoreService {
             crate::dl::query::certify(&mut status, reads, "dl", decided, Some(at.snapshot()));
         }
         let rules = if certificate.dl { "dl" } else { "rules" };
-        crate::dl::query::withhold(&mut status, reads, rules, snapshot, &certificate.state);
+        crate::dl::query::withhold(&mut status, reads, rules, (snapshot, certificate), self);
         Some(status)
     }
 
@@ -1898,9 +1974,8 @@ impl StoreService {
         if let nrese_sparql::ql::Printed::Query { completeness, .. } = &mut printed {
             completeness.regime = Some(nrese_sparql::Regime::Owl2Rl);
             let reads = crate::dl::query::Reads::default();
-            let lists = || self.lists_left_out(&snapshot);
             let query = (&query, &reads);
-            crate::dl::query::certify_report(Some(completeness), query, Some(&snapshot), lists);
+            crate::dl::query::certify_report(Some(completeness), query, Some(&snapshot), self);
         }
         Ok(printed)
     }
@@ -2725,9 +2800,7 @@ impl StoreService {
         snapshot: &nrese_engine::Snapshot,
     ) {
         let completeness = ql.map(|r| &mut r.completeness);
-        crate::dl::query::certify_report(completeness, prepared.reads(), Some(snapshot), || {
-            self.lists_left_out(snapshot)
-        });
+        crate::dl::query::certify_report(completeness, prepared.reads(), Some(snapshot), self);
     }
 
     /// A statement by the snapshot's ids; `None` if a term isn't in the store.
