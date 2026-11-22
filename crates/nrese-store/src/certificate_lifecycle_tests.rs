@@ -1366,8 +1366,8 @@ fn a_commit_in_quarantine_that_equates_two_literals_is_never_told_complete() {
             let name = "a repair commit and a certificate made again under rdfs";
             let none = status
                 .as_ref()
-                .is_some_and(|s| s.as_str() == "not-certified");
-            cells.check(name, &said(&status), |_| none, "not-certified");
+                .is_some_and(|s| s.as_str() == "not-certified" && s.reasons.is_empty());
+            cells.check(name, &said(&status), |_| none, "not-certified, no reasons");
             store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
             let (values, status) = answer(&store, read);
             let name = "a repair commit and a certificate made again under owl2-rl";
