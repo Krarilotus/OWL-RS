@@ -121,9 +121,10 @@ fn commit(
 
 /// An insert-only commit reads no `owl:sameAs` partners, whatever the schema's size: the
 /// recursion analysis is not built where no candidate asks for a proof.
+/// By default 10 and 100 classes; with `NRESE_CHECK_TIER=nightly`, 10 and 1,000.
 #[test]
 fn an_insert_reads_nothing_that_grows_with_the_schema() {
-    for classes in [10, 1000] {
+    for classes in [10, if super::nightly() { 1_000 } else { 100 }] {
         let mut vocabulary = LocalVocabulary::default();
         let asserted = chain(&mut vocabulary, classes, Equal::Nothing);
         let inserted = load(&mut vocabulary, "ex:w ex:value ex:v");
@@ -136,9 +137,10 @@ fn an_insert_reads_nothing_that_grows_with_the_schema() {
 
 /// A delete that leaves no overdelete candidate (a fact no rule derives anything from)
 /// reads no `owl:sameAs` partners either, whatever the schema's size.
+/// By default 10 and 100 classes; with `NRESE_CHECK_TIER=nightly`, 10 and 1,000.
 #[test]
 fn a_delete_without_candidates_reads_nothing_that_grows_with_the_schema() {
-    for classes in [10, 1000] {
+    for classes in [10, if super::nightly() { 1_000 } else { 100 }] {
         let mut vocabulary = LocalVocabulary::default();
         let mut asserted = chain(&mut vocabulary, classes, Equal::Nothing);
         let deleted = load(&mut vocabulary, "ex:w ex:value ex:v");

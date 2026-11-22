@@ -3,15 +3,22 @@
 //! may be empty, so their definitions are a conservative extension of the premise.
 //! Search state is created by the existing probe engine and is never shared.
 
-use nrese_dl::limits::Limit;
+use nrese_dl::limits::{Deadline, Limit};
 use nrese_dl::tableau::{self, At, Prepared, Probe, Want};
 use nrese_owl::{Axiom, ClassExpr, EntityKind, ExprId, ObjProp, Ontology};
 
 use super::{Budget, Entailed, consistency, intern};
 
 #[cfg(test)]
+type Hook = std::cell::Cell<Option<Box<dyn FnOnce()>>>;
+
+#[cfg(test)]
 thread_local! {
     static COMPILATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Run by [`Batch::check`] once the probe's time is read, just before it starts.
+    static BEFORE_PROBE: Hook = const { std::cell::Cell::new(None) };
+    /// Run by [`Batch::check`] just after the probe ends.
+    static AFTER_PROBE: Hook = const { std::cell::Cell::new(None) };
 }
 
 #[derive(Clone)]
@@ -66,12 +73,27 @@ impl Batch {
                 names.insert(*c);
             }
         }
+        // A key holds for named individuals only (Direct Semantics §2.3.5), and the compiled
+        // program names those of the premise. An individual only the question names is
+        // named too (§2.5): its test goes to the scalar reduction, which adds it.
+        let named = ontology
+            .axioms
+            .iter()
+            .any(|a| matches!(a, Axiom::HasKey(..)))
+            .then(|| ontology.named_individuals());
         let mut classes = Vec::new();
         let mut individuals = Vec::new();
         let mut next = u64::MAX;
         let probes = tests
             .iter()
             .map(|test| {
+                if let (Some(named), Test::Axiom(axiom)) = (&named, test)
+                    && super::individuals(axiom)
+                        .iter()
+                        .any(|t| named.binary_search(t).is_err())
+                {
+                    return None;
+                }
                 let (expr, individual) = assumption(ontology, test)?;
                 while names.contains(&next) {
                     next -= 1;
@@ -114,9 +136,10 @@ impl Batch {
         }
     }
 
-    /// Decides `tests[index]` of [`Self::new`] over its premise `ontology`: by the
-    /// compiled probe, or by the scalar reduction where the test has no probe form or the
-    /// probe can't express it.
+    /// Decides `tests[index]` of [`Self::new`] over its premise `ontology` before `deadline`:
+    /// by the compiled probe, which stops at it, or by the scalar reduction where the test
+    /// has no probe form or the probe can't express it, in what is left of it when it
+    /// starts. A verdict found past it is none.
     pub(crate) fn check(
         &self,
         index: usize,
@@ -124,16 +147,37 @@ impl Batch {
         ontology: &Ontology,
         fresh: &[u64],
         budget: &Budget,
+        deadline: Deadline,
     ) -> Entailed {
+        match self.decide(index, test, ontology, fresh, budget, deadline) {
+            Entailed::Yes | Entailed::No if deadline.passed() => {
+                Entailed::Unknown(Limit::Time.reached("the deadline passed"))
+            }
+            answer => answer,
+        }
+    }
+
+    /// [`Self::check`] before its check of the deadline.
+    fn decide(
+        &self,
+        index: usize,
+        test: &Test,
+        ontology: &Ontology,
+        fresh: &[u64],
+        budget: &Budget,
+        deadline: Deadline,
+    ) -> Entailed {
+        let scalar = || match test {
+            Test::Axiom(axiom) => super::entails_within(ontology, axiom, fresh, budget, deadline),
+            Test::Nonempty(class) => super::nonempty_within(ontology, *class, budget, deadline),
+        };
         if self.exhausted {
             return Entailed::Unknown(nrese_dl::memory::EXHAUSTED.to_owned());
         }
         let (Some(prepared), Some((class, at))) = (&self.prepared, self.probes[index]) else {
-            return match test {
-                Test::Axiom(axiom) => super::entails(ontology, axiom, fresh, budget),
-                Test::Nonempty(class) => super::nonempty(ontology, *class, budget),
-            };
+            return scalar();
         };
+        let budget = &budget.remaining(deadline);
         if budget
             .cancel
             .as_ref()
@@ -146,6 +190,8 @@ impl Batch {
         }
         let config = tableau::Config {
             timeout: budget.timeout,
+            // The probe stops at the caller's deadline, however late it starts.
+            deadline: deadline.instant(),
             max_memory: budget.memory_bytes,
             memory: budget.memory.clone(),
             max_nodes: budget.max_nodes,
@@ -156,6 +202,10 @@ impl Batch {
             portfolio: false,
             ..tableau::Config::default()
         };
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_PROBE.take() {
+            hook();
+        }
         let outcome = prepared.probe(
             &Probe {
                 at,
@@ -165,6 +215,10 @@ impl Batch {
             &config,
             Want::default(),
         );
+        #[cfg(test)]
+        if let Some(hook) = AFTER_PROBE.take() {
+            hook();
+        }
         match outcome.answer {
             tableau::Answer::Inconsistent => Entailed::Yes,
             tableau::Answer::Consistent => match &self.left_out {
@@ -173,10 +227,7 @@ impl Batch {
             },
             // The scalar reduction can still decide what the compiled probe can't express
             // (its Horn stage, for one): slower, but it keeps every answer the store had.
-            tableau::Answer::Unsupported(_) => match test {
-                Test::Axiom(axiom) => super::entails(ontology, axiom, fresh, budget),
-                Test::Nonempty(class) => super::nonempty(ontology, *class, budget),
-            },
+            tableau::Answer::Unsupported(_) => scalar(),
             tableau::Answer::GaveUp(why) => Entailed::Unknown(format!("gave up: {why}")),
         }
     }
