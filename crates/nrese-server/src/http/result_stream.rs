@@ -434,6 +434,11 @@ async fn hold(
             stopped => stopped,
         });
     }
+    // A wait with a deadline takes what is ready first: a hold that resumed past the
+    // deadline with the rest of the answer ready would take it. Past it, no answer.
+    if Instant::now() >= deadline {
+        return Err(ApiError::timeout(timeout_message));
+    }
     Ok(held)
 }
 
