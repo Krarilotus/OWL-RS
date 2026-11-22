@@ -104,6 +104,22 @@ ex:S10 a sh:NodeShape ; sh:property [ sh:path ex:p1 ; sh:maxCount 1 ] ;
   sh:property [ sh:path ex:p0 ; sh:node ex:S9 ] .
 "#;
 
+/// Shapes without a cycle, each nested shape reached from several targets and by several
+/// constructs: one result can be found through more than one route, and a change can add or
+/// remove a route to a result that is there before and after.
+const SHARED_SHAPES: &str = r#"
+@prefix ex: <http://example.com/> .
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+ex:S11 a sh:NodeShape ; sh:targetClass ex:C2 ; sh:property ex:P11 .
+ex:P11 sh:path ex:p1 ; sh:minCount 1 ; sh:class ex:C0 .
+ex:S12 a sh:NodeShape ; sh:targetSubjectsOf ex:p3 ; sh:property ex:P12 ; sh:node ex:N13 .
+ex:P12 sh:path ex:p2 ; sh:property ex:P11 ; sh:node ex:N13 .
+ex:N13 a sh:NodeShape ; sh:property [ sh:path ex:p0 ; sh:maxCount 1 ] .
+ex:S14 a sh:NodeShape ; sh:targetNode ex:n0 , ex:n1 ; sh:not ex:N15 ;
+  sh:property [ sh:path [ sh:inversePath ex:p2 ] ; sh:node ex:N13 ] .
+ex:N15 a sh:NodeShape ; sh:class ex:C1 ; sh:node ex:N13 .
+"#;
+
 #[test]
 fn incremental_validation_equals_the_difference_of_full_validations() {
     differences_agree(SHAPES, 20_261_002);
@@ -112,6 +128,11 @@ fn incremental_validation_equals_the_difference_of_full_validations() {
 #[test]
 fn incremental_validation_equals_the_difference_under_shapes_that_refer_back() {
     differences_agree(CYCLIC_SHAPES, 20_261_122);
+}
+
+#[test]
+fn incremental_validation_equals_the_difference_under_shapes_reached_from_several_targets() {
+    differences_agree(SHARED_SHAPES, 20_261_152);
 }
 
 /// On random data and random changes, under `shapes`, the results `validate_changes`
