@@ -556,20 +556,23 @@ fn table_bound<T>(capacity: usize) -> usize {
 struct Probed<'b> {
     rows: Solutions,
     held: Reservation<&'b Budget>,
+    ctx: &'b Context<'b>,
 }
 
 impl<'b> Probed<'b> {
-    fn new(ctx: &'b Context<'_>, rows: Solutions) -> Self {
+    fn new(ctx: &'b Context<'b>, rows: Solutions) -> Self {
         let bytes = rows.table.memory_bytes();
+        ctx.take_table_charge(bytes);
         Self {
             rows,
             held: Reservation::adopt(&*ctx.budget, bytes),
+            ctx,
         }
     }
 
     /// The rows, whose new holder releases them.
     fn take(self) -> Solutions {
-        self.held.transfer();
+        self.ctx.transfer_table_charge(self.held);
         self.rows
     }
 }

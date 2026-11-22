@@ -1857,12 +1857,10 @@ impl StoreService {
         read(&view, keeps_record)
     }
 
-    /// Pending changes aren't reasoned over until the commit, but for one that declares an
-    /// annotation property the rules read, or retracts its declaration
-    /// ([`Program::touches_a_declaration`](crate::reasoning::Program::touches_a_declaration)):
-    /// it changes what they read throughout the closure, so `tx`'s inferred stack is rebuilt
-    /// over its pending state, as its commit's is, and a read inside the transaction answers
-    /// by the transaction's own declarations.
+    /// A pending change that changes the set of annotation properties the rules read
+    /// rebuilds `tx`'s inferred stack over its pending state, as its commit does. A read
+    /// inside the transaction answers by that set. Other pending changes read the committed
+    /// inferred stack until commit.
     fn rebuild_pending_declarations(
         &self,
         tx: &mut nrese_engine::PrivateTransaction<'_>,
@@ -1879,7 +1877,7 @@ impl StoreService {
         }
         let pending = tx.pending_snapshot_within(budget)?;
         let program = self.bound_program(&pending, rules)?;
-        if !program.reads_annotations() {
+        if !program.annotation_set_changed(tx.base(), &pending) {
             return Ok(());
         }
         let program = (program.by_representatives(self.config.equality_by_representatives))

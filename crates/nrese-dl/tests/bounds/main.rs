@@ -657,6 +657,22 @@ fn a_proof_of_consistency_needs_a_model() {
             true,
         ),
         ("a datatype outside the map", some("xsd:date"), true),
+        // `xsd:boolean` has two values, so three distinct ones can't exist.
+        (
+            "three values of a datatype that has two",
+            format!(
+                "{data} :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :d ; \
+                 owl:minQualifiedCardinality \"3\"^^xsd:nonNegativeInteger ; \
+                 owl:onDataRange xsd:boolean ] ."
+            ),
+            false,
+        ),
+        // Two different individuals have a model: a difference is no clash.
+        (
+            "a difference between two individuals",
+            format!("{data} :b a owl:Thing . :a owl:differentFrom :b ."),
+            true,
+        ),
     ];
     let mut wrong = Vec::new();
     for (name, axioms, proved) in cases {
