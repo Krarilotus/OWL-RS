@@ -29,6 +29,14 @@ class BoundaryRuntime(unittest.TestCase):
         self.scratch = self.root / "scratch"
         os.environ["NRESE_BENCH_SCRATCH"] = str(self.scratch)
 
+    def link(self, path, target):
+        try:
+            path.symlink_to(target)
+        except OSError as error:
+            if getattr(error, "winerror", None) != 1314:
+                raise
+            self.skipTest("this Windows account cannot create symbolic links")
+
     def test_private_csv_checks_the_file_and_numbered_siblings(self):
         # Spec: a private CSV never writes into a checkout through a link, and ordinary private CSVs still append.
         os.environ["NRESE_BENCH_PRIVATE"] = str(self.overlay)
@@ -43,15 +51,15 @@ class BoundaryRuntime(unittest.TestCase):
                 before = public_file.read_bytes()
                 if form == "numbered":
                     target.write_text("different,header\n", encoding="utf-8")
-                    target.with_name("results-2.csv").symlink_to(public_file)
+                    self.link(target.with_name("results-2.csv"), public_file)
                 elif form == "linked":
-                    target.symlink_to(public_file)
+                    self.link(target, public_file)
                 before_write = directory / "results.csv"
                 writer = None
                 if form == "link after opening":
                     writer = schema.Writer(before_write)
                     before_write.unlink()
-                    before_write.symlink_to(public_file)
+                    self.link(before_write, public_file)
                 if form == "normal":
                     schema.Writer(target).write(ROW)
                     self.assertEqual([row["host"] for row in schema.read(target)], [ROW.host])
