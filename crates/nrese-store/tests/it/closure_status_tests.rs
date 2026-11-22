@@ -137,6 +137,25 @@ fn closure(data: &str, ruleset: Ruleset, ql: QlRewritingMode) -> StoreService {
     store
 }
 
+/// [`DATA`] and `more`, committed in one commit through the `owl2-rl` mode with the QL
+/// rewriting on: a store whose commits maintain the closure, which [`closure`]'s rebuild
+/// doesn't.
+fn committed(more: &str) -> nrese_store::MutationPipeline {
+    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    let config = StoreConfig {
+        ql_rewriting: QlRewritingMode::On,
+        ..StoreConfig::in_memory()
+    };
+    let pipeline = nrese_store::MutationPipeline::new(
+        std::sync::Arc::new(StoreService::new(config).unwrap()),
+        std::sync::Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Rl,
+        ))),
+    );
+    insert(&pipeline, &format!("{DATA} {more}")).expect("data");
+    pipeline
+}
+
 /// The rows of `query` and its statuses, as the answer and its plan give them.
 fn answer(store: &StoreService, query: &str) -> (String, [&'static str; 2]) {
     let request = SparqlQueryRequest::all(format!("{PREFIXES}{RDF}{query}"));
@@ -605,7 +624,10 @@ fn only_operators_that_can_make_a_row_wrong_label_a_dl_answer_unsound() {
 /// status and reason kind: a plain read, a denied one (an annotation, the one part of the
 /// reserved vocabulary print prints), that under NOT EXISTS, an ordered slice, and the
 /// `owl:sameAs` entry, on and off the RL route; under OWL 2 DL also with user rules and
-/// with `dl.consistency = "off"`, whose reasons the run adds whatever path decides.
+/// with `dl.consistency = "off"`, whose reasons the run adds whatever path decides. Under
+/// `owl2-rl` with the rewriting also the store's own conditions, whatever the route: rules
+/// that equated two literals (read through a property that holds one), and an import no
+/// loaded ontology answers.
 #[test]
 fn every_place_gives_a_query_the_answers_status() {
     use nrese_sparql::Completeness;
@@ -621,8 +643,17 @@ fn every_place_gives_a_query_the_answers_status() {
         ),
         ("SELECT ?x { ?x a :Animal } ORDER BY ?x LIMIT 1", None),
         ("ASK { :rex owl:sameAs :ann }", None),
+        ("SELECT ?v { :ann :age ?v }", None),
     ];
     let printed_for = closure(DATA, Ruleset::Owl2Rl, QlRewritingMode::On);
+    let equated = committed(
+        ":p a owl:FunctionalProperty . :s :p \"1\"^^xsd:integer , \"1.0\"^^xsd:decimal .",
+    );
+    let unread = closure(
+        &format!("{DATA} :o a owl:Ontology ; owl:imports <http://example.com/missing> ."),
+        Ruleset::Owl2Rl,
+        QlRewritingMode::On,
+    );
     let ql = closure(DATA, Ruleset::Owl2Ql, QlRewritingMode::Auto);
     let rl = closure(DATA, Ruleset::Owl2Rl, QlRewritingMode::Auto);
     let (on, off) = (dl(false), dl(true));
@@ -642,6 +673,18 @@ fn every_place_gives_a_query_the_answers_status() {
     let (unchecked_on, unchecked_off) = (dl_in(unchecked(), false), dl_in(unchecked(), true));
     let stores = [
         ("owl2-rl with the rewriting", &printed_for, true),
+        // Unprinted: a functional property makes no query printable (an equality of
+        // individuals isn't expressible), so print-query has no status here.
+        (
+            "owl2-rl with the rewriting, literals equated",
+            equated.store(),
+            false,
+        ),
+        (
+            "owl2-rl with the rewriting, an import unread",
+            &unread,
+            true,
+        ),
         ("owl2-ql", &ql, false),
         ("owl2-rl", &rl, false),
         ("owl2-dl on the RL route", on.store(), false),
