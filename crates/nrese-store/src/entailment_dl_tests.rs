@@ -1,4 +1,5 @@
-//! The `owl2-dl` entailment check at its seams: its time is one budget, from its start.
+//! The `owl2-dl` entailment check at its seams: its time is one budget, from its start, and
+//! it reads one revision.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -89,5 +90,32 @@ fn the_conclusion_is_tested_in_what_the_premise_check_left() {
     assert!(
         matches!(late, Entailed::Unknown(_)),
         "past the deadline: {late:?}"
+    );
+}
+
+/// Spec (`entails`: one certified closure, reads that answer only for it): `:x a :P` and
+/// `:x a ¬C` hold together in neither revision, the one with `:x a :P` (where `:x` may be a
+/// `:C`) nor the one after a commit that replaces it with `:x a :D` (`:D` disjoint with
+/// `:C`). With that commit between the closure's read and the refutation, the check gives no
+/// answer (undecided), never `Entailed`.
+#[test]
+fn a_commit_between_the_closure_and_the_refutation_leaves_the_answer_undecided() {
+    let (store, pipeline) = dl_store(DlConfig::default(), ":D owl:disjointWith :C . :x a :P .");
+    let mut conclusion = not_in("x", "C");
+    conclusion.push(Triple::new(iri("x"), nrese_rdf::vocab::rdf::TYPE, iri("P")));
+    let rules = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl)
+        .materialised_program()
+        .unwrap();
+    hooks::BETWEEN_ENTAILMENT_HALVES.set(Some(Box::new(move || {
+        update(
+            &pipeline,
+            "DELETE DATA { :x a :P } ; INSERT DATA { :x a :D }",
+        );
+    })));
+    let answer = store.entails(rules, &conclusion);
+    hooks::BETWEEN_ENTAILMENT_HALVES.set(None);
+    assert!(
+        matches!(answer, Err(crate::StoreError::Undecided(_))),
+        "{answer:?}"
     );
 }

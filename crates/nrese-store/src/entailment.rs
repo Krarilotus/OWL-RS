@@ -130,6 +130,8 @@ impl StoreService {
         if !split.positive.is_empty() && !self.ask(&split.positive)? {
             return Ok(false);
         }
+        #[cfg(test)]
+        crate::service::hooks::run(&crate::service::hooks::BETWEEN_ENTAILMENT_HALVES);
         for opposite in &split.refutations {
             if !self.refutes(program, opposite)? {
                 return Ok(false);

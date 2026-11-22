@@ -2943,6 +2943,9 @@ pub(crate) mod hooks {
         /// An entailment check has found the certificate current and is about to read the
         /// closure.
         pub(crate) static AFTER_CERTIFIED: Hook = const { RefCell::new(None) };
+        /// An entailment check has read the closure for the positive statements and is about
+        /// to refute the negative ones.
+        pub(crate) static BETWEEN_ENTAILMENT_HALVES: Hook = const { RefCell::new(None) };
         /// An `owl2-dl` entailment check has checked the premise and is about to test the
         /// conclusion.
         pub(crate) static AFTER_DL_PREMISE: Hook = const { RefCell::new(None) };
