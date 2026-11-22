@@ -334,14 +334,21 @@ impl MutationPipeline {
                 // A list that stopped at its budget before its first entry has none to
                 // explain; the change is rejected all the same. The operator's record
                 // holds the whole first violation, whoever committed.
-                let explanation = if stop() {
+                let explanation = if operation.fired() {
                     None
                 } else {
                     violations.first().map(|violation| {
-                        crate::reasoning::explain_violation(program, &violation, &tx, None)
+                        nrese_reasoner::engine::explain_violation_until(
+                            program,
+                            &violation,
+                            &tx,
+                            None,
+                            changed.as_ref().or(cached),
+                            &|| operation.fired(),
+                        )
                     })
                 };
-                let attribution = if stop() {
+                let attribution = if operation.fired() {
                     None
                 } else {
                     explanation.as_ref().and_then(|explanation| {

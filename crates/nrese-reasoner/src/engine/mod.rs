@@ -42,7 +42,8 @@ use crate::unnamed::UnnamedVocabulary;
 
 pub use explain::{
     InferenceStep, JUSTIFICATIONS_AT_MOST, JustificationAnswer, JustificationMode,
-    JustifiedStatement, explain_fact, explain_violation, justify_fact,
+    JustifiedStatement, explain_fact, explain_fact_until, explain_violation,
+    explain_violation_until, justify_fact, justify_fact_until,
 };
 pub use maintain::{
     EngineBase, Maintenance, install_closure, maintain, maintain_with, maintain_with_report_budget,
@@ -124,8 +125,9 @@ impl Program {
             snapshot,
             axioms: &[],
         };
-        let facts = crate::eval::AllFacts(&crate::explain::Whole(&base));
-        !crate::lists::instantiate(&lists, &facts).1.is_empty()
+        let facts =
+            crate::eval::AllFacts(&crate::explain::Whole(&base), &crate::eval::Poller::never());
+        lists.leaves_out(&facts)
     }
 
     /// Whether one of `quads` (by `at`'s ids) can change what [`Self::leaves_out_a_list`]
@@ -331,19 +333,33 @@ impl Program {
     /// The ground program of the committed state `snapshot`, as the delta executor
     /// builds it.
     pub fn ground_program(&self, snapshot: &Snapshot) -> GroundProgram {
+        self.ground_program_until(snapshot, crate::eval::NEVER)
+            .expect("unbounded grounding")
+    }
+
+    /// Grounds the snapshot's rules and private tables under the caller's stop.
+    pub fn ground_program_until(
+        &self,
+        snapshot: &Snapshot,
+        stop: crate::eval::Stop<'_>,
+    ) -> Result<GroundProgram, crate::eval::Stopped> {
+        if stop() {
+            return Err(crate::eval::Stopped);
+        }
         let schema = self.schema_for(snapshot);
         let rules = self.rules_for(snapshot);
         let base = explain::SnapshotBase {
             snapshot,
             axioms: &self.axioms,
         };
-        delta::program(
+        delta::program_until(
             &base,
             delta::Rules {
                 rules: &rules,
                 schema: &schema,
                 ..self.rules()
             },
+            stop,
         )
     }
 
@@ -443,7 +459,10 @@ impl<E> Vocabulary for Constants<'_, E> {
 }
 
 /// Whether RDF can store the triple: an IRI or blank node subject and an IRI predicate.
-pub(crate) fn storable([subject, predicate, _]: Triple) -> bool {
+pub(crate) fn storable(fact @ [subject, predicate, _]: Triple) -> bool {
+    if fact.into_iter().any(crate::lists::internal) {
+        return false;
+    }
     matches!(
         TermId::from_raw(subject).kind(),
         TermKind::Iri | TermKind::BlankNode

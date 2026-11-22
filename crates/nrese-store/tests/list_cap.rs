@@ -700,8 +700,8 @@ fn a_later_write_over_a_list_past_the_cap_gets_its_inference() {
 /// - `cax-adc` (Table 7), with `prp-spo1` for `ex:alt rdfs:subPropertyOf rdf:first`: the
 ///   second cell's members come only through `ex:alt` (65 of them), then `ex:c2 rdf:first
 ///   ex:B` and `ex:x rdf:type ex:B` are written with `ex:x` in `ex:A`: `(ex:A ex:B)`;
-/// - `cax-adc`: the second cell holds 65 written members, `ex:x` in `ex:A` and `ex:B`, and a
-///   delete of one member leaves `(ex:A ex:B)` with both;
+/// - `cax-adc`: deleting one of 65 written members still leaves a walk through the second
+///   cell's derived member `ex:Z1`, so adding its type clashes with `ex:A`;
 /// - `cax-adc` with `eq-rep-o`: the axiom's head `ex:c1` is the same as `ex:h`, whose list is
 ///   `(ex:C ex:B)`; the tail is equal to a node with 64 more members (through a subproperty of
 ///   `owl:sameAs`, `prp-spo1`); `ex:x` in `ex:C`, and later in `ex:B`;
@@ -759,13 +759,14 @@ fn a_clash_a_later_write_gives_through_a_list_past_the_cap_is_refused() {
             "cax-adc",
         ),
         (
-            "a delete that brings the written cell to 64",
+            "a delete and a type in a derived member",
             format!(
                 "{alt}{head}ex:c2 rdf:first ex:B , {} ; rdf:rest rdf:nil ; \
-                 ex:alt ex:Z1 , ex:Z2 . ex:x rdf:type ex:A , ex:B .",
+                 ex:alt ex:Z1 , ex:Z2 . ex:x rdf:type ex:A .",
                 b(1)
             ),
-            "DELETE DATA { ex:c2 rdf:first ex:B1 . }".to_owned(),
+            "DELETE DATA { ex:c2 rdf:first ex:B1 . } ; INSERT DATA { ex:x rdf:type ex:Z1 . }"
+                .to_owned(),
             "cax-adc",
         ),
         (

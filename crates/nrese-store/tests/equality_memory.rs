@@ -1,8 +1,8 @@
 //! D14 (LM-V15-4): an embedded store's memory limit (`process_memory_bytes`, its own watch,
 //! not the process's global limit) admits the reasoner's equality copies before they are
 //! made, in each of the store's operations that reason: a rematerialisation, a commit's
-//! maintenance and the equality report. Measured with a counting allocator, so this file is
-//! a test binary of its own.
+//! maintenance and the equality report. A commit's list premises are held to it the same
+//! way. Measured with a counting allocator, so this file is a test binary of its own.
 
 use std::sync::{Arc, Mutex};
 
@@ -134,6 +134,57 @@ fn a_commits_maintenance_is_refused_by_the_stores_own_limit_before_the_copies() 
             "replicate {replicate}: {peak} bytes at the heap's peak"
         );
     }
+}
+
+/// A commit of an intersection of 3,000 classes, read cell by cell (past the 256 classes of
+/// a rule), gives each member a premise path along the whole list for OWL 2 RL Table 6
+/// `cls-int2` and Table 9 `scm-int`: about 860 MB in all. Past the store's limit it is
+/// refused for it, with that limit; the heap stays under twice the room.
+#[test]
+fn a_long_intersections_member_premises_are_refused_by_the_stores_own_limit() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    if !nrese_exec::memory::READS_MEMORY {
+        return;
+    }
+    const EX: &str = "http://example.com/";
+    const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+    let mut data = format!("<{EX}All> <http://www.w3.org/2002/07/owl#intersectionOf> <{EX}c0> . ");
+    for i in 0..3_000 {
+        let rest = match i {
+            2_999 => format!("<{RDF}nil>"),
+            _ => format!("<{EX}c{}>", i + 1),
+        };
+        data.push_str(&format!(
+            "<{EX}c{i}> <{RDF}first> <{EX}C{i}> . <{EX}c{i}> <{RDF}rest> {rest} . "
+        ));
+    }
+    let store = store(true);
+    let pipeline = MutationPipeline::new(
+        Arc::clone(&store),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Rl,
+        ))),
+    );
+    let limit = store.process_memory_bytes().expect("the limit reads here");
+    let (result, peak) = peak(|| {
+        pipeline.apply(
+            MutationCommand::Update(SparqlUpdateRequest::new(format!(
+                "INSERT DATA {{ {data} }}"
+            ))),
+            &Requester::all(),
+            &MutationTicket::new(),
+        )
+    });
+    let error = result.expect_err("the premises were made");
+    assert!(
+        matches!(
+            &error,
+            MutationError::Store { source: StoreError::ProcessMemoryLimit { limit: l }, .. }
+                if *l == limit
+        ),
+        "{error}, not the store's limit {limit}"
+    );
+    assert!(peak < 2 * ROOM as usize, "{peak} bytes at the heap's peak");
 }
 
 /// The equality report, whose replicated closure would make the copies past the store's
