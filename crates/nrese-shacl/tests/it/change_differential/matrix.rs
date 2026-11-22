@@ -85,6 +85,13 @@ pub(super) fn run() {
         .chain(identity::rows())
         .chain(terminal::rows());
     let selector = std::env::var("NRESE_SHACL_CASE").ok();
+    if selector
+        .as_ref()
+        .is_some_and(|case| !case.starts_with("row:"))
+    {
+        // A random draw's or saved case's selector.
+        return;
+    }
     let gaps = super::witnesses::verified_gaps();
     let mut allowances: [Allowances<'_>; 3] = Default::default();
     let mut checked = 0;

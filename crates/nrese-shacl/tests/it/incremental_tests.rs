@@ -38,17 +38,17 @@ ex:S5 a sh:NodeShape ; sh:targetNode ex:n0 , ex:n1 ;
 
 /// `seed` varied by `NRESE_FUZZ_SEED` (a number) for bug hunts over many seeds; without
 /// it, the same cases on every run.
-fn fuzz(seed: u64) -> u64 {
+pub(super) fn fuzz(seed: u64) -> u64 {
     let fuzz: u64 = std::env::var("NRESE_FUZZ_SEED")
         .ok()
         .and_then(|value| value.trim().parse().ok())
         .unwrap_or(0);
     seed ^ fuzz.wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
-struct Rng(u64);
+pub(super) struct Rng(pub(super) u64);
 
 impl Rng {
-    fn below(&mut self, n: u64) -> u64 {
+    pub(super) fn below(&mut self, n: u64) -> u64 {
         self.0 = self
             .0
             .wrapping_mul(6_364_136_223_846_793_005)
