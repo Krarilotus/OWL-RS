@@ -3650,6 +3650,65 @@ mod marker_tests {
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
+
+    /// A marker read from disk while no state is kept in memory (an open whose own read of it
+    /// failed, read again later) is a store opened without a rebuild: whether the rules
+    /// equated two literals is unknown, and a certificate made from it (a registration of
+    /// rules, as every pipeline's, or a change of the QL setting) withholds a read of
+    /// literals. Under `owl2-rl` with the rewriting, a string value is `complete` after its
+    /// rebuild; with the kept state gone, the state read from the marker carries both flags,
+    /// and the read isn't `complete` under the certificate made from it.
+    #[test]
+    fn a_marker_read_from_disk_counts_a_literal_equality_as_unknown() {
+        use nrese_reasoner::rulesets::Ruleset;
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data.nt");
+        std::fs::write(
+            &data,
+            "<http://example.com/a> <http://example.com/p> \"Rex\" .\n",
+        )
+        .unwrap();
+        let store = StoreService::new(StoreConfig {
+            ql_rewriting: crate::QlRewritingMode::On,
+            ..StoreConfig::on_disk(dir.path().join("store"))
+        })
+        .unwrap();
+        store
+            .bulk_load(&crate::BulkLoadRequest {
+                files: vec![data],
+                replace: false,
+                graph: crate::GraphTarget::DefaultGraph,
+                invalid: None,
+            })
+            .unwrap();
+        store.rematerialise(Ruleset::Owl2Rl).unwrap();
+        store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
+        let word = |store: &StoreService| {
+            let read = "SELECT ?o { <http://example.com/a> <http://example.com/p> ?o }";
+            let status = store.execute_query_str(read).unwrap().completeness;
+            status.map_or("none".to_owned(), |s| {
+                format!("{} {:?}", s.as_str(), s.reasons)
+            })
+        };
+        let rebuilt = word(&store);
+        assert!(
+            rebuilt.starts_with("complete "),
+            "the setup, rebuilt: {rebuilt}"
+        );
+        // The trace of an open whose read of the marker failed: no state kept in memory.
+        *store.materialised.lock().unwrap() = None;
+        let read = store.reasoning_state().expect("the marker is on disk");
+        assert!(
+            read.literal_equality && read.literal_equality_unknown,
+            "the state read from the marker: {read:?}"
+        );
+        store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
+        let certified = word(&store);
+        assert!(
+            !certified.starts_with("complete "),
+            "under the certificate made from the marker: {certified}"
+        );
+    }
 }
 
 #[cfg(test)]
