@@ -4,6 +4,8 @@ use crate::{
     judges, oracle, sweep,
 };
 
+mod schema_operands;
+
 const ANNOTATION_AND_CLASS_DECLARATIONS: &str = "
     rdfs:label rdf:type owl:AnnotationProperty
     rdfs:comment rdf:type owl:AnnotationProperty
