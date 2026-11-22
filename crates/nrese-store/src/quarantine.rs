@@ -251,6 +251,8 @@ struct PlacementFaults {
     /// The rename reports an error without moving the file, and the check whether it moved
     /// the file fails.
     unmoved_rename: std::sync::atomic::AtomicBool,
+    /// The check whether a rename that reported an error moved the file.
+    existence: std::sync::atomic::AtomicBool,
     /// Where a commit whose placement failed stops, holding the state lock: it sends on the
     /// first once there, and goes on once the second receives a message or is disconnected.
     pause: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
@@ -397,6 +399,15 @@ impl Quarantine {
     pub fn fail_next_rename_and_existence_check(&self) {
         self.placement_faults
             .unmoved_rename
+            .store(true, Ordering::Relaxed);
+    }
+
+    /// Test hook: the next check whether a rename that reported an error moved the load's
+    /// file fails.
+    #[cfg(any(test, feature = "fault-points"))]
+    pub fn fail_next_existence_check(&self) {
+        self.placement_faults
+            .existence
             .store(true, Ordering::Relaxed);
     }
 
@@ -1358,6 +1369,17 @@ impl Collector<'_> {
                 "looking for the load's file failed (a test's)",
             ));
         }
+        #[cfg(any(test, feature = "fault-points"))]
+        if self
+            .quarantine
+            .placement_faults
+            .existence
+            .swap(false, Ordering::Relaxed)
+        {
+            return Err(io::Error::other(
+                "looking for the load's file failed (a test's)",
+            ));
+        }
         listed.try_exists()
     }
 
@@ -2161,6 +2183,48 @@ mod tests {
                 "the load completed at published revision {revision}. Its quarantine record couldn't be kept: the rename failed (a test's). This load's records may be listed under load ID {load}. Don't send it again."
             )
         );
+    }
+
+    /// A published load whose rename moved its file and reported an error, and whose check
+    /// for the file then failed: its record is listed but not counted. Discarding it leaves
+    /// the open count as it was, and the count of a later load's record right.
+    #[test]
+    fn discarding_a_record_never_counted_leaves_the_open_count_right() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("store");
+        let store = crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
+        let quarantine = store.quarantine();
+        let bulk_load = || {
+            let file = dir.path().join("load.nt");
+            fs::write(&file, MIXED_LOAD).unwrap();
+            store.bulk_load(&crate::BulkLoadRequest {
+                files: vec![file],
+                replace: false,
+                graph: crate::GraphTarget::DefaultGraph,
+                invalid: None,
+            })
+        };
+        quarantine.fail_next_rename_after_moving();
+        quarantine.fail_next_existence_check();
+        let uncounted = bulk_load();
+        let Err(StoreError::LoadPublished {
+            reason: QuarantineCommitError::PossiblyListed { load, seen, .. },
+            ..
+        }) = &uncounted
+        else {
+            panic!("{uncounted:?}");
+        };
+        assert!(!seen, "{uncounted:?}");
+        let listed = quarantine.list(&QuarantineFilter::default()).unwrap();
+        assert_eq!(listed.len(), 1, "{listed:#?}");
+        assert_eq!(&listed[0].statement.load, load);
+        assert_eq!(quarantine.open_count(), 0);
+
+        let id = listed[0].statement.id.clone();
+        quarantine.discard(&[id], None).unwrap();
+        assert_eq!(quarantine.open_count(), 0, "after the discard");
+        bulk_load().unwrap();
+        assert_eq!(quarantine.open_count(), 1, "after a counted load");
     }
 
     /// A commit holds the state lock from placing its file to taking it back, and a listing
