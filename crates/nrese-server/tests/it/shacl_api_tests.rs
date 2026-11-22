@@ -4,11 +4,12 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use axum::response::Response;
-use nrese_reasoner::ReasonerConfig;
+use nrese_reasoner::{ReasonerConfig, ReasoningMode};
 use nrese_server::policy::PolicyConfig;
 use nrese_store::{GateSeverity, ShaclGate, StoreConfig};
 use tower::util::ServiceExt;
 
+use crate::access_control_tests::{policy_of, token};
 use crate::support::{body_text, query_text, test_app, test_app_with_store_config};
 use crate::upgrade_tests::{Server, configure};
 
@@ -21,6 +22,355 @@ const PREFIXES: &str = "@prefix ex: <http://example.com/> .
 /// Every person needs a name.
 const SHAPES: &str = "ex:PersonShape a sh:NodeShape ; sh:targetClass ex:Person ;
   sh:property [ sh:path ex:name ; sh:minCount 1 ; sh:message \"a person needs a name\" ] .";
+
+const NAMED_SHAPE: &str = "ex:NameShape a sh:PropertyShape ; sh:targetClass ex:Person ;
+    sh:path ex:name ; sh:minCount 1 ; sh:message \"Name fehlt\"@de .";
+
+fn restricted_shacl_app(read_shapes: bool) -> Result<axum::Router, Box<dyn std::error::Error>> {
+    let shapes = if read_shapes {
+        format!(", \"{SHAPES_GRAPH}\"")
+    } else {
+        String::new()
+    };
+    let policy = format!(
+        r#"default = "deny"
+inferred = "hidden"
+[[role]]
+name = "writer"
+read = ["http://example.com/open"{shapes}]
+write = ["http://example.com/open"]"#
+    );
+    test_app_with_store_config(
+        StoreConfig {
+            shacl_gate: ShaclGate::Enforce(GateSeverity::Violation),
+            ..StoreConfig::in_memory()
+        },
+        policy_of(&policy)?,
+        ReasonerConfig::for_mode(ReasoningMode::Disabled),
+    )
+}
+
+/// Spec (docs/ops/http-api.md, docs/design/shacl.md): an enforcing gate reports what the
+/// committer's own graphs show. Equal readable data gives the same refusal body.
+#[tokio::test]
+async fn a_restricted_shacl_refusal_body_depends_only_on_readable_graphs() -> TestResult {
+    let admin = format!("Bearer {}", token(&["nrese.admin"]));
+    let writer = format!("Bearer {}", token(&["writer"]));
+    let mut replies = Vec::new();
+    // Each hidden graph satisfies a different visible focus node and adds its own focus
+    // when Candidate becomes a subclass of Person. Even filtering the full report by
+    // visible focus nodes would leave different answers and lose a visible result.
+    for hidden in [
+        "ex:bob ex:name \"Bob\" . ex:secretOne a ex:Candidate ; ex:note \"Name fehlt\"@de",
+        "ex:ada ex:name \"Ada\" . ex:secretTwo a ex:Candidate ; ex:note \"A name is required\"",
+    ] {
+        let app = restricted_shacl_app(true)?;
+        let update = "/dataset/update";
+        let media = ("content-type", "application/sparql-update");
+        let auth = ("authorization", admin.as_str());
+        let seed = format!(
+            "PREFIX ex: <http://example.com/> INSERT DATA {{ GRAPH ex:secret {{ {hidden} }} }}"
+        );
+        let response = send(&app, Method::POST, update, &[media, auth], seed).await?;
+        assert!(
+            response.status().is_success(),
+            "{}",
+            body_text(response).await?
+        );
+        let setup =
+            format!("{PREFIXES}{NAMED_SHAPE}\nex:NameShape sh:message \"A name is required\" .");
+        let response = send(
+            &app,
+            Method::PUT,
+            "/api/v1/repositories/nrese/shapes",
+            &[("content-type", "text/turtle"), auth],
+            setup,
+        )
+        .await?;
+        assert!(
+            response.status().is_success(),
+            "{}",
+            body_text(response).await?
+        );
+        let response = send(
+            &app,
+            Method::POST,
+            update,
+            &[
+                media,
+                ("authorization", &writer),
+                ("x-request-id", "same-request"),
+            ],
+            "PREFIX ex: <http://example.com/>
+             INSERT DATA { GRAPH ex:open {
+                ex:bob a ex:Person . ex:ada a ex:Person .
+                ex:Candidate <http://www.w3.org/2000/01/rdf-schema#subClassOf> ex:Person
+             } }",
+        )
+        .await?;
+        replies.push((response.status(), body_text(response).await?));
+    }
+    assert_eq!(replies[0], replies[1]);
+    let (status, body) = &replies[0];
+    let problem: serde_json::Value = serde_json::from_str(body)?;
+    assert_eq!(
+        problem["shacl"]["results"],
+        serde_json::json!([
+            name_result("ada", &["A name is required", "Name fehlt"]),
+            name_result("bob", &["A name is required", "Name fehlt"]),
+        ]),
+        "{body}"
+    );
+    assert_eq!(*status, StatusCode::BAD_REQUEST);
+    assert_eq!(problem["type"], "https://nrese.dev/problems/shacl-reject");
+    assert!(!body.contains("secret"), "{body}");
+    Ok(())
+}
+
+/// Spec (docs/ops/http-api.md, docs/design/shacl.md): unreadable shapes and SHACL-SPARQL
+/// shapes supply no SHACL report to a committer who can read only some graphs.
+#[tokio::test]
+async fn a_restricted_shacl_refusal_can_withhold_the_report() -> TestResult {
+    let admin = format!("Bearer {}", token(&["nrese.admin"]));
+    let writer = format!("Bearer {}", token(&["writer"]));
+    for (read_shapes, shapes, data) in [
+        (false, NAMED_SHAPE, "ex:bob a ex:Person"),
+        (true, SPARQL_SHAPES, "ex:bob a ex:Person ; ex:name \"Bob\""),
+    ] {
+        let app = restricted_shacl_app(read_shapes)?;
+        let setup = send(
+            &app,
+            Method::PUT,
+            "/api/v1/repositories/nrese/shapes",
+            &[("content-type", "text/turtle"), ("authorization", &admin)],
+            format!("{PREFIXES}{shapes}"),
+        )
+        .await?;
+        assert!(setup.status().is_success(), "{}", body_text(setup).await?);
+        let response = send(
+            &app,
+            Method::POST,
+            "/dataset/update",
+            &[
+                ("content-type", "application/sparql-update"),
+                ("authorization", &writer),
+            ],
+            format!(
+                "PREFIX ex: <http://example.com/> INSERT DATA {{ GRAPH ex:open {{ {data} }} }}"
+            ),
+        )
+        .await?;
+        let status = response.status();
+        let problem: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
+        assert_eq!(
+            (problem["type"].as_str(), problem.get("shacl")),
+            (Some("https://nrese.dev/problems/commit-reject"), None),
+            "{problem}"
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    Ok(())
+}
+
+fn name_result(person: &str, messages: &[&str]) -> serde_json::Value {
+    serde_json::json!({
+        "focusNode": format!("http://example.com/{person}"),
+        "resultPath": "http://example.com/name",
+        "value": null,
+        "sourceShape": "http://example.com/NameShape",
+        "sourceConstraintComponent": "http://www.w3.org/ns/shacl#MinCountConstraintComponent",
+        "resultSeverity": "http://www.w3.org/ns/shacl#Violation",
+        "resultMessage": messages,
+    })
+}
+
+/// Spec (docs/ops/http-api.md, docs/design/shacl.md): report mode accepts the write and
+/// logs its results, with the first result chosen by the same term order as a refusal.
+#[test]
+fn the_reporting_gate_logs_its_first_result_in_term_order() -> TestResult {
+    use std::io::{Read, Seek};
+    use std::sync::Arc;
+
+    use nrese_store::{
+        MutationCommand, MutationPipeline, MutationTicket, Requester, SparqlUpdateRequest,
+        StoreService,
+    };
+
+    let store = StoreService::new(StoreConfig {
+        shacl_gate: ShaclGate::Report,
+        ..StoreConfig::in_memory()
+    })?;
+    let reasoner =
+        nrese_reasoner::ReasonerService::new(ReasonerConfig::for_mode(ReasoningMode::Disabled));
+    let pipeline = MutationPipeline::new(Arc::new(store), Arc::new(reasoner));
+    let apply = |body: &str| {
+        let update = format!(
+            "PREFIX ex: <http://example.com/> PREFIX sh: <http://www.w3.org/ns/shacl#> {body}"
+        );
+        pipeline.apply(
+            MutationCommand::Update(SparqlUpdateRequest::new(update)),
+            &Requester::all(),
+            &MutationTicket::new(),
+        )
+    };
+    apply("INSERT DATA { ex:z ex:seed ex:z }")?;
+    apply(&format!(
+        "INSERT DATA {{ GRAPH <{SHAPES_GRAPH}> {{ {NAMED_SHAPE} }} }}"
+    ))?;
+    let mut log = tempfile::tempfile()?;
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(log.try_clone()?)
+        .finish();
+    let write = tracing::subscriber::with_default(subscriber, || {
+        apply("INSERT DATA { ex:z a ex:Person . ex:a a ex:Person }")
+    });
+    log.rewind()?;
+    let mut output = String::new();
+    log.read_to_string(&mut output)?;
+    assert!(
+        output.lines().any(|line| {
+            line.contains("first: focus node <http://example.com/a>")
+                && line.contains("SHACL gate: not rejected")
+        }),
+        "{output}"
+    );
+    write?;
+    Ok(())
+}
+
+/// Spec (docs/ops/http-api.md, docs/design/shacl.md): every committing protocol answers
+/// a SHACL refusal with the same structured results and first-result explanation.
+#[tokio::test]
+async fn every_commit_protocol_carries_the_shacl_refusal() -> TestResult {
+    let app = test_app_with_store_config(
+        StoreConfig {
+            shacl_gate: ShaclGate::Enforce(GateSeverity::Violation),
+            ..StoreConfig::in_memory()
+        },
+        policy_of("default = \"deny\"")?,
+        ReasonerConfig::for_mode(ReasoningMode::Disabled),
+    )?;
+    let admin = format!("Bearer {}", token(&["nrese.admin"]));
+    let auth = ("authorization", admin.as_str());
+    let update_media = ("content-type", "application/sparql-update");
+    let turtle = ("content-type", "text/turtle");
+    let data = "<http://example.com/bob> a <http://example.com/Person> .";
+    let update = format!("INSERT DATA {{ {data} }}");
+    let shapes = send(
+        &app,
+        Method::PUT,
+        "/api/v1/repositories/nrese/shapes",
+        &[auth, turtle],
+        format!("{PREFIXES}{NAMED_SHAPE}"),
+    )
+    .await?;
+    assert!(shapes.status().is_success(), "{}", body_text(shapes).await?);
+
+    let repo = "/repositories/nrese";
+    let opened = send(
+        &app,
+        Method::POST,
+        &format!("{repo}/transactions"),
+        &[auth],
+        Body::empty(),
+    )
+    .await?;
+    let tx = opened.headers()["location"].to_str()?.to_owned();
+    let staged = send(
+        &app,
+        Method::PUT,
+        &format!("{tx}?action=ADD"),
+        &[auth, turtle],
+        data,
+    )
+    .await?;
+    assert_eq!(
+        staged.status(),
+        StatusCode::OK,
+        "{}",
+        body_text(staged).await?
+    );
+
+    let opened = send(
+        &app,
+        Method::POST,
+        "/api/v1/repositories/nrese/sessions",
+        &[auth],
+        Body::empty(),
+    )
+    .await?;
+    let opened: serde_json::Value = serde_json::from_str(&body_text(opened).await?)?;
+    let session = opened["path"].as_str().expect("session path");
+    let staged = send(
+        &app,
+        Method::POST,
+        &format!("{session}/update"),
+        &[auth, update_media],
+        update.clone(),
+    )
+    .await?;
+    assert!(staged.status().is_success(), "{}", body_text(staged).await?);
+
+    let restore = format!(
+        "<http://example.com/bob> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.com/Person> .\n\
+         <http://example.com/NameShape> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/shacl#PropertyShape> <{SHAPES_GRAPH}> .\n\
+         <http://example.com/NameShape> <http://www.w3.org/ns/shacl#targetClass> <http://example.com/Person> <{SHAPES_GRAPH}> .\n\
+         <http://example.com/NameShape> <http://www.w3.org/ns/shacl#path> <http://example.com/name> <{SHAPES_GRAPH}> .\n\
+         <http://example.com/NameShape> <http://www.w3.org/ns/shacl#minCount> \"1\"^^<http://www.w3.org/2001/XMLSchema#integer> <{SHAPES_GRAPH}> .\n\
+         <http://example.com/NameShape> <http://www.w3.org/ns/shacl#message> \"Name fehlt\"@de <{SHAPES_GRAPH}> .\n"
+    );
+    let expected = serde_json::json!({
+        "results": [name_result("bob", &["Name fehlt"])],
+        "results_omitted": 0,
+        "failures": [],
+        "failures_omitted": 0
+    });
+    for (method, uri, media, payload) in [
+        (
+            Method::POST,
+            "/dataset/update",
+            update_media,
+            update.as_str(),
+        ),
+        (Method::PUT, "/dataset/data?default", turtle, data),
+        (Method::POST, "/dataset/tell", turtle, data),
+        (Method::POST, "/repositories/nrese/statements", turtle, data),
+        (Method::PUT, &format!("{tx}?action=COMMIT"), turtle, ""),
+        (Method::POST, &format!("{session}/commit"), turtle, ""),
+        (
+            Method::POST,
+            "/ops/api/admin/dataset/restore",
+            ("content-type", "application/n-quads"),
+            restore.as_str(),
+        ),
+    ] {
+        let response = send(&app, method, uri, &[auth, media], payload.to_owned()).await?;
+        let status = response.status();
+        let problem: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
+        assert_eq!(problem["shacl"], expected, "{uri}: {problem}");
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(problem["type"], "https://nrese.dev/problems/shacl-reject");
+        let reason = &problem["reasoner_reject"];
+        assert_eq!(
+            reason["violated_constraint"],
+            expected["results"][0]["sourceConstraintComponent"]
+        );
+        assert_eq!(reason["focus_resource"], "<http://example.com/bob>");
+        assert_eq!(reason["evidence"], serde_json::json!([]));
+    }
+    let bad = send(
+        &app,
+        Method::POST,
+        "/dataset/update",
+        &[auth, update_media],
+        "bad",
+    )
+    .await?;
+    let problem: serde_json::Value = serde_json::from_str(&body_text(bad).await?)?;
+    assert_eq!(problem.get("shacl"), None, "{problem}");
+    Ok(())
+}
 
 fn encode(text: &str) -> String {
     serde_urlencoded::to_string([("v", text)]).expect("encodes")[2..].to_owned()
@@ -475,8 +825,8 @@ async fn the_report_carries_sparql_constraint_messages() -> TestResult {
     Ok(())
 }
 
-/// A commit the SHACL gate refuses names the first result's message in its detail, filled
-/// in as the report has it: the committer is told what the shape says is wrong.
+/// Spec (docs/ops/http-api.md, docs/design/shacl.md): a refused commit carries the filled
+/// SHACL-SPARQL message and names its shape and component. The detail repeats the message.
 #[tokio::test]
 async fn a_shacl_reject_names_the_result_s_message() -> TestResult {
     let config = StoreConfig {
@@ -511,6 +861,20 @@ async fn a_shacl_reject_names_the_result_s_message() -> TestResult {
     .await?;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let problem: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
+    let result = &problem["shacl"]["results"][0];
+    assert_eq!(
+        (
+            &result["resultMessage"],
+            &result["sourceShape"],
+            &result["sourceConstraintComponent"],
+        ),
+        (
+            &serde_json::json!(["Bob is not a full name"]),
+            &serde_json::json!("http://example.com/FullName"),
+            &serde_json::json!("http://www.w3.org/ns/shacl#SPARQLConstraintComponent"),
+        ),
+        "{problem}"
+    );
     assert_eq!(
         problem["type"], "https://nrese.dev/problems/shacl-reject",
         "{problem}"
