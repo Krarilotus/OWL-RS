@@ -89,25 +89,26 @@ fn stops() -> Vec<Row> {
     rows
 }
 
-// Spec: both change APIs report every failure of the later validation.
+// Spec: both change APIs report every failure of the later validation, one per solution
+// (SHACL §3.6.2), however alike their text.
 fn failures() -> [Row; 3] {
     let shapes = "ex:T sh:targetNode ex:n5 ; sh:sparql ex:Check .
-        ex:Check sh:select '''SELECT $this ?failure WHERE {
+        ex:Check sh:select '''SELECT $this ?v ?failure WHERE {
             $this <http://example.com/p0> ?v .
             BIND(true AS ?failure)
         }''' .";
-    let trigger = "ex:n5 ex:p0 ex:v1 .";
+    let trigger = "ex:n5 ex:p0 ex:v1 . ex:n5 ex:p0 ex:v2 .";
     let mut step = Step::insert(trigger);
     step.shapes = Some(format!("{shapes} ex:T sh:name \"conditional check\" ."));
     let row = |id, step| {
         let mut row = Row::new(
             id,
-            "The selected edit triggers exactly one new SPARQL failure.",
+            "The selected edit triggers two new SPARQL failures with the same text.",
             Case::new(shapes, "", step),
             [],
             [],
         );
-        row.after_failures = BTreeMap::from([(FAILURE.into(), 1)]);
+        row.after_failures = BTreeMap::from([(FAILURE.into(), 2)]);
         row
     };
     let unconditional = "ex:T sh:targetNode ex:n5 ; sh:sparql ex:Check .
