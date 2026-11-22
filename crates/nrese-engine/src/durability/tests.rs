@@ -1253,12 +1253,8 @@ fn a_rotation_whose_segment_may_be_placed_takes_no_more_commits() {
         load.add(&[quad(10)]);
         load.finish()
     };
-    let rows: [(
-        &str,
-        EngineConfig,
-        bool,
-        &dyn Fn(&Engine) -> EngineResult<CommitSummary>,
-    ); 4] = [
+    type Step<'a> = &'a dyn Fn(&Engine) -> EngineResult<CommitSummary>;
+    let rows: [(&str, EngineConfig, bool, Step<'_>); 4] = [
         (
             "a commit's rotation, an error",
             small_segments(),
