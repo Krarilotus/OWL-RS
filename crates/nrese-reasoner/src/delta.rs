@@ -10,8 +10,8 @@
 //!    fact with a derivation that uses a deleted fact is removed, transitively: semi-naive
 //!    evaluation over the old state with the deleted facts as the delta. Rule instances
 //!    that exist because of a deleted schema fact are found by grounding through it
-//!    ([`super::eval::ground_delta`]) and evaluated in full, as are list rules whose list
-//!    lost a fact.
+//!    ([`super::eval::ground_delta`]), including list rules that read it as an operand.
+//!    Those instances and rules whose list lost a structural fact are evaluated in full.
 //! 2. **Rederive.** Each overdeleted fact (and each deleted asserted fact) that still has a
 //!    one-step derivation from the remaining facts is put back
 //!    ([`GroundProgram::derivable_with`], which finds the candidate rules by head).
@@ -48,9 +48,9 @@ use nrese_exec::Budget;
 
 use super::batch::{Equality, Store, check, is_replacement};
 use super::eval::{
-    AllFacts, GroundProgram, Job, NEVER, Poller, Probe, RuleKey, Schema, Seg, Source, Stop,
-    Stopped, Visit, Visits, WitnessIndex, instantiate_head, rule_key, run_jobs, run_jobs_acyclic,
-    transitive_predicate,
+    AllFacts, GroundProgram, Job, ListRuleHeads, NEVER, Poller, Probe, RuleKey, Schema, Seg,
+    Source, Stop, Stopped, Visit, Visits, WitnessIndex, instantiate_head, rule_key, run_jobs,
+    run_jobs_acyclic, transitive_predicate,
 };
 use super::ir::Triple;
 use super::ir::{Head, Rule};
@@ -289,7 +289,7 @@ impl Rules<'_> {
                 self.schema,
                 state.extra,
                 poll,
-                false,
+                ListRuleHeads::All,
             )?;
         }
         Ok(list_changed)
@@ -858,7 +858,14 @@ fn update_body<B: Base + ?Sized>(
             scratch.ground_delta(&old, schema, &fact_schema_rules);
             if !backward && let Some(operands) = old_program.list_operands.as_deref() {
                 operands
-                    .ground_delta(&mut scratch, &old, schema, &extra, &stage, true)
+                    .ground_delta(
+                        &mut scratch,
+                        &old,
+                        schema,
+                        &extra,
+                        &stage,
+                        ListRuleHeads::FactsOnly,
+                    )
                     .map_err(stopped)?;
             }
             let mut fresh: Vec<Rule> = scratch.rules.clone();

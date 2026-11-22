@@ -2330,7 +2330,14 @@ pub(crate) struct ListOperands {
     dispatch: Dispatch,
 }
 
+pub(crate) enum ListRuleHeads {
+    All,
+    FactsOnly,
+}
+
 impl ListOperands {
+    /// Grounds the templates that read changed schema atoms, keeping their list premises.
+    /// Overdeletion asks only for rules that derive facts.
     pub(crate) fn ground_delta<S: Source + ?Sized>(
         &self,
         target: &mut GroundProgram,
@@ -2338,14 +2345,14 @@ impl ListOperands {
         schema: &Schema,
         delta: &super::batch::Store,
         poll: &Poller<'_>,
-        facts_only: bool,
+        heads: ListRuleHeads,
     ) -> Result<(), Stopped> {
         for (index, _) in self.dispatch.matching(delta, poll)? {
             if poll.tick() {
                 return Err(Stopped);
             }
             let (rule, premises) = &self.templates[index];
-            if !facts_only || rule.head != Head::Inconsistent {
+            if matches!(heads, ListRuleHeads::All) || rule.head != Head::Inconsistent {
                 target.ground_one(source, schema, rule, true, premises);
             }
         }
@@ -2666,9 +2673,9 @@ impl GroundProgram {
             (!operands.templates.is_empty()).then(|| std::sync::Arc::new(operands));
     }
 
-    /// Grounds `rules` through the delta of `source` only (rules without schema atoms, list
-    /// rules among them, in full); returns the indices of the new fact rules and
-    /// consistency rules.
+    /// Grounds `rules` through the delta of `source` (rules without schema atoms in full).
+    /// Returns the indices of new fact and consistency rules. Incremental list operands
+    /// use `ListOperands::ground_delta` so their list premises stay attached.
     pub fn ground_delta<S: Source + ?Sized>(
         &mut self,
         source: &S,
