@@ -272,6 +272,42 @@ fn a_mode_switch_during_the_check_leaves_it_on_its_route() {
     assert_eq!(format!("{answer:?}"), "Ok(NotEntailed)");
 }
 
+/// A rule program whose conversion into one takes 600 ms.
+struct SlowProgram(nrese_reasoner::RuleProgram);
+
+impl From<SlowProgram> for nrese_reasoner::RuleProgram {
+    fn from(slow: SlowProgram) -> Self {
+        std::thread::sleep(Duration::from_millis(600));
+        slow.0
+    }
+}
+
+/// Spec (`entails` under `owl2-dl`: one `dl.timeout` from the call; past it, no answer of
+/// any kind): the caller's conversion of its program is part of the call, so where it takes
+/// the time, the answer is undecided; with a quick one, entailed.
+#[test]
+fn a_program_conversion_that_takes_the_time_leaves_the_answer_undecided() {
+    let answers = [false, true].map(|slow| {
+        let dl = DlConfig {
+            timeout: Some(Duration::from_millis(300)),
+            ..DlConfig::default()
+        };
+        let (store, _pipeline) = dl_store(dl, EMPTY_C);
+        let rules = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl)
+            .materialised_program()
+            .unwrap();
+        let answer = match slow {
+            true => store.entails(SlowProgram(rules), &not_in("a", "C")),
+            false => store.entails(rules, &not_in("a", "C")),
+        };
+        match answer {
+            Err(crate::StoreError::Undecided(_)) => "undecided".to_owned(),
+            other => format!("{other:?}"),
+        }
+    });
+    assert_eq!(answers, ["Ok(Entailed)".to_owned(), "undecided".to_owned()]);
+}
+
 /// Spec (`entails` under `owl2-dl`: one `dl.timeout` from the call; past it, no answer of
 /// any kind): where the time runs out after the check has its answer and has let its
 /// snapshot go, the answer is undecided; within it, entailed.
@@ -301,10 +337,11 @@ fn an_answer_past_the_time_after_the_reads_is_undecided() {
     assert_eq!(answers, ["Ok(Entailed)".to_owned(), "undecided".to_owned()]);
 }
 
-/// Spec (`entails`: one certified closure; a changed certificate refuses): a check with
-/// `owl2-dl` off that has read its mode, while the store switches it on and commits a premise
-/// whose annotation property's domain puts `:x a :C` in the closure, refuses. It never answers
-/// by the rules over a revision `owl2-dl` reads, where `:x a :C` isn't entailed.
+/// Spec (`entails`: one certified closure; a certificate changed during the check refuses,
+/// asking again): a check with `owl2-dl` off that has read its mode, while the store switches
+/// it on and commits a premise whose annotation property's domain puts `:x a :C` in the
+/// closure, refuses as undecided. It never answers by the rules over a revision `owl2-dl`
+/// reads, where `:x a :C` isn't entailed.
 #[test]
 fn a_switch_to_owl2_dl_during_the_check_is_refused() {
     let (store, pipeline) = dl_store(DlConfig::default(), ":a a :D .");
@@ -327,7 +364,7 @@ fn a_switch_to_owl2_dl_during_the_check_is_refused() {
     );
     hooks::AFTER_MODE_READ.set(None);
     assert!(
-        matches!(answer, Err(crate::StoreError::Configuration(_))),
+        matches!(&answer, Err(crate::StoreError::Undecided(why)) if why.ends_with("ask again")),
         "{answer:?}"
     );
 }
