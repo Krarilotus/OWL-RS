@@ -2008,77 +2008,92 @@ impl StoreService {
     ) -> StoreResult<T> {
         #[cfg(test)]
         hooks::run(&hooks::BEFORE_PENDING_GENERATION);
-        // The rules the view is decided under, read before it is made: one made under later
-        // rules is kept as of these, never the reverse.
-        let epoch = self.supports.epoch();
-        #[cfg(test)]
-        hooks::run(&hooks::AFTER_PENDING_GENERATION);
-        if let Some((view, keeps_record)) =
-            self.sessions
-                .view(&self.engine.snapshot(), scope, pending, epoch)
-        {
+        let mut retried = false;
+        loop {
+            // Capture the rules for declaration rebuilding with the epoch that keys this view.
+            // A view can only be kept under the epoch read before it was made.
+            let (rules, epoch) = self.supports.generation_now();
+            #[cfg(test)]
+            hooks::run(&hooks::AFTER_PENDING_GENERATION);
+            if let Some((view, keeps_record)) =
+                self.sessions
+                    .view(&self.engine.snapshot(), scope, pending, epoch)
+            {
+                return read(&view, keeps_record);
+            }
+            // Never committed: no writer slot, so other clients commit meanwhile. The operations
+            // read as the reader may; what they change is checked at the commit (the view is
+            // the reader's own, and shows the graphs it may read only). A private transaction
+            // (dictionary lifecycle V1): the operations' own terms and pending changes are charged
+            // to the reading query's envelope, and none enters the dictionary; the commit replays
+            // the operations, never these ids. One budget for the request, so its pending snapshot
+            // is made once (`pending_snapshot_within`'s memo).
+            let budget = std::sync::Arc::new(memory.part());
+            let mut tx = self.engine.speculative(std::sync::Arc::clone(&budget));
+            let context = self.update_context(memory.clone(), cancellation);
+            let requester = crate::Requester::new(scope.clone(), crate::WriteScope::All);
+            crate::statements::apply_statements(
+                &mut tx,
+                pending,
+                &requester,
+                &budget,
+                &mut |tx, request| {
+                    crate::mutation::command::apply_sparql_update(tx, request, &requester, &context)
+                },
+            )
+            .map_err(crate::StoreError::refusal_within)?;
+            self.rebuild_pending_declarations(&mut tx, rules, &budget, cancellation)?;
+            let keeps_record = self.dl().bounds.keeps_record(&tx);
+            let reading = self.reading(scope.access(), memory, Some(cancellation));
+            let restricted = reading.is_some();
+            let view = match reading {
+                Some(reading) => reading.pending(&tx, &budget)?,
+                // Operations that touch no input of the list scan (a list fact; under compact
+                // equality, any) leave out the lists their base does (a reader's own view, above,
+                // may drop equality's copies of list cells: it scans).
+                None => {
+                    use crate::reasoning::Program;
+                    let view = tx.pending_snapshot_within(&budget)?;
+                    if !Program::touches_a_list(&view, tx.inserted().chain(tx.deleted())) {
+                        self.lists.own(&view, || false);
+                    }
+                    view
+                }
+            };
+            let current = self.supports.epoch();
+            if restricted && current != epoch {
+                // The support view reads the live rules. Discard the attempt if it could
+                // have combined that view with a declaration rebuild under other rules.
+                if retried {
+                    return Err(crate::support::Unavailable::OtherProgram(self.dl.replica()).into());
+                }
+                retried = true;
+                continue;
+            }
+            self.sessions.keep_view(
+                tx.base().clone(),
+                scope,
+                pending,
+                (view.clone(), keeps_record),
+                epoch,
+                current,
+            );
             return read(&view, keeps_record);
         }
-        // Never committed: no writer slot, so other clients commit meanwhile. The operations
-        // read as the reader may; what they change is checked at the commit (the view is
-        // the reader's own, and shows the graphs it may read only). A private transaction
-        // (dictionary lifecycle V1): the operations' own terms and pending changes are charged
-        // to the reading query's envelope, and none enters the dictionary; the commit replays
-        // the operations, never these ids. One budget for the request, so its pending snapshot
-        // is made once (`pending_snapshot_within`'s memo).
-        let budget = std::sync::Arc::new(memory.part());
-        let mut tx = self.engine.speculative(std::sync::Arc::clone(&budget));
-        let context = self.update_context(memory.clone(), cancellation);
-        let requester = crate::Requester::new(scope.clone(), crate::WriteScope::All);
-        crate::statements::apply_statements(
-            &mut tx,
-            pending,
-            &requester,
-            &budget,
-            &mut |tx, request| {
-                crate::mutation::command::apply_sparql_update(tx, request, &requester, &context)
-            },
-        )
-        .map_err(crate::StoreError::refusal_within)?;
-        self.rebuild_pending_declarations(&mut tx, &budget, cancellation)?;
-        let keeps_record = self.dl().bounds.keeps_record(&tx);
-        let view = match self.reading(scope.access(), memory, Some(cancellation)) {
-            Some(reading) => reading.pending(&tx, &budget)?,
-            // Operations that touch no input of the list scan (a list fact; under compact
-            // equality, any) leave out the lists their base does (a reader's own view, above,
-            // may drop equality's copies of list cells: it scans).
-            None => {
-                use crate::reasoning::Program;
-                let view = tx.pending_snapshot_within(&budget)?;
-                if !Program::touches_a_list(&view, tx.inserted().chain(tx.deleted())) {
-                    self.lists.own(&view, || false);
-                }
-                view
-            }
-        };
-        self.sessions.keep_view(
-            tx.base().clone(),
-            scope,
-            pending,
-            (view.clone(), keeps_record),
-            epoch,
-            self.supports.epoch(),
-        );
-        read(&view, keeps_record)
     }
 
-    /// A pending change that changes the set of annotation properties the rules read
-    /// rebuilds `tx`'s inferred stack over its pending state, as its commit does. A read
-    /// inside the transaction answers by that set. Other pending changes read the committed
-    /// inferred stack until commit.
+    /// A pending change that changes the set of annotation properties rebuilds `tx`'s
+    /// inferred stack over its pending state using the rules captured at the read's entry.
+    /// Other pending changes read the committed inferred stack until commit.
     fn rebuild_pending_declarations(
         &self,
         tx: &mut nrese_engine::PrivateTransaction<'_>,
+        rules: Option<nrese_reasoner::RuleProgram>,
         budget: &std::sync::Arc<nrese_exec::Budget>,
         cancellation: &CancellationToken,
     ) -> StoreResult<()> {
         use crate::reasoning::Program;
-        let Some(rules) = self.supports.rules() else {
+        let Some(rules) = rules else {
             return Ok(());
         };
         let changes = tx.inserted().chain(tx.deleted());
