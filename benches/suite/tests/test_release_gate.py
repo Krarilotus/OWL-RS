@@ -42,6 +42,16 @@ import fast  # noqa: E402
 import isolation  # noqa: E402
 from suitekit import gatestats  # noqa: E402
 
+READS = (".gitignore", "benches/cases/core.toml", "benches/cases/sparql.toml", "benches/competitors/queries/",
+         "benches/datasets.toml", "benches/fast/compete.py", "benches/fast/fast.py",
+         "benches/fast/measurement-sides.toml", "benches/fast/queries/", "benches/fast/release_gate.py",
+         "benches/fast/w3c-expected.toml", "benches/hosts.toml", "benches/probes/gate-power.py",
+         "benches/reasoning/prepare-lubm.sh", "benches/reasoning/prepare-owl2bench.sh",
+         "benches/reasoning/queries/lubm/", "benches/reasoning/queries/owl2bench/",
+         "benches/sparql/prepare.sh", "benches/sparql/queries.sha256", "benches/suite/suitekit/",
+         "crates/nrese-store/examples/perf_lab/generate.rs", "docs/design/performance.md", "scripts/lib/",
+         "scripts/release-gate.sh")
+
 OVERLAY_HEAD = ""  # the commit of this module's private bench overlay (setUpModule)
 
 

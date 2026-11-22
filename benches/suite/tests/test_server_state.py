@@ -24,6 +24,10 @@ sys.path.insert(0, str(ROOT / "benches" / "suite"))
 from suitekit import adapters  # noqa: E402
 from suitekit.runtime import Mount  # noqa: E402
 
+READS = ("benches/suite/suitekit/__init__.py", "benches/suite/suitekit/adapters.py",
+         "benches/suite/suitekit/lock.py", "benches/suite/suitekit/manifest.py",
+         "benches/suite/suitekit/ns.py", "benches/suite/suitekit/runtime.py")
+
 
 def holder(spec, path: str):
     """The mount `path` lies on inside the container (the deepest), or None."""

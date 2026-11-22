@@ -35,6 +35,8 @@ a test starts takes its environment from inherit() or environment(), the suite's
     pytest:    tests/conftest.py imports it
     unittest:  python benches/suite/tests/isolation.py discover -s benches/suite/tests
                (scripts/check.sh's suite step; it is `python -m unittest` with the isolation first)
+    every contract is that and the crate scan, not a test_*.py (the gate's own step, run once):
+               python benches/suite/tests/isolation.py crate_scan
 """
 from __future__ import annotations
 

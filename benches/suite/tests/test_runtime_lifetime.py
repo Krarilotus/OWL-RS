@@ -14,6 +14,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from suitekit import runtime
 
+READS = ("benches/fast/fast.py", "benches/hosts.toml", "benches/suite/suitekit/*")
+
 
 def load_fast():
     """benches/fast/fast.py as a module of its own, as test_fast_timeouts loads it."""

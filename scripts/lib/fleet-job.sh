@@ -4,11 +4,19 @@
 # is FLEET_OWNER (your own thread: fleet-scheduler/skills/fleet-jobs). Every call has a deadline.
 #
 #   fleet_submit FILE             submits the job FILE; sets fleet_id (empty: refused, why on stderr)
-#   fleet_follow START_S MAX_S    until the job ends; 0 done or failed (fleet_state says which,
+#   fleet_follow START_S MAX_S [EST_S]
+#                                 until the job ends; 0 done or failed (fleet_state says which,
 #                                 fleet_host where it ran), 75
 #                                 when no host started it within START_S (again after a host
 #                                 stopped it), it ran past MAX_S, was cancelled or blocked, or the
-#                                 fleet stayed silent too long; the job is cancelled then
+#                                 fleet stayed silent too long; the job is cancelled then. While
+#                                 the fleet expects a pending job to start at a time E (its status'
+#                                 expected_start) from which a run of EST_S seconds (default 0) ends
+#                                 within MAX_S, the start window reaches at least to E + START_S; a
+#                                 later E moves it on, an earlier one never brings it back, and one
+#                                 too late for MAX_S drops it: only the fixed window holds then. An
+#                                 answer with no E it can read (none, not in the fleet's local
+#                                 YYYY-MM-DDTHH:MM:SS form, or no answer at all) moves nothing.
 #   fleet_results                 the directory its results were fetched to (nothing: none came)
 #   fleet_cancel                  cancels it, once (also on an interrupt)
 #   q TEXT                        TEXT as a TOML string
@@ -72,20 +80,37 @@ fleet_submit() {
 }
 
 fleet_follow() {
-  local start_s=$1 max_s=$2 poll_s=${NRESE_FLEET_POLL_S:-10}
-  local start_by=$((SECONDS + start_s)) last="" quiet="" asked now reply
+  local start_s=$1 max_s=$2 est_s=${3:-0} poll_s=${NRESE_FLEET_POLL_S:-10}
+  # The fixed window's end (it pauses while the fleet is silent) and, apart, the end an expected start
+  # holds it open to (an absolute time: no silence moves it; 0: none).
+  local start_by=$((SECONDS + start_s)) held_by=0 last="" quiet="" asked now reply expect said="" late e
   fleet_end_by=$((SECONDS + max_s)) fleet_max_s=$max_s
   while :; do
     fleet_may_wait "$quiet" || { fleet_cancel; return 75; }
     asked=$SECONDS
-    # A failed call is silence, whatever it printed.
-    now="" reply=""
+    # A failed call is silence, whatever it printed. The answer's first line: its expected start
+    # (epoch seconds, then its local clock time with the basis in brackets: the fleet CLI gives a
+    # local time without a zone, on this machine), or `-`; its second: state, host, reason.
+    now="" reply="" expect=-
     reply=$(timeout --kill-after=10 30 "$fleet_bin" status "$fleet_id" --json 2> /dev/null) &&
       now=$(printf '%s\n' "$reply" | python -c '
-import json, sys
+import datetime, json, sys
 j = json.load(sys.stdin)
 if j.get("state"):
+    try:
+        form = "%Y-%m-%dT%H:%M:%S"
+        at = datetime.datetime.strptime(j["expected_start"], form)
+        if at.strftime(form) != j["expected_start"]:  # strptime also takes a `t`, or unpadded fields
+            raise ValueError
+        basis = j.get("basis") or ""
+        print(int(at.timestamp()), at.strftime("%H:%M") + (f" ({basis})" if basis else ""))
+    except (KeyError, TypeError, ValueError, OverflowError, OSError):
+        print("-")
     print(j["state"], j.get("host") or "-", j.get("reason") or "")' 2> /dev/null | tr -d '\r')
+    case $now in
+      *$'\n'*) expect=${now%%$'\n'*} now=${now#*$'\n'} ;;
+      *) now="" ;;
+    esac
     [ -n "$now" ] || quiet=${quiet:-$asked}
     # An answer counts only if it came inside both deadlines.
     fleet_may_wait "$quiet" || { fleet_cancel; return 75; }
@@ -97,9 +122,23 @@ if j.get("state"):
       [ "$now" = "$last" ] || fleet_say "$now"
       last=$now
       case $fleet_state in
-        running) start_by=$((SECONDS + start_s)) ;;
+        running) start_by=$((SECONDS + start_s)) held_by=0 ;;
         pending | staging)
-          [ $SECONDS -lt $start_by ] || { fleet_say "no host started it within $start_s s"; fleet_cancel; return 75; } ;;
+          # The fleet's expected start, in SECONDS' terms: it holds the window open only if a run
+          # started then ends within MAX_S; one too late for that drops what earlier ones held.
+          late=""
+          if [ "$expect" != - ]; then
+            e=$((SECONDS + ${expect%% *} - EPOCHSECONDS))
+            if [ $((e + est_s)) -le $fleet_end_by ]; then
+              [ $((e + start_s)) -le $held_by ] || held_by=$((e + start_s))
+              [ "$expect" = "$said" ] || { said=$expect; fleet_say "expected start ${expect#* }"; }
+            else
+              held_by=0
+              late=" (the fleet expects it at $(printf '%s' "$expect" | awk '{ print $2 }'), past this gate's limit)"
+            fi
+          fi
+          [ $SECONDS -lt $start_by ] || [ $SECONDS -lt $held_by ] \
+            || { fleet_say "no host started it within $start_s s$late"; fleet_cancel; return 75; } ;;
         done | failed) return 0 ;;
         cancelled | blocked) fleet_say "it was $fleet_state"; fleet_id=""; return 75 ;;
       esac

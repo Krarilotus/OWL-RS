@@ -23,6 +23,12 @@ sys.path.insert(0, str(DL))
 sys.path.insert(0, str(SUITE))
 from suitekit import hosts, ns  # noqa: E402
 
+READS = ("benches/reasoning/dl/canonical.py", "benches/reasoning/dl/nrese.py", "benches/reasoning/dl/ore.py",
+         "benches/reasoning/dl/reference.py", "benches/reasoning/dl/w3c.py",
+         "benches/suite/suitekit/__init__.py", "benches/suite/suitekit/hosts.py",
+         "benches/suite/suitekit/lock.py", "benches/suite/suitekit/ns.py")
+
+
 def load(name, path):
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)

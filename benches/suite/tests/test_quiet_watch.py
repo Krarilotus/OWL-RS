@@ -13,6 +13,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+READS = ("benches/suite/suitekit/__init__.py", "benches/suite/suitekit/lock.py",
+         "benches/suite/suitekit/ns.py", "scripts/lib/quiet-watch.py")
+
 spec = importlib.util.spec_from_file_location(
     "quiet_watch", Path(__file__).resolve().parents[3] / "scripts" / "lib" / "quiet-watch.py")
 watch = importlib.util.module_from_spec(spec)

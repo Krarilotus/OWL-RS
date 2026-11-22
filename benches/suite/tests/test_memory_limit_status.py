@@ -19,6 +19,11 @@ import fast  # noqa: E402
 import release_gate as rg  # noqa: E402
 from suitekit import cases  # noqa: E402
 
+READS = ("benches/cases/core.toml", "benches/cases/sparql.toml", "benches/competitors/queries/",
+         "benches/datasets.toml", "benches/fast/compete.py", "benches/fast/fast.py", "benches/fast/queries/",
+         "benches/fast/release_gate.py", "benches/hosts.toml", "benches/reasoning/queries/lubm/",
+         "benches/reasoning/queries/owl2bench/", "benches/suite/abba.py", "benches/suite/suitekit/*")
+
 # support-ladder-256 on a0cc2dec6 (the release smoke's record, the shared host, 11 Nov 2026): the
 # shared budget refused the first restricted read; the process exited 1.
 STDERR = ("Error: SparqlEvaluation(MemoryLimit(BudgetExceeded { limit: 4831838208, requested: 134217792, "

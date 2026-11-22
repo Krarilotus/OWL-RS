@@ -17,6 +17,8 @@ sys.path.insert(0, str(ROOT / "benches/suite"))
 
 from suitekit import driver, workloads  # noqa: E402
 
+READS = ("benches/suite/suitekit/*",)
+
 
 class W3CRequired(unittest.TestCase):
     def test_preparation_failure_never_runs_the_suite_or_passes(self):

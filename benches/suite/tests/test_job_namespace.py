@@ -20,6 +20,15 @@ sys.path.insert(0, str(ROOT / "benches" / "suite"))
 from suitekit import ns  # noqa: E402
 import isolation  # noqa: E402
 
+READS = ("benches/cases/core.toml", "benches/cases/sparql.toml", "benches/competitors/scorecard.sh",
+         "benches/fast/compete.py", "benches/fast/fast.py", "benches/fast/release_gate.py",
+         "benches/hosts.toml", "benches/reasoning/prepare-lubm.sh", "benches/reasoning/prepare-owl2bench.sh",
+         "benches/reasoning/reasoning-scorecard.sh", "benches/reasoning/systems.sh",
+         "benches/suite/suitekit/*", "rust-toolchain.toml", "scripts/bench-cleanup.sh",
+         "scripts/cargo-guarded.sh", "scripts/check-names.sh", "scripts/lib/disk.sh",
+         "scripts/lib/gate-publish.sh", "scripts/lib/ns.sh", "scripts/lib/target-cpu.sh",
+         "scripts/office/perflab.sh")
+
 # A POSIX bash: Git's on Windows, not WSL's launcher.
 BASH = next((b for b in (["C:/Program Files/Git/bin/bash.exe"] if os.name == "nt" else []) if Path(b).is_file()),
             shutil.which("bash"))

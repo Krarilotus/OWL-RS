@@ -15,6 +15,10 @@ DL = Path(__file__).resolve().parents[2] / "reasoning" / "dl"
 sys.path.insert(0, str(DL))
 sys.path.insert(0, str(DL.parents[1] / "suite"))
 import isolation  # noqa: E402
+
+READS = ("benches/reasoning/dl/canonical.py", "benches/reasoning/dl/nrese.py", "benches/reasoning/dl/reference.py",
+         "benches/suite/suitekit/__init__.py", "benches/suite/suitekit/hosts.py", "benches/suite/suitekit/lock.py",
+         "benches/suite/suitekit/ns.py")
 spec = importlib.util.spec_from_file_location("nrese_el_contract", DL / "nrese.py")
 nrese = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(nrese)

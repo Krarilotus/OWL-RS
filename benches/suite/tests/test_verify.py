@@ -40,6 +40,9 @@ spec.loader.exec_module(verify)
 from verifykit import scenario  # noqa: E402
 from verifykit.server import LaunchError, Server  # noqa: E402
 
+READS = ("benches/suite/suitekit/__init__.py", "benches/suite/suitekit/processes.py",
+         "scripts/verify/build-on-host.sh", "scripts/verify/verify.py", "scripts/verify/verifykit/")
+
 # nrese-server's routes the self-test and the doctor read, answered as it answers them (compact
 # JSON), its words when its port is taken, and with VERIFY_STAND_IN=never-ready a /readyz of 503.
 # With VERIFY_STAND_IN=behind-a-launcher it is a launcher, as a Windows venv's python.exe is: the

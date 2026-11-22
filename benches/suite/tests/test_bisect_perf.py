@@ -11,6 +11,8 @@ import importlib.util
 import unittest
 from pathlib import Path
 
+READS = ("scripts/bisect-perf.py",)
+
 ROOT = Path(__file__).resolve().parents[3]
 spec = importlib.util.spec_from_file_location("bisect_perf", ROOT / "scripts/bisect-perf.py")
 bp = importlib.util.module_from_spec(spec)

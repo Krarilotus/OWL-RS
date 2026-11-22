@@ -21,6 +21,8 @@ from suitekit import quiet, reported, versus, workloads  # noqa: E402
 from suitekit.driver import Suite  # noqa: E402
 from suitekit.schema import Result, Writer, read  # noqa: E402
 
+READS = ("benches/",)
+
 
 def row(system, run, task, **fields):
     return Result(date="d", host="h", runtime="docker", system=system, version="-", publish="free",

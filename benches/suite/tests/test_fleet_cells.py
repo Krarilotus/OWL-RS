@@ -15,6 +15,10 @@ import abba
 import suite
 import isolation
 
+READS = ("benches/", "crates/nrese-shacl/tests/*", "crates/nrese-sparql/tests/geosparql_compliance/*",
+         "crates/nrese-sparql/tests/w3c_sparql11/*", "crates/nrese-store/tests/w3c_owl2_rl/*",
+         "scripts/lib/ns.sh")
+
 A = "a" * 40
 # One record in which each system these tests plan ran ok once, on a workload they don't plan.
 RECORDS = [{"id": "2026-11-20-adapters", "started": "2026-11-20T10:00", "commit": "f" * 40,
