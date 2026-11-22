@@ -397,22 +397,13 @@ fn only_a_rebuild_that_finds_no_literal_equality_gives_the_word_back() {
 /// the pair equated in a graph it reads, a reader by support is told it.
 #[test]
 fn a_reader_of_some_graphs_is_told_alike_with_a_hidden_literal_equality_and_without() {
-    use nrese_sparql::GraphAccess;
     use nrese_store::ReadScope;
     let visible = format!(":t :q {INTEGER} . :t a :A . GRAPH :open {{ :u :q {DECIMAL} . }}");
     let reads = [
         "SELECT ?v WHERE { :t :q ?v }",
         "SELECT ?x WHERE { ?x a :A }",
     ];
-    let reader = |by_support: bool| {
-        ReadScope::Graphs(Arc::new(GraphAccess {
-            graphs: vec!["http://example.com/open".to_owned()],
-            default_graph: true,
-            inferred: true,
-            inferred_by_support: by_support,
-            ..GraphAccess::default()
-        }))
-    };
+    let reader = reader_of_open;
     let mut unmet = Vec::new();
     for (ruleset, rewriting) in [
         ("owl2-rl", None),
@@ -461,6 +452,54 @@ fn a_reader_of_some_graphs_is_told_alike_with_a_hidden_literal_equality_and_with
     assert!(
         unmet.is_empty(),
         "a reader of some graphs is told of an equality in a graph it can't read:\n{}",
+        unmet.join("\n")
+    );
+}
+
+/// A reader of the default graph and `:open`, not `:hidden`, who sees every inference
+/// (`inferred = "visible"`) or, `by_support`, those its graphs support.
+fn reader_of_open(by_support: bool) -> nrese_store::ReadScope {
+    nrese_store::ReadScope::Graphs(Arc::new(nrese_sparql::GraphAccess {
+        graphs: vec!["http://example.com/open".to_owned()],
+        default_graph: true,
+        inferred: true,
+        inferred_by_support: by_support,
+        ..nrese_sparql::GraphAccess::default()
+    }))
+}
+
+/// A property made functional by what the rules derive from a graph the reader by support
+/// reads (`:F rdfs:subClassOf owl:FunctionalProperty`, Table 7 cax-sco), with the two
+/// spellings there: its view holds the functional property as an inference, and the rules
+/// equate the two literals, so a read of a later value is told so, as where that graph
+/// declares the property functional.
+#[test]
+fn a_reader_by_support_is_told_of_an_equality_its_graphs_derive() {
+    let data = format!(
+        ":t :q {INTEGER} . GRAPH :open {{ :F rdfs:subClassOf owl:FunctionalProperty . \
+         :p a :F . :s :p {INTEGER} , {DECIMAL} . }}"
+    );
+    let mut unmet = Vec::new();
+    for rewriting in [None, Some(QlRewritingMode::Off)] {
+        let pipeline = open("owl2-rl", config("replication", None));
+        if let Some(mode) = rewriting {
+            pipeline.store().set_ql_rewriting(mode);
+        }
+        insert(&pipeline, &data);
+        let every = read(pipeline.store(), READS[0]).2;
+        if !every.iter().any(|r| r.contains(REASON)) {
+            unmet.push(format!(
+                "setup: {rewriting:?}: a reader of every graph isn't told: {every:?}"
+            ));
+        }
+        let (_, word, reasons) = read_as(pipeline.store(), READS[0], reader_of_open(true));
+        if word == "complete" || !reasons.iter().any(|r| r.contains(REASON)) {
+            unmet.push(format!("{rewriting:?}: {word} {reasons:?}"));
+        }
+    }
+    assert!(
+        unmet.is_empty(),
+        "a reader by support isn't told of an equality its own graphs derive:\n{}",
         unmet.join("\n")
     );
 }
