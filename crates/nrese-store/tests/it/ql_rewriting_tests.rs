@@ -876,17 +876,17 @@ pub(crate) fn store(
     store
 }
 
-/// The QL cases: `NRESE_QL_CASES`, else 50 for the pinned ones, else the line's 150 (a seeded
-/// run is the full draw from that seed).
-fn cases() -> usize {
-    let default = if pinned() { 50 } else { 150 };
+/// Draw through the last pinned witness, or draw 150 cases in the full form.
+/// A valid `NRESE_QL_CASES` overrides the count in the full form.
+fn cases(witnesses: Option<&[usize]>) -> usize {
+    let default = witnesses.map_or(150, |cases| cases.iter().max().unwrap() + 1);
     std::env::var("NRESE_QL_CASES")
         .ok()
         .and_then(|n| n.parse().ok())
         .unwrap_or(default)
 }
 
-/// Whether the pinned QL cases run: only with no tier, seed or count (QL's or the fuzz ones).
+/// Replay the pinned QL cases when the tier is unset or `landing`, with no QL or fuzz seed or count.
 fn pinned() -> bool {
     !crate::support::nightly()
         && [
@@ -899,18 +899,24 @@ fn pinned() -> bool {
         .all(|knob| std::env::var_os(knob).is_none())
 }
 
-// Includes the three red cases (0 for printing, 1 for certain answers, 22 for EXISTS).
-fn ql_witnesses() -> Option<&'static [usize]> {
-    pinned().then_some(&[
-        0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 15, 17, 19, 20, 22, 24, 26, 29, 31, 33, 41, 46,
-    ])
+// Case 1 catches a fault that drops certain answers. Case 22 catches one that drops EXISTS answers.
+fn ql_witnesses(extra: Option<usize>) -> Option<Vec<usize>> {
+    pinned().then(|| {
+        [
+            0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 15, 17, 19, 20, 22, 24, 26, 29, 31, 33, 41, 46,
+        ]
+        .into_iter()
+        .chain(extra)
+        .collect()
+    })
 }
 
-/// By default, this test compares fixed QL witnesses across both store profiles. With `NRESE_CHECK_TIER=nightly` or a seed (`NRESE_QL_SEED`, `NRESE_FUZZ_SEED`) set, it draws 150 cases.
+/// By default (tier unset or `landing`, with no QL or fuzz seed or count), this test compares pinned witnesses across both profiles. With `NRESE_CHECK_TIER=nightly`, a seed or a count, it draws 150 cases unless `NRESE_QL_CASES` supplies a valid count.
 #[test]
 fn rewritten_answers_are_the_certain_answers_of_random_ql_cases() {
-    let cases = cases();
-    let witnesses = ql_witnesses();
+    let witnesses = ql_witnesses(None);
+    let witnesses = witnesses.as_deref();
+    let cases = cases(witnesses);
     let (mut families, mut forms) = (0, BTreeSet::new());
     let mut query_shapes = 0;
     let dir = tempfile::tempdir().unwrap();
@@ -2644,11 +2650,13 @@ fn inclusions_through_inverse_expressions_are_materialised() {
 /// where it hasn't), by the chase. Pure QL: exactly those, complete. Mixed ontologies: an
 /// answer that isn't the chase's says `unsound`, a missing one says so too (the
 /// negation's pattern may miss what makes an answer wrong).
-/// By default, this test checks fixed pure and mixed cases for EXISTS, NOT EXISTS and MINUS. With `NRESE_CHECK_TIER=nightly` or a seed (`NRESE_QL_SEED`, `NRESE_FUZZ_SEED`) set, it draws 150 cases.
+/// By default (tier unset or `landing`, with no QL or fuzz seed or count), this test checks pinned pure and mixed cases for EXISTS, NOT EXISTS and MINUS. With `NRESE_CHECK_TIER=nightly`, a seed or a count, it draws 150 cases unless `NRESE_QL_CASES` supplies a valid count.
 #[test]
 fn negation_and_exists_answer_as_the_chase() {
-    let cases = cases();
-    let witnesses = ql_witnesses();
+    // Case 95 judges a mixed answer with the first transitive-property slot and a property chain.
+    let witnesses = ql_witnesses(Some(95));
+    let witnesses = witnesses.as_deref();
+    let cases = cases(witnesses);
     let (mut families, mut negations) = (0, BTreeSet::new());
     let (mut extra_shapes, mut query_shapes) = (0, 0);
     let mut pairs_checked = BTreeSet::new();
@@ -2864,7 +2872,7 @@ fn negation_and_exists_answer_as_the_chase() {
                     decided_by_rewriting += 1;
                 }
                 checked += 1;
-                if witnesses.is_some() {
+                if witnesses.is_some() && (status.sound || status.complete) {
                     negations.insert((mixed, name));
                     families |= tbox.families;
                     extra_shapes |= extras.families;

@@ -2029,14 +2029,13 @@ fn size(default: usize, full: usize) -> usize {
     }
 }
 
-/// A random test's count: `default` for its pinned witnesses, else the line's `full` one. A
-/// seeded run is the full draw from that seed.
+/// A random test's count: `default` for pinned witnesses, or `full` for a full draw.
 fn cases(default: usize, full: usize) -> usize {
     if pinned_cases() { default } else { full }
 }
 
-/// Whether a random test replays its pinned witnesses: only with no tier, no seed
-/// (`NRESE_FUZZ_SEED`) and no count (`NRESE_FUZZ_CASES`). Any of them gives the full draw.
+/// Replay pinned witnesses when the tier is unset or `landing`, with no seed or count
+/// (`NRESE_FUZZ_SEED` and `NRESE_FUZZ_CASES`).
 fn pinned_cases() -> bool {
     !crate::support::nightly()
         && std::env::var_os("NRESE_FUZZ_CASES").is_none()
@@ -2285,7 +2284,7 @@ fn count_star_of_one_pattern_reads_the_index() {
 
 /// Cyclic BGPs (triangles, 4-cycles, with types, constants, repeated variables and a
 /// variable predicate) over dense graphs: the worst-case-optimal join equals the reference evaluator.
-/// By default, this test compares rows and counts for every cycle shape with and without a type. With `NRESE_CHECK_TIER=nightly` or `NRESE_FUZZ_SEED` set, it draws 40 datasets.
+/// By default (tier unset or `landing`, with no seed or count), this test compares pinned queries for each cycle shape with and without a type. With `NRESE_CHECK_TIER=nightly`, `NRESE_FUZZ_SEED` or `NRESE_FUZZ_CASES`, it draws 40 datasets.
 #[test]
 fn cyclic_bgps_equal_the_reference() {
     let witnesses = [
@@ -2306,6 +2305,7 @@ fn cyclic_bgps_equal_the_reference() {
         (0, 18),
         (0, 24),
         (1, 2),
+        (1, 7),
         (2, 8),
     ];
     let pinned = pinned_cases();
@@ -2454,7 +2454,9 @@ fn cyclic_bgps_equal_the_reference() {
                 "{count}"
             );
             checked += 1;
-            families.insert((shape, typed));
+            if pinned && !expected.is_empty() {
+                families.insert((shape, typed));
+            }
         }
     }
     if pinned {
@@ -2528,13 +2530,13 @@ fn a_cyclic_count_past_64_bits_fails_as_a_range_limit() {
 
 /// A selective pattern joined with a much larger one runs as a parallel index nested-loop
 /// join (enough rows for several chunks); it equals the reference evaluator.
-/// By default, this test uses 9,000 probe subjects. With `NRESE_CHECK_TIER=nightly`, it uses 12,000 with proportional background.
+/// By default, this test uses 10,000 probe subjects, 1,808 above the two-chunk minimum. With `NRESE_CHECK_TIER=nightly`, it uses 12,000 with proportional background.
 #[test]
 fn parallel_probe_join_equals_the_reference() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
     let mut tx = engine.transaction();
     let rdf_type = NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
-    let subjects = size(9_000, 12_000);
+    let subjects = size(10_000, 12_000);
     for i in 0..subjects {
         let quad = Quad::new(
             ex(&format!("t{i}")),
@@ -2758,12 +2760,12 @@ fn explain_reports_the_plan() {
 
 /// Filters and aggregates over tables large enough to run in parallel chunks (with terms
 /// computed by BIND, regular expressions, strings, decimals) equal the reference evaluator.
-/// By default, this test keeps the post-BIND filter parallel with 30,000 subjects. With `NRESE_CHECK_TIER=nightly`, it uses 40,000.
+/// By default, this test uses 34,000 subjects so the post-BIND filter sees over 18,000 rows against a 16,384-row parallel threshold. With `NRESE_CHECK_TIER=nightly`, it uses 40,000.
 #[test]
 fn parallel_filters_and_aggregates_equal_the_reference() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
     let mut tx = engine.transaction();
-    for i in 0..size(30_000, 40_000) as u32 {
+    for i in 0..size(34_000, 40_000) as u32 {
         let s = ex(&format!("s{i}"));
         let values: [Term; 3] = [
             Literal::new_typed_literal((i % 997).to_string(), xsd::INTEGER).into(),

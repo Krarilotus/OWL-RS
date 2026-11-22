@@ -501,16 +501,6 @@ fn with_visited<R>(nodes: usize, f: impl FnOnce(&mut Visited<'_>) -> R) -> R {
     result
 }
 
-/// A test graph's size: `default`, or the line's `full` one with `NRESE_CHECK_TIER=nightly`.
-#[cfg(test)]
-fn test_size(default: usize, full: usize) -> usize {
-    if crate::tests::nightly() {
-        full
-    } else {
-        default
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -595,7 +585,11 @@ mod tests {
     /// By default, this test extends 2,500 vectors to 5,000 for both metrics. With `NRESE_CHECK_TIER=nightly`, it extends 10,000 to 20,000.
     #[test]
     fn hnsw_finds_nearly_all_nearest_neighbours() {
-        let count = super::test_size(5_000, 20_000);
+        let count = if crate::tests::nightly() {
+            20_000
+        } else {
+            5_000
+        };
         let vectors = random_vectors(count, 16, 3);
         for metric in [Metric::Cosine, Metric::L2] {
             let mut graph = Hnsw::new(metric, HnswParameters::default());
@@ -753,7 +747,6 @@ mod growth_tests {
     /// A graph's parts read back give the same answers; a copy extended with new vectors
     /// finds them, the original stays as it was; a graph over a prefix plus an exact scan
     /// of the rest answers as one graph does.
-    /// By default, this test grows a 1,000-vector prefix to 1,500. With `NRESE_CHECK_TIER=nightly`, it uses 4,000 and 6,000.
     #[test]
     fn graphs_round_trip_grow_and_cover_a_prefix() {
         // Fix insertion order as well as the level seed: parallel insertion can change
@@ -762,17 +755,14 @@ mod growth_tests {
             .num_threads(1)
             .build()
             .unwrap();
-        let count = super::test_size(1_500, 6_000);
-        let prefix_len = count * 2 / 3;
-        let tail_query = (count * 5 / 6) as u32;
-        let all = random_vectors(count, 8, 11);
+        let all = random_vectors(6_000, 8, 11);
         let mut prefix = Vectors::new(8);
-        for p in 0..prefix_len as u32 {
+        for p in 0..4_000u32 {
             prefix.push(all.id(p), all.get(p));
         }
         let mut graph = Hnsw::new(Metric::L2, HnswParameters::default());
         one.install(|| graph.extend(&prefix));
-        let query = all.get(tail_query).to_vec();
+        let query = all.get(5_000).to_vec();
         let read = Hnsw::from_parts(graph.to_parts()).expect("sound parts");
         assert_eq!(
             read.search(&prefix, &query, 5, 64, &|_| true, &Budget::unlimited())
@@ -802,7 +792,7 @@ mod growth_tests {
         let merged = merge(from_graph.into_iter().chain(tail), 5, &Budget::unlimited())
             .unwrap()
             .to_vec();
-        assert_eq!(merged[0].id, all.id(tail_query));
+        assert_eq!(merged[0].id, all.id(5_000));
         // This deterministic graph plus the exact tail finds all five exact nearest
         // neighbours, in order and with the same distances.
         let truth = exact(&all, &query, 5, Metric::L2, &|_| true, &Budget::unlimited())
@@ -813,15 +803,15 @@ mod growth_tests {
         // still covers the prefix.
         let mut grown = graph.duplicate();
         one.install(|| grown.extend(&all));
-        assert_eq!(grown.len(), count);
-        assert_eq!(graph.len(), prefix_len);
+        assert_eq!(grown.len(), 6_000);
+        assert_eq!(graph.len(), 4_000);
         assert_eq!(
             grown
                 .search(&all, &query, 1, 64, &|_| true, &Budget::unlimited())
                 .unwrap()
                 .to_vec()[0]
                 .id,
-            all.id(tail_query)
+            all.id(5_000)
         );
         // Unsound parts are refused.
         let mut bad = graph.to_parts();

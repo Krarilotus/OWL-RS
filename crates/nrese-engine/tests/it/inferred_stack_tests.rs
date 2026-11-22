@@ -608,14 +608,13 @@ fn run_random_transactions(
     witnessed
 }
 
-/// By default, this test replays committed and aborted edits of both stacks. With `NRESE_CHECK_TIER=nightly` or `NRESE_FUZZ_SEED` set, it draws 25 seeds.
+/// By default (tier unset or `landing`, with no seed or count), this test replays committed and aborted edits of both stacks. With `NRESE_CHECK_TIER=nightly`, `NRESE_FUZZ_SEED` or `NRESE_FUZZ_CASES`, it draws 25 seeds.
 #[test]
 fn both_stacks_match_the_model_with_compaction() {
     let pinned = !crate::support::nightly()
         && std::env::var_os("NRESE_FUZZ_CASES").is_none()
         && std::env::var_os("NRESE_FUZZ_SEED").is_none();
     let mut kinds = BTreeSet::new();
-    // Any of the tier, a seed or a count gives the line's full draw.
     let seeds = if pinned { 8 } else { 25 };
     for seed in (0..seeds).filter(|seed| !pinned || [0, 2, 4, 7].contains(seed)) {
         let engine = engine(); // inline compaction after every commit

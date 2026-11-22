@@ -8,6 +8,7 @@
 //! one thread first, so the graph is built the same way every run (10 of 10 in 60 of 60 runs on
 //! one thread). This file is a test binary of its own, as `alone` needs the measured allocator.
 
+use nrese_engine::term::vectors::SYNC_BUILD;
 use nrese_engine::vector::{DATATYPE, Metric, lexical};
 use nrese_engine::{Engine, EngineConfig, VectorQuery, VectorStrategy};
 use nrese_exec::{Budget, measure};
@@ -20,7 +21,7 @@ static ALLOCATOR: measure::Measured<std::alloc::System> = measure::Measured(std:
 mod check_tier;
 
 /// A large space is searched through its graph and finds what the exact scan finds.
-/// By default, this test uses 140 radii above the threaded build threshold. With `NRESE_CHECK_TIER=nightly`, it uses 200.
+/// By default, this test rounds the threaded build threshold up to a whole radius. With `NRESE_CHECK_TIER=nightly`, it uses 200 radii.
 #[test]
 fn large_spaces_are_searched_through_a_graph() {
     if !measure::alone() {
@@ -36,15 +37,17 @@ fn large_spaces_are_searched_through_a_graph() {
         ..EngineConfig::default()
     })
     .expect("engine");
+    const POINTS_PER_RADIUS: usize = 360;
     let points = if crate::check_tier::nightly() {
         200
     } else {
-        140
-    } * 360;
+        SYNC_BUILD.div_ceil(POINTS_PER_RADIUS)
+    } * POINTS_PER_RADIUS;
     let mut tx = engine.transaction();
     for i in 0..points {
-        let angle = ((i % 360) as f32 + (i / 360) as f32 * 0.001).to_radians();
-        let radius = 1.0 + (i / 360) as f32 * 0.01;
+        let ring = i / POINTS_PER_RADIUS;
+        let angle = ((i % POINTS_PER_RADIUS) as f32 + ring as f32 * 0.001).to_radians();
+        let radius = 1.0 + ring as f32 * 0.01;
         let literal = Literal::new_typed_literal(
             lexical(&[radius * angle.cos(), radius * angle.sin(), (i % 7) as f32]),
             NamedNode::new_unchecked(DATATYPE),

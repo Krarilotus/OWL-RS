@@ -222,21 +222,19 @@ fn assert_matches_model(version: &IndexVersion, model: &BTreeSet<EncodedQuad>, c
     );
 }
 
-/// Whether the pinned seeds run: only with no tier, no seed and no count. Any of them gives
-/// the full draw.
+/// Replay pinned seeds when the tier is unset or `landing`, with no seed or count.
 fn pinned_compactions() -> bool {
     !crate::check_tier::nightly()
         && std::env::var_os("NRESE_FUZZ_CASES").is_none()
         && std::env::var_os("NRESE_FUZZ_SEED").is_none()
 }
 
-/// Seeds per layout: 10 for the pinned ones, else the line's 40 (a seeded run is the full
-/// draw from that seed).
+/// The range containing the pinned seed offsets, or all 40 offsets for a full draw.
 fn seeds() -> u64 {
     if pinned_compactions() { 10 } else { 40 }
 }
 
-/// By default, this test replays policy compactions in each layout. With `NRESE_CHECK_TIER=nightly` or `NRESE_FUZZ_SEED` set, it draws 40 seeds per layout.
+/// By default (tier unset or `landing`, with no seed or count), this test replays policy compactions in each layout. With `NRESE_CHECK_TIER=nightly`, `NRESE_FUZZ_SEED` or `NRESE_FUZZ_CASES`, it draws 40 seeds per layout.
 #[test]
 fn random_commits_with_policy_compaction_match_the_model() {
     let policy = CompactionPolicy {
@@ -248,7 +246,7 @@ fn random_commits_with_policy_compaction_match_the_model() {
     for layout in LAYOUTS {
         let mut compacted = false;
         let (mut inserted, mut deleted) = (false, false);
-        // Seed 0 exposes the loss of tombstones during compaction.
+        // Seed 0 catches a fault that drops tombstones during compaction.
         for seed in (0..cases).filter(|seed| !pinned || [0, 9].contains(seed)) {
             let mut rng = Rng(fuzz(seed));
             let mut model = BTreeSet::new();
@@ -286,7 +284,7 @@ fn random_commits_with_policy_compaction_match_the_model() {
     }
 }
 
-/// By default, this test replays fixed windows that touch or leave either boundary in each layout. With `NRESE_CHECK_TIER=nightly` or `NRESE_FUZZ_SEED` set, it draws 40 seeds per layout.
+/// By default (tier unset or `landing`, with no seed or count), this test replays fixed windows that touch or leave either boundary in each layout. With `NRESE_CHECK_TIER=nightly`, `NRESE_FUZZ_SEED` or `NRESE_FUZZ_CASES`, it draws 40 seeds per layout.
 #[test]
 fn arbitrary_compaction_windows_preserve_contents() {
     let pinned = pinned_compactions();

@@ -702,23 +702,24 @@ fn recovery_knows_every_bracket_open_wherever_a_statement_fails() {
 /// The escaped quotes are fewer: before, each was searched to the end again, so the parent's
 /// red run would take quadratic time on them. Their string never closes, so the document
 /// ends inside it and the error ends the document; before, the read went on after it.
-/// By default, this test keeps all reader paths with 1,000 bytes or brackets and 100 quotes. With `NRESE_CHECK_TIER=nightly`, it uses 100,000 and 5,000.
+/// By default, the bracket document spans the 64 KiB reader buffer, with 1,000 string bytes and 100 quotes for the other documents. With `NRESE_CHECK_TIER=nightly`, it uses 100,000 brackets of each kind or string bytes and 5,000 quotes.
 #[test]
 fn recovery_over_large_malformed_input() {
     let after = triple("urn:after", "urn:p", iri("urn:o"));
-    let (n, quotes) = if crate::support::nightly() {
-        (100_000, 5_000)
+    let (brackets, string_bytes, quotes) = if crate::support::nightly() {
+        (100_000, 100_000, 5_000)
     } else {
-        (1_000, 100)
+        // Three runs of brackets. Their combined length exceeds the initial reader buffer.
+        ((64_usize * 1024).div_ceil(3), 1_000, 100)
     };
     let documents: [(&str, Vec<u8>); 3] = [
         (
             "unmatched closers",
             [
                 b"<urn:s> % ".to_vec(),
-                b"[".repeat(n),
-                b")".repeat(n),
-                b"]".repeat(n),
+                b"[".repeat(brackets),
+                b")".repeat(brackets),
+                b"]".repeat(brackets),
                 b" . <urn:after> <urn:p> <urn:o> .".to_vec(),
             ]
             .concat(),
@@ -736,7 +737,7 @@ fn recovery_over_large_malformed_input() {
             "a long malformed string",
             [
                 b"<urn:s> <urn:p> [ <urn:q> \"\n".to_vec(),
-                b"a".repeat(n),
+                b"a".repeat(string_bytes),
                 b"\"] . <urn:after> <urn:p> <urn:o> .".to_vec(),
             ]
             .concat(),
