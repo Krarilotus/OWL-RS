@@ -10,7 +10,7 @@ use crate::error::ApiError;
 use crate::http::media::{BOOLEAN, GRAPHS, SOLUTIONS, negotiated};
 use crate::http::mutation;
 use crate::http::requests::{Explain, QueryOperation, UpdateOperation};
-use crate::http::result_stream::{Pace, stream_blocking};
+use crate::http::result_stream::{ChannelWriter, Pace, Reader, stream_blocking};
 use crate::policy::PolicyConfig;
 use crate::state::AppState;
 
@@ -55,6 +55,7 @@ pub async fn execute_query_in(
     }
     let origin = operation.origin.clone();
     let mut request = build_query_request(operation);
+    let reader = Reader::of(&request.scope);
     let memory = policy.limits.max_query_memory_bytes;
     request.memory_limit = (memory > 0).then_some(memory);
     let at = deadline.into_std();
@@ -104,6 +105,7 @@ pub async fn execute_query_in(
         Pace::Total(deadline),
         cancellation,
         move || memory,
+        reader,
         if explain == Explain::No {
             media_type
         } else {
@@ -111,16 +113,16 @@ pub async fn execute_query_in(
         },
         QUERY_TIMEOUT_MESSAGE,
         move |out| {
+            // Held whole, a memory refusal is the hold's to tell (`ChannelWriter::refused`).
+            let refused = |out: &ChannelWriter, error| {
+                out.refused(error, |error| map_query_error(&policy, error))
+            };
             if explain != Explain::No {
                 let (body, completeness) = if explain == Explain::Plan {
-                    let plan = run
-                        .plan(&token)
-                        .map_err(|error| map_query_error(&policy, error))?;
+                    let plan = run.plan(&token).map_err(|error| refused(out, error))?;
                     (plan_json(&plan), plan.completeness)
                 } else {
-                    let explanation = run
-                        .explain(&token)
-                        .map_err(|error| map_query_error(&policy, error))?;
+                    let explanation = run.explain(&token).map_err(|error| refused(out, error))?;
                     (explanation_json(&explanation), explanation.completeness)
                 };
                 if scoped {
@@ -130,10 +132,10 @@ pub async fn execute_query_in(
                     .map_err(|error| ApiError::internal(error.to_string()));
             }
             match &pending {
-                None => run.run_reporting(&token, out, report),
-                Some(pending) => run.run_pending_reporting(pending, &token, out, report),
+                None => run.run_reporting(&token, &mut *out, report),
+                Some(pending) => run.run_pending_reporting(pending, &token, &mut *out, report),
             }
-            .map_err(|error| map_query_error(&policy, error))
+            .map_err(|error| refused(out, error))
         },
     )
     .await?;

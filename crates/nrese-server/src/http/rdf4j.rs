@@ -468,6 +468,7 @@ async fn statements(
     let (media_type, format) = negotiated(header_value_str(headers.get(header::ACCEPT)), GRAPHS)?;
     let store = state.store();
     let (scope, infer) = (access.read_scope(), infer(&pairs));
+    let reader = super::result_stream::Reader::of(&scope);
     // Streamed as read: a whole repository in constant memory, for as long as the client
     // keeps reading (over HTTP/1.0 held whole: `result_stream`).
     let pace = super::result_stream::Pace::stalled_after(state.policy().timeouts.graph_read);
@@ -477,6 +478,7 @@ async fn statements(
         pace,
         cancellation,
         super::result_stream::read_envelope(&state),
+        reader,
         media_type,
         "reading the statements exceeded the policy timeout",
         move |out| {
@@ -488,9 +490,9 @@ async fn statements(
                 .cancelled_by(token)
                 .within(out.holding().cloned());
             store
-                .write_statements(&read, &pattern, format, out)
+                .write_statements(&read, &pattern, format, &mut *out)
                 .map(|_| ())
-                .map_err(read_error)
+                .map_err(|error| out.refused(error, read_error))
         },
     )
     .await
@@ -1002,6 +1004,7 @@ mod tests {
             used: 0,
             shared: true,
             unread: true,
+            for_held: false,
             rows: None,
         });
         let status = |error| {

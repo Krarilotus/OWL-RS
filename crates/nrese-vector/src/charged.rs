@@ -118,6 +118,7 @@ pub(crate) fn bytes<T>(budget: &Budget, n: usize) -> Result<usize, BudgetExceede
         used: budget.used(),
         shared: false,
         unread: false,
+        for_held: false,
         rows: None,
     })
 }

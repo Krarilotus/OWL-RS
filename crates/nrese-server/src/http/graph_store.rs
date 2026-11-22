@@ -12,7 +12,7 @@ use crate::http::mutation;
 use crate::http::rdf_payload::{
     parse_graph_content_format, parse_graph_target, parse_rdf_base_iri,
 };
-use crate::http::result_stream::{Pace, read_envelope, stream_blocking};
+use crate::http::result_stream::{Pace, Reader, read_envelope, stream_blocking};
 use crate::http::sparql::refused_or;
 use crate::state::AppState;
 
@@ -29,12 +29,14 @@ pub async fn get_graph(
     let (media_type, request) = graph_request(&state, &raw_query, &headers, &access)?;
     let store = state.store();
     let scope = access.read_scope();
+    let reader = Reader::of(&scope);
     let cancellation = nrese_store::CancellationToken::new();
     let token = cancellation.clone();
     stream_blocking(
         Pace::stalled_after(state.policy().timeouts.graph_read),
         cancellation,
         read_envelope(&state),
+        reader,
         media_type,
         "graph read exceeded policy timeout",
         move |out| {
@@ -42,12 +44,14 @@ pub async fn get_graph(
             let read = nrese_store::ReadContext::new(scope)
                 .cancelled_by(token)
                 .within(out.holding().cloned());
-            match store.write_graph(&read, &request, out) {
+            match store.write_graph(&read, &request, &mut *out) {
                 Ok(true) => Ok(()),
                 // Graph Store Protocol §5.2: a graph that doesn't exist is 404, not an empty
                 // document. Nothing is written for it, so the status is still open.
                 Ok(false) => Err(ApiError::not_found("the graph does not exist")),
-                Err(error) => Err(refused_or(error, ApiError::bad_request)),
+                Err(error) => {
+                    Err(out.refused(error, |error| refused_or(error, ApiError::bad_request)))
+                }
             }
         },
     )

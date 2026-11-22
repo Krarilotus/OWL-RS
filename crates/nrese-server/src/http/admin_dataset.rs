@@ -11,7 +11,7 @@ use crate::http::media::{header_value_str, media_type_matches};
 use crate::http::mutation;
 use crate::http::request_metrics::BackupKind;
 use crate::http::responses::build_admin_restore_response;
-use crate::http::result_stream::{Pace, read_envelope, stream_blocking};
+use crate::http::result_stream::{Pace, Reader, read_envelope, stream_blocking};
 use crate::state::AppState;
 
 const BACKUP_FORMAT_HEADER: &str = "x-nrese-backup-format";
@@ -42,6 +42,7 @@ pub async fn backup(state: AppState) -> Result<Response, ApiError> {
         Pace::stalled_after(state.policy().timeouts.graph_read),
         cancellation,
         read_envelope(&state),
+        Reader::Every,
         "application/n-quads",
         "the export's client stopped reading (timeouts.graph_read)",
         move |out| {

@@ -355,20 +355,10 @@ pub struct Budget {
     credit_cap: AtomicUsize,
     /// Whether its charges at the server's budget go through [`Self::credit`]: an envelope's.
     credits: bool,
-    /// What is held beside the request's work ([`Self::charge_beside`]), and whether what was
-    /// caused the last refusal of that work here. Locked only by those charges and releases
-    /// and by a refusal of this budget's own limit, so that a refusal is judged by what `used`
-    /// held of it then.
-    beside: Mutex<Beside>,
-}
-
-/// [`Budget::beside`].
-#[derive(Debug, Default)]
-struct Beside {
-    held: usize,
-    /// The last refusal of the work by this budget's limit had room with nothing held
-    /// beside it, and something was: holding was its cause ([`Budget::refused_for_held`]).
-    refused_for_held: bool,
+    /// The bytes held beside the request's work ([`Self::charge_beside`]). Locked only by
+    /// those charges and releases and by a refusal of this budget's own limit, so that a
+    /// refusal is judged by what `used` held of them then ([`BudgetExceeded::for_held`]).
+    beside: Mutex<usize>,
 }
 
 /// [`Budget::credit_cap`] before it is found.
@@ -501,6 +491,11 @@ pub struct BudgetExceeded {
     /// because memory is in use.
     pub unread: bool,
     pub rows: Option<RowsPast>,
+    /// Refused by this budget's own limit for what was held beside the request's work
+    /// ([`Budget::charge_beside`]) at the refusal: something was, and the refused bytes had
+    /// room with nothing held. Judged under the lock of what is held, and carried with this
+    /// refusal alone: a later refusal of the same request is judged on its own.
+    pub for_held: bool,
 }
 
 /// A table past the rows its memory has room for (`rows`: `room + 1` where not counted).
@@ -628,28 +623,31 @@ impl Budget {
         let mut used = self.used.load(Ordering::Relaxed);
         loop {
             let Some(next) = used.checked_add(bytes).filter(|&next| next <= self.limit) else {
+                let mut for_held = false;
                 if record {
                     // Decided again under the lock of what is held beside the request's work,
                     // which `used` then holds exactly: the refusal is judged by what it held
                     // then. Holding was its cause only where these bytes had room without it.
-                    let mut beside = self.beside.lock().unwrap_or_else(PoisonError::into_inner);
+                    let held = self.beside.lock().unwrap_or_else(PoisonError::into_inner);
                     let now = self.used.load(Ordering::Relaxed);
                     if now != used {
                         used = now;
                         continue;
                     }
-                    let held = beside.held;
-                    beside.refused_for_held = held > 0
+                    for_held = *held > 0
                         && used
-                            .saturating_sub(held)
+                            .saturating_sub(*held)
                             .checked_add(bytes)
                             .is_some_and(|next| next <= self.limit);
-                    drop(beside);
+                    drop(held);
                     // Before the credit is returned: see `add_credit`.
                     self.refused.store(true, Ordering::SeqCst);
                     self.return_credit();
                 }
-                return Err(self.exceeded(bytes, used));
+                return Err(BudgetExceeded {
+                    for_held,
+                    ..self.exceeded(bytes, used)
+                });
             };
             match self
                 .used
@@ -666,18 +664,18 @@ impl Budget {
 
     /// Charges `bytes` held beside the request's work: its output, kept whole for a client
     /// that can be answered only so (an HTTP/1.0 answer). As [`Self::charge`], and counted
-    /// apart, so that a later refusal of the request's own work by this budget's limit
-    /// records whether what was held beside it then caused it ([`Self::refused_for_held`]).
+    /// apart, so that a refusal of the request's own work by this budget's limit says whether
+    /// what was held beside it then caused it ([`BudgetExceeded::for_held`]).
     pub fn charge_beside(&self, bytes: usize) -> Result<(), BudgetExceeded> {
-        let mut beside = self.beside.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut held = self.beside.lock().unwrap_or_else(PoisonError::into_inner);
         if let Err(refused) = self.take_as(bytes, false) {
-            drop(beside);
+            drop(held);
             // Recorded as `take_as` would (not under the lock it takes for a work's refusal).
             self.refused.store(true, Ordering::SeqCst);
             self.return_credit();
             return Err(refused);
         }
-        beside.held += bytes;
+        *held += bytes;
         #[cfg(any(test, feature = "measure"))]
         crate::measure::charged(self, bytes);
         Ok(())
@@ -685,21 +683,10 @@ impl Budget {
 
     /// Releases up to `bytes` of what [`Self::charge_beside`] holds.
     pub fn release_beside(&self, bytes: usize) {
-        let mut beside = self.beside.lock().unwrap_or_else(PoisonError::into_inner);
-        let bytes = bytes.min(beside.held);
-        beside.held -= bytes;
+        let mut held = self.beside.lock().unwrap_or_else(PoisonError::into_inner);
+        let bytes = bytes.min(*held);
+        *held -= bytes;
         self.release(bytes);
-    }
-
-    /// Whether the last refusal of the request's work by this budget's own limit was caused by
-    /// what was held beside it ([`Self::charge_beside`]) at that refusal: something was, and
-    /// the refused bytes had room with nothing held. A charge past the limit even with nothing
-    /// held is the work's own refusal. False while none was refused.
-    pub fn refused_for_held(&self) -> bool {
-        self.beside
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .refused_for_held
     }
 
     /// `bytes` charged at the levels above exactly: refused where one hasn't room, which
@@ -715,6 +702,7 @@ impl Budget {
                         used: refused.used,
                         shared: true,
                         unread: refused.unread,
+                        for_held: false,
                         rows: None,
                     })
             }
@@ -829,6 +817,7 @@ impl Budget {
             used,
             shared: false,
             unread: false,
+            for_held: false,
             rows: None,
         }
     }
