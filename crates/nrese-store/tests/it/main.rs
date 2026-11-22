@@ -30,6 +30,7 @@ mod mutation_safety_tests;
 mod ql_assertion_tests;
 mod ql_consistency_tests;
 mod ql_rewriting_tests;
+mod ql_top_property_tests;
 mod quarantine_tests;
 mod query_cache_tests;
 mod query_execution_tests;
