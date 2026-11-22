@@ -1709,9 +1709,12 @@ fn aliases_leave_a_key_built() {
     }
 }
 
-/// A reopen with current reasoning retains the complete prp-key answer.
+/// A reopen with current reasoning, without a rebuild, keeps the prp-key answer and marks no
+/// list: the answer is true, and its one reason is the reopen's (whether the rules equated two
+/// literals since the last rebuild isn't recorded, docs/limits.md). The `complete` comes back
+/// after a rebuild.
 #[test]
-fn a_reopened_store_keeps_its_long_key_answer_complete() {
+fn a_reopened_store_keeps_its_long_key_answer_and_its_word_comes_back_after_a_rebuild() {
     let dir = tempfile::tempdir().expect("dir");
     let ask = format!("<{EX}x> <{EX}name> \"Y\"");
     commit_list_and_check_answer(
@@ -1719,10 +1722,29 @@ fn a_reopened_store_keeps_its_long_key_answer_complete() {
         &long_key(128),
         &ask,
     );
-    complete_list_answer(
-        ql_pipeline(nrese_store::StoreConfig::on_disk(dir.path())).store(),
-        &ask,
+    let reopened = ql_pipeline(nrese_store::StoreConfig::on_disk(dir.path()));
+    let store = reopened.store();
+    let answer = store
+        .execute_query(&nrese_store::SparqlQueryRequest::all(format!(
+            "ASK {{ {ask} }}"
+        )))
+        .expect("answered");
+    let json: serde_json::Value = serde_json::from_slice(&answer.payload).expect("json");
+    assert_eq!(json["boolean"], true, "{ask} after the reopen");
+    let reasons: Vec<&str> = (answer.completeness.iter())
+        .flat_map(|c| c.reasons.iter().map(|r| r.text.as_str()))
+        .collect();
+    assert!(
+        !reasons.iter().any(|r| r.contains("list axiom")),
+        "{ask} after the reopen, a list marked: {reasons:?}"
     );
+    assert!(
+        matches!(reasons[..], [only] if only.contains("opened without a rebuild")),
+        "{ask} after the reopen, the reopen's reason alone: {reasons:?}"
+    );
+    let rules = (reopened.reasoner().config().materialised_program()).expect("owl2-rl rules");
+    store.rematerialise(rules).expect("rebuild");
+    complete_list_answer(store, &ask);
 }
 
 /// A pending read that deletes the key shares the committed revision number.
