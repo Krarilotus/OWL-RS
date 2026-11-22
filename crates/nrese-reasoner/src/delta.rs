@@ -2378,9 +2378,33 @@ mod budget_tests {
     }
 
     /// Deletes can both enable a list check and change a long list's guard. Report the
-    /// witnesses introduced by the delete, even when the list's program is rebuilt.
+    /// witnesses introduced by the edit, even when the list's program is rebuilt.
+    /// The short case adds the only exit while removing the inferred back edge.
+    /// With an earlier exit, the accepting walk would already trigger Table 5 prp-adp.
     #[test]
     fn list_updates_report_only_introduced_witnesses() {
+        let mismatches = list_update_witnesses(&[
+            ("phase-2 list check", 2, false, (0, 1, 1)),
+            (
+                "changed long-list guard",
+                PAIRWISE_MEMBERS + 1,
+                true,
+                (1, 1, 0),
+            ),
+        ]);
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
+    /// The two-position exit of an accepting cycle already gives a prp-adp clash.
+    /// Removing the back edge or adding a separate plain list with the same pair
+    /// can add a short rule instance without introducing that clash.
+    #[test]
+    fn an_accepting_cycle_does_not_make_a_surviving_clash_new() {
+        let mismatches = list_update_witnesses(&[("old accepting cycle", 2, true, (2, 1, 0))]);
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
+    fn list_update_witnesses(cases: &[(&str, usize, bool, (usize, usize, usize))]) -> Vec<String> {
         let mut vocab = LocalVocabulary::default();
         let schema = Schema::owl(&mut vocab);
         let lists = ListVocabulary::new(&mut vocab);
@@ -2400,10 +2424,7 @@ mod budget_tests {
         let members = vocab.iri("http://www.w3.org/2002/07/owl#members");
         let deleted = [root, p, marker];
         let mut mismatches = Vec::new();
-        for (scenario, len, witness_counts) in [
-            ("phase-2 list check", 2, (0, 1, 1)),
-            ("changed long-list guard", PAIRWISE_MEMBERS + 1, (1, 1, 0)),
-        ] {
+        for &(scenario, len, exit_before, witness_counts) in cases {
             let nodes: Vec<_> = (0..len)
                 .map(|i| vocab.iri(&format!("http://example.com/cell{i}")))
                 .collect();
@@ -2417,12 +2438,20 @@ mod budget_tests {
                 let branch = vocab.iri(&format!("http://example.com/branch{i}"));
                 asserted.push([branch, e, root]);
             }
+            let mut inserted = Vec::new();
+            let mut member_properties = Vec::new();
             for (i, &node) in nodes.iter().enumerate() {
                 let member = vocab.iri(&format!("http://example.com/member{i}"));
                 asserted.push([node, first, member]);
-                asserted.push([node, rest, nodes.get(i + 1).copied().unwrap_or(nil)]);
+                let edge = [node, rest, nodes.get(i + 1).copied().unwrap_or(nil)];
+                if !exit_before && i + 1 == len {
+                    inserted.push(edge);
+                } else {
+                    asserted.push(edge);
+                }
                 if i < 2 {
                     asserted.push([subject, member, object]);
+                    member_properties.push(member);
                 }
             }
             asserted.sort_unstable();
@@ -2450,12 +2479,54 @@ mod budget_tests {
             mismatches.extend(check_witnesses(
                 scenario,
                 &asserted,
-                &[],
+                &inserted,
                 deleted,
                 compiled,
                 witness_counts,
             ));
+            if len == 2 && exit_before {
+                // The bulk witness entry point only accepts insertions. Keep the cycle and
+                // add the same disjoint pair in the enumerated form as another list axiom.
+                let [plain, a, b] = ["plain", "plain0", "plain1"]
+                    .map(|local| vocab.iri(&format!("http://example.com/{local}")));
+                let extra = [
+                    [plain, schema.rdf_type(), adp],
+                    [plain, members, a],
+                    [a, first, member_properties[0]],
+                    [a, rest, b],
+                    [b, first, member_properties[1]],
+                    [b, rest, nil],
+                ];
+                let before = batch::materialise(&asserted, &rules, Some(&lists), &schema);
+                let mut after = asserted.clone();
+                after.extend(extra);
+                let base = MemoryBase::new(&after, &before.derived);
+                for threads in POOL_WIDTHS {
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()
+                        .unwrap();
+                    let reported = pool.install(|| {
+                        introduced_violations(
+                            &base,
+                            &extra,
+                            &[],
+                            compiled,
+                            None,
+                            &crate::eval::OperationStop::new(crate::eval::NEVER),
+                            &Arc::new(Budget::unlimited()),
+                        )
+                        .expect("never stopped")
+                    });
+                    if !reported.consistent() {
+                        mismatches.push(format!(
+                            "bulk form addition, threads={threads}: {:?}",
+                            reported.to_vec()
+                        ));
+                    }
+                }
+            }
         }
-        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+        mismatches
     }
 }
