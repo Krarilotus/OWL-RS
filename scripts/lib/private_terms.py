@@ -322,12 +322,15 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     signal.signal(signal.SIGTERM, stop)
+    unexpected = False
     try:
         code = main(sys.argv[1:])
     except Exception:  # never a traceback: one can show a path, or a line that holds a term
+        unexpected = True
+    if unexpected:  # said outside the handler, so a failing write chains nothing to the error
         code = 2
         try:
             print("private terms: could not check: an unexpected error: refused", flush=True)
-        except OSError:  # no stdout to say it on: the exit alone refuses
+        except Exception:  # no stdout to say it on: the exit alone refuses
             pass
     sys.exit(code)

@@ -281,28 +281,36 @@ class TheCheckOwnEnds(unittest.TestCase):
         with answering(0, b"2:two\n"):
             self.assertEqual(terms.grep("list", ["one", "two"]), [1], "the one well-formed answer")
 
-    # Spec (never-printed; review r8, 22 Nov 2026): an error the check doesn't expect -> a refusal (exit 2) and
-    # no traceback, which can show a path or a line that holds a term.
+    # Spec (never-printed; reviews r8 and r9, 22 Nov 2026): an error the check doesn't expect -> a refusal
+    # (exit 2) and no traceback, which can show a path or a line that holds a term; with a stdout that can't be
+    # written to (closed) as well.
     def test_an_unexpected_error_is_a_refusal_with_no_traceback(self):
         secret = "c:/users/zzhomezz/private"
         saved = signal.getsignal(signal.SIGTERM)
         self.addCleanup(signal.signal, signal.SIGTERM, saved)
-        with tempfile.TemporaryDirectory(prefix="nrese-private-terms-") as overlay, \
-                mock.patch.dict(os.environ, {"NRESE_BENCH_PRIVATE": overlay}), \
-                mock.patch.object(sys, "argv", [str(SCRIPT), "commit"]), \
-                mock.patch("tomllib.loads", side_effect=RuntimeError(secret)), \
-                mock.patch("sys.stdout", new_callable=io.StringIO) as out, \
-                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
-            Path(overlay, "hosts.toml").write_text("", encoding="utf-8")
-            try:
-                runpy.run_path(str(SCRIPT), run_name="__main__")
-                ended = None
-            except SystemExit as stop:
-                ended = stop.code
-            except Exception as escaped:  # what would print as a traceback
-                ended = f"escaped: {escaped}"
-        self.assertEqual(ended, 2, "SPEC never-printed: an unexpected error escaped the check")
-        self.assertNotIn(secret, out.getvalue() + err.getvalue(), "SPEC never-printed")
+        for closed in (False, True):
+            with self.subTest(closed_stdout=closed), \
+                    tempfile.TemporaryDirectory(prefix="nrese-private-terms-") as overlay, \
+                    mock.patch.dict(os.environ, {"NRESE_BENCH_PRIVATE": overlay}), \
+                    mock.patch.object(sys, "argv", [str(SCRIPT), "commit"]), \
+                    mock.patch("tomllib.loads", side_effect=RuntimeError(secret)), \
+                    mock.patch("sys.stdout", new_callable=io.StringIO) as out, \
+                    mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                Path(overlay, "hosts.toml").write_text("", encoding="utf-8")
+                said = ""
+                if closed:
+                    out.close()
+                try:
+                    runpy.run_path(str(SCRIPT), run_name="__main__")
+                    ended = None
+                except SystemExit as stop:
+                    ended = stop.code
+                except Exception as escaped:  # what would print as a traceback
+                    ended = f"escaped: {escaped}"
+                if not closed:
+                    said = out.getvalue()
+                self.assertEqual(ended, 2, "SPEC never-printed: an unexpected error escaped the check")
+                self.assertNotIn(secret, said + err.getvalue(), "SPEC never-printed")
 
     # Spec (the master, 22 Nov 05:24: the signal path is where fail-opens sat): a stop while the pattern file
     # exists ends the check only once the file is removed, with the stop's exit (143, a refusal to check.sh).
