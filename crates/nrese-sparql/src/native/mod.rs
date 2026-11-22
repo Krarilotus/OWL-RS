@@ -6917,18 +6917,29 @@ impl<'a> Context<'a> {
                 }
             };
             let new: Vec<(u64, Number)> = if missing.len() < 2 * PARALLEL_EXPRESSION_ROWS {
-                let term = |id: u64| self.term(id);
-                let aggregator = Aggregator {
-                    evaluator: &self.evaluator,
-                    term: &term,
-                    memo: RefCell::default(),
-                    numbers: RefCell::default(),
-                    kept: None,
+                let serial = |term: &dyn Fn(u64) -> Option<Term>| -> Vec<(u64, Number)> {
+                    let aggregator = Aggregator {
+                        evaluator: &self.evaluator,
+                        term,
+                        memo: RefCell::default(),
+                        numbers: RefCell::default(),
+                        kept: None,
+                    };
+                    missing
+                        .iter()
+                        .map(|&(id, row)| (id, number(&aggregator, row)))
+                        .collect()
                 };
-                missing
-                    .iter()
-                    .map(|&(id, row)| (id, number(&aggregator, row)))
-                    .collect()
+                if twinned {
+                    // With a `COUNT` of an expression, into a cache of its own, as the
+                    // per-column route decodes: none of its terms stays charged after it.
+                    let computed = self.computed.borrow();
+                    let decoder =
+                        Decoder::new(&self.snapshot, &computed, &self.decodes, &self.budget);
+                    serial(&|id| decoder.term(id))
+                } else {
+                    serial(&|id| self.term(id))
+                }
             } else {
                 let computed = self.computed.borrow();
                 let computed: &[Term] = &computed;
