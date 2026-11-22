@@ -5,10 +5,11 @@ use nrese_shacl::{
     Selection, Shapes, ValidationReport, compile, validate, validate_changes,
     validate_shapes_change,
 };
-use nrese_sparql::Resources;
+use nrese_sparql::{QueryEvaluationError, Resources};
 
 use super::gaps::EntryPoint;
 use super::observe::{Observation, Observer};
+use super::stops::{Outcome, Stop, TripView};
 
 const PREFIXES: &str = "
     @prefix ex: <http://example.com/> .
@@ -68,6 +69,7 @@ pub(super) struct Case {
     pub steps: Vec<Step>,
     pub fresh_value: bool,
     pub equality: bool,
+    pub stop: Option<(EntryPoint, Stop)>,
 }
 
 impl Case {
@@ -79,6 +81,7 @@ impl Case {
             steps: vec![step],
             fresh_value: false,
             equality: false,
+            stop: None,
         }
     }
 
@@ -166,47 +169,71 @@ impl Case {
             };
             let full_before = reference(&before, shapes_before)?;
             let full_after = reference(&after, shapes_before)?;
-            let outcome = validate_changes(
-                &before,
-                &after,
-                shapes_before,
-                data,
-                &changed,
-                &Resources::default(),
-            );
+            let observe = |entry, check: &Check<'_>| {
+                let stop = self
+                    .stop
+                    .filter(|(api, _)| *api == entry)
+                    .map(|(_, stop)| stop);
+                observe_actual(stop, &before, &after, &observer, check)
+            };
             evaluations.push(Evaluation {
                 step: index + 1,
                 entry: EntryPoint::Data,
                 before: full_before.clone(),
                 after: full_after,
-                actual: outcome
-                    .map_err(|error| error.to_string())
-                    .and_then(|report| observer.observe(&report))?,
+                actual: observe(EntryPoint::Data, &|before, after, resources| {
+                    validate_changes(before, after, shapes_before, data, &changed, resources)
+                })?,
             });
             if step.shapes.is_some() {
                 let shapes_after = compile_shapes(&after)?;
                 let full_after = reference(&after, &shapes_after)?;
-                let report: ValidationReport = validate_shapes_change(
-                    &before,
-                    shapes.as_ref(),
-                    &after,
-                    &shapes_after,
-                    data,
-                    &Resources::default(),
-                )
-                .map_err(|error| error.to_string())?;
                 evaluations.push(Evaluation {
                     step: index + 1,
                     entry: EntryPoint::Shapes,
                     before: full_before,
                     after: full_after,
-                    actual: observer.observe(&report)?,
+                    actual: observe(EntryPoint::Shapes, &|before, after, resources| {
+                        validate_shapes_change(
+                            before,
+                            shapes.as_ref(),
+                            after,
+                            &shapes_after,
+                            data,
+                            resources,
+                        )
+                    })?,
                 });
                 shapes = Some(shapes_after);
             }
             before = after;
         }
         Ok(evaluations)
+    }
+}
+
+type Check<'a> = dyn Fn(&TripView<'_>, &TripView<'_>, &Resources) -> Result<ValidationReport, QueryEvaluationError>
+    + 'a;
+
+fn observe_actual(
+    stop: Option<Stop>,
+    before: &Snapshot,
+    after: &Snapshot,
+    observer: &Observer<'_>,
+    check: &Check<'_>,
+) -> Result<Outcome, String> {
+    let resources = stop.map_or_else(Resources::default, Stop::resources);
+    let token = |on| resources.cancellation.as_ref().filter(|_| stop == Some(on));
+    let before = TripView::new(before, token(Stop::Before));
+    let after = TripView::new(after, token(Stop::After));
+    match check(&before, &after, &resources) {
+        Ok(report) => observer.observe(&report).map(Outcome::Report),
+        Err(QueryEvaluationError::Cancelled) => Ok(Outcome::Cancelled {
+            before: before.tripped(),
+            after: after.tripped(),
+        }),
+        Err(QueryEvaluationError::MemoryLimit(_)) => Ok(Outcome::MemoryLimit),
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -225,5 +252,5 @@ pub(super) struct Evaluation {
     pub entry: EntryPoint,
     pub before: Observation,
     pub after: Observation,
-    pub actual: Observation,
+    pub actual: Outcome,
 }

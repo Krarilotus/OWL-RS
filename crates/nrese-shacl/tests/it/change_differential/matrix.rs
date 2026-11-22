@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use nrese_rdf::{NamedNode, Term};
 use nrese_shacl::{Component, PropertyPath, SH};
@@ -6,9 +6,12 @@ use nrese_shacl::{Component, PropertyPath, SH};
 use super::case::{Case, Step, ex, quads};
 use super::gaps::EntryPoint;
 use super::observe::{Deviation, ResultKey, ResultTerm, compare};
+use super::stops::{Outcome, Stop};
 
 mod data;
+mod identity;
 mod shapes;
+mod terminal;
 
 struct Row {
     id: String,
@@ -17,6 +20,8 @@ struct Row {
     entry: EntryPoint,
     before: BTreeSet<ResultKey>,
     after: BTreeSet<ResultKey>,
+    before_failures: BTreeMap<String, usize>,
+    after_failures: BTreeMap<String, usize>,
 }
 
 impl Row {
@@ -34,6 +39,8 @@ impl Row {
             entry: EntryPoint::Data,
             before: before.into_iter().collect(),
             after: after.into_iter().collect(),
+            before_failures: BTreeMap::new(),
+            after_failures: BTreeMap::new(),
         }
     }
 
@@ -74,7 +81,9 @@ pub(super) fn run() {
         .chain(cycle())
         .chain(shared_target())
         .chain(data::rows())
-        .chain(shapes::rows());
+        .chain(shapes::rows())
+        .chain(identity::rows())
+        .chain(terminal::rows());
     let selector = std::env::var("NRESE_SHACL_CASE").ok();
     let mut checked = 0;
     for row in rows {
@@ -95,8 +104,30 @@ pub(super) fn run() {
                 .unwrap_or_else(|error| panic!("{context}: {error}"))
             {
                 let location = format!("{context}, step {}, {:?}", outcome.step, outcome.entry);
-                let deviation = compare(&outcome.before, &outcome.after, &outcome.actual);
-                assert_eq!(deviation, Deviation::default(), "{location}");
+                let stop = case.stop.filter(|(entry, _)| *entry == outcome.entry);
+                let actual = match (&outcome.actual, stop.map(|(_, stop)| stop)) {
+                    (Outcome::Report(actual), None) => {
+                        let deviation = compare(&outcome.before, &outcome.after, actual);
+                        assert_eq!(deviation, Deviation::default(), "{location}");
+                        Some(actual)
+                    }
+                    (
+                        Outcome::Cancelled {
+                            before: true,
+                            after: false,
+                        },
+                        Some(Stop::Before),
+                    )
+                    | (
+                        Outcome::Cancelled {
+                            before: false,
+                            after: true,
+                        },
+                        Some(Stop::After),
+                    )
+                    | (Outcome::MemoryLimit, Some(Stop::Envelope(_))) => None,
+                    (actual, stop) => panic!("{location}: expected {stop:?}, got {actual:?}"),
+                };
                 if outcome.entry != row.entry {
                     continue;
                 }
@@ -111,18 +142,32 @@ pub(super) fn run() {
                     row.after,
                     "{location}: full after"
                 );
-                assert!(
-                    outcome.before.failures.is_empty(),
+                assert_eq!(
+                    outcome.before.failures, row.before_failures,
                     "{location}: full before failures"
                 );
-                assert!(
-                    outcome.after.failures.is_empty(),
+                assert_eq!(
+                    outcome.after.failures, row.after_failures,
                     "{location}: full after failures"
                 );
-                assert!(
-                    outcome.actual.failures.is_empty(),
-                    "{location}: actual failures"
-                );
+                if let Some(actual) = actual {
+                    assert_eq!(
+                        actual.failures, row.after_failures,
+                        "{location}: actual failures"
+                    );
+                }
+                if case.fresh_value {
+                    assert_eq!(
+                        outcome.before.results.values().sum::<usize>(),
+                        1,
+                        "{location}: one before value"
+                    );
+                    assert_eq!(
+                        outcome.after.results.values().sum::<usize>(),
+                        1,
+                        "{location}: one after value"
+                    );
+                }
             }
             assert!(pinned, "{context}: missing {:?} observation", row.entry);
         }

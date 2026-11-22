@@ -1767,15 +1767,19 @@ fn a_stored_triple_term_is_the_same_value_from_select_or_ask() {
     );
 }
 
+pub(super) const FRESH_VALUE_SHAPES: &str =
+    "ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:sparql ex:Check .
+     ex:Check sh:select '''
+        SELECT $this (BNODE() AS ?value) WHERE { $this <http://example.com/p> ?x }
+     ''' .";
+
 /// A blank node a constraint's query makes (`BNODE() AS ?value`) is the result's value
 /// (SHACL §5.3.2), and the same result found again is the same result: a change elsewhere
 /// introduces none, though the query makes a new blank node at each evaluation.
 #[test]
 fn a_blank_node_a_query_made_is_the_same_result_when_found_again() {
     let data = "ex:a ex:p ex:b .";
-    let shapes = "ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:sparql [ sh:select '''
-        SELECT $this (BNODE() AS ?value) WHERE { $this <http://example.com/p> ?x }''' ] .";
-    let store = engine(data, shapes);
+    let store = engine(data, FRESH_VALUE_SHAPES);
     let before = store.snapshot();
     let compiled = compiled(&before);
     let report = validate(&before, &compiled, DEFAULT);
