@@ -121,7 +121,12 @@ fn read_ontology(
     snapshot: &Snapshot,
 ) -> Result<KeptOntology, nrese_exec::BudgetExceeded> {
     let kept = store.dl().bounds.kept();
-    let ontology = Arc::new(source::read_snapshot(snapshot, Arc::clone(kept))?);
+    let treatments = &store.config().dl.treatments;
+    let ontology = Arc::new(source::read_snapshot(
+        snapshot,
+        Arc::clone(kept),
+        treatments,
+    )?);
     let bytes = nrese_dl::memory::ontology_bytes(&ontology);
     Ok(Arc::new(nrese_exec::cell::Kept::charge(
         ontology,
@@ -309,27 +314,87 @@ pub(crate) fn plan_status(
     let decided = decided(store, snapshot, prepared, cancellation)?;
     let completeness = match decided.as_ref() {
         Ok(at) => plan_status_built(store, prepared, &analysis, at).completeness,
-        Err(why) => Status::sound_only(*why).completeness,
+        Err(why) => fallback(prepared, why).completeness,
     };
     Ok(composed(store, prepared, snapshot, &decided, completeness))
 }
 
+/// The status when the DL bounds view isn't used ([`PART`], [`LATER`], [`DEADLINE`]): `why`,
+/// its cause without "answers over the RL closure" unless the read surely reads the closure
+/// ([`reads_store_closure`]); for a reader of every graph that can't read it
+/// ([`may_read_store_closure`]), also that its dataset leaves the closure out. A reader of
+/// some graphs keeps [`PART`] alone: it never reads the bounds, and under `owl2-dl` it is
+/// told `not-certified` whatever the reason (`status_for_its_reader` in `service.rs`), so no
+/// reason here reaches it.
+fn fallback(prepared: &PreparedQuery, why: &str) -> Status {
+    let mut status = match why.strip_suffix(OVER_THE_CLOSURE) {
+        Some(cause) if !reads_store_closure(prepared) => {
+            Status::sound_only(format!("{cause}{NOT_CHECKED}"))
+        }
+        _ => Status::sound_only(why),
+    };
+    if let Some(reason) = prepared.dataset_omission_reason()
+        && prepared.access().is_none()
+        && !may_read_store_closure(prepared)
+    {
+        status.add(reason.to_owned());
+    }
+    status
+}
+
+/// Whether `prepared` surely reads the store's default graph, where the closure's inferred
+/// statements are: its dataset keeps it, or its query names it by `GRAPH`
+/// ([`reads_store_default_by_graph`]).
+pub(crate) fn reads_store_closure(prepared: &PreparedQuery) -> bool {
+    prepared.dataset_omission_reason().is_none()
+        || reads_store_default_by_graph(prepared.query(), false)
+}
+
+/// Whether `prepared` may read the store's default graph: as [`reads_store_closure`], or by
+/// a variable graph (`GRAPH ?g`), which may be bound to its name.
+fn may_read_store_closure(prepared: &PreparedQuery) -> bool {
+    prepared.dataset_omission_reason().is_none()
+        || reads_store_default_by_graph(prepared.query(), true)
+}
+
 /// The bounds' view of `snapshot` its answers and their status are decided on, or
-/// why there is none ([`PART`], [`LATER`]). Never another snapshot's view.
+/// why there is none ([`PART`], [`LATER`], [`FAILED`], [`DEADLINE`]). Never another
+/// snapshot's view.
 type Decided = Result<(Snapshot, Arc<View>), &'static str>;
 
 /// A reader of some graphs reads its own view of the snapshot, not the bounds'.
 const PART: &str = "the reader sees part of the data: answers are checked against the bounds \
                     only for readers of every graph";
 
+/// The end of [`LATER`] and [`DEADLINE`]: what a read without the bounds' view answers over,
+/// where it surely reads the closure ([`fallback`]).
+macro_rules! over_the_closure {
+    () => {
+        ": answers over the RL closure, not checked against the bounds"
+    };
+}
+const OVER_THE_CLOSURE: &str = over_the_closure!();
+
+/// [`OVER_THE_CLOSURE`] for a read that may leave the closure out.
+const NOT_CHECKED: &str = ": not checked against the bounds";
+
 /// An older revision whose bounds a later commit replaced reads its RL closure.
-const LATER: &str = "a later commit's bounds replaced this revision's while it was read: \
-                     answers over the RL closure, not checked against the bounds";
+const LATER: &str = concat!(
+    "a later commit's bounds replaced this revision's while it was read",
+    over_the_closure!()
+);
 
 /// A read whose request's time was up before the view of its revision was built reads its RL
 /// closure: the build, another read's or none begun, isn't waited for.
-const DEADLINE: &str = "the request's time was up before the bounds' view of this revision was \
-                        built: answers over the RL closure, not checked against the bounds";
+const DEADLINE: &str = concat!(
+    "the request's time was up before the bounds' view of this revision was built",
+    over_the_closure!()
+);
+
+/// A read whose wait ended with the build of its revision's view failed (a panic, an early
+/// return) reads its RL closure.
+const FAILED: &str = "the bounds' build of this revision's view failed: answers over the RL \
+                      closure, not checked against the bounds";
 
 /// [`Decided`] of `snapshot` for `prepared`.
 fn decided(
@@ -341,18 +406,19 @@ fn decided(
     if prepared.access().is_some() {
         return Ok(Err(PART));
     }
-    let up = || {
-        prepared
-            .deadline()
-            .is_some_and(|at| Deadline::at(at).passed())
-    };
-    let stop = || cancellation.is_cancelled() || up();
-    let Some(view) = super::bounds::view_until(store, snapshot, Some(&stop)) else {
+    use super::bounds::Missing;
+    let stop = || cancellation.is_cancelled();
+    let Some(view) = super::bounds::view_until(store, snapshot, prepared.deadline(), Some(&stop))
+    else {
         // The operator's stop is the read's error; the request's time is a reason.
         cancellation.check()?;
         return Ok(Err(DEADLINE));
     };
-    Ok(view.map(|view| (snapshot.clone(), view)).ok_or(LATER))
+    Ok(match view {
+        Ok(view) => Ok((snapshot.clone(), view)),
+        Err(Missing::Later) => Err(LATER),
+        Err(Missing::Failed) => Err(FAILED),
+    })
 }
 
 /// The exact services' deadline for `prepared`: `dl.timeout` from now, or the request's own
@@ -382,20 +448,26 @@ fn composed(
 
 /// The data a status is composed for ([`mark`]): the view the answers were decided on, or
 /// the snapshot a read without the bounds ran on, committed or with a transaction's
-/// operations pending (whose revision number is its base's, so it is read afresh), and
-/// whether one of them may delete.
+/// operations pending (whose revision number is its base's, so it is read afresh).
 #[derive(Clone, Copy)]
 pub(crate) enum Revision<'a> {
     Decided(&'a (Snapshot, Arc<View>)),
     Committed(&'a Snapshot),
-    Pending(&'a Snapshot, bool),
+    Pending {
+        snapshot: &'a Snapshot,
+        /// Whether one of the operations may delete.
+        deletes: bool,
+        /// Whether they keep their base's record of what the reader left out
+        /// (`dl::bounds::Bounds::keeps_record`).
+        keeps_record: bool,
+    },
 }
 
 impl Revision<'_> {
     pub(crate) fn snapshot(&self) -> &Snapshot {
         match self {
             Revision::Decided((snapshot, _)) => snapshot,
-            Revision::Committed(snapshot) | Revision::Pending(snapshot, _) => snapshot,
+            Revision::Committed(snapshot) | Revision::Pending { snapshot, .. } => snapshot,
         }
     }
 }
@@ -435,7 +507,7 @@ pub(crate) fn mark(
         any(&by_subject).or_else(|| any(&by_object)).is_some()
     };
     let read = match at {
-        Revision::Pending(..) => read_ontology,
+        Revision::Pending { .. } => read_ontology,
         _ => ontology_at,
     };
     if let Some(iri) = named_outside(prepared.query(), held)
@@ -510,30 +582,33 @@ const ONLY: &str = "OWL 2 DL may not entail what the OWL 2 RL rules found here, 
 /// which both leave (`routed_to_rules` needs neither): what the store's indexes decide
 /// ([`by_index`]), else one read of the ontology `at` ([`ontology_at`], a pending one's of
 /// its own), whose refusal leaves it unknown. First [`left_out`], as recorded (pending: the
-/// base's).
+/// base's, taken where it tells something, and where it tells nothing only where the pending
+/// changes keep it, as their commit would).
 fn reads_differently(store: &StoreService, at: Revision<'_>) -> Option<String> {
-    let (snapshot, pending, proved) = match at {
+    let (snapshot, pending, keeps_record) = match at {
         Revision::Decided((_, view)) if view.rules => return None,
-        Revision::Decided((snapshot, view)) => (snapshot, false, view.proves_consistency),
-        Revision::Committed(snapshot) => (snapshot, false, false),
-        Revision::Pending(snapshot, _) => (snapshot, true, false),
-    };
-    let status = || {
-        store
-            .dl()
-            .status()
-            .filter(|s| s.revision == snapshot.revision())
+        Revision::Decided((snapshot, _)) => (snapshot, false, true),
+        Revision::Committed(snapshot) => (snapshot, false, true),
+        Revision::Pending {
+            snapshot,
+            keeps_record,
+            ..
+        } => (snapshot, true, keeps_record),
     };
     // Named where its commit wrote it: only a reader of every graph is given the status this
-    // reason is in (`status_for_its_reader`, service.rs).
-    let left_out = if proved {
-        Some(None)
-    } else {
-        status().and_then(|s| s.left_out)
-    };
+    // reason is in (`status_for_its_reader`, service.rs). U1's proof of consistency is no
+    // record: it says nothing of what the rules read beyond the ontology (an unused structure).
+    let left_out = (store.dl().status())
+        .filter(|s| s.revision == snapshot.revision())
+        .and_then(|s| s.left_out);
+    // A pending read's record is its base's: one that tells nothing says nothing of pending
+    // changes that may change what the reader reads (a node typed the ontology reads its
+    // statements otherwise, a literal gives an object property a second kind), so it reads
+    // its own, but where they keep the record (`Bounds::keeps_record`). The indexes are the
+    // pending state's own.
     match (left_out, by_index(snapshot)) {
         (Some(Some(why)), _) | (_, Some(Some(why))) => return Some(why),
-        (Some(None), Some(None)) => return None,
+        (Some(None), Some(None)) if keeps_record => return None,
         _ => {}
     }
     let marked = &store.dl().query_ontology.1;
@@ -645,12 +720,24 @@ fn annotation_reason(snapshot: &Snapshot, property: u64) -> String {
     )
 }
 
-/// [`reads_differently`]'s reason where the reader left out what the rules may read, its
-/// terms as `name` writes them.
+/// [`reads_differently`]'s reason where the reader left out what the rules may read, or the
+/// rules read a part otherwise than OWL 2 DL does (a name of two kinds, a structure no axiom
+/// uses: `nrese_owl::Diagnostic::reads_otherwise`), its terms as `name` writes them: what
+/// the premise of the rules' closure tells, `None` where it holds.
 pub(crate) fn left_out(ontology: &Ontology, name: &dyn Fn(u64) -> String) -> Option<String> {
-    let why = consistency::left_out_by(ontology, nrese_owl::Diagnostic::leaves_out, name)?;
+    if let Some(why) = consistency::left_out_by(ontology, nrese_owl::Diagnostic::leaves_out, name) {
+        return Some(format!(
+            "{why}, whose statements the OWL 2 RL rules may still read: {ONLY}, or remove them"
+        ));
+    }
+    let otherwise: Vec<_> = (ontology.diagnostics.iter())
+        .filter(|d| d.reads_otherwise())
+        .collect();
+    let first = otherwise.first()?.describe(name);
     Some(format!(
-        "{why}, whose statements the OWL 2 RL rules may still read: {ONLY}, or remove them"
+        "{} part(s) of the data aren't OWL 2 DL, and the OWL 2 RL rules read them otherwise; \
+         first: {first}: {ONLY}, or remove them, or declare each name as one kind",
+        otherwise.len()
     ))
 }
 
@@ -726,18 +813,34 @@ pub(crate) fn certify_closure(
     certify(completeness, (query, reads), source, false, snapshot);
 }
 
-/// The QL rewriting's own report as it leaves nrese-sparql (run, EXPLAIN and plan), with
-/// the whole composition ([`certify_closure`]) on it: the answer's status is this report
-/// (`StoreService::status_outside_dl`), so the two are one value.
+/// The QL rewriting's own report as it leaves nrese-sparql (run, EXPLAIN, plan and the printed
+/// query), with the whole composition ([`certify_closure`]) on it: the answer's status is this
+/// report (`StoreService::status_outside_dl`), so the two are one value. Under `owl2-rl`, where
+/// the closure leaves out a list axiom (`lists_left_out`, asked only of a report still
+/// `complete` after the composition's other steps, so an earlier reason keeps its place), whose
+/// conclusions an answer may miss, it isn't `complete` ([`LIST`]); then the operator rule, last.
 pub(crate) fn certify_report(
     completeness: Option<&mut Completeness>,
     query: (&Query, &Reads),
     snapshot: Option<&Snapshot>,
+    lists_left_out: impl FnOnce() -> bool,
 ) {
-    if let Some(completeness) = completeness {
-        certify_closure(completeness, query, "ql", snapshot);
+    let Some(completeness) = completeness else {
+        return;
+    };
+    if !lowerings(completeness, query, "ql", false, snapshot) {
+        return;
     }
+    let rl = completeness.regime == Some(nrese_sparql::Regime::Owl2Rl);
+    if completeness.complete && rl && lists_left_out() {
+        completeness.incomplete("rules", LIST.to_owned());
+    }
+    negation_rule(completeness, query, "ql");
 }
+
+/// Why a QL report under `owl2-rl` isn't `complete` where the closure leaves out a list.
+const LIST: &str =
+    "a list axiom the rules can't build is left out of the closure (a list diagnostic)";
 
 /// What [`certify`] reads of a query, which depends on the query and its reader alone, as the
 /// reasons it gives: each found on its first use and kept with the prepared query
@@ -773,14 +876,28 @@ impl Reads {
 /// [`certify_closure`], on the bounds' path where `bounds` (what [`denied`] allows there).
 pub(crate) fn certify(
     completeness: &mut Completeness,
-    (query, reads): (&Query, &Reads),
+    query: (&Query, &Reads),
     source: &'static str,
     bounds: bool,
     snapshot: Option<&Snapshot>,
 ) {
+    if lowerings(completeness, query, source, bounds, snapshot) {
+        negation_rule(completeness, query, source);
+    }
+}
+
+/// [`certify`]'s steps before the operator rule; `false` (none taken) where the regime isn't
+/// one of OWL 2's.
+fn lowerings(
+    completeness: &mut Completeness,
+    (query, reads): (&Query, &Reads),
+    source: &'static str,
+    bounds: bool,
+    snapshot: Option<&Snapshot>,
+) -> bool {
     use nrese_sparql::Regime::{Owl2Dl, Owl2Ql, Owl2Rl};
     if !matches!(completeness.regime, Some(Owl2Dl | Owl2Ql | Owl2Rl)) {
-        return;
+        return false;
     }
     let read = reads.denied[usize::from(bounds)].get_or_init(|| {
         denied(query, bounds).map(|what| format!("the query reads {what}: {DENIED}"))
@@ -832,7 +949,7 @@ pub(crate) fn certify(
         completeness.incomplete(source, QUARANTINE.to_owned());
     }
     annotation_rule(completeness, (query, reads), source, given);
-    negation_rule(completeness, (query, reads), source);
+    true
 }
 
 /// Where the status speaks of the OWL 2 Direct Semantics (`owl2-dl`, or the QL rewriting's,
@@ -903,28 +1020,79 @@ fn copied<'a>(
     // SHACL content (`nrese_owl::shacl_properties`) is copied only through an equality of two
     // different terms (OWL 2 Profiles §4.3, Table 4: eq-rep-s, eq-rep-p, eq-rep-o): an OWL axiom
     // on a SHACL term makes the reader read the store as any other, and a copy is then entailed.
-    // So with no equality its properties aren't probed.
+    // So with no equality its properties aren't probed. Nor are the properties of statements
+    // about the ontology's node ([`header_properties`]), which the reader reads as annotations
+    // where they are declared no object or data property: undeclared, they name no annotation
+    // property by a declaration, and an equality copies them.
     read.iter().find(|p| match p.as_deref() {
         None => {
             annotation_properties(snapshot, readable).any(copies)
                 || (equal()
-                    && nrese_owl::shacl_properties()
+                    && (nrese_owl::shacl_properties())
                         .filter_map(|i| id(&i))
+                        .chain(header_properties(snapshot, readable))
                         .any(copies))
         }
         Some(iri) => id(iri).is_some_and(|p| {
             let typed = id(RDF_TYPE).map(|ty| asserted(any_graph(Some(p), Some(ty), None)));
             let shacl = nrese_owl::is_shacl_property(iri) && equal();
+            let header = || equal() && header_properties(snapshot, readable).any(|h| h == p);
             let declared = || typed.into_iter().flatten().any(declares);
-            (BUILTIN.contains(&iri) || shacl || (nrese_owl::may_name_annotation(iri) && declared()))
+            (BUILTIN.contains(&iri)
+                || shacl
+                || (nrese_owl::may_name_annotation(iri) && declared())
+                || header())
                 && copies(p)
         }),
     })
 }
 
+/// The properties of the asserted statements about a node typed `owl:Ontology` (the
+/// ontology's header), each statement and typing in a graph `readable` takes, but an object
+/// or data property's, whose statement there is an assertion (*Mapping to RDF* Table 10; the
+/// reader's rule): one declared so in a graph `readable` takes, or built in; lazily, a node
+/// at a time.
+fn header_properties(
+    snapshot: &Snapshot,
+    readable: impl Fn(TermId) -> bool + Copy,
+) -> impl Iterator<Item = TermId> {
+    use nrese_owl::vocab::OWL;
+    let id = move |iri: &str| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into());
+    let (ty, ontology) = (id(RDF_TYPE), id(&format!("{OWL}Ontology")));
+    let asserted =
+        move |s, p, o| snapshot.quads_for_pattern_in(ReadModel::Asserted, &any_graph(s, p, o));
+    let declaring = ["ObjectProperty", "DatatypeProperty"].map(|k| id(&format!("{OWL}{k}")));
+    let built_in = [
+        "topObjectProperty",
+        "bottomObjectProperty",
+        "topDataProperty",
+        "bottomDataProperty",
+    ]
+    .map(|p| id(&format!("{OWL}{p}")));
+    let logical = move |p: TermId| {
+        built_in.contains(&Some(p))
+            || (declaring.into_iter().flatten())
+                .any(|k| asserted(Some(p), ty, Some(k)).any(|q| readable(q.graph)))
+    };
+    let nodes = ty
+        .zip(ontology)
+        .into_iter()
+        .flat_map(move |(ty, ontology)| {
+            asserted(None, Some(ty), Some(ontology)).filter(move |q| readable(q.graph))
+        });
+    nodes.flat_map(move |node| {
+        (asserted(Some(node.subject), None, None))
+            .filter(move |q| readable(q.graph) && Some(q.predicate) != ty)
+            .map(|q| q.predicate)
+            .filter(move |&p| !logical(p))
+    })
+}
+
 /// Where rows may be missing, an operator under which a missing row can make a returned
 /// one wrong makes the answers unsound ([`negation`]): the last step of [`certify`], and of
-/// a read inside a transaction whatever the regime, whose pending rows the closure lacks.
+/// a read inside a transaction whatever the regime, whose pending rows the closure lacks. Its
+/// reason is given once: a read it already lowered (its route's composition, before the
+/// pending operations') isn't told it again from another source.
 pub(crate) fn negation_rule(
     completeness: &mut Completeness,
     (query, reads): (&Query, &Reads),
@@ -938,7 +1106,8 @@ pub(crate) fn negation_rule(
             format!("the query uses {op} over answers that may be missing: a row may be wrong")
         })
     });
-    if let Some(reason) = operator {
+    let given = |reason: &String| completeness.reasons.iter().any(|r| r.text == *reason);
+    if let Some(reason) = operator.as_ref().filter(|reason| !given(reason)) {
         completeness.unsound(source, reason.clone());
     }
 }
@@ -950,9 +1119,7 @@ fn plan_status_built(
     (snapshot, view): &(Snapshot, Arc<View>),
 ) -> Status {
     if prepared.has_dataset() {
-        return Status::sound_only(
-            "the query reads part of the data: not checked against the bounds",
-        );
+        return Status::sound_only(prepared.dl_dataset_reason());
     }
     // What the run adds whatever path decides ([`decide_answers`]); a consistency the run
     // would check is not known yet.
@@ -1019,7 +1186,7 @@ pub(crate) fn answer(
     let read = (cancellation, deadline_of(store, prepared));
     let mut outcome = match decided.as_ref() {
         Ok(at) => decide_answers(store, prepared, &analysis, at, read, memory, mode)?,
-        Err(why) => Status::sound_only(*why).stream(Read::At(snapshot.clone())),
+        Err(why) => fallback(prepared, why).stream(Read::At(snapshot.clone())),
     };
     #[cfg(test)]
     crate::service::hooks::run(&crate::service::hooks::AFTER_DECIDED);
@@ -1100,11 +1267,9 @@ fn decide_answers(
     let settings = store.query_settings();
     if prepared.has_dataset() {
         // Over the decided snapshot, every graph's for this reader: the status's.
-        return Ok(Status::sound_only(
-            "the query names its dataset: answers are over those graphs, not checked \
-             against the bounds",
-        )
-        .stream(Read::At(snapshot.clone())));
+        return Ok(
+            Status::sound_only(prepared.dl_dataset_reason()).stream(Read::At(snapshot.clone()))
+        );
     }
     let mut status = Status::complete();
     // A version no certificate vouches for is told `not-certified` whatever its consistency

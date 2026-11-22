@@ -10,6 +10,7 @@ An assertion tagged `SPEC <tag>` states the behaviour its test is for.
 """
 
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import unittest
@@ -42,7 +44,7 @@ COPIED = (".githooks/pre-push", "scripts/check.sh", "scripts/cargo-guarded.sh", 
           "scripts/lib/gate-publish.sh", "rust-toolchain.toml",
           "scripts/lib/gate-record.py", "scripts/lib/windows-job.ps1", "scripts/lib/windows-job.sh",
           "scripts/lib/suite-python.sh", "scripts/lib/gate-node.sh", *isolation.NS_SH,
-          "benches/suite/requirements.txt")
+          "benches/suite/requirements.txt", "scripts/lib/gate-job.sh")
 # A stand-in for the fleet's CLI: each submit keeps its job file; status, results and cancel as told.
 FLEET = """#!/bin/sh
 answer() {
@@ -65,6 +67,16 @@ RUSTC = """#!/bin/sh
 [ "${1#+}" != "$1" ] && shift
 [ "$1" = -vV ] && printf 'rustc 1.98.1\\nbinary: rustc\\ncommit-hash: abcdef1234567890\\nrelease: 1.98.1\\n'
 exit 0
+"""
+# A stand-in for curl fetching a cargo-nextest release (get.nexte.st/<version>/linux, the last argument): a
+# gzipped tar of a cargo-nextest that says it is that version.
+CURL_NEXTEST = r"""for arg; do url=$arg; done
+v=${url#https://get.nexte.st/}; v=${v%%/*}
+d=$(mktemp -d)
+printf '#!/bin/sh\necho "cargo-nextest %s"\n' "$v" > "$d/cargo-nextest"
+chmod +x "$d/cargo-nextest"
+tar -cz -C "$d" cargo-nextest
+rm -rf -- "$d"
 """
 
 
@@ -322,6 +334,131 @@ class PushGate(Repo):
         self.assertNotEqual(done.returncode, 0, f"SPEC pushed-tree: a tree passed on another's result\n{done.stderr}")
         self.assertEqual([tree for _, tree, _ in self.jobs()], [self.tree(first), self.tree(second)])
 
+    def add(self, name, text):
+        """A commit adding NAME (or changing it) with TEXT; its id."""
+        (self.repo / name).parent.mkdir(parents=True, exist_ok=True)
+        (self.repo / name).write_text(text, newline="\n")
+        self.git(self.repo, "add", name)
+        self.git(self.repo, "commit", "-q", "-m", f"add {name}")
+        return self.git(self.repo, "rev-parse", "HEAD")
+
+    def test_a_pass_on_more_files_covers_a_narrower_push_of_its_tree(self):
+        """Spec (21 Nov 2026): a pass of the same commit whose recorded file list contains the
+        pushed range's files, its other files reaching no crate, lets the push through with no job:
+        those files only add steps of their own (test_push_tier_monotone.py). The second of two
+        approved branches, gated on top of the first, lands on that pass once the first has landed."""
+        first = self.commit("a.txt", "a changed\n")
+        tip = self.commit("b.txt", "b changed\n")
+        self.fleet("done", self.tree(tip), ["a.txt", "b.txt"])
+        done = self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", ZERO))
+        self.assertEqual(done.returncode, 0, f"SPEC verified: {done.stderr}")
+        self.fleet("pending")
+        narrower = self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", first))
+        self.assertEqual((narrower.returncode, len(self.jobs())), (0, 1),
+                         f"SPEC covering-pass: the pass on [a.txt, b.txt] didn't cover [b.txt]\n{narrower.stderr}")
+
+    def test_a_pass_on_fewer_or_other_files_covers_nothing_more(self):
+        """A pass covers only files its list holds: a push of its tree whose range has a file it
+        didn't hold is gated on its own (here refused: no verdict)."""
+        first = self.commit("a.txt", "a changed\n")
+        tip = self.commit("b.txt", "b changed\n")
+        self.fleet("done", self.tree(tip), ["b.txt"])
+        done = self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", first))
+        self.assertEqual(done.returncode, 0, f"SPEC verified: {done.stderr}")
+        self.fleet("pending")
+        wider = self.push(("refs/heads/pkg/y", tip, "refs/heads/pkg/y", ZERO))
+        self.assertEqual((wider.returncode != 0, len(self.jobs())), (True, 2),
+                         f"SPEC covering-pass: a pass on [b.txt] let [a.txt, b.txt] through\n{wider.stderr}")
+
+    def test_a_pass_on_more_files_covers_only_its_own_tree(self):
+        """A pass on more files never covers another tree: a later tip whose range's files the pass
+        held is still gated on its own."""
+        self.commit("a.txt", "a changed\n")
+        second = self.commit("b.txt", "b changed\n")
+        self.fleet("done", self.tree(second), ["a.txt", "b.txt"])
+        done = self.push(("refs/heads/pkg/x", second, "refs/heads/pkg/x", ZERO))
+        self.assertEqual(done.returncode, 0, f"SPEC verified: {done.stderr}")
+        third = self.commit("b.txt", "b changed again\n")
+        self.fleet("pending")
+        later = self.push(("refs/heads/pkg/x", third, "refs/heads/pkg/x", second))
+        self.assertEqual((later.returncode != 0, [tree for _, tree, _ in self.jobs()]),
+                         (True, [self.tree(second), self.tree(third)]),
+                         f"SPEC covering-pass: another tree passed on a wider list's pass\n{later.stderr}")
+
+    def test_a_pass_whose_other_files_reach_a_crate_covers_nothing_narrower(self):
+        """Review r1 (21 Nov 2026): cargo resolves features across the crates one run selects, so a
+        run over more crates isn't the same check of each; and a workspace-wide file selects every
+        crate. A pass whose files beyond the push's reach a crate (under crates/, or workspace-wide)
+        doesn't cover it: the push is gated on its own (here refused: no verdict)."""
+        cases = (("crates/alpha/src/lib.rs", "b.txt"), ("Cargo.lock", "c.txt"))
+        for n, (other, own) in enumerate(cases):
+            with self.subTest(other=other):
+                # Each case's range starts where the last one's commits end, whatever its outcome.
+                start = self.git(self.repo, "rev-parse", "HEAD")
+                for job in self.fake.glob("job-*.toml"):
+                    job.unlink()
+                first = self.add(other, f"{other} changed\n")
+                tip = self.commit(own, f"{own} changed\n")
+                self.fleet("done", self.tree(tip), sorted([other, own]))
+                done = self.push((f"refs/heads/pkg/x{n}", tip, f"refs/heads/pkg/x{n}", start))
+                self.assertEqual(done.returncode, 0, f"SPEC verified: {done.stderr}")
+                self.fleet("pending")
+                narrower = self.push((f"refs/heads/pkg/x{n}", tip, f"refs/heads/pkg/x{n}", first))
+                self.assertEqual((narrower.returncode != 0, len(self.jobs())), (True, 2),
+                                 f"SPEC covering-crates: a pass whose {other} reaches a crate covered "
+                                 f"[{own}]\n{narrower.stderr}")
+
+    def test_a_pass_covers_only_its_own_commit(self):
+        """Review r1 (21 Nov 2026): the push tier draws its random seeds from the commit, and the
+        fleet checks out the commit. Another commit with the same tree and a narrower range isn't
+        covered by the pass: it is gated on its own (here refused: no verdict)."""
+        first = self.commit("a.txt", "a changed\n")
+        tip = self.commit("b.txt", "b changed\n")
+        self.fleet("done", self.tree(tip), ["a.txt", "b.txt"])
+        done = self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", ZERO))
+        self.assertEqual(done.returncode, 0, f"SPEC verified: {done.stderr}")
+        twin = self.git(self.repo, "commit-tree", self.tree(tip), "-p", first, "-m", "the same tree again")
+        self.fleet("pending")
+        again = self.push(("refs/heads/pkg/y", twin, "refs/heads/pkg/y", first))
+        self.assertEqual((again.returncode != 0, [rev for rev, _, _ in self.jobs()]), (True, [tip, twin]),
+                         f"SPEC covering-commit: another commit of the tree passed on the pass\n{again.stderr}")
+
+    def test_a_pass_of_a_commit_with_an_older_runner_covers_nothing_narrower(self):
+        """Review r3 (21 Nov 2026): the fleet gate runs the pushed commit's own check.sh. A commit
+        whose check.sh draws its seeds from the abbreviated id (which grows where another object
+        shares its prefix) may have tried other random cases than another host would. Gated from an
+        updated checkout, its pass still counts for its exact files, but covers no narrower push:
+        that is gated on its own (here refused: no verdict)."""
+        current = (self.repo / "scripts/check.sh").read_text()
+        older = current.replace("16#${head:0:6} ", "16#$(git rev-parse --short=6 HEAD) ")
+        self.assertNotEqual(older, current, "the fixture's runner draws its seeds from the full id")
+        first = self.commit("scripts/check.sh", older)  # an older runner, committed with the change
+        tip = self.commit("b.txt", "b changed\n")
+        (self.repo / "scripts/check.sh").write_text(current, newline="\n")  # the pusher's checkout: updated
+        self.fleet("done", self.tree(tip), ["b.txt", "scripts/check.sh"])
+        done = self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", ZERO))
+        self.assertEqual(done.returncode, 0, f"SPEC verified: {done.stderr}")
+        self.fleet("pending")
+        narrower = self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", first))
+        self.assertEqual((narrower.returncode != 0, len(self.jobs())), (True, 2),
+                         f"SPEC covering-runner: a pass of an older runner covered a narrower push\n{narrower.stderr}")
+
+    def test_a_record_without_its_provenance_covers_nothing(self):
+        """Review r1 (21 Nov 2026): a line in the pass file that is a bare key, with no record of
+        where it ran, is no pass, though its file list is kept: the push is gated on its own."""
+        first = self.commit("a.txt", "a changed\n")
+        tip = self.commit("b.txt", "b changed\n")
+        kept = subprocess.run(["git", "hash-object", "-w", "--stdin"], input=b"a.txt\nb.txt\n", capture_output=True,
+                              cwd=self.repo, env=self.env, check=True).stdout.decode().strip()
+        identity = subprocess.run([BASH, "-c", ". scripts/lib/gate-key.sh && gate_identity HEAD"], cwd=self.repo,
+                                  capture_output=True, text=True, env=self.env).stdout.strip()
+        common = Path(self.git(self.repo, "rev-parse", "--absolute-git-dir"))
+        (common / "nrese-gate-passed").write_text(f"push {self.tree(tip)} {kept} {identity} fleet\n", newline="\n")
+        self.fleet("pending")
+        done = self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", first))
+        self.assertEqual((done.returncode != 0, len(self.jobs())), (True, 1),
+                         f"SPEC covering-record: a bare key covered the push\n{done.stderr}")
+
     def test_the_files_come_from_the_pushed_range(self):
         """The gate is told the files of the pushed range, from where the remote has the branch
         (or, new there, where it left refactor/engine-v2) to the pushed commit: not the last commit's
@@ -399,6 +536,43 @@ class PushGate(Repo):
         again = self.push(landing)
         self.assertEqual((again.returncode, len(list(self.fake.glob("job-*.toml")))), (0, 3),
                          f"SPEC landing-windows-reuse: the merge check's pass didn't serve the push\n{again.stderr}")
+
+    def test_a_hook_that_cant_tell_whether_a_ref_lands_refuses_it(self):
+        """Review r1 (21 Nov 2026): the hook asks scripts/lib/gate-key.sh's landing_ref whether a
+        ref lands. Where the helper lacks it (a hook and helper of different versions), a push to
+        the line is refused, not let through without the Windows part; a deletion still goes."""
+        tip = self.commit("a.txt", "a changed\n")
+        self.fleet("done", self.tree(tip), ["a.txt"])  # the push tier would pass
+        with (self.repo / "scripts/lib/gate-key.sh").open("a", newline="\n") as helper:
+            helper.write("unset -f landing_ref\n")
+        landing = self.push(("refs/heads/refactor/engine-v2", tip, "refs/heads/refactor/engine-v2", self.base))
+        self.assertNotEqual(landing.returncode, 0, f"SPEC landing-unknown: the line took a commit with no Windows "
+                                                   f"part\n{landing.stderr}")
+        self.assertIn("landing_ref", landing.stderr, "SPEC landing-unknown: the refusal names the cause")
+        deletion = self.push(("(delete)", ZERO, "refs/heads/plan/old", self.base))
+        self.assertEqual(deletion.returncode, 0, f"SPEC deletions: {deletion.stderr}")
+
+    def test_landing_on_a_release_branch_takes_the_windows_part_too(self):
+        """Spec (21 Nov 2026): a release is cut as its own branch, release/<name>, at the freeze; a
+        fix pushed there lands as on the line: the push tier and the merge check's Windows part,
+        both merge gates. A package whose name holds "release" takes neither."""
+        gate = 'priority_class = "merge-gate"'
+        tip = self.commit("a.txt", "a changed\n")
+        self.fleet("done", self.tree(tip), ["a.txt"], separate=True)
+        self.fleet("done", self.tree(tip), tier="windows", separate=True)
+        package = self.push(("refs/heads/pkg/release-notes", tip, "refs/heads/pkg/release-notes", ZERO))
+        landing = self.push(("refs/heads/r", tip, "refs/heads/release/v1.5.1", self.base))
+        diagnostics = "\n".join(f"hook {i}: rc={d.returncode}\nstderr:\n{d.stderr}"
+                                for i, d in enumerate((package, landing), 1))
+        self.assertEqual([package.returncode, landing.returncode], [0, 0], diagnostics)
+        jobs = [("windows" if "windows-job.ps1" in path.read_text() else "push",
+                 re.findall(r"^priority_class = .*$", path.read_text(), re.M))
+                for path in sorted(self.fake.glob("job-*.toml"))]
+        # The package's push tier; the release branch's push tier passed before for this tree and
+        # these files, then its Windows part.
+        self.assertEqual(jobs, [("push", []), ("windows", [gate])],
+                         "SPEC release-landing: the release branch's push took no Windows part, or not as a merge "
+                         "gate\n" + diagnostics)
 
 
 class FleetGate(Repo):
@@ -531,6 +705,12 @@ esac
             ("push", chained, v2, gate),
             ("push", integrated, "refs/heads/pkg/integrated", None),
             ("push", chained, None, None),  # by hand, naming no ref
+            # A release branch, cut from the line at a freeze, lands its fixes as the line does
+            # (21 Nov 2026); a package's name holding "release" is still a package.
+            ("push", chained, "refs/heads/release/v1.5.1", gate),
+            ("windows", chained, "refs/heads/release/v1.5.1", gate),
+            ("push", integrated, "refs/heads/pkg/release-notes", None),
+            ("push", integrated, "refs/heads/release", None),
         ]
         for mode, commit, ref, want in cases:
             self.reset()
@@ -762,7 +942,8 @@ class GateJob(Repo):
             "rustup": "exit 0",
             "rustc": '[ "${1#+}" != "$1" ] && shift; case "$1" in -vV) echo "release: 1.98.1"; echo "commit-hash: abcdef1234567890" ;;'
                      ' --print) echo "    native - Select the CPU of the current host (currently znver3)." ;; esac',
-            "cargo": 'echo "cargo-nextest 0.9.146"',  # the pinned one (Miri's too): nothing to install
+            "cargo": 'echo "cargo-nextest 0.9.146"',  # Miri there: nothing to install
+            "curl": CURL_NEXTEST,  # the pinned cargo-nextest, installed under the cache
             "cc-links": 'while [ $# -gt 0 ]; do [ "$1" = -o ] && { shift; : > "$1"; }; shift; done',
             "cc-broken": "exit 1",
         }.items():
@@ -1037,9 +1218,10 @@ class WindowsJob(Repo):
         lacks = ('  [ "$RUSTUP_AUTO_INSTALL" != 0 ] || exit 1\n'
                  '  : > "$STUB_NO_TOOLCHAIN"\n'
                  'fi\n')
-        # One workspace package, and no cargo-nextest: cargo test, crate by crate.
+        # One workspace package; `cargo nextest` runs the cargo-nextest on PATH, as cargo finds it.
         (stubs / "cargo").write_text(
             '#!/bin/sh\nif [ "$1" = metadata ]; then echo \'{"packages": [{"name": "x"}]}\'; exit 0; fi\n'
+            '[ "$1" != nextest ] || exec cargo-nextest "$@"\n'
             '[ "$1" = clippy ] || exit 1\n'
             'if [ -n "$STUB_MISSING" ] && [ ! -e "$STUB_INSTALLED" ]; then\n' + lacks
             + 'echo "clippy 0.1.98"\n', newline="\n")
@@ -1052,10 +1234,11 @@ class WindowsJob(Repo):
         for name in ("cargo", "rustc", "rustup"):
             (stubs / name).chmod(0o755)
         # The tree's cargo-guarded.sh: needs a usable stdin, as Python's subprocess and coreutils do,
-        # says where it builds, and fails as STUB_FAIL says (<its first argument>:<exit>).
+        # says where it builds and what it ran, and fails as STUB_FAIL says (<its first argument>:<exit>).
         guarded = ('#!/bin/sh\ncase "$1" in --print-rustflags) echo "-C target-cpu=native"; exit 0 ;; esac\n'
                    f'"{Path(sys.executable).as_posix()}" -c "import os; os.fstat(0)" || exit 9\n'
                    'printf %s "$CARGO_TARGET_DIR" > "$FLEET_OUT/target-dir"\n'
+                   'echo "$*" >> "$FLEET_OUT/guarded"\n'
                    # clippy as cargo runs it: not without the component.
                    '[ "$1" != clippy ] || [ -z "$STUB_MISSING" ] || [ -e "$STUB_INSTALLED" ] || exit 101\n'
                    '[ "${STUB_FAIL%%:*}" != "$1" ] || exit "${STUB_FAIL#*:}"\n')
@@ -1067,6 +1250,38 @@ class WindowsJob(Repo):
             (self.repo / rel).parent.mkdir(parents=True, exist_ok=True)
             (self.repo / rel).write_text(body, newline="\n")
         (self.repo / "scripts/cargo-guarded.sh").chmod(0o755)
+        # The pinned cargo-nextest: one executable, answering as STUB_NEXTEST says (by default with the
+        # pinned version; `other`: another version; `failing`: the pinned one, but the command fails;
+        # `split`: not inside the tier's run; `swapped`: another version inside it). Two archives of it as
+        # get.nexte.st serves them (curl copies STUB_ARCHIVE): the tree pins the first and the executable
+        # it holds by their sha256 (cargo-nextest-windows); the second holds that same executable and a
+        # file more, so only the archive's own sha256 tells it apart.
+        tools_txt = self.repo / "scripts/lib/gate-tools.txt"
+        pinned_nextest = re.search(r"^cargo-nextest (\S+)$", tools_txt.read_text(), re.M).group(1)
+        v = pinned_nextest
+        runner = ('#!/bin/sh\ncase "$STUB_NEXTEST" in\n'
+                  '  other) echo "cargo-nextest 0.9.1 (stand-in)" ;;\n'
+                  f'  failing) echo "cargo-nextest {v}"; exit 1 ;;\n'
+                  f'  split) [ -z "$NRESE_ON_BUILD_HOST" ] || exit 1; echo "cargo-nextest {v} (stand-in)" ;;\n'
+                  f'  swapped) [ -n "$NRESE_ON_BUILD_HOST" ] && v=0.9.1 || v={v}; echo "cargo-nextest $v (stand-in)" ;;\n'
+                  f'  *) echo "cargo-nextest {v} (stand-in)" ;;\nesac\n')
+        archives = []
+        for which, members in (("pinned", {"cargo-nextest": runner}),
+                               ("another", {"cargo-nextest": runner, "extra.txt": "not in the release\n"})):
+            path = self.root / f"nextest-{which}.tar.gz"
+            with tarfile.open(path, "w:gz") as tar:
+                for name, body in members.items():
+                    member = tarfile.TarInfo(name)
+                    member.size, member.mode = len(body.encode()), 0o755
+                    tar.addfile(member, io.BytesIO(body.encode()))
+            archives.append(path)
+        good_archive, bad_archive = archives
+        good_sum = hashlib.sha256(good_archive.read_bytes()).hexdigest()
+        exe_sum = hashlib.sha256(runner.encode()).hexdigest()
+        pinned_text, pins = re.subn(r"^(cargo-nextest-windows \S+) \S+ \S+$", rf"\g<1> {good_sum} {exe_sum}",
+                                    tools_txt.read_text(), flags=re.M)
+        self.assertEqual(pins, 1, "the tree pins the Windows archive of cargo-nextest and its executable by their sha256")
+        tools_txt.write_text(pinned_text, newline="\n")
         self.git(self.repo, "add", "-A")
         self.git(self.repo, "commit", "-q", "-m", "the commit under test")
         tree = self.tree("HEAD")
@@ -1083,7 +1298,9 @@ class WindowsJob(Repo):
         base.mkdir(parents=True)
         (base / "python.exe").write_text(f"#!/bin/sh\nprintf '%s\\n' '{build}'\n", newline="\n")
         (base / "python.exe").chmod(0o755)
-        (stubs / "curl").write_text("#!/bin/sh\nexit 22\n", newline="\n")
+        (stubs / "curl").write_text('#!/bin/sh\n[ -n "$STUB_ARCHIVE" ] || exit 22\n'
+                                    'while [ $# -gt 1 ]; do [ "$1" != -o ] || out=$2; shift; done\n'
+                                    'cp "$STUB_ARCHIVE" "$out"\n', newline="\n")
         (stubs / "curl").chmod(0o755)
         # The suite's own Python environment in the host's cache, made already (the tree's
         # requirements' and declared runtime's): it runs with the declared runtime, and its python
@@ -1118,29 +1335,70 @@ class WindowsJob(Repo):
         # The toolchain: there; missing, or there without clippy (another job installed the release with
         # a minimal profile), and rustup installs it; or missing and rustup can't install it.
         there, missing, no_clippy, uninstallable = None, ("toolchain", ""), ("clippy", ""), ("toolchain", "1")
-        cases = [  # tree sent, STUB_FAIL, stdin closed, toolchain, Python gone -> exit, a record, stdin
-            (tree, "", False, there, False, 0, True, "valid"),
-            ("0" * 40, "", False, there, False, 3, False, None),         # another tree checked out: no verdict
-            (tree, "build:101", False, there, False, 1, True, "valid"),  # a step fails: the tree fails
+        # The cargo-nextest the tree pins, in the host's cache as the job lays it out
+        # (tools/nextest-<version>-<archive sha256, 12>), answering as named (STUB_NEXTEST above): with the
+        # pinned version; another; the pinned one, but the command fails; or none there, and an archive to
+        # fetch (the pinned one, or another) or none. `split`: the pinned one, answering the job's check and
+        # not the run's (or gone in between); `swapped`: another version answering inside the run (one put
+        # first on cargo's path in between). `tampered`: an entry whose executable isn't the pinned one,
+        # with the pinned archive to fetch. `host-own`: the pinned entry, and a runner of the host's own in
+        # $CARGO_HOME/bin, which cargo would run first.
+        nextest_entry = cache / "tools" / f"nextest-{pinned_nextest}-{good_sum[:12]}"
+        pinned, other, failing, absent, split, swapped = "pinned", "other", "failing", None, "split", "swapped"
+        tampered, host_own = "tampered", "host-own"
+        cargo_home, tampered_ran = self.root / "cargo-home", self.root / "tampered-ran"
+        cases = [  # tree sent, STUB_FAIL, stdin closed, toolchain, Python gone, nextest -> exit, a record, stdin
+            (tree, "", False, there, False, pinned, 0, True, "valid"),
+            ("0" * 40, "", False, there, False, pinned, 3, False, None),         # another tree checked out: no verdict
+            (tree, "build:101", False, there, False, pinned, 1, True, "valid"),  # a step fails: the tree fails
             # A lint of code only Windows compiles (cfg(windows)) fails the tree there (PR #68:
             # the Windows tier built and tested it, and linted nothing).
-            (tree, "clippy:101", False, there, False, 1, True, "valid"),
-            (tree, "build:75", False, there, False, 75, True, "valid"),  # the PC guard stopped a build: no verdict
-            (tree, "", True, there, False, 0, True, "invalid"),          # no usable stdin (fleet I14): said, steps get /dev/null
+            (tree, "clippy:101", False, there, False, pinned, 1, True, "valid"),
+            (tree, "build:75", False, there, False, pinned, 75, True, "valid"),  # the PC guard stopped a build: no verdict
+            (tree, "", True, there, False, pinned, 0, True, "invalid"),          # no usable stdin (fleet I14): said, steps get /dev/null
             # A host the fleet places it on by `rust` (rustup) without the tree's pinned release: the job
             # installs that release through rustup, and runs.
-            (tree, "", False, missing, False, 0, True, "valid"),
+            (tree, "", False, missing, False, pinned, 0, True, "valid"),
             # The release there without clippy: installed too, never a failed tree.
-            (tree, "", False, no_clippy, False, 0, True, "valid"),
-            (tree, "", False, uninstallable, False, 3, False, None),     # and if it can't be had: no verdict
+            (tree, "", False, no_clippy, False, pinned, 0, True, "valid"),
+            (tree, "", False, uninstallable, False, pinned, 3, False, None),     # and if it can't be had: no verdict
+            # No pinned cargo-nextest, and none can be had: no verdict, never cargo test crate by crate.
+            (tree, "", False, there, False, absent, 3, False, None),
+            # None there, fetched: the archive the tree pins by its sha256 is installed and runs; another
+            # archive, holding a runner of the pinned version all the same, installs nothing: no verdict.
+            (tree, "", False, there, False, good_archive, 0, True, "valid"),
+            (tree, "", False, there, False, bad_archive, 3, False, None),
+            # One of another version, or one whose version command fails: not used, fetched again: no verdict.
+            (tree, "", False, there, False, other, 3, False, None),
+            (tree, "", False, there, False, failing, 3, False, None),
+            # Accepted by the job, then not answering inside the run: no verdict, never cargo test.
+            (tree, "", False, there, False, split, 3, False, None),
+            (tree, "", False, there, False, swapped, 3, False, None),
+            # An entry whose executable isn't the pinned one is never run: made again from the pinned
+            # archive, which runs.
+            (tree, "", False, there, False, tampered, 0, True, "valid"),
+            # A runner of the host's own where cargo looks first: no verdict, before anything is installed
+            # (the toolchain is missing here, and rustup isn't called).
+            (tree, "", False, missing, False, host_own, 3, False, None),
             # The declared Python isn't here and can't be had (the host's own ran the suite): no verdict.
-            (tree, "", False, there, True, 3, False, None),
+            (tree, "", False, there, True, pinned, 3, False, None),
         ]
-        for case, (sent, fail, closed, toolchain, gone, code, recorded, stdin) in enumerate(cases):
+        for case, (sent, fail, closed, toolchain, gone, nextest, code, recorded, stdin) in enumerate(cases):
             out = self.root / f"out-{case}"
             out.mkdir()
             if gone:
                 shutil.rmtree(base.parent)
+            shutil.rmtree(nextest_entry, ignore_errors=True)
+            shutil.rmtree(cargo_home, ignore_errors=True)
+            (cargo_home / "bin").mkdir(parents=True)
+            fetched = nextest if isinstance(nextest, Path) else good_archive if nextest == tampered else None
+            if isinstance(nextest, str):
+                nextest_entry.mkdir(parents=True)
+                body = runner + (f': > "{tampered_ran.as_posix()}"\n' if nextest == tampered else "")
+                (nextest_entry / "cargo-nextest").write_text(body, newline="\n")
+                (nextest_entry / "cargo-nextest").chmod(0o755)
+            if nextest == host_own:
+                (cargo_home / "bin" / "cargo-nextest.exe").write_text(runner, newline="\n")
             proxied, rustup = self.root / f"proxied-{case}", self.root / f"rustup-{case}"
             lacking, rustup_fails = toolchain or ("", "")
             run = ("exec 0<&-; " if closed else "") + 'exec bash "$@"'
@@ -1152,16 +1410,29 @@ class WindowsJob(Repo):
                      "STUB_MISSING": lacking, "STUB_INSTALLED": (self.root / f"installed-{case}").as_posix(),
                      "STUB_NO_TOOLCHAIN": proxied.as_posix(),
                      "STUB_RUSTUP_LOG": rustup.as_posix(), "STUB_RUSTUP_FAIL": rustup_fails,
-                     "NRESE_GATE_CACHE": cache.as_posix(),
+                     "NRESE_GATE_CACHE": cache.as_posix(), "STUB_ARCHIVE": fetched.as_posix() if fetched else "",
+                     "STUB_NEXTEST": nextest if nextest in (other, failing, split, swapped) else "",
+                     "CARGO_HOME": cargo_home.as_posix(),
                      "CARGO_TARGET_DIR": (self.root / "shared-target").as_posix()})  # a host's shared one
             self.assertEqual(done.returncode, code, f"SPEC windows-run: case {case}\n{done.stdout}{done.stderr}")
+            if nextest == tampered:
+                self.assertFalse(tampered_ran.exists(), f"SPEC windows-nextest: a cached runner not the pinned one ran: case {case}")
+            if fetched is bad_archive:
+                self.assertEqual([p.name for p in nextest_entry.parent.glob("nextest-*")], [],
+                                 f"SPEC windows-nextest: an archive other than the pinned one was installed: case {case}")
             self.assertFalse(proxied.exists(), "SPEC windows-toolchain: rustup's proxy installed a toolchain")
             # rustup only to install the tree's pinned release, and only where it is missing: never
             # `default`, `update`, `self update` or `uninstall` (the host's rustup home is shared).
             calls = rustup.read_text().splitlines() if rustup.exists() else []
-            self.assertEqual(calls, [] if toolchain is there else
+            self.assertEqual(calls, [] if toolchain is there or nextest == host_own else
                              ["toolchain install 1.98.1 --no-self-update --profile minimal --component rustfmt,clippy"],
                              f"SPEC windows-toolchain: case {case}")
+            if not recorded and nextest in (split, swapped):
+                ran = (out / "guarded").read_text().splitlines()
+                self.assertFalse((out / "gate.json").exists(), f"SPEC windows-nextest: case {case}")
+                self.assertEqual([c for c in ran if c.split()[0] in ("test", "nextest") and "--doc" not in c.split()],
+                                 [], f"SPEC windows-nextest: tests ran without the pinned nextest: case {case}")
+                continue
             if not recorded:
                 self.assertFalse((out / "gate.json").exists() or (out / "check.log").exists(), f"case {case}")
                 continue
@@ -1182,6 +1453,13 @@ class WindowsJob(Repo):
                               ("suite contracts", 0), ("console dependencies", 0), ("console typecheck", 0),
                               ("console tests", 0)],
                              f"SPEC windows-run: case {case}")
+            ran_tests = [(c.split()[0], "--doc" in c.split()) for c in (out / "guarded").read_text().splitlines()
+                         if c.split()[0] in ("test", "nextest")]
+            self.assertEqual(ran_tests, [("nextest", False), ("test", True)],
+                             f"SPEC windows-nextest: the tests ran under cargo nextest, cargo test only for the doc"
+                             f" tests: case {case}")
+            self.assertEqual(result["nextest"].split()[:2], ["cargo-nextest", pinned_nextest],
+                             f"SPEC windows-nextest: the record names the nextest it ran: case {case}")
             self.assertEqual(result["attempt"], (out / "attempt").read_text().strip())
             self.assertRegex(result["identity"],
                              rf"^rustc-1\.98\.1-abcdef123456 flags=-C_target-cpu=native tools=[0-9a-f]{{12}} {name}$",

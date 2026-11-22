@@ -72,6 +72,9 @@ impl StoreLock {
 
 impl Drop for StoreLock {
     fn drop(&mut self) {
+        // Before the registry is taken: a held close blocks no other store's open.
+        #[cfg(any(test, feature = "fault-points"))]
+        crate::fault_points::hold_close(&self.dir);
         let mut open = OPEN
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);

@@ -240,17 +240,19 @@ fn an_rl_rejection_shows_no_premise_of_a_graph_the_committer_cannot_read() {
         let Err(MutationError::Rejected(reject)) = result else {
             panic!("expected a rejection, got {result:?}");
         };
-        let secret = |text: &str| text.contains("disjointWith") || text.contains(&format!("{EX}B"));
+        // The secret graph's terms, and what it relates to the committer's statement.
+        let secret = [
+            "disjointWith".to_owned(),
+            format!("{EX}B"),
+            format!("{EX}A"),
+        ];
         if restricted {
             // Nothing of the secret graph, nor what it relates to the committer's statement.
             assert!(reject.explanation.is_none(), "{reject:?}");
             assert!(reject.attribution.is_none(), "{reject:?}");
-            assert!(!secret(&reject.detail), "{}", reject.detail);
-            assert!(
-                !reject.detail.contains(&format!("{EX}A")),
-                "{}",
-                reject.detail
-            );
+            for term in &secret {
+                assert!(!reject.detail.contains(term), "{term}: {}", reject.detail);
+            }
             assert!(
                 reject
                     .detail
@@ -259,14 +261,16 @@ fn an_rl_rejection_shows_no_premise_of_a_graph_the_committer_cannot_read() {
                 reject.detail
             );
         } else {
+            // The controls on the same words: the detail names each.
+            for term in &secret {
+                assert!(
+                    reject.detail.contains(term),
+                    "{term} not in {}",
+                    reject.detail
+                );
+            }
             let explanation = reject.explanation.expect("an explanation");
-            let shown: Vec<String> = explanation
-                .evidence
-                .iter()
-                .map(|e| format!("{} {} {}", e.subject, e.predicate, e.object))
-                .collect();
-            assert_eq!(shown.len(), 3, "{shown:#?}");
-            assert!(shown.iter().any(|s| secret(s)), "{shown:#?}");
+            assert_eq!(explanation.evidence.len(), 3, "{explanation:#?}");
         }
     }
 }
@@ -534,8 +538,9 @@ fn reasoning_state_tracks_whether_inferences_are_current() {
         store.consistency(),
         nrese_store::ConsistencyStatus::Consistent
     );
-    // The inferred subclass statement and OWL 2 RL's 32 datatype axioms (dt-type1).
-    assert_eq!(store.clear_inferred().expect("clear"), 1 + 32);
+    // OWL 2 Profiles §4.3: the inferred subclass membership, 32 datatype declarations,
+    // 11 annotation property and class declarations, and five distinct scm-cls rows.
+    assert_eq!(store.clear_inferred().expect("clear"), 1 + 32 + 11 + 5);
     assert!(!current(&store));
     drop(store);
     // A state file from a build with other semantics (another fingerprint) isn't current.
@@ -2430,6 +2435,197 @@ fn long_intersection(n: usize) -> String {
         data.push_str(&format!(" <{EX}x> a {member} ."));
     }
     data
+}
+
+/// Spec: reasoning-semantics.md, what may be complete, "Operators": where answers may be
+/// missing, `EXISTS` makes them `unsound`. Under `owl2-rl` with the QL rewriting on, a list
+/// axiom past the rules' cap is left out of the closure, so answers may be missing, and a
+/// `FILTER NOT EXISTS` read is `unsound` in its status, its QL report, its plan and the printed
+/// query's status (the status this store gives the same answers). The printer writes the
+/// chain's reads and the intersection's unrelated one, and finds the others `NotExpressible`
+/// (as a run on the line found; any other outcome fails here, so the status can't go
+/// unchecked). With
+/// the blocker the list's rule entails, the one row kept is one the certain answers drop. The
+/// rule is the query's, so the read with an unrelated blocker is `unsound` too.
+#[test]
+fn a_negation_over_a_list_left_out_is_unsound() {
+    use nrese_sparql::ql::{PrintForm, Printed};
+    let mut wrong = Vec::new();
+    // Whether each read prints: with the blocker, with the unrelated one.
+    for (data, subject, blocker, prints) in [
+        (
+            long_key(128),
+            "x",
+            format!("?x <{EX}name> \"Y\""),
+            [false, false],
+        ),
+        (
+            declared_chain(),
+            "a0",
+            format!("?x <{EX}chain> <{EX}a251>"),
+            [true, true],
+        ),
+        (
+            long_intersection(257),
+            "x",
+            format!("?x a <{EX}C>"),
+            [false, true],
+        ),
+    ] {
+        let pipeline = ql_pipeline(in_memory_store_config());
+        let ticket = MutationTicket::new();
+        (pipeline.apply(insert(&data), &nrese_store::Requester::all(), &ticket)).expect("data");
+        let store = pipeline.store();
+        let unrelated = format!("?x <{EX}unrelated> <{EX}unused>");
+        for (blocked_by, prints) in [blocker, unrelated].into_iter().zip(prints) {
+            let text = format!(
+                "SELECT ?x {{ VALUES ?x {{ <{EX}{subject}> }} FILTER NOT EXISTS {{ {blocked_by} }} }}"
+            );
+            let request = nrese_store::SparqlQueryRequest::all(text.clone());
+            let answer = store.execute_query(&request).expect("answered");
+            let prepared = store.prepare_query(&request).expect("prepared");
+            let token = nrese_store::CancellationToken::new();
+            let planned = store.plan_query(&prepared, &token).expect("planned");
+            let label = |c: Option<&nrese_sparql::Completeness>| c.map(|c| c.as_str());
+            let labels = [
+                label(answer.completeness.as_ref()),
+                label(answer.ql.as_ref().map(|r| &r.completeness)),
+                label(planned.completeness.as_ref()),
+                label(planned.ql.as_ref().map(|r| &r.completeness)),
+            ];
+            let json: serde_json::Value = serde_json::from_slice(&answer.payload).expect("json");
+            let rows: Vec<_> = (json["results"]["bindings"].as_array().expect("rows"))
+                .iter()
+                .map(|row| row["x"]["value"].as_str().expect("an IRI").to_owned())
+                .collect();
+            let printed = match store.print_query(&text, PrintForm::Paths) {
+                Ok(Printed::Query { completeness, .. }) => completeness.as_str().to_owned(),
+                Ok(Printed::NotExpressible(_)) => "not expressible".to_owned(),
+                Err(error) => format!("error: {error}"),
+            };
+            let expected = if prints { "unsound" } else { "not expressible" };
+            if labels != [Some("unsound"); 4]
+                || printed != expected
+                || rows != [format!("{EX}{subject}")]
+            {
+                wrong.push((blocked_by, labels, printed, rows));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// [`long_chain`] of 251 links, past the rules' cap, with the chain and every link declared an
+/// object property.
+fn declared_chain() -> String {
+    let property = "a <http://www.w3.org/2002/07/owl#ObjectProperty> .";
+    let mut chain = long_chain(251);
+    for link in (1..=251).map(|i| format!("p{i}")).chain(["chain".into()]) {
+        chain.push_str(&format!(" <{EX}{link}> {property}"));
+    }
+    chain
+}
+
+/// Spec: reasoning-semantics.md, what may be complete, "Operators": where answers may be
+/// missing, `EXISTS`, `MINUS` and `OPTIONAL` make them `unsound`. Over [`declared_chain`],
+/// which the rules leave out, `:a0 :chain :a251` is entailed and missing, so each read keeps a
+/// row the certain answers don't have (`:a0` under `NOT EXISTS` and `MINUS`; `:a0` without
+/// `?y` under `OPTIONAL`, where the certain row binds `?y` to `:a251`). Each is `unsound` in
+/// its status, its QL report, its plan, the plan's QL report, EXPLAIN and EXPLAIN's QL report.
+#[test]
+fn each_operator_over_a_list_left_out_is_unsound_on_every_surface() {
+    let pipeline = ql_pipeline(in_memory_store_config());
+    let ticket = MutationTicket::new();
+    let all = nrese_store::Requester::all();
+    (pipeline.apply(insert(&declared_chain()), &all, &ticket)).expect("data");
+    let store = pipeline.store();
+    let (a0, chain, a251) = (
+        format!("<{EX}a0>"),
+        format!("<{EX}chain>"),
+        format!("<{EX}a251>"),
+    );
+    let mut wrong = Vec::new();
+    for read in [
+        format!("FILTER NOT EXISTS {{ ?x {chain} {a251} }}"),
+        format!("MINUS {{ ?x {chain} {a251} }}"),
+        format!("OPTIONAL {{ ?x {chain} ?y }}"),
+    ] {
+        let text = format!("SELECT ?x ?y {{ VALUES ?x {{ {a0} }} {read} }}");
+        let request = nrese_store::SparqlQueryRequest::all(text);
+        let answer = store.execute_query(&request).expect("answered");
+        let prepared = store.prepare_query(&request).expect("prepared");
+        let token = nrese_store::CancellationToken::new();
+        let planned = store.plan_query(&prepared, &token).expect("planned");
+        let explained = store.explain_query(&prepared, &token).expect("explained");
+        let label = |c: Option<&nrese_sparql::Completeness>| c.map(|c| c.as_str());
+        let labels = [
+            label(answer.completeness.as_ref()),
+            label(answer.ql.as_ref().map(|r| &r.completeness)),
+            label(planned.completeness.as_ref()),
+            label(planned.ql.as_ref().map(|r| &r.completeness)),
+            label(explained.completeness.as_ref()),
+            label(explained.ql.as_ref().map(|r| &r.completeness)),
+        ];
+        let json: serde_json::Value = serde_json::from_slice(&answer.payload).expect("json");
+        let rows: Vec<_> = (json["results"]["bindings"].as_array().expect("rows"))
+            .iter()
+            .map(|row| {
+                let value = |v: &str| row[v]["value"].as_str().map(str::to_owned);
+                (value("x"), value("y"))
+            })
+            .collect();
+        if labels != [Some("unsound"); 6] || rows != [(Some(format!("{EX}a0")), None)] {
+            wrong.push((read, labels, rows));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec: the operator rule (reasoning-semantics.md, "Operators") holds once per read: a read
+/// inside a transaction, under `FILTER NOT EXISTS`, over a store whose committed key of 128
+/// properties is left out, is `unsound`, and its status names the operator once, not once for
+/// the QL report and again for the pending operations (the DL lead's P0 round 2, S2).
+#[test]
+fn a_pending_negation_over_a_list_left_out_names_the_operator_once() {
+    let pipeline = ql_pipeline(in_memory_store_config());
+    let store = pipeline.store();
+    let ticket = MutationTicket::new();
+    (pipeline.apply(
+        insert(&long_key(128)),
+        &nrese_store::Requester::all(),
+        &ticket,
+    ))
+    .expect("the data");
+    let read = format!(
+        "SELECT ?x {{ VALUES ?x {{ <{EX}x> }} FILTER NOT EXISTS {{ ?x <{EX}unrelated> <{EX}unused> }} }}"
+    );
+    let prepared =
+        (store.prepare_query(&nrese_store::SparqlQueryRequest::all(read))).expect("prepared");
+    let add = format!("INSERT DATA {{ <{EX}w> <{EX}name> \"W\" }}");
+    let ops = vec![nrese_store::StatementOp::Update(SparqlUpdateRequest::new(
+        add,
+    ))];
+    let mut pending = None;
+    store
+        .run_query_pending_reporting(
+            &nrese_store::StatementsRequest::new(ops),
+            &prepared,
+            &nrese_store::CancellationToken::new(),
+            &mut Vec::<u8>::new(),
+            |status, _| {
+                pending = status;
+                None
+            },
+        )
+        .expect("the pending read");
+    let status = pending.expect("a status");
+    let operator = (status.reasons.iter())
+        .filter(|r| {
+            r.text
+                .starts_with("the query uses EXISTS over answers that may be missing")
+        })
+        .count();
+    assert_eq!((status.as_str(), operator), ("unsound", 1), "{status:#?}");
 }
 
 /// An intersection of 256 members is one rule; one of 257 is either one too or reported

@@ -1089,3 +1089,74 @@ fn a_limit_of_zero_over_several_patterns_answers_no_rows() {
     assert_eq!(answer.table.len(), 0);
     ctx.consumed(answer);
 }
+
+/// Spec (SEP-0006; the drawing package's review, C): a LATERAL whose right side draws runs
+/// once per left row, and keeps nothing per row beyond what it charges: what it holds
+/// uncharged is the same for 500 and 8,000 left rows. With no room for its row column it is
+/// refused before any right side runs. The right side draws and keeps no row, so the final
+/// join is empty: a join's output, made before it is charged, is no part of what is measured.
+#[test]
+fn a_drawing_lateral_holds_nothing_per_row_beyond_its_charge() {
+    if !alone() {
+        return;
+    }
+    let engine = store([]);
+    let snapshot = engine.snapshot();
+    let text = "SELECT * WHERE { FILTER(RAND() < 0) }";
+    let Query::Select { pattern, .. } = SparqlParser::new().parse_query(text).unwrap() else {
+        panic!("a SELECT")
+    };
+    let right = match pattern {
+        GraphPattern::Project { inner, .. } => *inner,
+        other => other,
+    };
+    let run = |rows: usize, memory: Envelope| {
+        let options = QueryOptions {
+            resources: crate::Resources {
+                memory: memory.clone(),
+                ..crate::Resources::default()
+            },
+            ..QueryOptions::default()
+        };
+        let ctx = Context::new(&snapshot, &options, None, None);
+        let left = ctx
+            .produced(Solutions {
+                vars: vec![Variable::new_unchecked("i")],
+                table: IdTable::from_columns(vec![(0..rows as u64).collect()]),
+                ordered: false,
+            })
+            .ok()
+            .expect("room for the left rows");
+        let (answer, excess) = measure_within(&memory, || ctx.lateral(left, &right));
+        let answer = answer.map(|joined| {
+            let rows = joined.table.len();
+            ctx.consumed(joined);
+            rows
+        });
+        (answer, excess)
+    };
+    let excess = |rows: usize| {
+        let (answer, excess) = run(rows, Envelope::unlimited());
+        assert_eq!(answer.ok(), Some(0), "no right row is kept");
+        excess
+    };
+    let (small, large) = (excess(500), excess(8_000));
+    eprintln!("uncharged at most: {small} bytes at 500 left rows, {large} at 8,000");
+    assert!(
+        large <= small + 16 * 1024,
+        "uncharged bytes grow with the left rows: {small} at 500, {large} at 8,000"
+    );
+    // Room for the context and the left rows, not for their row column.
+    let rows = 8_000;
+    let room = own_bytes(&snapshot) + rows * 8 + rows * 4;
+    let (answer, _) = run(rows, Envelope::new(Some(room), None));
+    assert!(
+        matches!(
+            answer,
+            Err(NativeError::Evaluation(QueryEvaluationError::MemoryLimit(
+                _
+            )))
+        ),
+        "refused before any right side runs"
+    );
+}

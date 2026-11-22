@@ -24,7 +24,6 @@ use nrese_sparql_results::{QueryResultsFormat, QueryResultsSerializer};
 use nrese_sparql_syntax::Query;
 use nrese_sparql_syntax::algebra::QueryDataset;
 
-use crate::dl::query::certify_report;
 use crate::error::{StoreError, StoreResult};
 use crate::query::{GraphResultFormat, QueryResultKind, SolutionsResultFormat, SparqlQueryRequest};
 
@@ -317,6 +316,47 @@ impl PreparedQuery {
         self.dataset.is_some() || self.query.dataset().is_some()
     }
 
+    /// Whether the dataset this query reads by leaves out the store's default graph, where
+    /// the inferred statements are kept: the evaluator's own rule, on the same protocol
+    /// dataset and query dataset it resolves ([`nrese_sparql::dataset::omits_store_default_graph`];
+    /// a dataset of scoped inference, `inference-scope=dataset`, has its own inferred layer).
+    pub(crate) fn omits_default_graph(&self) -> bool {
+        nrese_sparql::dataset::omits_store_default_graph(
+            self.dataset.as_ref(),
+            self.query.dataset(),
+        )
+    }
+
+    /// Explanation when the query's dataset omits the store's default graph from its default
+    /// graph, tailored to the read model so compatibility `GRAPH` aliases and inferred-only
+    /// reads are never misdescribed as asserted-only answers.
+    pub(crate) fn dataset_omission_reason(&self) -> Option<&'static str> {
+        if !self.omits_default_graph() {
+            return None;
+        }
+        match self.read_model() {
+            ReadModel::Asserted => None,
+            ReadModel::Materialised => Some(
+                "this read's dataset leaves out the store's default graph from its default \
+                 graph, where inferred statements are stored; default-graph patterns see only \
+                 the selected graphs' asserted statements",
+            ),
+            ReadModel::Inferred => Some(
+                "this read's dataset leaves out the store's default graph from its default \
+                 graph, where inferred statements are stored; default-graph patterns read no \
+                 inferred statements",
+            ),
+        }
+    }
+
+    /// Explanation under `owl2-dl` when the query names an explicit dataset (`has_dataset`).
+    pub(crate) fn dl_dataset_reason(&self) -> &'static str {
+        self.dataset_omission_reason().unwrap_or(
+            "the query names its dataset: answers are over those graphs, not checked against \
+             the bounds",
+        )
+    }
+
     /// Under `owl2-dl`: which answers the query asks for (`None`: the store's setting).
     pub fn dl_answers(&self) -> Option<crate::DlAnswers> {
         self.dl_answers
@@ -388,9 +428,15 @@ fn scoped_dataset(
     if request.read_model.unwrap_or_default() != ReadModel::Materialised {
         return Err(bad("inference-scope=dataset conflicts with infer=false"));
     }
-    let mut dataset = protocol_dataset(&request.default_graphs, &request.named_graphs)?
-        .or_else(|| query_dataset(query).take().map(Into::into))
-        .unwrap_or_default();
+    // The dataset the evaluator would read by: the protocol's, else the query's own, which
+    // then becomes this one.
+    let protocol = protocol_dataset(&request.default_graphs, &request.named_graphs)?;
+    let own = query_dataset(query);
+    let mut dataset =
+        nrese_sparql::dataset::effective(protocol.as_ref(), own.as_ref()).unwrap_or_default();
+    if protocol.is_none() {
+        *own = None;
+    }
     let defaults = dataset.default_graph_graphs().unwrap_or_default();
     if dataset.available_named_graphs().is_some_and(|named| {
         named
@@ -501,9 +547,10 @@ pub(crate) fn protocol_dataset(
 
 /// Evaluates `prepared` on `view` and writes the serialised results to `out` as they are
 /// produced. On error the output is incomplete and must be discarded by the caller.
-/// `report` receives the retained QL report before any bytes and returns the cache
-/// context: what the store's answer depends on beyond the query's options (the
-/// `owl2-dl` mode with its `dl-answers` option, the completeness status it reports): part
+/// `report` receives the retained QL report before any bytes, to certify
+/// ([`crate::dl::query::certify_report`]; the report returned is as `report` left it), and
+/// returns the cache context: what the store's answer depends on beyond the query's options
+/// (the `owl2-dl` mode with its `dl-answers` option, the completeness status it reports): part
 /// of the key of the answer's bytes in the result cache. A part's rows don't depend on it
 /// (every path evaluates with the same options; the QL rewriting is in the algebra).
 /// With it, `report` returns `tell`, handed next, before any bytes, the status header kept
@@ -516,13 +563,11 @@ pub(crate) fn run_query<T: FnOnce(crate::service::StatusHeader) -> Option<String
     cancellation: &CancellationToken,
     memory: &nrese_exec::Envelope,
     out: impl Write,
-    report: impl FnOnce(Option<&nrese_sparql::ql::QlReport>) -> (Vec<u8>, T),
+    report: impl FnOnce(Option<&mut nrese_sparql::ql::QlReport>) -> (Vec<u8>, T),
 ) -> StoreResult<Option<nrese_sparql::ql::QlReport>> {
     let mut options = query_options(view, prepared, store, cancellation, memory);
     let (query, mut ql) = nrese_sparql::prepare_ql_query(view, &prepared.query, &options)?;
-    let completeness = ql.as_mut().map(|r| &mut r.completeness);
-    certify_report(completeness, prepared.reads(), view.snapshot());
-    let (context, tell) = report(ql.as_ref());
+    let (context, tell) = report(ql.as_mut());
     cancellation.check()?;
     // A repeated query's answer as written before, in this format; else written, and its
     // bytes offered to the cache with the time writing them took (`nrese_sparql::cache`).
@@ -723,7 +768,8 @@ fn results_serializer(
 }
 
 /// Runs `prepared` on `view` as [`run_query`] would, consuming the results instead of
-/// serialising them, and reports how it ran (EXPLAIN ANALYZE).
+/// serialising them, and reports how it ran (EXPLAIN ANALYZE); its QL report uncertified, as
+/// [`run_query`] hands it on.
 pub(crate) fn explain_prepared(
     view: &impl ReadView,
     prepared: &PreparedQuery,
@@ -732,14 +778,12 @@ pub(crate) fn explain_prepared(
     memory: &nrese_exec::Envelope,
 ) -> StoreResult<Explanation> {
     let options = query_options(view, prepared, store, cancellation, memory);
-    let mut explanation = explain_query(view, &prepared.query, &options)?;
-    let report = explanation.ql.as_mut().map(|r| &mut r.completeness);
-    certify_report(report, prepared.reads(), view.snapshot());
-    Ok(explanation)
+    explain_query(view, &prepared.query, &options).map_err(StoreError::from)
 }
 
 /// The plan `prepared` would run as on `view`, with estimated rows, without running it
-/// (EXPLAIN), drawing from the request's envelope `memory` as its run would.
+/// (EXPLAIN), drawing from the request's envelope `memory` as its run would; its QL report
+/// uncertified, as [`run_query`] hands it on.
 pub(crate) fn plan_prepared(
     view: &impl ReadView,
     prepared: &PreparedQuery,
@@ -748,10 +792,7 @@ pub(crate) fn plan_prepared(
     memory: &nrese_exec::Envelope,
 ) -> StoreResult<PlannedQuery> {
     let options = query_options(view, prepared, store, cancellation, memory);
-    let mut planned = plan_query(view, &prepared.query, &options)?;
-    let report = planned.ql.as_mut().map(|r| &mut r.completeness);
-    certify_report(report, prepared.reads(), view.snapshot());
-    Ok(planned)
+    plan_query(view, &prepared.query, &options).map_err(StoreError::from)
 }
 
 /// The options `prepared` runs with, for execution and explanation alike, drawing from

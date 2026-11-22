@@ -280,8 +280,9 @@ pub struct Program {
     /// contradiction they hold derives no clash. Their answers are all in U1; only
     /// [`Program::proves_consistency`] depends on this.
     pub unchecked: Vec<(usize, &'static str)>,
-    /// Whether the reader left part of the source out (a fatal diagnostic): U1 is of
-    /// what is left, so it proves nothing about the source's consistency.
+    /// Whether the reader left part of the source out (a fatal diagnostic), or read a name
+    /// of two kinds as one (`Diagnostic::joins_kinds`): U1 is of what was read, so it proves
+    /// nothing about the source's consistency.
     pub left_out: bool,
     /// U1's own terms, for [`Program::is_internal`].
     internal: HashSet<Term>,

@@ -2967,6 +2967,31 @@ fn a_rewritten_read_over_a_store_in_quarantine_under_owl2_rl_is_not_complete() {
     assert_ne!(status_class(&status), "complete", "status: {status}");
 }
 
+/// Spec: a read of a store in quarantine is never `complete`, whoever reads it
+/// (docs/spec/reasoning-semantics.md, "A store in quarantine"), and a cause once given is never
+/// replaced by another (the DL lead's P0 round 2, S3): under `owl2-rl` with the QL rewriting on,
+/// a store both in quarantine and holding an intersection of 257 classes, which the rules leave
+/// out, still names the quarantine, as v1.5.0 did.
+#[test]
+fn a_rewritten_read_in_quarantine_names_it_with_a_list_left_out() {
+    let members: Vec<String> = (1..=257).map(|i| format!(":M{i}")).collect();
+    let more = format!(
+        ":x a :A , :B . :C owl:intersectionOf ( {} ) .",
+        members.join(" ")
+    );
+    let store = quarantine_store(Ruleset::Owl2Rl, QlRewritingMode::On, &more);
+    assert_quarantined(&store);
+    let read = "SELECT ?x { ?x a :A }";
+    let (status, reasons) = rewritten_read(&store, read, nrese_store::ReadScope::All);
+    let quarantine = reasons
+        .iter()
+        .any(|r| r.starts_with("the store is in quarantine"));
+    assert!(
+        status_class(&status) != "complete" && quarantine,
+        "{status}: {reasons:#?}"
+    );
+}
+
 /// Spec (docs/spec/reasoning-semantics.md, "What `complete` refers to"): on clean data under
 /// `owl2-ql`, a read the QL rewriting ran on, of a named class of the data's own, is `complete`.
 /// The control of the `owl2-ql` quarantine cell.
@@ -3070,27 +3095,19 @@ fn rows_of(store: &StoreService, query: &str, scope: nrese_store::ReadScope) -> 
 /// `owl2-rl` with the QL rewriting, `complete` is the OWL 2 Direct Semantics'; Direct
 /// Semantics §2, annotations have no meaning; decided on 17 Nov): a read the
 /// rewriting answers that may return the rules' copy of an annotation statement is `unsound`,
-/// in its run, its EXPLAIN and its plan: `eq-rep-s`'s under `owl2-rl`, `prp-spo1`'s under
-/// `owl2-ql`.
+/// in its run, its EXPLAIN and its plan: `eq-rep-s`'s under `owl2-rl`. (Under `owl2-ql` no
+/// rule reads an annotation, so `prp-spo1` makes no such copy:
+/// `ql_consistency_tests::no_owl2_ql_rule_reads_an_annotation_as_an_axiom`.)
 #[test]
 fn a_rewritten_read_that_may_return_a_copied_annotation_is_unsound() {
     let mut wrong = Vec::new();
-    for (ruleset, ql, data, query, copy) in [
-        (
-            Ruleset::Owl2Rl,
-            QlRewritingMode::On,
-            EQUAL,
-            "SELECT ?s ?o { ?s :note ?o }",
-            "y",
-        ),
-        (
-            Ruleset::Owl2Ql,
-            QlRewritingMode::Auto,
-            SUB,
-            "SELECT ?s ?o { ?s :super ?o }",
-            "x",
-        ),
-    ] {
+    for (ruleset, ql, data, query, copy) in [(
+        Ruleset::Owl2Rl,
+        QlRewritingMode::On,
+        EQUAL,
+        "SELECT ?s ?o { ?s :note ?o }",
+        "y",
+    )] {
         let store = annotation_store(ruleset, ql, data);
         let rows = rows_of(&store, query, nrese_store::ReadScope::All);
         let copied = rows.iter().any(|r| r.contains(&format!("<{E}{copy}>")));

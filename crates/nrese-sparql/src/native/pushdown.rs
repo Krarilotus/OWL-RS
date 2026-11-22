@@ -331,7 +331,7 @@ pub(crate) fn per_solution(expression: &Expression) -> bool {
 }
 
 /// Whether `node` is a call that gives a new value at each evaluation.
-fn draw(node: Node<'_>) -> bool {
+pub(super) fn draw(node: Node<'_>) -> bool {
     matches!(node, Node::Expression(Expression::FunctionCall(function, _)) if draws(function))
 }
 

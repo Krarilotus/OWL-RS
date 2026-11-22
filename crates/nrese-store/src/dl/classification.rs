@@ -19,7 +19,7 @@ use std::time::Instant;
 use nrese_dl::classify::{self, Realisation, Taxonomy};
 use nrese_dl::verdict::Verdict;
 use nrese_engine::{ReadModel, Snapshot, TermId, TermKind};
-use nrese_exec::cell::{BuildCell, Busy, Claim, Kind};
+use nrese_exec::cell::{BuildCell, Claim, End, Ended, Joined, Kind};
 use nrese_owl::{Axiom, Characteristic, Ontology, Term, Unsupported};
 use nrese_rdf::{LiteralRef, NamedNodeRef, TermRef};
 use nrese_reasoner::classify::Classification;
@@ -152,7 +152,7 @@ pub(crate) fn realisation(
 /// Rayon worker (which must not wait for it) it computes its own. Publishing never lets an older in-flight request evict a newer
 /// revision; same-revision races keep the first complete result. No solver runs locked.
 /// `None`: `stop` fired while the request waited; the computation goes on and is kept.
-fn cached<T>(
+fn cached<T: Send + Sync + 'static>(
     slot: &Slot<T>,
     revision: u64,
     stop: Stop<'_>,
@@ -177,16 +177,24 @@ fn cached<T>(
         match slot.building.claim(revision, Kind::Opaque, kept) {
             Claim::Build(builder) => {
                 let result = own();
-                if complete(&result) {
-                    builder.finish(Some(Arc::clone(&result)));
+                match complete(&result) {
+                    true => builder.end(End::Kept(Arc::clone(&result))),
+                    // Nothing shared: its waiters claim again.
+                    false => builder.end(End::Empty),
                 }
                 return Some(result);
             }
-            Claim::Wait(build) => match build.wait_until(Some(stop)) {
-                Some(Ok(Some(result))) => return Some(result),
-                Some(Ok(None)) => {} // nothing shared: claim again, one replacement for all
-                Some(Err(Busy)) => return Some(own()),
-                None => return None,
+            Claim::Wait(build) => match build.join(None, stop) {
+                Joined::Told(Ended::End(End::Kept(result) | End::Unkept(Some(result)))) => {
+                    return Some(result);
+                }
+                // Nothing shared, or the computation panicked: claim again, one replacement
+                // for all.
+                Joined::Told(
+                    Ended::End(End::Empty | End::Later | End::Unkept(None)) | Ended::Abandoned,
+                ) => {}
+                Joined::Busy => return Some(own()),
+                Joined::Left => return None,
             },
         }
     }
@@ -233,7 +241,7 @@ fn run<T>(
     }
     let mut options = options(store);
     let memory = options.tableau.memory.clone().unwrap_or_default();
-    let read = source::read_snapshot(snapshot, memory);
+    let read = source::read_snapshot(snapshot, memory, &store.config().dl.treatments);
     options.timeout = options
         .timeout
         .map(|limit| limit.saturating_sub(started.elapsed()));
@@ -436,7 +444,8 @@ pub(crate) fn el_answer(
     }
     let options = options(store);
     let memory = options.tableau.memory.clone().unwrap_or_default();
-    let ontology = source::read_snapshot(snapshot, memory.clone()).ok()?;
+    let treatments = &store.config().dl.treatments;
+    let ontology = source::read_snapshot(snapshot, memory.clone(), treatments).ok()?;
     if !el_complete_for(&ontology) {
         return None;
     }
@@ -558,7 +567,12 @@ mod tests {
     fn realisation(store: &StoreService, snapshot: &Snapshot) -> Arc<Realisation> {
         super::realisation(store, snapshot, NEVER).unwrap()
     }
-    fn cached<T>(s: &Slot<T>, r: u64, c: impl Fn(&T) -> bool, f: impl FnOnce() -> T) -> Arc<T> {
+    fn cached<T: Send + Sync + 'static>(
+        s: &Slot<T>,
+        r: u64,
+        c: impl Fn(&T) -> bool,
+        f: impl FnOnce() -> T,
+    ) -> Arc<T> {
         super::cached(s, r, NEVER, c, f).unwrap()
     }
 
@@ -853,7 +867,7 @@ mod tests {
     }
 
     /// Whether `n` requests are asleep on `revision`'s computation under way.
-    fn asleep<T>(slot: &Slot<T>, revision: u64, n: usize) -> bool {
+    fn asleep<T: Send + Sync + 'static>(slot: &Slot<T>, revision: u64, n: usize) -> bool {
         matches!(slot.building.claim(revision, Kind::Opaque, || None),
             Claim::Wait(build) if build.waiting() >= n)
     }
@@ -868,7 +882,7 @@ mod tests {
     }
 
     /// Holds a computation until a request waits for it (at most 10 s, then fails).
-    fn until_waiting<T>(slot: &Slot<T>, revision: u64) {
+    fn until_waiting<T: Send + Sync + 'static>(slot: &Slot<T>, revision: u64) {
         until(|| asleep(slot, revision, 1));
     }
 

@@ -453,13 +453,14 @@ fn profiles_derive_what_they_define() {
             .len(),
         50
     );
-    // dt-type1: the 32 datatypes OWL 2 RL supports.
+    // OWL 2 Profiles §4.3: dt-type1 declares 32 datatypes, prp-ap declares nine
+    // annotation properties, and cls-thing and cls-nothing1 declare two classes.
     assert_eq!(
         Ruleset::Owl2Rl
             .axiom_triples(&mut vocabulary)
             .unwrap()
             .len(),
-        32
+        32 + 9 + 2
     );
 
     let data = "ex:Cat rdfs:subClassOf ex:Animal
@@ -580,8 +581,9 @@ fn owl2_rl_parses_and_every_rule_is_safe() {
     let mut vocabulary = LocalVocabulary::default();
     let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
     // Tables 4 (6 rules), 5 (16), 6 (13), 7 (4) and 9 (18); list rules come from `lists`.
-    // Plus the reflexive eq-diff1 (x differentFrom x), eq-ref's consistency part.
-    assert_eq!(rules.len(), 58);
+    // Plus the reflexive eq-diff1 (x differentFrom x), eq-ref's consistency part, and the
+    // empty-owl:Thing check beyond the tables (cls-thing-empty).
+    assert_eq!(rules.len(), 59);
     assert!(rules.iter().any(|r| r.name == "cls-maxqc4"));
     Ruleset::Rdfs.rules(&mut vocabulary).unwrap();
 }

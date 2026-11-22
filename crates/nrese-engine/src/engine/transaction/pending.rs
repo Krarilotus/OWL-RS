@@ -572,6 +572,15 @@ impl Pending {
         model: ReadModel,
         pattern: &QuadPattern,
     ) -> impl Iterator<Item = EncodedQuad> + use<'a> {
+        self.quads_for_pattern_until(model, pattern, || false)
+    }
+
+    pub(super) fn quads_for_pattern_until<'a, F: Fn() -> bool + Copy + 'a>(
+        &'a self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        stop: F,
+    ) -> impl Iterator<Item = EncodedQuad> + use<'a, F> {
         let pattern = *pattern;
         Stack::ALL
             .into_iter()
@@ -581,14 +590,23 @@ impl Pending {
                 let inferred = stack == Stack::Inferred;
                 // Base inferred quads can only be shadowed by pending asserted inserts (the
                 // base stacks are disjoint): a hash probe instead of an index lookup.
-                let base = self.base.stack_quads(stack, &pattern).filter(move |quad| {
-                    let shadowed = inferred && self.asserted.inserts.contains(quad);
-                    !shadowed && !delta.deletes.contains(quad)
-                });
-                let pending = delta.inserts.iter().copied().filter(move |quad| {
-                    let shadowed = inferred && self.delta_contains(Stack::Asserted, quad);
-                    !shadowed && pattern.matches(quad)
-                });
+                let base = self
+                    .base
+                    .stack_quads(stack, &pattern)
+                    .take_while(move |_| !stop())
+                    .filter(move |quad| {
+                        let shadowed = inferred && self.asserted.inserts.contains(quad);
+                        !shadowed && !delta.deletes.contains(quad)
+                    });
+                let pending = delta
+                    .inserts
+                    .iter()
+                    .copied()
+                    .take_while(move |_| !stop())
+                    .filter(move |quad| {
+                        let shadowed = inferred && self.delta_contains(Stack::Asserted, quad);
+                        !shadowed && pattern.matches(quad)
+                    });
                 base.chain(pending)
             })
     }

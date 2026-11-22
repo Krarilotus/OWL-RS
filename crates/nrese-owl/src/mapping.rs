@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use crate::diagnostics::Diagnostic;
+use crate::diagnostics::{Diagnostic, Treatment, Treatments};
 use crate::model::{
     Axiom, Characteristic, ClassExpr, DataRange, DataTerms, Disjoint, EntityKind, ExprId, Interner,
     Literal, ObjProp, RangeId, Term, canonical,
@@ -85,6 +85,17 @@ pub struct Ontology {
     /// among [`Self::annotations`]: OWL 2 DL gives these axioms no meaning, while the OWL 2
     /// RL rules over the triples (prp-dom, prp-rng, prp-spo1) read them. Sorted, each once.
     pub annotation_schema: Vec<Term>,
+    /// The properties used as annotation properties: those of the statements read past as
+    /// annotations (*Mapping to RDF* Table 10; in the functional syntax, annotation
+    /// assertions and the annotations of axioms and the ontology), and the properties of
+    /// the annotation axioms read past. Not the header's `owl:imports` and `owl:versionIRI`
+    /// (Table 4), nor SHACL content. Where a logical axiom or an assertion also uses one, it is
+    /// a name used as two kinds (`crate::typing`).
+    pub annotation_uses: BTreeSet<Term>,
+    /// The properties the annotation axioms read past name (Table 17): a domain's or range's
+    /// property, a sub-property axiom's two. Among [`Self::annotation_uses`]; each is named an
+    /// annotation property by an axiom (`crate::typing`).
+    pub annotation_axioms: BTreeSet<Term>,
     /// The properties of the SHACL vocabulary ([`shacl_properties`]) whose statements were read
     /// as SHACL content, which has no OWL meaning (read past as an annotation is).
     pub shacl: BTreeSet<Term>,
@@ -116,6 +127,9 @@ pub struct Ontology {
     /// `owl:disjointUnionOf`), read as an equivalence and an empty operand. Every later
     /// rewrite of that kind sets it too.
     pub rules_unread: Option<Term>,
+    /// The first list cell a statement outside its list names; the OWL 2 RL rules may equate
+    /// it and read sequences the graph doesn't write.
+    pub list_cell_outside: Option<Term>,
 }
 
 /// The properties OWL 2 gives a fixed meaning, by their ids in the source (`None` where
@@ -278,6 +292,26 @@ pub(crate) fn complete(ontology: &mut Ontology, terms: &dyn Terms) {
         .filter(|&t| terms.kind(t) == TermKind::Blank)
         .collect();
     crate::diagnostics::check_global_restrictions(ontology);
+    // An unused structure that is also an individual: an equality the rules derive may give
+    // it a second structure's statements (`Reader::reads_more`).
+    for d in &mut ontology.diagnostics {
+        if let Diagnostic::Unused {
+            node, reads_more, ..
+        } = d
+        {
+            *reads_more |= ontology.anonymous.contains(node);
+        }
+    }
+    let two_kinds = crate::typing::two_kinds(ontology).into_iter();
+    ontology
+        .diagnostics
+        .extend(two_kinds.map(|t| Diagnostic::TwoKinds {
+            term: t.term,
+            kinds: t.kinds,
+            by_axiom: t.by_axiom,
+            treatment: Treatment::Counted,
+        }));
+    ontology.treat(&Treatments::default());
 }
 
 /// The individuals class expressions name: in nominals and `hasValue`.
@@ -441,7 +475,16 @@ struct Reader<'a> {
     empty_list: Option<Term>,
     rules_unread: Option<Term>,
     annotation_schema: Vec<Term>,
+    annotation_uses: BTreeSet<Term>,
+    annotation_axioms: BTreeSet<Term>,
+    /// The properties declared object or data properties (`owl:ObjectProperty`,
+    /// `owl:DatatypeProperty`) or by OWL 2 itself (the four built-in ones), not typed so by a
+    /// characteristic: what makes a statement about the ontology no annotation (Table 10).
+    logical: HashSet<Term>,
     shacl: BTreeSet<Term>,
+    /// The cells of the lists read to `rdf:nil` ([`Self::cells_outside_their_lists`]).
+    cells: HashSet<Term>,
+    list_cell_outside: Option<Term>,
 }
 
 /// The classes whose instances are declared entities, by IRI: OWL 2's, and the RDFS and
@@ -573,6 +616,16 @@ impl AnnotationProperties {
     pub fn contains(&self, term: Term) -> bool {
         self.1.contains(&term)
     }
+
+    /// The `(predicate, object)` of a declaration, in either spelling, where both are known.
+    pub fn declaring(&self) -> impl Iterator<Item = [Term; 2]> + '_ {
+        self.0.iter().filter_map(|&[p, o]| Some([p?, o?]))
+    }
+
+    /// The annotation properties read so far, the built-in ones included.
+    pub fn properties(&self) -> impl Iterator<Item = Term> + '_ {
+        self.1.iter().copied()
+    }
 }
 
 /// `Some(id) == Some(x)` without matching an absent term.
@@ -628,7 +681,12 @@ impl<'a> Reader<'a> {
             empty_list: None,
             rules_unread: None,
             annotation_schema: Vec::new(),
+            annotation_uses: BTreeSet::new(),
+            annotation_axioms: BTreeSet::new(),
+            logical: HashSet::new(),
             shacl: BTreeSet::new(),
+            cells: HashSet::new(),
+            list_cell_outside: None,
         }
     }
 
@@ -684,14 +742,7 @@ impl<'a> Reader<'a> {
     /// two objects: then it is no structure, since which one a reading took would follow the
     /// order the statements come in. Reported, and every statement of such a property taken.
     fn twice(&mut self, node: Term) -> bool {
-        let pairs = self.by_subject.get(&node).cloned().unwrap_or_default();
-        let structure = |p| {
-            (self.is_vocabulary(p) || is(p, self.v.owl_inverse_of)) && !is(p, self.v.owl_imports)
-        };
-        let given_twice: Vec<[Term; 3]> = (pairs.iter())
-            .filter(|&&(p, o, _)| structure(p) && pairs.iter().any(|&(q, x, _)| q == p && x != o))
-            .map(|&(p, o, _)| [node, p, o])
-            .collect();
+        let given_twice = self.given_twice(node);
         for &triple in &given_twice {
             self.collect(triple);
         }
@@ -702,6 +753,68 @@ impl<'a> Reader<'a> {
             });
         }
         !given_twice.is_empty()
+    }
+
+    /// The statements of `node` whose structure property has a second object there: what
+    /// [`Self::twice`] reports, without reporting or taking anything.
+    fn given_twice(&self, node: Term) -> Vec<[Term; 3]> {
+        let Some(pairs) = self.by_subject.get(&node) else {
+            return Vec::new();
+        };
+        let structure = |p| {
+            (self.is_vocabulary(p) || is(p, self.v.owl_inverse_of)) && !is(p, self.v.owl_imports)
+        };
+        (pairs.iter())
+            .filter(|&&(p, o, _)| structure(p) && pairs.iter().any(|&(q, x, _)| q == p && x != o))
+            .map(|&(p, o, _)| [node, p, o])
+            .collect()
+    }
+
+    /// Of `forms`, those `node` gives: what [`Self::forms`] counts, without reporting or
+    /// taking anything.
+    fn given_forms(&self, node: Term, forms: &[Option<Term>]) -> Vec<Term> {
+        (forms.iter().flatten().copied())
+            .filter(|&p| !self.objects(node, Some(p)).is_empty())
+            .collect()
+    }
+
+    /// Whether the OWL 2 RL rules may read the blank node `node`, a structure no axiom read
+    /// ([`Diagnostic::Unused`]), as more than what one structure says: it has two forms (a
+    /// structure property given twice, two of [`Self::expression_forms`], two of
+    /// [`Self::restriction_fillers`]), or a negative property assertion's three statements,
+    /// which prp-npa1 and prp-npa2 read untyped. That it is also an individual, which an
+    /// equality can give a second structure's statements, is added once the axioms are
+    /// complete ([`Self::finish`]). Pure: [`Self::twice`] and [`Self::forms`] would report the
+    /// node malformed.
+    fn reads_more(&self, node: Term) -> bool {
+        let v = self.v;
+        let has = |p| !self.objects(node, p).is_empty();
+        let two = |forms: &[Option<Term>]| self.given_forms(node, forms).len() > 1;
+        let negative = has(v.owl_source_individual)
+            && has(v.owl_assertion_property)
+            && (has(v.owl_target_individual) || has(v.owl_target_value));
+        !self.given_twice(node).is_empty()
+            || two(&self.expression_forms())
+            || two(&self.restriction_fillers())
+            || negative
+    }
+
+    /// The properties that each give a restriction its one filler or cardinality (*Mapping to
+    /// RDF* Table 13).
+    fn restriction_fillers(&self) -> [Option<Term>; 10] {
+        let v = self.v;
+        [
+            v.owl_some_values_from,
+            v.owl_all_values_from,
+            v.owl_has_value,
+            v.owl_has_self,
+            v.owl_min_cardinality,
+            v.owl_min_qualified,
+            v.owl_max_cardinality,
+            v.owl_max_qualified,
+            v.owl_cardinality,
+            v.owl_qualified,
+        ]
     }
 
     /// The properties that each make a blank node one class expression or one data range
@@ -734,9 +847,7 @@ impl<'a> Reader<'a> {
     /// is no structure, as with a structure property given twice ([`Self::twice`]). Reported,
     /// and every statement of those properties taken.
     fn forms(&mut self, node: Term, forms: &[Option<Term>]) -> bool {
-        let given: Vec<Term> = (forms.iter().flatten().copied())
-            .filter(|&p| !self.objects(node, Some(p)).is_empty())
-            .collect();
+        let given = self.given_forms(node, forms);
         if given.len() < 2 {
             return false;
         }
@@ -812,6 +923,9 @@ impl<'a> Reader<'a> {
                     if !entry.contains(&kind) {
                         entry.push(kind);
                     }
+                    if matches!(kind, EntityKind::ObjectProperty | EntityKind::DataProperty) {
+                        self.logical.insert(s);
+                    }
                 }
             }
             if object_only.iter().any(|&c| is(o, c)) {
@@ -833,14 +947,7 @@ impl<'a> Reader<'a> {
                 if !entry.contains(&kind) {
                     entry.push(kind);
                 }
-            }
-        }
-        for (&term, kinds) in &self.declared {
-            if kinds.contains(&EntityKind::ObjectProperty)
-                && kinds.contains(&EntityKind::DataProperty)
-            {
-                self.diagnostics
-                    .push(Diagnostic::AmbiguousProperty { property: term });
+                self.logical.insert(property);
             }
         }
     }
@@ -896,13 +1003,15 @@ impl<'a> Reader<'a> {
 
     // Lists ----------------------------------------------------------------------------
 
-    /// The members of the list starting at `head`.
+    /// The members of the list starting at `head`. Its cells are checked once every statement
+    /// is read ([`Self::cells_outside_their_lists`]).
     fn list(&mut self, head: Term) -> Option<Vec<Term>> {
         let mut members = Vec::new();
         let mut seen = HashSet::new();
         let mut cell = head;
         loop {
             if is(cell, self.v.nil) {
+                self.cells.extend(seen);
                 return Some(members);
             }
             if self.kind(cell) != TermKind::Blank || !seen.insert(cell) {
@@ -1156,19 +1265,7 @@ impl<'a> Reader<'a> {
     /// A restriction on `property`.
     fn restriction(&mut self, node: Term, property: Term) -> Option<ExprId> {
         let v = self.v;
-        let fillers = [
-            v.owl_some_values_from,
-            v.owl_all_values_from,
-            v.owl_has_value,
-            v.owl_has_self,
-            v.owl_min_cardinality,
-            v.owl_min_qualified,
-            v.owl_max_cardinality,
-            v.owl_max_qualified,
-            v.owl_cardinality,
-            v.owl_qualified,
-        ];
-        if self.forms(node, &fillers) {
+        if self.forms(node, &self.restriction_fillers()) {
             return None;
         }
         let data = self.kind(property) == TermKind::Iri
@@ -1486,16 +1583,27 @@ impl<'a> Reader<'a> {
                 self.collected.clear();
             }
         }
-        // Structure statements on blank nodes that no axiom took.
+        // Structure statements on blank nodes that no axiom took: each node once, in the order
+        // its first such statement comes.
+        let (mut unused, mut seen) = (Vec::new(), HashSet::new());
         for statement in statements {
             let [s, p, _] = statement.triple;
             if self.kind(s) == TermKind::Blank
                 && !self.structural.contains(&statement.triple)
                 && (self.is_vocabulary(p) || is(p, self.v.owl_inverse_of))
                 && !is(p, self.v.owl_imports)
+                && seen.insert(s)
             {
-                self.report(Diagnostic::Unused { node: s });
+                unused.push(s);
             }
+        }
+        for node in unused {
+            let reads_more = self.reads_more(node);
+            self.report(Diagnostic::Unused {
+                node,
+                reads_more,
+                treatment: Treatment::Counted,
+            });
         }
     }
 
@@ -1616,6 +1724,10 @@ impl<'a> Reader<'a> {
             for (p, o, _) in self.by_subject.get(&node).cloned().unwrap_or_default() {
                 self.structural.insert([node, p, o]);
                 self.annotations += 1;
+                // Its annotations' properties; its typing and roles are vocabulary.
+                if !is(p, v.rdf_type) && !self.is_vocabulary(p) {
+                    self.annotation_uses.insert(p);
+                }
             }
         }
     }
@@ -1676,6 +1788,8 @@ impl<'a> Reader<'a> {
             if subject || self.annotation_property(o) {
                 self.annotations += 1;
                 self.annotation_schema.push(if subject { s } else { o });
+                self.annotation_uses.extend([s, o]);
+                self.annotation_axioms.extend([s, o]);
             } else if self.kind(s) == TermKind::Iri && self.is_data_property(s) {
                 self.add(Axiom::SubDataPropertyOf(s, o), triple);
             } else if let (Some(sub), Some(sup)) =
@@ -1731,6 +1845,8 @@ impl<'a> Reader<'a> {
             if self.annotation_property(s) {
                 self.annotations += 1;
                 self.annotation_schema.push(s);
+                self.annotation_uses.insert(s);
+                self.annotation_axioms.insert(s);
             } else if self.kind(s) == TermKind::Iri && self.is_data_property(s) {
                 if domain {
                     if let Some(class) = self.class(o) {
@@ -1816,11 +1932,19 @@ impl<'a> Reader<'a> {
         } else if self.declared_as(p, EntityKind::AnnotationProperty)
             || self.is_builtin_annotation(p)
             || self.shacl.contains(&p)
-            || self.has_type(s, v.owl_ontology)
+            || (self.has_type(s, v.owl_ontology) && !self.logical.contains(&p))
         {
             // An annotation, SHACL content, or a statement about the ontology: its header's
-            // annotations (an anonymous ontology's too: its node is a blank node).
+            // annotations (an anonymous ontology's too: its node is a blank node). A header
+            // statement of a declared object or data property is no annotation (*Mapping to
+            // RDF* Table 10 reads one only where the property is an annotation property) and is
+            // read as any other below; one of an undeclared property is, as the W3C test cases
+            // read it (FS2RDF-ontology-annotation-annotation-ar), and so is one of a property
+            // only a characteristic types, which declares nothing.
             self.annotations += 1;
+            if !self.shacl.contains(&p) && !is(p, self.builtin_annotations.1) {
+                self.annotation_uses.insert(p);
+            }
         } else if self.kind(o) == TermKind::Literal
             && self.declared_as(p, EntityKind::ObjectProperty)
             && !self.declared_as(p, EntityKind::DataProperty)
@@ -1828,8 +1952,15 @@ impl<'a> Reader<'a> {
             // An object property's assertion (Table 16, `*:x` or `_:x`): a literal there is
             // malformed. A property declared both ways is read as a data property, as before.
             self.individual(o);
-        } else if self.kind(o) == TermKind::Literal || self.is_data_property(p) {
+        } else if self.kind(o) == TermKind::Literal {
             self.add(Axiom::DataPropertyAssertion(p, s, o), triple);
+        } else if self.is_data_property(p) {
+            // A data property's assertion has a literal (Table 16): an IRI or a blank node there
+            // is malformed, and the statement left out.
+            self.report(Diagnostic::Malformed {
+                node: o,
+                what: "an IRI where a data value belongs",
+            });
         } else {
             self.add(Axiom::ObjectPropertyAssertion(p, s, o), triple);
         }
@@ -1957,7 +2088,85 @@ impl<'a> Reader<'a> {
         builtin.contains(&Some(predicate)) || *version_iri == Some(predicate)
     }
 
+    /// Reports each cell of [`Self::cells`] that a statement outside its list names (*Mapping
+    /// to RDF* §3: a sequence's blank nodes occur only in that sequence), once. Allowed: as
+    /// subject, its `rdf:first`, `rdf:rest` and `rdf:type rdf:List`; as object, the one
+    /// statement that points to it (its axiom's, or its predecessor's `rdf:rest`) and, where
+    /// that is its axiom's, the `owl:annotatedTarget` of that axiom's reification
+    /// ([`Self::reified_axiom`]). Read over every statement, so the order they come in changes
+    /// nothing; not at all where no list was read.
+    fn cells_outside_their_lists(&mut self) {
+        if self.cells.is_empty() {
+            return;
+        }
+        let v = self.v;
+        let mut outside = BTreeSet::new();
+        let mut owners: HashMap<Term, [Term; 3]> = HashMap::new();
+        let mut targets = Vec::new();
+        for statement in self.statements {
+            let [s, p, o] = statement.triple;
+            let typed_list = is(p, v.rdf_type) && is(o, v.rdf_list);
+            if self.cells.contains(&s) && !is(p, v.first) && !is(p, v.rest) && !typed_list {
+                outside.insert(s);
+            }
+            if !self.cells.contains(&o) {
+                continue;
+            }
+            if is(p, v.owl_annotated_target) {
+                targets.push((s, o));
+            } else if *owners.entry(o).or_insert(statement.triple) != statement.triple {
+                outside.insert(o);
+            }
+        }
+        // Each reification read once, however many targets it gives.
+        let mut mains: HashMap<Term, Option<[Term; 2]>> = HashMap::new();
+        for (reification, cell) in targets {
+            let main =
+                *(mains.entry(reification)).or_insert_with(|| self.reified_axiom(reification));
+            let axiom = owners.get(&cell).filter(|&&[_, p, _]| !is(p, v.rest));
+            if main.is_none() || axiom.map(|&[s, p, _]| [s, p]) != main {
+                outside.insert(cell);
+            }
+        }
+        for node in outside {
+            self.list_cell_outside.get_or_insert(node);
+            let what = "a list's cell used outside its list";
+            self.report(Diagnostic::Malformed { node, what });
+        }
+    }
+
+    /// The source and property of the main triple `node` reifies, where it is an annotated
+    /// axiom's reification (*Mapping to RDF* §2.3.1, Table 17): a blank node typed `owl:Axiom`
+    /// with one `owl:annotatedSource`, one `owl:annotatedProperty` and one
+    /// `owl:annotatedTarget`. Its statements read once, none past a role's second value.
+    fn reified_axiom(&self, node: Term) -> Option<[Term; 2]> {
+        let v = self.v;
+        if self.kind(node) != TermKind::Blank {
+            return None;
+        }
+        let roles = [
+            v.owl_annotated_source,
+            v.owl_annotated_property,
+            v.owl_annotated_target,
+        ];
+        let (mut typed, mut parts) = (false, [None; 3]);
+        for &(p, o, _) in self.by_subject.get(&node).into_iter().flatten() {
+            typed |= is(p, v.rdf_type) && is(o, v.owl_axiom);
+            if let Some(i) = roles.iter().position(|&r| is(p, r)) {
+                // A second value: no reification of one main triple.
+                if parts[i].replace(o).is_some_and(|before| before != o) {
+                    return None;
+                }
+            }
+        }
+        match parts {
+            [Some(s), Some(p), Some(_)] if typed => Some([s, p]),
+            _ => None,
+        }
+    }
+
     fn finish(mut self) -> Ontology {
+        self.cells_outside_their_lists();
         let mut axioms = Vec::with_capacity(self.axioms.len());
         let mut sources = Vec::with_capacity(self.axioms.len());
         for (axiom, from) in std::mem::take(&mut self.axioms) {
@@ -1974,6 +2183,8 @@ impl<'a> Reader<'a> {
             diagnostics: self.diagnostics,
             annotations: self.annotations,
             annotation_schema: self.annotation_schema,
+            annotation_uses: self.annotation_uses,
+            annotation_axioms: self.annotation_axioms,
             shacl: self.shacl,
             builtin: BuiltinProperties::of(&self.v),
             data: DataTerms::default(),
@@ -1983,6 +2194,7 @@ impl<'a> Reader<'a> {
             empty_list: self.empty_list,
             qualified_data_max: self.qualified_data_max,
             rules_unread: self.rules_unread,
+            list_cell_outside: self.list_cell_outside,
         };
         complete(&mut ontology, self.terms);
         ontology

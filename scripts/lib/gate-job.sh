@@ -13,10 +13,17 @@
 # scripts/cargo-guarded.sh), each entry's last use recorded, one sweep for the whole cache
 # (NRESE_HOST_CACHE_GB).
 #
+# MODE quick (scripts/check.sh quick) keeps what it uses in a directory of its own, quick/ (its lock,
+# wt, files, target-quick-<release>, py-*), so it never waits behind a push gate, nor a push gate
+# behind it, and no sweep of push's, an older runner's or /verify's (bin-*, target-*, py-*, node-*,
+# wt/target at the cache's root) can match it: quick/ is swept by quick alone, under its lock.
+#
 # Its tools: the tree's toolchain (rust-toolchain.toml), the pinned cargo-nextest and Miri
 # nightly (scripts/lib/gate-tools.txt), the suite's Python packages and, for a push that changes
 # the console, the pinned Node (scripts/lib/gate-node.sh), all installed once, nextest, Python's
-# and Node under the cache directory. No step reaches a Docker daemon.
+# and Node under the cache directory: the toolchains and nextest under the tools' lock
+# (tools/lock), which both modes take, nextest one directory per version. No step reaches a
+# Docker daemon.
 #
 # Results ($FLEET_OUT): gate.log, the run's output; check.log, check.sh's; attempt, this
 # attempt's name; gate.json, what it was (scripts/lib/gate-record.py).
@@ -27,14 +34,14 @@ shift 3
 [ "${1:-}" = -- ] && shift
 out=${FLEET_OUT:?a fleet job}
 cache=${NRESE_GATE_CACHE:-$HOME/fleet/cache/owlrs-gate}
-mkdir -p "$cache/bin"
+mkdir -p "$cache/tools"
 exec > >(tee "$out/gate.log") 2>&1
 # This attempt's own result only: what an earlier attempt of the job left goes, and the attempt is
 # named (its job, step, start and pid), so its result can't be taken for another's.
 rm -rf -- "$out/gate.json" "$out/check.log"
 attempt="${FLEET_JOB:-none}:${FLEET_STEP:-0}:${EPOCHREALTIME/[.,]/}:$$"
 echo "$attempt" > "$out/attempt"
-export PATH="$cache/bin:$HOME/.cargo/bin:$PATH"
+export PATH="$HOME/.cargo/bin:$PATH"
 # Nothing here may reach a Docker daemon (the shared host's volumes and images belong to others).
 export DOCKER_HOST=unix:///nonexistent/owlrs-gate-has-no-docker.sock
 infra() { echo "gate-job: $*" >&2; exit 3; }
@@ -46,7 +53,12 @@ quiet() {
   rm -f "$log"
 }
 
-exec 9> "$cache/lock"
+# Where this mode's entries live, each mode's under its own lock: push's at the cache's root, quick's
+# under quick/ (above).
+home=$cache tag=gate
+[ "$mode" = quick ] && home=$cache/quick tag=quick
+mkdir -p "$home"
+exec 9> "$home/lock"
 if ! flock -n 9; then
   echo "another gate runs on this host: waiting for it"
   flock 9 || infra "no lock"
@@ -57,7 +69,7 @@ fi
 tool=$PWD
 repo=$(git rev-parse --path-format=absolute --git-common-dir) || infra "not in the job's checkout"
 sha=$(git rev-parse "HEAD^{commit}") || infra "no commit HEAD"
-wt=$cache/wt
+wt=$home/wt
 if ! git -C "$wt" checkout -q -f --detach "$sha" 2> /dev/null; then
   rm -rf -- "$wt"
   git --git-dir="$repo" worktree prune
@@ -65,7 +77,7 @@ if ! git -C "$wt" checkout -q -f --detach "$sha" 2> /dev/null; then
 fi
 git -C "$wt" clean -q -fd
 [ "$(git -C "$wt" rev-parse 'HEAD^{tree}')" = "$tree" ] || infra "the checkout isn't tree $tree"
-files=$cache/files
+files=$home/files
 if [ $# -gt 0 ]; then
   printf '%s\n' "$@" > "$files"
 else
@@ -79,19 +91,24 @@ cd "$wt" || infra "no worktree"
 linker=${NRESE_GATE_CC:-cc}
 command -v "$linker" > /dev/null || infra "no C compiler and linker ($linker) on this host: its owner installs one (build-essential)"
 # ... and one that links: a tiny program, built.
-printf 'int main(void) { return 0; }\n' > "$cache/link-probe.c"
-quiet "$linker" "$cache/link-probe.c" -o "$cache/link-probe" \
+printf 'int main(void) { return 0; }\n' > "$home/link-probe.c"
+quiet "$linker" "$home/link-probe.c" -o "$home/link-probe" \
   || infra "the C compiler here ($linker) doesn't link a program: its owner repairs it (build-essential)"
-rm -f -- "$cache/link-probe.c" "$cache/link-probe"
+rm -f -- "$home/link-probe.c" "$home/link-probe"
+# The tools, made or changed by one job at a time (both modes take this lock).
+exec 7> "$cache/tools/lock"
+flock -w 1800 7 || infra "the tools' lock wasn't free within 30 minutes"
 # A host without rustup (the development machine's WSL VM, 20 Oct 2026) gets one of the gate's own, under the cache:
 # the host's own home and PATH stay as they are.
 if ! command -v rustup > /dev/null; then
   export RUSTUP_HOME="$cache/rustup" CARGO_HOME="$cache/cargo"
   export PATH="$CARGO_HOME/bin:$PATH"
   if ! command -v rustup > /dev/null; then
-    curl -fsSL --max-time 300 https://sh.rustup.rs -o "$cache/rustup-init.sh" \
-      && quiet sh "$cache/rustup-init.sh" -y --no-modify-path --profile minimal --default-toolchain none \
+    init=$(mktemp)
+    curl -fsSL --max-time 300 https://sh.rustup.rs -o "$init" \
+      && quiet sh "$init" -y --no-modify-path --profile minimal --default-toolchain none \
       || infra "no rustup (the gate's own, under $cache)"
+    rm -f -- "$init"
   fi
 fi
 channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
@@ -100,11 +117,21 @@ quiet rustup toolchain install "$channel" --no-self-update --profile minimal --c
   || infra "no toolchain $channel"
 # The gate's pinned tools (scripts/lib/gate-tools.txt); check.sh checks them again.
 pin() { sed -n "s/^$1 //p" "$tool/scripts/lib/gate-tools.txt" | tr -d '\r'; }
+# cargo-nextest: each version in a directory of its own (tools/nextest-<version>), made aside, moved
+# into place whole once it runs as that version and never changed after, first on PATH: no job
+# replaces the one another job runs.
 want=$(pin cargo-nextest)
-if [ "$(cargo nextest --version 2> /dev/null | awk 'NR == 1 { print $2 }')" != "$want" ]; then
-  curl -fsSL --max-time 300 "https://get.nexte.st/$want/linux" | tar -xz -C "$cache/bin" \
-    || infra "no cargo-nextest $want"
+nextest=$cache/tools/nextest-$want
+nextest_version() { "$1/cargo-nextest" nextest --version 2> /dev/null | awk 'NR == 1 { print $2 }'; }
+if [ ! -d "$nextest" ]; then
+  rm -rf -- "$nextest".partial-*
+  part=$(mktemp -d "$nextest.partial-XXXXXX") || infra "no cargo-nextest $want"
+  curl -fsSL --max-time 300 "https://get.nexte.st/$want/linux" | tar -xz -C "$part"
+  [ "$(nextest_version "$part")" = "$want" ] && mv -T -- "$part" "$nextest" \
+    || { rm -rf -- "$part"; infra "no cargo-nextest $want"; }
 fi
+[ "$(nextest_version "$nextest")" = "$want" ] || infra "$nextest isn't cargo-nextest $want"
+export PATH="$nextest:$PATH"
 nightly=$(pin miri)
 # Miri, for the push tier's nrese-exec step (scripts/miri.sh, which builds under this worktree:
 # its target directory stays where the next gate runs it).
@@ -113,24 +140,31 @@ if [ "$mode" = push ] && ! cargo "+$nightly" miri --version > /dev/null 2>&1; th
     || infra "no Miri on $nightly"
 fi
 # A tree whose miri.sh asks for plain `+nightly` (before the pin) gets the pinned one, the main
-# PC's, not whatever nightly is today.
-if grep -q 'cargo +nightly' scripts/miri.sh 2> /dev/null; then
+# PC's, not whatever nightly is today. Push's only: Miri runs in no other mode.
+if [ "$mode" = push ] && grep -q 'cargo +nightly' scripts/miri.sh 2> /dev/null; then
   mkdir -p "$cache/shim"
   printf '#!/bin/sh\nif [ "$1" = +nightly ]; then shift; exec %s "+%s" "$@"; fi\nexec %s "$@"\n' \
     "$(command -v cargo)" "$nightly" "$(command -v cargo)" > "$cache/shim/cargo"
   chmod +x "$cache/shim/cargo"
   export PATH="$cache/shim:$PATH"
 fi
+# ... and the one the checks get: cargo looks for `cargo nextest` in $CARGO_HOME/bin before PATH, where a
+# host's own cargo-nextest would stand in for the pinned one. A version command that fails counts as
+# none, whatever it printed: check.sh would then fall back to cargo test.
+runner=$(cargo nextest --version 2> /dev/null) || runner=
+got=$(printf '%s\n' "$runner" | awk 'NR == 1 { print $2 }')
+[ "$got" = "$want" ] || infra "cargo nextest is cargo-nextest ${got:-none}, not the pinned $want (\$CARGO_HOME/bin first)"
+exec 7>&-
 # The suite contracts' Python packages, in an environment of their own (scripts/lib/suite-python.sh).
 # shellcheck source=suite-python.sh
 . "$tool/scripts/lib/suite-python.sh"
-pybin=$(suite_python "$cache" "$tool/benches/suite/requirements.txt" python3) || infra "no Python for the suite"
+pybin=$(suite_python "$home" "$tool/benches/suite/requirements.txt" python3) || infra "no Python for the suite"
 py=${pybin%/*}
 export PATH="$pybin:$PATH"
 # The console's Node (scripts/lib/gate-node.sh), first on PATH, where the push changes the console:
 # its step runs with the pinned build, never the host's.
 node=""
-if grep -q '^apps/nrese-console/' "$files"; then
+if [ "$mode" = push ] && grep -q '^apps/nrese-console/' "$files"; then
   # shellcheck source=gate-node.sh
   . "$tool/scripts/lib/gate-node.sh"
   nodebin=$(gate_node "$cache" "$tool/scripts/lib/gate-tools.txt") || infra "no Node for the console"
@@ -148,17 +182,18 @@ identity=$(gate_identity HEAD) || infra "no rustc"
 # freshness by mtimes, so a build from another checkout in it (/verify's, which wrote
 # target-<release> until 26 Oct 2026) could stand in for the tree's own code.
 release=$(rustc -vV | sed -n 's/^release: //p')
-export CARGO_TARGET_DIR="$cache/target-gate-$release"
+export CARGO_TARGET_DIR="$home/target-$tag-$release"
 export NRESE_TARGET_BUDGET_GB=${NRESE_GATE_BUDGET_GB:-40}
 used=("$CARGO_TARGET_DIR" "$py" ${node:+"$node"})
 for entry in "${used[@]}"; do mkdir -p "$entry" && echo "$EPOCHSECONDS" > "$entry/.last-used"; done
 # bin-* after 7 days unused, target-*, py-* and node-* after 14, then the least recently used until the
-# root fits NRESE_HOST_CACHE_GB; never what this run used (nor wt, bin, rustup, cargo). Miri's
-# build in the worktree (wt/target) is an entry too.
+# root fits NRESE_HOST_CACHE_GB; never what this run used (nor wt, bin, rustup, cargo, tools). Miri's
+# build in the worktree (wt/target) is an entry too. This mode's entries only (push's at the root,
+# quick's in quick/), under its lock; the whole cache counts against the budget.
 sweep() {
-  GATE_KEEP=$(IFS=:; echo "${used[*]}") python3 - "$cache" "${NRESE_HOST_CACHE_GB:-40}" << 'EOF'
+  GATE_KEEP=$(IFS=:; echo "${used[*]}") python3 - "$cache" "$home" "${NRESE_HOST_CACHE_GB:-40}" << 'EOF'
 import glob, os, shutil, sys, time
-cache, budget, now = sys.argv[1], float(sys.argv[2]) * 2**30, time.time()
+cache, home, budget, now = sys.argv[1], sys.argv[2], float(sys.argv[3]) * 2**30, time.time()
 keep = set(os.environ["GATE_KEEP"].split(":"))
 def size(path):
     seen, total = set(), 0
@@ -177,8 +212,8 @@ def used(path):
         return float(open(os.path.join(path, ".last-used")).read())
     except (OSError, ValueError):
         return os.stat(path).st_mtime
-candidates = [p for pattern in ("bin-*", "target-*", "py-*", "node-*") for p in glob.glob(os.path.join(cache, pattern))]
-candidates.append(os.path.join(cache, "wt", "target"))
+candidates = [p for pattern in ("bin-*", "target-*", "py-*", "node-*") for p in glob.glob(os.path.join(home, pattern))]
+candidates.append(os.path.join(home, "wt", "target"))
 entries = sorted((p for p in candidates if os.path.isdir(p) and p not in keep), key=used)
 total = size(cache)
 for path in entries:
@@ -206,7 +241,7 @@ done
 [ -r "$cgroup/memory.peak" ] && peak=$(cat "$cgroup/memory.peak")
 
 GATE_TIER=$mode GATE_TREE=$tree GATE_LIST=$list_hash GATE_IDENTITY=$identity GATE_CODE=$code \
-  GATE_CPU=$(gate_cpu) GATE_HOST=$(hostname) GATE_NEXTEST=$(cargo nextest --version 2> /dev/null | head -1) \
+  GATE_CPU=$(gate_cpu) GATE_HOST=$(hostname) GATE_NEXTEST=$(printf '%s\n' "$runner" | head -1) \
   GATE_CHANGED=$(git status --porcelain --untracked-files=no) GATE_SECONDS=$((SECONDS - began)) GATE_PEAK=$peak \
   GATE_JOB=${FLEET_JOB:-} GATE_FLEET_HOST=${FLEET_HOST:-} GATE_ATTEMPT=$attempt \
   python3 "$tool/scripts/lib/gate-record.py" "$out"

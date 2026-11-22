@@ -16,9 +16,10 @@ use super::{ask, insert, pipeline, update};
 /// the ontology off the RL route, to the bounds.
 const OUTSIDE_RL: &str = ":Pet rdfs:subClassOf [ owl:unionOf ( :Dog :Cat ) ] . :tib a :Pet .";
 
-/// The fingerprint of `owl2-rl`'s program, as its stores record it. Another value rebuilds
-/// every `owl2-rl` store's closure at its next start.
-const OWL2_RL_FINGERPRINT: &str = "03379726e5ada85b";
+/// Under reasoning-semantics.md, Freshness, version 7 and the new seeds change the
+/// `owl2-rl` program fingerprint, so stores rebuild once at their next start; so does the
+/// empty-`owl:Thing` check (`cls-thing-empty`) in the rule text.
+const OWL2_RL_FINGERPRINT: &str = "d21b78c6c05606e7";
 
 /// An object key over `z`, `:a` and `:b` sharing it as value, and `more`.
 fn object_key(z: &str, more: &str) -> String {
@@ -390,7 +391,7 @@ fn a_key_over_a_chain_implied_value_refuses_an_inconsistent_write() {
 
 /// Under `owl2-rl` the key rule (prp-key, OWL 2 Profiles §4.3, Table 5) has no condition on
 /// the value: `_:z` binds `:a` and `:b`, and `:a a :D` holds. The named-only keys are
-/// `owl2-dl`'s; `owl2-rl`'s program keeps the fingerprint its stores were written with.
+/// `owl2-dl`'s. The fingerprint is stable within the current `owl2-rl` semantics.
 #[test]
 fn owl2_rl_keeps_its_key_rule_and_its_fingerprint() {
     let rl = ReasonerConfig::for_mode(ReasoningMode::Owl2Rl);

@@ -95,6 +95,9 @@ pub enum StoreError {
         #[source]
         reason: std::io::Error,
     },
+    /// The quarantine record could not be kept and the load published no changes.
+    #[error("i/o error: {0}")]
+    LoadQuarantineNotRecorded(#[source] std::io::Error),
     /// A classification or realisation request gave up waiting for the computation under
     /// way for its revision, which runs on and is kept.
     #[error("the classification request was cancelled while it waited")]
@@ -121,13 +124,14 @@ pub enum StoreError {
     #[error(transparent)]
     Forbidden(#[from] Refusal),
     /// A query's memory refusal as a reader of some graphs is told it
-    /// (`Self::without_amounts`): the limit, not the bytes held and asked for.
+    /// (`Self::without_amounts`): the limit, not the bytes held and asked for. Its view's
+    /// refusal, no limit either (`None`, `shared`: `crate::support::Reading::committed`).
     #[error(
-        "{}: limit {} (what the query held and asked for is not reported to a reader of some graphs)",
+        "{}{} (what the query held and asked for is not reported to a reader of some graphs)",
         memory_refusal(.shared),
-        nrese_exec::limit_text(*.limit)
+        limit_told(.limit)
     )]
-    MemoryLimitWithoutAmounts { limit: usize, shared: bool },
+    MemoryLimitWithoutAmounts { limit: Option<usize>, shared: bool },
     /// A reader of some graphs who sees inferences, refused while nothing vouches that the
     /// inferred statements are the closure of the rules in place: until the store is
     /// rematerialised, which a read replica isn't (`replica`).
@@ -194,8 +198,14 @@ impl StoreError {
                 .into();
             }
             Some(QueryEvaluationError::MemoryLimit(exceeded)) => {
-                Some((exceeded.limit, exceeded.shared))
+                Some((Some(exceeded.limit), exceeded.shared))
             }
+            // A view's refusal, which an update's `WHERE` carries as its dataset's failure
+            // (`crate::support::as_evaluation`): told as it is.
+            Some(QueryEvaluationError::Dataset(error)) => match error.downcast_ref::<Self>() {
+                Some(&Self::MemoryLimitWithoutAmounts { limit, shared }) => Some((limit, shared)),
+                _ => None,
+            },
             _ => None,
         };
         match refused {
@@ -271,13 +281,15 @@ impl StoreError {
             Self::SparqlSyntax(_)
             | Self::SparqlUpdate(_)
             | Self::InvalidGraphIri(_)
-            | Self::RdfParse(_)
+            | Self::RdfParse(RdfParseError::Syntax(_))
             | Self::ShaclShapes(_)
             | Self::Forbidden(_)
             | Self::Quarantine(_)
-            | Self::FileParse { .. } => true,
+            | Self::FileParse { source: RdfParseError::Syntax(_), .. } => true,
             Self::SparqlEvaluation(_) => unreachable!("classified above"),
             Self::Configuration(_)
+            | Self::RdfParse(RdfParseError::Io(_))
+            | Self::FileParse { source: RdfParseError::Io(_), .. }
             | Self::Io(_)
             | Self::Engine(_)
             | Self::OntologyFileNotFound { .. }
@@ -288,6 +300,7 @@ impl StoreError {
             | Self::MemoryLimitWithoutAmounts { .. }
             | Self::LoadCancelled
             | Self::LoadPublished { .. }
+            | Self::LoadQuarantineNotRecorded(_)
             | Self::Undecided(_)
             | Self::ClassificationCancelled
             | Self::NotRematerialised { .. }
@@ -308,6 +321,14 @@ fn memory_refusal(shared: &bool) -> &'static str {
     }
 }
 
+/// A memory refusal's limit as a reader of some graphs is told it, after its class; none
+/// where the class alone is told.
+fn limit_told(limit: &Option<usize>) -> String {
+    limit.map_or_else(String::new, |limit| {
+        format!(": limit {}", nrese_exec::limit_text(limit))
+    })
+}
+
 /// What a refusal before rematerialisation says, on a primary and on a read replica.
 fn not_rematerialised(replica: &bool) -> &'static str {
     match replica {
@@ -324,6 +345,25 @@ mod tests {
     use nrese_sparql::UpdateError;
 
     use super::*;
+
+    // Spec R2: a parser's I/O failure is a server error, including for a staged upload.
+    #[test]
+    fn parser_io_is_not_a_request_error() {
+        let io = || RdfParseError::Io(std::io::Error::other("simulated failure reading RDF"));
+        let errors = [
+            StoreError::FileParse {
+                path: PathBuf::from("upload.jsonld"),
+                source: io(),
+            },
+            StoreError::RdfParse(io()),
+        ];
+        for error in errors {
+            assert!(
+                !error.is_request_error(),
+                "parser I/O was misclassified: {error}"
+            );
+        }
+    }
 
     #[test]
     fn an_update_s_evaluation_error_is_classified_as_a_query_s() {

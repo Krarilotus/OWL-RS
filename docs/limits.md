@@ -72,17 +72,25 @@ come with. What is in is on
   emptied graph answers 404 ([Graph Store Protocol](ops/http-api.md#graph-store-protocol)).
   Read that 404 as an empty graph.
 - A reader of only some graphs gets no plan steps in `EXPLAIN`.
-- A value drawn at each evaluation (`RAND()`, `UUID()`, `STRUUID()`, `BNODE()`) is drawn once
-  per solution of its group, as SPARQL says, except where the engine shares one evaluation
-  between rows or repeats it: in an `EXISTS` (once per distinct value it reads, not once per
-  row), a `LATERAL`, a property path, a group beside a vector search probed first, a
-  `SERVICE` call sent in batches, and an `AVG` over a drawn value.
-- A group that draws such a value is evaluated from the distinct values of the rows joined
-  to it, not from the rows themselves, which costs a little more than a group that draws
-  nothing. Where those rows share no variable the group binds in every solution, or leave
-  such a variable unbound in a row, the group is evaluated alone and then joined: a
-  `FILTER(RAND() < …)` over a `UNION` in which only some arms bind the joined variable reads
-  all of those arms' data, not only the rows' values.
+- A part of a query that draws a value at each evaluation (`RAND()`, `UUID()`, `STRUUID()`,
+  `BNODE()`) is evaluated as follows, and gives up some faster plans for it, so it costs more
+  than one that draws nothing:
+  - an `EXISTS` that draws is evaluated once per tested row, and in an `OPTIONAL`'s condition
+    once per compatible pair: its cost grows with the rows, not with their distinct values;
+  - a `LATERAL` right side that draws is evaluated once per left row;
+  - a `SERVICE` pattern that draws is sent once per endpoint it resolves to, per evaluation of
+    the `SERVICE`, without the joined rows' values, and joined here;
+  - a group that draws, beside a vector search, is evaluated first: the search doesn't go
+    first. Where every row of the group binds the matched vector, the search ranks only those
+    vectors; otherwise it ranks every vector of the active graph;
+  - a `GROUP BY` with an `AVG` over a drawn value is never computed in parts: where its rows
+    don't fit the query's memory, the query is refused.
+- In a plan that passes rows sideways into a group, a group that draws is evaluated from the
+  distinct values of the rows joined to it, not from the rows themselves, which costs a little
+  more than a group that draws nothing. Where those rows share no variable the group binds in
+  every solution, or leave such a variable unbound in a row, the group is evaluated alone and
+  then joined: a `FILTER(RAND() < …)` over a `UNION` in which only some arms bind the joined
+  variable reads all of those arms' data, not only the rows' values.
   The answer is right, but slower, or refused under a tight memory budget.
 - Directional strings in the data alone don't make a result announce RDF 1.2, but a query that
   makes or matches them, or triple terms, does ([announcing](ops/http-api.md#requests-in-detail)).
@@ -119,30 +127,25 @@ leave something out.
   [modes](spec/reasoning-semantics.md#modes)).
 - `owl2-rl` doesn't infer `x owl:sameAs x` for every term, so `?x owl:sameAs ?x` doesn't
   return one for each, though an asserted one is returned. It checks the datatype rules in part,
-  and of the axiomatic triples it holds only `dt-type1`'s 32 datatype statements
-  (`rdf:PlainLiteral rdf:type rdfs:Datatype` and the like;
-  [when](spec/reasoning-semantics.md#omitted-and-what-that-means)). It doesn't type a literal by its own datatype (`dt-type2`), nor do `owl-horst` and
+  and seeds the closure with `dt-type1`'s 32 datatype declarations (`rdf:PlainLiteral rdf:type rdfs:Datatype` and the like),
+  the annotation property declarations from `prp-ap`, and the class declarations from `cls-thing` and `cls-nothing1`
+  (see [when these seeds are published](spec/reasoning-semantics.md#omitted-and-what-that-means)).
+  It doesn't type a literal by its own datatype (`dt-type2`), nor do `owl-horst` and
   `rdfs-plus`: without a range, `∃:p.xsd:integer ⊑ :C` and `:a :p 5` give no `:a a :C`, even in
   one commit, where `owl2-dl` gives it
   ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)).
-  Lists past their limits (a property chain of more than 250 properties, a key of more than
-  127, an intersection of more than 256 classes; for more than 64 member sequences,
-  [below](#a-list-past-the-cap)) aren't used
-  at all, never truncated, and each is reported in the log and the reasoning diagnostics;
-  while one is left out, no answer that reads the inferences is `complete`
-  ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)); none known beyond
-  keeping lists within those limits. Where the list of an axiom has a cycle, or a branch that
-  ends in a cell without `rdf:first` or `rdf:rest`, the whole axiom is left out, though OWL 2
-  RL's rules apply along every well-formed path through the list. A cyclic list is left out as a
-  whole, so a row only one of its paths entails is not inferred, and a read over the inferences
-  isn't `complete`; a violation only one of its paths entails is missed too, and the store can
-  report itself consistent over it. `owl:sameAs` between a list's cells makes the list cyclic
-  too: under `owl2-rl`, a property chain whose second cell is stated equal to its first is left
-  out as a whole, so the chain as written isn't applied, where the earlier `main` applies it.
-  An intersection of more than 256 classes is too long for the
-  rule format and is left out the same way (`list-too-long`): it gives no rules, a read over the
-  inferences isn't `complete`, and writes that leave it so stay incremental. A write after which
-  an axiom's list is read otherwise (left out where it was read, read where it was left out, or
+  The reader uses well-formed walks to `rdf:nil`. It ignores branches that cannot reach
+  `rdf:nil`, including loops with no exit to it. If the part that reaches `rdf:nil` contains a
+  cycle, including one created by `owl:sameAs`, the reader falls back to stopping at its
+  first visit to `rdf:nil` and reports the cycle. A row or clash
+  that needs an omitted walk can still be missed.
+  A walk past its limit (a chain of more than 250 properties, a key of more than 127, or an
+  intersection of more than 256 classes) is left out. Other walks that fit still give rules.
+  A list with more than 64 walks is handled [below](#a-list-past-the-cap). These limits are
+  reported in the log and reasoning diagnostics. While a list read is incomplete, an answer
+  that reads the inferences isn't `complete`
+  ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)).
+  A write after which an axiom's list is read otherwise (left out where it was read, read where it was left out, or
   left out for another reason) is rebuilt after its incremental maintenance
   ([list limits](spec/reasoning-semantics.md#list-limits)): such a write is rematerialised, and
   other writes stay incremental. For example, on one 32-core machine and a store of 2.8 million
@@ -152,6 +155,16 @@ leave something out.
   `rdf:rest` per cell, ending in `rdf:nil`, has no cycle or branch. Literals aren't
   equated by value (`"1"^^xsd:integer` and `"01"^^xsd:integer` stay two terms): compare
   values in a `FILTER` (`?v = 1`), which SPARQL does by value. Otherwise none known.
+- Under `owl2-rl` with the QL rewriting on, over a store holding a list axiom whose one walk
+  is past the [list limits](spec/reasoning-semantics.md#list-limits) (a chain of more than 250
+  properties, a key of more than 127, an intersection of more than 256 classes), so that the
+  rules leave it out, v1.5.0 tells a committed read under
+  `NOT EXISTS`, `MINUS`, `OPTIONAL` or another operator
+  [the rule](spec/reasoning-semantics.md#what-may-be-complete) names, whose QL report would
+  otherwise be `complete`, `sound-only` in its status, its plan's status and EXPLAIN's
+  `completeness`, and `complete` in its QL report (`ql`: the run's, the plan's and EXPLAIN's)
+  and in the printed query's status, where each should be `unsound`: it can return a row that
+  the left-out axiom's conclusions would remove. From v1.5.1 all of them say `unsound`.
 - Without the OWL 2 QL rewriting, every answer over a
   ruleset's closure is `sound-only`. The rewriting runs by default under `owl2-ql` only;
   under `owl2-rl`, `reasoner.ql_rewriting = "on"` checks each query as under `owl2-ql`.
@@ -329,6 +342,14 @@ leave something out.
   ([`owl2-dl`](spec/reasoning-semantics.md#owl2-dl-owl-2-dl-answers-with-their-completeness)).
   Remove such axioms, give the individual its own IRI, or use `owl2-rl`, whose promise
   is the rules' reading.
+- Under `owl2-dl`, a name used as two kinds OWL 2 DL keeps apart (an object and a data
+  property, either and an annotation property, a class and a datatype) leaves the rules-only
+  route where an axiom other than an assertion names it: every answer is `unsound` and the
+  consistency `unknown`. So does a structure no axiom uses that the rules may read more of
+  (a blank node with two forms, a negative assertion's statements without its type, or one
+  that is also an individual): every answer is `unsound`, the consistency decided. A name
+  only assertions use as two kinds (`dc:creator "N"` beside `dc:creator :n`) keeps the route.
+  Declare each name as one kind, or remove the unused structure.
 - Under `owl2-dl`, where the OWL 2 RL rules find a clash in such an ontology, this release
   doesn't decide whether the data is consistent under OWL 2 DL: the commit is refused,
   saying so, and data loaded with such a clash is `undecided` and quarantined, with the
@@ -337,8 +358,9 @@ leave something out.
   verdict at a query doesn't change readiness. In quarantine, each commit rebuilds the
   inferences in full, and under `owl2-dl` reads the asserted ontology once more to tell
   `undecided` from `inconsistent`. Remove the statements behind the clash, remove the
-  annotation property's domain, range, super-property or sub-property or the empty list, or give
-  the individual its own IRI. Under `owl2-rl`, which takes the rules' reading, the clash is an inconsistency.
+  annotation property's domain, range, super-property or sub-property or the empty list, give
+  the individual its own IRI, remove the unused structure, or declare each name as one kind.
+  Under `owl2-rl`, which takes the rules' reading, the clash is an inconsistency.
 - On a store in quarantine, a commit can be refused as introducing a violation that was
   already there, though a full rebuild finds the same violation after it (under `owl2-rl`, for
   one): a commit that deletes a statement the remaining statements still entail, that deletes a
@@ -536,12 +558,12 @@ leave something out.
   inferred ones, which are in the default graph. Under `owl2-rl` its status is `sound-only`
   with the reason of a read over the closure, which doesn't say that the inferred statements
   are outside its dataset. For what follows from those graphs, add `inference-scope=dataset`.
-- <a id="a-list-past-the-cap"></a>A list axiom whose members' `owl:sameAs` aliases give it more
-  than 64 member sequences is reported (`too-many-list-variants`). The clash checks of such an
+- <a id="a-list-past-the-cap"></a>A list axiom with more than 64 walks to `rdf:nil` is reported
+  (`too-many-list-variants`). Walks with identical member sequences count separately. The clash checks of such an
   `owl:AllDifferent`, `owl:AllDisjointClasses` or `owl:AllDisjointProperties` list are made from
   the list as written. A write that leaves the store holding such a list, one it held already or
   one the write brings, is rebuilt after its incremental check, and the rebuild makes what the
-  list gives while its cells give it at most 64 sequences
+  list gives while its cells give it at most 64 walks
   ([list limits](spec/reasoning-semantics.md#list-limits)). A write that deletes nothing is
   refused if either check refuses it; a write that deletes is judged by the rebuild alone. Such a
   write is rematerialised. For example, on one 12-core machine and a store of 2.8 million stated
@@ -624,15 +646,23 @@ leave something out.
   part has no stated bound in this release.
 - Near the memory limit, a cached decoding can cause a refusal while memory the cache could give back is still
   held. The output is never wrong.
+- A published snapshot's `owl:sameAs` classes are built by the first query that needs them, charged to its memory.
+  Where they don't fit, that query runs without them and nothing is kept, until a query with room builds them: the
+  answer is the same, only slower. Earlier versions built them in the first query whatever its budget.
 - A cancel, a deadline or a refusal takes effect at the work's next poll, which bounds work, not time. Under
   nested reads in reasoning, more work runs between two polls ([the bound](architecture/contracts.md#cancellation)).
-  A stop never gives a partial or wrong answer.
+  A stop never gives a wrong answer. A query whose time limit runs out before its output begins gets `408`; one
+  whose limit runs out after the server began sending its output keeps the `200` and the `NRESE-Completeness`
+  header already sent, and its body is cut: on HTTP/1.1 the chunked body never gets its last chunk. Treat a body without its end as no answer, whatever its status and header say.
 - Some phases run to their end after a stop: the executor's selection and sorting (seconds at 10 M rows on a term
   key), one call of a regular expression (seconds for adversarial megabyte literals), and the graph kernel's
   sorts and set-up arrays.
 
 ## Storage and transactions
 
+- If the background maintenance worker stops, the `degraded` list in detailed health and info
+  reports where it stopped, and new commits grow the write-ahead log and uncompacted run stacks
+  until restart, slowing reads and increasing index memory.
 - A commit holds at most 4 GiB of log payload, about 130 M quads.
   Larger loads go through the bulk loader
   ([storage](spec/02-storage-and-transactions.md#limits)).

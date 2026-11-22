@@ -130,10 +130,15 @@ impl Dl {
     /// Why `owl2-dl` wouldn't decide the OWL 2 RL rules' violations in `snapshot`, where it
     /// wouldn't: one read of its asserted ontology, charged to the bounds' budget. A read
     /// refused there leaves it undecided too, and says so.
-    pub(crate) fn undecided(&self, snapshot: &nrese_engine::Snapshot) -> Option<WhyUndecided> {
+    pub(crate) fn undecided(
+        &self,
+        snapshot: &nrese_engine::Snapshot,
+        treatments: &nrese_owl::Treatments,
+    ) -> Option<WhyUndecided> {
         why(source::read_snapshot(
             snapshot,
             std::sync::Arc::clone(self.bounds.kept()),
+            treatments,
         ))
     }
 
@@ -144,6 +149,7 @@ impl Dl {
         &self,
         tx: &nrese_engine::Transaction<'_>,
         lists_left_out: bool,
+        treatments: &nrese_owl::Treatments,
     ) -> Option<WhyUndecided> {
         if self.bounds.keeps_route(tx, lists_left_out) {
             return None;
@@ -151,15 +157,20 @@ impl Dl {
         why(source::read_pending(
             tx,
             std::sync::Arc::clone(self.bounds.kept()),
+            treatments,
         ))
     }
 }
 
+/// Why the rules' clash in the data `read` is no verdict of OWL 2 DL's: they read it otherwise
+/// ([`nrese_owl::profile::rules_read_differently`]), or the reader left out a part whose
+/// statements they still read ([`nrese_owl::Diagnostic::leaves_out`]), from which their clash
+/// may come.
 fn why<E>(read: Result<nrese_owl::Ontology, E>) -> Option<WhyUndecided> {
     match read {
-        Ok(o) => {
-            nrese_owl::profile::rules_read_differently(&o).then_some(WhyUndecided::ReadsDifferently)
-        }
+        Ok(o) => (nrese_owl::profile::rules_read_differently(&o)
+            || o.diagnostics.iter().any(nrese_owl::Diagnostic::leaves_out))
+        .then_some(WhyUndecided::ReadsDifferently),
         Err(_) => Some(WhyUndecided::Unchecked),
     }
 }

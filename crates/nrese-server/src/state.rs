@@ -36,7 +36,6 @@ struct Shared {
     deployment_posture: DeploymentPosture,
     rate_limiter: Arc<RateLimiter>,
     request_metrics: Arc<RequestMetrics>,
-    repositories: Arc<Catalog>,
     /// Users, workspaces and graph policies ([`crate::access`]), server-wide.
     access: Arc<nrese_store::access::AccessControl>,
     /// Long operations (imports) running or finished ([`nrese_store::jobs`]).
@@ -47,6 +46,13 @@ struct Shared {
     /// ([`nrese_store::StoreService::unavailable`]): read on every request
     /// ([`crate::app`]'s `screen`), one atomic load.
     default_unavailable: Arc<std::sync::OnceLock<String>>,
+    /// The repositories, the served default one's store among them. Last, so dropped last:
+    /// the system store (`access`, and with it the access state) is released before the
+    /// served default store, and a caller that waits until its own handle of the served store
+    /// is the only one finds the system store's directory free
+    /// (`tests/it/state_release_tests.rs`). Named repositories' stores are not covered: the
+    /// catalog releases the default repository before them.
+    repositories: Arc<Catalog>,
 }
 
 /// What a repository that didn't open at start ([`Catalog::unavailable`]) answers to all
@@ -171,8 +177,13 @@ impl AppState {
             .split_once(':')
             .ok_or_else(|| ApiError::unauthorized("malformed Basic credentials"))?;
         let (user, password) = (user.to_owned(), password.to_owned());
-        let access = Arc::clone(&self.shared.access);
-        let principal = tokio::task::spawn_blocking(move || access.login(&user, &password, client))
+        // The shared state, not the access control alone: a login its client abandoned keeps
+        // the access control and the catalog together, so the system store still goes before
+        // the served store ([`Shared`]). It can delay the catalog's release until its blocking
+        // work ends, as it delays the access control's.
+        let shared = Arc::clone(&self.shared);
+        let login = move || shared.access.login(&user, &password, client);
+        let principal = tokio::task::spawn_blocking(login)
             .await
             .map_err(|error| ApiError::internal(error.to_string()))?;
         match principal {
@@ -234,8 +245,7 @@ impl AppState {
         self.shared.default_unavailable.get().map(String::as_str)
     }
 
-    /// The repositories that can't serve: `id: unavailable` each, the default first (for
-    /// `/readyz`, which stays ready for the others).
+    /// Detailed health diagnostics for unavailable repositories and stopped maintenance workers.
     pub fn degraded(&self) -> Vec<String> {
         self.default_unavailable()
             .map(|_| DEFAULT_REPOSITORY.to_owned())
@@ -248,6 +258,19 @@ impl AppState {
                     .map(|(id, _)| id),
             )
             .map(|id| format!("{id}: unavailable"))
+            .chain(
+                self.shared
+                    .repositories
+                    .maintenance_errors()
+                    .into_iter()
+                    .map(|(id, error)| format!("{id}: {error}")),
+            )
+            .chain(
+                self.shared
+                    .access
+                    .maintenance_error()
+                    .map(|error| format!("system (access): {error}")),
+            )
             .collect()
     }
 
