@@ -176,7 +176,8 @@ gate_covering() {
       !($0 in held) { missing = 1; exit } { delete held[$0] }
       END { if (missing) exit 1; for (f in held) print f }' - pushed=1 "$list") || continue
     extra=()
-    [ -z "$beyond" ] || mapfile -t extra <<< "$beyond"
+    # A process substitution, not a here-string: Git Bash never returns from one of about 64 KiB.
+    [ -z "$beyond" ] || mapfile -t extra < <(printf '%s\n' "$beyond")
     "$accepts" "${extra[@]}" || continue
     printf '%s\n' "$where"
     return 0

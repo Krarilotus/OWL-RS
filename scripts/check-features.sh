@@ -12,9 +12,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && { pwd -W 2>/dev/null || pwd; })"
 tree=$(cargo tree --locked --manifest-path "$ROOT/Cargo.toml" -p nrese-server -e normal,features \
   --target all --prefix none)
-if grep -qE 'fault-points|witness' <<<"$tree"; then
+# Through a pipe with its reader, never a here-string: Git Bash never returns from a here-string
+# of about 64 KiB (65,536 to 65,600 bytes), and this runs in the commit hook. grep reads all of it
+# (no -q), so under pipefail an early exit can't fail the printf; its own 2 is an error.
+found=$(printf '%s\n' "$tree" | grep -E 'fault-points|witness') || [ $? -eq 1 ] ||
+  { echo "could not read the server's dependency tree for test-only features" >&2; exit 2; }
+if [ -n "$found" ]; then
   echo "the server's normal build has a test-only feature of nrese-engine (fault-points, witness):" >&2
-  grep -E 'fault-points|witness' <<<"$tree" | sort -u >&2
+  printf '%s\n' "$found" | sort -u >&2
   exit 1
 fi
 echo "no test-only feature in the server's normal build"
