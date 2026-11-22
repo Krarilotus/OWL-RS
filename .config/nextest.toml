@@ -1,0 +1,11 @@
+# cargo-nextest's configuration. The default profile is nextest's own. `nightly` is the nightly tier's
+# (scripts/check.sh nightly): no retries and no fail-fast, so every failing test is named once, and a
+# JUnit report of each run (the workspace's target/nextest/nightly/junit.xml, whatever CARGO_TARGET_DIR
+# says), which the tier's receipt reads
+# (scripts/lib/nightly-receipt.py).
+[profile.nightly]
+retries = 0
+fail-fast = false
+
+[profile.nightly.junit]
+path = "junit.xml"

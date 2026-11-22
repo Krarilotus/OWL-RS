@@ -44,7 +44,7 @@ COPIED = (".githooks/pre-push", "scripts/check.sh", "scripts/cargo-guarded.sh", 
           "scripts/lib/gate-publish.sh", "rust-toolchain.toml",
           "scripts/lib/gate-record.py", "scripts/lib/windows-job.ps1", "scripts/lib/windows-job.sh",
           "scripts/lib/suite-python.sh", "scripts/lib/gate-node.sh", "scripts/lib/gate-nextest.sh", *isolation.NS_SH,
-          "benches/suite/requirements.txt", "scripts/lib/gate-job.sh")
+          "benches/suite/requirements.txt", "scripts/lib/gate-job.sh", "scripts/lib/private_terms.py")
 # A stand-in for the fleet's CLI: each submit keeps its job file; status, results and cancel as told.
 FLEET = """#!/bin/sh
 answer() {
@@ -252,6 +252,24 @@ class PushGate(Repo):
                     self.assertIn("rustc-1.99.0-", own)
                 self.git(self.repo, "checkout", "-q", "--detach", tip)
                 previous = own
+
+    def test_a_private_host_name_stops_the_push_before_the_fleet(self):
+        # Spec (22 Nov: the private-terms rule, scripts/check.sh private_terms, read on the pusher's machine
+        # before the fleet's tier): a private host name in a pushed commit's message stops the push, no job sent.
+        overlay = self.root / "overlay"
+        overlay.mkdir()
+        (overlay / "hosts.toml").write_text('[host.zzkeyzz]\nhostname = "zznamezz"\n', newline="\n")
+        self.env["NRESE_BENCH_PRIVATE"] = overlay.as_posix()
+        (self.repo / "a.txt").write_text("changed\n", newline="\n")
+        self.git(self.repo, "commit", "-q", "-am", "runs on zznamezz")
+        tip = self.git(self.repo, "rev-parse", "HEAD")
+        self.fleet("pending")  # a job that is sent is refused at once: no verdict
+        done = self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", ZERO))
+        self.assertEqual(sorted(self.fake.glob("job-*.toml")), [],
+                         f"SPEC push-private-terms: no job is sent:\n{done.stdout}{done.stderr}")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("message matches", done.stdout)
+        self.assertNotIn("zznamezz", done.stdout + done.stderr)
 
     def test_fake_submit_refuses_a_job_it_cannot_copy(self):
         # Spec: D16-150: the fleet fake cannot acknowledge a submission it lost.
