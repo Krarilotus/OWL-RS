@@ -605,6 +605,18 @@ fn bulk_load(store: &StoreService, load: LoadCommand) -> Result<()> {
     if std::env::var_os("NRESE_TEST_FAIL_QUARANTINE_COMMIT").is_some() {
         store.quarantine().fail_next_commit();
     }
+    // The load's quarantine file is placed and its directory's sync fails.
+    #[cfg(feature = "fault-points")]
+    if std::env::var_os("NRESE_TEST_FAIL_QUARANTINE_SYNC").is_some() {
+        store.quarantine().fail_next_placement_sync();
+    }
+    // The load's quarantine file is placed, its directory's sync fails, and so does taking
+    // the file back.
+    #[cfg(feature = "fault-points")]
+    if std::env::var_os("NRESE_TEST_FAIL_QUARANTINE_REMOVAL").is_some() {
+        store.quarantine().fail_next_placement_sync();
+        store.quarantine().fail_next_record_removal();
+    }
     let request = BulkLoadRequest {
         files: load.files,
         replace: load.replace,
@@ -615,8 +627,13 @@ fn bulk_load(store: &StoreService, load: LoadCommand) -> Result<()> {
     };
     let report = store.bulk_load(&request).map_err(|error| match error {
         nrese_store::StoreError::LoadPublished { revision, reason } => anyhow::anyhow!(
-            "the load completed at published revision {revision}. Its quarantine record couldn't be kept: {reason}. Don't load it again."
+            "the load completed at published revision {revision}. Its quarantine record couldn't be kept: {reason}.{} Don't load it again.",
+            reason.published_note()
         ),
+        nrese_store::StoreError::LoadQuarantineNotRecorded(error) => {
+            let data_dir = &store.config().data_dir;
+            anyhow::Error::msg(error.unpublished_message("load", Some(data_dir)))
+        }
         error => anyhow::Error::new(error).context("bulk load failed"),
     })?;
     let seconds = report.elapsed.as_secs_f64();

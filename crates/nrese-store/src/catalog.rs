@@ -562,6 +562,12 @@ impl Catalog {
         &self.default
     }
 
+    /// The server's data directory: the default repository's, the others' under
+    /// `repositories/` in it.
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.template.data_dir
+    }
+
     /// Opens (or creates) repository `id`'s store and brings its inferences in line with
     /// its reasoning, as the server does for the default store at start.
     fn start(&self, id: &str, settings: RepositorySettings) -> Result<Repository, String> {
