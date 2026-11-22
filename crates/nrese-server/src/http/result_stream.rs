@@ -998,12 +998,19 @@ mod tests {
         assert_eq!(memory.used(), 0);
     }
 
+    /// Work of a query's that fits a 1 MiB limit alone, but not beside two chunks held.
+    const WORK: usize = (1 << 20) - CHUNK_BYTES;
+
     /// Over HTTP/1.0, the answer held by a producer whose own work (a query's) draws on the
-    /// same envelope as the hold, and which is refused there after writing `CHUNK_BYTES * 2`
-    /// and ending with what its refusal is mapped to (`stopped`): the response; the envelope
-    /// is checked to hold nothing after it.
-    async fn refused_beside_its_held_answer(memory: Envelope, stopped: ApiError) -> Response {
-        let work = memory.clone();
+    /// same envelope as the hold: it writes `CHUNK_BYTES * 2`, waits until the hold holds
+    /// them, charges `work` there, which must be refused, and ends with what its refusal is
+    /// mapped to (`stopped`). The response; the envelope is checked to hold nothing after it.
+    async fn refused_beside_its_held_answer(
+        memory: Envelope,
+        work: usize,
+        stopped: ApiError,
+    ) -> Response {
+        let charged = memory.clone();
         let held = memory.clone();
         let answer = WHOLE
             .scope(
@@ -1020,13 +1027,13 @@ mod tests {
                             .map_err(|error| ApiError::internal(error.to_string()))?;
                         // Its work grows once the hold holds what it wrote, and is refused.
                         for _ in 0..60_000 {
-                            if work.used() >= 2 * CHUNK_BYTES {
+                            if charged.used() >= 2 * CHUNK_BYTES {
                                 break;
                             }
                             std::thread::sleep(Duration::from_millis(1));
                         }
-                        let part = work.part();
-                        assert!(part.charge(2 << 20).is_err(), "its work fits after all");
+                        let part = charged.part();
+                        assert!(part.charge(work).is_err(), "its work fits after all");
                         Err(stopped)
                     },
                 ),
@@ -1048,6 +1055,7 @@ mod tests {
     async fn a_producers_work_refused_beside_its_held_answer_is_the_answers_refusal() {
         let own = refused_beside_its_held_answer(
             Envelope::new(Some(1 << 20), None),
+            WORK,
             ApiError::payload_too_large("the query's own (budgets.query_memory)"),
         )
         .await;
@@ -1064,6 +1072,7 @@ mod tests {
 
         let shared = refused_beside_its_held_answer(
             Envelope::new(Some(1 << 30), Some(nrese_exec::SharedBudget::new(1 << 20))),
+            WORK,
             ApiError::unavailable("the query's own (budgets.total_query_memory)"),
         )
         .await;
@@ -1072,6 +1081,49 @@ mod tests {
             shared.headers().get(header::RETRY_AFTER),
             Some(&HeaderValue::from_static("1"))
         );
+    }
+
+    /// Over HTTP/1.0, a producer's work refused before any of its answer was held keeps its
+    /// own refusal, though the hold holds the answer it wrote after it by the end: that
+    /// refusal was the work's alone, the client's to change (the query's own 413).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_producers_work_refused_before_its_answer_is_held_keeps_its_own_refusal() {
+        let memory = Envelope::new(Some(1 << 20), None);
+        let charged = memory.clone();
+        let held = memory.clone();
+        let answer = WHOLE
+            .scope(
+                true,
+                stream_blocking(
+                    Pace::Total(Instant::now() + Duration::from_secs(120)),
+                    CancellationToken::new(),
+                    move || held,
+                    "text/plain",
+                    "timeout",
+                    move |writer| {
+                        // Refused with nothing held, then it writes what it had.
+                        let part = charged.part();
+                        assert!(part.charge(2 << 20).is_err(), "its work fits after all");
+                        io::Write::write_all(writer, &vec![b'x'; 2 * CHUNK_BYTES])
+                            .and_then(|()| io::Write::flush(writer))
+                            .map_err(|error| ApiError::internal(error.to_string()))?;
+                        Err(ApiError::payload_too_large(
+                            "the query's own (budgets.query_memory)",
+                        ))
+                    },
+                ),
+            )
+            .await;
+        assert_eq!(memory.used(), 0, "the refused answer still holds memory");
+        let own = answer
+            .expect_err("its work refused, no answer")
+            .into_response();
+        assert_eq!(own.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = axum::body::to_bytes(own.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(problem["detail"], "the query's own (budgets.query_memory)");
     }
 
     /// Over HTTP/1.0, the first frame's stall bound starts when the answer is ready, not when
