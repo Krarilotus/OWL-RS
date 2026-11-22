@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use super::equality_rules;
-use super::ir::{OWL, ParseError, Rule, Vocabulary};
+use super::ir::{Head, OWL, ParseError, Rule, Term, Vocabulary};
 use super::n3::{self, N3Program};
 use super::rulesets::{Ruleset, SEMANTICS_VERSION, SemanticPart};
 use super::vocabulary::LocalVocabulary;
@@ -26,6 +26,8 @@ pub struct UserRules {
     context_relations: Vec<String>,
     /// The semantic parts the rules use, from the same compile: part of the fingerprint.
     parts: Vec<SemanticPart>,
+    /// User rules that could conclude an equality, independently of the built-in rules.
+    may_equate_literals: bool,
 }
 
 /// The languages user rules are read in.
@@ -59,6 +61,7 @@ impl UserRules {
             format,
             context_relations: Vec::new(),
             parts: Vec::new(),
+            may_equate_literals: false,
         };
         let mut vocabulary = LocalVocabulary::default();
         let compiled = rules.compile(&mut vocabulary)?;
@@ -71,6 +74,15 @@ impl UserRules {
         }
         // Where a build before the part read equality from the rules' names.
         let same_as = vocabulary.iri(&format!("{OWL}sameAs"));
+        rules.may_equate_literals = compiled.rules.iter().any(|rule| {
+            let Head::Facts(head) = &rule.head else {
+                return false;
+            };
+            head.iter().any(|atom| {
+                let predicate = atom.0[1];
+                predicate == Term::Const(same_as) || matches!(predicate, Term::Var(_))
+            })
+        }) || compiled.facts.iter().any(|fact| fact[1] == same_as);
         let named = compiled
             .rules
             .iter()
@@ -228,6 +240,13 @@ impl RuleProgram {
         self.base.is_some_and(Ruleset::has_list_rules)
     }
 
+    /// Whether this program may equate literals. The built-in part follows the
+    /// engine's equality switch. User rules may add a conclusion of their own.
+    pub fn may_equate_literals(&self) -> bool {
+        self.base.is_some_and(Ruleset::may_equate_literals)
+            || self.user().is_some_and(|user| user.may_equate_literals)
+    }
+
     /// Whether the program named `name` closes the data under `owl:sameAs` (its built-in
     /// part has the equality rules), so queries may rely on it.
     pub fn closes_equality(name: &str) -> bool {
@@ -261,6 +280,39 @@ mod tests {
     const RULES: &str = "@prefix : <http://e/> .
         { ?x :parent ?y . ?y :parent ?z } => { ?x :grandparent ?z } .
         :parent :is :relation .";
+
+    #[test]
+    fn only_the_builtin_rulesets_with_equality_handling_can_equate_literals() {
+        for ruleset in crate::rulesets::ALL {
+            let expected = match ruleset {
+                Ruleset::Rdfs | Ruleset::RdfsFull | Ruleset::Owl2Ql => false,
+                Ruleset::RdfsPlus | Ruleset::OwlHorst | Ruleset::Owl2Rl => true,
+            };
+            assert_eq!(
+                RuleProgram::builtin(ruleset).may_equate_literals(),
+                expected,
+                "{}",
+                ruleset.name()
+            );
+        }
+    }
+
+    #[test]
+    fn rdfs_with_user_rules_can_equate_when_their_head_can_be_same_as() {
+        for (conclusion, expected) in [
+            ("?x owl:sameAs ?y", true),
+            ("?x ?p ?y", true),
+            ("?x :other ?y", false),
+        ] {
+            let text = format!(
+                "@prefix : <http://e/> . @prefix owl: <{OWL}> . \
+                 {{ ?x ?p ?y }} => {{ {conclusion} }} ."
+            );
+            let user = Arc::new(UserRules::n3("rules.n3", text).unwrap());
+            let program = RuleProgram::new(Some(Ruleset::Rdfs), Some(user)).unwrap();
+            assert_eq!(program.may_equate_literals(), expected, "{conclusion}");
+        }
+    }
 
     /// What a build stored for a user ruleset before its context names and semantic parts
     /// entered the fingerprint.
