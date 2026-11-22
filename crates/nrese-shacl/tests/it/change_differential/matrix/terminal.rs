@@ -6,13 +6,15 @@ use nrese_shacl::Component;
 use super::{Row, core_key, predicate};
 use crate::change_differential::case::{Case, Step, ex};
 use crate::change_differential::gaps::EntryPoint;
+use crate::change_differential::observe::ResultKey;
 use crate::change_differential::stops::Stop;
 
-const MIN: &str = "ex:T sh:targetNode ex:n0 ; sh:property ex:Q .
-    ex:Q sh:path ex:p0 ; sh:minCount 1 .";
+// Explicitly targeted and pathless: no walk reads either revision, so the first read of the
+// named one, and its stop, is inside that revision's validation.
+const CLASS: &str = "ex:T sh:targetNode ex:n0 ; sh:class ex:C .";
+const TYPED: &str = "ex:n0 a ex:C .";
 const DATATYPE: &str = "ex:T sh:targetNode ex:n0 ; sh:property ex:Q .
     ex:Q sh:path ex:p0 ; sh:datatype xsd:integer .";
-const SUPPORT: &str = "ex:n0 ex:p0 ex:v1 .";
 const FAILURE: &str =
     "a SPARQL constraint at focus node <http://example.com/n5>: the query reported ?failure";
 
@@ -25,23 +27,28 @@ fn stops() -> Vec<Row> {
     let mut rows = Vec::new();
     for (entry, label) in [(EntryPoint::Data, "data"), (EntryPoint::Shapes, "shapes")] {
         for (side, prefix) in [(Stop::Before, "before"), (Stop::After, "after")] {
-            let mut case = Case::new(MIN, SUPPORT, Step::delete(SUPPORT));
+            // Removing the only type assertion makes the target violate.
+            let mut case = Case::new(CLASS, TYPED, Step::delete(TYPED));
             if entry == EntryPoint::Shapes {
-                case.steps[0].shapes = Some(MIN.to_owned());
+                case.steps[0].shapes = Some(CLASS.to_owned());
             }
             case.stop = Some((entry, side));
+            let violation = ResultKey {
+                path: None,
+                ..core_key(
+                    "n0",
+                    predicate("p0"),
+                    Some(ex("n0").into()),
+                    "T",
+                    Component::Class,
+                )
+            };
             let mut row = Row::new(
                 format!("cancel-{prefix}-{label}"),
                 "Cancellation on the named revision returns a stop.",
                 case,
                 [],
-                [core_key(
-                    "n0",
-                    predicate("p0"),
-                    None,
-                    "Q",
-                    Component::MinCount,
-                )],
+                [violation],
             );
             row.entry = entry;
             rows.push(row);
