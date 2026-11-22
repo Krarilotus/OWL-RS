@@ -593,7 +593,7 @@ impl Running {
 /// without a list of rows per group. `None` for other aggregates. DBpedia q12 summed 1 M
 /// goals into 35 k teams.
 /// Once it applies, and before it allocates, it calls `reserve` with what it holds at most
-/// ([`pass_bytes`]); a refusal ends it.
+/// ([`pass_bytes`]); a refusal ends the pass (its caller takes another route).
 pub(super) fn aggregate_in_one_pass(
     solutions: &Solutions,
     group_of: &[u32],
@@ -745,8 +745,8 @@ pub(super) fn key_columns(
 impl Context<'_> {
     /// Each aggregate's column over `groups` groups (`group_of`: each row's), its values
     /// interned ([`Context::id`]); the caller charges the columns. From one pass over every
-    /// aggregate where each allows it, what that holds charged first ([`pass_bytes`]);
-    /// otherwise an aggregate at a time ([`Self::aggregate_column`]).
+    /// aggregate where it applies and fits ([`Self::columns_in_one_pass`]); otherwise an
+    /// aggregate at a time ([`Self::aggregate_column`]).
     pub(super) fn aggregate_columns(
         &self,
         solutions: &Solutions,
@@ -757,28 +757,10 @@ impl Context<'_> {
         if aggregates.is_empty() {
             return Ok(Vec::new());
         }
-        let mut columns = Vec::with_capacity(aggregates.len());
-        {
-            let mut pass = Reservation::new(&*self.budget);
-            let mut reserve = |bytes: usize| pass.charge(bytes);
-            let memory = QueryEvaluationError::MemoryLimit;
-            // Declared after `pass`: dropped before it.
-            let values =
-                match aggregate_in_one_pass(solutions, group_of, groups, aggregates, &mut reserve)
-                    .map_err(memory)?
-                {
-                    Some(values) => Some(values),
-                    None => self
-                        .numeric_pass(solutions, group_of, groups, aggregates, &mut reserve)
-                        .map_err(memory)?,
-                };
-            if let Some(values) = values {
-                for a in 0..aggregates.len() {
-                    columns.push(self.interned(values.iter().map(|group| &group[a]), groups)?);
-                }
-                return Ok(columns);
-            }
+        if let Some(columns) = self.columns_in_one_pass(solutions, group_of, groups, aggregates) {
+            return Ok(columns);
         }
+        let mut columns = Vec::with_capacity(aggregates.len());
         let mut members: Vec<Vec<usize>> = vec![Vec::new(); groups];
         for (row, &group) in group_of.iter().enumerate() {
             members[group as usize].push(row);
@@ -787,6 +769,48 @@ impl Context<'_> {
             columns.push(self.aggregate_column(solutions, &members, aggregate)?);
         }
         Ok(columns)
+    }
+
+    /// [`Self::aggregate_columns`] from one pass over every aggregate, all or nothing: what
+    /// the pass holds charged first ([`pass_bytes`]), then the numbers it finds, then the
+    /// terms of its results, in a save point ([`Context::save`]). `None` where the pass
+    /// doesn't apply, declines, or one of those charges is refused: then the point is
+    /// restored and the reservation let go, so the per-column route meets the memory the
+    /// query held before the pass.
+    fn columns_in_one_pass(
+        &self,
+        solutions: &Solutions,
+        group_of: &[u32],
+        groups: usize,
+        aggregates: &[(Variable, AggregateExpression)],
+    ) -> Option<Vec<Vec<u64>>> {
+        let point = self.save();
+        let mut pass = Reservation::new(&*self.budget);
+        let mut reserve = |bytes: usize| pass.charge(bytes);
+        let values =
+            match aggregate_in_one_pass(solutions, group_of, groups, aggregates, &mut reserve) {
+                Ok(Some(values)) => Some(values),
+                Ok(None) => self
+                    .numeric_pass(solutions, group_of, groups, aggregates, &mut reserve)
+                    .ok()
+                    .flatten(),
+                Err(_) => None,
+            };
+        // The values are let go here, before the point closes: no id of a term made since
+        // outlives a restore.
+        let columns = values.and_then(|values| {
+            (0..aggregates.len())
+                .map(|a| {
+                    self.interned(values.iter().map(|group| &group[a]), groups)
+                        .ok()
+                })
+                .collect::<Option<Vec<_>>>()
+        });
+        match columns {
+            Some(_) => self.keep(point),
+            None => self.restore(point),
+        }
+        columns
     }
 
     /// `aggregate`'s column over the groups `members` lists, its values interned

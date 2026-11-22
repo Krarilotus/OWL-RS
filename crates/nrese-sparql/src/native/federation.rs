@@ -102,7 +102,7 @@ impl Context<'_> {
         // From here the table's charge, released as it is consumed.
         held.resize(kept.memory_bytes())
             .map_err(QueryEvaluationError::MemoryLimit)?;
-        held.transfer();
+        self.transfer_table_charge(held);
         let kept = Solutions {
             vars: bound.vars.clone(),
             table: kept,
@@ -298,7 +298,7 @@ impl Context<'_> {
                     self.aliases
                         .borrow()
                         .get(name)
-                        .and_then(|&id| self.term(id))
+                        .and_then(|alias| self.term(alias.id))
                 })
             };
             // Under the query's BASE: an `IRI()` the endpoint evaluates resolves as here.

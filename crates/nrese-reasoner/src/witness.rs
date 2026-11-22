@@ -32,10 +32,12 @@ pub(crate) enum Site {
     Merge,
     /// Old consistency instances inspected in a delete's witness lookup.
     OldWitnessInstance,
+    /// Full materialisations started, including runs that keep only a consistency report.
+    FullMaterialisation,
 }
 
 thread_local! {
-    static COUNTS: [Cell<u64>; 11] = const { [const { Cell::new(0) }; 11] };
+    static COUNTS: [Cell<u64>; 12] = const { [const { Cell::new(0) }; 12] };
 }
 
 /// Counts `n` units at `site` on this thread.

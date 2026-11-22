@@ -15,7 +15,7 @@ use rayon::prelude::*;
 use super::{Program, encode, pattern, storable, triple};
 use crate::delta::{self, Base, MemoryBase, VisitsBase};
 use crate::eval::{GroundProgram, OperationStop, Poller, Probe, Stopped, Visit};
-use crate::ir::{AnnotationIds, Triple, Violations};
+use crate::ir::{Triple, Violations};
 use crate::lists::ListDiagnostic;
 
 /// A transaction's state as the delta executor reads it: the committed indexes (asserted
@@ -285,13 +285,35 @@ pub fn maintain_within(
 /// and once it fires, every part of the maintenance stops.
 ///
 /// `uses_rebuilt_report`: the caller judges a rebuilt change by the rebuild's own report
-/// ([`Maintenance::rebuilt_violations`]), so a first load makes no other.
+/// ([`Maintenance::rebuilt_violations`]), so a first load or a redeclaration makes no other.
 pub fn maintain_with(
     program: &Program,
     ground: Option<&GroundProgram>,
     tx: &mut Transaction<'_>,
     operation: &OperationStop<'_>,
     memory: &Arc<Budget>,
+    uses_rebuilt_report: bool,
+) -> Result<Maintenance, delta::Interrupted> {
+    maintain_with_report_budget(
+        program,
+        ground,
+        tx,
+        operation,
+        memory,
+        &|| Arc::clone(memory),
+        uses_rebuilt_report,
+    )
+}
+
+/// [`maintain_with`] with a separate budget for the working witnesses of a redeclaration
+/// judged by its introduced clashes. Only the resulting report is charged to `memory`.
+pub fn maintain_with_report_budget(
+    program: &Program,
+    ground: Option<&GroundProgram>,
+    tx: &mut Transaction<'_>,
+    operation: &OperationStop<'_>,
+    memory: &Arc<Budget>,
+    working_memory: &dyn Fn() -> Arc<Budget>,
     uses_rebuilt_report: bool,
 ) -> Result<Maintenance, delta::Interrupted> {
     // Axioms that need an inferred copy published by this commit.
@@ -305,18 +327,6 @@ pub fn maintain_with(
         (program.schema.clone().hiding(after), revived)
     } else {
         (program.schema.clone(), false)
-    };
-    // Revived memberships must participate in the delta executor's introduced-only
-    // consistency checks. Keep the batch result for installation below: no second run.
-    let mut rebuilt = if revived {
-        Some(super::materialise_with(
-            program,
-            &tx.pending_snapshot(),
-            operation,
-            memory,
-        )?)
-    } else {
-        None
     };
     // A first load (no asserted fact before, nothing deleted): its closure is the whole
     // closure, so it is materialised once, by the batch executor, and its violations are
@@ -342,32 +352,52 @@ pub fn maintain_with(
         && tx.deleted().next().is_none()
         && tx.inserted().next().is_some()
         && program.axioms_conclude_only_storable(tx.base(), operation, memory)?;
-    let mut unstorable: Vec<Triple> = Vec::new();
-    if first_load {
-        rebuilt = Some(super::materialise::materialise_with_unstorable(
+    // A change that changes the asserted annotation-property set changes what the rules
+    // read throughout the closure, so it is rebuilt. A first load already has a rebuild;
+    // its introduced-only check uses the pending rules and grounds that agree with them.
+    let read_before = program.annotation_ids(tx.base());
+    let may_change_annotations = program.annotations.as_ref().is_some_and(|a| {
+        first_load
+            || tx
+                .inserted()
+                .chain(tx.deleted())
+                .any(|q| a.declares(triple(q)))
+    });
+    let changed_annotations = if may_change_annotations {
+        program.changed_annotation_ids(read_before.as_ref(), &tx.pending_snapshot())
+    } else {
+        None
+    };
+    let redeclared = !first_load && changed_annotations.is_some();
+    let comparison_memory = (redeclared && !uses_rebuilt_report).then(working_memory);
+    let rebuild_memory = comparison_memory.as_ref().unwrap_or(memory);
+    // Revived memberships participate in the delta executor's introduced-only checks.
+    // Keep the full result for installation below, so it is computed once.
+    let mut unstorable = Vec::new();
+    let mut rebuilt = if first_load {
+        Some(super::materialise::materialise_with_unstorable(
             program,
             &tx.pending_snapshot(),
             operation,
-            memory,
+            rebuild_memory,
             &mut unstorable,
-        )?);
-    }
-    // The annotation properties the rules read, where they do: the state's before the
-    // change (a first load's, after it). The reader reads asserted declarations only, so a
-    // change after which it reads others asserts or retracts one, whether or not its
-    // statement was inferred: that changes what the rules read throughout the closure, so
-    // the change is rebuilt (`redeclared`).
-    let read_before = match first_load {
-        true => program.annotation_ids(&tx.pending_snapshot()),
-        false => program.annotation_ids(tx.base()),
+        )?)
+    } else if revived {
+        Some(super::materialise_with(
+            program,
+            &tx.pending_snapshot(),
+            operation,
+            rebuild_memory,
+        )?)
+    } else {
+        None
     };
-    let declares = |q| (program.annotations.as_ref()).is_some_and(|a| a.declares(triple(q)));
-    let read_after = match !first_load && tx.inserted().chain(tx.deleted()).any(declares) {
-        true => program.annotation_ids(&tx.pending_snapshot()),
-        false => read_before.clone(),
+    let delta_annotations = if redeclared {
+        None
+    } else {
+        changed_annotations.as_ref().or(read_before.as_ref())
     };
-    let redeclared = read_after != read_before;
-    let annotated = program.rules_with(read_before.as_ref());
+    let annotated = program.rules_with(delta_annotations);
     let rules = delta::Rules {
         rules: &annotated,
         schema: &schema,
@@ -375,8 +405,6 @@ pub fn maintain_with(
     };
     let unkept: bool;
     let delta_ran: bool;
-    // A redeclaring change's facts new to the state, for its judgement after the rebuild.
-    let mut new_to_state: Vec<Triple> = Vec::new();
     let deletes: bool;
     let update = {
         let mut base = EngineBase::new(tx, &program.axioms);
@@ -459,7 +487,6 @@ pub fn maintain_with(
         };
         if redeclared {
             // Rebuilt, then judged by the rebuild's report or by what it introduces (below).
-            new_to_state = std::mem::take(&mut inserted);
             delta::Update {
                 policy: delta::policy::Counts {
                     plan: delta::policy::Plan::Rebuild,
@@ -498,7 +525,13 @@ pub fn maintain_with(
                 violations: match uses_rebuilt_report {
                     true => Violations::default(),
                     false => delta::introduced_violations(
-                        &base, &inserted, &derived, rules, ground, operation, memory,
+                        &base,
+                        &inserted,
+                        &derived,
+                        rules,
+                        ground.filter(|_| changed_annotations.is_none()),
+                        operation,
+                        memory,
                     )?,
                 },
                 insert: derived,
@@ -538,7 +571,7 @@ pub fn maintain_with(
     // A list that already stopped at its budget makes the change inconsistent: the
     // datatype checks would add nothing to that. A first load judged by its rebuild has
     // them in the batch's report already.
-    if update.violations.complete() && !(first_load && uses_rebuilt_report) {
+    if !redeclared && update.violations.complete() && !(first_load && uses_rebuilt_report) {
         let datatypes = super::datatypes::violations(
             &update.insert,
             program.rdf_type,
@@ -586,7 +619,9 @@ pub fn maintain_with(
     if rebuild {
         let mut closure = match rebuilt.take() {
             Some(closure) => closure,
-            None => super::materialise_with(program, &tx.pending_snapshot(), operation, memory)?,
+            None => {
+                super::materialise_with(program, &tx.pending_snapshot(), operation, rebuild_memory)?
+            }
         };
         // An interruption drops the transaction, these changes with it.
         if operation.fired() {
@@ -608,45 +643,35 @@ pub fn maintain_with(
                 false => found,
             }
         });
-        let pending = tx.pending_snapshot();
-        let judged = redeclared && !uses_rebuilt_report;
-        // A fact the change retracts and the rebuild still derives was known before: it moves
-        // from asserted to inferred, and is not new to the state (the delta executor's
-        // restored facts). Any other fact the rebuild newly stores as inferred is new.
-        let retracted: HashSet<Triple> = match judged {
-            true => tx.deleted().map(triple).collect(),
-            false => HashSet::new(),
-        };
-        let mut new_inferred = Vec::new();
-        let (added, dropped) =
+        let (added, dropped) = {
+            let pending = tx.pending_snapshot();
             install_closure(&pending, &mut closure.inferred, |fact, add| match add {
-                true => {
-                    let new = tx.insert_inferred(fact);
-                    let fact = triple(fact.in_default_graph());
-                    if new && judged && !retracted.contains(&fact) {
-                        new_inferred.push(fact);
-                    }
-                    new
-                }
+                true => tx.insert_inferred(fact),
                 false => tx.remove_inferred(fact),
-            });
+            })
+        };
         (inserted, removed) = (inserted + added, removed + dropped);
-        if judged {
-            let removed_ids: Vec<u64> = (read_before.iter().flat_map(AnnotationIds::ids))
-                .filter(|&&id| !read_after.as_ref().is_some_and(|a| a.contains(id)))
-                .copied()
-                .collect();
-            update.violations = redeclaration_violations(
-                program,
-                tx,
-                &schema,
-                read_after.as_ref(),
-                &removed_ids,
-                std::mem::take(&mut new_to_state),
-                new_inferred,
-                operation,
-                memory,
-            )?;
+        drop(closure.inferred);
+
+        if let Some(working) = comparison_memory
+            .as_ref()
+            .filter(|_| !closure.violations.consistent())
+        {
+            // Both runs check the entire closure, including facts the inferred stack cannot
+            // store. The old run needs its report only and shares the process workspace.
+            let before =
+                super::materialise::violations_with(program, tx.base(), operation, working)?;
+            let stop = || operation.fired();
+            let poll = Poller::new(&stop).ok_or_else(|| operation.interrupted())?;
+            closure
+                .violations
+                .remove_previous(&before, &poll)
+                .map_err(|Stopped| operation.interrupted())?;
+            drop(before);
+            update.violations = closure
+                .violations
+                .charged_to(memory, &poll)
+                .map_err(|Stopped| operation.interrupted())?;
         }
         update.rounds += closure.rounds;
         // The delta cache may still contain heads rewritten for a formerly hidden
@@ -685,74 +710,6 @@ pub fn maintain_with(
         work: update.policy,
         rebuilt_violations,
     })
-}
-
-/// The consistency violations a change that redeclares an annotation property introduces,
-/// for a caller that doesn't take the rebuild's report (it holds the state's old ones too),
-/// read over the state after it (`tx`, its rebuilt closure installed) by the rules with the
-/// set after it (`after`), as the delta executor finds a change's
-/// ([`delta::introduced_violations`]): those through a statement new to the state (`new`
-/// asserted, `inferred` by the rebuild), or through one the rules read only now, as an
-/// annotation property no longer read (`removed`) in a place their guard covers
-/// (`rulesets::guard_annotation_readings`).
-/// Any other one held before as well: its statements were there and its rule read them. The
-/// set before the change can't judge it: the rules would read what the change made an
-/// annotation, and the closure before it (a declaration used at once would clash with what
-/// its old reading derived). And the datatype checks of the new inferred statements.
-#[allow(clippy::too_many_arguments)]
-fn redeclaration_violations(
-    program: &Program,
-    tx: &Transaction<'_>,
-    schema: &crate::batch::Schema,
-    after: Option<&AnnotationIds>,
-    removed: &[u64],
-    mut new: Vec<Triple>,
-    inferred: Vec<Triple>,
-    operation: &OperationStop<'_>,
-    memory: &Arc<Budget>,
-) -> Result<Violations, delta::Interrupted> {
-    let snapshot = tx.pending_snapshot();
-    let [domain, range, sub] = program.reading_predicates.map(Some);
-    for &id in removed {
-        let id = Some(id);
-        let read = [
-            [None, id, None],
-            [id, domain, None],
-            [id, range, None],
-            [id, sub, None],
-            [None, sub, id],
-        ];
-        for bound in read {
-            let found = snapshot
-                .quads_for_pattern_in(ReadModel::Materialised, &pattern(bound, GraphSelector::Any));
-            new.extend(found.map(triple));
-        }
-    }
-    new.extend_from_slice(&inferred);
-    new.sort_unstable();
-    new.dedup();
-    let rules = program.rules_with(after);
-    let rules = delta::Rules {
-        rules: &rules,
-        schema,
-        ..program.rules()
-    };
-    let base = super::explain::SnapshotBase {
-        snapshot: &snapshot,
-        axioms: &program.axioms,
-    };
-    let mut found = delta::introduced_violations(&base, &new, &[], rules, None, operation, memory)?;
-    if found.complete() {
-        found.append(super::datatypes::violations(
-            &inferred,
-            program.rdf_type,
-            program.same_as,
-            None,
-            &|id| tx.decode(TermId::from_raw(id)),
-            memory,
-        ));
-    }
-    Ok(found)
 }
 
 /// Makes the inferred stack of `pending` hold `closure` instead, applying only the
@@ -954,6 +911,74 @@ mod tests {
     use nrese_engine::{Engine, EngineConfig};
     use nrese_rdf::{BlankNodeRef, NamedNodeRef};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Spec: a redeclaration spends a second rebuild only for introduced-only judgement
+    /// when the changed state reports a clash. A caller using the full report gets it from
+    /// the pending rebuild alone. An ordinary insertion takes the delta.
+    #[test]
+    fn a_ql_commit_rebuilds_the_base_only_to_compare_clashes_after_redeclaration() {
+        use crate::witness::{self, Site::FullMaterialisation};
+        use nrese_rdf_io::{RdfFormat, RdfParser};
+
+        let engine = Engine::new(EngineConfig {
+            background_maintenance: false,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let prefix =
+            "@prefix : <http://example.com/> . @prefix owl: <http://www.w3.org/2002/07/owl#> .";
+        let insert = |tx: &mut Transaction<'_>, data: &str| {
+            let text = format!("{prefix}\n{data}");
+            for quad in RdfParser::from_format(RdfFormat::Turtle).for_reader(text.as_bytes()) {
+                tx.insert(quad.unwrap().as_ref());
+            }
+        };
+        let mut tx = engine.transaction();
+        let program = Program::compile(&crate::rulesets::Ruleset::Owl2Ql.into(), &|t| tx.intern(t));
+        insert(&mut tx, ":A owl:disjointWith :B . :old a :A, :B .");
+        tx.commit().unwrap();
+        let remat = engine.rematerialisation();
+        let closure = super::super::materialise(&program, remat.base());
+        assert!(
+            !closure.violations.consistent(),
+            "the base must have a clash"
+        );
+        remat.finish(closure.inferred).unwrap();
+
+        let operation = OperationStop::new(crate::eval::NEVER);
+        let memory = crate::violations::unlimited();
+        let declaration = ":note a owl:AnnotationProperty .";
+        let ground = program.ground_program(&engine.snapshot());
+        for (case, data, uses_rebuilt_report, rebuilds) in [
+            ("ordinary insertion", ":new :p :value .", false, 0),
+            ("full report", declaration, true, 1),
+            ("introduced-only report", declaration, false, 2),
+        ] {
+            let mut tx = engine.transaction();
+            insert(&mut tx, data);
+            let before = witness::get(FullMaterialisation);
+            let done = maintain_with(
+                &program,
+                Some(&ground),
+                &mut tx,
+                &operation,
+                &memory,
+                uses_rebuilt_report,
+            )
+            .unwrap();
+            assert!(done.violations.consistent(), "{case}: tolerated base clash");
+            assert_eq!(
+                done.rebuilt_violations.is_some_and(|r| !r.consistent()),
+                uses_rebuilt_report,
+                "{case}: full report"
+            );
+            assert_eq!(
+                witness::get(FullMaterialisation) - before,
+                rebuilds,
+                "{case}: full materialisation count"
+            );
+        }
+    }
 
     /// REAS-2 (a counted test per leaf that filters): an engine base's
     /// scan counts the quads it passes over (deleted by the change), not only those it

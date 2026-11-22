@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! cargo run --release -p nrese-reasoner --example v2_closure -- \
-//!     [--ruleset owl2-rl|rdfs] [--executor batch|naive] --out derived.nt input.nt...
+//!     [--ruleset owl2-ql|owl2-rl|rdfs] [--executor batch|naive] --out derived.nt input.nt...
 //! ```
 //!
 //! The batch executor is the default; `naive` runs the reference evaluator (the oracle).
@@ -57,7 +57,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let out = out.ok_or("--out is required")?;
     let mut vocabulary = LocalVocabulary::default();
-    let rules = ruleset.rules(&mut vocabulary)?;
     let lists = ruleset
         .has_list_rules()
         .then(|| ListVocabulary::new(&mut vocabulary));
@@ -76,6 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     facts.sort_unstable();
     facts.dedup();
     let load = started.elapsed();
+    let rules = ruleset.rules_for(&mut vocabulary, &facts)?;
     let started = Instant::now();
     let (derived, violations, diagnostics, rounds) = if naive {
         let closure = materialise(&facts, &rules, lists.as_ref());
