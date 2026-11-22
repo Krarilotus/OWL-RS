@@ -388,6 +388,18 @@ impl Server {
         repo: &str,
         update: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let status = self.update_status(repo, update).await?;
+        if !status.is_success() {
+            return Err(self.failed(&format!("{repo}: {update}: {status}")));
+        }
+        Ok(())
+    }
+
+    pub(super) async fn update_status(
+        &self,
+        repo: &str,
+        update: &str,
+    ) -> Result<reqwest::StatusCode, Box<dyn std::error::Error>> {
         let response = self
             .http
             .post(format!("{}/api/v1/repositories/{repo}/update", self.url))
@@ -397,10 +409,7 @@ impl Server {
             .send()
             .await
             .map_err(|error| self.failed(&format!("{repo}: {update}: {error}")))?;
-        if !response.status().is_success() {
-            return Err(self.failed(&format!("{repo}: {update}: {}", response.status())));
-        }
-        Ok(())
+        Ok(response.status())
     }
 }
 
