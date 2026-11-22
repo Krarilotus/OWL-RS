@@ -1,3 +1,6 @@
+//! The oracle cells check the chain's rows across equality modes. This public SPARQL
+//! check also verifies the documented `sound-only` status on the ASK response.
+
 use std::sync::Arc;
 
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
@@ -39,7 +42,7 @@ fn load(pipeline: &MutationPipeline, with_edge: bool) {
     update(pipeline, "INSERT", &format!("{CHAIN}\n{edge}"));
 }
 
-fn ask(store: &StoreService, case: &str, stage: &str) -> bool {
+fn ask(store: &StoreService, case: &str, stage: &str) -> (bool, &'static str) {
     let mut request = SparqlQueryRequest::all(format!("{PREFIXES}\nASK {{ ex:a ex:out ex:z }}"));
     request.solutions_format = SolutionsResultFormat::Json;
     let result = store.execute_query(&request).expect("read SPARQL ASK");
@@ -50,7 +53,7 @@ fn ask(store: &StoreService, case: &str, stage: &str) -> bool {
         .as_ref()
         .map_or("unavailable", |status| status.as_str());
     println!("case={case} stage={stage} ask={answer} status={status}");
-    answer
+    (answer, status)
 }
 
 // Spec: OWL 2 RL/RDF Table 5 prp-spo2 uses rdfs:subClassOf as the first
@@ -61,14 +64,14 @@ fn check(case: &str, verb: &str, has_edge_after_commit: bool) {
     let open =
         || Arc::new(StoreService::new(StoreConfig::on_disk(dir.path())).expect("open store"));
 
-    let warm = {
+    let (warm, warm_status) = {
         let store = open();
         let writer = pipeline(&store, rl);
         load(&writer, !has_edge_after_commit);
         update(&writer, verb, EDGE);
         ask(&store, case, "warm")
     };
-    let cold = {
+    let (cold, cold_status) = {
         let store = open();
         let _reader = pipeline(&store, rl);
         ask(&store, case, "cold")
@@ -85,7 +88,7 @@ fn check(case: &str, verb: &str, has_edge_after_commit: bool) {
     rebuilt
         .rematerialise(rules)
         .expect("rebuild final statements");
-    let expected = ask(&rebuilt, case, "rebuild");
+    let (expected, rebuild_status) = ask(&rebuilt, case, "rebuild");
 
     assert_eq!(
         expected, has_edge_after_commit,
@@ -96,6 +99,14 @@ fn check(case: &str, verb: &str, has_edge_after_commit: bool) {
         [expected, expected],
         "[warm, cold] disagree with rebuild"
     );
+    // reasoning-semantics.md promises sound-only for standard owl2-rl answers.
+    for (stage, status) in [
+        ("warm", warm_status),
+        ("cold", cold_status),
+        ("rebuild", rebuild_status),
+    ] {
+        assert_eq!(status, "sound-only", "{case} {stage} ASK status");
+    }
 }
 
 #[test]
