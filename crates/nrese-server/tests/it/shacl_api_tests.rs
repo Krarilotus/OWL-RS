@@ -773,7 +773,7 @@ async fn a_restart_counts_the_stored_shapes() -> TestResult {
     Ok(())
 }
 
-/// Spec (gate-state design §7, S5): malformed stored shapes cause an enforcing gate to
+/// Spec (docs/ops/http-api.md): malformed stored shapes cause an enforcing gate to
 /// warn at restart and refuse data writes until the shapes are repaired.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restart_with_malformed_shapes_warns_and_refuses_writes_until_repair() -> TestResult {

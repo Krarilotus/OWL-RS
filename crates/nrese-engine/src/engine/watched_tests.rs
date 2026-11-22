@@ -25,7 +25,7 @@ fn insert(engine: &Engine, quad: &Quad) -> u64 {
     tx.commit().unwrap().revision
 }
 
-/// Spec (gate-state design §7, E1): asserted changes to the watched graph renew its
+/// Spec (docs/ops/http-api.md): asserted changes to the watched graph renew its
 /// cell. Data changes, inferred changes and layout changes preserve it, including
 /// data-only records at the end of a replica batch.
 #[test]
@@ -96,7 +96,7 @@ fn a_version_keeps_the_cell_until_the_watched_graph_changes() {
     assert!(cell.kept().is_none());
 }
 
-/// Spec (gate-state design §7, E2): append and replace keep the count and its revision
+/// Spec (docs/ops/http-api.md): append and replace keep the count and its revision
 /// when their asserted watched range is unchanged, including a load that spills.
 #[test]
 fn a_bulk_load_compares_the_asserted_watched_range() {

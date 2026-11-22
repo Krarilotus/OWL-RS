@@ -59,7 +59,7 @@ fn replica_batch(store: &StoreService, primary: &StoreService, stop: &StopSource
         .unwrap();
 }
 
-/// Spec (gate-state design §7, S1): newly published shapes are either already counted
+/// Spec (docs/ops/http-api.md): newly published shapes are either already counted
 /// (pipeline) or pending (bulk and replica), at the same revision the reader sees.
 #[test]
 fn published_shapes_never_show_the_old_count() {
@@ -115,7 +115,7 @@ fn published_shapes_never_show_the_old_count() {
     }
 }
 
-/// Spec (gate-state design §7, S2): the count names the latest shapes change, even
+/// Spec (docs/ops/http-api.md): the count names the latest shapes change, even
 /// after a data-only publication or when a refresh sees a later data revision.
 #[test]
 fn the_shapes_revision_names_the_write_that_changed_the_shapes() {
@@ -165,7 +165,7 @@ fn the_shapes_revision_names_the_write_that_changed_the_shapes() {
     }
 }
 
-/// Spec (gate-state design §7, S3): a malformed stored shape's diagnostic has a byte
+/// Spec (docs/ops/http-api.md): a malformed stored shape's diagnostic has a byte
 /// bound, including when the shape IRI contains multibyte characters.
 #[test]
 fn the_kept_diagnostic_is_bounded() {
@@ -186,7 +186,7 @@ fn the_kept_diagnostic_is_bounded() {
     assert!(why.contains("don't compile"), "{why}");
 }
 
-/// Spec (gate-state design §7, S4): stopping after publication leaves the new cell
+/// Spec (docs/ops/http-api.md): stopping after publication leaves the new cell
 /// unfilled and visibly stopped. The next refresh counts the same shapes revision.
 #[test]
 fn stopped_writers_leave_the_shapes_for_the_next_refresh() {
