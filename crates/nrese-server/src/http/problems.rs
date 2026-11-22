@@ -104,7 +104,7 @@ mod tests {
             .get(header::CONTENT_TYPE)
             .map(|value| value.to_str().unwrap().to_owned())
             .unwrap_or_default();
-        let bytes = axum::body::to_bytes(response.into_body(), MAX_BODY)
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
         let document = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
@@ -126,6 +126,86 @@ mod tests {
                 "/framework",
                 get(|| async { (StatusCode::UNPROCESSABLE_ENTITY, "bad json") }),
             )
+            .route(
+                "/long-refusal",
+                get(|| async {
+                    let kind = nrese_store::RejectKind::ShapesViolated;
+                    ApiError::rejected(kind, long_text(2 * KIB_64), None, None)
+                }),
+            )
+            .route(
+                "/empty",
+                get(|| async { (StatusCode::UNPROCESSABLE_ENTITY, "") }),
+            )
+            .route("/at-limit", get(|| async { plain(KIB_64) }))
+            .route("/past-limit", get(|| async { plain(KIB_64 + 1) }))
+            .route(
+                "/past-limit-unmarked-problem",
+                get(|| async {
+                    let document = serde_json::json!({"detail": long_text(KIB_64)});
+                    let media = [(header::CONTENT_TYPE, PROBLEM_JSON)];
+                    (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        media,
+                        document.to_string(),
+                    )
+                }),
+            )
+    }
+
+    /// The limit the docs name for a framework's message: 64 KiB.
+    const KIB_64: usize = 65_536;
+
+    /// `len` bytes of text, as a refusal that quotes long values has.
+    fn long_text(len: usize) -> String {
+        "x".repeat(len)
+    }
+
+    /// A body the server didn't write, of `len` bytes.
+    fn plain(len: usize) -> (StatusCode, String) {
+        (StatusCode::UNPROCESSABLE_ENTITY, long_text(len))
+    }
+
+    /// Spec (docs/ops/http-api.md, the error envelope): every error is a problem document
+    /// with its type and detail, a handler's whole however long its detail. A SHACL refusal
+    /// past 64 KiB keeps its type and its detail, not its status's bare document.
+    #[tokio::test]
+    async fn own_documents_pass_whole_past_the_frameworks_limit() {
+        let (status, media, document) = answer(app(), Method::GET, "/long-refusal").await;
+        assert_eq!(document["type"], "https://nrese.dev/problems/shacl-reject");
+        assert_eq!(
+            document["detail"],
+            long_text(2 * KIB_64),
+            "the whole detail"
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(media, PROBLEM_JSON);
+        assert_eq!(document["request_id"], "req-1");
+    }
+
+    /// Spec (docs/ops/http-api.md, the error envelope): a body the server didn't write is
+    /// its detail up to 64 KiB; past that, the answer is the problem of its status alone,
+    /// as for an empty body, with the request id. A problem document's media type alone
+    /// doesn't make it the server's own.
+    #[tokio::test]
+    async fn other_bodies_past_64_kib_report_only_their_status() {
+        let (_, _, bare) = answer(app(), Method::GET, "/empty").await;
+        assert_eq!(
+            bare["request_id"], "req-1",
+            "the bare problem, its id included"
+        );
+        let (_, _, at) = answer(app(), Method::GET, "/at-limit").await;
+        assert_eq!(
+            at["detail"],
+            long_text(KIB_64),
+            "a body of 64 KiB is its detail"
+        );
+        for uri in ["/past-limit", "/past-limit-unmarked-problem"] {
+            let (status, media, document) = answer(app(), Method::GET, uri).await;
+            assert_eq!(document, bare, "{uri}: the status's problem alone");
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{uri}");
+            assert_eq!(media, PROBLEM_JSON, "{uri}");
+        }
     }
 
     #[tokio::test]
