@@ -141,47 +141,90 @@ fn entails_in_300_ms(data: &str, conclusion: &[Triple], late: bool) -> String {
     }
 }
 
+/// The ground statement `:s <predicate> <object>`, both full IRIs.
+fn ground(s: &str, predicate: &str, object: &str) -> Triple {
+    let named = NamedNode::new_unchecked;
+    Triple::new(iri(s), named(predicate), named(object))
+}
+
+const OWL: &str = "http://www.w3.org/2002/07/owl#";
+
 /// Spec (`entails` under `owl2-dl`: one `dl.timeout` from the call, which the rules' pass
-/// spends too): where the rules leave the conclusion to the DL engines and their pass uses
-/// up the time, the DL check gets none and the answer is undecided; with the time, entailed.
+/// spends too): where the rules leave a ground conclusion (`:C ⊑ ⊥`) to the DL engines and
+/// their pass uses up the time, the DL check gets none and the answer is undecided; with
+/// the time, entailed.
 #[test]
 fn a_rules_pass_that_uses_up_the_time_leaves_the_dl_check_none() {
-    let conclusion = not_in("a", "C");
+    let conclusion = [ground(
+        "C",
+        "http://www.w3.org/2000/01/rdf-schema#subClassOf",
+        &format!("{OWL}Nothing"),
+    )];
     assert_eq!(
         [false, true].map(|late| entails_in_300_ms(EMPTY_C, &conclusion, late)),
         ["Ok(Entailed)".to_owned(), "undecided".to_owned()]
     );
 }
 
-/// Spec (as above): a refutation by the rules found after the time is up is no answer
-/// either; within it, entailed.
+/// Spec (as above): an answer the rules find after the time is up is no answer either;
+/// within it, entailed.
 #[test]
-fn a_rules_refutation_past_the_time_is_undecided() {
-    let data = ":D owl:disjointWith :C . :x a :D .";
-    let conclusion = not_in("x", "C");
+fn a_rules_answer_past_the_time_is_undecided() {
+    let data = ":D rdfs:subClassOf :C . :x a :D .";
+    let conclusion = vec![Triple::new(iri("x"), nrese_rdf::vocab::rdf::TYPE, iri("C"))];
     assert_eq!(
         [false, true].map(|late| entails_in_300_ms(data, &conclusion, late)),
         ["Ok(Entailed)".to_owned(), "undecided".to_owned()]
     );
 }
 
+/// Spec (`entailment` module docs: under `owl2-dl` the rules decide plain ground
+/// assertions): a ground conclusion the rules show is entailed with no DL check.
+#[test]
+fn a_ground_conclusion_the_rules_show_takes_no_dl_check() {
+    let (store, _pipeline) = dl_store(DlConfig::default(), ":D rdfs:subClassOf :C . :x a :D .");
+    let rules = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl)
+        .materialised_program()
+        .unwrap();
+    let checked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = Arc::clone(&checked);
+    hooks::AFTER_DL_PREMISE.set(Some(Box::new(move || {
+        seen.store(true, std::sync::atomic::Ordering::Relaxed);
+    })));
+    let answer = store.entails(
+        rules,
+        &[Triple::new(iri("x"), nrese_rdf::vocab::rdf::TYPE, iri("C"))],
+    );
+    hooks::AFTER_DL_PREMISE.set(None);
+    assert_eq!(
+        (
+            format!("{answer:?}"),
+            checked.load(std::sync::atomic::Ordering::Relaxed)
+        ),
+        ("Ok(Entailed)".to_owned(), false),
+        "the answer, whether the DL check ran"
+    );
+}
+
 /// Spec (`entails`: one certified closure, reads that answer only for it): `:x a :P` and
-/// `:x a ¬C` hold together in neither revision, the one with `:x a :P` (where `:x` may be a
-/// `:C`) nor the one after a commit that replaces it with `:x a :D` (`:D` disjoint with
-/// `:C`). With that commit between the closure's read and the refutation, the check gives no
-/// answer (undecided), never `Entailed`.
+/// `:x ≠ :y` hold together in neither revision, the one with `:x a :P` (where `:x` may be
+/// `:y`) nor the one after a commit that replaces it with `:x a :D` and `:y a :C` (`:D`
+/// disjoint with `:C`). With that commit between the closure's read and the refutation, the
+/// check gives no answer (undecided), never `Entailed`.
 #[test]
 fn a_commit_between_the_closure_and_the_refutation_leaves_the_answer_undecided() {
     let (store, pipeline) = dl_store(DlConfig::default(), ":D owl:disjointWith :C . :x a :P .");
-    let mut conclusion = not_in("x", "C");
-    conclusion.push(Triple::new(iri("x"), nrese_rdf::vocab::rdf::TYPE, iri("P")));
+    let conclusion = [
+        Triple::new(iri("x"), nrese_rdf::vocab::rdf::TYPE, iri("P")),
+        ground("x", &format!("{OWL}differentFrom"), "http://example.com/y"),
+    ];
     let rules = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl)
         .materialised_program()
         .unwrap();
     hooks::BETWEEN_ENTAILMENT_HALVES.set(Some(Box::new(move || {
         update(
             &pipeline,
-            "DELETE DATA { :x a :P } ; INSERT DATA { :x a :D }",
+            "DELETE DATA { :x a :P } ; INSERT DATA { :x a :D . :y a :C }",
         );
     })));
     let answer = store.entails(rules, &conclusion);

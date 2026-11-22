@@ -18,10 +18,11 @@
 //!
 //! The answer is sound; it is complete as far as the rules are for the premise (OWL 2 RL
 //! premises and the forms above). A conclusion outside them may be entailed although the
-//! answer is no, except under `owl2-dl`: there what the rules leave unshown is decided by
-//! the DL engines ([`StoreService::entails_dl`]), and is an [`StoreError::Undecided`] error
-//! where they can't decide it. There the whole check, the rules' pass included, has one
-//! `dl.timeout` from the call; past it, the answer is undecided.
+//! answer is no, except under `owl2-dl`: there the rules decide only a conclusion of plain
+//! ground assertions (no blank node, none of the structured forms above); any other, and
+//! what the rules leave unshown, the DL engines decide whole ([`StoreService::entails_dl`]),
+//! an [`StoreError::Undecided`] error where they can't. There the whole check, the rules'
+//! pass included, has one `dl.timeout` from the call; past it, the answer is undecided.
 //! Refutation uses the store's process-memory watch; interruption is an error, never
 //! a negative entailment answer or an assumed-unreachable panic.
 
@@ -62,9 +63,9 @@ struct Split {
     positive: Vec<Triple>,
     /// Sets of statements whose addition must make the data inconsistent.
     refutations: Vec<Vec<Triple>>,
-    /// A negative form's node says more than the form (another axiom about a complement's
-    /// class, say), which its refutation doesn't show.
-    beyond: bool,
+    /// A structured negative form was read (`owl:AllDifferent`, a complement, a negative
+    /// property assertion): its statements were read apart from the rest.
+    formed: bool,
 }
 
 impl StoreService {
@@ -130,11 +131,13 @@ impl StoreService {
         let at = self.engine().snapshot();
         let split = split(conclusion);
         // The rules are complete under the Direct Semantics only for OWL 2 RL premises
-        // (OWL 2 Profiles §4.3, PR1): under owl2-dl, what they leave unshown the DL engines
-        // decide, and a conclusion whose negative forms say more than the rules refute goes
-        // to them whole.
+        // (OWL 2 Profiles §4.3, PR1), and they decide a conclusion's statements apart. Under
+        // owl2-dl they decide only plain ground assertions, which say nothing of each other: a
+        // blank node or a structured form links statements, so that conclusion, and what the
+        // rules leave unshown, the DL engines decide whole.
         let dl = self.dl().active();
-        let shown = !(dl && split.beyond) && self.shown_by_rules(&at, program, &split, deadline)?;
+        let plain = !split.formed && conclusion.iter().all(ground);
+        let shown = (!dl || plain) && self.shown_by_rules(&at, program, &split, deadline)?;
         // A rules' answer found late is none either: the deadline bounds the whole answer.
         if deadline.passed() {
             return Err(out_of_time());
@@ -157,11 +160,12 @@ impl StoreService {
         split: &Split,
         deadline: Deadline,
     ) -> StoreResult<bool> {
-        if !split.positive.is_empty() && !self.ask(at, &split.positive)? {
-            return Ok(false);
-        }
+        let asked = split.positive.is_empty() || self.ask(at, &split.positive)?;
         #[cfg(test)]
         crate::service::hooks::run(&crate::service::hooks::BETWEEN_ENTAILMENT_HALVES);
+        if !asked {
+            return Ok(false);
+        }
         for opposite in &split.refutations {
             if !self.refutes(at, program, opposite, deadline)? {
                 return Ok(false);
@@ -322,14 +326,6 @@ fn split(conclusion: &[Triple]) -> Split {
         t.predicate.as_ref() == rdf::TYPE
             && matches!(&t.object, Term::NamedNode(n) if n.as_ref() == class)
     };
-    // Whether `node` says more than a form whose node is typed `class` and has `predicates`.
-    let says_more = |node: &NamedOrBlankNode,
-                     class: nrese_rdf::NamedNodeRef<'_>,
-                     predicates: &[nrese_rdf::NamedNodeRef<'_>]| {
-        conclusion.iter().any(|t| {
-            &t.subject == node && !is_type(t, class) && !predicates.contains(&t.predicate.as_ref())
-        })
-    };
     // The statements a negative form or the header consumed, by index.
     let mut used: HashSet<usize> = HashSet::new();
     let mut split = Split::default();
@@ -368,15 +364,10 @@ fn split(conclusion: &[Triple]) -> Split {
                     }
                 }
                 used.extend(about(&t.subject));
-                split.beyond |= says_more(
-                    &t.subject,
-                    owl::ALL_DIFFERENT,
-                    &[owl::MEMBERS, owl::DISTINCT_MEMBERS],
-                );
                 for node in &nodes {
                     used.extend(about(node));
-                    split.beyond |= says_more(node, rdf::LIST, &[rdf::FIRST, rdf::REST]);
                 }
+                split.formed = true;
             }
         }
         // a rdf:type _:c . _:c owl:complementOf C
@@ -392,7 +383,7 @@ fn split(conclusion: &[Triple]) -> Split {
                 )]);
                 used.insert(i);
                 used.extend(about(&class));
-                split.beyond |= says_more(&class, owl::CLASS, &[owl::COMPLEMENT_OF]);
+                split.formed = true;
             }
         }
         // [] a owl:NegativePropertyAssertion; source, property, target (or value).
@@ -409,16 +400,7 @@ fn split(conclusion: &[Triple]) -> Split {
                     .refutations
                     .push(vec![Triple::new(a.clone(), p.clone(), b.clone())]);
                 used.extend(about(node));
-                split.beyond |= says_more(
-                    node,
-                    owl::NEGATIVE_PROPERTY_ASSERTION,
-                    &[
-                        owl::SOURCE_INDIVIDUAL,
-                        owl::ASSERTION_PROPERTY,
-                        owl::TARGET_INDIVIDUAL,
-                        owl::TARGET_VALUE,
-                    ],
-                );
+                split.formed = true;
             }
         }
     }
@@ -432,6 +414,16 @@ fn split(conclusion: &[Triple]) -> Split {
 }
 
 const OWL_ONTOLOGY: &str = "http://www.w3.org/2002/07/owl#Ontology";
+
+/// Whether `triple` has no blank node, at any depth.
+fn ground(triple: &Triple) -> bool {
+    !matches!(triple.subject, NamedOrBlankNode::BlankNode(_))
+        && match &triple.object {
+            Term::BlankNode(_) => false,
+            Term::Triple(t) => ground(t),
+            _ => true,
+        }
+}
 
 /// The items of the RDF list at `head` in `triples`, and its nodes; `None` if malformed.
 fn list_items(triples: &[Triple], head: &Term) -> Option<(Vec<Term>, Vec<NamedOrBlankNode>)> {
