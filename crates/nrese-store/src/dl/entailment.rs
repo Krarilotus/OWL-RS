@@ -375,13 +375,30 @@ pub fn nonempty(premise: &Ontology, class: ExprId, budget: &Budget) -> Entailed 
 }
 
 /// Whether `premise` (consistent) entails every logical axiom of `conclusion` (an
-/// ontology read over the same term ids), each test within what is left of `deadline`.
+/// ontology read over the same term ids), within `budget`'s time from the call.
 ///
 /// A conclusion's anonymous individual says that *some* individual is so (*OWL 2 Direct
 /// Semantics* §2.3.7–2.4). It is held here as a fresh constant: entailed for every value
 /// it may take is entailed for some, but not entailed for one says nothing of the others,
 /// so then the answer is undecided.
 pub fn entails_ontology(
+    premise: &Ontology,
+    conclusion: &Ontology,
+    fresh: &[u64],
+    budget: &Budget,
+) -> Entailed {
+    entails_ontology_within(
+        premise,
+        conclusion,
+        fresh,
+        budget,
+        Deadline::after(budget.timeout),
+    )
+}
+
+/// [`entails_ontology`], each test within what is left of `deadline`: a caller's, that
+/// began before this check.
+pub(crate) fn entails_ontology_within(
     premise: &Ontology,
     conclusion: &Ontology,
     fresh: &[u64],

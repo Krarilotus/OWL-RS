@@ -464,7 +464,7 @@ impl StoreService {
         snapshot: &Snapshot,
         conclusion: &[Triple],
     ) -> StoreResult<DlEntailment> {
-        use crate::dl::entailment::{Entailed, entails_ontology};
+        use crate::dl::entailment::{Entailed, entails_ontology_within};
         use crate::dl::{Verdict, consistency, gate, source};
         use nrese_rdf::{BlankNode, NamedNodeRef, NamedOrBlankNode};
         let deadline = nrese_dl::limits::Deadline::after(self.config().dl.timeout);
@@ -586,7 +586,7 @@ impl StoreService {
             .collect();
         let fresh = fresh?;
         Ok(DlEntailment {
-            answer: entails_ontology(&premise, &read, &fresh, &budget, deadline),
+            answer: entails_ontology_within(&premise, &read, &fresh, &budget, deadline),
             premise: checked.verdict,
         })
     }
