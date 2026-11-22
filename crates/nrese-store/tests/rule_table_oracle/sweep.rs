@@ -491,6 +491,13 @@ fn seeds() {
         }
         println!("SEED {seed} shape={} required-red={known}", case.shape);
         result.print("RESULT ");
+        if demonstrate_red {
+            assert!(
+                generator::RED_SHAPES.contains(&case.shape),
+                "unexpected red shape {}",
+                case.shape
+            );
+        }
         for difference in result.differences {
             // Verdict and redundancy mismatches have no row key. Keep their
             // originating write so different inconsistency inputs stay distinct.
