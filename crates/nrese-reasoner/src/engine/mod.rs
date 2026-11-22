@@ -278,14 +278,19 @@ impl Program {
     /// subject or predicate, it may need such a statement (`prp-rng` types a literal, and
     /// `cls-maxqc3` reads that type): the rule runs without it, and a match counts where the
     /// conclusion's subject is a literal or left unbound, so the answer errs towards an
-    /// equality (`literal_equality_atoms`). `Err` once `stop` fires.
+    /// equality (`literal_equality_atoms`). Where a rule concludes a statement with a literal
+    /// subject over the statements held (the first such statement the closure had has only
+    /// held premises: `prp-rng` typing a literal), such statements may fill any atom whose
+    /// subject is a variable no atom reads as a predicate (`cls-hv1` giving that literal two
+    /// values of a functional property, which `prp-fp` reads): those atoms are left out too.
+    /// `Err` once `stop` fires.
     pub fn derives_literal_equality(
         &self,
         snapshot: &Snapshot,
         stop: crate::eval::Stop<'_>,
     ) -> Result<bool, delta::Interrupted> {
         use crate::eval::{Poller, Seg, plan, value, walk_until};
-        use crate::ir::Head;
+        use crate::ir::{Head, Term};
         let Some(same_as) = self.same_as else {
             return Ok(false);
         };
@@ -297,6 +302,57 @@ impl Program {
         };
         let source = crate::explain::Whole(&base);
         let ground = self.ground_program(snapshot);
+        // Whether `atoms` of `rule` match with `found` taking a match: every atom left out
+        // matches, as nothing the store holds decides against it.
+        let search =
+            |rule: &Rule, atoms: &[usize], found: &mut dyn FnMut(&[Option<u64>]) -> bool| {
+                let Some(&first) = atoms.first() else {
+                    return true;
+                };
+                let order = plan(&source, rule, atoms, first, |_| Seg::All, &poll);
+                let mut bindings = vec![None; rule.variables()];
+                walk_until(
+                    &source,
+                    &rule.body,
+                    &rule.guards,
+                    &order,
+                    0,
+                    &mut bindings,
+                    &poll,
+                    found,
+                )
+            };
+        let literal = |id: u64| {
+            !matches!(
+                TermId::from_raw(id).kind(),
+                TermKind::Iri | TermKind::BlankNode
+            )
+        };
+        let concluded = std::cell::OnceCell::new();
+        let literal_subjects = || {
+            *concluded.get_or_init(|| {
+                ground
+                    .rules
+                    .iter()
+                    .filter(|rule| !rule.body.is_empty())
+                    .any(|rule| {
+                        let Head::Facts(heads) = &rule.head else {
+                            return false;
+                        };
+                        heads.iter().any(|head| {
+                            let subject = head.0[0];
+                            let may = match subject {
+                                Term::Const(c) => literal(c),
+                                Term::Var(_) => rule.body.iter().any(|atom| atom.0[2] == subject),
+                            };
+                            let all: Vec<usize> = (0..rule.body.len()).collect();
+                            may && search(rule, &all, &mut |b| {
+                                value(subject, b).is_some_and(literal)
+                            })
+                        })
+                    })
+            })
+        };
         for rule in &ground.rules {
             let Head::Facts(heads) = &rule.head else {
                 continue;
@@ -305,34 +361,20 @@ impl Program {
                 continue;
             }
             for head in heads {
-                let Some(atoms) = literal_equality_atoms(rule, head, same_as) else {
+                let Some(atoms) = literal_equality_atoms(rule, head, same_as, false) else {
                     continue;
                 };
                 let [subject, _, object] = head.0;
                 let mut equates = |bindings: &[Option<u64>]| {
                     let object = value(object, bindings);
-                    value(subject, bindings).is_none_or(|subject| {
-                        object != Some(subject)
-                            && !matches!(
-                                TermId::from_raw(subject).kind(),
-                                TermKind::Iri | TermKind::BlankNode
-                            )
-                    })
+                    value(subject, bindings)
+                        .is_none_or(|subject| object != Some(subject) && literal(subject))
                 };
-                let found = match atoms.first() {
-                    // Every atom left out: nothing the store holds decides against it.
-                    None => true,
-                    Some(&first) => walk_until(
-                        &source,
-                        &rule.body,
-                        &rule.guards,
-                        &plan(&source, rule, &atoms, first, |_| Seg::All, &poll),
-                        0,
-                        &mut vec![None; rule.variables()],
-                        &poll,
-                        &mut equates,
-                    ),
-                };
+                let mut found = search(rule, &atoms, &mut equates);
+                let wider = literal_equality_atoms(rule, head, same_as, true).unwrap_or_default();
+                if !found && !poll.stopped() && wider.len() < atoms.len() && literal_subjects() {
+                    found = search(rule, &wider, &mut equates);
+                }
                 if poll.stopped() {
                     return Err(interrupted());
                 }
@@ -467,7 +509,14 @@ pub(crate) fn equates_literal([subject, predicate, object]: Triple, same_as: Opt
 /// the closure had such statements and dropped them (`prp-rng` typing a literal). An
 /// `owl:sameAs` atom stays: a literal at its subject is an equality of a literal already,
 /// and the first one the rules conclude is found by a run of the rule that concluded it.
-fn literal_equality_atoms(rule: &Rule, head: &crate::ir::Atom, same_as: u64) -> Option<Vec<usize>> {
+/// `wide`, where the rules conclude statements with a literal subject: also every other atom
+/// whose subject is a variable that no atom reads as a predicate, which may be a literal.
+fn literal_equality_atoms(
+    rule: &Rule,
+    head: &crate::ir::Atom,
+    same_as: u64,
+    wide: bool,
+) -> Option<Vec<usize>> {
     use crate::ir::Term;
     let [subject, predicate, object] = head.0;
     if !matches!(subject, Term::Var(_)) || predicate != Term::Const(same_as) || object == subject {
@@ -475,9 +524,12 @@ fn literal_equality_atoms(rule: &Rule, head: &crate::ir::Atom, same_as: u64) -> 
     }
     let concluded =
         |term: Term| matches!(term, Term::Var(_)) && (term == subject || term == object);
+    let literal = |term: Term| {
+        wide && matches!(term, Term::Var(_)) && rule.body.iter().all(|atom| atom.0[1] != term)
+    };
     let kept = (0..rule.body.len()).filter(|&i| {
         let [s, p, _] = rule.body[i].0;
-        !concluded(p) && (!concluded(s) || p == Term::Const(same_as))
+        !concluded(p) && (p == Term::Const(same_as) || !(concluded(s) || literal(s)))
     });
     Some(kept.collect())
 }
