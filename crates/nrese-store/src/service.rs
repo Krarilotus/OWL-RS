@@ -420,6 +420,8 @@ impl StoreService {
             .literal_equality |= state.literal_equality;
         if state.literal_equality_unknown {
             let cannot_equate = self.supports.rules().is_some_and(|program| {
+                // Defence in depth: vouches also checks the fingerprint under
+                // this writer slot before the certificate is published.
                 state.made_by(&program, self.config.hide_unnamed_classes)
                     && !program.may_equate_literals()
                     && state.ruleset == program.name()
@@ -3632,7 +3634,10 @@ mod marker_tests {
         store.use_reasoning_rules(Some(program));
         assert_eq!(flags(), Some((false, false)));
         assert_eq!(unknown, Some((true, true)));
-        assert_eq!(mismatch, None);
+        assert_eq!(
+            mismatch, None,
+            "vouches rejects a certificate for a different fingerprint"
+        );
         store.use_reasoning_rules(None);
         assert_eq!(flags(), Some((true, true)));
     }

@@ -72,8 +72,10 @@ impl UserRules {
         if compiled.rules.iter().any(|rule| !rule.guards.is_empty()) {
             rules.parts.push(SemanticPart::GuardsOverClasses);
         }
-        // Where a build before the part read equality from the rules' names.
         let same_as = vocabulary.iri(&format!("{OWL}sameAs"));
+        // equality_rules::of enables equality only with all five eq-* rules.
+        // Its atoms() accepts only owl:sameAs as a constant, so a user rule that
+        // completes the set has a variable or owl:sameAs as its head predicate.
         rules.may_equate_literals = compiled.rules.iter().any(|rule| {
             let Head::Facts(head) = &rule.head else {
                 return false;
@@ -83,6 +85,7 @@ impl UserRules {
                 predicate == Term::Const(same_as) || matches!(predicate, Term::Var(_))
             })
         }) || compiled.facts.iter().any(|fact| fact[1] == same_as);
+        // Where a build before the part read equality from the rules' names.
         let named = compiled
             .rules
             .iter()
@@ -274,6 +277,14 @@ impl From<&RuleProgram> for RuleProgram {
 }
 
 #[cfg(test)]
+pub(crate) const EQUALITY_RULES_N3: &str = "@prefix owl: <http://www.w3.org/2002/07/owl#> .
+    { ?a owl:sameAs ?b } => { ?b owl:sameAs ?a } .
+    { ?a owl:sameAs ?b . ?b owl:sameAs ?c } => { ?a owl:sameAs ?c } .
+    { ?s owl:sameAs ?t . ?s ?p ?o } => { ?t ?p ?o } .
+    { ?p owl:sameAs ?q . ?s ?p ?o } => { ?s ?q ?o } .
+    { ?o owl:sameAs ?t . ?s ?p ?o } => { ?s ?p ?t } .";
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -389,12 +400,6 @@ Id: eq-rep-s
   y <e:knows> x
 }
 ";
-        let shaped = "@prefix owl: <http://www.w3.org/2002/07/owl#> .
-            { ?a owl:sameAs ?b } => { ?b owl:sameAs ?a } .
-            { ?a owl:sameAs ?b . ?b owl:sameAs ?c } => { ?a owl:sameAs ?c } .
-            { ?s owl:sameAs ?t . ?s ?p ?o } => { ?t ?p ?o } .
-            { ?p owl:sameAs ?q . ?s ?p ?o } => { ?s ?q ?o } .
-            { ?o owl:sameAs ?t . ?s ?p ?o } => { ?s ?p ?t } .";
         let mut wrong = Vec::new();
         for (case, user, text, rebuilds) in [
             (
@@ -405,8 +410,8 @@ Id: eq-rep-s
             ),
             (
                 "the five under other names",
-                UserRules::n3("r.n3", shaped),
-                shaped,
+                UserRules::n3("r.n3", EQUALITY_RULES_N3),
+                EQUALITY_RULES_N3,
                 true,
             ),
             ("other rules", UserRules::n3("r.n3", RULES), RULES, false),

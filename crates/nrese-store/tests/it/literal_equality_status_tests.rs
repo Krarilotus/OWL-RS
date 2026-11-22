@@ -290,6 +290,8 @@ const REOPENED: &str = "opened without a rebuild";
 
 /// RDFS keeps its closure status across a reopen, even when its subproperty rule
 /// derives a raw `owl:sameAs`. Its reason stays the same as after a rebuild.
+/// This guard also passes before narrowing. The marker test covers the change
+/// to the RDFS certificate's reopen flags.
 #[test]
 fn a_reopened_rdfs_literal_read_matches_a_fresh_rebuild() {
     use nrese_reasoner::rulesets::Ruleset;
