@@ -76,18 +76,18 @@ impl StoreService {
         conclusion: &[Triple],
     ) -> StoreResult<Entailment> {
         let program = program.into();
-        // Under owl2-dl, one dl.timeout from the call.
-        let deadline = match self.dl().active() {
-            true => Deadline::after(self.config().dl.timeout),
-            false => Deadline::NONE,
-        };
+        // The mode, read once: under owl2-dl, the DL route with one dl.timeout from the call.
+        let dl = self
+            .dl()
+            .active()
+            .then(|| Deadline::after(self.config().dl.timeout));
         // One certified closure: reads start only on a settled certificate (an
         // even epoch; odd, a change is in progress and the old certificate may still be
         // visible), and an answer stands only if no change began while they took their
         // snapshots. An open or changed certificate refuses without waiting or retrying.
         let epoch = self.certificate_epoch();
         if epoch.is_multiple_of(2) {
-            let answer = self.entails_once(&program, conclusion, deadline)?;
+            let answer = self.entails_once(&program, conclusion, dl)?;
             if self.certificate_epoch() == epoch {
                 return Ok(answer);
             }
@@ -99,12 +99,12 @@ impl StoreService {
     }
 
     /// One try of [`Self::entails`]; it stands only if the certificate didn't change meanwhile.
-    /// Under owl2-dl, decided by the DL engines before `deadline`.
+    /// Under owl2-dl, `dl` is the deadline before which the DL engines decide it.
     fn entails_once(
         &self,
         program: &RuleProgram,
         conclusion: &[Triple],
-        deadline: Deadline,
+        dl: Option<Deadline>,
     ) -> StoreResult<Entailment> {
         if !self.reasoning_is_current(program.clone()) {
             return Err(StoreError::Configuration(format!(
@@ -121,7 +121,7 @@ impl StoreService {
         }
         // Under owl2-dl the closure is no proof, its inconsistency included: the DL engines
         // decide, the premise's consistency too.
-        if self.dl().active() {
+        if let Some(deadline) = dl {
             return self.decided_by_dl(&self.engine().snapshot(), conclusion, deadline);
         }
         if let crate::ConsistencyStatus::Inconsistent { .. } = consistency {
