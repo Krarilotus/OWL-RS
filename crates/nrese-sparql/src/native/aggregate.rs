@@ -615,8 +615,8 @@ pub(super) fn aggregate_in_one_pass(
     reserve(pass_bytes(groups, plan.len()))?;
     let mut running = vec![Running::default(); groups * plan.len()];
     let mut rows = vec![0u64; groups];
-    if mixed {
-        mixed_pass(solutions, group_of, &plan, &mut running, &mut rows);
+    if mixed.contains(&true) {
+        mixed_pass(solutions, group_of, &plan, &mixed, &mut running, &mut rows);
     } else {
         for (row, &group) in group_of.iter().enumerate() {
             let group = group as usize;
@@ -864,15 +864,16 @@ impl Context<'_> {
 /// Per aggregate: the column it reads (`None`: the rows) and its function.
 type OnePassPlan = Vec<(Option<usize>, AggregateFunction)>;
 
-/// [`aggregate_in_one_pass`]'s plan, and whether a MIN or MAX column holds several
-/// datatypes; `None` if one aggregate isn't for that pass.
+/// [`aggregate_in_one_pass`]'s plan, and per aggregate whether it is a MIN or MAX over a
+/// column of several datatypes; `None` if one aggregate isn't for that pass.
 fn one_pass_plan(
     solutions: &Solutions,
     aggregates: &[(Variable, AggregateExpression)],
-) -> Option<(OnePassPlan, bool)> {
+) -> Option<(OnePassPlan, Vec<bool>)> {
     let mut plan = OnePassPlan::new();
-    let mut mixed = false;
+    let mut mixed = Vec::with_capacity(aggregates.len());
     for (_, aggregate) in aggregates {
+        mixed.push(false);
         match aggregate {
             AggregateExpression::CountSolutions { distinct: false } => {
                 plan.push((None, AggregateFunction::Count));
@@ -895,7 +896,7 @@ fn one_pass_plan(
                 let column = solutions.column(variable)?;
                 let ids = solutions.table.column(column);
                 if matches!(name, AggregateFunction::Min | AggregateFunction::Max) {
-                    mixed |= min_max_column(ids)?;
+                    *mixed.last_mut()? = min_max_column(ids)?;
                 } else if numeric
                     && !ids.iter().all(|&id| {
                         id == UNDEF || TermId::from_raw(id).as_inline_integer().is_some()
@@ -912,9 +913,10 @@ fn one_pass_plan(
 }
 
 /// [`aggregate_in_one_pass`]'s pass where a MIN or MAX column holds several datatypes, one
-/// aggregate at a time. A MIN or MAX keeps one [`value::order_key`] per group, the extreme
-/// in [`value::order`], and recovers its id once per group; the others take
-/// [`Running::add`]. Out of line and cold, so the ordinary pass keeps its code; its state is
+/// aggregate at a time. Each such MIN or MAX (`mixed`) keeps one [`value::order_key`] per
+/// group, the extreme in [`value::order`], and recovers its id once per group; every other
+/// aggregate, a MIN or MAX over one datatype included, takes [`Running::add`], as in the
+/// ordinary pass. Out of line and cold, so the ordinary pass keeps its code; its state is
 /// per group, like that pass's, never per row.
 #[cold]
 #[inline(never)]
@@ -922,6 +924,7 @@ fn mixed_pass(
     solutions: &Solutions,
     group_of: &[u32],
     plan: &[(Option<usize>, AggregateFunction)],
+    mixed: &[bool],
     running: &mut [Running],
     rows: &mut [u64],
 ) {
@@ -933,8 +936,9 @@ fn mixed_pass(
         let ids = solutions.table.column(*column);
         let at = |group: usize| group * plan.len() + a;
         let max = match name {
-            AggregateFunction::Min => false,
-            AggregateFunction::Max => true,
+            AggregateFunction::Min | AggregateFunction::Max if mixed[a] => {
+                *name == AggregateFunction::Max
+            }
             _ => {
                 for (&group, &id) in group_of.iter().zip(ids) {
                     running[at(group as usize)].add(id);
