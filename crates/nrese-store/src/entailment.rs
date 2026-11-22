@@ -181,7 +181,9 @@ impl StoreService {
     ) -> StoreResult<Entailment> {
         let decided = self.entails_dl_at(at, conclusion, deadline)?;
         match (decided.premise, decided.answer) {
-            (crate::dl::Verdict::Inconsistent, _) => Ok(Entailment::InconsistentPremise),
+            (crate::dl::Verdict::Inconsistent, crate::dl::entailment::Entailed::Yes) => {
+                Ok(Entailment::InconsistentPremise)
+            }
             (_, crate::dl::entailment::Entailed::Yes) => Ok(Entailment::Entailed),
             (_, crate::dl::entailment::Entailed::No) => Ok(Entailment::NotEntailed),
             (_, crate::dl::entailment::Entailed::Unknown(why)) => {
@@ -433,15 +435,16 @@ fn list_items(triples: &[Triple], head: &Term) -> Option<(Vec<Term>, Vec<NamedOr
 /// ([`StoreService::entails_dl`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DlEntailment {
+    /// `Yes` or `No` only once the conclusion is admitted; over an inconsistent premise, `Yes`.
     pub answer: crate::dl::entailment::Entailed,
-    /// The premise's consistency: an inconsistent one entails everything.
+    /// The premise's consistency, as evidence: it decides nothing about an unread conclusion.
     pub premise: crate::dl::Verdict,
 }
 
 impl DlEntailment {
+    /// Whether the entailment is established: `answer` is `Yes`.
     pub fn holds(&self) -> bool {
-        self.premise == crate::dl::Verdict::Inconsistent
-            || self.answer == crate::dl::entailment::Entailed::Yes
+        self.answer == crate::dl::entailment::Entailed::Yes
     }
 }
 
@@ -516,18 +519,25 @@ impl StoreService {
         };
         let budget = gate::budget(self, None, &memory);
         let checked = consistency::check(&premise, &budget.remaining(deadline));
-        if checked.verdict != Verdict::Consistent {
-            let answer = match &checked.verdict {
-                Verdict::Unknown(why) => Entailed::Unknown(format!("the premise: {why}")),
-                _ => Entailed::Yes,
-            };
+        if let Verdict::Unknown(why) = &checked.verdict {
+            let answer = Entailed::Unknown(format!("the premise: {why}"));
             return Ok(DlEntailment {
                 answer,
                 premise: checked.verdict,
             });
         }
+        let inconsistent = checked.verdict == Verdict::Inconsistent;
         #[cfg(test)]
         crate::service::hooks::run(&crate::service::hooks::AFTER_DL_PREMISE);
+        // Over an inconsistent premise too, the answer waits for the conclusion's admission,
+        // never begun past the deadline: the read has none and scans the premise for SHACL.
+        if inconsistent && deadline.passed() {
+            let late = nrese_dl::limits::Limit::Time.reached("the deadline passed");
+            return Ok(DlEntailment {
+                answer: Entailed::Unknown(late),
+                premise: checked.verdict,
+            });
+        }
         // The OWL vocabulary and the fresh names are system vocabulary, shared (dictionary
         // lifecycle V1); the conclusion's terms are the request's own, in a private
         // vocabulary charged to its envelope, past the premise's ids.
@@ -600,6 +610,13 @@ impl StoreService {
                     "the conclusion isn't well-formed OWL 2 DL: {}",
                     diagnostic.describe(&name)
                 )),
+                premise: checked.verdict,
+            });
+        }
+        // Admitted: an inconsistent premise has no model, so it entails the conclusion.
+        if inconsistent {
+            return Ok(DlEntailment {
+                answer: Entailed::Yes,
                 premise: checked.verdict,
             });
         }
