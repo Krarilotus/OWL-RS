@@ -756,6 +756,62 @@ fn min_and_max_beside_an_id_with_a_reserved_datatype_code() {
     );
 }
 
+/// MIN or MAX over a column of ids that all hold a datatype code no datatype has keeps its
+/// winner beside MIN or MAX over a column of several datatypes in the same SELECT: the
+/// winner can't be written as a literal, but it is bound, so COUNT over it is 1.
+#[test]
+fn a_column_of_reserved_codes_keeps_its_extreme_beside_a_mixed_column() {
+    let engine = load([
+        (node("s1"), node("v"), Term::from(typed("1", "integer"))),
+        (node("s2"), node("v"), Term::from(typed("9", "int"))),
+    ]);
+    // "3"^^xsd:byte's and "5"^^xsd:byte's ids with their datatype code set to 12.
+    let reserved = |value: &str| {
+        let byte = engine
+            .snapshot()
+            .lookup(Term::from(typed(value, "byte")).as_ref())
+            .unwrap();
+        TermId::from_raw((byte.raw() & !15) | 12)
+    };
+    let (three, five) = (reserved("3"), reserved("5"));
+    let mut tx = engine.transaction();
+    let r = tx.intern(Term::from(node("r")).as_ref());
+    for (subject, object) in [("s1", three), ("s2", five)] {
+        let subject = tx.intern(Term::from(node(subject)).as_ref());
+        tx.insert_encoded(EncodedQuad::new(subject, r, object, TermId::DEFAULT_GRAPH));
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let options = QueryOptions {
+        as_written: true,
+        ..QueryOptions::default()
+    };
+    let run = |body: &str| {
+        let text = format!("{PREFIX}{body}");
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        assert!(runs_natively(&query), "query must run natively: {text}");
+        collect_rows(evaluate_query(&snapshot, &query, &options).unwrap())
+    };
+    let one = || Some(Term::from(typed("1", "integer")));
+
+    assert_eq!(
+        run(
+            "SELECT (COUNT(?lo) AS ?seen) (COUNT(?hi) AS ?alsoSeen) WHERE { \
+             { SELECT (MIN(?r) AS ?lo) (MAX(?v) AS ?hi) WHERE { ?s :v ?v ; :r ?r } } }"
+        ),
+        vec![vec![one(), one()]],
+        "MIN of the reserved codes beside a mixed MAX"
+    );
+    assert_eq!(
+        run(
+            "SELECT (COUNT(?hi) AS ?seen) (COUNT(?lo) AS ?alsoSeen) WHERE { \
+             { SELECT (MAX(?r) AS ?hi) (MIN(?v) AS ?lo) WHERE { ?s :v ?v ; :r ?r } } }"
+        ),
+        vec![vec![one(), one()]],
+        "MAX of the reserved codes beside a mixed MIN"
+    );
+}
+
 #[test]
 fn big_integer_comparisons_with_nan_return_booleans() {
     let engine = load(Vec::new());
