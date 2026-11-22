@@ -296,6 +296,9 @@ fn a_left_join_still_classifies_completely() {
         },
     );
     assert!(holds(&mut table, &left.classification, "W", "G"));
+    // Complete, so the whole taxonomy is the answer, and equal to the uncapped one's.
+    assert!(left.complete(), "{:?}", left.incomplete);
     let whole = nrese_dl::classify::classify(&o, &Default::default());
+    assert!(whole.complete(), "{:?}", whole.incomplete);
     assert_eq!(left.classification, whole.classification);
 }

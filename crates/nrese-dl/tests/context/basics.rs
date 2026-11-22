@@ -2,6 +2,7 @@
 //! at least once, and the cases the Horn stage gives up.
 
 use nrese_dl::context::Unsupported;
+use nrese_dl::verdict::Verdict::{Consistent, Inconsistent};
 use nrese_owl::{Axiom, Characteristic, ClassExpr, ExprId, ObjProp};
 
 use super::support::{Build, Table, classify, holds, unsat};
@@ -248,10 +249,11 @@ fn a_range_on_a_chains_superproperty() {
 #[test]
 fn assertions_along_named_edges() {
     let mut table = Table::default();
-    let consistent = |table: &mut Table, build: &dyn Fn(&mut Build)| {
+    // The verdict itself, so that an undecided one fails both kinds of case.
+    let verdict = |table: &mut Table, build: &dyn Fn(&mut Build)| {
         let mut b = Build::new(table);
         build(&mut b);
-        classify(&b.done(), 1).expect("Horn").consistency == nrese_dl::verdict::Verdict::Consistent
+        classify(&b.done(), 1).expect("Horn").consistency
     };
     // A ⊑ ∀r.B, B ⊓ C ⊑ ⊥, A(a), r(a, b): C(b) clashes. With `included`, the universal is
     // over `s` and `r ⊑ s`: the clash needs the edge `s(a, b)` the inclusion derives.
@@ -274,10 +276,22 @@ fn assertions_along_named_edges() {
             b.axiom(Axiom::ClassAssertion(cc, j));
         }
     };
-    assert!(consistent(&mut table, &|b| forward(b, false, false)));
-    assert!(!consistent(&mut table, &|b| forward(b, true, false)));
-    assert!(consistent(&mut table, &|b| forward(b, false, true)));
-    assert!(!consistent(&mut table, &|b| forward(b, true, true)));
+    assert_eq!(
+        Consistent,
+        verdict(&mut table, &|b| forward(b, false, false))
+    );
+    assert_eq!(
+        Inconsistent,
+        verdict(&mut table, &|b| forward(b, true, false))
+    );
+    assert_eq!(
+        Consistent,
+        verdict(&mut table, &|b| forward(b, false, true))
+    );
+    assert_eq!(
+        Inconsistent,
+        verdict(&mut table, &|b| forward(b, true, true))
+    );
     // ∃r.B ⊑ D at the subject, D ⊓ E ⊑ ⊥; transitivity: s(i, j), s(j, k), B(k), E(i).
     let back = |b: &mut Build, transitive: bool| {
         let (bb, d, e) = (b.c("B"), b.c("D"), b.c("E"));
@@ -296,28 +310,34 @@ fn assertions_along_named_edges() {
         b.axiom(Axiom::ClassAssertion(bb, k));
         b.axiom(Axiom::ClassAssertion(e, i));
     };
-    assert!(consistent(&mut table, &|b| back(b, false)));
-    assert!(!consistent(&mut table, &|b| back(b, true)));
+    assert_eq!(Consistent, verdict(&mut table, &|b| back(b, false)));
+    assert_eq!(Inconsistent, verdict(&mut table, &|b| back(b, true)));
     // An edge fires an existential: ∃r.⊤ ⊑ ∃s.F, F ⊑ ⊥.
-    assert!(!consistent(&mut table, &|b| {
-        let f = b.c("F");
-        let (r, s) = (b.r("r"), b.r("s"));
-        let thing = b.e(ClassExpr::Thing);
-        let (any, some) = (b.some(r, thing), b.some(s, f));
-        b.sub(any, some);
-        let bot = b.e(ClassExpr::Nothing);
-        b.sub(f, bot);
-        let (i, j) = (b.t("i"), b.t("j"));
-        b.axiom(Axiom::ObjectPropertyAssertion(r.named(), i, j));
-    }));
+    assert_eq!(
+        Inconsistent,
+        verdict(&mut table, &|b| {
+            let f = b.c("F");
+            let (r, s) = (b.r("r"), b.r("s"));
+            let thing = b.e(ClassExpr::Thing);
+            let (any, some) = (b.some(r, thing), b.some(s, f));
+            b.sub(any, some);
+            let bot = b.e(ClassExpr::Nothing);
+            b.sub(f, bot);
+            let (i, j) = (b.t("i"), b.t("j"));
+            b.axiom(Axiom::ObjectPropertyAssertion(r.named(), i, j));
+        })
+    );
     // A reflexive role disjoint from an asserted self-loop's.
-    assert!(!consistent(&mut table, &|b| {
-        let (r, s) = (b.r("r"), b.r("s"));
-        b.axiom(Axiom::ObjectCharacteristic(Characteristic::Reflexive, s));
-        b.axiom(Axiom::DisjointObjectProperties(vec![r, s]));
-        let i = b.t("i");
-        b.axiom(Axiom::ObjectPropertyAssertion(r.named(), i, i));
-    }));
+    assert_eq!(
+        Inconsistent,
+        verdict(&mut table, &|b| {
+            let (r, s) = (b.r("r"), b.r("s"));
+            b.axiom(Axiom::ObjectCharacteristic(Characteristic::Reflexive, s));
+            b.axiom(Axiom::DisjointObjectProperties(vec![r, s]));
+            let i = b.t("i");
+            b.axiom(Axiom::ObjectPropertyAssertion(r.named(), i, i));
+        })
+    );
 }
 
 #[test]
