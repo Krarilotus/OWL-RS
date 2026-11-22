@@ -6,7 +6,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use nrese_engine::{TermId, TermKind};
+use nrese_engine::TermId;
 use nrese_exec::group::{Groups, group_rows};
 use nrese_exec::{Budget, BudgetExceeded, Grant, IdTable, Reservation, UNDEF};
 use nrese_rdf::vocab::xsd;
@@ -983,16 +983,7 @@ fn mixed_pass(
 /// declines the pass there, and the per-group path answers, as it does for every id this
 /// pass doesn't take.
 fn min_max_column(ids: &[u64]) -> Option<bool> {
-    let (mut first, mut several, mut keyless) = (None, false, false);
-    for &id in ids.iter().filter(|&&id| id != UNDEF) {
-        let id = TermId::from_raw(id);
-        if !matches!(id.kind(), TermKind::Integer | TermKind::DerivedInteger) {
-            return None;
-        }
-        let rank = value::inline_integer_rank(id);
-        keyless |= rank.is_none();
-        several |= *first.get_or_insert(rank) != rank;
-    }
+    let (several, keyless) = value::inline_integer_datatypes(ids)?;
     (!(several && keyless)).then_some(several)
 }
 

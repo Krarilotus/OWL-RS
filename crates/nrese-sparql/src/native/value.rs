@@ -8,6 +8,7 @@ use std::str::FromStr;
 
 use nrese_engine::term::PAYLOAD_BITS;
 use nrese_engine::{TermId, TermKind};
+use nrese_exec::UNDEF;
 use nrese_rdf::vocab::{rdf, xsd};
 use nrese_rdf::{Literal, Term};
 use nrese_xsd::owl::Datatype;
@@ -593,6 +594,40 @@ pub(crate) fn order_key_id(key: u64) -> TermId {
 #[inline]
 pub(crate) fn inline_integer_rank(id: TermId) -> Option<u64> {
     order_key(id).map(|key| key & 15)
+}
+
+/// Over a column's ids (`UNDEF` aside), in one pass over their raw bits: `None` unless each
+/// is an inline integer; then whether they hold several datatypes, as [`inline_integer_rank`]
+/// tells them apart, and whether one has no order key. Each id's datatype is its kind's tag
+/// above a derived integer's code (0 for `xsd:integer`), with every code no datatype has as
+/// one; it stops within 64 ids of one that isn't an inline integer.
+pub(crate) fn inline_integer_datatypes(ids: &[u64]) -> Option<(bool, bool)> {
+    const DERIVED: u64 = TermKind::DerivedInteger as u64;
+    const INTEGER: u64 = (TermKind::Integer as u64) << CODE_BITS;
+    const KEYLESS: u64 = DERIVED << CODE_BITS | DERIVED_RANK.len() as u64;
+    let datatype = |raw: u64| {
+        let tag = raw >> PAYLOAD_BITS;
+        let code = (raw & ((1 << CODE_BITS) - 1)).min(DERIVED_RANK.len() as u64);
+        tag << CODE_BITS | code * u64::from(tag == DERIVED)
+    };
+    let Some(first) = ids.iter().find(|&&raw| raw != UNDEF) else {
+        return Some((false, false));
+    };
+    let first = datatype(*first);
+    let (mut several, mut keyless) = (false, false);
+    for chunk in ids.chunks(64) {
+        let mut other = false;
+        for &raw in chunk {
+            let (bound, datatype) = (raw != UNDEF, datatype(raw));
+            other |= bound & (datatype != INTEGER) & (datatype >> CODE_BITS != DERIVED);
+            several |= bound & (datatype != first);
+            keyless |= bound & (datatype == KEYLESS);
+        }
+        if other {
+            return None;
+        }
+    }
+    Some((several, keyless))
 }
 
 /// [`order`] of two literals, given their values.
