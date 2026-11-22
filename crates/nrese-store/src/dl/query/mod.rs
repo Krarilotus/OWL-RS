@@ -1082,6 +1082,8 @@ fn may_equate_literals(
 ///   tells nothing of the data.
 /// - An import no loaded ontology answers ([`unread_import`]; for a reader of some graphs, in
 ///   the graphs it reads): every read.
+/// - A reader by support under `owl2-ql` may miss conclusions the store-wide annotation
+///   declarations kept out of the closure. Its grant alone decides the cap on every read.
 pub(crate) fn withhold(
     completeness: &mut Completeness,
     (query, reads): (&Query, &Reads),
@@ -1132,6 +1134,15 @@ fn conditions(
                 "the store holds owl:imports {target}, and no ontology with that IRI is \
                  loaded: its axioms take no part in reasoning"
             ),
+        );
+    }
+    if completeness.regime == Some(Owl2Ql)
+        && access.is_some_and(|a| a.inferred && a.inferred_by_support)
+    {
+        completeness.incomplete(
+            source,
+            "the reader can't read every graph, so its OWL 2 QL answers may be incomplete"
+                .to_owned(),
         );
     }
     true

@@ -2423,11 +2423,10 @@ fn no_query_with_a_triple_term_is_complete_under_owl_2() {
 /// A reader of `:open` (and of the default graph, or not), with the inferences their graphs
 /// support, under `owl2-ql` and `owl2-rl` with the rewriting on. A triple term in a graph
 /// the reader can't read takes no part in their answers, so it has no say in their status.
-/// Spec: the status is `complete` (run and planned, rows kept) where no graph they read holds
-/// a triple term: none in the store, one only in a hidden named graph, one only in the
-/// default graph when they can't read it; and not `complete` where one they read does: in
-/// `:open`, in the default graph they read, or inferred where they see it (`rdfs:subPropertyOf`
-/// copies the object, so `:claims` holds the triple term).
+/// Spec: the run and plan name a triple term only where the reader can read it, and keep the
+/// rows. A term can be in `:open`, in the default graph they read, or inferred where they see
+/// it (`rdfs:subPropertyOf` copies the object, so `:claims` holds the triple term). Without a
+/// readable triple term the `owl2-rl` read is `complete`; the `owl2-ql` grant caps it at `sound-only`.
 #[test]
 fn a_readers_status_follows_the_triple_terms_they_may_read() {
     use std::sync::Arc;
@@ -2483,7 +2482,7 @@ fn a_readers_status_follows_the_triple_terms_they_may_read() {
         ("owl2-ql", Ruleset::Owl2Ql, QlRewritingMode::Auto),
         ("owl2-rl rewriting on", Ruleset::Owl2Rl, QlRewritingMode::On),
     ] {
-        for (default_graph, case, data, read, complete) in &cases {
+        for &(default_graph, case, ref data, read, no_visible_term) in &cases {
             let store = StoreService::new(StoreConfig {
                 ql_rewriting: ql,
                 ..StoreConfig::in_memory()
@@ -2497,7 +2496,7 @@ fn a_readers_status_follows_the_triple_terms_they_may_read() {
             store.use_reasoning_rules(Some(ruleset.into()));
             let scope = ReadScope::Graphs(Arc::new(GraphAccess {
                 graphs: vec!["http://example.com/open".to_owned()],
-                default_graph: *default_graph,
+                default_graph,
                 inferred: true,
                 inferred_by_support: true,
                 ..GraphAccess::default()
@@ -2508,17 +2507,26 @@ fn a_readers_status_follows_the_triple_terms_they_may_read() {
             let planned = store
                 .plan_query(&prepared, &CancellationToken::new())
                 .expect("planned");
-            let status = [result.completeness, planned.completeness]
-                .map(|c| c.map_or("none", |c| c.as_str()));
+            let statuses = [result.completeness, planned.completeness];
             let rows = String::from_utf8(result.payload).unwrap();
-            eprintln!("{regime}, {case}: {rows} {status:?}");
+            eprintln!("{regime}, {case}: {rows} {statuses:?}");
             let kept = rows.contains("example.com/a\"") || rows.contains("example.com/b\"");
-            let right = match complete {
-                true => status == ["complete"; 2],
-                false => !status.contains(&"complete"),
+            let expected = if ruleset == Ruleset::Owl2Ql || !no_visible_term {
+                "sound-only"
+            } else {
+                "complete"
             };
+            let right = statuses.iter().all(|status| {
+                status.as_ref().is_some_and(|status| {
+                    let names_triple = status
+                        .reasons
+                        .iter()
+                        .any(|r| r.text.contains("the data read holds a triple term"));
+                    status.as_str() == expected && names_triple != no_visible_term
+                })
+            });
             if !kept || !right {
-                wrong.push(format!("{regime}, {case}: {rows} {status:?}"));
+                wrong.push(format!("{regime}, {case}: {rows} {statuses:?}"));
             }
         }
     }
