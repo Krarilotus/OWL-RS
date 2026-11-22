@@ -3619,6 +3619,10 @@ mod context_tests {
 #[path = "certificate_lifecycle_tests.rs"]
 mod certificate_lifecycle_tests;
 
+#[cfg(test)]
+#[path = "run_envelope_tests.rs"]
+mod run_envelope_tests;
+
 /// A rematerialisation under `reasoner.equality = "compact"` is read as it will be certified
 /// from the moment its stack is published: a reader between the publication and the
 /// certificate (`hooks::AFTER_PUBLICATION`) answers as a reader after both, its rows and their
