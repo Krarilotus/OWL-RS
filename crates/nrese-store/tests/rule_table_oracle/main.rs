@@ -3,7 +3,9 @@ mod cycle_compat;
 mod generator;
 mod judges;
 mod oracle;
+mod per_cell;
 mod publication;
+mod review_cells;
 mod sweep;
 
 type Triple = [String; 3];
