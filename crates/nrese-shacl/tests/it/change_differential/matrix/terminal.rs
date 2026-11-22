@@ -83,7 +83,7 @@ fn stops() -> Vec<Row> {
 }
 
 // Spec: both change APIs report every failure of the later validation.
-fn failures() -> [Row; 2] {
+fn failures() -> [Row; 3] {
     let shapes = "ex:T sh:targetNode ex:n5 ; sh:sparql ex:Check .
         ex:Check sh:select '''SELECT $this ?failure WHERE {
             $this <http://example.com/p0> ?v .
@@ -103,8 +103,24 @@ fn failures() -> [Row; 2] {
         row.after_failures = BTreeMap::from([(FAILURE.into(), 1)]);
         row
     };
+    let unconditional = "ex:T sh:targetNode ex:n5 ; sh:sparql ex:Check .
+        ex:Check sh:select '''SELECT $this ?failure WHERE { BIND(true AS ?failure) }''' .";
+    let mut persistent = Row::new(
+        "failure-excluded-edit",
+        "An edit only in the excluded shapes graph keeps the failure of both validations.",
+        Case::new(
+            unconditional,
+            "",
+            Step::insert("ex:shapes { ex:n5 ex:p0 ex:v1 . }"),
+        ),
+        [],
+        [],
+    );
+    persistent.before_failures = BTreeMap::from([(FAILURE.into(), 1)]);
+    persistent.after_failures = persistent.before_failures.clone();
     [
         row("failure-trigger-data", Step::insert(trigger)),
         row("failure-trigger-shapes", step).for_shapes(),
+        persistent,
     ]
 }

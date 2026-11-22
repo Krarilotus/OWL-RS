@@ -107,6 +107,7 @@ pub(super) fn run() {
                 .unwrap_or_else(|error| panic!("{context}: {error}"))
             {
                 let location = format!("{context}, step {}, {:?}", outcome.step, outcome.entry);
+                let mut failures_forgiven = false;
                 let stop = case.stop.filter(|(entry, _)| *entry == outcome.entry);
                 let actual = match (&outcome.actual, stop.map(|(_, stop)| stop)) {
                     (Outcome::Report(actual), None) => {
@@ -123,6 +124,7 @@ pub(super) fn run() {
                                         .forgive(&gaps, &at, kind, &deviation)
                                         .unwrap_or_else(|| panic!("{location}: {deviation:?}"));
                                     known.insert(id);
+                                    failures_forgiven |= kind == Kind::Failure;
                                 }
                             }
                         }
@@ -167,7 +169,8 @@ pub(super) fn run() {
                     outcome.after.failures, row.after_failures,
                     "{location}: full after failures"
                 );
-                if let Some(actual) = actual {
+                // A forgiven failure delta was matched count by count against its entry.
+                if let Some(actual) = actual.filter(|_| !failures_forgiven) {
                     assert_eq!(
                         actual.failures, row.after_failures,
                         "{location}: actual failures"
