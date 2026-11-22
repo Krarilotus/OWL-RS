@@ -37,11 +37,18 @@ pub(crate) async fn problems(method: Method, response: Response) -> Response {
         .headers
         .get(header::CONTENT_TYPE)
         .is_some_and(|value| value.as_bytes().starts_with(PROBLEM_JSON.as_bytes()));
-    let limit = match parts.extensions.get::<Own>() {
-        Some(_) => usize::MAX,
-        None => MAX_BODY,
-    };
+    let own = parts.extensions.get::<Own>().is_some();
+    let limit = if own { usize::MAX } else { MAX_BODY };
     let bytes = axum::body::to_bytes(body, limit).await.ok();
+    // The server's own document passes as it was written, its request id appended: never
+    // decoded and written again, which would hold two more copies of it, uncharged.
+    if let (true, true, Some(bytes)) = (own, documented, &bytes) {
+        if let Some(body) = with_request_id(bytes, id.as_deref()) {
+            parts.headers.remove(header::CONTENT_LENGTH);
+            parts.headers.remove(header::CONTENT_ENCODING);
+            return Response::from_parts(parts, body);
+        }
+    }
     let mut document = match (&bytes, documented) {
         (Some(bytes), true) => match serde_json::from_slice::<Value>(bytes) {
             Ok(Value::Object(document)) => document,
@@ -64,6 +71,26 @@ pub(crate) async fn problems(method: Method, response: Response) -> Response {
     Response::from_parts(parts, body)
 }
 
+/// `document`, a JSON object as [`problem`] writes it, with `"request_id"` as its last
+/// member, as a body of two chunks: the document's bytes up to its closing brace (shared,
+/// not copied) and the member. `None` if it isn't an object's text.
+fn with_request_id(document: &axum::body::Bytes, id: Option<&str>) -> Option<axum::body::Body> {
+    let (Some(b'{'), Some(b'}')) = (document.first(), document.last()) else {
+        return None;
+    };
+    let Some(id) = id else {
+        return Some(axum::body::Body::from(document.clone()));
+    };
+    let id = serde_json::to_string(id).ok()?;
+    let empty = document.len() == 2;
+    let tail = format!("{}\"request_id\":{id}}}", if empty { "" } else { "," });
+    let head = document.slice(..document.len() - 1);
+    let chunks = [head, axum::body::Bytes::from(tail)].map(Ok::<_, std::convert::Infallible>);
+    Some(axum::body::Body::from_stream(futures_util::stream::iter(
+        chunks,
+    )))
+}
+
 /// The document for a plain answer: the status's kind, its text as the detail.
 fn framework(status: axum::http::StatusCode, text: &str) -> Map<String, Value> {
     let (problem_type, title) = kind(status);
@@ -84,6 +111,7 @@ mod tests {
     use axum::Router;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use axum::response::IntoResponse;
     use axum::routing::get;
     use tower::util::ServiceExt;
     use tower_http::request_id::PropagateRequestIdLayer;
@@ -92,7 +120,7 @@ mod tests {
     use crate::error::ApiError;
 
     /// As the server layers it ([`crate::app::build_app`]): outside the id's propagation.
-    async fn answer(app: Router, method: Method, uri: &str) -> (StatusCode, String, Value) {
+    async fn respond(app: Router, method: Method, uri: &str) -> Response {
         let app = app
             .layer(PropagateRequestIdLayer::x_request_id())
             .layer(axum::middleware::map_response(problems));
@@ -102,7 +130,11 @@ mod tests {
             .header("x-request-id", "req-1")
             .body(Body::empty())
             .unwrap();
-        let response = app.oneshot(request).await.unwrap();
+        app.oneshot(request).await.unwrap()
+    }
+
+    async fn answer(app: Router, method: Method, uri: &str) -> (StatusCode, String, Value) {
+        let response = respond(app, method, uri).await;
         let status = response.status();
         let media = response
             .headers()
@@ -142,6 +174,16 @@ mod tests {
                 "/empty",
                 get(|| async { (StatusCode::UNPROCESSABLE_ENTITY, "") }),
             )
+            .route(
+                "/own-as-written",
+                get(|| async {
+                    let media = [(header::CONTENT_TYPE, PROBLEM_JSON)];
+                    let mut response =
+                        (StatusCode::CONFLICT, media, OWN_AS_WRITTEN).into_response();
+                    response.extensions_mut().insert(Own);
+                    response
+                }),
+            )
             .route("/at-limit", get(|| async { plain(KIB_64) }))
             .route("/past-limit", get(|| async { plain(KIB_64 + 1) }))
             .route(
@@ -160,6 +202,27 @@ mod tests {
 
     /// The limit the docs name for a framework's message: 64 KiB.
     const KIB_64: usize = 65_536;
+
+    /// A document of the server's own, written with spaces a decode and new encoding
+    /// would not keep.
+    const OWN_AS_WRITTEN: &str =
+        r#"{"type": "https://nrese.dev/problems/conflict", "detail": "x"}"#;
+
+    /// Spec (docs/ops/http-api.md, the error envelope): the server's own document comes
+    /// whole, with `request_id`. The envelope passes it as written, the member appended:
+    /// it doesn't decode it and write it again, which would hold two more copies of a
+    /// large one, outside the request's memory.
+    #[tokio::test]
+    async fn own_documents_pass_as_written_with_the_request_id_appended() {
+        let response = respond(app(), Method::GET, "/own-as-written").await;
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let expected = OWN_AS_WRITTEN.replace("\"x\"}", "\"x\",\"request_id\":\"req-1\"}");
+        assert_eq!(String::from_utf8_lossy(&bytes), expected);
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
 
     /// `len` bytes of text, as a refusal that quotes long values has.
     fn long_text(len: usize) -> String {
