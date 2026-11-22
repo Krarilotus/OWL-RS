@@ -106,6 +106,10 @@ class PrivateTerms(unittest.TestCase):
             "a list line that is no pattern": lambda: (self.overlay / "publish-deny.txt").write_text("zz(\n"),
             "a list line Python reads otherwise": lambda: (self.overlay / "publish-deny.txt").write_text("[[:alpha:]]\n"),
             "an equivalence class": lambda: (self.overlay / "publish-deny.txt").write_text("[[=h=]]ostname\n"),
+            "an equivalence class among others": lambda: (self.overlay / "publish-deny.txt").write_text(
+                "[a[=h=]]ostname\n"),
+            "a collating element among others": lambda: (self.overlay / "publish-deny.txt").write_text(
+                "[a[.h.]]ostname\n"),
             "a list that links to nothing": lambda: os.symlink(self.root / "gone", self.overlay / "publish-deny.txt"),
             "an identifying field that isn't text": lambda: (self.overlay / "hosts.toml").write_text(
                 "[host.zzkeyzz]\nssh = 42\n"),

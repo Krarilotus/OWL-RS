@@ -50,8 +50,9 @@ HOST_FIELDS = {
 UNKNOWN = "a field the check doesn't know"  # its name may itself be private: never printed
 HOME = re.compile(r"(?:/home/|/Users/|[A-Za-z]:[/\\](?i:users)[/\\])([^/\\\s'\"]+)")
 # What Python reads otherwise than an extended regular expression (a push-deny list's dialect): refused, not
-# silently matched as something else.
-FOREIGN = ("[[:", "[[=", "[[.", r"\<", r"\>")
+# silently matched as something else. A class, equivalence or collating element opens with these anywhere in a
+# bracket expression; a pattern that only means the characters writes them escaped or out of brackets.
+FOREIGN = ("[:", "[=", "[.", r"\<", r"\>")
 # Literal pathspecs whatever the caller's environment sets (a conflicting mode makes git fail: could not check),
 # and the objects as stored: no replace ref or graft stands in for what a push sends (suitekit/checkout.py's
 # STORED_OBJECTS).
