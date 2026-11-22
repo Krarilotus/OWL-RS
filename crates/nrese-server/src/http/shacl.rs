@@ -152,27 +152,36 @@ pub async fn validate(
 /// property names, and the failures (SPARQL-based constraints that couldn't be
 /// evaluated; `conforms` is then false).
 fn report_json(validation: &ShaclValidation) -> serde_json::Value {
-    let results: Vec<serde_json::Value> = validation
-        .results_text()
-        .into_iter()
-        .map(|result| {
-            serde_json::json!({
-                "focusNode": result.focus_node,
-                "resultPath": result.path,
-                "value": result.value,
-                "sourceShape": result.source_shape,
-                "sourceConstraintComponent": result.component,
-                "resultSeverity": result.severity,
-                "resultMessage": result.messages,
-            })
-        })
-        .collect();
+    let results: Vec<serde_json::Value> =
+        validation.results_text().iter().map(result_json).collect();
     serde_json::json!({
         "conforms": validation.report.conforms(),
         "revision": validation.revision,
         "shapes": validation.shapes,
         "results": results,
         "failures": validation.report.failures,
+    })
+}
+
+fn result_json(result: &nrese_store::ShaclResultText) -> serde_json::Value {
+    serde_json::json!({
+        "focusNode": result.focus_node,
+        "resultPath": result.path,
+        "value": result.value,
+        "sourceShape": result.source_shape,
+        "sourceConstraintComponent": result.component,
+        "resultSeverity": result.severity,
+        "resultMessage": result.messages,
+    })
+}
+
+pub(crate) fn refusal_json(refusal: &nrese_store::ShaclRefusal) -> serde_json::Value {
+    let results: Vec<_> = refusal.results.iter().map(result_json).collect();
+    serde_json::json!({
+        "results": results,
+        "results_omitted": refusal.results_omitted,
+        "failures": refusal.failures,
+        "failures_omitted": refusal.failures_omitted,
     })
 }
 

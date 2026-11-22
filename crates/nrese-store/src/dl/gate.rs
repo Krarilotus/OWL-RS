@@ -343,6 +343,7 @@ fn rejection(
             }),
             detail,
             attribution: None,
+            shacl: None,
         }
     };
     let reject = view.reject(full, |view| {

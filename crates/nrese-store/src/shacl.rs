@@ -6,16 +6,19 @@
 //!
 //! [`StoreConfig::shapes_graph`]: crate::StoreConfig::shapes_graph
 
+use std::collections::BinaryHeap;
+
 use nrese_engine::{EncodedQuad, GraphSelector, ReadModel, Snapshot, TermId, Transaction};
 use nrese_exec::stop::StopSource;
 use nrese_rdf::{GraphName, NamedNode, NamedNodeRef, Term};
 use nrese_shacl::{
-    PropertyPath, Selection, ShapeError, Shapes, ValidationReport, compile, compile_until,
-    validate, validate_changes, validate_shapes_change,
+    PropertyPath, Selection, ShapeError, Shapes, ValidationReport, ValidationResult, compile,
+    compile_until, validate, validate_changes, validate_shapes_change,
 };
 use nrese_sparql::{CancellationToken, QueryEvaluationError, ReadView, Resources};
 
 use crate::error::{StoreError, StoreResult};
+use crate::mutation::evidence::{Draft, EvidenceView, in_readable_graphs};
 use crate::mutation::{MutationState, MutationTicket};
 use crate::query::GraphResultFormat;
 use crate::rdf_io::{BlankNodes, each_graph_quad, serialize_triples};
@@ -122,6 +125,42 @@ pub struct ShaclResultText {
     pub messages: Vec<String>,
 }
 
+/// The results and validation failures shown to the committer of a refused write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShaclRefusal {
+    pub results: Vec<ShaclResultText>,
+    /// Refusing results beyond the list's limit.
+    pub results_omitted: usize,
+    pub failures: Vec<String>,
+    /// Validation failures beyond the list's limit.
+    pub failures_omitted: usize,
+}
+
+impl ShaclResultText {
+    fn of(result: &ValidationResult) -> Self {
+        let text = |term: &Term| match term {
+            Term::NamedNode(node) => node.as_str().to_owned(),
+            other => other.to_string(),
+        };
+        Self {
+            focus_node: text(&result.focus_node),
+            path: result.path.as_ref().map(|path| match path {
+                PropertyPath::Predicate(predicate) => predicate.as_str().to_owned(),
+                other => other.to_string(),
+            }),
+            value: result.value.as_ref().map(text),
+            source_shape: text(&result.source_shape),
+            component: result.component.as_str().to_owned(),
+            severity: result.severity.as_str().to_owned(),
+            messages: result
+                .messages
+                .iter()
+                .map(|message| message.value().to_owned())
+                .collect(),
+        }
+    }
+}
+
 impl ShaclValidation {
     /// The report as an RDF graph in `format`.
     pub fn serialize(&self, format: GraphResultFormat) -> StoreResult<Vec<u8>> {
@@ -130,29 +169,10 @@ impl ShaclValidation {
 
     /// The results in plain text.
     pub fn results_text(&self) -> Vec<ShaclResultText> {
-        let text = |term: &Term| match term {
-            Term::NamedNode(node) => node.as_str().to_owned(),
-            other => other.to_string(),
-        };
         self.report
             .results
             .iter()
-            .map(|result| ShaclResultText {
-                focus_node: text(&result.focus_node),
-                path: result.path.as_ref().map(|path| match path {
-                    PropertyPath::Predicate(predicate) => predicate.as_str().to_owned(),
-                    other => other.to_string(),
-                }),
-                value: result.value.as_ref().map(text),
-                source_shape: text(&result.source_shape),
-                component: result.component.as_str().to_owned(),
-                severity: result.severity.as_str().to_owned(),
-                messages: result
-                    .messages
-                    .iter()
-                    .map(|message| message.value().to_owned())
-                    .collect(),
-            })
+            .map(ShaclResultText::of)
             .collect()
     }
 }
@@ -355,7 +375,7 @@ fn introduced_in<A: ReadView + Sync, B: ReadView + Sync>(
 /// A result as a refusal names it: its focus node and component, and its messages
 /// (`sh:resultMessage`) where it has any, in the order of their text: the report's order is
 /// the dictionary's, which statements in graphs a committer may not read can decide.
-pub(crate) fn described(result: &nrese_shacl::ValidationResult) -> String {
+fn described(result: &ValidationResult) -> String {
     let mut text = format!("focus node {}, {}", result.focus_node, result.component);
     let mut messages: Vec<String> = result.messages.iter().map(ToString::to_string).collect();
     messages.sort_unstable();
@@ -366,18 +386,159 @@ pub(crate) fn described(result: &nrese_shacl::ValidationResult) -> String {
     text
 }
 
+/// By decoded terms, so interning terms in hidden graphs cannot change the order.
+fn result_key(result: &ValidationResult) -> impl Ord + '_ {
+    (
+        &result.focus_node,
+        &result.component,
+        &result.path,
+        &result.value,
+        &result.source_shape,
+        &result.severity,
+        &result.source_constraint,
+        &result.messages,
+    )
+}
+
+struct OrderedResult<'a>(&'a ValidationResult);
+
+impl<'a> OrderedResult<'a> {
+    fn of(result: &'a mut ValidationResult) -> Self {
+        // Validation can carry message literals in dictionary order.
+        result.messages.sort_unstable();
+        Self(result)
+    }
+}
+
+impl Ord for OrderedResult<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        result_key(self.0).cmp(&result_key(other.0))
+    }
+}
+
+impl PartialOrd for OrderedResult<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for OrderedResult<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for OrderedResult<'_> {}
+
+/// Keeps the smallest items in order, counting the rest without storing them.
+fn smallest<T: Ord>(items: impl Iterator<Item = T>, bound: Option<usize>) -> (Vec<T>, usize) {
+    let Some(bound) = bound.filter(|&bound| bound > 0) else {
+        let mut all: Vec<_> = items.collect();
+        all.sort_unstable();
+        return (all, 0);
+    };
+    let mut kept = BinaryHeap::new();
+    let mut total = 0;
+    for item in items {
+        total += 1;
+        if kept.len() < bound {
+            kept.push(item);
+        } else if let Some(mut largest) = kept.peek_mut()
+            && item < *largest
+        {
+            *largest = item;
+        }
+    }
+    let omitted = total - kept.len();
+    (kept.into_sorted_vec(), omitted)
+}
+
+/// The common refusal for either the full validation or the committer's own validation.
+pub(crate) fn refusal(
+    mut report: ValidationReport,
+    rejects: impl Fn(&ValidationResult) -> bool,
+    bound: Option<usize>,
+    running: impl Fn() -> bool,
+) -> Option<Draft> {
+    let refusing = report
+        .results
+        .iter_mut()
+        .take_while(|_| running())
+        .filter(|result| rejects(result))
+        .map(OrderedResult::of);
+    let (results, results_omitted) = smallest(refusing, bound);
+    let failures = report.failures.drain(..).take_while(|_| running());
+    let (failures, failures_omitted) = smallest(failures, bound);
+    if !running() || (results.is_empty() && failures.is_empty()) {
+        return None;
+    }
+    let first = results.first().map(|result| result.0);
+    let mut detail = format!(
+        "the commit introduces {} SHACL result(s) the gate rejects",
+        results.len() + results_omitted
+    );
+    if !failures.is_empty() {
+        let total = failures.len() + failures_omitted;
+        detail.push_str(&format!(" and {total} failure(s)"));
+    }
+    if let Some(first) = first {
+        detail.push_str(&format!("; first: {}", described(first)));
+    }
+    let explanation = first.map(|result| nrese_reasoner::RejectExplanation {
+        summary: detail.clone(),
+        violated_constraint: result.component.as_str().to_owned(),
+        focus_resource: result.focus_node.to_string(),
+        evidence: Vec::new(),
+    });
+    let results = results
+        .into_iter()
+        .take_while(|_| running())
+        .map(|result| ShaclResultText::of(result.0))
+        .collect();
+    running().then_some(Draft {
+        kind: crate::RejectKind::ShapesViolated,
+        detail,
+        explanation,
+        attribution: None,
+        shacl: Some(ShaclRefusal {
+            results,
+            results_omitted,
+            failures,
+            failures_omitted,
+        }),
+    })
+}
+
+/// The gate log counts every result, in the same order a refusal would use.
+pub(crate) fn reported(mut report: ValidationReport) -> String {
+    let first = report
+        .results
+        .iter_mut()
+        .map(OrderedResult::of)
+        .min()
+        .map_or_else(String::new, |result| {
+            format!("; first: {}", described(result.0))
+        });
+    format!(
+        "the commit introduces {} SHACL result(s) and {} failure(s){first}",
+        report.results.len(),
+        report.failures.len()
+    )
+}
+
 /// The SHACL reason a restricted committer's view shows: the results the commit introduces
 /// in the statements asserted in graphs it may read, against the shapes of the shapes
 /// graph, if it may read that ([`crate::mutation::evidence::Readable`]). `None` if there
 /// are none, that isn't known within `resources`, or the shapes use SHACL-SPARQL, whose
 /// queries the view can't confine (D16-065).
 pub(crate) fn view_reason(
-    view: &crate::mutation::evidence::EvidenceView<'_, '_>,
+    view: &EvidenceView<'_, '_>,
     pending: Option<&Snapshot>,
     shapes_graph: &str,
-    rejects: impl Fn(&nrese_shacl::ValidationResult) -> bool,
+    rejects: impl Fn(&ValidationResult) -> bool,
+    bound: Option<usize>,
     resources: &Resources,
-) -> Option<crate::mutation::evidence::Draft> {
+) -> Option<Draft> {
     let tx = view.tx();
     let shapes_id = tx.lookup(graph_iri(shapes_graph).ok()?.as_ref().into())?;
     if !view.graph(shapes_id) {
@@ -415,43 +576,9 @@ pub(crate) fn view_reason(
         resources,
     )
     .ok()??;
-    // The first by what the view's statements say, never by the results' order, which is
-    // the dictionary's: term ids follow what was interned first, in any graph.
-    // Every field, as decoded terms (`nrese_rdf::Term`'s order: the kind, then the value; a
-    // blank node by its label, the store's name for it in the committer's view), never
-    // their text: equal keys are equal results, so either is shown the same.
-    let mut count = 0;
-    let first = report
-        .results
-        .iter()
-        .take_while(|_| resources.check().is_ok())
-        .filter(|result| rejects(result))
-        .inspect(|_| count += 1)
-        .min_by_key(|result| {
-            (
-                result.focus_node.clone(),
-                result.component.clone(),
-                result.path.clone(),
-                result.value.clone(),
-                result.source_shape.clone(),
-                result.severity.clone(),
-                result.source_constraint.clone(),
-                result.messages.clone(),
-            )
-        })?;
-    resources.check().ok()?;
-    let reason = format!(
-        "the commit introduces {} SHACL result(s) the gate rejects; first: {}",
-        count,
-        described(first)
-    );
-    Some(crate::mutation::evidence::shown(
-        crate::RejectKind::ShapesViolated,
-        reason,
-        first.component.as_str(),
-        first.focus_node.to_string(),
-        Vec::new(),
-    ))
+    let mut draft = refusal(report, rejects, bound, || resources.check().is_ok())?;
+    draft.detail = in_readable_graphs(&draft.detail);
+    Some(draft)
 }
 
 /// The SHACL commit gate's state: its policy, and the shapes it checks commits against (the

@@ -298,6 +298,7 @@ Ill-formed shapes are 400, naming the shape and the parameter.
 These are its limits.
 
 - SHACL Core and SHACL-SPARQL; SHACL Advanced Features are not supported, nor is `sh:entailment` (a shapes graph that asks for an entailment regime is reported as a failure). Commits are validated where the SHACL gate is on (`shacl.gate`, off by default: [config-reference.md](config-reference.md#shacl.gate), which says when a commit is refused); bulk loads (`nrese-server load`, the import endpoints) skip the gate ([storage](../spec/02-storage-and-transactions.md#bulk-loads)).
+- An enforcing gate's [refusal](#example-a-commit-refused-by-shacl) lists the results and validation failures that caused it. The result fields use the same JSON form as this endpoint's report.
 - A `POST`'s shapes live in a transaction of its own that is never committed and takes no writer slot, so other writes go on; they count against the request's memory.
 - The shapes graph is an ordinary graph: queries see it, and reasoning reads it like any other.
 
@@ -399,7 +400,7 @@ Nothing of a request refused with a `4xx` status is applied, except that a refus
 
 | Code | When | What to do |
 |---|---|---|
-| 400 | The request is wrong: syntax error, invalid IRI, malformed RDF, a commit rejected by a consistency check (with an explanation) or by the SHACL gate ([when](config-reference.md#shacl.gate)) | Fix what `detail` names (for a rejected commit, the statements in `reasoner_reject`) and send it again (worked examples: [a syntax error](#example-a-sparql-syntax-error), [a refused commit](#example-a-commit-refused-as-inconsistent)) |
+| 400 | Syntax error, invalid IRI, malformed RDF, or a commit refused by a consistency check or the [SHACL gate](config-reference.md#shacl.gate) | Fix what `detail` names. A refused commit can also give statements in `reasoner_reject` or validation results and failures in `shacl`. See [syntax](#example-a-sparql-syntax-error), [consistency](#example-a-commit-refused-as-inconsistent) and [SHACL](#example-a-commit-refused-by-shacl) examples. |
 | 401, 403 | Authentication or authorisation failed; 403 also for a write to a graph the access policy doesn't let the user write | 401: send credentials the [auth mode](config-reference.md#auth-modes) takes. 403: an administrator grants the role or graph ([graph access](#graph-level-access-control)) |
 | 404 | The surface is disabled, or the named graph doesn't exist | Check the URL, and that the [deployment posture](config-reference.md#server) enables the surface; a named graph without statements doesn't exist ([Graph Store Protocol](#graph-store-protocol)) |
 | 406 | The client accepts no format the result has | Send an `Accept` the result has ([formats](#result-formats)) |
@@ -412,7 +413,31 @@ Nothing of a request refused with a `4xx` status is applied, except that a refus
 | 500 | The server's fault; logged with the request id | Report it with `request_id`: the server's log has the error under that id |
 | 503 | Starting; (for `/readyz`) in quarantine; or the memory queries and client transactions share is taken, so try again later; or, to a reader of only some graphs who sees inferred statements, the stored inferences aren't known to be the closure of the rules in place (a read, an explanation or a transaction's read: while a repository's reasoning is changed or an import's inferences are recomputed, after that recomputation failed, and always on a read replica); or (type `rights-changed`) the requester's rights changed while its write waited, and nothing was written | Starting: wait for `/readyz` to answer 200. Memory taken: send again (after `Retry-After`, where sent); if it recurs, raise `budgets.total_query_memory` ([budgets](config-reference.md#budgets)). Inferences not known to be the closure: send again; after a failed recomputation an administrator rebuilds them (`POST …/reasoning/rematerialise`, named in the answer); on a read replica, read from the primary ([replication](replication.md#limits-of-this-first-step)). Rights changed: send it again; it is judged under the new rights |
 
-Every error is an `application/problem+json` document ([RFC 9457](https://www.rfc-editor.org/rfc/rfc9457)), whoever answered: a handler, or the framework itself (no such route 404, a method the route doesn't take 405 with `Allow`, a body that doesn't decode). It has `type`, `title`, `status` and `detail`, and `request_id`, the id that `x-request-id` carries on every response and the server's log carries with the request. A document the server writes comes with all its members, however long its `detail`. A body the framework answers with that is over 64 KiB becomes the problem of its status alone: its `type`, `title` and `status`, the title as `detail`, and `request_id`. A rejected commit answers 400, its type saying what kind of reason the committer is shown, not which check rejected: `reasoner-reject` (the data shown is inconsistent), `undecided-reject` (under `owl2-dl`, the OWL 2 RL rules find a clash in the whole data that OWL 2 DL may read as consistent, which this release doesn't decide; the detail says so and gives the ways out), `shacl-reject` (the data shown has SHACL results the gate rejects for) or `commit-reject` (the committer's graphs show no reason by themselves, whichever check rejected). The data shown is the whole data for a committer that may read every graph, else the graphs it may read. Its `reasoner_reject` has the rule or constraint and the statements shown, where there are any; the field keeps its name for every kind, so that clients that read it go on working. The exceptions are for clients that show the message as text: SPARQL parse errors under the `plain-text` profile, and an RDF4J transaction's refused isolation level; and a not-ready `503` from `/readyz` or the extended health, which is the status document probes read. The console and its CLI print an error as `title: detail (request <id>)`, and the CLI exits non-zero.
+Errors use `application/problem+json` ([RFC 9457](https://www.rfc-editor.org/rfc/rfc9457)),
+including framework errors such as a missing route or an unsupported method. The body has
+`type`, `title`, `status`, `detail` and `request_id`. The response's `x-request-id`
+header and the server's log carry the same id. A document the server writes comes with all
+its members, however long its `detail`. A body the framework answers with that is over
+64 KiB becomes the problem of its status alone: its `type`, `title` and `status`, the title
+as `detail`, and `request_id`.
+
+A refused commit answers 400. Its problem type describes the reason visible to the
+committer.
+
+- `reasoner-reject` means the data shown is inconsistent.
+- `undecided-reject` means the OWL 2 RL rules found a clash that OWL 2 DL may read as
+  consistent. The detail describes the choices.
+- `shacl-reject` carries the refusing results and validation failures in `shacl`.
+- `commit-reject` means the committer's own graphs show no reason for the refusal.
+
+`reasoner_reject` gives the rule or constraint and any statements shown. For
+`shacl-reject`, it gives the first result's component and focus node with empty evidence.
+See the [SHACL example](#example-a-commit-refused-by-shacl) for the refusal fields.
+
+SPARQL parse errors under the `plain-text` profile and RDF4J transaction isolation refusals
+use plain text. The not-ready `503` from `/readyz` or extended health uses the health status
+document. The console and CLI print an error as `title: detail (request <id>)`. The CLI
+exits non-zero.
 
 A server that doesn't start answers nothing, and its errors are in the log and its exit status ([startup errors](server-setup.md#startup-errors), such as a [locked data directory](server-setup.md#err-data-directory-locked) or an [address that can't be bound](server-setup.md#err-failed-to-bind)).
 
@@ -515,6 +540,57 @@ date: Sun, 15 Nov 2026 22:45:17 GMT
   no rows.
 - To fix it, drop the premise that is wrong (here, one of Felix's two classes) and send the write
   again.
+
+### Example: a commit refused by SHACL
+
+An enforcing gate refuses a write that adds Bob as a person without a name. The response
+has status 400 and content type `application/problem+json`.
+
+```json
+{
+  "type": "https://nrese.dev/problems/shacl-reject",
+  "title": "SHACL Reject",
+  "status": 400,
+  "detail": "the commit introduces 1 SHACL result(s) the gate rejects; first: focus node <http://example.org/bob>, <http://www.w3.org/ns/shacl#MinCountConstraintComponent>, message \"a person needs a name\"",
+  "reasoner_reject": {
+    "summary": "the commit introduces 1 SHACL result(s) the gate rejects; first: focus node <http://example.org/bob>, <http://www.w3.org/ns/shacl#MinCountConstraintComponent>, message \"a person needs a name\"",
+    "violated_constraint": "http://www.w3.org/ns/shacl#MinCountConstraintComponent",
+    "focus_resource": "<http://example.org/bob>",
+    "likely_commit_trigger": null,
+    "commit_attribution": null,
+    "evidence": []
+  },
+  "shacl": {
+    "results": [
+      {
+        "focusNode": "http://example.org/bob",
+        "resultPath": "http://example.org/name",
+        "value": null,
+        "sourceShape": "http://example.org/PersonName",
+        "sourceConstraintComponent": "http://www.w3.org/ns/shacl#MinCountConstraintComponent",
+        "resultSeverity": "http://www.w3.org/ns/shacl#Violation",
+        "resultMessage": ["a person needs a name"]
+      }
+    ],
+    "results_omitted": 0,
+    "failures": [],
+    "failures_omitted": 0
+  },
+  "request_id": "<id>"
+}
+```
+
+Only results at or above the gate's severity threshold appear in the refusal or its result
+count. Their order follows the RDF terms, and failure strings are ordered by text.
+`reasoner_reject` gives the first result's constraint component and focus node with empty
+`evidence`. It is `null` when there are only failures. The
+[`shacl.reject_results`](config-reference.md#shacl.reject_results) setting limits each of the
+two lists. Add each list's omitted count to its length to get its total.
+
+A committer with limited graph access gets a report from validation of its own readable
+assertions. If it cannot read the shapes graph, or those shapes use SHACL-SPARQL, a
+`commit-reject` with no `shacl` member is returned when its view shows no other reason.
+Add Bob's missing name to the write and send it again.
 
 ## Service and operations
 

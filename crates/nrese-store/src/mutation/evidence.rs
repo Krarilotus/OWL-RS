@@ -35,6 +35,7 @@ pub(crate) struct Draft {
     pub detail: String,
     pub explanation: Option<RejectExplanation>,
     pub attribution: Option<RejectAttribution>,
+    pub shacl: Option<crate::ShaclRefusal>,
 }
 
 /// Ends every restricted committer's rejection.
@@ -122,6 +123,7 @@ impl<'v, 'e> EvidenceView<'v, 'e> {
             detail,
             explanation,
             attribution,
+            shacl,
         } = match self.restricted() {
             false => full(),
             true => view(self),
@@ -131,6 +133,7 @@ impl<'v, 'e> EvidenceView<'v, 'e> {
             detail,
             explanation,
             attribution,
+            shacl,
             _projected: Projected(()),
         }
     }
@@ -147,6 +150,7 @@ pub(crate) fn nothing_shown() -> Draft {
         ),
         explanation: None,
         attribution: None,
+        shacl: None,
     }
 }
 
@@ -161,9 +165,7 @@ pub(crate) fn shown(
 ) -> Draft {
     Draft {
         kind,
-        detail: format!(
-            "the mutation was rejected; in the graphs you can read, {reason}. {ONLY_READABLE}"
-        ),
+        detail: in_readable_graphs(&reason),
         explanation: Some(RejectExplanation {
             summary: reason,
             violated_constraint: constraint.to_owned(),
@@ -171,7 +173,12 @@ pub(crate) fn shown(
             evidence,
         }),
         attribution: None,
+        shacl: None,
     }
+}
+
+pub(crate) fn in_readable_graphs(reason: &str) -> String {
+    format!("the mutation was rejected; in the graphs you can read, {reason}. {ONLY_READABLE}")
 }
 
 /// The likely commit-local trigger sentence of `attribution`, or nothing.

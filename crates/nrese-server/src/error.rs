@@ -3,12 +3,11 @@ use std::borrow::Cow;
 use axum::Json;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use nrese_reasoner::RejectExplanation;
 use serde::Serialize;
 use thiserror::Error;
 
 use crate::reject_view::RejectExplanationView;
-use nrese_store::{RejectAttribution, RejectKind};
+use nrese_store::{MutationReject, RejectKind, ShaclRefusal};
 
 #[derive(Clone, Debug, Error)]
 pub enum ApiError {
@@ -22,6 +21,7 @@ pub enum ApiError {
         kind: RejectKind,
         detail: String,
         reject: Box<Option<RejectExplanationView>>,
+        shacl: Option<Box<ShaclRefusal>>,
     },
     #[error("unauthorized: {0}")]
     Unauthorized(String, Option<&'static str>),
@@ -81,18 +81,14 @@ impl ApiError {
         self
     }
 
-    pub fn rejected(
-        kind: RejectKind,
-        message: impl Into<String>,
-        reject: Option<RejectExplanation>,
-        commit_attribution: Option<RejectAttribution>,
-    ) -> Self {
+    pub fn rejected(reject: MutationReject) -> Self {
         Self::Rejected {
-            kind,
-            detail: message.into(),
-            reject: Box::new(reject.as_ref().map(|reject| {
-                crate::reject_view::reject_view(reject, commit_attribution.as_ref())
+            kind: reject.kind,
+            detail: reject.detail,
+            reject: Box::new(reject.explanation.as_ref().map(|explanation| {
+                crate::reject_view::reject_view(explanation, reject.attribution.as_ref())
             })),
+            shacl: reject.shacl.map(Box::new),
         }
     }
 
@@ -158,7 +154,9 @@ impl IntoResponse for ApiError {
             tracing::error!(%detail, "request failed on the server side");
         }
         let rejected = match &self {
-            Self::Rejected { kind, .. } => Some(*kind),
+            Self::Rejected { kind, shacl, .. } => {
+                Some((*kind, shacl.as_deref().map(crate::http::refusal_json)))
+            }
             _ => None,
         };
         if let Self::IncompleteAnswer(answer) = self {
@@ -218,19 +216,24 @@ impl IntoResponse for ApiError {
             }
             Self::Internal(detail) => (StatusCode::INTERNAL_SERVER_ERROR, detail, None),
         };
-        let (problem_type, title) = match rejected {
-            Some(reject) => {
+        let (problem_type, title, shacl) = match rejected {
+            Some((reject, shacl)) => {
                 let (slug, title) = reject_label(reject);
                 (
                     Cow::Owned(format!("https://nrese.dev/problems/{slug}")),
                     Cow::Borrowed(title),
+                    shacl,
                 )
             }
             None if rights_changed => (
                 Cow::Borrowed("https://nrese.dev/problems/rights-changed"),
                 Cow::Borrowed("Rights Changed"),
+                None,
             ),
-            None => kind(status),
+            None => {
+                let (problem_type, title) = kind(status);
+                (problem_type, title, None)
+            }
         };
         let mut response = problem(
             status,
@@ -240,6 +243,7 @@ impl IntoResponse for ApiError {
                 status: status.as_u16(),
                 detail,
                 reasoner_reject,
+                shacl,
             },
         );
         if let Some(challenge) = challenge {
@@ -369,6 +373,8 @@ struct ProblemJson {
     status: u16,
     detail: String,
     reasoner_reject: Option<RejectExplanationView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shacl: Option<serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -393,8 +399,13 @@ mod tests {
     /// same whichever gate rejected (D16-503).
     #[tokio::test]
     async fn a_rejection_with_no_reason_shown_names_no_gate() {
-        let response =
-            ApiError::rejected(RejectKind::NotShown, "rejected", None, None).into_response();
+        let response = ApiError::Rejected {
+            kind: RejectKind::NotShown,
+            detail: "rejected".to_owned(),
+            reject: Box::new(None),
+            shacl: None,
+        }
+        .into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await

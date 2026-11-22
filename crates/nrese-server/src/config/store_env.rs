@@ -168,6 +168,12 @@ pub(super) fn parse_store_config(
             source.get(names::SHACL_GATE).as_deref(),
             source.get(names::SHACL_GATE_SEVERITY).as_deref(),
         )?,
+        shacl_reject_results: super::env_values::parse_limit(
+            source,
+            names::SHACL_REJECT_RESULTS,
+            defaults.shacl_reject_results,
+            |text| Ok(text.parse()?),
+        )?,
         dl: parse_dl(source)?,
         // The role is `replication.mode`'s, set at the open (`main.rs`).
         replica: false,

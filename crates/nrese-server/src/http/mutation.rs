@@ -65,15 +65,7 @@ fn map_error(policy: &PolicyConfig, error: MutationError, timeout_message: &str)
                 ApiError::bad_request(source.to_string())
             }
         }
-        MutationError::Rejected(reject) => {
-            let reject = *reject;
-            ApiError::rejected(
-                reject.kind,
-                reject.detail,
-                reject.explanation,
-                reject.attribution,
-            )
-        }
+        MutationError::Rejected(reject) => ApiError::rejected(*reject),
         MutationError::Cancelled => ApiError::timeout(timeout_message.to_owned()),
         error @ MutationError::Retired => ApiError::busy(error.to_string()),
         error @ MutationError::RightsChanged => ApiError::RightsChanged(error.to_string()),
