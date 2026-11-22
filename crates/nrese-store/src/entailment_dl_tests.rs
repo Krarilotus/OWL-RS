@@ -244,6 +244,34 @@ fn the_empty_conclusion_past_the_time_is_unknown() {
     assert_eq!(answers, ["Yes".to_owned(), "unknown".to_owned()]);
 }
 
+/// Spec (`entails`: the mode at the call's start gives its route and, under `owl2-dl`, its one
+/// `dl.timeout`): a check started outside `owl2-dl` stays on the rules' route when the mode
+/// switches to `owl2-dl` during it, and answers a complement only the DL engines show with
+/// the rules' `NotEntailed`, never with a DL answer found past the time.
+#[test]
+fn a_mode_switch_during_the_check_leaves_it_on_its_route() {
+    let dl = DlConfig {
+        timeout: Some(Duration::from_millis(300)),
+        ..DlConfig::default()
+    };
+    let (store, _pipeline) = dl_store(dl, EMPTY_C);
+    let rules = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl)
+        .materialised_program()
+        .unwrap();
+    store.dl().set_active(false, false);
+    let switched = Arc::clone(&store);
+    hooks::AFTER_CERTIFIED.set(Some(Box::new(move || {
+        switched.dl().set_active(true, false);
+    })));
+    hooks::AFTER_DL_PREMISE.set(Some(Box::new(|| {
+        std::thread::sleep(Duration::from_millis(600));
+    })));
+    let answer = store.entails(rules, &not_in("a", "C"));
+    hooks::AFTER_CERTIFIED.set(None);
+    hooks::AFTER_DL_PREMISE.set(None);
+    assert_eq!(format!("{answer:?}"), "Ok(NotEntailed)");
+}
+
 /// Spec (`entailment` module docs: under `owl2-dl` the DL engines decide the whole
 /// conclusion): a ground conclusion the closure holds is entailed by the DL check.
 #[test]
