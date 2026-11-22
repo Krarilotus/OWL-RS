@@ -83,7 +83,8 @@ Validate RDF data against SHACL shapes, natively and fast enough to run on every
 - **Position:** after reasoning, before the commit, inside the transaction. A rejected commit changes nothing (the same contract as consistency rejection, [reasoning-semantics.md](../spec/reasoning-semantics.md)).
 - **Policy, configurable:**
   - `off`;
-  - `report`: validate and log the result count and first result in term order.
+  - `report`: validate and log the result count and first result in term order; it rejects no commit for its
+    results, only one whose check needs more memory than its budget (below).
   - `enforce`: reject a commit that adds results at or above a severity (default
     `sh:Violation`) or leaves a validation failure.
 - **Refusal:** the write reports only results that meet the gate's threshold and any
@@ -107,6 +108,13 @@ Validate RDF data against SHACL shapes, natively and fast enough to run on every
   limit, it checks against whole validations in the state before, once per targeted
   ancestor of the candidate shapes. Individual compound property paths can still expand
   before the walk counts the pairs they yield.
+- **Memory:** the affected walk charges its seeds, reached sets and returned set to the
+  write's memory envelope through the lifetime of each set. It charges path outputs on
+  taking ownership. A refused charge stops the commit with `MemoryLimit` in `report` or
+  `enforce` mode. A commit that previously succeeded while holding more memory than the budget
+  allowed can now be refused. Raise
+  [`budgets.query_memory`](../ops/config-reference.md#budgets.query_memory)
+  (`NRESE_MAX_QUERY_MEMORY_BYTES`) to give the write more room.
 - **Full validation cases.** Closed and SPARQL constraints, changes to `rdfs:subClassOf`,
   and affected sets over 100,000 nodes can require validating a targeted shape whole.
   When any active target can reach a cycle through active shape references, a nonempty

@@ -37,10 +37,12 @@ use crate::report::{ValidationReport, decode};
 use crate::validate::{self, RawResult, ResultTerm, Validator};
 
 mod before_routes;
+mod reached;
 #[cfg(test)]
 mod tests;
 
 use before_routes::BeforeRoutes;
+use reached::Reached;
 
 /// Affected nodes per shape or reverse route pair visits per call before whole-root
 /// validation: following that many nodes back costs about what a full validation does.
@@ -155,7 +157,7 @@ fn validate_changes_within<A: ReadView + Sync, B: ReadView + Sync>(
                 affected(
                     shapes,
                     shape,
-                    &seeds,
+                    seeds.as_slice(),
                     &graph_before,
                     &graph_after,
                     &walk_budget,
@@ -437,34 +439,36 @@ fn in_selection(data: Selection, graph: TermId) -> bool {
 /// The nodes of the changed statements that can matter to `shape`: subjects and objects
 /// of statements whose predicate the shape (with its nested shapes) reads, or that decide
 /// its targets. `None` for any predicate.
-fn seeds(
+fn seeds<'a>(
     shapes: &Shapes,
     shape: ShapeRef,
     changed: &[EncodedQuad],
     rdf_type: Option<TermId>,
     resources: &Resources,
-    budget: &Budget,
-) -> Result<Vec<TermId>, QueryEvaluationError> {
+    budget: &'a Budget,
+) -> Result<Reached<'a>, QueryEvaluationError> {
     let mut read = BTreeSet::new();
     let bounded = predicates(shapes, shape, &mut read, resources, budget)?;
     if let Some(rdf_type) = rdf_type {
         read.insert(rdf_type);
     }
-    let mut nodes = BTreeSet::new();
+    let mut nodes = Reached::new(budget);
     for chunk in changed.chunks(CHECK_EVERY) {
         resources.check()?;
-        nodes.extend(
+        let batch = Reached::from_unsorted(
+            budget,
             chunk
                 .iter()
                 .filter(|quad| !bounded || read.contains(&quad.predicate))
                 .flat_map(|quad| [quad.subject, quad.object]),
-        );
+        )?;
+        nodes.union(batch)?;
         // Every seed is itself affected, so this shape will be validated whole.
         if nodes.len() > MAX_AFFECTED {
             break;
         }
     }
-    Ok(nodes.into_iter().collect())
+    Ok(nodes)
 }
 
 /// Adds the predicates `shape` reads (paths, property pairs, targets) to `read`, through
@@ -535,15 +539,23 @@ fn path_predicates(path: &Path, read: &mut BTreeSet<TermId>) {
     }
 }
 
-#[derive(Default)]
-struct AffectedFrame {
+struct AffectedFrame<'a> {
     parent: Option<ShapeRef>,
     constraint: usize,
     member: usize,
-    reached: BTreeSet<TermId>,
+    reached: Reached<'a>,
 }
 
-impl AffectedFrame {
+impl<'a> AffectedFrame<'a> {
+    fn new(parent: Option<ShapeRef>, budget: &'a Budget) -> Self {
+        Self {
+            parent,
+            constraint: 0,
+            member: 0,
+            reached: Reached::new(budget),
+        }
+    }
+
     /// Resumes at the next child, or signals a constraint that reads the whole graph.
     fn next_child(&mut self, shape: &Shape) -> Result<Option<ShapeRef>, ()> {
         for constraint in &shape.constraints[self.constraint..] {
@@ -566,20 +578,20 @@ impl AffectedFrame {
 
 /// The nodes whose validation against `root` (as a focus or value node) `seeds` can
 /// change, in either state; `None` if unbounded. Shape references are acyclic here.
-fn affected<A: ReadView, B: ReadView>(
+fn affected<'a, A: ReadView, B: ReadView>(
     shapes: &Shapes,
     root: ShapeRef,
     seeds: &[TermId],
     before: &GraphView<'_, A>,
     after: &GraphView<'_, B>,
-    budget: &Budget,
-) -> Result<Option<BTreeSet<TermId>>, QueryEvaluationError> {
+    budget: &'a Budget,
+) -> Result<Option<Reached<'a>>, QueryEvaluationError> {
     if seeds.len() > MAX_AFFECTED || before.cancelled() {
         return Ok(None);
     }
     let mut callers = Suspended::new(budget);
     let mut current = root;
-    let mut frame = AffectedFrame::default();
+    let mut frame = AffectedFrame::new(None, budget);
     loop {
         let shape = &shapes.shapes[current];
         match frame.next_child(shape) {
@@ -595,15 +607,18 @@ fn affected<A: ReadView, B: ReadView>(
                     return Ok(None);
                 }
                 callers.park(current, frame)?;
-                frame = AffectedFrame {
-                    parent: Some(current),
-                    ..AffectedFrame::default()
-                };
+                frame = AffectedFrame::new(Some(current), budget);
                 current = child;
             }
             Ok(None) => {
-                let Some(nodes) =
-                    affected_through_path(shape.path.as_ref(), seeds, frame.reached, before, after)
+                let Some(nodes) = affected_through_path(
+                    shape.path.as_ref(),
+                    seeds,
+                    frame.reached,
+                    before,
+                    after,
+                    budget,
+                )?
                 else {
                     return Ok(None);
                 };
@@ -612,54 +627,52 @@ fn affected<A: ReadView, B: ReadView>(
                 };
                 current = parent;
                 frame = callers.resume(&parent);
-                if frame.reached.is_empty() {
-                    frame.reached = nodes;
-                } else {
-                    frame.reached.extend(nodes);
-                }
+                frame.reached.union(nodes)?;
             }
         }
     }
 }
 
-fn affected_through_path<A: ReadView, B: ReadView>(
+fn affected_through_path<'a, A: ReadView, B: ReadView>(
     path: Option<&Path>,
     seeds: &[TermId],
-    mut reached: BTreeSet<TermId>,
+    mut reached: Reached<'a>,
     before: &GraphView<'_, A>,
     after: &GraphView<'_, B>,
-) -> Option<BTreeSet<TermId>> {
+    budget: &'a Budget,
+) -> Result<Option<Reached<'a>>, QueryEvaluationError> {
     let Some(path) = path else {
         // A node shape's value is its focus node.
-        reached.extend(seeds);
-        return Some(reached);
+        reached.union_sorted(seeds)?;
+        return Ok(Some(reached));
     };
     // Value nodes affected, and the seeds anywhere along the path: back along every
     // prefix of it, in both states. Seeds from the change are already sorted and unique.
-    let merged;
-    let reached = if reached.is_empty() {
+    let input = if reached.is_empty() {
         seeds
     } else {
-        reached.extend(seeds);
-        merged = reached.into_iter().collect::<Vec<_>>();
-        &merged
+        reached.union_sorted(seeds)?;
+        reached.as_slice()
     };
-    let mut out: BTreeSet<TermId> = seeds.iter().copied().collect();
+    let mut out = Reached::from_sorted(budget, seeds)?;
+    let mut add = |nodes| {
+        // A cancelled scan can return a partial set. Let the caller surface the stop.
+        if before.cancelled() {
+            return Ok(false);
+        }
+        let nodes = Reached::adopt(budget, nodes)?;
+        out.union_sorted(nodes.as_slice())?;
+        Ok::<_, QueryEvaluationError>(out.len() <= MAX_AFFECTED)
+    };
     for prefix in prefixes(&normalised(path)) {
         if before.cancelled() {
-            return None;
+            return Ok(None);
         }
-        for graph_nodes in [
-            path::back(before, &prefix, reached),
-            path::back(after, &prefix, reached),
-        ] {
-            out.extend(graph_nodes);
-            if out.len() > MAX_AFFECTED {
-                return None;
-            }
+        if !add(path::back(before, &prefix, input))? || !add(path::back(after, &prefix, input))? {
+            return Ok(None);
         }
     }
-    Some(out)
+    Ok(Some(out))
 }
 
 /// `path` with inverses pushed down to predicates, so that its prefixes are sequences of

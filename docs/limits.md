@@ -561,6 +561,12 @@ leave something out.
 - The commit gate is off by default, and when it is on, it checks only what a commit introduces
   ([configuration](ops/config-reference.md)). To check data already stored, validate it
   with `GET /dataset/shacl`.
+- The gate counts the affected nodes it holds across nested shapes against the write's memory
+  budget. A commit that exceeds the budget is refused without applying the write, even in
+  `report` mode. This can refuse commits that previously succeeded while holding more memory
+  than the budget allowed. To give the commit more room, raise
+  [`budgets.query_memory`](ops/config-reference.md#budgets.query_memory)
+  (`NRESE_MAX_QUERY_MEMORY_BYTES`).
 - A rebuild of the inferences passes no gate: a change of the rules, the rebuild at a start, the
   one after a load or an import, and one asked for (`POST …/reasoning/rematerialise`) store
   their inferences without checking them against the shapes, and
