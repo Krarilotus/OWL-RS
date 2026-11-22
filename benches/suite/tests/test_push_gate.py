@@ -1604,9 +1604,14 @@ class WindowsJob(Repo):
         subprocess.run([BASH, "-c", '. scripts/lib/gate-node.sh && gate_node_seal "$@"', "-", node_entry.as_posix(),
                         platform, node_version, node_sha], cwd=self.repo, check=True, capture_output=True,
                        env=self.env, timeout=60)
+        # The contracts its gate sent, with the pinned cargo-nextest in the cache (each case below lays out its own).
+        nextest_entry = cache / "tools" / f"nextest-{pinned_nextest}-{good_sum[:12]}"
+        nextest_entry.mkdir(parents=True)
+        (nextest_entry / "cargo-nextest").write_text(runner, newline="\n")
+        (nextest_entry / "cargo-nextest").chmod(0o755)
+        self.selected_run(stubs, cache, tree, seen, pinned_npm)
         # The toolchain: there; missing, or there without clippy (another job installed the release with
         # a minimal profile), and rustup installs it; or missing and rustup can't install it.
-        self.selected_run(stubs, cache, tree, seen, pinned_npm)
         there, missing, no_clippy, uninstallable = None, ("toolchain", ""), ("clippy", ""), ("toolchain", "1")
         # The cargo-nextest the tree pins, in the host's cache as the job lays it out
         # (tools/nextest-<version>-<archive sha256, 12>), answering as named (STUB_NEXTEST above): with the
@@ -1616,7 +1621,6 @@ class WindowsJob(Repo):
         # first on cargo's path in between). `tampered`: an entry whose executable isn't the pinned one,
         # with the pinned archive to fetch. `host-own`: the pinned entry, and a runner of the host's own in
         # $CARGO_HOME/bin, which cargo would run first.
-        nextest_entry = cache / "tools" / f"nextest-{pinned_nextest}-{good_sum[:12]}"
         pinned, other, failing, absent, split, swapped = "pinned", "other", "failing", None, "split", "swapped"
         tampered, host_own = "tampered", "host-own"
         cargo_home, tampered_ran = self.root / "cargo-home", self.root / "tampered-ran"
