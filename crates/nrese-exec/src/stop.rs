@@ -264,6 +264,7 @@ mod tests {
             used: 0,
             shared: false,
             unread: false,
+            for_held: false,
             rows: None,
         };
         assert_eq!(Stop::from(exceeded), Stop::Memory(exceeded));

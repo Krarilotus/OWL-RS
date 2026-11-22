@@ -10,7 +10,7 @@ use crate::error::ApiError;
 use crate::http::media::{BOOLEAN, GRAPHS, SOLUTIONS, negotiated};
 use crate::http::mutation;
 use crate::http::requests::{Explain, QueryOperation, UpdateOperation};
-use crate::http::result_stream::{Pace, stream_blocking};
+use crate::http::result_stream::{ChannelWriter, Pace, Reader, stream_blocking};
 use crate::policy::PolicyConfig;
 use crate::state::AppState;
 
@@ -55,6 +55,7 @@ pub async fn execute_query_in(
     }
     let origin = operation.origin.clone();
     let mut request = build_query_request(operation);
+    let reader = Reader::of(&request.scope);
     let memory = policy.limits.max_query_memory_bytes;
     request.memory_limit = (memory > 0).then_some(memory);
     let at = deadline.into_std();
@@ -75,7 +76,10 @@ pub async fn execute_query_in(
     } else {
         prepared.media_type()
     };
-    let store = state.store();
+    // The request's one run, opened by the store that runs it: the run draws on its envelope,
+    // and so does an answer held whole.
+    let run = state.store().open_run(&prepared);
+    let memory = run.memory().clone();
     let cancellation = CancellationToken::new();
     let token = cancellation.clone();
     // The completeness goes with the answers, in a header: the store reports it on the
@@ -96,11 +100,12 @@ pub async fn execute_query_in(
         *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(value);
         made
     };
-    let announced = prepared.clone();
     let scoped = request.inference_scope_dataset;
     let mut response = stream_blocking(
         Pace::Total(deadline),
         cancellation,
+        move || memory,
+        reader,
         if explain == Explain::No {
             media_type
         } else {
@@ -108,15 +113,21 @@ pub async fn execute_query_in(
         },
         QUERY_TIMEOUT_MESSAGE,
         move |out| {
+            // Held whole, a memory refusal is the hold's to tell (`ChannelWriter::refused`).
+            let refused = |out: &ChannelWriter, error| {
+                out.refused(error, |error| map_query_error(&policy, error))
+            };
             if explain != Explain::No {
+                // Nothing is held while it runs (its JSON is written after), so its refusal
+                // is the query's own.
                 let (body, completeness) = if explain == Explain::Plan {
-                    let plan = store
-                        .plan_query(&prepared, &token)
+                    let plan = run
+                        .plan(&token)
                         .map_err(|error| map_query_error(&policy, error))?;
                     (plan_json(&plan), plan.completeness)
                 } else {
-                    let explanation = store
-                        .explain_query(&prepared, &token)
+                    let explanation = run
+                        .explain(&token)
                         .map_err(|error| map_query_error(&policy, error))?;
                     (explanation_json(&explanation), explanation.completeness)
                 };
@@ -127,19 +138,17 @@ pub async fn execute_query_in(
                     .map_err(|error| ApiError::internal(error.to_string()));
             }
             match &pending {
-                None => store.run_query_reporting(&prepared, &token, out, report),
-                Some(pending) => {
-                    store.run_query_pending_reporting(pending, &prepared, &token, out, report)
-                }
+                None => run.run_reporting(&token, &mut *out, report),
+                Some(pending) => run.run_pending_reporting(pending, &token, &mut *out, report),
             }
-            .map_err(|error| map_query_error(&policy, error))
+            .map_err(|error| refused(out, error))
         },
     )
     .await?;
     // The run decided the announcement on what its reader reads before its first byte, which
     // `stream_blocking` waits for: the media type is the run's (its place among the headers kept).
     if explain == Explain::No {
-        let announcement = announced.media_type();
+        let announcement = prepared.media_type();
         let parameters = announcement.find(';').map_or("", |i| &announcement[i..]);
         let media_type = HeaderValue::from_str(&format!("{media_type}{parameters}"))
             .map_err(|error| ApiError::internal(error.to_string()))?;
@@ -326,7 +335,8 @@ fn server_memory_in_use(error: StoreError) -> ApiError {
 /// until the store is rematerialised ([`StoreError::NotRematerialised`]): that is 503, with the
 /// store's sentence and, on a primary, the administrator's route. A replica refuses that route
 /// (`guard::enforce_admin_write`), so its answer adds nothing. A reader of some graphs whose
-/// view had no room, told the class only (no limit), gets the 503 a query gets.
+/// view had no room, told the class only (no limit), gets the 503 a query gets; a read past
+/// its own memory limit, the 413 a query gets.
 pub(crate) fn refused_or(error: StoreError, otherwise: fn(String) -> ApiError) -> ApiError {
     match error {
         StoreError::NotRematerialised { replica: false } => ApiError::unavailable(format!(
@@ -335,6 +345,14 @@ pub(crate) fn refused_or(error: StoreError, otherwise: fn(String) -> ApiError) -
         error @ StoreError::NotRematerialised { .. } => ApiError::unavailable(error.to_string()),
         error @ StoreError::MemoryLimitWithoutAmounts { limit: None, .. } => {
             server_memory_in_use(error)
+        }
+        // A read's own memory limit, which only a statement read's replay of a transaction
+        // has, where its answer is held whole (HTTP/1.0, a reader of every graph:
+        // `result_stream`): the client's to change, as a query's is.
+        error if error.is_memory_limit() && !error.is_server_memory_limit() => {
+            ApiError::payload_too_large(format!(
+                "{error} (budgets.query_memory, NRESE_MAX_QUERY_MEMORY_BYTES)"
+            ))
         }
         error => otherwise(error.to_string()),
     }
@@ -406,9 +424,32 @@ fn build_query_request(operation: QueryOperation) -> SparqlQueryRequest {
 
 #[cfg(test)]
 mod tests {
-    use nrese_store::{GraphResultFormat, QueryResultKind, SolutionsResultFormat};
+    use axum::http::{StatusCode, header};
+    use axum::response::IntoResponse;
+    use nrese_store::{GraphResultFormat, QueryResultKind, SolutionsResultFormat, StoreError};
 
-    use super::negotiate_formats;
+    use super::{map_query_error, negotiate_formats, refused_or};
+    use crate::error::ApiError;
+    use crate::policy::PolicyConfig;
+
+    /// A reader of some graphs refused for the memory all queries share, told the class only,
+    /// gets 503 without `Retry-After`, as every memory refusal does, whether it queried or
+    /// read a graph.
+    #[test]
+    fn a_readers_refusal_told_the_class_only_is_not_told_to_retry() {
+        let class = |limit| StoreError::MemoryLimitWithoutAmounts {
+            limit,
+            shared: true,
+        };
+        let policy = PolicyConfig::default();
+        for response in [
+            map_query_error(&policy, class(Some(1 << 20))).into_response(),
+            refused_or(class(None), ApiError::internal).into_response(),
+        ] {
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers().get(header::RETRY_AFTER), None);
+        }
+    }
 
     #[test]
     fn the_query_form_decides_which_formats_are_negotiated() {

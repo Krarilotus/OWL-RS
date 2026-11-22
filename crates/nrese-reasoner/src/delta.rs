@@ -10,8 +10,8 @@
 //!    fact with a derivation that uses a deleted fact is removed, transitively: semi-naive
 //!    evaluation over the old state with the deleted facts as the delta. Rule instances
 //!    that exist because of a deleted schema fact are found by grounding through it
-//!    ([`super::eval::ground_delta`]) and evaluated in full, as are list rules whose list
-//!    lost a fact.
+//!    ([`super::eval::ground_delta`]), including list rules that read it as an operand.
+//!    Those instances and rules whose list lost a structural fact are evaluated in full.
 //! 2. **Rederive.** Each overdeleted fact (and each deleted asserted fact) that still has a
 //!    one-step derivation from the remaining facts is put back
 //!    ([`GroundProgram::derivable_with`], which finds the candidate rules by head).
@@ -48,9 +48,9 @@ use nrese_exec::Budget;
 
 use super::batch::{Equality, Store, check, is_replacement};
 use super::eval::{
-    AllFacts, GroundProgram, Job, NEVER, Poller, Probe, RuleKey, Schema, Seg, Source, Stop,
-    Stopped, Visit, Visits, WitnessIndex, instantiate_head, rule_key, run_jobs, run_jobs_acyclic,
-    transitive_predicate,
+    AllFacts, GroundProgram, Job, ListRuleHeads, NEVER, Poller, Probe, RuleKey, Schema, Seg,
+    Source, Stop, Stopped, Visit, Visits, WitnessIndex, instantiate_head, rule_key, run_jobs,
+    run_jobs_acyclic, transitive_predicate,
 };
 use super::ir::Triple;
 use super::ir::{Head, Rule};
@@ -225,7 +225,7 @@ impl Rules<'_> {
         if let Some((rules, premises, diagnostics)) =
             self.read_lists(source, &mut program.list_predicates, poll)
         {
-            program.ground_with_premises(source, self.schema, &rules, &premises);
+            program.ground_lists(source, self.schema, rules, premises);
             program.list_diagnostics = diagnostics;
         }
         program.take_facts();
@@ -260,6 +260,39 @@ impl Rules<'_> {
             predicates,
             RuleKind::All,
         ))
+    }
+
+    /// A list edit reads the lists again. A schema edit with the same lists grounds
+    /// just the affected templates, through the delta and with their original premises.
+    fn extend_lists<B: Base + ?Sized>(
+        &self,
+        state: &Overlay<'_, B>,
+        program: &mut Cow<'_, GroundProgram>,
+        delta: &[Triple],
+        schema_changed: bool,
+        poll: &Poller<'_>,
+    ) -> Result<bool, Stopped> {
+        let list_changed = self.lists.is_some() && delta.iter().any(|&f| self.is_list_fact(f));
+        if list_changed {
+            let program = program.to_mut();
+            let (rules, premises, diagnostics) = self
+                .read_lists(state, &mut program.list_predicates, poll)
+                .expect("list vocabulary");
+            poll.ended()?;
+            program.ground_lists(state, self.schema, rules, premises);
+            program.list_diagnostics = diagnostics;
+        } else if schema_changed && let Some(operands) = program.list_operands.clone() {
+            // The schema delta already made the program owned.
+            operands.ground_delta(
+                program.to_mut(),
+                state,
+                self.schema,
+                state.extra,
+                poll,
+                ListRuleHeads::All,
+            )?;
+        }
+        Ok(list_changed)
     }
 
     fn is_list_fact(&self, fact: Triple) -> bool {
@@ -823,6 +856,18 @@ fn update_body<B: Base + ?Sized>(
             // Instances through a deleted schema fact, known or not, in full.
             let mut scratch = GroundProgram::default();
             scratch.ground_delta(&old, schema, &fact_schema_rules);
+            if !backward && let Some(operands) = old_program.list_operands.as_deref() {
+                operands
+                    .ground_delta(
+                        &mut scratch,
+                        &old,
+                        schema,
+                        &extra,
+                        &stage,
+                        ListRuleHeads::FactsOnly,
+                    )
+                    .map_err(stopped)?;
+            }
             let mut fresh: Vec<Rule> = scratch.rules.clone();
             // Transitivity whose declaration is deleted: every inferred pair may lose its
             // support.
@@ -1348,19 +1393,13 @@ fn update_body<B: Base + ?Sized>(
             .map_err(stopped)?;
         // The program grows from these: only from a delta read whole.
         check_stop()?;
-        if delta_facts.iter().any(|&f| schema.is_schema_fact(f)) {
+        let schema_changed = delta_facts.iter().any(|&f| schema.is_schema_fact(f));
+        if schema_changed {
             program.to_mut().ground_delta(&state, schema, &schema_rules);
         }
-        if rules.lists.is_some() && delta_facts.iter().any(|&f| rules.is_list_fact(f)) {
-            lists_changed = true;
-            let program = program.to_mut();
-            let (list_rules, premises, diagnostics) = rules
-                .read_lists(&state, &mut program.list_predicates, &stage)
-                .expect("list vocabulary");
-            stage.ended().map_err(stopped)?;
-            program.ground_with_premises(&state, schema, &list_rules, &premises);
-            program.list_diagnostics = diagnostics;
-        }
+        lists_changed |= rules
+            .extend_lists(&state, &mut program, &delta_facts, schema_changed, &stage)
+            .map_err(stopped)?;
         let mut candidates = if program.has_pending_facts() {
             program.to_mut().take_facts()
         } else {
@@ -1693,20 +1732,15 @@ fn introduced_violations_body<B: Base + ?Sized>(
     if stop() {
         return Err(Interrupted::default());
     }
-    if delta_facts.iter().any(|&f| rules.schema.is_schema_fact(f)) {
+    let schema_changed = delta_facts.iter().any(|&f| rules.schema.is_schema_fact(f));
+    if schema_changed {
         program
             .to_mut()
             .ground_delta(&state, rules.schema, &rules.schema_rules());
     }
-    if rules.lists.is_some() && delta_facts.iter().any(|&f| rules.is_list_fact(f)) {
-        let program = program.to_mut();
-        let (list_rules, premises, diagnostics) = rules
-            .read_lists(&state, &mut program.list_predicates, &stage)
-            .expect("list vocabulary");
-        stage.ended().map_err(|Stopped| Interrupted::default())?;
-        program.ground_with_premises(&state, rules.schema, &list_rules, &premises);
-        program.list_diagnostics = diagnostics;
-    }
+    rules
+        .extend_lists(&state, &mut program, &delta_facts, schema_changed, &stage)
+        .map_err(|Stopped| Interrupted::default())?;
     let variants: Vec<(usize, usize)> = program
         .consistency_variants(&fresh, &stage)
         .map_err(|Stopped| Interrupted::default())?

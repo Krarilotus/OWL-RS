@@ -22,6 +22,34 @@ pub enum JobState {
     Cancelled,
 }
 
+/// Why a job did not complete.
+#[derive(Debug, PartialEq, Eq)]
+pub enum JobFailure {
+    /// The operation stopped in response to cancellation.
+    Cancelled,
+    /// The operation failed with a message for the client.
+    Failed(String),
+}
+
+impl JobFailure {
+    /// How a load's error ends its job. Only a load that stopped for its cancellation ends
+    /// cancelled. Every other error is a failure with its message, and an unpublished load
+    /// whose quarantine record couldn't be kept says how to `retry_action` it again.
+    pub fn of_load(
+        error: crate::StoreError,
+        retry_action: &str,
+        data_dir: Option<&std::path::Path>,
+    ) -> Self {
+        match error {
+            crate::StoreError::LoadCancelled => Self::Cancelled,
+            crate::StoreError::LoadQuarantineNotRecorded(error) => {
+                Self::Failed(error.unpublished_message(retry_action, data_dir))
+            }
+            error => Self::Failed(error.to_string()),
+        }
+    }
+}
+
 /// A job as listed.
 #[derive(Debug, Clone, serde::Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -101,10 +129,9 @@ impl Job {
             .update(self.id, |entry| entry.phase = Some(phase.to_owned()));
     }
 
-    /// Ends the job: done with `report`, or failed with an error (cancelled if it was
-    /// cancelled).
-    pub fn finish(self, outcome: Result<serde_json::Value, String>) {
-        let cancelled = self.progress.is_cancelled();
+    /// Ends the job with the operation's outcome, preserving a genuine failure
+    /// even when a cancel request arrived before this call.
+    pub fn finish(self, outcome: Result<serde_json::Value, JobFailure>) {
         self.jobs.update(self.id, |entry| {
             entry.ended = Some(Instant::now());
             entry.phase = None;
@@ -113,8 +140,8 @@ impl Job {
                     entry.state = JobState::Done;
                     entry.report = Some(report);
                 }
-                Err(_) if cancelled => entry.state = JobState::Cancelled,
-                Err(error) => {
+                Err(JobFailure::Cancelled) => entry.state = JobState::Cancelled,
+                Err(JobFailure::Failed(error)) => {
                     entry.state = JobState::Failed;
                     entry.error = Some(error);
                 }
@@ -229,6 +256,75 @@ impl Jobs {
 mod tests {
     use super::*;
 
+    // Spec: docs/ops/http-api.md says an import that could not keep its quarantine
+    // and published nothing ends failed with retry advice, even if cancelled late.
+    #[cfg(feature = "fault-points")]
+    #[test]
+    fn late_cancel_preserves_import_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("bad.nt");
+        std::fs::write(&file, "<http://example.com/a> <http://example.com/p> .\n").unwrap();
+        let store = crate::StoreService::new(crate::StoreConfig::on_disk(dir.path().join("store")))
+            .unwrap();
+        let request = crate::BulkLoadRequest {
+            files: vec![file],
+            replace: false,
+            graph: crate::GraphTarget::DefaultGraph,
+            invalid: None,
+        };
+        let jobs = Arc::new(Jobs::default());
+        let job = jobs.start("import", "nrese", "an uploaded document");
+        let id = job.id();
+        store.quarantine().fail_next_commit();
+        let error = store.bulk_load_with(&request, job.progress()).unwrap_err();
+        assert!(
+            matches!(error, crate::StoreError::LoadQuarantineNotRecorded(_)),
+            "expected an unpublished quarantine error, got {error}"
+        );
+        jobs.cancel(id);
+        job.finish(Err(JobFailure::of_load(error, "send", None)));
+
+        let view = serde_json::to_value(jobs.get(id).unwrap()).unwrap();
+        assert_eq!(view["state"], "failed", "GET job body: {view}");
+        assert_eq!(
+            view["error"],
+            "the load published nothing. The quarantine record couldn't be kept: simulated failure. It's safe to send it again once the cause is resolved."
+        );
+    }
+
+    // Spec: docs/ops/http-api.md says cancelling an import stops it before its next file;
+    // one cancelled before its first file loads nothing and its job ends cancelled.
+    #[test]
+    fn a_load_cancelled_before_its_first_file_ends_its_job_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("good.nt");
+        std::fs::write(
+            &file,
+            "<http://example.com/a> <http://example.com/p> <http://example.com/o> .\n",
+        )
+        .unwrap();
+        let store = crate::StoreService::new(crate::StoreConfig::on_disk(dir.path().join("store")))
+            .unwrap();
+        let request = crate::BulkLoadRequest {
+            files: vec![file],
+            replace: false,
+            graph: crate::GraphTarget::DefaultGraph,
+            invalid: None,
+        };
+        let jobs = Arc::new(Jobs::default());
+        let job = jobs.start("import", "nrese", "an uploaded document");
+        let id = job.id();
+        assert!(jobs.cancel(id));
+        let error = store.bulk_load_with(&request, job.progress()).unwrap_err();
+        let failure = JobFailure::of_load(error, "send", None);
+        assert_eq!(failure, JobFailure::Cancelled);
+        job.finish(Err(failure));
+
+        let view = serde_json::to_value(jobs.get(id).unwrap()).unwrap();
+        assert_eq!(view["state"], "cancelled", "GET job body: {view}");
+        assert_eq!(store.stats().unwrap().quad_count, 0, "nothing was loaded");
+    }
+
     #[test]
     fn jobs_report_their_progress_and_outcome() {
         let jobs = Arc::new(Jobs::default());
@@ -248,12 +344,12 @@ mod tests {
         assert!(jobs.cancel(job.id()));
         assert!(job.progress().is_cancelled());
         let id = job.id();
-        job.finish(Err("the load was cancelled".to_owned()));
+        job.finish(Err(JobFailure::Cancelled));
         assert_eq!(jobs.get(id).unwrap().state, JobState::Cancelled);
 
         let job = jobs.start("import", "nrese", "c.ttl");
         let id = job.id();
-        job.finish(Err("no such file".to_owned()));
+        job.finish(Err(JobFailure::Failed("no such file".to_owned())));
         let view = jobs.get(id).unwrap();
         assert_eq!(view.state, JobState::Failed);
         assert_eq!(view.error.as_deref(), Some("no such file"));

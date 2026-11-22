@@ -106,7 +106,8 @@ async fn screen(
         ))
         .into_response();
     }
-    next.run(request).await
+    let version = request.version();
+    crate::http::answering(version, next.run(request)).await
 }
 
 #[cfg(test)]
