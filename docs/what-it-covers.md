@@ -13,20 +13,56 @@ reason, beside its runner.
 
 | Standard | What NRESE does | Tests |
 |---|---|---|
-| [SPARQL 1.1](https://www.w3.org/TR/sparql11-overview/) [Query](https://www.w3.org/TR/sparql11-query/), [Update](https://www.w3.org/TR/sparql11-update/), [Federated Query](https://www.w3.org/TR/sparql11-federated-query/) | All of it but Update's `LOAD`, with the [deviations listed](limits.md#sparql) | 505 W3C tests, no known failure ([runner](../crates/nrese-sparql/tests/w3c_sparql11)) |
+| [SPARQL 1.1](https://www.w3.org/TR/sparql11-overview/) [Query](https://www.w3.org/TR/sparql11-query/), [Update](https://www.w3.org/TR/sparql11-update/), [Federated Query](https://www.w3.org/TR/sparql11-federated-query/) | All of it but Update's `LOAD`, with the [deviations listed](limits.md#sparql) | 531 W3C tests, no known failure ([runner](../crates/nrese-sparql/tests/w3c_sparql11)); 1,318 SPARQL syntax tests of 1.0, 1.1 and 1.2, each parsed and written back, or refused ([runner](../crates/rdf/nrese-sparql-syntax/tests/w3c_syntax)) |
 | [SPARQL 1.1 Protocol](https://www.w3.org/TR/sparql11-protocol/), [Graph Store Protocol](https://www.w3.org/TR/sparql11-http-rdf-update/), [Service Description](https://www.w3.org/TR/sparql11-service-description/) | Served at `/dataset/…` ([HTTP interface](ops/http-api.md)) | Our own ([protocol](../crates/nrese-server/tests/it/query_protocol_tests.rs), [Graph Store](../crates/nrese-server/tests/it/graph_store_api_tests.rs)) |
 | Results as [JSON](https://www.w3.org/TR/sparql11-results-json/), [XML](https://www.w3.org/TR/rdf-sparql-XMLres/), [CSV and TSV](https://www.w3.org/TR/sparql11-results-csv-tsv/) | Written, and read but for CSV | The SPARQL suites read JSON, XML and TSV and check the CSV writer, and [round trips](../crates/rdf/nrese-sparql-results/tests/round_trip_tests.rs) check the others |
-| [Turtle](https://www.w3.org/TR/turtle/), [TriG](https://www.w3.org/TR/trig/), [N-Triples](https://www.w3.org/TR/n-triples/), [N-Quads](https://www.w3.org/TR/n-quads/), [RDF/XML](https://www.w3.org/TR/rdf-syntax-grammar/) | Read and written, RDF 1.1 and the RDF 1.2 drafts | RDF 1.1 and 1.2 syntax suites, [runner](../crates/rdf/nrese-rdf-io/tests/w3c_rdf) |
-| [JSON-LD 1.1](https://www.w3.org/TR/json-ld11/) | Read and written, [remote contexts not fetched](limits.md#rdf-syntaxes) | `toRdf`, `expand`, `fromRdf`, [runner](../crates/rdf/nrese-rdf-io/tests/w3c_jsonld) |
-| [RDF Dataset Canonicalization](https://www.w3.org/TR/rdf-canon/) | RDFC-1.0 | [runner](../crates/rdf/nrese-rdf-io/tests/w3c_rdfc) |
-| [SPARQL 1.2](https://www.w3.org/TR/sparql12-query/) and [RDF 1.2](https://www.w3.org/TR/rdf12-concepts/) drafts | Triple terms and directional strings | 269 W3C tests, no known failure |
+| [Turtle](https://www.w3.org/TR/turtle/), [TriG](https://www.w3.org/TR/trig/), [N-Triples](https://www.w3.org/TR/n-triples/), [N-Quads](https://www.w3.org/TR/n-quads/), [RDF/XML](https://www.w3.org/TR/rdf-syntax-grammar/) | Read and written, RDF 1.1 and the RDF 1.2 drafts | 993 RDF 1.1 syntax and 351 RDF 1.2 syntax W3C tests, no known failure ([runner](../crates/rdf/nrese-rdf-io/tests/w3c_rdf)) |
+| [JSON-LD 1.1](https://www.w3.org/TR/json-ld11/) | Read and written, [remote contexts not fetched](limits.md#rdf-syntaxes) | 884 W3C tests of `toRdf`, `expand` and `fromRdf`, no known failure; 22 not run (JSON-LD 1.0 only, or generalized RDF) ([runner](../crates/rdf/nrese-rdf-io/tests/w3c_jsonld)) |
+| [RDF Dataset Canonicalization](https://www.w3.org/TR/rdf-canon/) | RDFC-1.0 | 86 RDFC-1.0 W3C tests, no known failure ([runner](../crates/rdf/nrese-rdf-io/tests/w3c_rdfc)) |
+| [Notation3](https://w3c.github.io/N3/spec/) (W3C Community Group) | Read in the library ([not over HTTP](limits.md#rdf-syntaxes)), and [user rules](spec/reasoning-semantics.md#user-rules-notation3) for the reasoner | 1,084 N3 parser tests, [1 known failure](../crates/rdf/nrese-rdf-io/tests/w3c_n3/expected-failures.txt) ([runner](../crates/rdf/nrese-rdf-io/tests/w3c_n3)); 13 N3 reasoner tests in scope, all passed, and 76 out of scope ([runner](../crates/nrese-reasoner/tests/w3c_n3_reasoner)) |
+| [SPARQL 1.2](https://www.w3.org/TR/sparql12-query/) and [RDF 1.2](https://www.w3.org/TR/rdf12-concepts/) drafts | Triple terms and directional strings | 271 W3C SPARQL 1.2 tests, no known failure ([runner](../crates/nrese-sparql/tests/w3c_sparql11)); RDF 1.2's syntax tests are counted with the syntaxes above |
 | [RDF Schema 1.1](https://www.w3.org/TR/rdf11-schema/) | Its entailment rules, with the [few left out](spec/reasoning-semantics.md#modes) listed | No W3C suite run |
 | [OWL 2 RL](https://www.w3.org/TR/owl2-profiles/#OWL_2_RL) | The OWL 2 RL/RDF rules, materialised and maintained with each write | 86 W3C test cases, 7 of them passed only under `owl2-dl`, and 3 skipped whose premise is in no RDF syntax or imports another ontology ([runner](../crates/nrese-store/tests/w3c_owl2_rl)) |
-| [OWL 2 QL](https://www.w3.org/TR/owl2-profiles/#OWL_2_QL) | Rules plus query rewriting | W3C test cases, [9 known failures](../crates/nrese-store/tests/w3c_owl2_ql/expected-failures.txt) |
-| [OWL 2 DL](https://www.w3.org/TR/owl2-direct-semantics/) | Consistency, classification, realisation, proven answers | 410 W3C test cases answered as expected, and [1 whose expected answer is wrong](../crates/nrese-dl/tests/tableau_w3c/disputed.txt), shown by a model ([runner](../crates/nrese-dl/tests/tableau_w3c)) |
+| [OWL 2 QL](https://www.w3.org/TR/owl2-profiles/#OWL_2_QL) | Rules plus query rewriting | 55 W3C test cases, 2 of them passed only under `owl2-dl`, [5 known failures](../crates/nrese-store/tests/w3c_owl2_ql/expected-failures.txt), and 2 skipped that import another ontology ([runner](../crates/nrese-store/tests/w3c_owl2_ql)) |
+| [OWL 2 DL](https://www.w3.org/TR/owl2-direct-semantics/) | Consistency, classification, realisation, proven answers | 408 W3C test cases answered as expected, [2 not decided](../crates/nrese-dl/tests/tableau_w3c/undecided.txt) because their texts are not OWL 2 DL by the reader, and [1 whose expected answer is wrong](../crates/nrese-dl/tests/tableau_w3c/disputed.txt), shown by a model ([runner](../crates/nrese-dl/tests/tableau_w3c)); their ontologies read: 403 round trips through RDF/XML (OWL 2 RDF/XML round trip), 295 test cases whose profiles agree (OWL 2 profiles), 77 read alike from the functional syntax and RDF/XML (OWL 2 functional syntax), each with its listed exceptions ([runner](../crates/nrese-owl/tests/w3c_owl2)) |
 | [SHACL](https://www.w3.org/TR/shacl/) Core and SHACL-SPARQL | On request, or as a gate on writes | 98 Core and 22 SHACL-SPARQL W3C tests, no known failure ([runner](../crates/nrese-shacl/tests/w3c_shacl)) |
-| [GeoSPARQL 1.1](https://docs.ogc.org/is/22-047r1/22-047r1.html) | In part: functions and relations over WKT, GeoJSON and simple GML | 194 of the 212 compliance tests, 18 disputed with the reference ([runner](../crates/nrese-sparql/tests/geosparql_compliance)) |
+| [GeoSPARQL 1.1](https://docs.ogc.org/is/22-047r1/22-047r1.html) | In part: functions and relations over WKT, GeoJSON and simple GML | 194 of the 212 compliance tests, [18 disputed with the reference](../crates/nrese-sparql/tests/geosparql_compliance/disputed.txt) ([runner](../crates/nrese-sparql/tests/geosparql_compliance)) |
 | [RDF4J REST protocol](https://rdf4j.org/documentation/reference/rest-api/) | Served at `/repositories/…`, so RDF4J clients and tools connect | Our own ([protocol](../crates/nrese-server/tests/it/rdf4j_protocol_tests.rs), [clients](../crates/nrese-server/tests/it/client_compat_tests.rs)) |
+
+### Implementation reports
+
+The SPARQL suites and the RDF 1.2 syntax suites also write W3C implementation reports: one
+[EARL](https://www.w3.org/TR/EARL10-Schema/) file in Turtle per suite. To write them, run this from a
+clean clone, with git, a network connection and the Rust toolchain named in `rust-toolchain.toml`:
+
+```sh
+bash scripts/w3c-reports.sh
+```
+
+It fetches the suites at the `w3c/rdf-tests` commit pinned in `scripts/fetch-w3c-tests.sh`, runs the
+two runners, and writes into `w3c-reports/`:
+- `sparql11.ttl` and `sparql12.ttl`, from the [SPARQL runner](../crates/nrese-sparql/tests/w3c_sparql11),
+  with its text reports beside them;
+- `rdf12-n-triples.ttl`, `rdf12-n-quads.ttl`, `rdf12-turtle.ttl`, `rdf12-trig.ttl` and `rdf12-xml.ttl`,
+  from the [RDF syntax runner](../crates/rdf/nrese-rdf-io/tests/w3c_rdf).
+
+It refuses a tree with changes or untracked files, and a `w3c-reports/` that isn't empty. The workflow
+[`w3c-reports.yml`](../.github/workflows/w3c-reports.yml) runs the same script on GitHub's machines
+when it is started at a release tag, and keeps the files with that run for 90 days.
+
+Reading a report:
+- It has one assertion for each test in its suite's manifests: `earl:passed`, `earl:failed` with the
+  reason from the runner's expected-failures list, or `earl:untested` with the reason the runner
+  skips it. The run writes the file; nobody edits it.
+- Its `dc:description` names the commit that ran, the `w3c/rdf-tests` commit and the counts. Two runs
+  of the same commit differ only in `dc:issued`, the time of the run.
+- At this commit, no file has a test failed or untested.
+- No report covers the SPARQL 1.1 Protocol, Graph Store Protocol, Service Description or entailment
+  tests, or RDF 1.2 Semantics: the runners don't read those manifests, so those tests aren't in the
+  files at all. The RDF 1.1 syntax suites run in the checks but write no report: the runner reads their
+  tests under other IRIs than the ones W3C's RDF 1.1 reports use.
+- A report shows the outcome of its suite's tests at that suite commit, and claims nothing beyond
+  them. The 1.2 suites are drafts and can still change.
 
 ## SPARQL
 

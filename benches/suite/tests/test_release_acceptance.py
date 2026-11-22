@@ -289,11 +289,11 @@ class EvidenceContract(Scratch):
     def test_the_producer_s_partial_expectations_never_pass_the_candidate(self):
         # Spec: probe generated-partial-w3c-final-verdict: `w3c --run` with an expectations
         # file declaring one kit writes a passing result and receipt at the candidate's own tree; the join
-        # holds it to the candidate tree's seven kits.
-        stub = "#!/usr/bin/env bash\necho 'test result: ok. 1 passed; 0 failed; 0 ignored'\n"
+        # holds it to the candidate tree's own kits.
+        stub = f"#!/usr/bin/env bash\nprintf '%s' '{RL_LOG}'\n"
         a = self.repo.commit(files={"scripts/cargo-guarded.sh": stub})
         partial = self.tmp / "partial.toml"
-        partial.write_text('[kit."nrese-owl:w3c_owl2"]\nsuites = []\n', encoding="utf-8")
+        partial.write_text(kits_toml(("nrese-store:w3c_owl2_rl", ["OWL 2 RL"]), suites=RL_SUITE), encoding="utf-8")
         result = self.tmp / "w3c.json"
         made = subprocess.run([sys.executable, str(GATE), "w3c", str(self.tmp / "logs"), "--expected", str(partial),
                                "--run", "--identity", IDENTITY, "--attempt", ATTEMPT, "--json", str(result)],
@@ -304,7 +304,7 @@ class EvidenceContract(Scratch):
         w3c = json.loads(result.read_text(encoding="utf-8"))
         self.assertEqual(w3c["receipt"]["tree"], self.repo.tree(a))
         done = verdict(self.repo.path, a, rounds(a), w3c, checks(a, self.repo.tree(a))[1])
-        self.assertEqual(done.returncode, 1, f"SPEC one kit of seven\n{done.stdout}")
+        self.assertEqual(done.returncode, 1, f"SPEC one kit of the tree's\n{done.stdout}")
         self.assertIn("nrese-sparql:w3c_sparql11: no launch recorded", done.stdout)
 
 
@@ -358,8 +358,12 @@ def kits_toml(*kits: tuple[str, list[str]], suites: str = "") -> str:
 RL_SUITE = '[suite."OWL 2 RL"]\npassed = 86\nskipped = 3\n'
 RL_LOG = ("W3C OWL 2 RL test cases (RDF-based semantics): 86 passed, 0 failed (0 expected), 3 skipped\n"
           "test result: ok. 1 passed; 0 failed; 0 ignored\n")
-KITS = (("nrese-store:w3c_owl2_rl", ["OWL 2 RL"]), ("nrese-owl:w3c_owl2", []),
-        ("nrese-reasoner:w3c_n3_reasoner", []))
+OWL_LOG = "295 test cases compared\ntest result: ok. 3 passed; 0 failed; 0 ignored\n"
+N3_LOG = ("N3 reasoner tests: 13 in scope, 13 passed; 76 out of scope:\n"
+          "test result: ok. 1 passed; 0 failed; 0 ignored\n")
+SUITES = RL_SUITE + '[suite."OWL 2 profiles"]\nchecked = 295\n[suite."N3 reasoner"]\npassed = 13\nskipped = 76\n'
+KITS = (("nrese-store:w3c_owl2_rl", ["OWL 2 RL"]), ("nrese-owl:w3c_owl2", ["OWL 2 profiles"]),
+        ("nrese-reasoner:w3c_n3_reasoner", ["N3 reasoner"]))
 
 
 class KitOutcomes(Scratch):
@@ -369,7 +373,7 @@ class KitOutcomes(Scratch):
     def w3c(self, logs: Path, *extra: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
         expected = self.tmp / "w3c-expected.toml"
         if not expected.exists():
-            expected.write_text(kits_toml(*KITS, suites=RL_SUITE), encoding="utf-8")
+            expected.write_text(kits_toml(*KITS, suites=SUITES), encoding="utf-8")
         return subprocess.run([sys.executable, str(GATE), "w3c", str(logs), "--expected", str(expected),
                                "--json", str(self.tmp / "w3c.json"), *extra], cwd=cwd, capture_output=True,
                               text=True, timeout=120, env=isolation.inherit("NRESE_", "FLEET_", "CARGO_",
@@ -412,6 +416,8 @@ class KitOutcomes(Scratch):
         return done, result
 
     RL_OK = f"printf '%s' '{RL_LOG}'; exit 0"
+    OWL_OK = f"printf '%s' '{OWL_LOG}'; exit 0"
+    N3_OK = f"printf '%s' '{N3_LOG}'; exit 0"
     OK = "echo 'test result: ok. 1 passed; 0 failed; 0 ignored'; exit 0"
 
     def test_a_kit_that_exits_non_zero_or_without_its_summary_fails_and_each_launch_is_recorded(self):
@@ -427,12 +433,12 @@ class KitOutcomes(Scratch):
                 shutil.rmtree(self.tmp / "checkout", True)
                 shutil.rmtree(self.tmp / "out-w3c", True)
                 (self.tmp / "w3c.json").unlink(missing_ok=True)
-                done, result = self.run_kits({"w3c_owl2_rl": self.RL_OK, "w3c_owl2": body, "w3c_n3_reasoner": self.OK})
+                done, result = self.run_kits({"w3c_owl2_rl": self.RL_OK, "w3c_owl2": body, "w3c_n3_reasoner": self.N3_OK})
                 self.assertEqual(done.returncode, 1, f"SPEC {name}\n{done.stdout}{done.stderr}")
                 self.assertIn("nrese-owl:w3c_owl2", " ".join(result.get("errors", [])), result)
         shutil.rmtree(self.tmp / "checkout", True)
         shutil.rmtree(self.tmp / "out-w3c", True)
-        done, result = self.run_kits({"w3c_owl2_rl": self.RL_OK, "w3c_owl2": self.OK, "w3c_n3_reasoner": self.OK})
+        done, result = self.run_kits({"w3c_owl2_rl": self.RL_OK, "w3c_owl2": self.OWL_OK, "w3c_n3_reasoner": self.N3_OK})
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         checkout = self.tmp / "checkout"
         r = result["receipt"]
@@ -446,7 +452,7 @@ class KitOutcomes(Scratch):
     def test_a_re_check_refuses_a_receipt_whose_logs_a_later_run_replaced(self):
         # Spec: a run passed and left its receipt; a later run stopped midway, having
         # replaced w3c_owl2's log with a compile failure; a re-check (no --run) reads the logs as they are.
-        done, _ = self.run_kits({"w3c_owl2_rl": self.RL_OK, "w3c_owl2": self.OK, "w3c_n3_reasoner": self.OK})
+        done, _ = self.run_kits({"w3c_owl2_rl": self.RL_OK, "w3c_owl2": self.OWL_OK, "w3c_n3_reasoner": self.N3_OK})
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         (self.tmp / "out-w3c" / "w3c_owl2.log").write_text("error: could not compile `nrese-owl`\n", encoding="utf-8")
         again = self.w3c(self.tmp / "out-w3c")
@@ -454,10 +460,64 @@ class KitOutcomes(Scratch):
         self.assertIn("nrese-owl:w3c_owl2: its log isn't the one its launch recorded", again.stdout)
 
     def test_a_suite_s_counts_come_from_its_own_kit_s_log(self):
-        # Spec: the design's attack 8: the RL counts printed by another kit's log don't stand for the RL kit.
-        done, result = self.run_kits({"w3c_owl2_rl": self.OK, "w3c_owl2": self.RL_OK, "w3c_n3_reasoner": self.OK})
+        # Spec: the design's attack 8: the RL counts printed by another kit's log (whose own counts are
+        # whole) don't stand for the RL kit: RL alone has no counts.
+        borrowed = f"printf '%s' '{RL_LOG}{OWL_LOG}'; exit 0"
+        done, result = self.run_kits({"w3c_owl2_rl": self.OK, "w3c_owl2": borrowed, "w3c_n3_reasoner": self.N3_OK})
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
-        self.assertIn("OWL 2 RL", " ".join(result["errors"]))
+        self.assertEqual(result["errors"], ["OWL 2 RL: no counts (its kit didn't run, or its data was missing)"])
+
+    def local(self, checkout: Path, *extra: str) -> subprocess.CompletedProcess:
+        expected = self.tmp / "w3c-expected.toml"
+        expected.write_text(kits_toml(*KITS, suites=SUITES), encoding="utf-8")
+        return subprocess.run([sys.executable, str(GATE), "w3c", str(self.tmp / "out-w3c"), "--expected", str(expected),
+                               "--local", *extra], cwd=checkout, capture_output=True, text=True, timeout=120,
+                              env=isolation.inherit("NRESE_", "FLEET_", "CARGO_", PYTHONIOENCODING="utf-8"))
+
+    def test_the_local_check_checks_every_count_and_is_no_verdict(self):
+        # Spec: `w3c --local` launches the declared kits here and checks the same counts and outcomes as the
+        # gate, says it is not a verdict, and leaves no receipt or result a verdict could read.
+        checkout = self.cargo_guarded({"w3c_owl2_rl": self.RL_OK, "w3c_owl2": self.OWL_OK, "w3c_n3_reasoner": self.N3_OK})
+        done = self.local(checkout)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("not a verdict", done.stdout)
+        self.assertEqual(sorted(p.name for p in (self.tmp / "out-w3c").iterdir()),
+                         ["local-check.txt", "w3c_n3_reasoner.log", "w3c_owl2.log", "w3c_owl2_rl.log"])
+        self.assertFalse((self.tmp / "w3c.json").exists())
+        # The gate never reads a local check's directory, as a re-check or a run.
+        self.assertEqual(self.w3c(self.tmp / "out-w3c").returncode, 2)
+        # One kit, by name, in the directory the local check marked: only its suites are checked.
+        done = self.local(checkout, "--kits", "nrese-store:w3c_owl2_rl")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertNotIn("OWL 2 profiles", done.stdout)
+        self.assertEqual(self.local(checkout, "--kits", "nrese-store:w3c_owl2_qq").returncode, 2)
+        # A gate's flags, even empty, are refused before the gate's earlier result or receipt is touched.
+        receipt, result = self.tmp / "out-w3c" / "receipt.json", self.tmp / "w3c.json"
+        result.write_text("{}", encoding="utf-8")
+        receipt.write_text("{}", encoding="utf-8")
+        for flags in (("--json", str(result)), ("--run",), ("--identity=",), ("--attempt=",), ()):
+            self.assertEqual(self.local(checkout, *flags).returncode, 2, flags)
+            self.assertTrue(receipt.exists() and result.exists(), flags)
+        # A gate's directory, done or running (a run removes its receipt first), is never a local check's.
+        gate_logs = self.tmp / "gate-w3c"
+        gate_logs.mkdir()
+        (gate_logs / "w3c_owl2_rl.log").write_text(RL_LOG, encoding="utf-8")
+        done = subprocess.run([sys.executable, str(GATE), "w3c", str(gate_logs), "--expected",
+                               str(self.tmp / "w3c-expected.toml"), "--local"], cwd=checkout, capture_output=True,
+                              text=True, timeout=120, env=isolation.inherit("NRESE_", "FLEET_", "CARGO_"))
+        self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+        self.assertEqual([p.name for p in gate_logs.iterdir()], ["w3c_owl2_rl.log"])
+
+    def test_the_local_check_fails_a_count_or_a_kit_as_the_gate_does(self):
+        # Spec: RL passes fewer than stated, w3c_owl2 doesn't compile: exit 1, both named.
+        short = RL_LOG.replace("86 passed", "85 passed")
+        checkout = self.cargo_guarded({"w3c_owl2_rl": f"printf '%s' '{short}'; exit 0",
+                                       "w3c_owl2": "echo 'error: could not compile'; exit 101",
+                                       "w3c_n3_reasoner": self.N3_OK})
+        done = self.local(checkout)
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("OWL 2 RL: 85 passed, at least 86 required", done.stdout)
+        self.assertIn("nrese-owl:w3c_owl2: exited 101", done.stdout)
 
     def test_the_gate_s_kits_are_declared_once_and_claim_every_expected_suite(self):
         # Spec: T02 ("the expectation table still omits the two extra kits"): release-gate.sh's w3c step
@@ -469,7 +529,14 @@ class KitOutcomes(Scratch):
         self.assertEqual(listed.returncode, 0, listed.stderr)
         self.assertEqual(listed.stdout.split(), [
             "nrese-sparql:w3c_sparql11", "nrese-sparql:geosparql_compliance", "nrese-shacl:w3c_shacl",
-            "nrese-store:w3c_owl2_rl", "nrese-dl:tableau_w3c", "nrese-owl:w3c_owl2", "nrese-reasoner:w3c_n3_reasoner"])
+            "nrese-store:w3c_owl2_rl", "nrese-dl:tableau_w3c", "nrese-owl:w3c_owl2", "nrese-reasoner:w3c_n3_reasoner",
+            "nrese-store:w3c_owl2_ql", "nrese-rdf-io:w3c_rdf", "nrese-rdf-io:w3c_jsonld", "nrese-rdf-io:w3c_rdfc",
+            "nrese-rdf-io:w3c_n3", "nrese-sparql-syntax:w3c_syntax"])
+        # Every W3C runner in the workspace is a declared kit: none runs outside the gate's counts. Cargo
+        # makes a test target of each `tests/NAME/main.rs` and each `tests/NAME.rs`.
+        runners = {f"{p.parent.parent.name}:{p.stem}" for p in (ROOT / "crates").glob("**/tests/*w3c*")
+                   if (p / "main.rs").is_file() or (p.is_file() and p.suffix == ".rs")}
+        self.assertEqual(runners - set(listed.stdout.split()), set())
         declared = tomllib.loads((ROOT / "benches/fast/w3c-expected.toml").read_text(encoding="utf-8"))
         owners = [s for kit in declared["kit"].values() for s in kit["suites"]]
         self.assertEqual(sorted(owners), sorted(declared["suite"]))

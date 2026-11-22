@@ -1,0 +1,59 @@
+description = """SHACL-SPARQL result messages in the validation report (docs/ops/http-api.md,
+"SHACL validation"; SHACL 1.0 section 5.3.2): with shapes in the shapes graph whose SPARQL
+constraints carry messages, GET /dataset/shacl reports a person with a one-word name twice: the
+first constraint's sh:message with the solution's ?name filled in, the second's message bound
+by its query (?message) in place of its own sh:message; the Turtle report says the same."""
+
+[vars]
+shapes = "http://rdf4j.org/schema/rdf4j#SHACLShapeGraph"
+
+[[step]]
+name = "store the shapes: two SPARQL constraints with messages"
+method = "PUT"
+path = "/dataset/data"
+params = { graph = "${shapes}" }
+headers = { Content-Type = "text/turtle" }
+body = """
+@prefix ex: <http://example.com/verify/> .
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+ex:FullName a sh:NodeShape ; sh:targetClass ex:Person ;
+  sh:sparql [ sh:message "{?name} is not a full name" ;
+    sh:select '''SELECT $this ?name WHERE {
+      $this <http://example.com/verify/name> ?name . FILTER (!CONTAINS(?name, " ")) }''' ] ;
+  sh:sparql [ sh:message "never shown" ;
+    sh:select '''SELECT $this ?message WHERE {
+      $this <http://example.com/verify/name> ?name . FILTER (!CONTAINS(?name, " "))
+      BIND (CONCAT("add a surname to ", ?name) AS ?message) }''' ] .
+"""
+[step.expect]
+status = [200, 201, 204]
+
+[[step]]
+name = "store a person with a one-word name"
+method = "PUT"
+path = "/dataset/data"
+params = { graph = "http://example.com/verify/people" }
+headers = { Content-Type = "text/turtle" }
+body = """
+@prefix ex: <http://example.com/verify/> .
+ex:bob a ex:Person ; ex:name "Bob" .
+"""
+[step.expect]
+status = [200, 201, 204]
+
+[[step]]
+name = "the JSON report: both messages, filled in and bound by the query"
+path = "/dataset/shacl"
+headers = { Accept = "application/json" }
+[step.expect]
+status = 200
+json = { "$.conforms" = false, "$.results" = { length = 2 }, "$.results[*].focusNode" = { contains = "http://example.com/verify/bob" } }
+body = [{ contains = '"Bob is not a full name"' }, { contains = '"add a surname to Bob"' }, { not_contains = "never shown" }, { not_contains = "{?name}" }]
+
+[[step]]
+name = "the Turtle report: the same messages as sh:resultMessage"
+path = "/dataset/shacl"
+headers = { Accept = "text/turtle" }
+[step.expect]
+status = 200
+body = [{ contains = '"Bob is not a full name"' }, { contains = '"add a surname to Bob"' }, { not_contains = "never shown" }]

@@ -174,6 +174,7 @@ STUBS = {
     "scripts/check-locks.sh": RECORD.format(name="locks"),
     "scripts/check-features.sh": RECORD.format(name="features"),
     "scripts/check-names.sh": RECORD.format(name="names"),
+    "scripts/check-effect.sh": RECORD.format(name="effect"),
     "scripts/miri.sh": RECORD.format(name="miri"),
     "scripts/check-python-names.py": 'import os, sys\nopen(os.environ["CALLS"], "a")'
                                      '.write("python-names " + " ".join(sys.argv[1:]) + "\\n")\n',
@@ -181,6 +182,12 @@ STUBS = {
     "scripts/lib/fuzz-targets.txt": "alpha:lib:random\nbeta:lib:random\n",
     "scripts/lib/explorer-targets.txt": "# a listed explorer\nbeta:lib:explore::\n",
     "benches/suite/tests/isolation.py": 'import os\nopen(os.environ["CALLS"], "a").write("suite\\n")\n',
+    # Contracts the tier selects by what they read (benches/suite/tests/contracts.py, copied in as it
+    # is): the gate's scripts and hooks, one by its own file, and the crate scan, which a crate's
+    # sources reach.
+    "benches/suite/tests/test_gate.py": 'READS = ("scripts/", ".githooks/")\n',
+    "benches/suite/tests/test_push_gate.py": 'READS = (".githooks/pre-push",)\n',
+    "benches/suite/tests/crate_scan.py": 'READS = ("crates/**/src/**/*.rs",)\n',
     "crates/alpha/Cargo.toml": '[package]\nname = "alpha"\n',
     "crates/alpha/tests/it/probes/mod.rs": "mod topic;\n",
     "crates/beta/Cargo.toml": '[package]\nname = "beta"\n',
@@ -215,6 +222,8 @@ class QuickTier(unittest.TestCase):
         subprocess.run(["git", "init", "-q", str(cls.repo)], check=True, capture_output=True, env=cls.env)
         (cls.repo / "scripts").mkdir()
         shutil.copy(ROOT / "scripts/check.sh", cls.repo / "scripts/check.sh")
+        (cls.repo / "benches/suite/tests").mkdir(parents=True)
+        shutil.copy(ROOT / "benches/suite/tests/contracts.py", cls.repo / "benches/suite/tests/contracts.py")
         for rel, text in STUBS.items():
             (cls.repo / rel).parent.mkdir(parents=True, exist_ok=True)
             (cls.repo / rel).write_text(text, newline="\n")
@@ -244,8 +253,9 @@ class QuickTier(unittest.TestCase):
         # Spec (design §1), worked by hand for a change to alpha (beta depends on it, has the listed
         # explorer target; alpha has probes): fmt, message strings; clippy on alpha, every target;
         # alpha's unit tests; its it binary's probes:: module; nrese-server's generated views; one
-        # seed of alpha's random tests; beta's explorer target. Not beta's tests, the W3C data, Miri,
-        # the suite contracts.
+        # seed of alpha's random tests; beta's explorer target; the crate scan, which alpha's source
+        # reaches (push's selection, contracts.py). Not beta's tests, the W3C data, Miri, the other suite
+        # contracts (none reads it).
         fallback = ["guarded clippy --locked -p alpha --all-targets",
                     "guarded test --locked --no-fail-fast -p alpha --lib",
                     "guarded test --locked --no-fail-fast -p alpha --test it -- probes::",
@@ -260,7 +270,8 @@ class QuickTier(unittest.TestCase):
                    "-E (binary_id(nrese-server::it)) & test(generated_views)",
                    "guarded seed=SEED nextest run --locked --no-fail-fast -p alpha -E (binary_id(alpha) & test(random))",
                    "guarded nextest run --locked --no-fail-fast -p beta -E (binary_id(beta) & test(explore::))"]
-        steps = {"fmt", "message strings", "clippy", "unit tests", "probes", "generated views", "seeds", "explorer"}
+        steps = {"fmt", "message strings", "clippy", "unit tests", "probes", "generated views", "seeds", "explorer",
+                 "crate scan"}
         for has, want in (("", fallback), ("1", nextest)):
             with self.subTest(nextest=bool(has)):
                 code, got, calls, out = self.tier("quick", ALPHA, HAS_NEXTEST=has)
@@ -268,6 +279,25 @@ class QuickTier(unittest.TestCase):
                 self.assertEqual([re.sub(r"seed=\d+", "seed=SEED", c) for c in calls], want,
                                  f"SPEC quick-steps: the build admission's calls\n{out}")
                 self.assertEqual(set(got), steps, f"SPEC quick-steps: the summary\n{out}")
+
+    def test_a_change_to_the_gates_own_files_gets_the_suite_contracts_as_in_push(self):
+        # Spec (check.sh reached_contracts, one rule for both tiers): a change to the gate's own files
+        # runs the suite contracts that read them in quick as in push. The cases are the
+        # gate files of two changes whose contracts failed only in the push gate (21 Nov 2026): the
+        # effect check added to the guards, its stand-in missing from this file's fixture; the
+        # runner check that took a silent `cargo nextest --version` for no runner. And each of the other
+        # two folders alone: a contract, a hook.
+        cases = {"effect check": ["scripts/check-effect.sh", "scripts/check.sh"],
+                 "runner check": ["benches/suite/tests/test_push_gate.py",
+                                  "benches/suite/tests/test_push_tier_monotone.py", "scripts/check.sh",
+                                  "scripts/lib/gate-tools.txt", "scripts/lib/windows-job.sh"],
+                 "a contract": ["benches/suite/tests/test_push_gate.py"], "a hook": [".githooks/pre-push"]}
+        for name, files in cases.items():
+            for mode in ("quick", "push"):
+                with self.subTest(case=name, mode=mode):
+                    code, steps, _, out = self.tier(mode, files)
+                    self.assertEqual((code, steps.get("suite contracts")), (0, 0),
+                                     f"SPEC quick-suite-contracts\n{out}")
 
     def test_its_one_seed_is_the_push_tiers_first_whatever_the_environment_says(self):
         # Spec (design §1; review r1, 6): one seed, the first of push's three, so a failure replays in
@@ -396,12 +426,18 @@ class QuickGateJob(fixture.Repo):
             "rustc": '[ "${1#+}" != "$1" ] && shift; case "$1" in -vV) echo "release: 1.98.1"; echo "commit-hash: abcdef1234567890" ;;'
                      ' --print) echo "    native - Select the CPU of the current host (currently znver3)." ;; esac',
             "cargo": '[ "$1" = nextest ] && exec cargo-nextest "$@"; exit 0',
-            "curl": fixture.CURL_NEXTEST,
+            # get.nexte.st/<version>/linux: the stand-in archive of that version (pin() below).
+            "curl": 'for a; do url=$a; done; v=${url#https://get.nexte.st/}; v=${v%%/*}\n'
+                    'STUB_ARCHIVE="$STUB_ARCHIVES/$v.tar.gz"; [ -e "$STUB_ARCHIVE" ] || STUB_ARCHIVE=\n'
+                    + fixture.CURL_ARCHIVE.removeprefix("#!/bin/sh\n"),
             "cc": 'while [ $# -gt 0 ]; do [ "$1" = -o ] && { shift; : > "$1"; }; shift; done',
         }.items():
             (stubs / name).write_text("#!/bin/sh\n" + body + "\n")
             (stubs / name).chmod(0o755)
         self.stubs, self.cache, self.seen = stubs, self.root / "cache", self.root / "seen"
+        self.archives = self.root / "archives"
+        self.archives.mkdir()
+        self.pin("0.9.146")
         # check.sh: where it builds and runs, its files and Python; held (HOLD) until told to go, at most
         # 30 s; then the cargo-nextest it runs.
         check = ('s="$SEEN-$1"\n'
@@ -427,6 +463,17 @@ class QuickGateJob(fixture.Repo):
         self.sent = self.tree("HEAD")
         self.jobs = 0
 
+    def pin(self, version):
+        """The checkout's scripts/lib/gate-tools.txt pinning cargo-nextest VERSION: a stand-in runner of that
+        version, in an archive get.nexte.st serves (the curl stand-in), both by their sha256."""
+        made = self.archives / version
+        made.mkdir(exist_ok=True)
+        archive, _, archive_sum, exe_sum = fixture.nextest_archives(
+            made, f'#!/bin/sh\necho "cargo-nextest {version}"\n')
+        shutil.copy(archive, self.archives / f"{version}.tar.gz")
+        (self.repo / "scripts/lib/gate-tools.txt").write_text(
+            f"cargo-nextest {version}\ncargo-nextest-linux {version} {archive_sum} {exe_sum}\n")
+
     def start(self, mode, **env):
         """gate-job.sh MODE, started in a process group of its own."""
         self.jobs += 1
@@ -438,6 +485,7 @@ class QuickGateJob(fixture.Repo):
             stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True,
             env={**self.env, "FLEET_OUT": str(out), "NRESE_GATE_CACHE": str(self.cache), "SEEN": str(self.seen),
                  "HOME": str(self.root), "PATH": f"{self.stubs}:{os.environ['PATH']}", "NRESE_GATE_CC": "cc",
+                 "STUB_ARCHIVES": str(self.archives), "CARGO_HOME": str(self.root / "no-cargo-home"),
                  "FLEET_JOB": f"gate-{self.jobs}", "FLEET_STEP": "1", "FLEET_HOST": self.HOST, **env})
         self.addCleanup(self.stop, job, log)
         return job
@@ -522,12 +570,11 @@ class QuickGateJob(fixture.Repo):
     def test_each_job_runs_the_nextest_its_checkout_pins(self):
         # Spec (review r1, 2): two jobs pinning different cargo-nextest versions, the second installing
         # its own while the first runs: each runs its own version.
-        pins = self.repo / "scripts/lib/gate-tools.txt"
-        pins.write_text("cargo-nextest 0.9.1\n")
+        self.pin("0.9.1")
         hold = self.root / "hold"
         first = self.start("quick", HOLD=str(hold))
         self.assertTrue(self.appeared(Path(f"{hold}.ready")), "the quick job didn't reach its check")
-        pins.write_text("cargo-nextest 0.9.2\n")
+        self.pin("0.9.2")
         second = self.start("push")
         pushed = self.ended(second)
         Path(f"{hold}.go").touch()
@@ -537,27 +584,29 @@ class QuickGateJob(fixture.Repo):
                          f"{(self.root / 'job-1.log').read_text()}{(self.root / 'job-2.log').read_text()}")
 
     def test_a_job_whose_cargo_runs_another_nextest_than_the_pinned_one_has_no_verdict(self):
-        # Spec (review r2, 1; r3, 1): real Cargo runs `cargo nextest` from $CARGO_HOME/bin before PATH. With
-        # another version there, or the pinned one's text from a version command that fails (check.sh
-        # would fall back to cargo test), the job ends with no verdict (3) before its check; with the
-        # pinned one it runs it.
+        # Spec (review r2, 1; r3, 1; the pinned runner by its sha256): real Cargo runs `cargo nextest` from
+        # $CARGO_HOME/bin before PATH. Any runner there (another version, the pinned one's text from a
+        # version command that fails, or the pinned version itself, which isn't the pinned executable)
+        # ends the job with no verdict (3) before its check; with none there, cargo runs the pinned one.
         cargo = real_cargo()
         if cargo is None:
             self.skipTest("no Cargo here")
         (self.stubs / "cargo").write_text(f'#!/bin/sh\n[ "$1" = nextest ] && exec "{cargo}" "$@"\nexit 0\n')
-        (self.repo / "scripts/lib/gate-tools.txt").write_text("cargo-nextest 0.9.2\n")
+        self.pin("0.9.2")
         got = {}
-        for case, version, status in (("other", "0.9.1", 0), ("failing", "0.9.2", 1), ("pinned", "0.9.2", 0)):
+        for case, version, status in (("other", "0.9.1", 0), ("failing", "0.9.2", 1), ("same-version", "0.9.2", 0),
+                                      ("none", None, None)):
             home = self.root / f"cargo-home-{case}"
             (home / "bin").mkdir(parents=True)
-            (home / "bin" / "cargo-nextest").write_text(f'#!/bin/sh\necho "cargo-nextest {version}"\nexit {status}\n')
-            (home / "bin" / "cargo-nextest").chmod(0o755)
+            if version:
+                (home / "bin" / "cargo-nextest").write_text(f'#!/bin/sh\necho "cargo-nextest {version}"\nexit {status}\n')
+                (home / "bin" / "cargo-nextest").chmod(0o755)
             Path(f"{self.seen}-quick").unlink(missing_ok=True)
             job = self.start("quick", CARGO_HOME=str(home))
             got[case] = (self.ended(job), self.said("quick").get("nextest"))
-        self.assertEqual(got, {"other": (3, None), "failing": (3, None), "pinned": (0, "0.9.2")},
+        self.assertEqual(got, {"other": (3, None), "failing": (3, None), "same-version": (3, None), "none": (0, "0.9.2")},
                          f"SPEC cargo-runs-the-pinned-nextest ({cargo})\n"
-                         + "".join((self.root / f"job-{n}.log").read_text() for n in (1, 2, 3)))
+                         + "".join((self.root / f"job-{n}.log").read_text() for n in (1, 2, 3, 4)))
 
 
 if __name__ == "__main__":

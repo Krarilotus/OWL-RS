@@ -17,7 +17,10 @@
 # (scripts/lib/gate-key.sh gate_runtime), or there is no verdict; the record states the runtime it
 # ran with, which scripts/lib/fleet-gate.sh checks against the declared one. The console's Node is
 # the pinned one (scripts/lib/gate-tools.txt node), installed under the cache by
-# scripts/lib/gate-node.sh, never the host's.
+# scripts/lib/gate-node.sh, never the host's. The tests run under the pinned cargo-nextest
+# (scripts/lib/gate-tools.txt cargo-nextest), installed under the cache (scripts/lib/gate-nextest.sh), as
+# the Linux gate's: every crate's tests in one run with the workspace's features, never cargo test crate by
+# crate; without it there is no verdict.
 #
 # The fleet starts a Windows step without a usable stdin (fleet backlog I14): Python's subprocess
 # and coreutils fail on it. The job says so after check.sh's summary, records it (`stdin` in
@@ -63,6 +66,11 @@ run() {
   echo "$attempt" > "$out/attempt"
 
   [ "$(git rev-parse 'HEAD^{tree}' 2> /dev/null)" = "$tree" ] || infra "the checkout isn't tree $tree"
+  # A host's own cargo-nextest where cargo runs one first, before any on PATH, would stand in for the
+  # pinned one whatever its version says: no verdict, before anything is installed.
+  local home=${CARGO_HOME:-$HOME/.cargo}
+  [ ! -e "$home/bin/cargo-nextest.exe" ] && [ ! -e "$home/bin/cargo-nextest" ] \
+    || infra "the host's own cargo-nextest in $home/bin would run in place of the pinned one: no verdict"
   # shellcheck source=gate-key.sh
   . scripts/lib/gate-key.sh
   # shellcheck source=suite-python.sh
@@ -111,6 +119,19 @@ run() {
   nodebin=$(NRESE_PYTHON=python gate_node "$cache" scripts/lib/gate-tools.txt) || infra "no Node for the console"
   echo "$EPOCHSECONDS" > "$nodebin/.last-used"
   export PATH="$nodebin:$PATH"
+  # The pinned cargo-nextest (scripts/lib/gate-nextest.sh), first on PATH. Then the one the tier gets:
+  # cargo looks in $CARGO_HOME/bin before PATH, where a host's own would stand in. Its version counts
+  # only from a version command that succeeded.
+  local want nextest runner
+  want=$(sed -n 's/^cargo-nextest //p' scripts/lib/gate-tools.txt | tr -d '\r')
+  # shellcheck source=gate-nextest.sh
+  . scripts/lib/gate-nextest.sh
+  nextest=$(NRESE_PYTHON=python gate_nextest "$cache" scripts/lib/gate-tools.txt windows) \
+    || infra "no cargo-nextest ${want:-pinned}"
+  export PATH="$nextest:$PATH"
+  runner=$(cargo nextest --version 2> /dev/null) || runner=""
+  [ "$(printf '%s\n' "$runner" | tr -d '\r' | awk 'NR == 1 { print $2 }')" = "$want" ] \
+    || infra "cargo nextest is ${runner:-none}, not the pinned cargo-nextest $want (\$CARGO_HOME/bin first)"
 
   local temp
   mkdir -p tmp/windows-job/temp
@@ -123,15 +144,17 @@ run() {
   export TMPDIR=$temp TEMP=$temp TMP=$temp CARGO_TARGET_DIR NRESE_BASH PYTHONUTF8=1
   local began=$SECONDS code
   # check.sh's own output, whole: its summary is the evidence, step by step.
-  NRESE_ON_BUILD_HOST=1 bash scripts/check.sh windows 2>&1 | tee "$out/check.log"
+  # The tier runs its tests under that version or ends with 3 (check.sh's nextest).
+  NRESE_ON_BUILD_HOST=1 NRESE_NEXTEST_REQUIRED=$want bash scripts/check.sh windows 2>&1 | tee "$out/check.log"
   code=${PIPESTATUS[0]}
+  [ "$code" -ne 3 ] || infra "cargo nextest wasn't the pinned $want inside the run: no verdict"
   [ $stdin = valid ] || echo "stdin: the fleet gave this step none it could use (fleet backlog I14); it ran with /dev/null"
 
   # The runtime as the run left it: a run that changed its environment ran with no declared one.
   GATE_RUNTIME=$(suite_python_runtime "$pybin/python") \
     GATE_TIER=windows GATE_TREE=$tree GATE_LIST=$(gate_contracts_list | git hash-object --stdin) GATE_IDENTITY=$identity \
     GATE_CODE=$code GATE_CPU=$(gate_cpu) GATE_HOST=$(hostname) \
-    GATE_NEXTEST=$(cargo nextest --version 2> /dev/null | head -1) \
+    GATE_NEXTEST=${runner%%$'\n'*} \
     GATE_CHANGED=$(git status --porcelain --untracked-files=no) GATE_SECONDS=$((SECONDS - began)) \
     GATE_JOB=${FLEET_JOB:-} GATE_FLEET_HOST=${FLEET_HOST:-} GATE_ATTEMPT=$attempt GATE_STDIN=$stdin \
     python scripts/lib/gate-record.py "$out" || infra "no record of the run"

@@ -100,6 +100,117 @@ fn published_answer_followup_cli_reports_quarantine_failure()
     Ok(())
 }
 
+#[cfg(feature = "fault-points")]
+#[test]
+fn quarantine_failure_without_publication_says_load_again() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("invalid.nt");
+    std::fs::write(&file, "this is not a statement\n")?;
+    let mut command = nrese(dir.path(), &dir.path().join("data"));
+    command
+        .env("NRESE_TEST_FAIL_QUARANTINE_COMMIT", "1")
+        .arg("load")
+        .arg(&file);
+    let output = run(&mut command)?;
+    let detail = "Error: the load published nothing. The quarantine record couldn't be kept: simulated failure. It's safe to load it again once the cause is resolved.";
+    assert_eq!(
+        output
+            .stderr
+            .lines()
+            .filter(|line| line.contains("simulated failure"))
+            .collect::<Vec<_>>(),
+        [detail],
+        "{}",
+        output.stderr
+    );
+    assert!(!output.status.success(), "{}", output.status);
+    Ok(())
+}
+
+/// The load whose file the store kept in the quarantine of the data directory `data`, the
+/// only file there; a run's `stderr` is shown if there isn't exactly one.
+#[cfg(feature = "fault-points")]
+fn kept_load(data: &std::path::Path, stderr: &str) -> std::io::Result<String> {
+    let kept = std::fs::read_dir(data.join("quarantine"))?
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let loads = kept
+        .iter()
+        .filter_map(|name| name.strip_prefix("load-")?.strip_suffix(".jsonl"))
+        .collect::<Vec<_>>();
+    let [load] = loads[..] else {
+        panic!("{kept:?}\n{stderr}");
+    };
+    Ok(load.to_owned())
+}
+
+/// A load that published nothing, whose quarantine file was placed but couldn't be made
+/// durable or taken back: the error names the load and says when loading it again is safe.
+#[cfg(feature = "fault-points")]
+#[test]
+fn kept_quarantine_without_publication_says_when_to_load_again()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("invalid.nt");
+    std::fs::write(&file, "this is not a statement\n")?;
+    let data = dir.path().join("data");
+    let mut command = nrese(dir.path(), &data);
+    command
+        .env("NRESE_TEST_FAIL_QUARANTINE_REMOVAL", "1")
+        .arg("load")
+        .arg(&file);
+    let output = run(&mut command)?;
+    let load = kept_load(&data, &output.stderr)?;
+    let lines = output
+        .stderr
+        .lines()
+        .filter(|line| line.starts_with("Error:"))
+        .collect::<Vec<_>>();
+    let [line] = lines[..] else {
+        panic!("{}", output.stderr);
+    };
+    assert_eq!(
+        line,
+        format!(
+            "Error: the load published nothing. The quarantine record couldn't be kept: the quarantine's directory sync failed (a test's). This load's quarantine may have been kept as quarantine/load-{load}.jsonl in the server's data directory. If that file is there, don't load it again. If it isn't, loading it again is safe. If the server restarts before you load it again, check again."
+        )
+    );
+    assert!(!output.status.success(), "{}", output.status);
+    Ok(())
+}
+
+/// A load that published, whose quarantine file was placed but not made durable: the error
+/// names the load whose records stay listed, the one whose file the store kept.
+#[cfg(feature = "fault-points")]
+#[test]
+fn published_load_names_its_kept_quarantine() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("mixed.nt");
+    std::fs::write(
+        &file,
+        "<urn:a> <urn:p> \"one\" .\nthis is not a statement\n",
+    )?;
+    let data = dir.path().join("data");
+    let mut command = nrese(dir.path(), &data);
+    command
+        .env("NRESE_TEST_FAIL_QUARANTINE_SYNC", "1")
+        .arg("load")
+        .arg(&file);
+    let output = run(&mut command)?;
+    let load = kept_load(&data, &output.stderr)?;
+    let detail = format!(
+        "Error: the load completed at published revision 1. Its quarantine record couldn't be kept: the quarantine's directory sync failed (a test's). This load's records are listed under load ID {load}, but a power loss may lose them. Don't load it again."
+    );
+    assert!(
+        output.stderr.lines().any(|line| line == detail),
+        "{}",
+        output.stderr
+    );
+    assert!(!output.status.success(), "{}", output.status);
+    Ok(())
+}
+
 /// `query --format json`: standard output is one SPARQL 1.1 JSON results document (`ASK {}`
 /// is true), nothing before or after it; the INFO lines are on standard error.
 #[test]
