@@ -5,6 +5,7 @@ output says where, never what. Every term here is a made-up one in a fake overla
 Run: python benches/suite/tests/isolation.py discover -s benches/suite/tests -p test_private_terms.py
 """
 import importlib.util
+import io
 import os
 from pathlib import Path
 import shutil
@@ -266,7 +267,7 @@ class TheCheckOwnEnds(unittest.TestCase):
         terms = module()
         lies = {"a match with nothing printed": (0, b""), "a record not ended": (0, b"1:zz"),
                 "line 0": (0, b"0:zz\n"), "a line past the input": (0, b"3:zz\n"),
-                "no match yet printed": (1, b"1:zz\n")}
+                "a number past Python's int limit": (0, b"9" * 5000 + b":zz\n"), "no match yet printed": (1, b"1:zz\n")}
 
         def answering(code, out):
             return mock.patch.object(terms.subprocess, "run",
@@ -295,17 +296,24 @@ class TheCheckOwnEnds(unittest.TestCase):
             held.close()
         self.assertEqual((ended.exception.code, path.exists()), (143, False), "SPEC stop")
 
-    # Spec (as above; never-printed): a pattern file that can't be removed -> a refusal whose message names no
-    # path (the temp folder's names the user).
+    # Spec (as above; never-printed): a pattern file that can't be removed -> a refusal that says so and names no
+    # path (the temp folder's names the user), a stop waiting for it or not.
     def test_a_pattern_file_that_cant_be_removed_is_a_refusal_naming_no_path(self):
-        terms = module()
-        held = terms.Terms(None, ["zzlisted"])
-        path = held.listed
-        self.addCleanup(lambda: Path(path).unlink(missing_ok=True))
-        with mock.patch.object(terms.os, "remove", side_effect=PermissionError(13, "denied", path)):
-            with self.assertRaises(terms.Unreadable, msg="SPEC cleanup: a failed removal passed") as refused:
-                held.close()
-        self.assertNotIn(path, str(refused.exception), "SPEC never-printed: the path")
+        for stopped in (False, True):
+            with self.subTest(stopped=stopped):
+                terms = module()
+                held = terms.Terms(None, ["zzlisted"])
+                path = held.listed
+                self.addCleanup(lambda p=path: Path(p).unlink(missing_ok=True))
+                if stopped:
+                    terms.stop()
+                with mock.patch.object(terms.os, "remove", side_effect=PermissionError(13, "denied", path)), \
+                        mock.patch("sys.stdout", new_callable=io.StringIO) as out, \
+                        self.assertRaises(SystemExit if stopped else terms.Unreadable, msg="SPEC cleanup") as refused:
+                    held.close()
+                said = ("" if stopped else str(refused.exception)) + out.getvalue()
+                self.assertIn("removing its own pattern file", said, "SPEC cleanup: it doesn't say what failed")
+                self.assertNotIn(path, said, "SPEC never-printed: the path")
 
 
 if __name__ == "__main__":

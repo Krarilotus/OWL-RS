@@ -96,15 +96,21 @@ class Terms:
         if not self.held:
             return
         self.held = False
+        removed = True
         try:
             if self.listed:
                 os.remove(self.listed)
         except OSError:
-            raise Unreadable("removing its own pattern file") from None  # never the path: it names the user
+            removed = False
         finally:
             STOP["files"] -= 1
-            if STOP["asked"] and not STOP["files"]:
-                sys.exit(128 + signal.SIGTERM)
+        why = "removing its own pattern file"  # never the path: it names the user
+        if STOP["asked"] and not STOP["files"]:
+            if not removed:  # the stop's exit, with what it couldn't do
+                print(f"private terms: could not check: {why}: refused")
+            sys.exit(128 + signal.SIGTERM)
+        if not removed:
+            raise Unreadable(why)
 
     def hits(self, values: list[str]) -> set[int]:
         """The indexes of the values a term matches, line by line."""
@@ -135,7 +141,8 @@ def grep(patterns: str, lines: list[str]) -> list[int]:
     found = []
     for line in records:
         number = re.match(rb"([1-9][0-9]*):", line)
-        if not number or int(number.group(1)) > len(lines):
+        # its digits counted before it is read: a number past Python's int limit would raise, path and all
+        if not number or len(number.group(1)) > len(str(len(lines))) or int(number.group(1)) > len(lines):
             raise Unreadable(f"grep's output with the overlay's {LIST}")
         found.append(int(number.group(1)) - 1)
     return found
