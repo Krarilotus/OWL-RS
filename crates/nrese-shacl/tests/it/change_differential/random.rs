@@ -96,14 +96,8 @@ pub(super) fn replay(test: &str, outer: &str, case: &str) -> String {
     )
 }
 
-/// Whether `selector`, not a matrix row's, names a draw or an existing saved case.
-pub(super) fn selects_a_draw(selector: &str) -> bool {
-    match selector.strip_prefix("saved:") {
-        Some(file) => witnesses::saved_path(file).is_file(),
-        None => selector.parse::<u64>().is_ok_and(|index| index < DRAWS),
-    }
-}
-
+/// Runs the draws, or the draw or saved case `NRESE_SHACL_CASE` names. A matrix row's
+/// selector runs that row, so every selector runs a case or fails.
 pub(super) fn run() {
     let outer = std::env::var("NRESE_FUZZ_SEED").unwrap_or_else(|_| "0".into());
     let selector = std::env::var("NRESE_SHACL_CASE").ok();
@@ -111,21 +105,15 @@ pub(super) fn run() {
         None => (0..DRAWS)
             .map(|index| (index.to_string(), draw::case(index), None))
             .collect(),
-        Some(row) if row.starts_with("row:") => {
-            let id = &row["row:".len()..];
-            assert!(
-                matrix::has_row(id),
-                "no case matches NRESE_SHACL_CASE={row}"
-            );
-            return;
-        }
-        Some(case) if !selects_a_draw(case) => panic!("no case matches NRESE_SHACL_CASE={case}"),
+        Some(row) if row.starts_with("row:") => return matrix::run(),
         Some(saved) if saved.starts_with("saved:") => {
             let (case, recorded) = witnesses::load(&saved["saved:".len()..]);
             vec![(saved.into(), case, recorded)]
         }
         Some(index) => {
-            let index = index.parse::<u64>().expect("a draw's index");
+            let index = (index.parse::<u64>().ok())
+                .filter(|index| *index < DRAWS)
+                .unwrap_or_else(|| panic!("no case matches NRESE_SHACL_CASE={index}"));
             vec![(index.to_string(), draw::case(index), None)]
         }
     };

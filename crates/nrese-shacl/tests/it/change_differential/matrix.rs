@@ -98,20 +98,16 @@ fn pin<A: PartialEq<B> + std::fmt::Debug, B: std::fmt::Debug>(
     }
 }
 
-pub(super) fn has_row(id: &str) -> bool {
-    rows().any(|row| row.id == id)
-}
-
+/// Runs every row, or the row `NRESE_SHACL_CASE` names. A draw's or saved case's selector
+/// runs that case, so every selector runs a case or fails.
 pub(super) fn run() {
     let outer = std::env::var("NRESE_FUZZ_SEED").unwrap_or_else(|_| "0".into());
     let selector = std::env::var("NRESE_SHACL_CASE").ok();
-    if let Some(case) = selector.as_ref().filter(|case| !case.starts_with("row:")) {
-        // A random draw's or saved case's selector, which must name one.
-        assert!(
-            super::random::selects_a_draw(case),
-            "no case matches NRESE_SHACL_CASE={case}"
-        );
-        return;
+    if selector
+        .as_ref()
+        .is_some_and(|case| !case.starts_with("row:"))
+    {
+        return super::random::run();
     }
     let gaps = super::witnesses::verified_gaps();
     let mut allowances: [Allowances<'_>; 3] = Default::default();
