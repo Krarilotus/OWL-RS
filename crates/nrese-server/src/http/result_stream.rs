@@ -417,11 +417,13 @@ async fn hold(
     if let Err(stopped) = outcome.take() {
         // The producer's own work (a query's) draws on the same envelope: refused while the
         // hold held part of the answer, it was refused for holding it, as a refusal of the
-        // hold's own charge would be.
-        let beside = held.memory.bytes() > 0 && envelope.refused();
+        // hold's own charge would be. Refused by the memory all queries share, whenever that
+        // was, it may be retried as the hold's own refusal there may.
+        let refused = envelope.refused();
+        let beside = held.memory.bytes() > 0 && refused;
         return Err(match stopped {
             ApiError::PayloadTooLarge(_) if beside => too_large_for_http10(bound),
-            ApiError::ServiceUnavailable(detail) if beside => ApiError::busy(detail),
+            ApiError::ServiceUnavailable(detail) if refused => ApiError::busy(detail),
             stopped => stopped,
         });
     }
