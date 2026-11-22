@@ -664,7 +664,10 @@ class Suite:
             endpoint = system.serve(ctx, store, regime)
             base["version"] = system.version(ctx, endpoint)
             if endpoint.index_ms is not None:
-                self.emit(base, task="index", ms=endpoint.index_ms, note=endpoint.index_note)
+                self.emit(base, task="index", status=endpoint.index_status, ms=endpoint.index_ms,
+                          note=endpoint.index_note)
+                if endpoint.index_status != "ok":
+                    return
             if system.persistent and not in_memory:
                 self.emit(base, task="restart", ms=endpoint.restart_ms if endpoint.restart_ms is not None else "")
             if self.settings.get("SKIP_COUNT") == "1":

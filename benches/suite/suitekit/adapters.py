@@ -192,9 +192,10 @@ class Endpoint:
     server: Server | None = None
     restart_ms: float | None = None
     # A service index built after the server started (GraphDB's GeoSPARQL plugin), apart
-    # from the restart: its time and what it was.
+    # from the restart: its time, what it was and its status.
     index_ms: float | None = None
     index_note: str = ""
+    index_status: str = "ok"
 
 
 # --- HTTP -----------------------------------------------------------------------------------
@@ -215,6 +216,11 @@ def no_answer(error: OSError, timeout: float) -> str:
     if isinstance(reason, TimeoutError):
         return f"{NO_ANSWER} {timeout:g} s"
     return f"no response: {reason}"[:300]
+
+
+def answer(status: int, body: str) -> str:
+    """A post() or upload() result for a note: its HTTP status, or why there was none."""
+    return (body if status == 0 else f"HTTP {status} {body}")[:200]
 
 
 def post(url: str, data: dict, accept: str = "application/sparql-results+json", timeout: float = 30) -> tuple[int, str]:
@@ -900,7 +906,7 @@ class Rdf4j(Adapter):
         created = put(endpoint.query, RDF4J_REPOSITORY, "text/turtle")
         rc = 0 if created in (200, 201, 204) else 1
         log.append(f"create repository: HTTP {created}")
-        late = False
+        late, why = False, ""
         for path in inputs:
             if rc != 0:
                 break
@@ -913,12 +919,12 @@ class Rdf4j(Adapter):
                                     timeout=ctx.timeout_s)
             log.append(f"LOAD {path}: HTTP {status} {text[:500]}")
             rc = 0 if status in (200, 204) else 1
-            late = timed_out(status, text)
+            late, why = timed_out(status, text), f"; LOAD {path}: {answer(status, text)}" if rc else ""
         ms = (time.monotonic() - started) * 1000
         (ctx.logs / "load.log").write_text("\n".join(log), encoding="utf-8")
         peak, kind, memory_note = self.stop_memory(ctx)
         return Step(Measured(ms, peak, rc, late, memory_kind=kind, memory_note=memory_note),
-                    note="server start-up excluded; SPARQL LOAD per file")
+                    note="server start-up excluded; SPARQL LOAD per file" + why)
 
     def serve(self, ctx, store, regime):
         spec = self.spec(ctx, ctx.name("serve"), store, ctx.listen(8080))
@@ -1069,7 +1075,9 @@ class Graphdb(Adapter):
                                 timeout=ctx.timeout_s)
             endpoint.index_ms = (time.monotonic() - started) * 1000
             endpoint.index_note = f"GeoSPARQL plugin enabled (HTTP {status})"
-            if not 200 <= status < 300:
+            if timed_out(status, text):  # the driver records the index as a timeout
+                endpoint.index_status, endpoint.index_note = "timeout", f"enabling GeoSPARQL: {text}"
+            elif not 200 <= status < 300:
                 raise RuntimeError(f"graphdb: enabling GeoSPARQL failed: {status} {text[:200]}")
         return endpoint
 
@@ -1145,7 +1153,7 @@ class Anzograph(Adapter):
         spec = Spec(ctx.name("serve"), self.images(ctx)[0], [], mounts=mounts, port=port, entrypoint=True)
         base = ctx.runtime.url(spec) + "/sparql"
         self.endpoint = self.start(ctx, spec, Endpoint(base, base), timeout_s=900)
-        started, rc, output, late = time.monotonic(), 0, [], False
+        started, rc, output, late, why = time.monotonic(), 0, [], False, ""
         for path in inputs:
             path = "/bench/" + path[len("/data/"):] if path.startswith("/data/") else path
             if ctx.dry:
@@ -1153,13 +1161,13 @@ class Anzograph(Adapter):
                 continue
             status, body = post(base, {"update": f"LOAD WITH 'global' <file:{path}>"}, timeout=ctx.timeout_s)
             output.append(f"{path}: HTTP {status} {body[:500]}")
-            rc = rc or (0 if status == 200 else 1)
-            late = late or timed_out(status, body)
+            if rc == 0 and status != 200:  # the first unsuccessful file decides
+                rc, late, why = 1, timed_out(status, body), f"; LOAD {path}: {answer(status, body)}"
         ms = (time.monotonic() - started) * 1000
         (ctx.logs / "load.log").write_text("\n".join(output), encoding="utf-8")
         peak, kind, memory_note = memory_now(self.server)  # it serves on: its peak so far
         return Step(Measured(ms, peak, rc, late, memory_kind=kind, memory_note=memory_note),
-                    note="server start-up excluded; in memory")
+                    note="server start-up excluded; in memory" + why)
 
     def serve(self, ctx, store, regime):
         return self.endpoint

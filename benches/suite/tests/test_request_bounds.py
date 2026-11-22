@@ -21,7 +21,8 @@ from suitekit import adapters  # noqa: E402
 
 
 class Holding(http.server.BaseHTTPRequestHandler):
-    """Answers a repository PUT at once; holds every POST until the test ends."""
+    """Answers a repository PUT at once and a POST naming "fail" with HTTP 500; holds every other POST until the
+    test ends."""
     release = threading.Event()
 
     def log_message(self, *args):
@@ -33,8 +34,11 @@ class Holding(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
-        self.rfile.read(int(self.headers.get("Content-Length", 0)))
-        self.release.wait(10)
+        if b"fail" in self.rfile.read(int(self.headers.get("Content-Length", 0))):
+            self.send_response(500)
+            self.end_headers()
+        else:
+            self.release.wait(10)
 
 
 class Bounds(unittest.TestCase):
@@ -80,7 +84,36 @@ class Bounds(unittest.TestCase):
             step = rdf4j.load(ctx, "store", ["/data/input.nt"], "none")
             self.assertLess(time.monotonic() - started, 9, "the load waited past its bound")
             self.assertTrue(step.measured.timed_out, step)
-            self.assertIn("no answer within 1 s", (Path(tmp) / "load.log").read_text(encoding="utf-8"))
+            self.assertIn("no answer within 1 s", step.note)
+
+    # Spec (as above): when one file of a load fails and a later one runs out of time, the load is a failure.
+    def test_a_failed_file_before_a_late_one_is_a_failure(self):
+        base = self.url("/sparql")
+        anzo = adapters.adapter("anzograph")
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(anzo, "start"), \
+                mock.patch.object(anzo, "server", None, create=True), \
+                mock.patch.object(adapters, "memory_now", return_value=(None, "", "")):
+            ctx = SimpleNamespace(dry=False, timeout_s=1, logs=Path(tmp), name=str, data=SimpleNamespace(source=tmp),
+                                  extra=[], listen=lambda port, fixed: port, setting=lambda key, default: default,
+                                  runtime=SimpleNamespace(url=lambda spec: base[:-len("/sparql")]))
+            step = anzo.load(ctx, "store", ["/data/fail.nt", "/data/late.nt"], "none")
+            self.assertEqual((step.measured.rc, step.measured.timed_out), (1, False), step)
+            self.assertIn("fail.nt: HTTP 500", step.note)
+
+    # Spec (as above, for GraphDB's GeoSPARQL index, built by an update after the server starts): an index request
+    # that gets no answer within the cell's bound makes the index a timeout.
+    def test_an_index_past_its_bound_is_a_timeout(self):
+        base = self.url("")
+        graphdb = adapters.adapter("graphdb")
+        with mock.patch.object(graphdb, "licence"), mock.patch.object(graphdb, "images", return_value=["image"]), \
+                mock.patch.object(graphdb, "env"), mock.patch.object(graphdb, "record_configuration"), \
+                mock.patch.object(graphdb, "start", side_effect=lambda ctx, spec, endpoint: endpoint):
+            ctx = SimpleNamespace(dry=False, timeout_s=1, services={"geosparql"}, name=str, memory=None,
+                                  listen=lambda port, fixed: port, mounts=lambda *mounts: list(mounts),
+                                  runtime=SimpleNamespace(url=lambda spec: base))
+            endpoint = graphdb.serve(ctx, "store", "none")
+            self.assertEqual(endpoint.index_status, "timeout", endpoint)
+            self.assertIn("no answer within 1 s", endpoint.index_note)
 
 
 if __name__ == "__main__":
