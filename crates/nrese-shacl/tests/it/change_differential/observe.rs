@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
 use nrese_engine::Snapshot;
 use nrese_rdf::{Literal, NamedNode, Term};
@@ -117,10 +118,27 @@ pub(crate) enum Direction {
     Mixed,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq)]
 pub(crate) struct Count {
     pub expected: usize,
     pub actual: usize,
+}
+
+/// A deviation's reader sees each key's direction beside its counts.
+impl fmt::Debug for Count {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let direction = match self.direction() {
+            Direction::Missed => "missed",
+            Direction::Extra => "extra",
+            Direction::Duplicate => "duplicate",
+            Direction::Mixed => "mixed",
+        };
+        write!(
+            f,
+            "{direction} (expected {}, actual {})",
+            self.expected, self.actual
+        )
+    }
 }
 
 impl Count {
@@ -222,6 +240,28 @@ mod tests {
                     actual: 1
                 }
             )])
+        );
+    }
+
+    // Spec: a deviation names each key's direction (missed, duplicate, extra) with its
+    // expected and actual counts.
+    #[test]
+    fn a_deviation_names_each_direction() {
+        let count = |expected, actual| Count { expected, actual };
+        let deviation = Deviation {
+            results: BTreeMap::from([
+                ("lost".into(), count(1, 0)),
+                ("repeated".into(), count(1, 2)),
+                ("unexpected".into(), count(0, 1)),
+            ]),
+            failures: BTreeMap::from([("failed".into(), count(2, 1))]),
+        };
+        assert_eq!(
+            format!("{deviation:?}"),
+            "Deviation { results: {\"lost\": missed (expected 1, actual 0), \
+             \"repeated\": duplicate (expected 1, actual 2), \
+             \"unexpected\": extra (expected 0, actual 1)}, \
+             failures: {\"failed\": missed (expected 2, actual 1)} }"
         );
     }
 }
