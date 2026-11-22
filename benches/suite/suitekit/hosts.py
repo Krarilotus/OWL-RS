@@ -207,12 +207,22 @@ def private_home() -> Path:
     return Path.home() / "owlrs" / "private"
 
 
-def evidence_path(path: str | Path, private: bool | None = None, checkout: str | Path = ROOT) -> Path:
-    """Resolve a private output file at the write, using saved privacy when supplied."""
+def evidence_path(path: str | Path, private: bool | None = None, checkout: str | Path = ROOT,
+                  *, within: Path | None = None) -> Path:
+    """Check output privacy and, for a locked directory, require its own unlinked file."""
     path = Path(path)
     if private is None:
         private = private_session()
-    return private_output(path, checkout) if private else path
+    checked = private_output(path, checkout) if private else path
+    if within is not None:
+        resolved = checked if private else path.resolve()
+        try:
+            shared = path.lstat().st_nlink > 1
+        except FileNotFoundError:
+            shared = False
+        if path.parent != within or resolved != path or path.is_symlink() or shared:
+            raise ValueError(f"result evidence must be an unlinked file in {within}: {path}")
+    return checked
 
 
 def private_dir(environ: dict | None = None) -> Path | None:

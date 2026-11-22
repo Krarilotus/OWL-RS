@@ -230,9 +230,38 @@ def canonical(path: Path) -> collections.Counter:
     return bag
 
 
+def private_results(out: Path) -> bool:
+    """Saved runs are private unless every invocation records public machine provenance."""
+    try:
+        data = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True
+    invocations = data.get("invocations") if isinstance(data, dict) else None
+    if not isinstance(invocations, list) or not invocations:
+        return True
+    for invocation in invocations:
+        machine = invocation.get("machine") if isinstance(invocation, dict) else None
+        if not isinstance(machine, dict):
+            return True
+        host = machine.get("host")
+        if not isinstance(host, str) or not host or "overlay" not in machine:
+            return True
+        if kit.hosts.private_run(machine):
+            return True
+    return False
+
+
 def check(args) -> int:
     out = Path(args.results).resolve()
-    rows = list(csv.DictReader(open(out / "results.csv", encoding="utf-8")))
+    private = private_results(out)
+    try:
+        raw = kit.hosts.evidence_path(out / "results.raw.csv", private)
+        results = kit.hosts.evidence_path(out / "results.csv", private)
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        return 2
+    with results.open(encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
     reports = out / "reports"
     verdicts, reference_bags = {}, {}
     for row in rows:
@@ -255,8 +284,8 @@ def check(args) -> int:
         else:
             missing, extra = sum((theirs - mine).values()), sum((mine - theirs).values())
             verdicts[name] = ("wrong", f"against {args.reference}: {missing} results missing, {extra} extra")
-    shutil.copyfile(out / "results.csv", kit.hosts.evidence_path(out / "results.raw.csv"))
-    with open(kit.hosts.evidence_path(out / "results.csv"), "w", newline="", encoding="utf-8") as f:
+    shutil.copyfile(results, kit.hosts.evidence_path(raw, private))
+    with open(kit.hosts.evidence_path(results, private), "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, rows[0].keys())
         w.writeheader()
         for row in rows:
