@@ -242,7 +242,7 @@ class QuickTier(unittest.TestCase):
         # explorer target; alpha has probes): fmt, message strings; clippy on alpha, every target;
         # alpha's unit tests; its it binary's probes:: module; nrese-server's generated views; one
         # seed of alpha's random tests; beta's explorer target. Not beta's tests, the W3C data, Miri,
-        # the suite contracts.
+        # the suite contracts (no gate file changed).
         fallback = ["guarded clippy --locked -p alpha --all-targets",
                     "guarded test --locked --no-fail-fast -p alpha --lib",
                     "guarded test --locked --no-fail-fast -p alpha --test it -- probes::",
@@ -265,6 +265,25 @@ class QuickTier(unittest.TestCase):
                 self.assertEqual([re.sub(r"seed=\d+", "seed=SEED", c) for c in calls], want,
                                  f"SPEC quick-steps: the build admission's calls\n{out}")
                 self.assertEqual(set(got), steps, f"SPEC quick-steps: the summary\n{out}")
+
+    def test_a_change_to_the_gates_own_files_gets_the_suite_contracts_as_in_push(self):
+        # Spec (check.sh suite_contracts, one rule for both tiers): a change under scripts/,
+        # benches/suite/ or .githooks/ runs the suite contracts in quick as in push. The cases are the
+        # gate files of two changes whose contracts failed only in the push gate (21 Nov 2026): the
+        # effect check added to the guards, its stand-in missing from this file's fixture; the
+        # runner check that took a silent `cargo nextest --version` for no runner. And each of the other
+        # two folders alone: a contract, a hook.
+        cases = {"effect check": ["scripts/check-effect.sh", "scripts/check.sh"],
+                 "runner check": ["benches/suite/tests/test_push_gate.py",
+                                  "benches/suite/tests/test_push_tier_monotone.py", "scripts/check.sh",
+                                  "scripts/lib/gate-tools.txt", "scripts/lib/windows-job.sh"],
+                 "a contract": ["benches/suite/tests/test_push_gate.py"], "a hook": [".githooks/pre-push"]}
+        for name, files in cases.items():
+            for mode in ("quick", "push"):
+                with self.subTest(case=name, mode=mode):
+                    code, steps, _, out = self.tier(mode, files)
+                    self.assertEqual((code, steps.get("suite contracts")), (0, 0),
+                                     f"SPEC quick-suite-contracts\n{out}")
 
     def test_its_one_seed_is_the_push_tiers_first_whatever_the_environment_says(self):
         # Spec (design §1; review r1, 6): one seed, the first of push's three, so a failure replays in
