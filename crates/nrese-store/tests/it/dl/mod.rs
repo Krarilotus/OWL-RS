@@ -6,6 +6,7 @@ mod bounds;
 mod cache_admission;
 pub(crate) mod classification;
 pub(crate) mod consistency;
+mod counterexample_witness;
 mod dataset_reasons;
 mod datatypes;
 mod entailment;
