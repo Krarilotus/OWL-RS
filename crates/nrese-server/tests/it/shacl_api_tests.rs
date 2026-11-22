@@ -10,6 +10,7 @@ use nrese_store::{GateSeverity, ShaclGate, StoreConfig};
 use tower::util::ServiceExt;
 
 use crate::support::{body_text, query_text, test_app, test_app_with_store_config};
+use crate::upgrade_tests::{Server, configure};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -560,5 +561,215 @@ async fn a_shacl_reject_lists_messages_by_their_text() -> TestResult {
     let problem: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
     let detail = problem["detail"].as_str().expect("a detail");
     assert!(detail.contains("message \"aa\", \"zz\""), "{detail}");
+    Ok(())
+}
+
+/// The SHACL gate's state as the repository's info gives it.
+async fn gate_state(app: &axum::Router) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let info = report(app, "/dataset/info").await?;
+    Ok(info["shacl"].clone())
+}
+
+/// The info names an enforcing gate, the least severity it refuses, and the shapes it
+/// checks against: their number, nested ones included, as a validation counts them.
+#[tokio::test]
+async fn the_info_names_the_enforcing_gate_and_its_shapes() -> TestResult {
+    let config = StoreConfig {
+        shacl_gate: ShaclGate::Enforce(GateSeverity::Warning),
+        ..StoreConfig::default()
+    };
+    let app =
+        test_app_with_store_config(config, PolicyConfig::default(), ReasonerConfig::default())?;
+    put(&app, SHAPES_GRAPH, SHAPES).await?;
+    let gate = gate_state(&app).await?;
+    assert_eq!(
+        gate["shapes"], 2,
+        "the node shape and its property shape: {gate}"
+    );
+    assert_eq!(gate["vacuous"], false, "{gate}");
+    assert_eq!(gate["gate"], "enforce", "{gate}");
+    assert_eq!(gate["severity"], "warning", "{gate}");
+    Ok(())
+}
+
+/// With no shapes stored, the info says the gate checks nothing (0 shapes, `vacuous`: an
+/// enforcing gate then accepts every write, docs/limits.md), and names the gate: `off` has
+/// no severity.
+#[tokio::test]
+async fn without_shapes_the_info_says_the_gate_checks_nothing() -> TestResult {
+    for (gate, name, severity) in [
+        (ShaclGate::Off, "off", serde_json::Value::Null),
+        (
+            ShaclGate::Enforce(GateSeverity::Violation),
+            "enforce",
+            "violation".into(),
+        ),
+    ] {
+        let config = StoreConfig {
+            shacl_gate: gate,
+            ..StoreConfig::default()
+        };
+        let app =
+            test_app_with_store_config(config, PolicyConfig::default(), ReasonerConfig::default())?;
+        let state = gate_state(&app).await?;
+        assert_eq!(state["shapes"], 0, "{name}: {state}");
+        assert_eq!(state["vacuous"], true, "{name}: {state}");
+        assert_eq!(state["gate"], name, "{state}");
+        assert_eq!(state["severity"], severity, "{name}: {state}");
+    }
+    Ok(())
+}
+
+/// A shapes graph with no shape but an `sh:entailment` isn't vacuous: every validation
+/// against it fails (SHACL §1.5: no entailment regime is supported), as the gate treats it.
+#[tokio::test]
+async fn an_entailment_alone_is_counted_and_not_vacuous() -> TestResult {
+    let app = test_app()?;
+    put(
+        &app,
+        SHAPES_GRAPH,
+        "<http://example.com/shapes> sh:entailment <http://www.w3.org/ns/entailment/RDFS> .",
+    )
+    .await?;
+    let gate = gate_state(&app).await?;
+    assert_eq!(gate["vacuous"], false, "{gate}");
+    assert_eq!(gate["shapes"], 0, "{gate}");
+    Ok(())
+}
+
+/// The shapes are compiled when the shapes graph changes (the owner's ruling): a commit of
+/// data keeps the revision they were compiled at; one that adds a shape counts it, at its
+/// own revision.
+#[tokio::test]
+async fn the_shapes_are_counted_again_when_the_shapes_graph_changes() -> TestResult {
+    let app = test_app()?;
+    put(&app, SHAPES_GRAPH, SHAPES).await?;
+    let gate = gate_state(&app).await?;
+    assert_eq!(gate["shapes"], 2, "{gate}");
+    let compiled = gate["revision"].as_u64().expect("a revision");
+
+    put(
+        &app,
+        "http://example.com/people",
+        "ex:ada a ex:Person ; ex:name \"Ada\" .",
+    )
+    .await?;
+    let info = report(&app, "/dataset/info").await?;
+    assert!(
+        info["revision"].as_u64().is_some_and(|now| now > compiled),
+        "the data's commit is a later revision: {info}"
+    );
+    assert_eq!(info["shacl"]["revision"], compiled, "{info}");
+    assert_eq!(info["shacl"]["shapes"], 2, "{info}");
+
+    let more = format!(
+        "{SHAPES}\nex:Named a sh:NodeShape ; sh:targetClass ex:Person ; sh:nodeKind sh:IRI ."
+    );
+    put(&app, SHAPES_GRAPH, &more).await?;
+    let gate = gate_state(&app).await?;
+    assert_eq!(gate["shapes"], 3, "{gate}");
+    assert!(
+        gate["revision"].as_u64().is_some_and(|now| now > compiled),
+        "{gate}"
+    );
+    Ok(())
+}
+
+/// A bulk load passes no commit gate, so it can store shapes that don't compile
+/// (docs/limits.md): the info then counts nothing, null and never 0, and says why. Shapes
+/// stored in their place are counted again.
+#[tokio::test]
+async fn shapes_that_dont_compile_are_not_counted() -> TestResult {
+    let app = test_app()?;
+    let uri = format!(
+        "/api/v1/repositories/nrese/import?graph={}",
+        encode(SHAPES_GRAPH)
+    );
+    let unreadable = format!(
+        "{PREFIXES}ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:property [ sh:path \"not a path\" ] ."
+    );
+    let turtle = [("content-type", "text/turtle")];
+    let response = send(&app, Method::POST, &uri, &turtle, unreadable).await?;
+    let status = response.status();
+    assert_eq!(status, StatusCode::OK, "{}", body_text(response).await?);
+
+    let gate = gate_state(&app).await?;
+    assert_eq!(gate.get("shapes"), Some(&serde_json::Value::Null), "{gate}");
+    assert_eq!(
+        gate.get("vacuous"),
+        Some(&serde_json::Value::Null),
+        "{gate}"
+    );
+    assert!(
+        gate["not_counted"]
+            .as_str()
+            .is_some_and(|why| why.contains("don't compile") && why.contains("sh:path")),
+        "{gate}"
+    );
+
+    put(&app, SHAPES_GRAPH, SHAPES).await?;
+    let gate = gate_state(&app).await?;
+    assert_eq!(gate["shapes"], 2, "{gate}");
+    assert_eq!(gate.get("not_counted"), None, "{gate}");
+    Ok(())
+}
+
+/// The configuration of a server binary on `dir`'s data directory with its SHACL gate set
+/// to `enforce` ([`configure`]).
+fn enforcing(dir: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let data = dir.join("data");
+    std::fs::create_dir_all(&data)?;
+    let file = configure(dir, &data)?;
+    let mut text = std::fs::read_to_string(&file)?;
+    text.push_str("[shacl]\ngate = \"enforce\"\n");
+    std::fs::write(&file, text)?;
+    Ok(file)
+}
+
+/// At its start, a server warns when its enforcing gate checks nothing: a shapes graph that
+/// holds only a label (metadata) compiles to no shape, so every write passes the gate.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_start_warns_when_the_shapes_graph_holds_no_shape() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let config = enforcing(dir.path())?;
+    let server = Server::start(&config).await?;
+    let label = format!(
+        "INSERT DATA {{ GRAPH <{SHAPES_GRAPH}> {{ <http://example.com/shapes> \
+         <http://www.w3.org/2000/01/rdf-schema#label> \"the shapes\" }} }}"
+    );
+    server.update("nrese", &label).await?;
+    drop(server);
+
+    let server = Server::start(&config).await?;
+    let output = server.output();
+    assert!(
+        output.lines().any(|line| line.contains("WARN")
+            && line.contains("SHACL gate: no shapes are compiled from the shapes graph")),
+        "{output}"
+    );
+    Ok(())
+}
+
+/// After a restart on the same data, the info counts the shapes stored before it, and the
+/// start doesn't warn.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_counts_the_stored_shapes() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let config = enforcing(dir.path())?;
+    let server = Server::start(&config).await?;
+    let shapes = format!(
+        "PREFIX ex: <http://example.com/> PREFIX sh: <http://www.w3.org/ns/shacl#>
+         INSERT DATA {{ GRAPH <{SHAPES_GRAPH}> {{ ex:PersonShape a sh:NodeShape ;
+           sh:targetClass ex:Person ; sh:property [ sh:path ex:name ; sh:minCount 1 ] }} }}"
+    );
+    server.update("nrese", &shapes).await?;
+    drop(server);
+
+    let server = Server::start(&config).await?;
+    let info: serde_json::Value = serde_json::from_str(&server.get("/dataset/info").await?)?;
+    assert_eq!(info["shacl"]["shapes"], 2, "{info}");
+    assert_eq!(info["shacl"]["vacuous"], false, "{info}");
+    let output = server.output();
+    assert!(!output.contains("SHACL gate: no shapes"), "{output}");
     Ok(())
 }
