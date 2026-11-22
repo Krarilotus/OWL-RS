@@ -751,6 +751,7 @@ impl Context<'_> {
         // the result no longer holds is released.
         self.budget
             .release(charged.saturating_sub(solutions.table.memory_bytes()));
+        self.returned_table_charge(solutions.table.memory_bytes());
         Ok(solutions)
     }
 

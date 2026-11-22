@@ -43,7 +43,8 @@ pub use explain::{
     JustifiedStatement, explain_fact, explain_violation, justify_fact,
 };
 pub use maintain::{
-    EngineBase, Maintenance, install_closure, maintain, maintain_with, maintain_within,
+    EngineBase, Maintenance, install_closure, maintain, maintain_with, maintain_with_report_budget,
+    maintain_within,
 };
 pub use materialise::{
     Closure, equality_report_until, equality_report_with, materialise, materialise_until,
@@ -87,9 +88,6 @@ pub struct Program {
     /// Where a rule reads the data's annotation properties ([`Guard::NotAnnotation`]): the
     /// built-in ones and the declaring statements, by the OWL reader's rule.
     annotations: Option<AnnotationProperties>,
-    /// `rdfs:domain`, `rdfs:range` and `rdfs:subPropertyOf`: where, besides a statement's
-    /// predicate, those rules read a property (`rulesets::guard_annotation_readings`).
-    reading_predicates: [u64; 3],
 }
 
 impl std::fmt::Debug for Program {
@@ -137,9 +135,8 @@ impl Program {
         at.equality_classes().is_some() || quads.any(|quad| lists.is_list_fact(triple(quad)))
     }
 
-    /// Whether one of `quads` (by `lookup`'s ids) declares an annotation property, in either
-    /// spelling: a change with one changes what [`Self::rules_for`] reads, so its closure is
-    /// rebuilt, where the program reads it ([`Self::reads_annotations`]).
+    /// Whether one of `quads` (by `lookup`'s ids) has the shape of either annotation
+    /// declaration. A change with one may change the set ([`Self::annotation_set_changed`]).
     pub fn touches_a_declaration(
         lookup: &dyn Fn(TermRef<'_>) -> Option<TermId>,
         mut quads: impl Iterator<Item = EncodedQuad>,
@@ -149,9 +146,20 @@ impl Program {
         quads.any(|quad| declaring.declares(triple(quad)))
     }
 
-    /// Whether a rule reads the data's annotation properties ([`Guard::NotAnnotation`]).
-    pub fn reads_annotations(&self) -> bool {
-        self.annotations.is_some()
+    /// Whether the asserted statements change the annotation properties read by this program.
+    pub fn annotation_set_changed(&self, base: &Snapshot, pending: &Snapshot) -> bool {
+        self.changed_annotation_ids(self.annotation_ids(base).as_ref(), pending)
+            .is_some()
+    }
+
+    /// The pending annotation properties when they differ from the base's.
+    fn changed_annotation_ids(
+        &self,
+        base: Option<&AnnotationIds>,
+        pending: &Snapshot,
+    ) -> Option<AnnotationIds> {
+        self.annotation_ids(pending)
+            .filter(|after| Some(after) != base)
     }
 
     /// The rules for a run over `snapshot`: where a rule reads the annotation properties,
@@ -184,16 +192,9 @@ impl Program {
         let Some(set) = set else {
             return std::borrow::Cow::Borrowed(&self.rules);
         };
-        let with_set = |rule: &Rule| {
-            let mut rule = rule.clone();
-            for guard in &mut rule.guards {
-                if let Guard::NotAnnotation(_, ids) = guard {
-                    *ids = set.clone();
-                }
-            }
-            rule
-        };
-        std::borrow::Cow::Owned(self.rules.iter().map(with_set).collect())
+        let mut rules = self.rules.clone();
+        crate::rulesets::bind_annotations(&mut rules, set);
+        std::borrow::Cow::Owned(rules)
     }
 
     /// The rules as the delta executor takes them; a rule that reads the annotation
@@ -250,8 +251,6 @@ impl Program {
             .iter()
             .any(reads)
             .then(|| AnnotationProperties::new(&mut |iri| Some(constants.iri(iri))));
-        let reading_predicates = ["domain", "range", "subPropertyOf"]
-            .map(|local| constants.iri(&format!("{}{local}", crate::ir::RDFS)));
         if let Some(refused) = constants.refused {
             return Err(refused);
         }
@@ -271,7 +270,6 @@ impl Program {
             plan: None,
             axioms_storable: std::sync::OnceLock::new(),
             annotations,
-            reading_predicates,
         })
     }
 

@@ -111,3 +111,51 @@ fn expired_islands_start_no_solver_and_a_refuted_island_still_wins() {
     .unwrap();
     assert_eq!(out.answer, Answer::Inconsistent);
 }
+
+/// The cross-batch range case of `tests/islands`, as its budget splits it: a node budget of
+/// 64 gives batches of 16 assertions, so `a`'s island and `b`'s are decided apart, and
+/// `b`'s batch carries the edge's incoming `∃r⁻.⊤(b)` beside `E(b)`, not the edge.
+#[test]
+fn a_budgeted_split_gives_the_target_its_incoming_stub() {
+    let (r, a, b) = (10, 300, 301);
+    let mut o = Ontology::default();
+    let class = |o: &mut Ontology, t: Term| ExprId(o.classes.intern(ClassExpr::Class(t)));
+    let (cc, ce) = (class(&mut o, 1), class(&mut o, 2));
+    o.axioms
+        .push(Axiom::ObjectPropertyRange(ObjProp::Named(r), cc));
+    o.axioms.push(Axiom::DisjointClasses(vec![cc, ce]));
+    o.axioms.push(Axiom::ObjectPropertyAssertion(r, a, b));
+    o.axioms.push(Axiom::ClassAssertion(ce, b));
+    for f in 20..35 {
+        let cf = class(&mut o, f);
+        o.axioms.push(Axiom::ClassAssertion(cf, a));
+    }
+    o.sources = vec![Vec::new(); o.axioms.len()];
+    let config = Config {
+        max_nodes: Some(64),
+        ..Config::default()
+    };
+    let Split::Islands(split) = split_into(&o, batch_for(&config), None) else {
+        panic!("decided whole");
+    };
+    assert_eq!(split.batches.len(), 2);
+    let target = split
+        .batches
+        .iter()
+        .find(|o| o.axioms.contains(&Axiom::ClassAssertion(ce, b)))
+        .expect("a batch holds E(b)");
+    let incoming = target.axioms.iter().any(|x| match x {
+        Axiom::ClassAssertion(e, y) if *y == b => matches!(
+            target.classes.get(e.0),
+            ClassExpr::Some(ObjProp::Inverse(p), t)
+                if *p == r && matches!(target.classes.get(t.0), ClassExpr::Thing)
+        ),
+        _ => false,
+    });
+    assert!(incoming, "{:?}", target.axioms);
+    assert!(
+        !target
+            .axioms
+            .contains(&Axiom::ObjectPropertyAssertion(r, a, b))
+    );
+}

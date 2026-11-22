@@ -278,6 +278,55 @@ class PushGate(Repo):
                          (True, 1, True), f"SPEC no-verdict: the fleet wasn't asked, or the push went\n{done.stderr}")
         self.assertNotIn("=== fmt", done.stdout + done.stderr, "a tier ran here")
 
+    def test_a_new_branch_is_based_on_what_the_remote_has(self):
+        # Spec (the master, 22 Nov 04:40, the private-terms base finding): a new branch's base is its merge base with
+        # refactor/engine-v2 as the remote has it now; a local copy that differs is refused before the fleet is asked
+        # ("fetch first").
+        self.git(self.repo, "update-ref", "refs/remotes/origin/refactor/engine-v2", self.commit("b.txt", "b\n"))
+        tip = self.commit("a.txt", "a changed\n")
+        self.fleet("pending")
+        done = self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", ZERO))
+        self.assertEqual((done.returncode != 0, self.jobs()), (True, []),
+                         f"SPEC push-base: a stale engine-v2 is refused before the fleet\n{done.stderr}")
+        self.assertIn("fetch first", done.stderr)
+
+    def test_only_the_push_urls_own_branch_answers(self):
+        # Spec (as above): the answer is refactor/engine-v2's own row from the URL the push goes to; a longer ref
+        # that ends in that name, or a URL Git rewrites for the read, answers nothing (no base, no job).
+        stale = self.commit("b.txt", "b\n")
+        tip = self.commit("a.txt", "a changed\n")
+        other = (self.root / "other.git").as_posix()
+        self.git(self.root, "init", "-q", "--bare", other)
+        self.git(self.repo, "push", "-q", other, f"{stale}:refs/heads/refactor/engine-v2")
+        self.fleet("pending")
+        longer = f"{stale}:refs/heads/x/refs/heads/refactor/engine-v2"
+        for name, spoil in (
+                ("a longer ref with that name's ending",
+                 lambda: self.git(self.repo, "push", "-q", "origin", longer, ":refs/heads/refactor/engine-v2")),
+                ("a URL Git rewrites for the read",
+                 lambda: self.git(self.repo, "config", f"url.{other}.insteadOf", self.origin.as_posix()))):
+            with self.subTest(name):
+                spoil()  # then the copy here holds what the wrong row says (a deleting push drops it)
+                self.git(self.repo, "update-ref", "refs/remotes/origin/refactor/engine-v2", stale)
+                done = self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", ZERO))
+                self.assertEqual((done.returncode != 0, self.jobs()), (True, []), f"SPEC push-base\n{done.stderr}")
+                self.assertIn("couldn't be asked", done.stderr)
+
+    def test_a_replace_ref_doesnt_move_a_new_branchs_base(self):
+        # Spec (as above): the base is read with no replace ref, which could make engine-v2 seem to descend from an
+        # unpublished commit and so leave that commit out of the gated range.
+        self.fleet("pending")
+        self.git(self.repo, "checkout", "-q", "-b", "next", self.base)
+        moved = self.commit("c.txt", "c moved\n")
+        self.git(self.repo, "push", "-q", "origin", "HEAD:refs/heads/refactor/engine-v2")
+        self.git(self.repo, "checkout", "-q", "--detach", self.base)
+        unpublished = self.commit("a.txt", "unpublished\n")
+        tip = self.commit("b.txt", "tip\n")
+        self.git(self.repo, "replace", "--graft", moved, unpublished)  # engine-v2 seems to descend from it
+        done = self.push(("refs/heads/pkg/y", tip, "refs/heads/pkg/y", ZERO))
+        self.assertEqual([files for _, _, files in self.jobs()], [["a.txt", "b.txt"]],
+                         f"SPEC push-base: a replace ref doesn't move the base\n{done.stderr}")
+
     def test_a_push_to_engine_v2_is_a_merge_gate_and_a_packages_isnt(self):
         """The hook names the ref each commit goes to: the push tier of refactor/engine-v2's is a merge
         gate on the fleet, a package's isn't (31 Oct 2026)."""
