@@ -270,18 +270,20 @@ class FleetFollow(push.Repo):
     def test_a_start_time_it_cant_read_is_never_taken_as_in_time(self):
         """Spec (22 Nov, the gate's start window): a start time the waiter couldn't read (none, null,
         malformed, or the answer of a status call that failed, however good) is never taken as fitting:
-        the fixed window holds, and the job is cancelled when it ends, with no verdict."""
-        fits = pending(expected_start=expected(60), basis="its reservation")
+        the fixed window holds, and the job is cancelled when it ends, with no verdict. Here the window is
+        3 s and the job would start after 6 s, inside what a start expected 10 s on (a 1 min estimate,
+        a 120 s limit) would hold open."""
+        fits = pending(expected_start=expected(10), basis="its reservation")
         for name, replies in (
-                ("none", [f"+1 {pending()}"]),
-                ("null", [f"+1 {pending(expected_start=None, basis='not estimated')}"]),
-                ("malformed", [f"+1 {pending(expected_start='soon')}"]),
-                ("a number", [f"+1 {pending(expected_start=1795330592)}"]),
-                ("a failed call's", [f"+1 {pending()}", f"!{fits}", f"+1 {pending()}"])):
+                ("none", [f"+1 {pending()}"] * 6),
+                ("null", [f"+1 {pending(expected_start=None, basis='not estimated')}"] * 6),
+                ("malformed", [f"+1 {pending(expected_start='soon')}"] * 6),
+                ("a number", [f"+1 {pending(expected_start=1795330592)}"] * 6),
+                ("a failed call's", [f"+1 {pending()}", f"!{fits}", *[f"+1 {pending()}"] * 5])):
             with self.subTest(name):
                 self.reset()
-                self.env.update(NRESE_GATE_START_S="3", NRESE_GATE_EST_MIN="1", NRESE_GATE_MAX_S="60")
-                self.play("status", *replies)
+                self.env.update(NRESE_GATE_START_S="3", NRESE_GATE_EST_MIN="1", NRESE_GATE_MAX_S="120")
+                self.play("status", *replies, state("running"), state("done"))
                 self.play("results", self.results())
                 code, where, _, err = self.gate()
                 self.assertEqual((code, where, self.cancels()), (75, "", ["gate-1"]),
