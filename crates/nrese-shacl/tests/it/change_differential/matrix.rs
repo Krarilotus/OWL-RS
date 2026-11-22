@@ -241,7 +241,7 @@ fn recursion() -> Vec<Row> {
                 )
             };
             let key = core_key(&focus, predicate(path), value, &shape, component);
-            let support = format!("ex:n{supported} ex:p0 ex:v1 . ");
+            let support = format!("ex:n{supported} ex:p0 ex:support{supported} . ");
             if !odd_not {
                 data.push_str(&support);
             }
@@ -257,7 +257,7 @@ fn recursion() -> Vec<Row> {
                 [],
                 [key.clone()],
             ));
-            write!(data, "ex:n{supported} ex:p0 ex:v2 . ").unwrap();
+            write!(data, "ex:n{supported} ex:p0 ex:spare{supported} . ").unwrap();
             let persistent = odd_not.then_some(key).into_iter().collect::<Vec<_>>();
             rows.push(Row::new(
                 format!("rec-{wrapper}-{depth}-twin"),
@@ -278,12 +278,13 @@ fn cycle() -> [Row; 2] {
         ex:R sh:path ex:p1 ; sh:node ex:T .
     ";
     let data = "
-        ex:n0 ex:p1 ex:n1 ; ex:p0 ex:v1 .
+        ex:n0 ex:p1 ex:n1 ; ex:p0 ex:v0 .
         ex:n1 ex:p1 ex:n2 ; ex:p0 ex:v1 .
-        ex:n2 ex:p1 ex:n3 ; ex:p0 ex:v1 .
-        ex:n3 ex:p0 ex:v1 .
+        ex:n2 ex:p1 ex:n3 ; ex:p0 ex:v2 .
+        ex:n3 ex:p0 ex:v3 .
     ";
-    let step = Step::delete("ex:n3 ex:p0 ex:v1 .");
+    // The old walk back from the changed object must not reach n0 through p0.
+    let step = Step::delete("ex:n3 ex:p0 ex:v3 .");
     let key = core_key(
         "n0",
         predicate("p1"),
@@ -302,7 +303,7 @@ fn cycle() -> [Row; 2] {
         Row::new(
             "cycle-twin",
             "A second support at the distant node keeps the cycle conformant.",
-            Case::new(shapes, &format!("{data} ex:n3 ex:p0 ex:v2 ."), step),
+            Case::new(shapes, &format!("{data} ex:n3 ex:p0 ex:v4 ."), step),
             [],
             [],
         ),

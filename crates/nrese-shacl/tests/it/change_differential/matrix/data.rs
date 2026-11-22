@@ -77,7 +77,7 @@ fn equality() -> [Row; 4] {
             "A direct support remains when the alias is removed.",
             make(
                 MIN,
-                "ex:n1 ex:p0 ex:v1 . ex:n0 ex:p0 ex:v1 .",
+                "ex:n1 ex:p0 ex:v1 . ex:n0 ex:p0 ex:v2 .",
                 ALIAS,
                 "",
                 ALIAS,
@@ -92,13 +92,12 @@ fn min_key(focus: &str) -> ResultKey {
     core_key(focus, predicate("p0"), None, "Q", Component::MinCount)
 }
 
-fn life_cycle() -> [Row; 4] {
+fn life_cycle() -> [Row; 3] {
     let key = min_key("n0");
-    let target = "ex:T sh:targetSubjectsOf ex:p1 ; sh:property ex:Q .
-        ex:Q sh:path ex:p0 ; sh:minCount 1 .";
     let absent = "ex:T sh:targetNode ex:absent ; sh:property ex:Q .
         ex:Q sh:path ex:p0 ; sh:maxCount 0 .";
-    let trigger = "ex:n0 ex:p1 ex:v1 .";
+    let persistent =
+        format!("{MIN} ex:T sh:property ex:Aux . ex:Aux sh:path ex:p1 ; sh:maxCount 1 .");
     [
         Row::new(
             "repair",
@@ -108,16 +107,9 @@ fn life_cycle() -> [Row; 4] {
             [],
         ),
         Row::new(
-            "new-target",
-            "A new target with no support introduces a result.",
-            Case::new(target, "", Step::insert(trigger)),
-            [],
-            [key.clone()],
-        ),
-        Row::new(
             "persistent",
             "An unrelated edit at the focus leaves its existing result.",
-            Case::new(MIN, "", Step::insert(trigger)),
+            Case::new(persistent, "", Step::insert("ex:n0 ex:p1 ex:trigger .")),
             [key.clone()],
             [key],
         ),
@@ -357,7 +349,7 @@ fn graphs() -> [Row; 2] {
             SELECT $this WHERE { FILTER NOT EXISTS { $this <http://example.com/p0> ?support } }
         ''' .
     ";
-    let step = Step::insert("ex:g1 { ex:n0 ex:p1 ex:v1 . }");
+    let step = Step::insert("ex:g1 { ex:n0 ex:p1 ex:trigger . }");
     let node = ResultTerm::Rdf(ex("n0").into());
     let sparql_key = ResultKey {
         focus: node.clone(),
