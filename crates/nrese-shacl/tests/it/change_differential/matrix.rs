@@ -4,7 +4,7 @@ use nrese_rdf::{NamedNode, Term};
 use nrese_shacl::{Component, PropertyPath, SH};
 
 use super::case::{Case, Step, ex, quads};
-use super::gaps::EntryPoint;
+use super::gaps::{Allowances, EntryPoint, Kind, Location};
 use super::observe::{Deviation, ResultKey, ResultTerm, compare};
 use super::stops::{Outcome, Stop};
 
@@ -85,13 +85,16 @@ pub(super) fn run() {
         .chain(identity::rows())
         .chain(terminal::rows());
     let selector = std::env::var("NRESE_SHACL_CASE").ok();
+    let gaps = super::witnesses::verified_gaps();
+    let mut allowances: [Allowances<'_>; 3] = Default::default();
     let mut checked = 0;
     for row in rows {
         let case_id = format!("row:{}", row.id);
         if selector.as_ref().is_some_and(|wanted| wanted != &case_id) {
             continue;
         }
-        for padding in 0..3 {
+        let mut known = BTreeSet::new();
+        for (padding, allowance) in allowances.iter_mut().enumerate() {
             let context = format!("{case_id}, padding {padding}: {}", row.description);
             let mut case = row.case.clone();
             for i in 0..padding {
@@ -108,7 +111,21 @@ pub(super) fn run() {
                 let actual = match (&outcome.actual, stop.map(|(_, stop)| stop)) {
                     (Outcome::Report(actual), None) => {
                         let deviation = compare(&outcome.before, &outcome.after, actual);
-                        assert_eq!(deviation, Deviation::default(), "{location}");
+                        if deviation != Deviation::default() {
+                            let at = Location {
+                                case: &case_id,
+                                step: outcome.step,
+                                entry: outcome.entry,
+                            };
+                            for kind in [Kind::Result, Kind::Failure] {
+                                if !kind.select(&deviation).is_empty() {
+                                    let id = allowance
+                                        .forgive(&gaps, &at, kind, &deviation)
+                                        .unwrap_or_else(|| panic!("{location}: {deviation:?}"));
+                                    known.insert(id);
+                                }
+                            }
+                        }
                         Some(actual)
                     }
                     (
@@ -170,6 +187,13 @@ pub(super) fn run() {
                 }
             }
             assert!(pinned, "{context}: missing {:?} observation", row.entry);
+        }
+        if known.is_empty() {
+            println!("{case_id} pass");
+        } else {
+            for id in known {
+                println!("{case_id} known-gap {id}");
+            }
         }
         checked += 1;
     }

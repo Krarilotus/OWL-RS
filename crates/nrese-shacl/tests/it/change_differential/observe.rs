@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use nrese_engine::Snapshot;
 use nrese_rdf::{Literal, NamedNode, Term};
 use nrese_shacl::{PropertyPath, ValidationReport, ValidationResult};
+use serde::Deserialize;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum ResultTerm {
@@ -107,7 +108,8 @@ impl Observation {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum Direction {
     Missed,
     Extra,
@@ -115,7 +117,7 @@ pub(crate) enum Direction {
     Mixed,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 pub(crate) struct Count {
     pub expected: usize,
     pub actual: usize,

@@ -1,21 +1,26 @@
 use std::collections::BTreeSet;
 
+use serde::Deserialize;
+
 use super::observe::{Delta, Deviation, Direction};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 pub(crate) enum EntryPoint {
+    #[serde(rename = "C1")]
     Data,
+    #[serde(rename = "C2")]
     Shapes,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum Kind {
     Result,
     Failure,
 }
 
 impl Kind {
-    fn select(self, deviation: &Deviation) -> &Delta {
+    pub(super) fn select(self, deviation: &Deviation) -> &Delta {
         match self {
             Self::Result => &deviation.results,
             Self::Failure => &deviation.failures,
@@ -30,6 +35,7 @@ pub(crate) struct Location<'a> {
     pub entry: EntryPoint,
 }
 
+#[derive(Deserialize)]
 pub(crate) struct Gap {
     pub id: String,
     pub case: String,
