@@ -1539,6 +1539,194 @@ mod tests {
         assert_eq!(memory.used(), 0, "the refused answer still holds memory");
     }
 
+    /// What each step of a producer's growing work charges.
+    const GROWTH: usize = 64 << 10;
+
+    /// The first refusal of work that grows by [`GROWTH`] up to `total` through `charge`.
+    fn grown(charge: impl Fn(usize) -> Result<(), BudgetExceeded>, total: usize) -> BudgetExceeded {
+        (0..total / GROWTH)
+            .find_map(|_| charge(GROWTH).err())
+            .expect("the work fits")
+    }
+
+    /// How a route tells a store error that a writer leaves to it (`sparql::map_query_error`):
+    /// the memory all queries share's 503, else the query's own 413.
+    fn routed(error: StoreError) -> ApiError {
+        match error.is_server_memory_limit() {
+            true => ApiError::unavailable("the server's query memory is in use"),
+            false => own(),
+        }
+    }
+
+    /// Waits on the producer's thread until `memory` holds `bytes`.
+    fn held_at_least(memory: &Envelope, bytes: usize) {
+        for _ in 0..60_000 {
+            if memory.used() >= bytes {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A site of an answer's memory refusals: what its producer does with its writer and the
+    /// envelope its answer is held in.
+    type Site = fn(&mut ChannelWriter, &Envelope) -> Result<(), ApiError>;
+
+    /// The hold's charge of a frame: the producer writes 2 MiB.
+    fn frame(writer: &mut ChannelWriter, _: &Envelope) -> Result<(), ApiError> {
+        io::Write::write_all(writer, &vec![b'x'; 2 << 20])
+            .and_then(|()| io::Write::flush(writer))
+            .map_err(|error| ApiError::internal(error.to_string()))
+    }
+
+    /// The producer's work before anything is held (a query's evaluation, a read's view): it
+    /// grows to 2 MiB.
+    fn evaluation(writer: &mut ChannelWriter, memory: &Envelope) -> Result<(), ApiError> {
+        let part = memory.part();
+        let refused = grown(|bytes| part.charge(bytes), 2 << 20);
+        Err(writer.refused(StoreError::from(refused), routed))
+    }
+
+    /// A later reservation of the producer's, beside what is held: it writes two chunks,
+    /// waits until they are held, then its work grows to 2 MiB.
+    fn later(writer: &mut ChannelWriter, memory: &Envelope) -> Result<(), ApiError> {
+        io::Write::write_all(writer, &vec![b'x'; 2 * CHUNK_BYTES])
+            .and_then(|()| io::Write::flush(writer))
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        held_at_least(memory, 2 * CHUNK_BYTES);
+        let part = memory.part();
+        let refused = grown(|bytes| part.charge(bytes), 2 << 20);
+        Err(writer.refused(StoreError::from(refused), routed))
+    }
+
+    /// The status and the problem's `type`, `title` and `detail` of `response`.
+    async fn problem_of(response: Response) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let problem = serde_json::json!({
+            "type": problem["type"],
+            "title": problem["title"],
+            "detail": problem["detail"],
+        });
+        (status, problem)
+    }
+
+    /// What `reader` is told of the HTTP/1.0 answer `site` makes, held whole in an envelope
+    /// of 1 MiB within 8 MiB all queries share, of which work the reader can't see holds all
+    /// but `room` (`None`: none of it). The envelope is checked to hold nothing after it.
+    async fn told_at(
+        site: Site,
+        reader: Reader,
+        room: Option<usize>,
+    ) -> (StatusCode, serde_json::Value) {
+        const SHARED: usize = 8 << 20;
+        let shared = nrese_exec::SharedBudget::new(SHARED);
+        let hidden = Envelope::new(None, Some(Arc::clone(&shared)));
+        if let Some(room) = room {
+            hidden.charge(SHARED - room).unwrap();
+        }
+        let memory = Envelope::new(Some(1 << 20), Some(shared));
+        let (charged, held) = (memory.clone(), memory.clone());
+        let answer = WHOLE
+            .scope(
+                true,
+                stream_blocking(
+                    Pace::Total(Instant::now() + Duration::from_secs(120)),
+                    CancellationToken::new(),
+                    move || held,
+                    reader,
+                    "text/plain",
+                    "timeout",
+                    move |writer| site(writer, &charged),
+                ),
+            )
+            .await;
+        let refused = answer.expect_err("refused for memory, no answer");
+        assert_eq!(memory.used(), 0, "the refused answer still holds memory");
+        problem_of(refused.into_response()).await
+    }
+
+    /// Each site where a reader of some graphs' HTTP/1.0 answer, held whole, is refused for
+    /// memory, its producer's writer and hold as every route has them: the hold's charge of a
+    /// frame, the producer's work before anything is held, and its later reservation beside
+    /// what is held. Alone, its own envelope refuses (1 MiB); beside work it can't see, the
+    /// memory all queries share does (all but 256 KiB held). Every row is told one 503 and one
+    /// text ([`restricted_refusal`]) either way. A reader of every graph is told which limit:
+    /// alone its own 413, beside the hidden work the shared memory's 503.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restricted_readers_held_answer_is_told_alike_at_every_site() {
+        let one = problem_of(restricted_refusal().into_response()).await;
+        assert_eq!(one.0, StatusCode::SERVICE_UNAVAILABLE);
+        let sites: [(&str, Site); 3] = [
+            ("the hold's charge of a frame", frame),
+            ("the producer's work before anything is held", evaluation),
+            ("a later reservation beside what is held", later),
+        ];
+        for (name, site) in sites {
+            let alone = told_at(site, Reader::Restricted, None).await;
+            assert_eq!(alone, one, "{name}");
+            let beside = told_at(site, Reader::Restricted, Some(256 << 10)).await;
+            assert_eq!(
+                beside, alone,
+                "{name}: the reader is told of work it can't see"
+            );
+            let every = told_at(site, Reader::Every, None).await;
+            assert_eq!(every.0, StatusCode::PAYLOAD_TOO_LARGE, "{name}: {every:?}");
+            let every = told_at(site, Reader::Every, Some(256 << 10)).await;
+            assert_eq!(
+                every.0,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{name}: {every:?}"
+            );
+        }
+    }
+
+    /// Over HTTP/1.0, a refusal of a producer's work carries the cause the budget judged at
+    /// it, whatever is refused after it: refused while two chunks are held for work that fits
+    /// alone ([`WORK`]: holding caused it), then again for work past the whole envelope (its
+    /// own), the producer ends with the first, which is told as the hold's 413, the one that
+    /// tells the client to stream.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refusals_cause_stays_its_own_after_a_later_refusal() {
+        let memory = Envelope::new(Some(1 << 20), None);
+        let (charged, held) = (memory.clone(), memory.clone());
+        let answer = WHOLE
+            .scope(
+                true,
+                stream_blocking(
+                    Pace::Total(Instant::now() + Duration::from_secs(120)),
+                    CancellationToken::new(),
+                    move || held,
+                    Reader::Every,
+                    "text/plain",
+                    "timeout",
+                    move |writer| {
+                        io::Write::write_all(writer, &vec![b'x'; 2 * CHUNK_BYTES])
+                            .and_then(|()| io::Write::flush(writer))
+                            .map_err(|error| ApiError::internal(error.to_string()))?;
+                        held_at_least(&charged, 2 * CHUNK_BYTES);
+                        let part = charged.part();
+                        let first = part.charge(WORK).expect_err("its work fits after all");
+                        let second = part.charge(2 << 20).expect_err("its work fits after all");
+                        assert!(first.for_held && !second.for_held, "{first:?}, {second:?}");
+                        Err(writer.refused(StoreError::from(first), routed))
+                    },
+                ),
+            )
+            .await;
+        let stopped = answer.expect_err("its work refused, no answer");
+        assert_eq!(memory.used(), 0, "the refused answer still holds memory");
+        let detail = detail(stopped).await;
+        let detail = detail.as_str().unwrap_or_default();
+        assert!(
+            detail.starts_with("This answer is larger than the 1 MiB an HTTP/1.0 request"),
+            "{detail}"
+        );
+    }
+
     /// Over HTTP/1.0, what a hold that resumes only past its deadline (1 s) answers, on a
     /// clock the test moves: the producer is open through expiry, and only after it are
     /// `frame` bytes queued and, with `end`, its end set (`None`: it stays open).
