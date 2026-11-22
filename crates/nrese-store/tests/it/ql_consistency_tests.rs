@@ -602,6 +602,40 @@ fn a_transaction_reads_by_its_own_declarations() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Spec: pending statements read the committed closure unless the annotation-property set
+/// changes. Removing one graph's copy of a declaration that another graph still asserts
+/// leaves a pending assertion visible and its domain inference absent, just as with the
+/// pending assertion alone.
+#[test]
+fn pending_removal_of_a_duplicate_declaration_keeps_the_committed_closure() {
+    let store = store(QlRewritingMode::Auto);
+    let reasoning = pipeline(&store, ReasoningMode::Owl2Ql);
+    assert_eq!(
+        commit(
+            &reasoning,
+            &format!("{DECLARATION} GRAPH :copy {{ {DECLARATION} }} :p rdfs:domain :Kind ."),
+        ),
+        "applied"
+    );
+    let assertion = "INSERT DATA { :new :p :o }";
+    for (case, pending) in [
+        ("assertion alone", assertion.to_owned()),
+        (
+            "one declaration removed",
+            format!("DELETE DATA {{ GRAPH :copy {{ {DECLARATION} }} }} ; {assertion}"),
+        ),
+    ] {
+        assert!(
+            ask_pending(&store, &pending, ":new :p :o"),
+            "{case}: assertion"
+        );
+        assert!(
+            !ask_pending(&store, &pending, ":new a :Kind"),
+            "{case}: inferred membership must wait until commit"
+        );
+    }
+}
+
 /// Spec (module docs; the reader's rule): a replica answers as its primary at each revision it
 /// has taken. Under `owl2-ql` a primary commits [`UNDECLARED_DOMAIN`] (`:alice a :Doc` is
 /// `true`), then the declaration of `:note` (`false`), then its retraction (`true`); a replica
@@ -817,6 +851,64 @@ fn a_redeclaring_commit_in_quarantine_is_judged_by_its_own_clashes() {
         let committed = apply(&reasoning, update);
         if committed != outcome {
             wrong.push(format!("{name}: {committed}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec: a commit in quarantine is refused for a clash of its own. Irreflexivity of an
+/// inverse property forbids a self-edge on the named property (OWL 2 Direct Semantics,
+/// Tables 3 and 6). An unrelated annotation declaration changes neither that clash nor
+/// which self-edge witnesses it.
+#[test]
+fn a_redeclaring_commit_in_quarantine_checks_inverse_property_clashes() {
+    let inverse = ":p a owl:ObjectProperty . _:inv owl:inverseOf :p ; a owl:IrreflexiveProperty .";
+    let disjoint = format!(
+        "{inverse} :A a owl:Class ; owl:disjointWith :B . :B a owl:Class . :old a :A , :B ."
+    );
+    let self_edge = format!("{inverse} :old :p :old .");
+    let declare = "INSERT DATA { :note a owl:AnnotationProperty }";
+    let heal = "DELETE DATA { :old a :B }";
+    let clash = "INSERT DATA { :x :p :x }";
+    let mut wrong = Vec::new();
+    for (case, base, update, expected) in [
+        ("heal only", &disjoint, heal.to_owned(), ("applied", false)),
+        (
+            "inverse clash alone",
+            &disjoint,
+            format!("{heal} ; {clash}"),
+            ("refused", true),
+        ),
+        (
+            "inverse clash with declaration",
+            &disjoint,
+            format!("{heal} ; {clash} ; {declare}"),
+            ("refused", true),
+        ),
+        (
+            "old inverse clash with declaration",
+            &self_edge,
+            declare.to_owned(),
+            ("applied", true),
+        ),
+        (
+            "different inverse clash with declaration",
+            &self_edge,
+            format!("DELETE DATA {{ :old :p :old }} ; {clash} ; {declare}"),
+            ("refused", true),
+        ),
+    ] {
+        let mode = ReasoningMode::Owl2Ql;
+        let (store, reasoning) = rebuilt(mode, QlRewritingMode::Auto, base);
+        assert!(
+            store.is_quarantined(),
+            "{case}: setup must be in quarantine"
+        );
+        let verdict = apply(&reasoning, &update);
+        store.rematerialise(program(mode)).expect("rebuilt");
+        let outcome = (verdict.as_str(), store.is_quarantined());
+        if outcome != expected {
+            wrong.push(format!("{case}: {outcome:?}, expected {expected:?}"));
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
