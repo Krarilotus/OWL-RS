@@ -37,6 +37,7 @@ import subprocess
 import uuid
 from pathlib import Path
 
+from . import hosts
 from .lock import lock
 
 # The variables the suite and its adapters read; licence variables are recorded as set or not.
@@ -298,7 +299,7 @@ def append_attempts(results: Path, attempts: dict[str, dict]):
 
 
 def _append(results: Path, records: list[dict]):
-    with open(results / ATTEMPTS, "a", encoding="utf-8", newline="\n") as f:
+    with open(hosts.evidence_path(results / ATTEMPTS), "a", encoding="utf-8", newline="\n") as f:
         f.write("".join("\n" + json.dumps(record) for record in records))
         f.flush()
         os.fsync(f.fileno())
@@ -326,13 +327,12 @@ class Manifest:
     directory, from here to finish() or close() (or its process's end): a second is refused."""
 
     def __init__(self, results: Path, root: Path, argv: list[str], args, runtime: str, settings: dict):
-        from . import hosts
-        if hosts.private_session():
-            for name in ("manifest.json", "manifest.json.tmp", "manifest.lock", ATTEMPTS):
-                hosts.private_output(results / name, root)
+        self.private, self.root = hosts.private_session(), root
+        for name in ("manifest.json", "manifest.json.tmp", "manifest.lock", ATTEMPTS):
+            hosts.evidence_path(results / name, self.private, root)
         self.path, self._owner = results / "manifest.json", contextlib.ExitStack()
         try:
-            self._owner.enter_context(lock(results / "manifest.lock", wait=False))
+            self._owner.enter_context(lock(hosts.evidence_path(results / "manifest.lock", self.private, root), wait=False))
         except OSError as error:
             raise ManifestError(f"{results}: another run is writing into it ({error}); let it finish, "
                                 "or give this one its own --results") from error
@@ -393,11 +393,12 @@ class Manifest:
         before its work starts). Raises if any of that fails."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".json.tmp")
-        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        with open(hosts.evidence_path(tmp, self.private, self.root), "w", encoding="utf-8", newline="\n") as f:
             f.write(json.dumps(data, indent=2) + "\n")
             f.flush()
             os.fsync(f.fileno())  # on Windows _commit, i.e. FlushFileBuffers
-        os.replace(tmp, self.path)
+        os.replace(hosts.evidence_path(tmp, self.private, self.root),
+                   hosts.evidence_path(self.path, self.private, self.root))
         sync_directory(self.path.parent)
 
     def update(self, **fields):

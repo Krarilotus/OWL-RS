@@ -121,7 +121,7 @@ def steps(args) -> int:
                       {"runs": args.runs, "memory": args.memory, "heap": args.heap, "timeout_s": args.timeout_s,
                        "scenario": f"matched: every engine in one container capped at {args.memory} without swap, "
                                    f"all host CPUs; JVM heap {args.heap}"})
-    manifest_path.write_text(json.dumps({"invocations": [entry]}, indent=1), encoding="utf-8")
+    kit.hosts.evidence_path(manifest_path).write_text(json.dumps({"invocations": [entry]}, indent=1), encoding="utf-8")
     date = entry["started"][:16]
     try:
         for rep, (subset, shape, engine) in plan:
@@ -255,8 +255,8 @@ def check(args) -> int:
         else:
             missing, extra = sum((theirs - mine).values()), sum((mine - theirs).values())
             verdicts[name] = ("wrong", f"against {args.reference}: {missing} results missing, {extra} extra")
-    shutil.copy(out / "results.csv", out / "results.raw.csv")
-    with open(out / "results.csv", "w", newline="", encoding="utf-8") as f:
+    shutil.copyfile(out / "results.csv", kit.hosts.evidence_path(out / "results.raw.csv"))
+    with open(kit.hosts.evidence_path(out / "results.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, rows[0].keys())
         w.writeheader()
         for row in rows:

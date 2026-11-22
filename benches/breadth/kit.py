@@ -43,7 +43,7 @@ BIN = ns.directory(WORK, "bin", ROOT)
 
 def run(command: list[str], **kw) -> subprocess.CompletedProcess:
     print("+", " ".join(command), flush=True)
-    return subprocess.run(command, check=True, **kw)
+    return hosts.launch(subprocess.run, command, check=True, **kw)
 
 
 def rust_image() -> str:

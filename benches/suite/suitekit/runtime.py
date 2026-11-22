@@ -17,6 +17,7 @@ removed by `cleanup()`, also when a run fails; nothing else is touched.
 from __future__ import annotations
 
 import json
+from functools import partial
 import math
 import os
 import re
@@ -31,9 +32,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 try:
-    from . import ns
+    from . import hosts, ns
 except ImportError:  # run as a script (the scope entry below): the kit's module beside it
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import hosts
     import ns
 
 OWNER = "suite"
@@ -95,7 +97,7 @@ def shell(command: list[str]) -> str:
 
 def run_quiet(command: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
     # UTF-8 whatever the console's code page (Windows): a container's log is the system's bytes.
-    return subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace",
+    return hosts.launch(subprocess.run, command, capture_output=True, text=True, encoding="utf-8", errors="replace",
                           timeout=timeout)
 
 
@@ -653,7 +655,7 @@ class DockerRuntime(Runtime):
 
     def save_logs(self, server):
         if server.log:
-            server.log.write_text(self.logs(server), encoding="utf-8", errors="replace")
+            hosts.evidence_path(server.log).write_text(self.logs(server), encoding="utf-8", errors="replace")
 
     def run(self, spec, log, timeout_s):
         if spec.name in self.containers or spec.name in self.names("container"):
@@ -662,7 +664,7 @@ class DockerRuntime(Runtime):
         server = self.containers[spec.name] = Server(spec, spec.name, log)
         started = time.monotonic()
         try:
-            subprocess.run(argv, check=True, capture_output=True)
+            hosts.launch(subprocess.run, argv, check=True, capture_output=True)
             sampler = server.sampler = self.sample(spec.name)
             server.memory = self.memory(spec.name)
             timed_out = False
@@ -684,7 +686,7 @@ class DockerRuntime(Runtime):
             raise FileExistsError(spec.name)
         argv = self.args(spec, detached=True)
         server = self.containers[spec.name] = Server(spec, spec.name, log)
-        subprocess.run(argv, check=True, capture_output=True)
+        hosts.launch(subprocess.run, argv, check=True, capture_output=True)
         server.sampler = self.sample(spec.name)
         server.memory = self.memory(spec.name)
         return server
@@ -714,7 +716,7 @@ class DockerRuntime(Runtime):
         return peak
 
     def exec(self, server, command, timeout_s=3600):
-        out = subprocess.run(["docker", "exec", server.spec.name] + command, capture_output=True,
+        out = hosts.launch(subprocess.run, ["docker", "exec", server.spec.name] + command, capture_output=True,
                              text=True, timeout=timeout_s)
         return out.returncode, out.stdout + out.stderr
 
@@ -793,8 +795,8 @@ class ProcessRuntime(Runtime):
         kwargs = {}
         if os.name == "posix":
             kwargs["start_new_session"] = True
-        with open(log, "w", encoding="utf-8", errors="replace") as out:
-            return subprocess.Popen(argv, stdout=out, stderr=subprocess.STDOUT, env=self.environment(spec),
+        with open(hosts.evidence_path(log), "w", encoding="utf-8", errors="replace") as out:
+            return hosts.launch(subprocess.Popen, argv, stdout=out, stderr=subprocess.STDOUT, environ=self.environment(spec),
                                     cwd=self.cwd(spec), stdin=subprocess.PIPE if spec.keep_stdin else subprocess.DEVNULL,
                                     **kwargs)
 
@@ -871,8 +873,8 @@ class ProcessRuntime(Runtime):
 
     def exec(self, server, command, timeout_s=3600):
         spec = server.spec
-        out = subprocess.run([self.translate(spec, c) for c in command], capture_output=True, text=True,
-                             env=self.environment(spec), timeout=timeout_s)
+        out = hosts.launch(subprocess.run, [self.translate(spec, c) for c in command], capture_output=True, text=True,
+                             environ=self.environment(spec), timeout=timeout_s)
         return out.returncode, out.stdout + out.stderr
 
     def url(self, spec):
@@ -921,7 +923,7 @@ class ApptainerRuntime(ProcessRuntime):
     def exec(self, server, command, timeout_s=3600):
         spec = server.spec
         argv = self.prefix(spec, "exec") + command if spec.image else command
-        out = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s)
+        out = hosts.launch(subprocess.run, argv, capture_output=True, text=True, timeout=timeout_s)
         return out.returncode, out.stdout + out.stderr
 
     def image_present(self, image):
@@ -1056,7 +1058,7 @@ class RootfsRuntime(ProcessRuntime):
         if spec.image is None:
             return ProcessRuntime.exec(self, server, command, timeout_s)
         plain = Spec(spec.name, spec.image, [], spec.env, spec.mounts, workdir=spec.workdir)
-        out = subprocess.run(self.prefix(plain, command), capture_output=True, text=True, timeout=timeout_s)
+        out = hosts.launch(subprocess.run, self.prefix(plain, command), capture_output=True, text=True, timeout=timeout_s)
         return out.returncode, out.stdout + out.stderr
 
     def image_present(self, image):
@@ -1126,4 +1128,4 @@ if __name__ == "__main__":
         raise ValueError("a fresh Fleet scope and command are required")
     argv = scope_argv(unit, memory, interval_s=float(interval), stop_s=float(stop))
     os.environ.update(SUITE_SCOPE_PARENT=unit, SUITE_SCOPE_STOP_S=stop)
-    os.execvpe(argv[0], [*argv, *command], os.environ)
+    hosts.launch(partial(os.execvpe, argv[0]), [*argv, *command])

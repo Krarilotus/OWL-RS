@@ -23,10 +23,6 @@ sys.path.insert(0, str(DL))
 sys.path.insert(0, str(SUITE))
 from suitekit import hosts, ns  # noqa: E402
 
-# `reference` resolves its image through Docker on import; a stand-in names it here.
-sys.modules.setdefault("reference", SimpleNamespace(IMAGE="unused"))
-
-
 def load(name, path):
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
@@ -107,6 +103,8 @@ class ElTrack(unittest.TestCase):
         commands = []
 
         def run(command, **kw):
+            if command[1:3] == ["image", "inspect"]:
+                return ok(PINNED)
             commands.append(command)
             reply = conversion(command) if "batch" in command else (classifier or self.classify)(command)
             if kw.get("check") and reply.returncode:  # subprocess.run(check=True)'s answer
@@ -114,11 +112,10 @@ class ElTrack(unittest.TestCase):
             return reply
 
         args = SimpleNamespace(cases=str(cases), binary="classify", threads=1, timeout=60)
+        settings = {k: v for k, v in os.environ.items() if k not in JOB}
+        settings.update(NRESE_LOCK_DIR=str(cases / "locks"), **(environ or {}))
         with patch.object(nrese.subprocess, "run", side_effect=run), \
-                patch.object(ns, "pin_images", return_value={}), \
-                patch.object(ns, "image_id", return_value=PINNED), \
-                patch.dict(os.environ, {k: v for k, v in os.environ.items() if k not in JOB} | (environ or {}),
-                           clear=True):
+                patch.dict(os.environ, settings, clear=True):
             status, rows = drive(nrese.el, args)
         return status, rows, commands
 
@@ -167,7 +164,7 @@ class ElTrack(unittest.TestCase):
         self.assertEqual(start[start.index("--memory-swap") + 1], str(2 * 2**30) + "b")
         self.assertEqual(cpu_limits(start), ["2"])
         self.assertEqual(start[start.index(PINNED) + 1], "batch")
-        self.assertNotIn(nrese.reference.IMAGE, start)
+        self.assertNotIn("nrese-bench/dl-reference", start)
 
     def test_the_classifier_killed_at_its_timeout_is_a_timeout_and_the_next_task_runs(self):
         # Spec: `classify` has no budget of its

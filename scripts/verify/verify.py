@@ -249,7 +249,7 @@ def run_one(sc: scenarios.Scenario, out: Path, target: dict, settings: dict[str,
     """The five phases of one scenario; its result is appended to `results` first, so an
     interruption (re-raised after the cleanup) leaves it there, failed."""
     out.mkdir(parents=True, exist_ok=True)
-    (out / ("scenario.toml" if sc.path else "scenario.json")).write_text(sc.text, encoding="utf-8")
+    hosts.evidence_path(out / ("scenario.toml" if sc.path else "scenario.json")).write_text(sc.text, encoding="utf-8")
     result = {"scenario": sc.name, "dir": out.name, "file": str(sc.path) if sc.path else None,
               "description": sc.description, "ok": False, "error": None, "doctor": None, "launch": None,
               "cleanup": None, "steps": []}
@@ -293,7 +293,7 @@ def run_one(sc: scenarios.Scenario, out: Path, target: dict, settings: dict[str,
 
 def _write(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=1, ensure_ascii=False, default=str) + "\n", encoding="utf-8")
+    hosts.evidence_path(path).write_text(json.dumps(data, indent=1, ensure_ascii=False, default=str) + "\n", encoding="utf-8")
 
 
 def cgroup_peak_mib() -> float | None:
@@ -355,7 +355,7 @@ def summarise(evidence: Path, results: list[dict], target: dict, title: str, ext
                       + (f" ({cleanup['directory']})" if not cleanup["removed"] else "")
                       + (f"; **{cleanup['error']}**" if cleanup["error"] else "")]
     path = evidence / "summary.md"
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    hosts.evidence_path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path
 
 

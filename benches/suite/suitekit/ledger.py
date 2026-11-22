@@ -231,7 +231,7 @@ def write_record(record: dict, path: Path) -> None:
     for key, default in (("purpose", ""), ("baseline", ""), ("findings", [])):
         record.setdefault(key, default)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(dump(record), encoding="utf-8", newline="\n")
+    hosts.evidence_path(path, bool(record.get("private"))).write_text(dump(record), encoding="utf-8", newline="\n")
 
 
 def main(argv: list[str], root: Path) -> int:

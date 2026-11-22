@@ -184,15 +184,15 @@ def run_snapshot(run):
     return wrapped
 
 
-def run_environment(environ):
-    """Pass the run's resolved overlay to a nested benchmark process."""
-    child = dict(environ)
-    for key in (*CHANNELS, PRIVATE, "BENCH_INPUTS_GIT"):
-        child.pop(key, None)
-    overlay = resolve_overlay()
-    if overlay:
-        child.update(overlay.environment())
-    return child
+def launch(start, command, *, environ=None, **kwargs):
+    """Start a child with a complete environment and the active run's frozen overlay."""
+    environment = dict(os.environ if environ is None else environ)
+    if (bound := _run_overlay.get()) is not UNBOUND:
+        for key in (*CHANNELS, PRIVATE, "BENCH_INPUTS_GIT"):
+            environment.pop(key, None)
+        if overlay := bound[0]:
+            environment.update(overlay.environment())
+    return start(command, env=environment, **kwargs)
 
 
 def private_run(machine: dict) -> bool:
@@ -207,7 +207,11 @@ def private_home() -> Path:
     return Path.home() / "owlrs" / "private"
 
 
-def evidence_path(path: Path, private: bool, checkout: str | Path = ROOT) -> Path:
+def evidence_path(path: str | Path, private: bool | None = None, checkout: str | Path = ROOT) -> Path:
+    """Resolve a private output file at the write, using saved privacy when supplied."""
+    path = Path(path)
+    if private is None:
+        private = private_session()
     return private_output(path, checkout) if private else path
 
 
@@ -266,7 +270,7 @@ def write_job(path: Path, text: str, checkout: str | Path, jobs: Iterable[dict])
             raise ValueError(f"{job['id']}: fleet stages only the checkout Git input")
     path = private_output(path, checkout)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8", newline="\n")
+    evidence_path(path, True, checkout).write_text(text, encoding="utf-8", newline="\n")
     return path
 
 

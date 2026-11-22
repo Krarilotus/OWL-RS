@@ -1582,8 +1582,8 @@ def run_unit(unit: str, argv: list[str], log: Path, env: dict | None = None) -> 
     if argv[0] == "bash":
         argv = [driver.bash(), *argv[1:]]
     log.parent.mkdir(parents=True, exist_ok=True)
-    with open(log, "wb") as out:
-        code = subprocess.run(argv, stdout=out, stderr=subprocess.STDOUT, env=env).returncode
+    with open(hosts_registry.evidence_path(log), "wb") as out:
+        code = hosts_registry.launch(subprocess.run, argv, stdout=out, stderr=subprocess.STDOUT, environ=env).returncode
     data = log.read_bytes()
     summaries = SUMMARY.findall(data.decode("utf-8", errors="replace"))
     return Outcome(unit, code, hashlib.sha256(data).hexdigest(), bool(summaries) and set(summaries) == {"ok"})
@@ -1678,7 +1678,8 @@ def attempt_record(kind: str, where: Path) -> str:
     first = 1 + max(attempt_records(where, kind).sequences, default=0)
     for sequence in range(first, first + ATTEMPT_TRIES):
         try:
-            fd = os.open(where / f"{kind}.attempt.{sequence:09d}.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            fd = os.open(hosts_registry.evidence_path(where / f"{kind}.attempt.{sequence:09d}.json"),
+                         os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         except FileExistsError:
             continue  # another attempt holds it: the next
         with os.fdopen(fd, "w", encoding="utf-8") as out:
@@ -1719,11 +1720,10 @@ CANT_INVALIDATE = 3
 def publish(path: Path, data: dict) -> None:
     """DATA as PATH's JSON, whole or not at all: written beside it, then renamed over it."""
     part = path.with_name(path.name + ".partial")
-    if data.get("receipt") and hosts_registry.private_session():
-        path = hosts_registry.private_output(path)
-        part = hosts_registry.private_output(part)
-    part.write_text(json.dumps(data, indent=1), encoding="utf-8")
-    os.replace(part, path)
+    private = hosts_registry.private_session()
+    path = hosts_registry.evidence_path(path, private)
+    hosts_registry.evidence_path(part, private).write_text(json.dumps(data, indent=1), encoding="utf-8")
+    os.replace(hosts_registry.evidence_path(part, private), hosts_registry.evidence_path(path, private))
 
 
 def run_w3c(logs: Path, kits: list[Kit], identity: str, attempt: str) -> CheckReceipt:
@@ -2637,7 +2637,7 @@ def rdfc_hash(binary: str | None):
         return None
 
     def run(path: Path) -> str:
-        done = subprocess.run([binary, str(path)], capture_output=True, timeout=3600)
+        done = hosts_registry.launch(subprocess.run, [binary, str(path)], capture_output=True, timeout=3600)
         if done.returncode != 0:
             return f"rdfc failed (exit {done.returncode}): {done.stderr.decode(errors='replace').strip()[-120:]}"
         return hashlib.sha256(done.stdout).hexdigest()
@@ -2752,7 +2752,7 @@ def make_dataset(name: str, entry: dict, root: Path, cache: Path, asides: dict[s
             lines.append(f"FAILED making `{key}`: no perf_lab here (NRESE_PERF_LAB)")
         else:
             start = time.monotonic()
-            done = subprocess.run(argv, cwd=root, env={**os.environ, "NRESE_DATASET_DIR": aside.as_posix()})
+            done = hosts_registry.launch(subprocess.run, argv, cwd=root, environ={**os.environ, "NRESE_DATASET_DIR": aside.as_posix()})
             lines.append(f"ran `{key}` aside: exit {done.returncode}, {time.monotonic() - start:.0f} s")
     made = asides[key] / name
     if not made.is_file():
@@ -2776,7 +2776,7 @@ def probe_dataset(name: str, entry: dict, found: Path | None, make: bool, cache:
     ok = True
     if found is None and make and SPARQL_PREPARE in entry.get("made_by", ""):
         dataset = entry["made_by"].split(SPARQL_PREPARE, 1)[1].split()
-        done = subprocess.run(["bash", str(root / SPARQL_PREPARE), *dataset, "--out", str(cache)], cwd=root)
+        done = hosts_registry.launch(subprocess.run, ["bash", str(root / SPARQL_PREPARE), *dataset, "--out", str(cache)], cwd=root)
         lines.append(f"made {name} ({' '.join(dataset)}): exit {done.returncode}")
         if done.returncode != 0:
             ok = False
@@ -3024,7 +3024,7 @@ def fleet_call(*args: str) -> tuple[int, str]:
     if not binary:
         return -1, "fleet: not on PATH (set FLEET_BIN)"
     try:
-        done = subprocess.run([binary, *args], capture_output=True, text=True, encoding="utf-8",
+        done = hosts_registry.launch(subprocess.run, [binary, *args], capture_output=True, text=True, encoding="utf-8",
                               errors="replace", timeout=FLEET_DEADLINE_S)
     except subprocess.TimeoutExpired:
         return -1, f"fleet {args[0]}: no answer in {FLEET_DEADLINE_S} s (stopped)"
@@ -3632,9 +3632,9 @@ def main() -> int:
         text = render(summary)
         print(text)
         if output:
-            output.write_text(text, encoding="utf-8")
+            hosts_registry.evidence_path(output, private).write_text(text, encoding="utf-8")
         if json_output:
-            json_output.write_text(json.dumps(summary, indent=1, default=str), encoding="utf-8")
+            hosts_registry.evidence_path(json_output, private).write_text(json.dumps(summary, indent=1, default=str), encoding="utf-8")
         return 0 if summary["passed"] else 1
     if args.command == "floor":
         summary = json.loads(args.report.read_text(encoding="utf-8"))
@@ -3642,13 +3642,14 @@ def main() -> int:
         private = hosts_registry.private_dir()
         floors = (private or ROOT / "benches" / "fast") / "noise-floor"
         out = floors / f"{args.host}.toml"
-        if private_report(summary) or private:
+        private_floor = private_report(summary) or private is not None
+        if private_floor:
             if private is None:
                 raise SystemExit("a private floor needs a private overlay checkout")
             out = hosts_registry.private_output(out)
         out.parent.mkdir(exist_ok=True)
         source = f"{summary['context'].get('gate_name') or args.report.parent.name} round {summary['context'].get('round', 0)}"
-        out.write_text(write_floor(floor, source), encoding="utf-8")
+        hosts_registry.evidence_path(out, private_floor).write_text(write_floor(floor, source), encoding="utf-8")
         print(f"{out}: {sum(len(d) for d in floor['cases'].values())} dimensions of {len(floor['cases'])} cases, "
               f"{floor['blocks']} blocks")
         return 0
@@ -3747,7 +3748,7 @@ def main() -> int:
         hosts_ = sorted({str((p["report"].get("machine") or {}).get("host")) for p in found})
         source = f"{len(found)} passes on {', '.join(hosts_)} ({', '.join(sorted({p['path'] for p in found})[:2])} ...)"
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(write_measure(result, source), encoding="utf-8")
+        hosts_registry.evidence_path(out, private).write_text(write_measure(result, source), encoding="utf-8")
         under = {c: e for c, e in result["cases"].items() if e.get("power", 1) < TARGET_POWER}
         print(f"{len(result['cases'])} cases, family m = {result['m']}; timed part {result['minutes']} min; "
               f"blocks at most {result['cap']}; "
@@ -3760,8 +3761,8 @@ def main() -> int:
                        if args.measure.is_file() else {}, args.min_blocks, square=args.square,
                        checked={c["name"] for c in cases_registry.load() if c.get("outcome", "ok") != "ok"})
         for k, cases in enumerate(found, start=1):
-            (args.out / f"plan-block-{k}.json").write_text(json.dumps({"run": cases, "not_run": {}, "elsewhere": {}},
-                                                                      indent=1), encoding="utf-8")
+            hosts_registry.evidence_path(args.out / f"plan-block-{k}.json").write_text(
+                json.dumps({"run": cases, "not_run": {}, "elsewhere": {}}, indent=1), encoding="utf-8")
         print("blocks: " + ", ".join(f"{k} {len(c)} cases" for k, c in enumerate(found, start=1)))
         return 0
     if args.command == "confirm":

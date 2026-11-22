@@ -731,7 +731,7 @@ def run(args) -> int:
     out = rg.hosts_registry.private_output(out, checkout)
     path = rg.hosts_registry.private_output(out / "family.toml", checkout)
     out.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(text.encode("utf-8"))
+    rg.hosts_registry.evidence_path(path, True, checkout).write_bytes(text.encode("utf-8"))
     try:
         family = load_family(path, checkout, catalog)
     except Invalid as error:
@@ -858,7 +858,7 @@ def main() -> int:
             manifest = manifest_of(family, harness, int(os.environ.get("ABBA_ROUND", "1")), host,
                                    os.environ.get("FLEET_JOB", ""))
             path = rg.hosts_registry.private_output(Path(os.environ["FLEET_OUT"]) / "abba-manifest.json", ROOT)
-            path.write_text(json.dumps(manifest, indent=1), encoding="utf-8")
+            rg.hosts_registry.evidence_path(path, True, ROOT).write_text(json.dumps(manifest, indent=1), encoding="utf-8")
         return 0
     if args.command == "jobs":
         harness = git(Path(args.checkout), "rev-parse", args.harness or family["sides"]["b"])
@@ -880,9 +880,9 @@ def main() -> int:
     data = rg.hosts_registry.private_output(args.json, ROOT) if args.json else None
     print(text)
     if output:
-        output.write_text(text, encoding="utf-8")
+        rg.hosts_registry.evidence_path(output, True, ROOT).write_text(text, encoding="utf-8")
     if data:
-        data.write_text(json.dumps(out, indent=1, default=str), encoding="utf-8")
+        rg.hosts_registry.evidence_path(data, True, ROOT).write_text(json.dumps(out, indent=1, default=str), encoding="utf-8")
     return code
 
 

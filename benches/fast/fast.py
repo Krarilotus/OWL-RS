@@ -178,7 +178,7 @@ def files(script: str) -> subprocess.CompletedProcess:
     verified inputs (/inputs, read-only): in an Alpine container, or natively."""
     if runtime() == "native":
         FAST_DATA.mkdir(parents=True, exist_ok=True)
-        return subprocess.run(["sh", "-c", native(script)], capture_output=True, text=True, encoding="utf-8",
+        return hosts.launch(subprocess.run, ["sh", "-c", native(script)], capture_output=True, text=True, encoding="utf-8",
                               errors="replace")
     mounts = ["-v", f"{data_volume()}:/fast", "-v", f"{bench_volume()}:/data:ro"]
     if fast_inputs() is not None:
@@ -187,7 +187,7 @@ def files(script: str) -> subprocess.CompletedProcess:
 
 
 def docker(args: list[str], timeout: float | None = None, capture: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run([ns.executable(), *args], capture_output=capture, text=True, timeout=timeout, env=ENV,
+    return hosts.launch(subprocess.run, [ns.executable(), *args], capture_output=capture, text=True, timeout=timeout, environ=ENV,
                           encoding="utf-8", errors="replace")
 
 
@@ -224,9 +224,9 @@ def quiet_slot(what: str):
         yield
         return
     bash = os.environ.get("NRESE_BASH") or (r"C:\Program Files\Git\bin\bash.exe" if os.name == "nt" else "bash")
-    holder = subprocess.Popen([bash, str(ROOT / "scripts" / "quiet-slot.sh"), "bash", "-c",
+    holder = hosts.launch(subprocess.Popen, [bash, str(ROOT / "scripts" / "quiet-slot.sh"), "bash", "-c",
                                'echo "held $NRESE_QUIET_TOKEN"; read _', what],
-                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=ENV)
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, environ=ENV)
     said = holder.stdout.readline().split()
     if not said or said[0] != "held":
         holder.kill()
@@ -406,8 +406,8 @@ def process(name: str, cap_gb: float, command: list[str], env: dict | None = Non
     sampler.start()
     at_timeout = ""
     try:
-        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, encoding="utf-8",
-                              errors="replace", env={**ENV, **pad, "FAST_SCOPE_DIR": str(where),
+        done = hosts.launch(subprocess.run, argv, capture_output=True, text=True, timeout=timeout, encoding="utf-8",
+                              errors="replace", environ={**ENV, **pad, "FAST_SCOPE_DIR": str(where),
                                                      **{k: str(v) for k, v in (env or {}).items()}},
                               pass_fds=tuple(map(int, os.environ.get("SUITE_LEASE_FDS", "").split())))
     except subprocess.TimeoutExpired:
@@ -642,7 +642,7 @@ def host_state() -> dict | None:
     if runtime() != "native" or not Path("/proc/self").exists():
         return None
     cpus = pinned_cpus()
-    done = subprocess.run([sys.executable, str(ROOT / "scripts" / "hosts" / "hygiene.py"),
+    done = hosts.launch(subprocess.run, [sys.executable, str(ROOT / "scripts" / "hosts" / "hygiene.py"),
                            *(["--cpus", cpus] if cpus else []), "--sample-s", "1"],
                           capture_output=True, text=True, timeout=60)
     try:
@@ -1676,7 +1676,7 @@ def cold_cache_command() -> str | None:
 def drop_page_cache(record: dict) -> bool:
     """Empties the page cache (the host's cold_cache command); a failure ends the case's
     runs as a harness failure."""
-    done = subprocess.run(["sh", "-c", cold_cache_command()], capture_output=True, text=True)
+    done = hosts.launch(subprocess.run, ["sh", "-c", cold_cache_command()], capture_output=True, text=True)
     if done.returncode != 0:
         record["status"] = "failed"
         record["notes"].append(f"missing input: the cold-cache command failed: {(done.stderr or '').strip()[:200]}")
@@ -2024,10 +2024,10 @@ def prepare(args) -> int:
             print(f"NOT prepared {case['name']}: {failed[case['name']]}", flush=True)
     if index_path:
         index_path.parent.mkdir(parents=True, exist_ok=True)
-        index_part.write_text(json.dumps(index, indent=0), encoding="utf-8")
-        os.replace(index_part, index_path)
+        hosts.evidence_path(index_part, private, ROOT).write_text(json.dumps(index, indent=0), encoding="utf-8")
+        os.replace(index_part, hosts.evidence_path(index_path, private, ROOT))
         print(f"shared data ({SHARED}): {adopted} data files linked in, not generated")
-    manifest_path.write_text(json.dumps({"git": manifest.git(ROOT), "binaries": binaries(),
+    hosts.evidence_path(manifest_path, private, ROOT).write_text(json.dumps({"git": manifest.git(ROOT), "binaries": binaries(),
                                          "cases": [c["name"] for c in cases if c["name"] not in failed],
                                          "failed": failed, "files": entries}, indent=1), encoding="utf-8")
     print(f"{len(cases) - len(failed)} of {len(cases)} cases prepared, {len(entries)} files: {manifest_path}")
@@ -2211,7 +2211,7 @@ def run(args) -> int:
                 f = record["frontier"]
                 print(f"      past its limit ({', '.join(f'{k} = {x}' for k, x in f['settings'].items())}): {f['status']}, "
                       f"metric {f['metric']}, peak {f['peak_mib']} MiB")
-            out.write_text(json.dumps(report, indent=1), encoding="utf-8")
+            hosts.evidence_path(out, private, ROOT).write_text(json.dumps(report, indent=1), encoding="utf-8")
     report["git_finished"] = manifest.git(ROOT)
     report["host_state_finished"] = host_state()
     if runtime() == "native":
@@ -2224,7 +2224,7 @@ def run(args) -> int:
     report["finished_ns"] = time.time_ns()
     report["finished"] = datetime.datetime.now().isoformat(timespec="seconds")
     report["duration_s"] = round((datetime.datetime.now() - started).total_seconds(), 1)
-    out.write_text(json.dumps(report, indent=1), encoding="utf-8")
+    hosts.evidence_path(out, private, ROOT).write_text(json.dumps(report, indent=1), encoding="utf-8")
     kept = write_compact(out, compact_path)
     if rows:
         from suitekit.schema import Writer
@@ -2451,7 +2451,7 @@ def timed_block(args, sides: list[dict], catalog: list[dict], cases: list[dict],
                       started_ns=min((r["started_ns"] for r in records), default=started),
                       finished_ns=max((r["finished_ns"] for r in records), default=time.time_ns()))
         report["prepared"] = {**report["prepared"], "changed": changed}
-        paths[(name, run)].write_text(json.dumps(report, indent=1), encoding="utf-8")
+        hosts.evidence_path(paths[(name, run)], private, ROOT).write_text(json.dumps(report, indent=1), encoding="utf-8")
         bad += len(not_as_expected(records))
     print(f"block {args.block}: {len(cases)} cases x {len(order)} runs, layout {args.layout}; {bad} runs not as expected")
     return 1 if bad else 0
@@ -2468,15 +2468,15 @@ def write_compact(full: Path, target: Path) -> Path:
     and where the full report is, with its hash."""
     data = full.read_bytes()
     report = json.loads(data)
-    target = hosts.evidence_path(target, hosts.private_run(report.get("machine") or {}), ROOT)
+    private = hosts.private_run(report.get("machine") or {})
     home = Path.home()
     where = f"~/{full.relative_to(home).as_posix()}" if full.is_relative_to(home) else full.as_posix()
     keep = {k: v for k, v in report.items() if k != "records"}
     keep["full_report"] = {"path": where, "host": (report.get("machine") or {}).get("host"), "bytes": len(data),
                            "sha256": hashlib.sha256(data).hexdigest()}
     keep["records"] = [compact_record(r) for r in report["records"]]
-    target.write_text(json.dumps(keep, indent=1), encoding="utf-8")
-    return target
+    hosts.evidence_path(target, private, ROOT).write_text(json.dumps(keep, indent=1), encoding="utf-8")
+    return hosts.evidence_path(target, private, ROOT)
 
 
 def compact_record(r: dict) -> dict:
@@ -2549,7 +2549,8 @@ def table(args) -> int:
     path = ROOT / "benches" / "CATALOG.md"
     catalog = path.read_text(encoding="utf-8")
     start, end = catalog.index(MARKERS[0]) + len(MARKERS[0]), catalog.index(MARKERS[1])
-    path.write_text(catalog[:start] + "\n" + text + "\n" + catalog[end:], encoding="utf-8")
+    hosts.evidence_path(path, bool(args.baseline and hosts.private_run(report.get("machine") or {}))).write_text(
+        catalog[:start] + "\n" + text + "\n" + catalog[end:], encoding="utf-8")
     print(f"wrote {len(cases)} cases into {path.relative_to(ROOT)}")
     return 0
 

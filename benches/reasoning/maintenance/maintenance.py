@@ -304,12 +304,12 @@ class Run:
         harness = None
         if readers:
             report = self.logs / f"readers-{readers}.json"
-            harness = subprocess.Popen(
+            harness = hosts.launch(subprocess.Popen,
                 [setting("HARNESS"), "query-mix", "--endpoint", endpoint.query,
                  "--queries", str(ROOT / "benches/reasoning/queries/lubm"), "--label", self.key,
                  "--warmup", "0", "--runs", "1", "--clients", str(readers), "--duration-s", str(self.args.duration_s),
                  "--interactive-ms", "1000", "--timeout-s", str(self.args.timeout_s), "--report-json", str(report)],
-                stdout=open(self.logs / f"readers-{readers}.log", "w"), stderr=subprocess.STDOUT)
+                stdout=open(hosts.evidence_path(self.logs / f"readers-{readers}.log"), "w"), stderr=subprocess.STDOUT)
         times, failures, i = [], 0, 0
         deadline = time.monotonic() + self.args.duration_s
         item = f"commit@readers-{readers}"

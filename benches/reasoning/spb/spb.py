@@ -125,9 +125,9 @@ def run_driver(name: str, work: Path, data: Path, log: Path, timeout_s: int) -> 
     for m in spec.mounts:
         command += ["-v", f"{m.source}:{m.target}{':ro' if m.readonly else ''}"]
     command += [ns.image_id(spec.image, ROOT), *spec.command]
-    with open(log, "w", encoding="utf-8") as out:
+    with open(hosts.evidence_path(log), "w", encoding="utf-8") as out:
         try:
-            return subprocess.run(command, stdout=out, stderr=subprocess.STDOUT, timeout=timeout_s).returncode
+            return hosts.launch(subprocess.run, command, stdout=out, stderr=subprocess.STDOUT, timeout=timeout_s).returncode
         except subprocess.TimeoutExpired:
             subprocess.run(["docker", "rm", "-f", name], capture_output=True)
             return 124

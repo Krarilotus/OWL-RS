@@ -213,8 +213,8 @@ def suite_run(case: dict, semantics: str, systems: list[str], runs: int, stamp: 
     print(f"  suite: {tier} on nrese, {', '.join(systems)}", flush=True)
     log = out.with_suffix(".log")
     out.parent.mkdir(parents=True, exist_ok=True)
-    with open(log, "w", encoding="utf-8") as f, fast.quiet_slot(f"compete {tier} {track}".strip()):
-        subprocess.run(command, stdout=f, stderr=subprocess.STDOUT, env=fast.hosts.run_environment(env), cwd=fast.ROOT)
+    with open(fast.hosts.evidence_path(log), "w", encoding="utf-8") as f, fast.quiet_slot(f"compete {tier} {track}".strip()):
+        fast.hosts.launch(subprocess.run, command, stdout=f, stderr=subprocess.STDOUT, environ=env, cwd=fast.ROOT)
     path = out / "results.csv"
     if not path.exists():
         print(f"  no results; see {log}")
@@ -476,7 +476,7 @@ def compete(args) -> int:
     batch.mkdir(parents=True, exist_ok=True)
 
     def save():
-        report_path.write_text(json.dumps(report, indent=1), encoding="utf-8")
+        fast.hosts.evidence_path(report_path).write_text(json.dumps(report, indent=1), encoding="utf-8")
 
     # Every image the comparisons' containers run, pinned before the first one (fast.pin_images);
     # the suite's systems are pinned by the suite's own run.

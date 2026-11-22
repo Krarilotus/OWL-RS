@@ -163,7 +163,7 @@ def docker_as_user(image: str, args: list[str], mounts: dict[str, str], entrypoi
         command += ["-v", f"{source}:{target}" + (":ro" if source == target else "")]
     if entrypoint:
         command += ["--entrypoint", entrypoint]
-    subprocess.run(command + [image, *args], check=True)
+    hosts.launch(subprocess.run, command + [image, *args], check=True)
 
 
 def prepare(case: dict):
@@ -392,7 +392,7 @@ class Run:
                                 note=note + ("" if status != "wrong" else f"; expected {expected}")))
         if passed and getattr(self, "derived", None) is not None:
             known = self.qualified() | {f"{self.case['name']}/{self.system}": self.derived}
-            (Path(self.args.results) / "qualified.json").write_text(json.dumps(known, indent=1) + "\n", encoding="utf-8")
+            hosts.evidence_path(Path(self.args.results) / "qualified.json").write_text(json.dumps(known, indent=1) + "\n", encoding="utf-8")
 
     def go(self):
         getattr(self, f"run_{self.system}")()

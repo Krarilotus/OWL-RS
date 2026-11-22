@@ -214,9 +214,9 @@ def member(root, systems):
     landing = hosts.private_output(Path(payload["result_root"]).expanduser() / payload["member"], root)
     out = hosts.private_output(Path(os.environ["FLEET_OUT"]), root)
     landing.mkdir(parents=True, exist_ok=True)
-    (landing / "identity.json").write_text(json.dumps({**payload["identity"], "nrese": payload["nrese"], "harness": payload["harness"],
+    hosts.evidence_path(landing / "identity.json", True, root).write_text(json.dumps({**payload["identity"], "nrese": payload["nrese"], "harness": payload["harness"],
         "git": manifest.git(root), "machine": manifest.machine("process"), "classification": "private/free"}, indent=2), encoding="utf-8")
-    env = hosts.run_environment(os.environ)
+    env = dict(os.environ)
     env["PATH"] = str(Path.home() / ".cargo/bin") + os.pathsep + os.environ["PATH"]
     env.pop("DOCKER_CPUS", None)
     gate = Path(env["NRESE_GATE_DIR"]).expanduser()
@@ -224,9 +224,9 @@ def member(root, systems):
     target = out.parent / "suite-client-target"
     env["CARGO_TARGET_DIR"] = str(target)
     code = 1
-    with (landing / "stdout.log").open("a") as stdout, (landing / "stderr.log").open("a") as stderr:
+    with hosts.evidence_path(landing / "stdout.log", True, root).open("a") as stdout, hosts.evidence_path(landing / "stderr.log", True, root).open("a") as stderr:
         def run(command, capture=False):
-            done = subprocess.run(command, cwd=root, env=env, stdout=subprocess.PIPE if capture else stdout,
+            done = hosts.launch(subprocess.run, command, cwd=root, environ=env, stdout=subprocess.PIPE if capture else stdout,
                                   stderr=stderr, timeout=payload["deadline_min"] * 60, text=True)
             done.check_returncode()
             return done.stdout.strip() if capture else None
@@ -253,7 +253,7 @@ def member(root, systems):
                             build_identity=(Path(binary_dir) / "IDENTITY").read_text(),
                             inputs=(gate / "inputs.txt").read_text(),
                             classification="private/free", machine=manifest.machine("process"))
-            (landing / "identity.json").write_text(json.dumps(identity, indent=2), encoding="utf-8")
+            hosts.evidence_path(landing / "identity.json", True, root).write_text(json.dumps(identity, indent=2), encoding="utf-8")
             command = ["uv", "run", "--no-project", "python", "-B", "benches/suite/suite.py", "run", "--skip-build",
                        "--systems", ",".join(chosen), "--workloads", group["case"]["workload"], "--tier",
                        f"{group['case']['workload']}={group['case']['tier']}", "--data", str(gate / "data"),
@@ -275,7 +275,12 @@ def member(root, systems):
             except (OSError, subprocess.SubprocessError) as error:
                 print(f"cleanup: {error}", file=stderr)
                 code = 1
-    shutil.copytree(landing, out / "cell", dirs_exist_ok=True)
+    def copy_evidence(source, destination):
+        # copytree gives the callback each file's destination, including in reused directories.
+        return shutil.copyfile(source, hosts.evidence_path(destination, True, root))
+
+    shutil.copytree(landing, hosts.evidence_path(out / "cell", True, root),
+                    dirs_exist_ok=True, copy_function=copy_evidence)
     return code
 
 
