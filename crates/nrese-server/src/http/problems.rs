@@ -9,10 +9,11 @@ use axum::http::{HeaderValue, Method, header};
 use axum::response::Response;
 use serde_json::{Map, Value};
 
-use crate::error::{PROBLEM_JSON, Verbatim, kind, problem};
+use crate::error::{Own, PROBLEM_JSON, Verbatim, kind, problem};
 
 /// The framework's messages are short: a body beyond this isn't a message, and only its
-/// status is reported.
+/// status is reported. The server's own documents ([`Own`]) are read whole: what one holds
+/// (a refusal's values, a justification) is what it wrote, at any size.
 const MAX_BODY: usize = 64 * 1024;
 
 /// A response mapped on its way out (`map_response`, outside the request id's propagation):
@@ -36,7 +37,11 @@ pub(crate) async fn problems(method: Method, response: Response) -> Response {
         .headers
         .get(header::CONTENT_TYPE)
         .is_some_and(|value| value.as_bytes().starts_with(PROBLEM_JSON.as_bytes()));
-    let bytes = axum::body::to_bytes(body, MAX_BODY).await.ok();
+    let limit = match parts.extensions.get::<Own>() {
+        Some(_) => usize::MAX,
+        None => MAX_BODY,
+    };
+    let bytes = axum::body::to_bytes(body, limit).await.ok();
     let mut document = match (&bytes, documented) {
         (Some(bytes), true) => match serde_json::from_slice::<Value>(bytes) {
             Ok(Value::Object(document)) => document,
