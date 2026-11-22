@@ -77,38 +77,10 @@ fn peak_of(read: impl FnOnce()) -> usize {
     peak
 }
 
-/// The check tier (`NRESE_CHECK_TIER`): `landing` (the default) or `nightly`.
-pub(crate) fn nightly() -> bool {
-    match std::env::var("NRESE_CHECK_TIER").as_deref() {
-        Err(std::env::VarError::NotPresent) | Ok("landing") => false,
-        Ok("nightly") => true,
-        Ok(other) => panic!("NRESE_CHECK_TIER={other:?}: expected `landing` or `nightly`"),
-        Err(error) => panic!("NRESE_CHECK_TIER: {error}"),
-    }
-}
-
-/// By default the million-cell square and two smaller skewed shapes, each also measured: a
-/// header far wider than its rows bind (4,000 × 100) and just over a 1,024-row batch
-/// (250 × 1,025); and, for the answers alone, 4,000 × 3 and 3 × 1,025. With
-/// `NRESE_CHECK_TIER=nightly` it reads the two skewed million-cell shapes instead.
 #[test]
 fn results_before_head_read_without_every_row_at_every_variable() {
-    // Measured past 100,000 cells (a million in the square and the full form's skewed
-    // shapes), and small shapes for the answers alone.
-    let shapes: &[(usize, usize)] = if nightly() {
-        &[(1, 1), (3, 7), (1_000, 1_000), (250, 4_000), (4_000, 250)]
-    } else {
-        &[
-            (1, 1),
-            (3, 7),
-            (4_000, 3),
-            (3, 1_025),
-            (1_000, 1_000),
-            (4_000, 100),
-            (250, 1_025),
-        ]
-    };
-    for &(width, rows) in shapes {
+    // A million cells each, in three shapes, and two small ones for the answers alone.
+    for (width, rows) in [(1, 1), (3, 7), (1_000, 1_000), (250, 4_000), (4_000, 250)] {
         let first = document(width, rows, true);
         let usual = document(width, rows, false);
         let expected = slice_rows(usual.as_bytes());
@@ -124,7 +96,7 @@ fn results_before_head_read_without_every_row_at_every_variable() {
             "reader, {width} × {rows}"
         );
         let cells = width * rows;
-        if cells < 100_000 {
+        if cells < 1_000_000 {
             continue;
         }
         // Every row at every variable: what may not be made.
