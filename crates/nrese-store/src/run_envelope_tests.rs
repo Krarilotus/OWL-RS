@@ -30,26 +30,27 @@ fn prepared(store: &StoreService, limit: Option<usize>) -> PreparedQuery {
     store.prepare_query(&request).unwrap()
 }
 
-/// Two runs of one prepared query opened at once, the first's transport holding all but half
-/// of what a run's evaluation peaks at: the second's evaluation is answered within its own
-/// limit and charges only its own envelope; the first's is refused, by its own limit.
+/// Two runs of one prepared query opened at once (16 MiB each, which a run's evaluation fits
+/// in), the first's transport holding all of its envelope but 64 KiB, far less than the
+/// 40,000 rows need: the first's evaluation is refused, by its own limit; the second's is
+/// answered within its own limit and charges only its own envelope.
 #[test]
 fn two_runs_of_one_prepared_query_opened_at_once_each_draw_on_their_own() {
     const LIMIT: usize = 16 << 20;
+    const ROOM: usize = 64 << 10;
     let store = store();
     let prepared = prepared(&store, Some(LIMIT));
     let token = CancellationToken::new();
-    // What a run's evaluation peaks at, under the same limit.
-    let measured = store.open_run(&prepared);
-    let peak = measured.memory().clone();
-    measured
-        .run_reporting(&token, std::io::sink(), |_, _| None)
-        .unwrap();
-    let peak = peak.peak();
-    assert!(peak > 0);
     let (first, second) = (store.open_run(&prepared), store.open_run(&prepared));
     let (held, own) = (first.memory().clone(), second.memory().clone());
-    held.charge(LIMIT - peak / 2).unwrap();
+    held.charge(LIMIT - ROOM).unwrap();
+    let refused = first
+        .run_reporting(&token, std::io::sink(), |_, _| None)
+        .expect_err("the first run's evaluation fits beside what its transport holds");
+    assert!(
+        refused.is_memory_limit() && !refused.is_server_memory_limit(),
+        "{refused}"
+    );
     let answered = second.run_reporting(&token, std::io::sink(), |_, _| None);
     assert!(answered.is_ok(), "{answered:?}");
     assert!(
@@ -58,15 +59,8 @@ fn two_runs_of_one_prepared_query_opened_at_once_each_draw_on_their_own() {
     );
     assert_eq!(
         held.used(),
-        LIMIT - peak / 2,
+        LIMIT - ROOM,
         "the second run charged the first's envelope"
-    );
-    let refused = first
-        .run_reporting(&token, std::io::sink(), |_, _| None)
-        .expect_err("the first run's evaluation has half the room it needs");
-    assert!(
-        refused.is_memory_limit() && !refused.is_server_memory_limit(),
-        "{refused}"
     );
 }
 

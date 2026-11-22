@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderValue, Request, StatusCode, Version, header};
-use nrese_reasoner::ReasonerConfig;
+use nrese_reasoner::{ReasonerConfig, ReasoningMode};
 use nrese_server::auth::{AuthConfig, StaticBearerConfig};
 use nrese_server::policy::PolicyConfig;
 use nrese_store::{StoreConfig, StoreService};
@@ -352,6 +352,127 @@ async fn an_http10_rdf4j_statements_read_is_sent_whole() -> Result<(), Box<dyn E
 #[tokio::test]
 async fn an_http10_export_is_sent_whole() -> Result<(), Box<dyn Error>> {
     the_same_answer_whole("/api/v1/repositories/nrese/backup").await
+}
+
+/// The status and body of `request`'s answer.
+async fn answer(
+    app: &axum::Router,
+    request: Request<Body>,
+) -> Result<(StatusCode, String), Box<dyn Error>> {
+    let response = app.clone().oneshot(request).await?;
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await?;
+    Ok((status, String::from_utf8_lossy(&body).into_owned()))
+}
+
+/// Over HTTP/1.0 a read's working memory draws on the envelope its answer is held in, as a
+/// query run's does: a legacy RDF4J transaction's read of one statement, whose replay of the
+/// transaction's 20,000 added statements needs more than the request's 64 KiB
+/// (`budgets.query_memory`), is refused for its memory, 413, though its answer is one line.
+/// Streamed (HTTP/1.1), the read holds no answer and its replay draws on the queries'
+/// memory: answered.
+#[tokio::test]
+async fn an_http10_transaction_read_replays_within_its_answers_envelope()
+-> Result<(), Box<dyn Error>> {
+    let mut policy = PolicyConfig::default();
+    policy.limits.max_query_memory_bytes = 64 << 10;
+    let app = test_app_with_store(shared_store()?, policy, ReasonerConfig::default())?;
+    let begun = app
+        .clone()
+        .oneshot(Request::post("/repositories/nrese/transactions").body(Body::empty())?)
+        .await?;
+    assert_eq!(begun.status(), StatusCode::CREATED);
+    let tx = begun.headers()[header::LOCATION].to_str()?.to_owned();
+    let added: String = (0..20_000)
+        .map(|i| format!("<urn:s{i}> <urn:p> \"{i}\" .\n"))
+        .collect();
+    let add = Request::put(format!("{tx}?action=ADD"))
+        .header(header::CONTENT_TYPE, "application/n-triples")
+        .body(Body::from(added))?;
+    let (status, body) = answer(&app, add).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let read = |version| {
+        Request::put(format!("{tx}?action=GET&subj=%3Curn%3As0%3E"))
+            .version(version)
+            .header(header::ACCEPT, "application/n-triples")
+            .body(Body::empty())
+    };
+    // Whole first: a streamed read keeps the transaction's view for the reads after it.
+    let (status, body) = answer(&app, read(Version::HTTP_10)?).await?;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert!(body.contains("budgets.query_memory"), "{body}");
+    let (status, body) = answer(&app, read(Version::HTTP_11)?).await?;
+    assert_eq!(
+        (status, body.lines().count()),
+        (StatusCode::OK, 1),
+        "{body}"
+    );
+    Ok(())
+}
+
+/// Readers of the access policy: `public` reads `urn:g:public` and the default graph, and the
+/// inferred statements its graphs support.
+const SUPPORTED: &str = r#"
+default = "deny"
+inferred = "supported"
+
+[[role]]
+name = "public"
+read = ["urn:g:public"]
+default_graph = "read"
+"#;
+
+/// Over HTTP/1.0 a reader of some graphs' graph read builds its view within the envelope its
+/// answer is held in: a read of the public graph (a few statements) whose view of what the
+/// graphs support, built over a secret graph's 10,000 statements, needs more than the
+/// request's 64 KiB (`budgets.query_memory`), is refused for its memory. Streamed
+/// (HTTP/1.1), its view draws on the queries' memory: answered.
+#[tokio::test]
+async fn an_http10_graph_read_builds_its_view_within_its_answers_envelope()
+-> Result<(), Box<dyn Error>> {
+    let store = shared_store()?;
+    let reasoner = || ReasonerConfig::for_mode(ReasoningMode::Owl2Rl);
+    let setup = test_app_with_store(store.clone(), policy_of(SUPPORTED)?, reasoner())?;
+    let secret: String = (0..10_000)
+        .map(|i| format!("<urn:hidden{i}> <urn:p> {i} . "))
+        .collect();
+    let insert = Request::post("/dataset/update")
+        .header(header::CONTENT_TYPE, "application/sparql-update")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", token(&["nrese.admin"])),
+        )
+        .body(Body::from(format!(
+            "INSERT DATA {{ GRAPH <urn:g:public> {{ <urn:visible> <urn:p> <urn:o> . \
+             <urn:p> <http://www.w3.org/2000/01/rdf-schema#subPropertyOf> <urn:q> }} \
+             GRAPH <urn:g:secret> {{ {secret} }} }}"
+        )))?;
+    let (status, body) = answer(&setup, insert).await?;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let mut policy = policy_of(SUPPORTED)?;
+    policy.limits.max_query_memory_bytes = 64 << 10;
+    let app = test_app_with_store(store, policy, reasoner())?;
+    let read = |version| {
+        Request::get("/dataset/data?graph=urn:g:public")
+            .version(version)
+            .header(header::ACCEPT, "application/n-triples")
+            .header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", token(&["nrese.read", "public"])),
+            )
+            .body(Body::empty())
+    };
+    let (status, body) = answer(&app, read(Version::HTTP_10)?).await?;
+    assert!(
+        matches!(
+            status,
+            StatusCode::PAYLOAD_TOO_LARGE | StatusCode::SERVICE_UNAVAILABLE
+        ) && body.contains("memory"),
+        "{status}: {body}"
+    );
+    let (status, body) = answer(&app, read(Version::HTTP_11)?).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    Ok(())
 }
 
 /// A primary's replication image is a file, its size known before it is sent: over HTTP/1.0
