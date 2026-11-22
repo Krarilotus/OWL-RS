@@ -81,7 +81,16 @@ fn insert(pipeline: &MutationPipeline, data: &str) {
 
 /// `query`'s answer (its JSON) and its status: the word and the reasons' texts.
 fn read(store: &StoreService, query: &str) -> (String, String, Vec<String>) {
-    let mut request = SparqlQueryRequest::all(format!("{PREFIXES}{query}"));
+    read_as(store, query, nrese_store::ReadScope::All)
+}
+
+/// [`read`] by a reader of `scope`.
+fn read_as(
+    store: &StoreService,
+    query: &str,
+    scope: nrese_store::ReadScope,
+) -> (String, String, Vec<String>) {
+    let mut request = SparqlQueryRequest::new(format!("{PREFIXES}{query}"), scope);
     request.solutions_format = SolutionsResultFormat::Json;
     let result = store.execute_query(&request).expect("read");
     let status = result.completeness.expect("a reasoned read has a status");
@@ -357,4 +366,81 @@ fn only_a_rebuild_that_finds_no_literal_equality_gives_the_word_back() {
             "{mode}: a rebuild with no literal equality gives the word back: {reasons:?}"
         );
     }
+}
+
+/// A reader of some graphs is told nothing of a graph it can't read (docs/spec/
+/// reasoning-semantics.md, "What may be `complete`": a restricted reader's status says
+/// nothing about graphs they can't read). With the two spellings equated in such a graph,
+/// and the same values there with nothing to equate them, its reads of the same data it
+/// reads are told alike, word and reasons: whether it sees every inference or those its
+/// graphs support, under `owl2-rl` with the rewriting and without, and under `owl2-dl`. With
+/// the pair equated in a graph it reads, a reader by support is told it.
+#[test]
+fn a_reader_of_some_graphs_is_told_alike_with_a_hidden_literal_equality_and_without() {
+    use nrese_sparql::GraphAccess;
+    use nrese_store::ReadScope;
+    let visible = format!(":t :q {INTEGER} . :t a :A . GRAPH :open {{ :u :q {DECIMAL} . }}");
+    let reads = [
+        "SELECT ?v WHERE { :t :q ?v }",
+        "SELECT ?x WHERE { ?x a :A }",
+    ];
+    let reader = |by_support: bool| {
+        ReadScope::Graphs(Arc::new(GraphAccess {
+            graphs: vec!["http://example.com/open".to_owned()],
+            default_graph: true,
+            inferred: true,
+            inferred_by_support: by_support,
+            ..GraphAccess::default()
+        }))
+    };
+    let mut unmet = Vec::new();
+    for (ruleset, rewriting) in [
+        ("owl2-rl", None),
+        ("owl2-rl", Some(QlRewritingMode::Off)),
+        ("owl2-dl", None),
+    ] {
+        let store = |graph: &str, axiom: &str| {
+            let pipeline = open(ruleset, config("replication", None));
+            if let Some(mode) = rewriting {
+                pipeline.store().set_ql_rewriting(mode);
+            }
+            let pair = format!("GRAPH {graph} {{ {axiom} :s :p {INTEGER} , {DECIMAL} . }}");
+            insert(&pipeline, &format!("{visible} {pair}"));
+            pipeline
+        };
+        let case = format!("{ruleset} {rewriting:?}");
+        let (equated, plain) = (store(":hidden", SOURCES[0]), store(":hidden", ""));
+        let every = read_as(equated.store(), reads[0], ReadScope::All).2;
+        if !every.iter().any(|r| r.contains(REASON)) {
+            unmet.push(format!(
+                "setup: {case}: a reader of every graph isn't told: {every:?}"
+            ));
+        }
+        // The control: the pair equated in a graph it reads, a reader by support is told,
+        // under the rules (`owl2-dl` tells every reader of some graphs `not-certified`).
+        if ruleset == "owl2-rl" {
+            let own = store(":open", SOURCES[0]);
+            let (_, word, reasons) = read_as(own.store(), reads[0], reader(true));
+            if word == "complete" || !reasons.iter().any(|r| r.contains(REASON)) {
+                unmet.push(format!("{case}: in a graph it reads: {word} {reasons:?}"));
+            }
+        }
+        for by_support in [false, true] {
+            for query in reads {
+                let told = read_as(equated.store(), query, reader(by_support));
+                let alone = read_as(plain.store(), query, reader(by_support));
+                if (&told.1, &told.2) != (&alone.1, &alone.2) {
+                    unmet.push(format!(
+                        "{case} by support {by_support}: {query}: {} {:?}, not {} {:?}",
+                        told.1, told.2, alone.1, alone.2
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        unmet.is_empty(),
+        "a reader of some graphs is told of an equality in a graph it can't read:\n{}",
+        unmet.join("\n")
+    );
 }

@@ -9,8 +9,9 @@
 use std::sync::Arc;
 
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+use nrese_sparql::GraphAccess;
 use nrese_store::{
-    MutationCommand, MutationPipeline, MutationTicket, QlRewritingMode, Requester,
+    MutationCommand, MutationPipeline, MutationTicket, QlRewritingMode, ReadScope, Requester,
     SolutionsResultFormat, SparqlQueryRequest, SparqlUpdateRequest, StoreConfig, StoreService,
 };
 
@@ -178,4 +179,84 @@ fn an_import_of_the_owl_vocabulary_counts_as_read() {
         "an import of the owl: vocabulary takes the word away:\n{}",
         unmet.join("\n")
     );
+}
+
+/// A reader of some graphs is told nothing of a graph it can't read (docs/spec/
+/// reasoning-semantics.md, "What may be `complete`": a restricted reader's status says
+/// nothing about graphs they can't read). With an import no loaded ontology answers in such a
+/// graph, and without it, its read of the same data it reads is told alike, word and
+/// reasons, and no reason names the import: whether it sees every inference or those its
+/// graphs support, under each ruleset, and under `owl2-rl` without the rewriting too.
+#[test]
+fn a_reader_of_some_graphs_isnt_told_of_a_hidden_import() {
+    const TARGET: &str = "http://example.org/hidden-import";
+    const PET: &str = "SELECT ?x WHERE { ?x a :Pet }";
+    let visible = ":tom a :Cat . GRAPH :open { :Cat rdfs:subClassOf :Pet . }";
+    let mut unmet = Vec::new();
+    for (ruleset, rewriting) in [
+        ("owl2-dl", None),
+        ("owl2-ql", None),
+        ("owl2-rl", None),
+        ("owl2-rl", Some(QlRewritingMode::Off)),
+    ] {
+        let store = |header: &str| {
+            let pipeline = open(ruleset);
+            if let Some(mode) = rewriting {
+                pipeline.store().set_ql_rewriting(mode);
+            }
+            insert(
+                &pipeline,
+                &format!("{visible} GRAPH :hidden {{ {header} }}"),
+            );
+            pipeline
+        };
+        let case = format!("{ruleset} {rewriting:?}");
+        let with = store(&format!(
+            ":onto-h a owl:Ontology ; owl:imports <{TARGET}> ."
+        ));
+        let without = store(":onto-h a owl:Ontology .");
+        let (_, every) = read_as(with.store(), PET, ReadScope::All);
+        if !every.iter().any(|r| r.contains(TARGET)) {
+            unmet.push(format!(
+                "setup: {case}: a reader of every graph isn't told: {every:?}"
+            ));
+        }
+        for by_support in [false, true] {
+            let reader = || reader_of_some_graphs(by_support);
+            let told = read_as(with.store(), PET, reader());
+            let alone = read_as(without.store(), PET, reader());
+            if told != alone || told.1.iter().any(|r| r.contains(TARGET)) {
+                unmet.push(format!(
+                    "{case} by support {by_support}: {told:?}, not {alone:?}"
+                ));
+            }
+        }
+    }
+    assert!(
+        unmet.is_empty(),
+        "a reader of some graphs is told of an import in a graph it can't read:\n{}",
+        unmet.join("\n")
+    );
+}
+
+/// A reader of the default graph and `:open`, not `:hidden`, who sees every inference
+/// (`inferred = "visible"`) or, `by_support`, those its graphs support.
+fn reader_of_some_graphs(by_support: bool) -> ReadScope {
+    ReadScope::Graphs(Arc::new(GraphAccess {
+        graphs: vec!["http://example.org/open".to_owned()],
+        default_graph: true,
+        inferred: true,
+        inferred_by_support: by_support,
+        ..GraphAccess::default()
+    }))
+}
+
+/// `query`'s status as a reader of `scope` is told it: the word and the reasons' texts.
+fn read_as(store: &StoreService, query: &str, scope: ReadScope) -> (String, Vec<String>) {
+    let mut request = SparqlQueryRequest::new(format!("{PREFIXES}{query}"), scope);
+    request.solutions_format = SolutionsResultFormat::Json;
+    let result = store.execute_query(&request).expect("read");
+    let status = result.completeness.expect("a reasoned read has a status");
+    let reasons = status.reasons.iter().map(|r| r.text.clone()).collect();
+    (status.as_str().to_owned(), reasons)
 }
