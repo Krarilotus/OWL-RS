@@ -32,7 +32,7 @@ use crate::model::{Constraint, Path, Shape, ShapeRef, Shapes, Target};
 use crate::nested_walk::Suspended;
 use crate::path;
 use crate::report::{ValidationReport, decode};
-use crate::validate::{self, RawResult, Validator};
+use crate::validate::{self, RawResult, ResultTerm, Validator};
 
 /// Affected focus nodes per shape beyond which the shape is validated whole: following
 /// that many nodes back costs about what a full validation does.
@@ -238,6 +238,15 @@ pub fn validate_shapes_change<A: ReadView + Sync, B: ReadView + Sync>(
     report
 }
 
+/// A message in effect, borrowed, as it is compared: a stored one by id, before any a query
+/// computed, which compare by their term (a message is a literal: it holds no blank node, so
+/// its term is its comparison form).
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum MessageKey<'r> {
+    Stored(TermId),
+    Computed(&'r Term),
+}
+
 /// A result as the same finding in any compilation of the shapes ([`validate_shapes_change`]):
 /// borrowed, so comparing copies nothing.
 struct Key<'r> {
@@ -250,12 +259,19 @@ impl<'r> Key<'r> {
         &self.shapes.shapes[self.result.shape]
     }
 
-    /// The messages in effect: the result's own, else its shape's.
-    fn messages(&self) -> &'r [TermId] {
-        self.result
-            .messages
-            .as_deref()
-            .unwrap_or(&self.shape().messages)
+    /// The messages in effect: the result's own, else its shape's (stored ones), in the
+    /// order [`ResultTerm`] compares them.
+    fn messages(&self) -> impl Iterator<Item = MessageKey<'r>> {
+        let (own, shape) = match &self.result.messages {
+            Some(own) => (own.as_slice(), &[][..]),
+            None => (&[][..], self.shape().messages.as_slice()),
+        };
+        own.iter()
+            .map(|message| match message {
+                ResultTerm::Stored(id) => MessageKey::Stored(*id),
+                ResultTerm::Computed(computed) => MessageKey::Computed(&computed.term),
+            })
+            .chain(shape.iter().map(|&id| MessageKey::Stored(id)))
     }
 
     fn order(&self, other: &Self) -> Ordering {

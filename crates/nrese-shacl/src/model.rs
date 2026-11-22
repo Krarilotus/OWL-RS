@@ -264,10 +264,26 @@ pub(crate) struct SparqlCheck {
     /// multiplied out, which would grow as a power of the shapes graph.
     pub(crate) parameters: Vec<(nrese_rdf::Variable, Vec<TermId>)>,
     /// The `sh:message`s of the constraint or validator (else the component's).
-    pub(crate) messages: Vec<TermId>,
+    pub(crate) messages: Vec<Message>,
+}
+
+/// An `sh:message` of a SPARQL check: its literal, and its template where it has blocks to
+/// fill in per result (SHACL §5.3.2).
+#[derive(Debug)]
+pub(crate) struct Message {
+    pub(crate) id: TermId,
+    pub(crate) template: Option<crate::sparql::Template>,
 }
 
 impl SparqlCheck {
+    /// The names of the variables the message templates name, once per block.
+    pub(crate) fn template_variables(&self) -> impl Iterator<Item = &str> {
+        self.messages
+            .iter()
+            .filter_map(|message| message.template.as_ref())
+            .flat_map(crate::sparql::Template::variables)
+    }
+
     /// Calls `each` with every combination of the parameters' values, one value per
     /// parameter, the first parameter's changing slowest, until `each` breaks. Without
     /// parameters (`sh:sparql`) that is one combination, the empty one; a parameter without
