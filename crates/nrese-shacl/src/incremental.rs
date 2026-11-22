@@ -9,9 +9,9 @@
 //! qualified components) work on value nodes: their affected nodes are carried back along
 //! the parent's path the same way.
 //!
-//! Only those focus nodes are validated, against the state before and after, and the
-//! results present after but not before are the change's. Data that was invalid before
-//! stays reported by full validation, not blamed on the change.
+//! The affected focus nodes supply the candidate results. A candidate is new only if no
+//! validation route in the state before produced it, including routes from unaffected
+//! focus nodes.
 //!
 //! Some shapes can't be bounded this way, and are validated whole: closed shapes (any
 //! predicate counts), SPARQL constraints (a query reads anything), and any shape when a
@@ -35,6 +35,10 @@ use crate::path;
 use crate::report::{ValidationReport, decode};
 use crate::validate::{self, RawResult, Validator};
 
+mod before_routes;
+
+use before_routes::BeforeRoutes;
+
 /// Affected focus nodes per shape beyond which the shape is validated whole: following
 /// that many nodes back costs about what a full validation does.
 const MAX_AFFECTED: usize = 100_000;
@@ -43,8 +47,8 @@ const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const RDFS_SUB_CLASS_OF: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
 
 /// The results that `changed` (the statements inserted and deleted, asserted and inferred)
-/// introduce in `data`: validation of the focus nodes the change can affect, in `after`,
-/// minus the same validation in `before`. Both views must share one dictionary (a
+/// introduce in `data`: results among the affected focus nodes in `after` that no
+/// targeted validation in `before` produced. Both views must share one dictionary (a
 /// transaction and its base snapshot do), and `shapes` must be compiled from it.
 ///
 /// Both validations run on `resources` and stop as [`crate::validate`] does: a stop in
@@ -107,6 +111,7 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
     let mut introduced: BTreeSet<RawResult> = BTreeSet::new();
     if !changed.is_empty() {
         let walk_budget = resources.memory.part();
+        let mut before_routes = None;
         let rdf_type = graph_after.iri(RDF_TYPE);
         for shape in shapes.targeted() {
             // After a stop in either state the difference means nothing: it is the outcome.
@@ -166,16 +171,42 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
             }
             // Results kept are charged to their state's validator; those dropped here are
             // returned to it once freed.
+            let unchecked_target = |root, focus| {
+                let already_checked =
+                    root == shape && affected.as_ref().is_none_or(|nodes| nodes.contains(&focus));
+                !already_checked && validator_before.is_focus(&shapes.shapes[root], focus)
+            };
             let mut dropped = 0;
             for (i, result) in after_results.into_iter().enumerate() {
                 if i % CHECK_EVERY == 0 {
                     resources.check()?;
                 }
+                if validator_before.has_stopped() {
+                    break;
+                }
                 if before.contains(&result) || introduced.contains(&result) {
                     dropped += result.retained_bytes();
-                } else {
-                    introduced.insert(result);
+                    continue;
                 }
+                if before_routes.is_none() {
+                    before_routes = Some(BeforeRoutes::new(shapes, &walk_budget, resources)?);
+                }
+                let routes = before_routes
+                    .as_ref()
+                    .expect("the reverse shape references");
+                if routes.reaches_target(
+                    shapes,
+                    &graph_before,
+                    (result.shape, result.focus),
+                    unchecked_target,
+                    &walk_budget,
+                    resources,
+                )? && validator_before.has_result(&result)
+                {
+                    dropped += result.retained_bytes();
+                    continue;
+                }
+                introduced.insert(result);
             }
             validator_after.release(dropped);
             drop(before);

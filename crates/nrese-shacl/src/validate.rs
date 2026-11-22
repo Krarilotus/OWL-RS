@@ -781,6 +781,33 @@ impl<'a, V: ReadView> Validator<'a, V> {
         nodes
     }
 
+    /// A point lookup for the same targets `focus_nodes` enumerates.
+    pub(crate) fn is_focus(&self, shape: &Shape, node: TermId) -> bool {
+        shape.targets.iter().any(|target| match *target {
+            Target::Node(focus) => node == focus,
+            Target::Class(class) => self.is_instance(node, class),
+            Target::SubjectsOf(predicate) => self
+                .graph
+                .scan(Some(node), Some(predicate), None)
+                .next()
+                .is_some(),
+            Target::ObjectsOf(predicate) => self
+                .graph
+                .scan(None, Some(predicate), Some(node))
+                .next()
+                .is_some(),
+        })
+    }
+
+    /// A result at its source shape and focus. In acyclic shapes the validation at this
+    /// pair is independent of its callers, so any reporting route produces the same results.
+    pub(crate) fn has_result(&self, result: &RawResult) -> bool {
+        let mut task = TaskResults::new(&self.results_budget);
+        let mut walk = nesting::Walk::new(&self.results_budget);
+        self.validate_node(result.shape, result.focus, &mut task, &mut walk);
+        task.list.contains(result)
+    }
+
     /// Whether `node` is a SHACL instance of `class`: typed by it or by a subclass.
     fn is_instance(&self, node: TermId, class: TermId) -> bool {
         let Some(rdf_type) = self.rdf_type else {

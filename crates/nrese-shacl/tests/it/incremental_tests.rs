@@ -113,7 +113,8 @@ const SHARED_SHAPES: &str = r#"
 ex:S11 a sh:NodeShape ; sh:targetClass ex:C2 ; sh:property ex:P11 .
 ex:P11 sh:path ex:p1 ; sh:minCount 1 ; sh:class ex:C0 .
 ex:S12 a sh:NodeShape ; sh:targetSubjectsOf ex:p3 ; sh:property ex:P12 ; sh:node ex:N13 .
-ex:P12 sh:path ex:p2 ; sh:property ex:P11 ; sh:node ex:N13 .
+ex:P12 sh:path ex:p2 ; sh:property ex:P11 , ex:P16 ; sh:node ex:N13 .
+ex:P16 sh:path ex:p1 ; sh:targetObjectsOf ex:p0 ; sh:minCount 1 .
 ex:N13 a sh:NodeShape ; sh:property [ sh:path ex:p0 ; sh:maxCount 1 ] .
 ex:S14 a sh:NodeShape ; sh:targetNode ex:n0 , ex:n1 ; sh:not ex:N15 ;
   sh:property [ sh:path [ sh:inversePath ex:p2 ] ; sh:node ex:N13 ] .

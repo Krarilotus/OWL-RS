@@ -128,7 +128,7 @@ impl<'a, V: ReadView> GraphView<'a, V> {
             .is_some_and(CancellationToken::is_cancelled)
     }
 
-    fn scan(
+    pub(crate) fn scan(
         &self,
         subject: Option<TermId>,
         predicate: Option<TermId>,
