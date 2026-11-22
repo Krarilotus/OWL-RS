@@ -904,3 +904,34 @@ fn decimal_to_integer_cast_keeps_integers_beyond_64_bits() {
         );
     }
 }
+
+/// SPARQL 1.1 §18.5.1: each aggregate of a group is computed from the group's values on its
+/// own, whatever its place in the projection. MIN and MAX over inline integers of several
+/// datatypes, written before a COUNT and a SUM of the same variable, are ORDER BY's first
+/// and last term of the tie (`xsd:byte` < `xsd:int` < `xsd:integer`), and the COUNT and SUM
+/// count and add every value.
+#[test]
+fn min_and_max_of_several_datatypes_written_before_a_count_and_sum_of_their_variable() {
+    let values = [("5", "int"), ("5", "integer"), ("5", "byte")];
+    let engine = load(
+        values.map(|(value, datatype)| (node("x"), node("v"), Term::from(typed(value, datatype)))),
+    );
+    let snapshot = engine.snapshot();
+    let t = |value: &str, datatype: &str| Some(Term::from(typed(value, datatype)));
+    assert_eq!(
+        run_both(
+            &snapshot,
+            "SELECT (MAX(?v) AS ?hi) (MIN(?v) AS ?lo) (COUNT(?v) AS ?n) (SUM(?v) AS ?sum) \
+             { ?x :v ?v } GROUP BY ?x",
+            &QueryOptions::default(),
+            false
+        ),
+        vec![vec![
+            t("5", "integer"),
+            t("5", "byte"),
+            t("3", "integer"),
+            t("15", "integer")
+        ]],
+        "MIN and MAX of the tie, then COUNT and SUM of every value"
+    );
+}
