@@ -9,6 +9,7 @@ pub(crate) mod consistency;
 mod dataset_reasons;
 mod datatypes;
 mod entailment;
+mod existential_refutation;
 mod explain;
 mod gap;
 mod gates;
