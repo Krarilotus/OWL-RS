@@ -6833,6 +6833,11 @@ impl<'a> Context<'a> {
                 None => return Ok(None),
             }
         }
+        // A test's control: such a pass declines, its aggregates go a column at a time.
+        #[cfg(test)]
+        if twinned && self::pass_fallback_tests::twin_pass_off() {
+            return Ok(None);
+        }
         for a in 0..plans.len() {
             let Plan::Bound(column) = plans[a] else {
                 continue;

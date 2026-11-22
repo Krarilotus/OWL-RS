@@ -5352,20 +5352,20 @@ fn rows_by_value(
 
 /// A query whose one pass over all aggregates takes a `COUNT` of an expression beside its
 /// `SUM` or `AVG`, a shape the per-column path counts otherwise, keeping nothing after it.
-/// What that pass remembers of the expression's numbers, `distinct` × 114 bytes, must not
-/// outlive it: a later operator (the cross product with `?k`) would then be refused at a
-/// limit where the per-column path answers. The window is measured on the tree itself: B
-/// is the least limit, to 4 KiB, at which `control` answers (the same query with
-/// `COUNT(e + 0)` for `COUNT(e)`, whose values are the same and which the pass declines, as
-/// the per-column path counts it); the query must give `expected` at B + half the
-/// numbers, inside [B, B + numbers).
+/// What that pass would hold past itself, `held` bytes (the expression's numbers it
+/// remembers, 114 bytes each, or the terms it decodes), must not outlive it: a later
+/// operator (the cross product with `?k`) would then be refused at a limit where the
+/// per-column path answers. The window is measured on the tree itself: B is the least
+/// limit, to 4 KiB, at which `control` answers (the same query with `COUNT(e + 0)` for
+/// `COUNT(e)`, whose values are the same and which the pass declines, as the per-column
+/// path counts it); the query must give `expected` at B + `held` / 2, inside [B, B + `held`).
 fn answers_where_a_kept_memo_would_not_fit(
     snapshot: &nrese_engine::Snapshot,
     query: &str,
     control: &str,
     options: impl Fn(Option<usize>) -> QueryOptions,
     expected: &[String],
-    distinct: usize,
+    held: usize,
 ) {
     let query = SparqlParser::new().parse_query(query).unwrap();
     let control = SparqlParser::new().parse_query(control).unwrap();
@@ -5387,9 +5387,8 @@ fn answers_where_a_kept_memo_would_not_fit(
             false => low = middle,
         }
     }
-    let numbers = distinct * 114;
-    let limit = high + numbers / 2;
-    let window = format!("limit {limit}, window [{high}, {})", high + numbers);
+    let limit = high + held / 2;
+    let window = format!("limit {limit}, window [{high}, {})", high + held);
     assert_eq!(answer(&control, Some(limit)), expected, "control, {window}");
     assert_eq!(answer(&query, Some(limit)), expected, "{window}");
 }
@@ -5431,7 +5430,7 @@ fn a_sum_and_count_of_one_expression_keep_no_numbers_past_their_pass() {
         &text("COUNT(?v * 2 + 0)"),
         |limit| capped_options(limit, true, None),
         &expected,
-        4_096,
+        4_096 * 114,
     );
 }
 
@@ -5488,7 +5487,7 @@ fn an_eager_average_beside_a_count_of_its_argument_keeps_no_numbers_past_its_pas
         &text("COUNT(?price * 2 + 0)"),
         |limit| capped_options(limit, false, None),
         &expected,
-        4_096,
+        4_096 * 114,
     );
 }
 
@@ -5534,7 +5533,45 @@ fn a_streamed_average_keeps_no_numbers_past_each_morsel() {
         &text("COUNT(?v * 2 + 0)"),
         |limit| capped_options(limit, false, Some(256)),
         &expected,
-        4_096,
+        4_096 * 114,
+    );
+}
+
+/// [`answers_where_a_kept_memo_would_not_fit`] for a user's `SUM(STRLEN(?v))` and
+/// `COUNT(STRLEN(?v))` over 16 subjects each with the same 1,024 strings of 1,024
+/// characters (16,384 rows: each group sums to 1,048,576 and counts 1,024), crossed with
+/// `?k` in 1 to 16,384, as written: what the pass would keep past itself is the strings it
+/// decodes, 1 MiB of text.
+#[test]
+fn a_sum_and_count_of_a_string_expression_keep_no_decoded_terms_past_their_pass() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for g in 0..16 {
+        for j in 0..1_024 {
+            let text = Term::from(Literal::from(format!("{j:04}{}", "x".repeat(1_020))));
+            let quad = Quad::new(ex(&format!("g{g}")), ex("p"), text, GraphName::DefaultGraph);
+            tx.insert(quad.as_ref());
+        }
+    }
+    tx.commit().unwrap();
+    let ks: String = (1..=16_384).map(|k| format!("{k} ")).collect();
+    let text = |count: &str| {
+        format!(
+            "PREFIX : <{EX}> SELECT ?g ?s ?n ?k WHERE {{ {{ SELECT ?g (SUM(STRLEN(?v)) AS ?s) \
+             ({count} AS ?n) WHERE {{ ?g :p ?v }} GROUP BY ?g }} VALUES ?k {{ {ks}}} }}"
+        )
+    };
+    let mut expected: Vec<String> = (0..16)
+        .flat_map(|g| (1..=16_384).map(move |k| format!("<{EX}g{g}>\t1048576\t1024\t{k}")))
+        .collect();
+    expected.sort();
+    answers_where_a_kept_memo_would_not_fit(
+        &engine.snapshot(),
+        &text("COUNT(STRLEN(?v))"),
+        &text("COUNT(STRLEN(?v) + 0)"),
+        |limit| capped_options(limit, true, None),
+        &expected,
+        1_024 * 1_024,
     );
 }
 
