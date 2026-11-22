@@ -52,6 +52,65 @@ enum Fault {
     /// A panic at the first directory sync once the checkpoint of revision 2 is in place (the
     /// one after its rename), before its version is installed.
     PanicPlaced,
+    /// A panic at the install of the version the checkpoint holds, its directory synced, the
+    /// log's and the compaction slot's locks held ([`fault::PANIC_AT_VERSION_INSTALL`]).
+    PanicAtInstall,
+}
+
+/// What [`Fault::PanicPlaced`]'s panic says.
+const PLACED_PANIC: &str = "a test's panic once the checkpoint is in place";
+
+impl Fault {
+    /// What the injected panic says; `None`: the fault injects none.
+    fn panic_text(self) -> Option<&'static str> {
+        match self {
+            Self::Error(_) => None,
+            Self::PanicPlaced => Some(PLACED_PANIC),
+            Self::PanicAtInstall => Some(fault::VERSION_INSTALL_PANIC),
+        }
+    }
+}
+
+/// What a panic's payload says.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic without a message".into())
+}
+
+/// The write after the publication.
+#[derive(Clone, Copy, Debug)]
+enum Later {
+    /// A transaction inserting `quad(2)`: a new revision.
+    Commit,
+    /// A transaction inserting `quad(1)`, which revision 1 holds: nothing changes in memory.
+    UnchangedCommit,
+    /// A bulk append of `quad(1)` alone: nothing changes in memory.
+    UnchangedLoad,
+}
+
+impl Later {
+    fn run(self, engine: &Engine) -> EngineResult<CommitSummary> {
+        match self {
+            Self::Commit => commit(engine, 2),
+            Self::UnchangedCommit => commit(engine, 1),
+            Self::UnchangedLoad => {
+                let load = engine.bulk_load(BulkMode::Append);
+                load.add(&[quad(1)]);
+                load.finish()
+            }
+        }
+    }
+
+    /// The statement it writes.
+    fn witness(self) -> Quad {
+        match self {
+            Self::Commit => quad(2),
+            Self::UnchangedCommit | Self::UnchangedLoad => quad(1),
+        }
+    }
 }
 
 /// What publishes revision 2 of a store at revision 1 by a checkpoint, before it installs
@@ -134,7 +193,7 @@ impl Publication {
 
 /// One row of [`a_failed_bulk_publication_never_costs_a_later_acknowledged_commit`]: what
 /// went wrong, if anything.
-fn publication_row(injected: Fault, publication: Publication) -> Vec<String> {
+fn publication_row(injected: Fault, publication: Publication, later: Later) -> Vec<String> {
     let mut wrong = Vec::new();
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::open(dir.path(), publication.config()).unwrap();
@@ -148,42 +207,78 @@ fn publication_row(injected: Fault, publication: Publication) -> Vec<String> {
             fault::ON_DIR_SYNC.set(Some(Box::new(move |_: &std::path::Path| {
                 if !seen.get() && super::checkpoint::placed(&root, 2).unwrap_or(false) {
                     seen.set(true);
-                    panic!("a test's panic once the checkpoint is in place");
+                    panic!("{PLACED_PANIC}");
                 }
             })));
         }
+        Fault::PanicAtInstall => fault::PANIC_AT_VERSION_INSTALL.set(true),
     }
     let published = catch_unwind(AssertUnwindSafe(|| publication.run(&engine)));
     match injected {
         Fault::Error(point) => point.set(false),
         Fault::PanicPlaced => fault::ON_DIR_SYNC.set(None),
+        // Taken by the panic: still set, it was never reached.
+        Fault::PanicAtInstall => fired.set(!fault::PANIC_AT_VERSION_INSTALL.replace(false)),
     }
-    if matches!(injected, Fault::PanicPlaced) && !fired.get() {
+    if injected.panic_text().is_some() && !fired.get() {
         return vec!["the panic's point was never reached".into()];
     }
+    // The checkpoint of revision 2 in place once the publication ended (unknown: not counted).
+    let placed = super::checkpoint::placed(dir.path(), 2).unwrap_or(false);
     let published = match published {
         Ok(result) => result.map_err(|error| error.to_string()),
-        Err(_) => Err("a panic".into()),
+        // Only the injected panic is a row's: any other fails it.
+        Err(payload) => match panic_text(payload.as_ref()) {
+            text if injected.panic_text() == Some(text.as_str()) => Err(text),
+            text => return vec![format!("an unexpected panic: {text}")],
+        },
     };
-    let later = commit(&engine, 2);
+    let after = later.run(&engine);
     drop(engine);
 
-    let engine = Engine::open(dir.path(), publication.config()).unwrap();
+    let engine = match Engine::open(dir.path(), publication.config()) {
+        Ok(engine) => engine,
+        Err(error) => return vec![format!("the store doesn't reopen: {error}")],
+    };
     let held = contents(&engine);
-    if later.is_ok() && !held.contains(&quad(2)) {
+    if after.is_ok() && !held.contains(&later.witness()) {
         wrong.push(format!(
-            "the acknowledged commit is lost (publication: {:?})",
+            "the acknowledged write is lost (publication: {:?})",
             published.as_ref().err()
         ));
     }
     let marker = publication.marker();
-    match (&published, &later) {
+    match (&published, &after) {
         (Ok(_), _) if !held.contains(&marker) => wrong.push("the publication is lost".into()),
-        // Reported failed while the engine went on taking commits: it must not be there.
+        // Reported failed while the engine went on taking writes: it must not be there.
         (Err(error), Ok(_)) if held.contains(&marker) => wrong.push(format!(
             "a publication that failed ({error}) is there after a restart"
         )),
         _ => {}
+    }
+    // Failed with its checkpoint in place: the log takes no write before a reopen, which
+    // recovers the publication at revision 2 and takes the next write at 3.
+    if published.is_err() && placed {
+        if !matches!(after, Err(EngineError::WalPoisoned)) {
+            wrong.push(format!(
+                "the write after it is answered {:?}, not refused as poisoned",
+                after.as_ref().map(|summary| summary.revision)
+            ));
+        }
+        let revision = engine.snapshot().revision();
+        if revision != 2 || !held.contains(&marker) {
+            wrong.push(format!(
+                "the reopen is at revision {revision}, the publication there: {}",
+                held.contains(&marker)
+            ));
+        }
+        match commit(&engine, 20) {
+            Ok(summary) if summary.revision == 3 => {}
+            next => wrong.push(format!(
+                "the reopened store's next commit is answered {:?}",
+                next.map(|summary| summary.revision)
+            )),
+        }
     }
     wrong
 }
@@ -194,22 +289,30 @@ fn publication_row(injected: Fault, publication: Publication) -> Vec<String> {
 /// write is acknowledged until the store is reopened, or memory agrees with what is durable.
 ///
 /// A store at revision 1 with its record in the log; a bulk publication of revision 2 fails at
-/// a durable step; then a transaction commits. After a restart, the transaction is there if it
-/// was acknowledged (checked first); the publication is there if it succeeded, and absent if
-/// it failed while the engine went on taking commits (a failure whose outcome is unknown takes
-/// no more: then either is right). Before the fix of the error rows, the checkpoint of
-/// revision 2 was in place when the load failed, the transaction was acknowledged as revision
-/// 2 too, and the restart skipped it as covered by that checkpoint; the panic rows did the
-/// same until the log was poisoned on any exit, not only a returned error. Each row is judged
-/// on its own. The mapping rows are guards, right on the base too: a built version is then
-/// served from memory, and a streamed one poisons the log.
+/// a durable step; then a write follows. After a restart, the write is there if it was
+/// acknowledged (checked first); the publication is there if it succeeded, and absent if it
+/// failed while the engine went on taking writes (a failure whose outcome is unknown takes no
+/// more: then either is right). A publication that failed with its checkpoint in place leaves
+/// the log taking no write before a reopen, which recovers it at revision 2 and takes the next
+/// commit at 3. A panic other than the one injected fails its row.
+///
+/// The write is a commit of a new statement, or (after a replacement, whose checkpoint lacks
+/// `quad(1)`) one that changes nothing in memory: a transaction or an append of `quad(1)`,
+/// which revision 1 holds. Before the fix of the error rows, the checkpoint of revision 2 was
+/// in place when the load failed, the transaction was acknowledged as revision 2 too, and the
+/// restart skipped it as covered by that checkpoint; the panic rows did the same until the log
+/// was poisoned on any exit, not only a returned error; the unchanged writes were acknowledged
+/// at revision 1 on a poisoned log until every acknowledgement asked the log. The install rows
+/// fail if the fence is let go before the install. Each row is judged on its own. The mapping
+/// rows of a built version are guards, right on the base too: it is then served from memory.
 #[test]
 fn a_failed_bulk_publication_never_costs_a_later_acknowledged_commit() {
-    let points: [(Fault, &str); 4] = [
+    let points: [(Fault, &str); 5] = [
         (Fault::Error(&fault::FAIL_ROTATE), "rotation"),
         (Fault::Error(&fault::FAIL_DIR_SYNC), "directory sync"),
         (Fault::PanicPlaced, "panic once the checkpoint is in place"),
-        (Fault::Error(&fault::FAIL_MAP), "mapping (guard)"),
+        (Fault::PanicAtInstall, "panic at the install"),
+        (Fault::Error(&fault::FAIL_MAP), "mapping"),
     ];
     let publications = [
         Publication::Load(BulkMode::Append),
@@ -217,18 +320,29 @@ fn a_failed_bulk_publication_never_costs_a_later_acknowledged_commit() {
         Publication::Spilled,
         Publication::Rematerialisation,
     ];
+    // Every point and publication with a commit after it; every point with each unchanged
+    // write after a replacement.
+    let rows = points
+        .iter()
+        .flat_map(|&point| {
+            publications
+                .iter()
+                .map(move |&publication| (point, publication, Later::Commit))
+        })
+        .chain(points.iter().flat_map(|&point| {
+            [Later::UnchangedCommit, Later::UnchangedLoad]
+                .map(|later| (point, Publication::Load(BulkMode::Replace), later))
+        }));
     let mut failures = Vec::new();
-    for (injected, step) in points {
-        for publication in publications {
-            let wrong = publication_row(injected, publication);
-            let verdict = if wrong.is_empty() { "ok" } else { "FAILED" };
-            eprintln!("row {step}, {publication:?}: {verdict}");
-            failures.extend(
-                wrong
-                    .into_iter()
-                    .map(|w| format!("{step}, {publication:?}: {w}")),
-            );
-        }
+    for ((injected, step), publication, later) in rows {
+        let wrong = publication_row(injected, publication, later);
+        let verdict = if wrong.is_empty() { "ok" } else { "FAILED" };
+        eprintln!("row {step}, {publication:?}, then {later:?}: {verdict}");
+        failures.extend(
+            wrong
+                .into_iter()
+                .map(|w| format!("{step}, {publication:?}, then {later:?}: {w}")),
+        );
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }
@@ -1045,25 +1159,131 @@ fn a_cut_waits_for_its_copy_to_be_durable() {
     assert_eq!(contents(&engine), [quad(1)].into_iter().collect());
 }
 
+/// What [`a_rotation_whose_segment_may_be_placed_takes_no_more_commits`]'s panic says.
+const ROTATION_PANIC: &str = "a test's panic once the new segment is in place";
+
+/// One row of [`a_rotation_whose_segment_may_be_placed_takes_no_more_commits`]: a store at
+/// revision 1; `step` rotates the log to a segment for revision 2, which fails once that
+/// segment is in place (an error, or a panic at its directory's sync); what went wrong, if
+/// anything.
+fn placed_segment_row(
+    config: EngineConfig,
+    panics: bool,
+    step: impl FnOnce(&Engine) -> EngineResult<CommitSummary>,
+) -> Vec<String> {
+    let mut wrong = Vec::new();
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(dir.path(), config.clone()).unwrap();
+    commit(&engine, 1).unwrap();
+    let wal = super::wal::wal_dir(dir.path());
+    let segment = wal.join(format!("{:020}.wal", 2));
+    let fired = Rc::new(Cell::new(false));
+    match panics {
+        false => fault::FAIL_SEGMENT_PLACED.set(true),
+        true => {
+            let seen = Rc::clone(&fired);
+            fault::ON_DIR_SYNC.set(Some(Box::new(move |synced: &std::path::Path| {
+                if !seen.get() && fault::same_dir(synced, &wal) && segment.exists() {
+                    seen.set(true);
+                    panic!("{ROTATION_PANIC}");
+                }
+            })));
+        }
+    }
+    let stepped = catch_unwind(AssertUnwindSafe(|| step(&engine)));
+    fault::FAIL_SEGMENT_PLACED.set(false);
+    fault::ON_DIR_SYNC.set(None);
+    match stepped {
+        Err(_) if !panics => return vec!["an unexpected panic".into()],
+        Err(payload) if panic_text(payload.as_ref()) != ROTATION_PANIC => {
+            return vec![format!(
+                "an unexpected panic: {}",
+                panic_text(payload.as_ref())
+            )];
+        }
+        Ok(Ok(summary)) => wrong.push(format!(
+            "the rotating write is acknowledged at revision {}",
+            summary.revision
+        )),
+        _ if panics && !fired.get() => return vec!["the panic's point was never reached".into()],
+        _ => {}
+    }
+    let next = commit(&engine, 3);
+    drop(engine);
+    let engine = match Engine::open(dir.path(), config) {
+        Ok(engine) => engine,
+        Err(error) => return vec![format!("the store doesn't reopen: {error}")],
+    };
+    let held = contents(&engine);
+    if next.is_ok() && !held.contains(&quad(3)) {
+        wrong.push("the acknowledged commit is lost".into());
+    }
+    if !matches!(next, Err(EngineError::WalPoisoned)) {
+        wrong.push(format!(
+            "the next commit is answered {:?}, not refused as poisoned",
+            next.map(|summary| summary.revision)
+        ));
+    }
+    if !held.contains(&quad(1)) || engine.snapshot().revision() != 1 {
+        wrong.push(format!(
+            "the reopen is at revision {}, revision 1's commit there: {}",
+            engine.snapshot().revision(),
+            held.contains(&quad(1))
+        ));
+    }
+    if let Err(error) = commit(&engine, 4) {
+        wrong.push(format!("the reopened store refuses a commit: {error}"));
+    }
+    wrong
+}
+
 /// A rotation that fails once its new segment is in place under its name (its directory
-/// not synced) takes no more commits before a reopen: records appended to the old segment
-/// would sit behind a later-named one, which replication and segment release read as
-/// covering them. Every commit acknowledged before survives. This is the contract the
-/// change sets; the base goes on committing (no loss is reproduced here).
+/// not synced), by an error or a panic, takes no more commits before a reopen: records
+/// appended to the old segment would sit behind a later-named one, which replication and
+/// segment release read as covering them, and a torn append there would be damage in a
+/// segment that isn't the last. Every commit acknowledged before survives, and the reopen
+/// takes commits again. Rows: a commit's own rotation (every commit after the first starts a
+/// segment) and a bulk load's (below the segment's size), each failing by an error and by a
+/// panic. This is the contract the change sets; the base goes on committing after a panic
+/// (no loss is reproduced here).
 #[test]
 fn a_rotation_whose_segment_may_be_placed_takes_no_more_commits() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = Engine::open(dir.path(), small_segments()).unwrap();
-    commit(&engine, 1).unwrap();
-    fault::FAIL_SEGMENT_PLACED.set(true);
-    assert!(commit(&engine, 2).is_err());
-    fault::FAIL_SEGMENT_PLACED.set(false);
-    let next = commit(&engine, 3);
-    assert!(matches!(next, Err(EngineError::WalPoisoned)), "{next:?}");
-    drop(engine);
-    let engine = Engine::open(dir.path(), small_segments()).unwrap();
-    assert_eq!(contents(&engine), [quad(1)].into_iter().collect());
-    commit(&engine, 4).unwrap();
+    let load = |engine: &Engine| {
+        let load = engine.bulk_load(BulkMode::Append);
+        load.add(&[quad(10)]);
+        load.finish()
+    };
+    let rows: [(
+        &str,
+        EngineConfig,
+        bool,
+        &dyn Fn(&Engine) -> EngineResult<CommitSummary>,
+    ); 4] = [
+        (
+            "a commit's rotation, an error",
+            small_segments(),
+            false,
+            &|e: &Engine| commit(e, 2),
+        ),
+        (
+            "a commit's rotation, a panic",
+            small_segments(),
+            true,
+            &|e: &Engine| commit(e, 2),
+        ),
+        ("a bulk load's rotation, an error", config(), false, &load),
+        ("a bulk load's rotation, a panic", config(), true, &load),
+    ];
+    let mut failures = Vec::new();
+    for (name, config, panics, step) in rows {
+        let wrong = placed_segment_row(config, panics, step);
+        eprintln!(
+            "row {name}: {}",
+            if wrong.is_empty() { "ok" } else { "FAILED" }
+        );
+        failures.extend(wrong.into_iter().map(|w| format!("{name}: {w}")));
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
 }
 
 /// A directory sync is a real one on every platform (F2): syncing a directory that isn't

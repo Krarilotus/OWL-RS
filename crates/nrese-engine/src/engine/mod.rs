@@ -441,6 +441,10 @@ impl Versions {
     /// compaction slot, so that none is published while it is replaced. A value, never an
     /// `Arc`: no snapshot can have held it, so its own slots ([`OwnState`]) are empty.
     fn install(&self, version: Version) {
+        #[cfg(test)]
+        if crate::durability::fault::PANIC_AT_VERSION_INSTALL.replace(false) {
+            panic!("{}", crate::durability::fault::VERSION_INSTALL_PANIC);
+        }
         let version = Arc::new(version);
         *self.current.write() = version;
     }
