@@ -2003,13 +2003,13 @@ impl<'a> Context<'a> {
     }
 
     /// Charges a join's hash table over `rows` build rows (a key, a row number and the
-    /// table's slack per row); the caller releases the returned bytes after the join.
-    fn charge_hash_table(&self, rows: usize) -> NativeResult<usize> {
-        let bytes = rows.saturating_mul(32);
-        self.budget
-            .charge(bytes)
+    /// table's slack per row), held while the join runs: released when it drops, on the
+    /// join's error path too.
+    fn charge_hash_table(&self, rows: usize) -> NativeResult<Reservation<&Budget>> {
+        let mut held = Reservation::new(&*self.budget);
+        held.charge(rows.saturating_mul(32))
             .map_err(QueryEvaluationError::MemoryLimit)?;
-        Ok(bytes)
+        Ok(held)
     }
 
     /// The error for an operator that would outgrow the budget.
@@ -5404,7 +5404,7 @@ impl<'a> Context<'a> {
             join(&left.table, &right.table, &lk, &rk, max_rows)
         }
         .map_err(|e| self.join_stopped(e, vars.len()))?;
-        self.budget.release(hash_table);
+        drop(hash_table);
         let ordered = left.ordered;
         self.consumed(left);
         self.consumed(right);
@@ -5449,7 +5449,7 @@ impl<'a> Context<'a> {
             left_join(&left.table, &right.table, &lk, &rk, accept, max_rows)
         }
         .map_err(|e| self.join_stopped(e, vars.len()))?;
-        self.budget.release(hash_table);
+        drop(hash_table);
         let ordered = left.ordered;
         self.consumed(left);
         self.consumed(right);
