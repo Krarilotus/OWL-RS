@@ -276,6 +276,20 @@ fn negations(o: &mut Ontology, axiom: &Axiom, fresh: &[u64]) -> Result<Vec<Vec<A
     })
 }
 
+/// The individuals a test axiom of [`negations`] names.
+fn individuals(axiom: &Axiom) -> Vec<u64> {
+    match axiom {
+        Axiom::ClassAssertion(_, a) => vec![*a],
+        Axiom::ObjectPropertyAssertion(_, a, b)
+        | Axiom::NegativeObjectPropertyAssertion(_, a, b) => vec![*a, *b],
+        Axiom::DataPropertyAssertion(_, a, _) | Axiom::NegativeDataPropertyAssertion(_, a, _) => {
+            vec![*a]
+        }
+        Axiom::SameIndividual(v) | Axiom::DifferentIndividuals(v) => v.clone(),
+        _ => Vec::new(),
+    }
+}
+
 fn sorted_pair(a: ExprId, b: ExprId) -> Vec<ExprId> {
     let mut v = vec![a, b];
     v.sort_unstable();
@@ -313,6 +327,14 @@ pub fn entails(premise: &Ontology, axiom: &Axiom, fresh: &[u64], budget: &Budget
         Ok(tests) => tests,
         Err(why) => return Entailed::Unknown(why),
     };
+    // ¬α over fresh individuals says that *some* individuals are so: they are unnamed
+    // (Direct Semantics §2.3.7). Only a key tells unnamed from named ones (§2.3.5), so
+    // where the premise has none they stay as they are, on the routes they had.
+    if o.axioms.iter().any(|a| matches!(a, Axiom::HasKey(..))) {
+        let witnesses = tests.iter().flatten().flat_map(individuals);
+        o.anonymous
+            .extend(witnesses.filter(|t| fresh.contains(t)).collect::<Vec<_>>());
+    }
     let base = o.axioms.len();
     let mut answer = Entailed::Yes;
     for test in tests {
