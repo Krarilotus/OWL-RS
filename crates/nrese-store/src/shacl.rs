@@ -9,12 +9,13 @@
 use nrese_engine::{EncodedQuad, GraphSelector, ReadModel, Snapshot, TermId, Transaction};
 use nrese_rdf::{GraphName, NamedNode, Term};
 use nrese_shacl::{
-    PropertyPath, Selection, ShapeError, Shapes, ValidationReport, compile, validate,
-    validate_changes, validate_shapes_change,
+    PropertyPath, Selection, ShapeError, Shapes, ValidationReport, compile, compile_until,
+    validate, validate_changes, validate_shapes_change,
 };
-use nrese_sparql::{CancellationToken, ReadView, Resources};
+use nrese_sparql::{CancellationToken, QueryEvaluationError, ReadView, Resources};
 
 use crate::error::{StoreError, StoreResult};
+use crate::mutation::{MutationState, MutationTicket};
 use crate::query::GraphResultFormat;
 use crate::rdf_io::{BlankNodes, each_graph_quad, serialize_triples};
 use crate::service::StoreService;
@@ -159,6 +160,18 @@ fn shapes_error(errors: Vec<ShapeError>) -> StoreError {
     StoreError::ShaclShapes(errors.iter().map(ToString::to_string).collect())
 }
 
+fn commit_shapes_error(
+    ticket: &MutationTicket,
+    errors: Vec<ShapeError>,
+    format: impl FnOnce(Vec<ShapeError>) -> StoreError,
+) -> StoreError {
+    if ticket.end_pending() == MutationState::Cancelled {
+        nrese_sparql::QueryEvaluationError::Cancelled.into()
+    } else {
+        format(errors)
+    }
+}
+
 /// Validates `view` against the shapes in the graph `shapes` (none, if the graph holds
 /// nothing), leaving `also_excluded` out of the data as well, on `resources`.
 fn validate_view<V: ReadView + Sync>(
@@ -204,6 +217,7 @@ fn validate_view<V: ReadView + Sync>(
 pub(crate) fn check_shapes(
     tx: &Transaction<'_>,
     shapes_graph: &str,
+    ticket: &MutationTicket,
     view: &crate::mutation::evidence::EvidenceView<'_, '_>,
 ) -> StoreResult<()> {
     let iri = graph_iri(shapes_graph)?;
@@ -222,7 +236,11 @@ pub(crate) fn check_shapes(
         Selection::asserted(GraphSelector::Exact(shapes_id)),
     )
     .map(drop)
-    .map_err(|errors| view.shapes_error(shapes_graph, shapes_error(errors)))
+    .map_err(|errors| {
+        commit_shapes_error(ticket, errors, |errors| {
+            view.shapes_error(shapes_graph, shapes_error(errors))
+        })
+    })
 }
 
 /// What the commit in `tx` introduces against the shapes in the graph `shapes_graph` (the
@@ -234,7 +252,8 @@ pub(crate) fn introduced(
     tx: &Transaction<'_>,
     shapes_graph: &str,
     resources: &Resources,
-) -> StoreResult<Option<ValidationReport>> {
+    ticket: &MutationTicket,
+) -> StoreResult<Option<(ValidationReport, Snapshot)>> {
     let iri = graph_iri(shapes_graph)?;
     let Some(shapes_id) = tx.lookup(iri.as_ref().into()) else {
         return Ok(None);
@@ -247,17 +266,20 @@ pub(crate) fn introduced(
                     .chain(tx.inferred_deleted())
                     .map(nrese_engine::EncodedTriple::in_default_graph),
             )
+            .take_while(|_| resources.check().is_ok())
             .collect()
     };
-    introduced_in(
+    let after = tx.pending_snapshot();
+    let report = introduced_in(
         tx,
         tx.base(),
-        &tx.pending_snapshot(),
-        shapes_id,
+        &after,
+        (shapes_id, Some(ticket)),
         changed,
         |_| true,
         resources,
-    )
+    )?;
+    Ok(report.map(|report| (report, after)))
 }
 
 /// [`introduced`] over the views `before` and `after` of the commit in `tx`, with the
@@ -266,21 +288,33 @@ fn introduced_in<A: ReadView + Sync, B: ReadView + Sync>(
     tx: &Transaction<'_>,
     before: &A,
     after: &B,
-    shapes_id: TermId,
+    shapes: (TermId, Option<&MutationTicket>),
     changed: impl FnOnce() -> Vec<EncodedQuad>,
     validated: impl Fn(&Shapes) -> bool,
     resources: &Resources,
 ) -> StoreResult<Option<ValidationReport>> {
+    let (shapes_id, ticket) = shapes;
+    let compile_error = |errors| match ticket {
+        Some(ticket) => commit_shapes_error(ticket, errors, shapes_error),
+        None => shapes_error(errors),
+    };
     let data = Selection::of(GraphSelector::Any).excluding(shapes_id);
     let shapes_selection = Selection::asserted(GraphSelector::Exact(shapes_id));
+    let cancellation = resources.cancellation.as_ref();
     let shapes_changed = tx
         .inserted()
         .chain(tx.deleted())
+        .take_while(|_| resources.check().is_ok())
         .any(|quad| quad.graph == shapes_id);
+    resources.check()?;
     if shapes_changed {
-        let shapes_after = compile(after, shapes_selection).map_err(shapes_error)?;
+        let shapes_after = compile_until(after, shapes_selection, cancellation)
+            .ok_or(QueryEvaluationError::Cancelled)?
+            .map_err(compile_error)?;
         // Shapes that didn't compile before had no results.
-        let shapes_before = compile(before, shapes_selection).ok();
+        let shapes_before = compile_until(before, shapes_selection, cancellation)
+            .ok_or(QueryEvaluationError::Cancelled)?
+            .ok();
         if !validated(&shapes_after) || shapes_before.as_ref().is_some_and(|s| !validated(s)) {
             return Ok(None);
         }
@@ -294,19 +328,32 @@ fn introduced_in<A: ReadView + Sync, B: ReadView + Sync>(
         )?;
         return Ok(Some(report));
     }
-    let shapes = compile(before, shapes_selection).map_err(shapes_error)?;
+    let shapes = compile_until(before, shapes_selection, cancellation)
+        .ok_or(QueryEvaluationError::Cancelled)?
+        .map_err(compile_error)?;
     // A shapes graph with only `sh:entailment` still makes every validation fail.
     if shapes.is_vacuous() || !validated(&shapes) {
         return Ok(None);
     }
+    let changed = changed();
+    resources.check()?;
     Ok(Some(validate_changes(
-        before,
-        after,
-        &shapes,
-        data,
-        &changed(),
-        resources,
+        before, after, &shapes, data, &changed, resources,
     )?))
+}
+
+/// A result as a refusal names it: its focus node and component, and its messages
+/// (`sh:resultMessage`) where it has any, in the order of their text: the report's order is
+/// the dictionary's, which statements in graphs a committer may not read can decide.
+pub(crate) fn described(result: &nrese_shacl::ValidationResult) -> String {
+    let mut text = format!("focus node {}, {}", result.focus_node, result.component);
+    let mut messages: Vec<String> = result.messages.iter().map(ToString::to_string).collect();
+    messages.sort_unstable();
+    for (i, message) in messages.iter().enumerate() {
+        text.push_str(if i == 0 { ", message " } else { ", " });
+        text.push_str(message);
+    }
+    text
 }
 
 /// The SHACL reason a restricted committer's view shows: the results the commit introduces
@@ -316,6 +363,7 @@ fn introduced_in<A: ReadView + Sync, B: ReadView + Sync>(
 /// queries the view can't confine (D16-065).
 pub(crate) fn view_reason(
     view: &crate::mutation::evidence::EvidenceView<'_, '_>,
+    pending: Option<&Snapshot>,
     shapes_graph: &str,
     rejects: impl Fn(&nrese_shacl::ValidationResult) -> bool,
     resources: &Resources,
@@ -325,47 +373,67 @@ pub(crate) fn view_reason(
     if !view.graph(shapes_id) {
         return None;
     }
-    let after = tx.pending_snapshot();
-    let (before, after) = (view.readable(tx.base())?, view.readable(&after)?);
+    let before = view.readable(tx.base(), resources)?;
     let changed = || {
         tx.inserted()
             .chain(tx.deleted())
+            .take_while(|_| resources.check().is_ok())
             .filter(|quad| view.graph(quad.graph))
             .collect()
     };
+    let core = |shapes: &Shapes| !shapes.uses_sparql();
+    // Reuse the SHACL gate's indexed snapshot. After an earlier refusal, build one
+    // for the whole evidence pass so each pattern read can use its indexes.
+    let built;
+    let pending = match pending {
+        Some(pending) => pending,
+        None => {
+            resources.check().ok()?;
+            built = tx.pending_snapshot();
+            &built
+        }
+    };
+    resources.check().ok()?;
+    let after = view.readable(pending, resources)?;
     let report = introduced_in(
         tx,
         &before,
         &after,
-        shapes_id,
+        (shapes_id, None),
         changed,
-        |shapes| !shapes.uses_sparql(),
+        core,
         resources,
     )
     .ok()??;
-    let rejecting: Vec<_> = report.results.iter().filter(|r| rejects(r)).collect();
     // The first by what the view's statements say, never by the results' order, which is
     // the dictionary's: term ids follow what was interned first, in any graph.
     // Every field, as decoded terms (`nrese_rdf::Term`'s order: the kind, then the value; a
     // blank node by its label, the store's name for it in the committer's view), never
     // their text: equal keys are equal results, so either is shown the same.
-    let first = rejecting.iter().min_by_key(|result| {
-        (
-            result.focus_node.clone(),
-            result.component.clone(),
-            result.path.clone(),
-            result.value.clone(),
-            result.source_shape.clone(),
-            result.severity.clone(),
-            result.source_constraint.clone(),
-            result.messages.clone(),
-        )
-    })?;
+    let mut count = 0;
+    let first = report
+        .results
+        .iter()
+        .take_while(|_| resources.check().is_ok())
+        .filter(|result| rejects(result))
+        .inspect(|_| count += 1)
+        .min_by_key(|result| {
+            (
+                result.focus_node.clone(),
+                result.component.clone(),
+                result.path.clone(),
+                result.value.clone(),
+                result.source_shape.clone(),
+                result.severity.clone(),
+                result.source_constraint.clone(),
+                result.messages.clone(),
+            )
+        })?;
+    resources.check().ok()?;
     let reason = format!(
-        "the commit introduces {} SHACL result(s) the gate rejects; first: focus node {}, {}",
-        rejecting.len(),
-        first.focus_node,
-        first.component
+        "the commit introduces {} SHACL result(s) the gate rejects; first: {}",
+        count,
+        described(first)
     );
     Some(crate::mutation::evidence::shown(
         crate::RejectKind::ShapesViolated,

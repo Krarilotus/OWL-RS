@@ -85,6 +85,16 @@ else
 fi
 [ "$(git hash-object "$files")" = "$list_hash" ] || infra "the file list isn't $list_hash"
 cd "$wt" || infra "no worktree"
+# A cargo-nextest where cargo runs one first, before any on PATH, would stand in for the pinned one
+# whatever its version says: no verdict, before anything is installed. Cargo's home here: the host's
+# where it has rustup (a relative one from this worktree, as cargo resolves it), else the gate's own,
+# made below. Decided once, here: the setup below takes the same home, whatever appears on PATH meanwhile.
+host_rustup=""
+command -v rustup > /dev/null && host_rustup=1
+cargo_home=$cache/cargo
+[ -z "$host_rustup" ] || cargo_home=${CARGO_HOME:-$HOME/.cargo}
+[ ! -e "$cargo_home/bin/cargo-nextest" ] \
+  || infra "a cargo-nextest in $cargo_home/bin would run in place of the pinned one: no verdict"
 
 # Rust links through the system's C compiler: a host without one can't run a gate, and that is
 # the host's failure, not the tree's (the development machine's WSL VM, 20 Oct 2026: every build script failed).
@@ -100,7 +110,7 @@ exec 7> "$cache/tools/lock"
 flock -w 1800 7 || infra "the tools' lock wasn't free within 30 minutes"
 # A host without rustup (the development machine's WSL VM, 20 Oct 2026) gets one of the gate's own, under the cache:
 # the host's own home and PATH stay as they are.
-if ! command -v rustup > /dev/null; then
+if [ -z "$host_rustup" ]; then
   export RUSTUP_HOME="$cache/rustup" CARGO_HOME="$cache/cargo"
   export PATH="$CARGO_HOME/bin:$PATH"
   if ! command -v rustup > /dev/null; then
@@ -117,20 +127,12 @@ quiet rustup toolchain install "$channel" --no-self-update --profile minimal --c
   || infra "no toolchain $channel"
 # The gate's pinned tools (scripts/lib/gate-tools.txt); check.sh checks them again.
 pin() { sed -n "s/^$1 //p" "$tool/scripts/lib/gate-tools.txt" | tr -d '\r'; }
-# cargo-nextest: each version in a directory of its own (tools/nextest-<version>), made aside, moved
-# into place whole once it runs as that version and never changed after, first on PATH: no job
-# replaces the one another job runs.
+# cargo-nextest: the pinned build, by its archive's sha256 and its executable's (scripts/lib/gate-nextest.sh),
+# first on PATH: each version and archive in an entry of its own, made aside and moved into place whole.
 want=$(pin cargo-nextest)
-nextest=$cache/tools/nextest-$want
-nextest_version() { "$1/cargo-nextest" nextest --version 2> /dev/null | awk 'NR == 1 { print $2 }'; }
-if [ ! -d "$nextest" ]; then
-  rm -rf -- "$nextest".partial-*
-  part=$(mktemp -d "$nextest.partial-XXXXXX") || infra "no cargo-nextest $want"
-  curl -fsSL --max-time 300 "https://get.nexte.st/$want/linux" | tar -xz -C "$part"
-  [ "$(nextest_version "$part")" = "$want" ] && mv -T -- "$part" "$nextest" \
-    || { rm -rf -- "$part"; infra "no cargo-nextest $want"; }
-fi
-[ "$(nextest_version "$nextest")" = "$want" ] || infra "$nextest isn't cargo-nextest $want"
+# shellcheck source=gate-nextest.sh
+. "$tool/scripts/lib/gate-nextest.sh"
+nextest=$(gate_nextest "$cache" "$tool/scripts/lib/gate-tools.txt" linux) || infra "no cargo-nextest ${want:-pinned}"
 export PATH="$nextest:$PATH"
 nightly=$(pin miri)
 # Miri, for the push tier's nrese-exec step (scripts/miri.sh, which builds under this worktree:
@@ -229,9 +231,12 @@ EOF
 
 echo "=== gate $mode of tree $tree on $(hostname) ($identity)"
 began=$SECONDS
-# check.sh's own output, whole: its summary is the gate's evidence, step by step.
-NRESE_ON_BUILD_HOST=1 NRESE_FILES_FROM="$files" bash scripts/check.sh "$mode" 2>&1 | tee "$out/check.log"
+# check.sh's own output, whole: its summary is the gate's evidence, step by step. The tier runs its tests
+# under the pinned version or ends with 3 (check.sh's nextest): no verdict, and nothing recorded.
+NRESE_ON_BUILD_HOST=1 NRESE_FILES_FROM="$files" NRESE_NEXTEST_REQUIRED=$want bash scripts/check.sh "$mode" 2>&1 \
+  | tee "$out/check.log"
 code=${PIPESTATUS[0]}
+[ "$code" -ne 3 ] || infra "cargo nextest wasn't the pinned $want inside the run: no verdict"
 # The memory the step's slice (FLEET_SLICE) held at most: the gate's whole peak on this host.
 peak=""
 cgroup=/sys/fs/cgroup$(awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup 2> /dev/null)

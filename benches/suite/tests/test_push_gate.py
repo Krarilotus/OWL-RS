@@ -10,6 +10,7 @@ An assertion tagged `SPEC <tag>` states the behaviour its test is for.
 """
 
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import unittest
@@ -41,7 +43,7 @@ COPIED = (".githooks/pre-push", "scripts/check.sh", "scripts/cargo-guarded.sh", 
           "scripts/lib/fleet-gate.sh", "scripts/lib/fleet-job.sh", "scripts/lib/gate-tools.txt",
           "scripts/lib/gate-publish.sh", "rust-toolchain.toml",
           "scripts/lib/gate-record.py", "scripts/lib/windows-job.ps1", "scripts/lib/windows-job.sh",
-          "scripts/lib/suite-python.sh", "scripts/lib/gate-node.sh", *isolation.NS_SH,
+          "scripts/lib/suite-python.sh", "scripts/lib/gate-node.sh", "scripts/lib/gate-nextest.sh", *isolation.NS_SH,
           "benches/suite/requirements.txt", "scripts/lib/gate-job.sh")
 # A stand-in for the fleet's CLI: each submit keeps its job file; status, results and cancel as told.
 FLEET = """#!/bin/sh
@@ -66,16 +68,39 @@ RUSTC = """#!/bin/sh
 [ "$1" = -vV ] && printf 'rustc 1.98.1\\nbinary: rustc\\ncommit-hash: abcdef1234567890\\nrelease: 1.98.1\\n'
 exit 0
 """
-# A stand-in for curl fetching a cargo-nextest release (get.nexte.st/<version>/linux, the last argument): a
-# gzipped tar of a cargo-nextest that says it is that version.
-CURL_NEXTEST = r"""for arg; do url=$arg; done
-v=${url#https://get.nexte.st/}; v=${v%%/*}
-d=$(mktemp -d)
-printf '#!/bin/sh\necho "cargo-nextest %s"\n' "$v" > "$d/cargo-nextest"
-chmod +x "$d/cargo-nextest"
-tar -cz -C "$d" cargo-nextest
-rm -rf -- "$d"
-"""
+# A stand-in for curl fetching a cargo-nextest release (get.nexte.st/<version>/<platform>): it copies
+# STUB_ARCHIVE where -o says, or fails as curl does on a server's error where there is none.
+CURL_ARCHIVE = ('#!/bin/sh\n[ -n "$STUB_ARCHIVE" ] || exit 22\n'
+                'while [ $# -gt 1 ]; do [ "$1" != -o ] || out=$2; shift; done\n'
+                'cp "$STUB_ARCHIVE" "$out"\n')
+
+
+def nextest_archives(root, runner):
+    """RUNNER (a cargo-nextest stand-in's text) in two archives as get.nexte.st serves them: the first,
+    which a tree pins by its sha256 and the executable's; the second holds that same executable and a
+    file more, so only the archive's own sha256 tells it apart. Returns both, and the sha256 of the
+    first and of the executable."""
+    archives = []
+    for which, members in (("pinned", {"cargo-nextest": runner}),
+                           ("another", {"cargo-nextest": runner, "extra.txt": "not in the release\n"})):
+        path = root / f"nextest-{which}.tar.gz"
+        with tarfile.open(path, "w:gz") as tar:
+            for name, body in members.items():
+                member = tarfile.TarInfo(name)
+                member.size, member.mode = len(body.encode()), 0o755
+                tar.addfile(member, io.BytesIO(body.encode()))
+        archives.append(path)
+    return (*archives, hashlib.sha256(archives[0].read_bytes()).hexdigest(),
+            hashlib.sha256(runner.encode()).hexdigest())
+
+
+def pin_nextest(tools_txt, platform, archive_sum, exe_sum):
+    """TOOLS_TXT (a tree's scripts/lib/gate-tools.txt) pinning PLATFORM's cargo-nextest archive and
+    executable by these sha256; returns how many pins it changed."""
+    text, pins = re.subn(rf"^(cargo-nextest-{platform} \S+) \S+ \S+$", rf"\g<1> {archive_sum} {exe_sum}",
+                         tools_txt.read_text(), flags=re.M)
+    tools_txt.write_text(text, newline="\n")
+    return pins
 
 
 class Repo(unittest.TestCase):
@@ -936,22 +961,41 @@ class GateJob(Repo):
     def test_it_runs_only_the_tree_it_was_sent_on_a_host_that_links_and_says_what_it_was(self):
         stubs = self.root / "stubs"
         stubs.mkdir()
+        tools_txt = self.repo / "scripts/lib/gate-tools.txt"
+        v = re.search(r"^cargo-nextest (\S+)$", tools_txt.read_text(), re.M).group(1)
         for name, body in {
             "rustup": "exit 0",
             "rustc": '[ "${1#+}" != "$1" ] && shift; case "$1" in -vV) echo "release: 1.98.1"; echo "commit-hash: abcdef1234567890" ;;'
                      ' --print) echo "    native - Select the CPU of the current host (currently znver3)." ;; esac',
-            "cargo": 'echo "cargo-nextest 0.9.146"',  # Miri there: nothing to install
-            "curl": CURL_NEXTEST,  # the pinned cargo-nextest, installed under the cache
+            # `cargo nextest` runs a cargo-nextest as cargo finds it: in $CARGO_HOME/bin first, then on PATH.
+            # Miri there: nothing to install.
+            "cargo": 'if [ "$1" = nextest ]; then [ ! -x "$CARGO_HOME/bin/cargo-nextest" ] || exec "$CARGO_HOME/bin/cargo-nextest" "$@"\n'
+                     '  exec cargo-nextest "$@"; fi\necho "miri 0.1.0"',
             "cc-links": 'while [ $# -gt 0 ]; do [ "$1" = -o ] && { shift; : > "$1"; }; shift; done',
             "cc-broken": "exit 1",
         }.items():
             (stubs / name).write_text("#!/bin/sh\n" + body + "\n")
             (stubs / name).chmod(0o755)
+        (stubs / "curl").write_text(CURL_ARCHIVE)
+        (stubs / "curl").chmod(0o755)
+        # The pinned cargo-nextest: one executable, with the pinned version (STUB_NEXTEST `failing`: its
+        # version command prints it and fails). Two archives of it as get.nexte.st serves them: the tree
+        # pins the first and the executable by their sha256 (cargo-nextest-linux); the second holds that
+        # same executable and a file more, so only the archive's own sha256 tells it apart.
+        runner = ('#!/bin/sh\ncase "$STUB_NEXTEST" in\n'
+                  f'  failing) echo "cargo-nextest {v}"; exit 1 ;;\n'
+                  f'  *) echo "cargo-nextest {v} (stand-in)" ;;\nesac\n')
+        good_archive, bad_archive, good_sum, exe_sum = nextest_archives(self.root, runner)
+        self.assertEqual(pin_nextest(tools_txt, "linux", good_sum, exe_sum), 1,
+                         "the tree pins the Linux archive of cargo-nextest and its executable by their sha256")
         cache, seen = self.root / "cache", self.root / "seen"
-        # check.sh: says whether an old cache entry was still there while it ran, where it builds, and
-        # prints its summary.
+        # check.sh: says whether an old cache entry was still there while it ran, where it builds and which
+        # cargo-nextest the job requires of it, and prints its summary; or ends as STUB_CHECK says (3: cargo
+        # didn't run the required one, as its nextest() ends).
         check = ('echo "old=$(test -d "$NRESE_GATE_CACHE/target-old" && echo there)" > "$SEEN"\n'
                  'echo "target=$CARGO_TARGET_DIR" >> "$SEEN"\n'
+                 'echo "required=${NRESE_NEXTEST_REQUIRED:-none}" >> "$SEEN"\n'
+                 '[ -z "$STUB_CHECK" ] || exit "$STUB_CHECK"\n'
                  'printf "=== summary\\n  0  fmt (1 s)\\n"\n')
         for rel, body in {"scripts/check.sh": check, "scripts/cargo-guarded.sh": 'echo "-C target-cpu=native"\n',
                           "rust-toolchain.toml": '[toolchain]\nchannel = "1.98.1"\n',
@@ -968,28 +1012,137 @@ class GateJob(Repo):
         self.git(self.repo, "add", "-A")
         self.git(self.repo, "commit", "-q", "-m", "two")
         tree = self.tree("HEAD")
-        cases = [  # tree sent, C compiler -> exit
-            (tree, "cc-links", 0),
-            ("0" * 40, "cc-links", 3),   # another tree checked out
-            (tree, "no-such-cc", 3),     # no C compiler: no verdict
-            (tree, "cc-broken", 3),      # one that doesn't link: no verdict
+        # The cargo-nextest the tree pins, in the host's cache as the job lays it out
+        # (tools/nextest-<version>-<archive sha256, 12>): the pinned one; or none there, and an archive to
+        # fetch (the pinned one, or another holding the same runner). `failing`: the pinned one there, its
+        # version command printing the pinned version and failing (as a runner that can't run just now);
+        # `cold-failing`: none there, and the pinned archive's runner answering so. `tampered`: an entry
+        # whose executable isn't the pinned one; `mixed`: an entry holding the pinned executable as
+        # cargo-nextest.exe and another as cargo-nextest, which cargo runs on Linux; both with the pinned
+        # archive to fetch. `host-own`: the pinned archive to fetch, and a runner in $CARGO_HOME/bin, which
+        # cargo would run first. `gate-own`: the same in the gate's own cargo home on a host without rustup
+        # (where that home is cargo's); `gate-own-unused`: there on a host with rustup (where cargo never
+        # looks). `late-3`: the pinned one there, and the tier ending with 3 (cargo didn't run it inside the
+        # run). `mispinned`: the checkout pins an archive whose executable isn't the pinned one (a wrong
+        # pin): fetched, its executable is never run. `rustup-late`: a host without rustup whose rustup
+        # appears while the job waits for the tools' lock, and another runner in $CARGO_HOME/bin: the job
+        # keeps the home it checked (its own), so that runner never runs.
+        nextest_entry = cache / "tools" / f"nextest-{v}-{good_sum[:12]}"
+        pinned, failing, cold_failing, tampered, mixed = "pinned", "failing", "cold-failing", "tampered", "mixed"
+        host_own, gate_own, gate_unused, late_3 = "host-own", "gate-own", "gate-own-unused", "late-3"
+        mispinned, rustup_late = "mispinned", "rustup-late"
+        cargo_home, tampered_ran, marked_ran = self.root / "cargo-home", self.root / "tampered-ran", self.root / "marked-ran"
+        late_ran = self.root / "late-ran"
+        (self.root / "marked").mkdir()
+        marked_archive, _, marked_sum, _ = nextest_archives(self.root / "marked", runner + f': > "{marked_ran}"\n')
+        # The host without rustup: the stand-ins but rustup, and no PATH directory holding one.
+        no_rustup = self.root / "stubs-no-rustup"
+        shutil.copytree(stubs, no_rustup)
+        (no_rustup / "rustup").unlink()
+        path_no_rustup = os.pathsep.join([str(no_rustup)] + [d for d in os.environ["PATH"].split(os.pathsep)
+                                                             if d and not (Path(d) / "rustup").exists()])
+        # rustup-late: a flock that puts rustup on PATH when the job takes the tools' lock (flock -w).
+        late = self.root / "stubs-late"
+        late.mkdir()
+        (late / "flock").write_text(f'#!/bin/sh\ncase "$*" in *-w*) cp "{stubs / "rustup"}" "{late}/rustup" ;; esac\n'
+                                    f'exec "{shutil.which("flock")}" "$@"\n')
+        (late / "flock").chmod(0o755)
+        pins_text = tools_txt.read_text()
+        cases = [  # tree sent, C compiler, nextest -> exit
+            # None there: the archive the tree pins by its sha256 is fetched, installed and runs.
+            (tree, "cc-links", good_archive, 0),
+            ("0" * 40, "cc-links", pinned, 3),   # another tree checked out
+            (tree, "no-such-cc", pinned, 3),     # no C compiler: no verdict
+            (tree, "cc-broken", pinned, 3),      # one that doesn't link: no verdict
+            (tree, "cc-links", pinned, 0),       # the pinned one there: it runs
+            # Another archive, holding a runner of the pinned version all the same, installs nothing: no verdict.
+            (tree, "cc-links", bad_archive, 3),
+            # The pinned one there, but its version command fails: no verdict, and it stays (another job may
+            # be running it). From the pinned archive, such a runner is never installed.
+            (tree, "cc-links", failing, 3),
+            (tree, "cc-links", cold_failing, 3),
+            # An entry whose executable cargo would run isn't the pinned one: never run, made again from the
+            # pinned archive.
+            (tree, "cc-links", tampered, 0),
+            (tree, "cc-links", mixed, 0),
+            # A runner where cargo looks first: no verdict, before anything is installed. One where cargo
+            # doesn't look refuses nothing.
+            (tree, "cc-links", host_own, 3),
+            (tree, "cc-links", gate_own, 3),
+            (tree, "cc-links", gate_unused, 0),
+            # rustup appearing after that check changes nothing: the home checked is the home used.
+            (tree, "cc-links", rustup_late, 0),
+            # The tier ends with 3: no verdict, nothing recorded.
+            (tree, "cc-links", late_3, 3),
+            # A wrong pin: the archive's executable isn't the pinned one: never run, nothing installed.
+            (tree, "cc-links", mispinned, 3),
         ]
-        for case, (sent, linker, code) in enumerate(cases):
+        for case, (sent, linker, nextest, code) in enumerate(cases):
             old = cache / "target-old"  # another toolchain's, unused for long
             old.mkdir(exist_ok=True)
             (old / ".last-used").write_text("0")
             out = self.root / f"out-{case}"
             out.mkdir()
+            shutil.rmtree(nextest_entry.parent, ignore_errors=True)
+            shutil.rmtree(cache / "cargo", ignore_errors=True)
+            shutil.rmtree(cargo_home, ignore_errors=True)
+            (cargo_home / "bin").mkdir(parents=True)
+            fetched = (nextest if isinstance(nextest, Path) else marked_archive if nextest == mispinned else
+                       good_archive if nextest in (cold_failing, tampered, mixed, host_own, gate_own, gate_unused,
+                                                   rustup_late) else None)
+            # The checkout's pins: the tree's, or (mispinned) the marked archive's sha256 beside the pinned
+            # executable's.
+            tools_txt.write_text(pins_text.replace(good_sum, marked_sum) if nextest == mispinned else pins_text,
+                                 newline="\n")
+            if nextest in (pinned, failing, tampered, mixed, late_3):
+                nextest_entry.mkdir(parents=True)
+                body = runner + (f': > "{tampered_ran}"\n' if nextest in (tampered, mixed) else "")
+                (nextest_entry / "cargo-nextest").write_text(body, newline="\n")
+                (nextest_entry / "cargo-nextest").chmod(0o755)
+                if nextest == mixed:
+                    (nextest_entry / "cargo-nextest.exe").write_text(runner, newline="\n")
+            own = {host_own: cargo_home / "bin", gate_own: cache / "cargo" / "bin",
+                   gate_unused: cache / "cargo" / "bin"}.get(nextest)
+            if own:
+                own.mkdir(parents=True, exist_ok=True)
+                (own / "cargo-nextest").write_text(runner, newline="\n")
+                (own / "cargo-nextest").chmod(0o755)
+                if nextest in (gate_own, gate_unused):  # the gate's own rustup there, as its bootstrap leaves it
+                    shutil.copy(stubs / "rustup", own / "rustup")
+            if nextest == rustup_late:  # the host's runner of the pinned version, which marks that it ran
+                (late / "rustup").unlink(missing_ok=True)
+                (cargo_home / "bin" / "cargo-nextest").write_text(runner + f': > "{late_ran}"\n', newline="\n")
+                (cargo_home / "bin" / "cargo-nextest").chmod(0o755)
             done = subprocess.run(
                 [BASH, "scripts/lib/gate-job.sh", "push", sent, empty, "--"], cwd=self.repo, capture_output=True,
                 text=True, timeout=120,
                 env={**self.env, "FLEET_OUT": str(out), "NRESE_GATE_CACHE": str(cache), "SEEN": str(seen),
-                     "HOME": str(self.root), "PATH": f"{stubs}:{os.environ['PATH']}", "NRESE_GATE_CC": linker,
-                     "FLEET_JOB": f"gate-{case}", "FLEET_STEP": "1", "FLEET_HOST": "office-pc"})
-            self.assertEqual(done.returncode, code, f"SPEC job: {sent} {linker}\n{done.stdout}{done.stderr}")
+                     "HOME": str(self.root), "NRESE_GATE_CC": linker,
+                     "PATH": (path_no_rustup if nextest == gate_own else f"{late}:{path_no_rustup}"
+                              if nextest == rustup_late else f"{stubs}:{os.environ['PATH']}"),
+                     "FLEET_JOB": f"gate-{case}", "FLEET_STEP": "1", "FLEET_HOST": "office-pc",
+                     "CARGO_HOME": str(cargo_home), "STUB_ARCHIVE": str(fetched) if fetched else "",
+                     "STUB_NEXTEST": "failing" if nextest in (failing, cold_failing) else "",
+                     "STUB_CHECK": "3" if nextest == late_3 else ""})
+            self.assertEqual(done.returncode, code, f"SPEC job: case {case}\n{done.stdout}{done.stderr}")
+            if nextest in (tampered, mixed):
+                self.assertFalse(tampered_ran.exists(), f"SPEC gate-nextest: a cached runner not the pinned one ran: case {case}")
+            if nextest == mispinned:
+                self.assertFalse(marked_ran.exists(), f"SPEC gate-nextest: an executable not the pinned one ran: case {case}")
+            if nextest == rustup_late:
+                self.assertFalse(late_ran.exists(),
+                                 f"SPEC gate-nextest: a runner in a Cargo home the job didn't check ran: case {case}")
+            if fetched is bad_archive or nextest in (cold_failing, host_own, gate_own, mispinned):
+                self.assertEqual([p.name for p in nextest_entry.parent.glob("nextest-*")], [],
+                                 f"SPEC gate-nextest: a cargo-nextest was installed: case {case}")
+            if nextest == failing:
+                self.assertTrue((nextest_entry / "cargo-nextest").exists(),
+                                f"SPEC gate-nextest: the pinned runner was removed: case {case}")
             if code:
-                self.assertFalse((out / "gate.json").exists(), linker)
+                self.assertFalse((out / "gate.json").exists(), f"case {case}")
                 continue
+            self.assertEqual(dict(line.split("=", 1) for line in seen.read_text().split())["required"], v,
+                             f"SPEC gate-nextest: the tier isn't required to run the pinned cargo-nextest: case {case}")
             result = json.loads((out / "gate.json").read_text())
             self.assertEqual({k: result[k] for k in ("tier", "tree", "code", "cpu", "tracked_changes", "job",
                                                      "fleet_host", "summary")},
@@ -1216,9 +1369,10 @@ class WindowsJob(Repo):
         lacks = ('  [ "$RUSTUP_AUTO_INSTALL" != 0 ] || exit 1\n'
                  '  : > "$STUB_NO_TOOLCHAIN"\n'
                  'fi\n')
-        # One workspace package, and no cargo-nextest: cargo test, crate by crate.
+        # One workspace package; `cargo nextest` runs the cargo-nextest on PATH, as cargo finds it.
         (stubs / "cargo").write_text(
             '#!/bin/sh\nif [ "$1" = metadata ]; then echo \'{"packages": [{"name": "x"}]}\'; exit 0; fi\n'
+            '[ "$1" != nextest ] || exec cargo-nextest "$@"\n'
             '[ "$1" = clippy ] || exit 1\n'
             'if [ -n "$STUB_MISSING" ] && [ ! -e "$STUB_INSTALLED" ]; then\n' + lacks
             + 'echo "clippy 0.1.98"\n', newline="\n")
@@ -1231,10 +1385,11 @@ class WindowsJob(Repo):
         for name in ("cargo", "rustc", "rustup"):
             (stubs / name).chmod(0o755)
         # The tree's cargo-guarded.sh: needs a usable stdin, as Python's subprocess and coreutils do,
-        # says where it builds, and fails as STUB_FAIL says (<its first argument>:<exit>).
+        # says where it builds and what it ran, and fails as STUB_FAIL says (<its first argument>:<exit>).
         guarded = ('#!/bin/sh\ncase "$1" in --print-rustflags) echo "-C target-cpu=native"; exit 0 ;; esac\n'
                    f'"{Path(sys.executable).as_posix()}" -c "import os; os.fstat(0)" || exit 9\n'
                    'printf %s "$CARGO_TARGET_DIR" > "$FLEET_OUT/target-dir"\n'
+                   'echo "$*" >> "$FLEET_OUT/guarded"\n'
                    # clippy as cargo runs it: not without the component.
                    '[ "$1" != clippy ] || [ -z "$STUB_MISSING" ] || [ -e "$STUB_INSTALLED" ] || exit 101\n'
                    '[ "${STUB_FAIL%%:*}" != "$1" ] || exit "${STUB_FAIL#*:}"\n')
@@ -1246,6 +1401,24 @@ class WindowsJob(Repo):
             (self.repo / rel).parent.mkdir(parents=True, exist_ok=True)
             (self.repo / rel).write_text(body, newline="\n")
         (self.repo / "scripts/cargo-guarded.sh").chmod(0o755)
+        # The pinned cargo-nextest: one executable, answering as STUB_NEXTEST says (by default with the
+        # pinned version; `other`: another version; `failing`: the pinned one, but the command fails;
+        # `split`: not inside the tier's run; `swapped`: another version inside it). Two archives of it as
+        # get.nexte.st serves them (curl copies STUB_ARCHIVE): the tree pins the first and the executable
+        # it holds by their sha256 (cargo-nextest-windows); the second holds that same executable and a
+        # file more, so only the archive's own sha256 tells it apart.
+        tools_txt = self.repo / "scripts/lib/gate-tools.txt"
+        pinned_nextest = re.search(r"^cargo-nextest (\S+)$", tools_txt.read_text(), re.M).group(1)
+        v = pinned_nextest
+        runner = ('#!/bin/sh\ncase "$STUB_NEXTEST" in\n'
+                  '  other) echo "cargo-nextest 0.9.1 (stand-in)" ;;\n'
+                  f'  failing) echo "cargo-nextest {v}"; exit 1 ;;\n'
+                  f'  split) [ -z "$NRESE_ON_BUILD_HOST" ] || exit 1; echo "cargo-nextest {v} (stand-in)" ;;\n'
+                  f'  swapped) [ -n "$NRESE_ON_BUILD_HOST" ] && v=0.9.1 || v={v}; echo "cargo-nextest $v (stand-in)" ;;\n'
+                  f'  *) echo "cargo-nextest {v} (stand-in)" ;;\nesac\n')
+        good_archive, bad_archive, good_sum, exe_sum = nextest_archives(self.root, runner)
+        self.assertEqual(pin_nextest(tools_txt, "windows", good_sum, exe_sum), 1,
+                         "the tree pins the Windows archive of cargo-nextest and its executable by their sha256")
         self.git(self.repo, "add", "-A")
         self.git(self.repo, "commit", "-q", "-m", "the commit under test")
         tree = self.tree("HEAD")
@@ -1262,7 +1435,7 @@ class WindowsJob(Repo):
         base.mkdir(parents=True)
         (base / "python.exe").write_text(f"#!/bin/sh\nprintf '%s\\n' '{build}'\n", newline="\n")
         (base / "python.exe").chmod(0o755)
-        (stubs / "curl").write_text("#!/bin/sh\nexit 22\n", newline="\n")
+        (stubs / "curl").write_text(CURL_ARCHIVE, newline="\n")
         (stubs / "curl").chmod(0o755)
         # The suite's own Python environment in the host's cache, made already (the tree's
         # requirements' and declared runtime's): it runs with the declared runtime, and its python
@@ -1297,29 +1470,70 @@ class WindowsJob(Repo):
         # The toolchain: there; missing, or there without clippy (another job installed the release with
         # a minimal profile), and rustup installs it; or missing and rustup can't install it.
         there, missing, no_clippy, uninstallable = None, ("toolchain", ""), ("clippy", ""), ("toolchain", "1")
-        cases = [  # tree sent, STUB_FAIL, stdin closed, toolchain, Python gone -> exit, a record, stdin
-            (tree, "", False, there, False, 0, True, "valid"),
-            ("0" * 40, "", False, there, False, 3, False, None),         # another tree checked out: no verdict
-            (tree, "build:101", False, there, False, 1, True, "valid"),  # a step fails: the tree fails
+        # The cargo-nextest the tree pins, in the host's cache as the job lays it out
+        # (tools/nextest-<version>-<archive sha256, 12>), answering as named (STUB_NEXTEST above): with the
+        # pinned version; another; the pinned one, but the command fails; or none there, and an archive to
+        # fetch (the pinned one, or another) or none. `split`: the pinned one, answering the job's check and
+        # not the run's (or gone in between); `swapped`: another version answering inside the run (one put
+        # first on cargo's path in between). `tampered`: an entry whose executable isn't the pinned one,
+        # with the pinned archive to fetch. `host-own`: the pinned entry, and a runner of the host's own in
+        # $CARGO_HOME/bin, which cargo would run first.
+        nextest_entry = cache / "tools" / f"nextest-{pinned_nextest}-{good_sum[:12]}"
+        pinned, other, failing, absent, split, swapped = "pinned", "other", "failing", None, "split", "swapped"
+        tampered, host_own = "tampered", "host-own"
+        cargo_home, tampered_ran = self.root / "cargo-home", self.root / "tampered-ran"
+        cases = [  # tree sent, STUB_FAIL, stdin closed, toolchain, Python gone, nextest -> exit, a record, stdin
+            (tree, "", False, there, False, pinned, 0, True, "valid"),
+            ("0" * 40, "", False, there, False, pinned, 3, False, None),         # another tree checked out: no verdict
+            (tree, "build:101", False, there, False, pinned, 1, True, "valid"),  # a step fails: the tree fails
             # A lint of code only Windows compiles (cfg(windows)) fails the tree there (PR #68:
             # the Windows tier built and tested it, and linted nothing).
-            (tree, "clippy:101", False, there, False, 1, True, "valid"),
-            (tree, "build:75", False, there, False, 75, True, "valid"),  # the PC guard stopped a build: no verdict
-            (tree, "", True, there, False, 0, True, "invalid"),          # no usable stdin (fleet I14): said, steps get /dev/null
+            (tree, "clippy:101", False, there, False, pinned, 1, True, "valid"),
+            (tree, "build:75", False, there, False, pinned, 75, True, "valid"),  # the PC guard stopped a build: no verdict
+            (tree, "", True, there, False, pinned, 0, True, "invalid"),          # no usable stdin (fleet I14): said, steps get /dev/null
             # A host the fleet places it on by `rust` (rustup) without the tree's pinned release: the job
             # installs that release through rustup, and runs.
-            (tree, "", False, missing, False, 0, True, "valid"),
+            (tree, "", False, missing, False, pinned, 0, True, "valid"),
             # The release there without clippy: installed too, never a failed tree.
-            (tree, "", False, no_clippy, False, 0, True, "valid"),
-            (tree, "", False, uninstallable, False, 3, False, None),     # and if it can't be had: no verdict
+            (tree, "", False, no_clippy, False, pinned, 0, True, "valid"),
+            (tree, "", False, uninstallable, False, pinned, 3, False, None),     # and if it can't be had: no verdict
+            # No pinned cargo-nextest, and none can be had: no verdict, never cargo test crate by crate.
+            (tree, "", False, there, False, absent, 3, False, None),
+            # None there, fetched: the archive the tree pins by its sha256 is installed and runs; another
+            # archive, holding a runner of the pinned version all the same, installs nothing: no verdict.
+            (tree, "", False, there, False, good_archive, 0, True, "valid"),
+            (tree, "", False, there, False, bad_archive, 3, False, None),
+            # One of another version, or one whose version command fails: not used, fetched again: no verdict.
+            (tree, "", False, there, False, other, 3, False, None),
+            (tree, "", False, there, False, failing, 3, False, None),
+            # Accepted by the job, then not answering inside the run: no verdict, never cargo test.
+            (tree, "", False, there, False, split, 3, False, None),
+            (tree, "", False, there, False, swapped, 3, False, None),
+            # An entry whose executable isn't the pinned one is never run: made again from the pinned
+            # archive, which runs.
+            (tree, "", False, there, False, tampered, 0, True, "valid"),
+            # A runner of the host's own where cargo looks first: no verdict, before anything is installed
+            # (the toolchain is missing here, and rustup isn't called).
+            (tree, "", False, missing, False, host_own, 3, False, None),
             # The declared Python isn't here and can't be had (the host's own ran the suite): no verdict.
-            (tree, "", False, there, True, 3, False, None),
+            (tree, "", False, there, True, pinned, 3, False, None),
         ]
-        for case, (sent, fail, closed, toolchain, gone, code, recorded, stdin) in enumerate(cases):
+        for case, (sent, fail, closed, toolchain, gone, nextest, code, recorded, stdin) in enumerate(cases):
             out = self.root / f"out-{case}"
             out.mkdir()
             if gone:
                 shutil.rmtree(base.parent)
+            shutil.rmtree(nextest_entry, ignore_errors=True)
+            shutil.rmtree(cargo_home, ignore_errors=True)
+            (cargo_home / "bin").mkdir(parents=True)
+            fetched = nextest if isinstance(nextest, Path) else good_archive if nextest == tampered else None
+            if isinstance(nextest, str):
+                nextest_entry.mkdir(parents=True)
+                body = runner + (f': > "{tampered_ran.as_posix()}"\n' if nextest == tampered else "")
+                (nextest_entry / "cargo-nextest").write_text(body, newline="\n")
+                (nextest_entry / "cargo-nextest").chmod(0o755)
+            if nextest == host_own:
+                (cargo_home / "bin" / "cargo-nextest.exe").write_text(runner, newline="\n")
             proxied, rustup = self.root / f"proxied-{case}", self.root / f"rustup-{case}"
             lacking, rustup_fails = toolchain or ("", "")
             run = ("exec 0<&-; " if closed else "") + 'exec bash "$@"'
@@ -1331,16 +1545,29 @@ class WindowsJob(Repo):
                      "STUB_MISSING": lacking, "STUB_INSTALLED": (self.root / f"installed-{case}").as_posix(),
                      "STUB_NO_TOOLCHAIN": proxied.as_posix(),
                      "STUB_RUSTUP_LOG": rustup.as_posix(), "STUB_RUSTUP_FAIL": rustup_fails,
-                     "NRESE_GATE_CACHE": cache.as_posix(),
+                     "NRESE_GATE_CACHE": cache.as_posix(), "STUB_ARCHIVE": fetched.as_posix() if fetched else "",
+                     "STUB_NEXTEST": nextest if nextest in (other, failing, split, swapped) else "",
+                     "CARGO_HOME": cargo_home.as_posix(),
                      "CARGO_TARGET_DIR": (self.root / "shared-target").as_posix()})  # a host's shared one
             self.assertEqual(done.returncode, code, f"SPEC windows-run: case {case}\n{done.stdout}{done.stderr}")
+            if nextest == tampered:
+                self.assertFalse(tampered_ran.exists(), f"SPEC windows-nextest: a cached runner not the pinned one ran: case {case}")
+            if fetched is bad_archive:
+                self.assertEqual([p.name for p in nextest_entry.parent.glob("nextest-*")], [],
+                                 f"SPEC windows-nextest: an archive other than the pinned one was installed: case {case}")
             self.assertFalse(proxied.exists(), "SPEC windows-toolchain: rustup's proxy installed a toolchain")
             # rustup only to install the tree's pinned release, and only where it is missing: never
             # `default`, `update`, `self update` or `uninstall` (the host's rustup home is shared).
             calls = rustup.read_text().splitlines() if rustup.exists() else []
-            self.assertEqual(calls, [] if toolchain is there else
+            self.assertEqual(calls, [] if toolchain is there or nextest == host_own else
                              ["toolchain install 1.98.1 --no-self-update --profile minimal --component rustfmt,clippy"],
                              f"SPEC windows-toolchain: case {case}")
+            if not recorded and nextest in (split, swapped):
+                ran = (out / "guarded").read_text().splitlines()
+                self.assertFalse((out / "gate.json").exists(), f"SPEC windows-nextest: case {case}")
+                self.assertEqual([c for c in ran if c.split()[0] in ("test", "nextest") and "--doc" not in c.split()],
+                                 [], f"SPEC windows-nextest: tests ran without the pinned nextest: case {case}")
+                continue
             if not recorded:
                 self.assertFalse((out / "gate.json").exists() or (out / "check.log").exists(), f"case {case}")
                 continue
@@ -1361,6 +1588,13 @@ class WindowsJob(Repo):
                               ("suite contracts", 0), ("console dependencies", 0), ("console typecheck", 0),
                               ("console tests", 0)],
                              f"SPEC windows-run: case {case}")
+            ran_tests = [(c.split()[0], "--doc" in c.split()) for c in (out / "guarded").read_text().splitlines()
+                         if c.split()[0] in ("test", "nextest")]
+            self.assertEqual(ran_tests, [("nextest", False), ("test", True)],
+                             f"SPEC windows-nextest: the tests ran under cargo nextest, cargo test only for the doc"
+                             f" tests: case {case}")
+            self.assertEqual(result["nextest"].split()[:2], ["cargo-nextest", pinned_nextest],
+                             f"SPEC windows-nextest: the record names the nextest it ran: case {case}")
             self.assertEqual(result["attempt"], (out / "attempt").read_text().strip())
             self.assertRegex(result["identity"],
                              rf"^rustc-1\.98\.1-abcdef123456 flags=-C_target-cpu=native tools=[0-9a-f]{{12}} {name}$",
