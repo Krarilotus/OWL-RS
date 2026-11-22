@@ -567,8 +567,15 @@ leave something out.
   later commits are checked only for what they introduce. Validate with `GET /dataset/shacl`
   after one.
 - With no shapes stored, a gate set to `enforce` accepts every write. An upload of shapes that
-  fails (one that runs past its timeout, say) stores none, so check its status and read the
-  shapes graph back.
+  fails (one that runs past its timeout, say) stores none. The repository's info says which
+  shapes are in force (`GET /dataset/info`, `shacl`: their number and `vacuous`), and the log
+  warns at the start while a gate that is on checks nothing.
+- The info reports the count for its dataset revision and the revision that last changed
+  the asserted shapes graph. A bulk load or replica batch can publish new shapes before
+  their count is ready. The info then gives `null` for `shapes` and `vacuous`, with the
+  reason in `not_counted`. Cancelling the count leaves the published data in place.
+  A later load, replica batch or restart can retry a count deferred by a stop or the
+  process memory limit. Malformed shapes have a bounded diagnostic in the info.
 - A commit that changes the shapes is checked against the shapes as they are after it: one
   update that removes the shapes and adds data is checked against none. It needs the right to
   write the shapes graph.
@@ -580,8 +587,10 @@ leave something out.
   took 5 ms and 1.7 MB.
 - Under `reasoner.equality = "compact"`, a write of `owl:sameAs` can pass the gate though it
   brings a result ([reasoning](#reasoning)).
-- Shapes that don't compile refuse every write, and a validation stopped by its budget fails
-  the write, with the gate set to `report` as to `enforce`.
+- With the gate set to `report` or `enforce`, a write that leaves an uncompilable shapes graph
+  unchanged is refused (a bulk load can store such shapes; the info's `shacl` then says why
+  they aren't counted). Repair or replace the shapes graph to restore writes. A validation
+  stopped by its budget fails the write in either mode.
 
 ## Memory and stopping
 

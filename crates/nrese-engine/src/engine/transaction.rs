@@ -10,7 +10,7 @@ use parking_lot::MutexGuard;
 mod pending;
 
 pub(super) use self::pending::{Pending, SnapshotChanges};
-use super::{Inner, ReadModel, Snapshot, Version};
+use super::{Inner, ReadModel, Snapshot, Version, VersionData, Watch};
 use crate::durability::codec::CommitRecord;
 use crate::error::EngineResult;
 use crate::index::Layout;
@@ -69,6 +69,7 @@ pub struct Transaction<'e> {
     reading: Option<Option<TermId>>,
     /// What the commit publishes as its certificate ([`Self::vouch`]); `None` by default.
     vouched: Option<super::Certificate>,
+    watched_value: Option<super::Certificate>,
 }
 
 impl<'e> Transaction<'e> {
@@ -82,6 +83,7 @@ impl<'e> Transaction<'e> {
             publication: None,
             reading: None,
             vouched: None,
+            watched_value: None,
         }
     }
 
@@ -90,7 +92,7 @@ impl<'e> Transaction<'e> {
         self._slot.as_ref().map(|_| super::WriterHeld::new())
     }
 
-    /// The stack this commit publishes is read with `same_as` ([`Version::reading`]): its
+    /// The stack this commit publishes is read with `same_as` ([`VersionData::reading`]): its
     /// inferred stack holds the closure over representatives of `same_as` classes, or with
     /// `None` is read as stored. Installed with the commit's changes, in one install; a commit
     /// without changes installs nothing.
@@ -112,6 +114,12 @@ impl<'e> Transaction<'e> {
     /// it maintained; without this it publishes none.
     pub fn vouch(&mut self, certificate: super::Certificate) {
         self.vouched = Some(certificate);
+    }
+
+    /// Prefills the observation carried by this commit if it changes the watched graph.
+    /// The caller's value must describe the graph after this transaction's final changes.
+    pub fn keep_watched(&mut self, value: super::Certificate) {
+        self.watched_value = Some(value);
     }
 
     /// The reading the commit installs: the one given, or the installed version's (the base's,
@@ -242,22 +250,25 @@ impl<'e> Transaction<'e> {
             [&inferred_inserts[..], &inferred_deletes[..]],
             &self.engine.shared.forms,
             budget,
-            |asserted, inferred| Version {
-                content,
-                // Pending: its own, even without asserted changes (staged terms).
-                asserted_content: super::AssertedIdentity::fresh(),
-                asserted,
-                inferred,
-                revision: seen.revision,
-                committed_micros: seen.committed_micros,
-                dictionary_len: self.engine.shared.dictionary.len(),
-                equality,
-                reading: seen.reading,
-                certificate: seen.certificate.clone(),
-                canonical: Default::default(),
-                // Empty, as every new version's: what this pending version's readers keep
-                // (its memo's hits share it, as they share the version).
-                own: Default::default(),
+            |asserted, inferred| {
+                let data = VersionData {
+                    content,
+                    // Pending: its own, even without asserted changes (staged terms).
+                    asserted_content: super::AssertedIdentity::fresh(),
+                    asserted,
+                    inferred,
+                    revision: seen.revision,
+                    committed_micros: seen.committed_micros,
+                    dictionary_len: self.engine.shared.dictionary.len(),
+                    equality,
+                    reading: seen.reading,
+                    certificate: seen.certificate.clone(),
+                    canonical: Default::default(),
+                    // Empty, as every new version's: what this pending version's readers keep
+                    // (its memo's hits share it, as they share the version).
+                    own: Default::default(),
+                };
+                Version::new(Watch::unwatched(), data)
             },
         )?;
         // Recorded once nothing can be refused any more (a refusal records nothing).
@@ -321,21 +332,24 @@ impl<'e> Transaction<'e> {
             [&[][..], &gone[..]],
             &self.engine.shared.forms,
             budget,
-            |asserted, inferred| Version {
-                content,
-                // Pending: its own, even without asserted changes (staged terms).
-                asserted_content: super::AssertedIdentity::fresh(),
-                asserted,
-                inferred,
-                revision: seen.revision,
-                committed_micros: seen.committed_micros,
-                dictionary_len: self.engine.shared.dictionary.len(),
-                equality,
-                reading: seen.reading,
-                certificate: seen.certificate.clone(),
-                canonical: Default::default(),
-                // Empty, as every new version's: what this pending version's readers keep.
-                own: Default::default(),
+            |asserted, inferred| {
+                let data = VersionData {
+                    content,
+                    // Pending: its own, even without asserted changes (staged terms).
+                    asserted_content: super::AssertedIdentity::fresh(),
+                    asserted,
+                    inferred,
+                    revision: seen.revision,
+                    committed_micros: seen.committed_micros,
+                    dictionary_len: self.engine.shared.dictionary.len(),
+                    equality,
+                    reading: seen.reading,
+                    certificate: seen.certificate.clone(),
+                    canonical: Default::default(),
+                    // Empty, as every new version's: what this pending version's readers keep.
+                    own: Default::default(),
+                };
+                Version::new(Watch::unwatched(), data)
             },
         )?;
         if let Some(corpora) = self.engine.shared.statistics.corpora.get() {
@@ -367,7 +381,7 @@ impl<'e> Transaction<'e> {
         } = self.pending.snapshot_changes();
         let base = self.pending.base().version();
         let content = super::Content::fresh();
-        let version = Version {
+        let data = VersionData {
             content,
             // Pending: its own, even without asserted changes (staged terms).
             asserted_content: super::AssertedIdentity::fresh(),
@@ -391,7 +405,9 @@ impl<'e> Transaction<'e> {
             canonical: Default::default(),
             own: Default::default(),
         };
-        self.pending.base().with_version(version)
+        self.pending
+            .base()
+            .with_version(Version::new(Watch::unwatched(), data))
     }
 
     /// [`Self::pending_snapshot`] as a reader of `view` reads it: `view` is a restricted
@@ -409,7 +425,7 @@ impl<'e> Transaction<'e> {
         let asserted_inserts: Vec<EncodedQuad> = asserted.inserts.iter().copied().collect();
         let asserted_deletes: Vec<EncodedQuad> = asserted.deletes.iter().copied().collect();
         let content = super::Content::fresh();
-        let version = Version {
+        let data = VersionData {
             content,
             // Pending: its own, even without asserted changes (staged terms).
             asserted_content: super::AssertedIdentity::fresh(),
@@ -431,7 +447,7 @@ impl<'e> Transaction<'e> {
             canonical: Default::default(),
             own: Default::default(),
         };
-        view.with_version(version)
+        view.with_version(Version::new(Watch::unwatched(), data))
     }
 
     /// Whether the pending changes touch an `owl:sameAs` statement while reads expand
@@ -723,6 +739,7 @@ impl<'e> Transaction<'e> {
             note,
             publication,
             vouched,
+            watched_value,
             ..
         } = self;
         // The pending changes' charge, bound first so it drops last: after the sets are freed,
@@ -785,6 +802,7 @@ impl<'e> Transaction<'e> {
             changes_equality,
             reading,
             vouched,
+            watched_value,
             note,
             publication,
         )? {
@@ -820,6 +838,7 @@ impl Inner {
         changes_equality: bool,
         reading: Option<TermId>,
         certificate: Option<super::Certificate>,
+        watched_value: Option<super::Certificate>,
         note: Option<super::CommitNote<'_>>,
         publication: Option<super::CommitPublication<'_>>,
     ) -> EngineResult<Option<super::AssertedIdentity>> {
@@ -843,7 +862,16 @@ impl Inner {
         // that, in the layout the stack will have (no holder of the compaction slot runs
         // parallel work; only commits, under the writer slot, change the layout).
         let latest = shared.versions.load();
-        let converting = latest.asserted.layout() == Layout::DefaultGraph && record.names_a_graph();
+        let watched_graph = if changes_asserted {
+            shared.watched_id()
+        } else {
+            None
+        };
+        let (converting, changes_watched) = super::watched::record_changes(
+            record,
+            watched_graph,
+            latest.asserted.layout() == Layout::DefaultGraph,
+        );
         let asserted_layout = match converting {
             true => Layout::Quads,
             false => latest.asserted.layout(),
@@ -872,7 +900,12 @@ impl Inner {
             let asserted = converted.as_ref().unwrap_or(&current.asserted);
             let content = super::Content::fresh();
             published_to.set(Some((current.content, content)));
-            Version {
+            let watch = if changes_watched {
+                Watch::renew(watched_value)
+            } else {
+                Watch::Keep(current)
+            };
+            let data = VersionData {
                 content,
                 asserted_content: asserted_identity.unwrap_or(current.asserted_content),
                 asserted: asserted.with_run(asserted_run),
@@ -895,7 +928,8 @@ impl Inner {
                 certificate: certificate.clone(),
                 canonical: Default::default(),
                 own: Default::default(),
-            }
+            };
+            Version::new(watch, data)
         };
         let wal_bytes = match &shared.durable {
             Some(durable) => {

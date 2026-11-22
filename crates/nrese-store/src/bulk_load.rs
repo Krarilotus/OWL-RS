@@ -94,13 +94,14 @@ impl Skipping<'_, '_> {
 }
 
 /// How far a bulk load is, and a way to stop it: shared with whoever watches it (an import
-/// job). Cancelling stops the load before its next file; nothing of it is committed.
+/// job). The loader checks cancellation before each file and before handing the load
+/// to the engine to publish. The same cancellation can stop the SHACL count refresh.
 #[derive(Debug, Default)]
 pub struct LoadProgress {
     files_done: AtomicU64,
     files: AtomicU64,
     parsed: AtomicU64,
-    cancelled: std::sync::atomic::AtomicBool,
+    cancelled: nrese_sparql::CancellationToken,
 }
 
 impl LoadProgress {
@@ -117,13 +118,17 @@ impl LoadProgress {
         self.parsed.load(Ordering::Relaxed)
     }
 
-    /// Asks the load to stop before its next file.
+    /// Asks the load or the SHACL count refresh to stop.
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Relaxed);
+        self.cancelled.cancel();
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Relaxed)
+        self.cancelled.is_cancelled()
+    }
+
+    pub(crate) fn stop(&self) -> nrese_exec::stop::StopSource {
+        nrese_exec::stop::StopSource::new(Some(self.cancelled.flag()), None)
     }
 }
 

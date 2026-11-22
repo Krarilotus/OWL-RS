@@ -451,7 +451,7 @@ impl MutationPipeline {
             } else {
                 None
             };
-            crate::shacl::check_shapes(
+            let shapes = crate::shacl::check_shapes(
                 &tx,
                 &self.store.config().shapes_graph,
                 ticket,
@@ -509,6 +509,9 @@ impl MutationPipeline {
                 }
                 tx.vouch(certificate);
             }
+            if let Some(shapes) = shapes {
+                tx.keep_watched(Arc::new(crate::shacl::ShapesCounted(Ok(shapes))));
+            }
             let committed = match ql {
                 Some(ql) => publishing(ticket, report, tx, |tx| ql.commit(tx)),
                 None => publishing(ticket, report, tx, |tx| tx.commit()),
@@ -522,6 +525,8 @@ impl MutationPipeline {
                 source: StoreError::Engine(error),
             })?;
             drop(rights);
+            #[cfg(test)]
+            crate::service::hooks::run(&crate::service::hooks::AFTER_WRITE_PUBLICATION);
             if let Some(touched) = touched {
                 supports.note_commit(before, summary.revision, touched);
             }
@@ -566,7 +571,7 @@ impl MutationPipeline {
         self.store
             .invalidate_held(tx.writer().expect("a transaction holds the writer slot"))
             .map_err(store_error)?;
-        crate::shacl::check_shapes(
+        let shapes = crate::shacl::check_shapes(
             &tx,
             &self.store.config().shapes_graph,
             ticket,
@@ -587,6 +592,9 @@ impl MutationPipeline {
             return Err(MutationError::Cancelled);
         }
         let rights = ticket.hold_rights()?;
+        if let Some(shapes) = shapes {
+            tx.keep_watched(Arc::new(crate::shacl::ShapesCounted(Ok(shapes))));
+        }
         let (_, report) = publishing(ticket, report, tx, |tx| tx.commit()).map_err(|error| {
             MutationError::Store {
                 kind,
@@ -594,6 +602,8 @@ impl MutationPipeline {
             }
         })?;
         drop(rights);
+        #[cfg(test)]
+        crate::service::hooks::run(&crate::service::hooks::AFTER_WRITE_PUBLICATION);
         Ok(report)
     }
 

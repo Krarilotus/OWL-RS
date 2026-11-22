@@ -80,6 +80,11 @@ impl StopSource {
         Self::default()
     }
 
+    /// The shared cancellation flag, if this source has one.
+    pub fn flag(&self) -> Option<Arc<AtomicBool>> {
+        self.flag.clone()
+    }
+
     /// A ticker for one loop or task, after checking at once.
     pub fn ticker(&self) -> Result<Ticker, Stop> {
         Ticker::new(self.clone())
