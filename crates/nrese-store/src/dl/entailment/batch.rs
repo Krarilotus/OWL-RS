@@ -183,7 +183,7 @@ impl Batch {
             &config,
             Want::default(),
         );
-        let answer = match outcome.answer {
+        match outcome.answer {
             tableau::Answer::Inconsistent => Entailed::Yes,
             tableau::Answer::Consistent => match &self.left_out {
                 Some(why) => Entailed::Unknown(why.clone()),
@@ -193,8 +193,7 @@ impl Batch {
             // (its Horn stage, for one): slower, but it keeps every answer the store had.
             tableau::Answer::Unsupported(_) => scalar(),
             tableau::Answer::GaveUp(why) => Entailed::Unknown(format!("gave up: {why}")),
-        };
-        super::by(deadline, answer)
+        }
     }
 }
 

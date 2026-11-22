@@ -328,8 +328,7 @@ pub fn entails(premise: &Ontology, axiom: &Axiom, fresh: &[u64], budget: &Budget
     )
 }
 
-/// [`entails`] before `deadline`: each test within what is left of it, and no definite
-/// answer past it.
+/// [`entails`], each test within what is left of `deadline` when it starts.
 pub(crate) fn entails_within(
     premise: &Ontology,
     axiom: &Axiom,
@@ -372,7 +371,7 @@ pub(crate) fn entails_within(
             break;
         }
     }
-    by(deadline, answer)
+    answer
 }
 
 /// Whether `premise` (consistent) entails that some individual is an instance of
@@ -381,7 +380,7 @@ pub fn nonempty(premise: &Ontology, class: ExprId, budget: &Budget) -> Entailed 
     nonempty_within(premise, class, budget, Deadline::after(budget.timeout))
 }
 
-/// [`nonempty`] within what is left of `deadline`, and no definite answer past it.
+/// [`nonempty`] within what is left of `deadline`.
 pub(crate) fn nonempty_within(
     premise: &Ontology,
     class: ExprId,
@@ -395,21 +394,10 @@ pub(crate) fn nonempty_within(
     let nothing = intern(&mut o, ClassExpr::Nothing);
     o.axioms.push(Axiom::SubClassOf(class, nothing));
     o.sources.push(Vec::new());
-    let answer = match consistency::check(&o, &budget.remaining(deadline)).verdict {
+    match consistency::check(&o, &budget.remaining(deadline)).verdict {
         Verdict::Inconsistent => Entailed::Yes,
         Verdict::Consistent => Entailed::No,
         Verdict::Unknown(why) => Entailed::Unknown(why),
-    };
-    by(deadline, answer)
-}
-
-/// `answer`, unless `deadline` has passed: then no definite one.
-pub(crate) fn by(deadline: Deadline, answer: Entailed) -> Entailed {
-    match answer {
-        Entailed::Yes | Entailed::No if deadline.passed() => {
-            Entailed::Unknown(nrese_dl::limits::Limit::Time.reached("the deadline passed"))
-        }
-        answer => answer,
     }
 }
 
@@ -436,7 +424,7 @@ pub fn entails_ontology(
 }
 
 /// [`entails_ontology`], each test within what is left of `deadline` (a caller's, that
-/// began before this check), and no definite answer past it.
+/// began before this check).
 pub(crate) fn entails_ontology_within(
     premise: &Ontology,
     conclusion: &Ontology,
@@ -473,5 +461,5 @@ pub(crate) fn entails_ontology_within(
             "not entailed for one value of the conclusion's anonymous individual".into(),
         );
     }
-    by(deadline, answer)
+    answer
 }
