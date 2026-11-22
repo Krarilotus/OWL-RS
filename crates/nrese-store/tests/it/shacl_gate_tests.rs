@@ -403,13 +403,30 @@ fn a_validation_past_the_writes_memory_fails_the_write_under_any_gate() {
 /// results omitted if their refusal text cannot fit alongside it.
 #[test]
 fn the_refusal_omits_results_that_would_exceed_the_writes_memory() {
+    let rejected = refuse_with_message(&"x".repeat(96 * 1024));
+    let refusal = rejected.shacl.as_ref().expect("SHACL refusal report");
+    assert_eq!((refusal.results.len(), refusal.results_omitted), (0, 1));
+    assert!(rejected.explanation.is_none());
+}
+
+/// Spec: results whose refusal text fits the write's memory
+/// alongside the report are listed whole.
+#[test]
+fn the_refusal_lists_results_that_fit_the_writes_memory() {
+    let message = "x".repeat(24 * 1024);
+    let rejected = refuse_with_message(&message);
+    let refusal = rejected.shacl.as_ref().expect("SHACL refusal report");
+    assert_eq!((refusal.results.len(), refusal.results_omitted), (1, 0));
+    assert_eq!(refusal.results[0].messages, [message]);
+}
+
+fn refuse_with_message(message: &str) -> Box<MutationReject> {
     let pipeline = pipeline_with(StoreConfig {
         shacl_gate: ShaclGate::Enforce(GateSeverity::Violation),
         shacl_reject_results: None,
         total_query_memory_bytes: 256 * 1024,
         ..StoreConfig::in_memory()
     });
-    let message = "x".repeat(96 * 1024);
     load_shapes(
         &pipeline,
         &format!(
@@ -419,10 +436,7 @@ fn the_refusal_omits_results_that_would_exceed_the_writes_memory() {
              <http://example.com/RequiresName> <http://www.w3.org/ns/shacl#message> \"{message}\" ."
         ),
     );
-    let rejected = refuse(&pipeline, "INSERT DATA { ex:ada a ex:Person }");
-    let refusal = rejected.shacl.as_ref().expect("SHACL refusal report");
-    assert_eq!((refusal.results.len(), refusal.results_omitted), (0, 1));
-    assert!(rejected.explanation.is_none());
+    refuse(&pipeline, "INSERT DATA { ex:ada a ex:Person }")
 }
 
 /// Loads `ntriples` into the shapes graph without passing the gate (a bulk load doesn't).

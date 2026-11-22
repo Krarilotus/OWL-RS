@@ -8,11 +8,11 @@
 
 use std::cmp::Ordering;
 use std::fmt::{self, Write as _};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use nrese_engine::{EncodedQuad, GraphSelector, ReadModel, Snapshot, TermId, Transaction};
 use nrese_exec::stop::StopSource;
-use nrese_exec::{Budget, ChargedVec, Envelope, Reservation};
+use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Envelope, Reservation};
 use nrese_rdf::{GraphName, NamedNode, NamedNodeRef, Term};
 use nrese_shacl::{
     PropertyPath, Selection, ShapeError, Shapes, ValidationReport, ValidationResult, compile,
@@ -140,14 +140,34 @@ pub struct ShaclRefusal {
     /// Validation failures left out by the count or memory limit.
     pub failures_omitted: usize,
     memory: Arc<Budget>,
+    encoding_floor: usize,
     // Drop the text and vectors before giving their space back.
-    _held: (Reservation, Reservation, Reservation),
+    text: Mutex<Reservation>,
+    _slots: (Reservation, Reservation),
 }
 
 impl ShaclRefusal {
     /// The write's budget for preparing and encoding this refusal.
     pub fn memory(&self) -> &Arc<Budget> {
         &self.memory
+    }
+
+    /// Holds the encoded buffer alongside the refusal, after mapping the explanation.
+    /// Reuse the part of the text reservation that covered temporaries, keeping the
+    /// live texts covered until drop.
+    pub fn reserve_encoding(&self, bytes: usize) -> Result<Reservation, BudgetExceeded> {
+        let mut text = self.text.lock().expect("refusal text reservation");
+        let reusable = bytes.min(text.bytes().saturating_sub(self.encoding_floor));
+        let mut encoded = Reservation::new(Arc::clone(&self.memory));
+        encoded.charge(bytes - reusable)?;
+        if reusable > 0 {
+            // Keep both portions charged to the same write throughout the transfer.
+            let held = std::mem::replace(&mut *text, Reservation::new(Arc::clone(&self.memory)));
+            let remaining = held.transfer() - reusable;
+            *text = Reservation::adopt(Arc::clone(&self.memory), remaining);
+            encoded.absorb(Reservation::adopt(Arc::clone(&self.memory), reusable));
+        }
+        Ok(encoded)
     }
 }
 
@@ -173,6 +193,17 @@ impl ShaclResultText {
                 .map(|message| message.value().to_owned())
                 .collect(),
         }
+    }
+
+    fn heap_bytes(&self) -> usize {
+        self.focus_node.capacity()
+            + self.path.as_ref().map_or(0, String::capacity)
+            + self.value.as_ref().map_or(0, String::capacity)
+            + self.source_shape.capacity()
+            + self.component.capacity()
+            + self.severity.capacity()
+            + self.messages.capacity() * size_of::<String>()
+            + self.messages.iter().map(String::capacity).sum::<usize>()
     }
 }
 
@@ -503,7 +534,8 @@ fn first_result_bytes(result: &ValidationResult, detail: &str) -> usize {
         .saturating_add(description);
     // First, the temporary description and its sorted message strings. Then the
     // detail, framing for a restricted committer, and the two explanation summaries
-    // that can overlap while the server maps the error.
+    // that can overlap in nrese-server's reject_view::reject_view, which clones the
+    // summary, focus and constraint before the store's explanation drops.
     let describe = growing_text_bytes(description)
         .saturating_add(message_text)
         .saturating_add(detail.len());
@@ -524,6 +556,7 @@ pub(crate) fn refusal(
     rejects: impl Fn(&ValidationResult) -> bool,
     bound: Option<usize>,
     memory: &Envelope,
+    restricted: bool,
     running: impl Fn() -> bool,
 ) -> Option<Draft> {
     let memory = Arc::new(memory.optional_part());
@@ -541,6 +574,7 @@ pub(crate) fn refusal(
     }
     let mut text = Reservation::new(Arc::clone(&memory));
     let mut results = ChargedVec::new(Arc::clone(&memory));
+    let mut live_text_bytes = 0;
     let mut explanation = None;
     for result in report.results.iter_mut().take_while(|_| running()) {
         sort_messages(result);
@@ -564,8 +598,10 @@ pub(crate) fn refusal(
                 evidence: Vec::new(),
             });
         }
+        let result = ShaclResultText::of(result);
+        live_text_bytes += result.heap_bytes();
         results
-            .push_within(ShaclResultText::of(result))
+            .push_within(result)
             .expect("the result's slot was reserved");
     }
     order_prefix(&mut report.failures, bound, Ord::cmp);
@@ -576,16 +612,33 @@ pub(crate) fn refusal(
         .take(bound)
         .take_while(|_| running())
     {
-        if failures.reserve(1).is_err() || text.charge(failure.capacity()).is_err() {
+        let bytes = failure.capacity();
+        if failures.reserve(1).is_err() || text.charge(bytes).is_err() {
             break;
         }
+        live_text_bytes += bytes;
         failures
             .push_within(failure)
             .expect("the failure's slot was reserved");
     }
+    if !running() {
+        return None;
+    }
     let (results, result_slots) = results.into_parts();
     let (failures, failure_slots) = failures.into_parts();
-    running().then_some(Draft {
+    if restricted {
+        detail = in_readable_graphs(&detail);
+    }
+    // By encoding time the server holds one copy of the explanation strings. The
+    // result and failure vector slots have their own reservations.
+    let encoding_floor = live_text_bytes
+        + detail.capacity()
+        + explanation.as_ref().map_or(0, |explanation| {
+            explanation.summary.len()
+                + explanation.violated_constraint.len()
+                + explanation.focus_resource.len()
+        });
+    Some(Draft {
         kind: crate::RejectKind::ShapesViolated,
         detail,
         explanation,
@@ -596,7 +649,9 @@ pub(crate) fn refusal(
             results,
             failures,
             memory,
-            _held: (text, result_slots, failure_slots),
+            encoding_floor,
+            text: Mutex::new(text),
+            _slots: (result_slots, failure_slots),
         })),
     })
 }
@@ -668,11 +723,9 @@ pub(crate) fn view_reason(
         resources,
     )
     .ok()??;
-    let mut draft = refusal(report, rejects, bound, &resources.memory, || {
+    refusal(report, rejects, bound, &resources.memory, true, || {
         resources.check().is_ok()
-    })?;
-    draft.detail = in_readable_graphs(&draft.detail);
-    Some(draft)
+    })
 }
 
 /// The SHACL commit gate's state: its policy, and the shapes it checks commits against (the

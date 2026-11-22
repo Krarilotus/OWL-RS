@@ -659,6 +659,7 @@ impl MutationPipeline {
                     rejects,
                     self.store.config().shacl_reject_results,
                     &resources.memory,
+                    false,
                     || true,
                 )
                 .expect("the gate rejected a result or a validation failure")

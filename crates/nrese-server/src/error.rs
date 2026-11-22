@@ -6,7 +6,7 @@ use axum::Json;
 use axum::body::Bytes;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use nrese_exec::{BudgetExceeded, ChargedVec};
+use nrese_exec::Reservation;
 use serde::Serialize;
 use thiserror::Error;
 
@@ -174,7 +174,7 @@ impl IntoResponse for ApiError {
                 shacl: shacl.as_deref().map(crate::http::refusal_json),
             };
             return match shacl.as_deref() {
-                Some(refusal) => shacl_problem(&body, refusal),
+                Some(refusal) => shacl_problem(body, refusal),
                 None => problem(StatusCode::BAD_REQUEST, &body),
             };
         }
@@ -369,37 +369,39 @@ fn problem_media(mut response: Response) -> Response {
     response
 }
 
-/// The first serialization borrows the refusal's strings, with the store's charge
-/// live. The encoded bytes carry their own charge while they are held by the response.
-fn shacl_problem(body: &ProblemJson<'_>, refusal: &ShaclRefusal) -> Response {
-    let mut encoded = ChargedJson {
-        bytes: ChargedVec::new(Arc::clone(refusal.memory())),
-        refused: None,
-    };
-    if let Err(error) = serde_json::to_writer(&mut encoded, body) {
-        let refused = encoded.refused.take();
-        drop(encoded);
-        let error = match refused {
-            Some(error) if error.unread => ApiError::unavailable(format!(
-                "{error} (budgets.total_query_memory, NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES)"
-            )),
-            Some(error) if error.shared => ApiError::unavailable(
-                "the server's query memory is in use (budgets.total_query_memory, NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES)",
-            ),
-            Some(error) => ApiError::payload_too_large(format!(
-                "{error} (budgets.query_memory, NRESE_MAX_QUERY_MEMORY_BYTES)"
-            )),
-            None => ApiError::internal(error.to_string()),
-        };
-        return error.into_response();
+/// Size the escaped JSON before allocating, reusing the refusal's reservation.
+/// Even if a top-up is refused, counts alone can report the gate's verdict.
+fn shacl_problem(mut body: ProblemJson<'_>, refusal: &ShaclRefusal) -> Response {
+    if let Some(response) = charged_shacl_problem(&body, refusal) {
+        return response;
     }
-    let bytes = Bytes::from_owner(encoded);
-    problem_media((StatusCode::BAD_REQUEST, bytes).into_response())
+    if body.reasoner_reject.take().is_some() {
+        body.detail = "the commit was rejected by the SHACL gate".to_owned();
+    }
+    body.shacl = Some(crate::http::refusal_counts_json(refusal));
+    charged_shacl_problem(&body, refusal).unwrap_or_else(|| {
+        // If even the count-only response has no room, it is a bounded problem
+        // document: no result text, only the fixed fields and two integer counts.
+        problem(StatusCode::BAD_REQUEST, &body)
+    })
+}
+
+fn charged_shacl_problem(body: &ProblemJson<'_>, refusal: &ShaclRefusal) -> Option<Response> {
+    let mut length = JsonLength(0);
+    serde_json::to_writer(&mut length, body).ok()?;
+    let held = refusal.reserve_encoding(length.0).ok()?;
+    let mut bytes = Vec::with_capacity(length.0);
+    serde_json::to_writer(&mut bytes, body).ok()?;
+    debug_assert_eq!(bytes.len(), length.0);
+    let bytes = Bytes::from_owner(ChargedJson { bytes, _held: held });
+    Some(problem_media(
+        (StatusCode::BAD_REQUEST, bytes).into_response(),
+    ))
 }
 
 struct ChargedJson {
-    bytes: ChargedVec<u8>,
-    refused: Option<BudgetExceeded>,
+    bytes: Vec<u8>,
+    _held: Reservation,
 }
 
 impl AsRef<[u8]> for ChargedJson {
@@ -408,12 +410,15 @@ impl AsRef<[u8]> for ChargedJson {
     }
 }
 
-impl io::Write for ChargedJson {
+struct JsonLength(usize);
+
+impl io::Write for JsonLength {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if let Err(error) = self.bytes.extend_from_slice(bytes) {
-            self.refused = Some(error);
-            return Err(io::Error::other("problem document memory"));
-        }
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .filter(|&length| length <= isize::MAX as usize)
+            .ok_or_else(|| io::Error::other("SHACL problem document too large"))?;
         Ok(bytes.len())
     }
 

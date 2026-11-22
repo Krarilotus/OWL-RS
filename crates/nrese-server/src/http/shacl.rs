@@ -207,6 +207,15 @@ pub(crate) fn refusal_json(refusal: &ShaclRefusal) -> RefusalJson<'_> {
     }
 }
 
+pub(crate) fn refusal_counts_json(refusal: &ShaclRefusal) -> RefusalJson<'static> {
+    RefusalJson {
+        results: ResultsJson(&[]),
+        results_omitted: refusal.results_omitted + refusal.results.len(),
+        failures: &[],
+        failures_omitted: refusal.failures_omitted + refusal.failures.len(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nrese_store::{ReadModel, ShapesSource, ValidatedGraphs};

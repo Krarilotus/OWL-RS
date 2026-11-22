@@ -588,8 +588,9 @@ count. Their order follows the RDF terms, and failure strings are ordered by tex
 empty `evidence`. It is `null` when no result is listed. The
 [`shacl.reject_results`](config-reference.md#shacl.reject_results) setting limits each of the
 two lists. The write's memory budget can shorten them further, including at `unlimited`.
-Add each list's omitted count to its length to get its total. If encoding the refusal
-exceeds the memory budget, the write answers with the applicable memory error.
+Add each list's omitted count to its length to get its total. If encoding the lists would
+exceed the write's memory budget, the response still says `shacl-reject` and gives just the
+counts, with both lists empty.
 
 A committer with limited graph access gets a report from validation of its own readable
 assertions. If it cannot read the shapes graph, or those shapes use SHACL-SPARQL, a
