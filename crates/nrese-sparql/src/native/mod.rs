@@ -2009,23 +2009,20 @@ impl<'a> Context<'a> {
                 shared: true,
                 unread: true,
                 rows: None,
-                retry: false,
             })
             .into();
         };
-        let shared = self.budget.bounded_by_shared();
         QueryEvaluationError::MemoryLimit(BudgetExceeded {
             limit: self.budget.used().saturating_add(room),
             requested,
             used: self.budget.used(),
-            shared,
+            shared: self.budget.bounded_by_shared(),
             unread: false,
             rows: Some(nrese_exec::RowsPast {
                 rows,
                 width,
                 room: max_rows,
             }),
-            retry: shared && self.budget.may_pass_later(requested),
         })
         .into()
     }

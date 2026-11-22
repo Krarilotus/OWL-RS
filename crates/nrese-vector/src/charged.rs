@@ -119,6 +119,5 @@ pub(crate) fn bytes<T>(budget: &Budget, n: usize) -> Result<usize, BudgetExceede
         shared: false,
         unread: false,
         rows: None,
-        retry: false,
     })
 }

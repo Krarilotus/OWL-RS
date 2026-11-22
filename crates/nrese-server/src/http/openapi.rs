@@ -334,9 +334,8 @@ const QUERY_501: &str = "`inference-scope=dataset` where this server can't serve
 const SCOPE: &str = "`dataset`: the inferred statements are those that follow from the \
     dataset's graphs alone (`FROM` and `FROM NAMED`, or `default-graph-uri` and \
     `named-graph-uri`), without the store's default graph; answers are `not-certified`";
-const UNAVAILABLE: &str = "Not ready or unavailable, or no room in \
-    `budgets.total_query_memory` (send it again after `Retry-After`, where that is sent). A \
-    reader of some graphs whose view of the inferred statements has no room, by \
+const UNAVAILABLE: &str = "Not ready or unavailable, or `budgets.total_query_memory` taken; \
+    try again. A reader of some graphs whose view of the inferred statements has no room, by \
     either budget, is told only that the server's query memory is in use, with no limit";
 const AFTER_BODY: &str = "With a SPARQL body; a form carries it in the body instead";
 protocol!(query_get, get, path = "/api/v1/repositories/{id}/query", tag = "sparql",

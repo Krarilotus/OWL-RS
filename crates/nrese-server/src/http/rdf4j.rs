@@ -1000,7 +1000,6 @@ mod tests {
             shared: true,
             unread: true,
             rows: None,
-            retry: false,
         });
         let status = |error| {
             super::configuration_error(&policy, error)

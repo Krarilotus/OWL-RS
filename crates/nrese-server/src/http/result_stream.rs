@@ -426,8 +426,7 @@ async fn hold(
         // limit while the hold held part of the answer, it was refused for holding it, as a
         // refusal of the hold's own charge would be. What was held counts as it was at the
         // refusal itself, recorded with it, not as frames queued before it and taken since
-        // leave it. Refused by the memory all queries share, its 503 is the producer's:
-        // whether it may be retried was decided at the refusal.
+        // leave it. Refused by the memory all queries share, its 503 is the producer's.
         let beside = held
             .envelope
             .held_at_refusal()
@@ -441,17 +440,17 @@ async fn hold(
 }
 
 /// The refusal of an answer held whole past `bound`, its envelope's limit; or, where the
-/// memory all queries share has no room for it, a 503, told to retry where the request alone
-/// fits that memory and others held part of it ([`BudgetExceeded::retry`]); or, where the
-/// process's memory couldn't be read, a 503 without a hint.
+/// memory all queries share has no room for it, a 503 that names that memory and no amounts:
+/// what it holds is other requests' work too, which its reader may not see. Where the
+/// process's memory couldn't be read, a 503 that says so. No memory refusal is told when to
+/// try again (no `Retry-After`).
 fn too_large(refused: BudgetExceeded, bound: usize) -> ApiError {
-    let shared =
-        || format!("{refused} (budgets.total_query_memory, NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES)");
-    if refused.unread || (refused.shared && !refused.retry) {
-        return ApiError::unavailable(shared());
+    const SHARED: &str = "(budgets.total_query_memory, NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES)";
+    if refused.unread {
+        return ApiError::unavailable(format!("{refused} {SHARED}"));
     }
     if refused.shared {
-        return ApiError::busy(shared());
+        return ApiError::unavailable(format!("the server's query memory is in use {SHARED}"));
     }
     too_large_for_http10(bound)
 }
@@ -1094,9 +1093,7 @@ mod tests {
     /// the 413 of an answer too large for HTTP/1.0, which tells the client to stream it, not
     /// the query's own, which tells it to raise the query's memory (over HTTP/1.1 the same
     /// query in the same envelope would be answered). Where the memory all queries share
-    /// refused it, its 503 is the producer's as it is: whether it may be retried was decided
-    /// at the refusal, from what the request held then (here: its work and answer don't fit
-    /// the shared 1 MiB, so no `Retry-After`).
+    /// refused it, its 503 is the producer's as it is, without `Retry-After`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_producers_work_refused_beside_its_held_answer_is_the_answers_refusal() {
         let own = refused_beside_its_held_answer(
@@ -1126,9 +1123,9 @@ mod tests {
         assert_eq!(shared.headers().get(header::RETRY_AFTER), None);
     }
 
-    /// Over HTTP/1.0, an answer the memory all queries share has no room to hold, though no
-    /// other request holds any of it (a frame past that memory's whole limit), gets 503
-    /// without `Retry-After`: sent again, it would be refused again.
+    /// Over HTTP/1.0, an answer the memory all queries share has no room to hold (a frame past
+    /// that memory's whole limit) gets 503 without `Retry-After`, as every memory refusal
+    /// does.
     #[tokio::test]
     async fn a_held_answer_past_the_whole_shared_memory_is_not_told_to_retry() {
         let shared = nrese_exec::SharedBudget::new(CHUNK_BYTES / 2);

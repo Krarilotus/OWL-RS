@@ -296,7 +296,7 @@ pub(crate) fn map_query_error(policy: &PolicyConfig, error: StoreError) -> ApiEr
                 "the query was stopped: it exceeded the policy timeout, or an operator cancelled it",
             )
         }
-        // The memory all queries share has no room for this one.
+        // Other queries hold the memory this one asked for: it may succeed later.
         error if error.is_server_memory_limit() => server_memory_in_use(error),
         // The query needs more memory than the policy allows: the client's to change.
         error if error.is_memory_limit() => ApiError::payload_too_large(format!(
@@ -316,17 +316,11 @@ pub(crate) fn map_query_error(policy: &PolicyConfig, error: StoreError) -> ApiEr
     }
 }
 
-/// The 503 of a read refused for the memory all queries share, told when to try again
-/// (`Retry-After: 1`) only where that can help: what it held and asked for fits that memory
-/// alone, and other requests held part of it ([`StoreError::may_pass_later`]).
+/// The 503 of a read refused for the memory all queries share: it may succeed later.
 fn server_memory_in_use(error: StoreError) -> ApiError {
-    let retry = error.may_pass_later();
-    let detail =
-        format!("{error} (budgets.total_query_memory, NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES)");
-    match retry {
-        true => ApiError::busy(detail),
-        false => ApiError::unavailable(detail),
-    }
+    ApiError::unavailable(format!(
+        "{error} (budgets.total_query_memory, NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES)"
+    ))
 }
 
 /// A store error of a read (query, RDF4J, Graph Store), `otherwise` unless it is a refusal
@@ -421,9 +415,9 @@ mod tests {
     use crate::error::ApiError;
     use crate::policy::PolicyConfig;
 
-    /// A reader of some graphs refused for the memory all queries share is told the class
-    /// only: whether its own need could fit is hidden with the amounts, so it is never told
-    /// to retry (503, no `Retry-After`), whether it queried or read a graph.
+    /// A reader of some graphs refused for the memory all queries share, told the class only,
+    /// gets 503 without `Retry-After`, as every memory refusal does, whether it queried or
+    /// read a graph.
     #[test]
     fn a_readers_refusal_told_the_class_only_is_not_told_to_retry() {
         let class = |limit| StoreError::MemoryLimitWithoutAmounts {
