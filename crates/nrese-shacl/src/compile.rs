@@ -4,7 +4,7 @@
 //! types, and from there through every shape-valued parameter. An ill-formed shape is an
 //! error naming the shape and the parameter: nothing is validated with half a shape.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::str::FromStr;
 
 use nrese_engine::{GraphSelector, TermId, TermKind};
@@ -60,7 +60,9 @@ pub fn compile<V: ReadView>(view: &V, shapes_graph: Selection) -> Result<Shapes,
         graph,
         shapes: Vec::new(),
         index: HashMap::new(),
-        errors: Vec::new(),
+        numbering: Vec::new(),
+        reference_count: 0,
+        pending_errors: VecDeque::new(),
         components: Vec::new(),
     };
     compiler.components = compiler.discover_components();
@@ -78,15 +80,13 @@ pub fn compile<V: ReadView>(view: &V, shapes_graph: Selection) -> Result<Shapes,
     for class in ["NodeShape", "PropertyShape"] {
         roots.extend(compiler.instances(&format!("{SH}{class}")));
     }
-    for root in roots {
-        compiler.shape(root);
-    }
+    let errors = compiler.compile_shapes(roots);
     // Any triple with `sh:entailment` in the shapes graph, whatever its subject (SHACL §1.5).
     let entailments = compiler
         .sh("entailment")
         .map(|predicate| compiler.graph.objects_of(predicate))
         .unwrap_or_default();
-    if compiler.errors.is_empty() {
+    if errors.is_empty() {
         Ok(Shapes {
             shapes: compiler.shapes,
             index: compiler.index,
@@ -97,7 +97,7 @@ pub fn compile<V: ReadView>(view: &V, shapes_graph: Selection) -> Result<Shapes,
             entailments,
         })
     } else {
-        Err(compiler.errors)
+        Err(errors)
     }
 }
 
@@ -109,9 +109,54 @@ struct Compiler<'a, V: ReadView> {
     rdf_nil: Option<TermId>,
     shapes: Vec<Shape>,
     index: HashMap<TermId, ShapeRef>,
-    errors: Vec<ShapeError>,
+    // The depth-first number of each interned slot, or None while it is pending.
+    numbering: Vec<Option<ShapeRef>>,
+    // Each error remembers how many references preceded it in the shape being filled.
+    reference_count: usize,
+    pending_errors: VecDeque<(usize, ShapeError)>,
     /// The shapes graph's SPARQL-based constraint components.
     components: Vec<ComponentDef>,
+}
+
+/// Where the depth-first walk stopped in a compiled shape's constraints.
+struct ShapeFrame {
+    shape: ShapeRef,
+    constraint: usize,
+    member: usize,
+    references_seen: usize,
+    errors: VecDeque<(usize, ShapeError)>,
+}
+
+impl ShapeFrame {
+    fn next_reference<'a>(&mut self, shape: &'a mut Shape) -> Option<&'a mut ShapeRef> {
+        for constraint in &mut shape.constraints[self.constraint..] {
+            let reference = match constraint {
+                Constraint::Not(shape) | Constraint::Node(shape) | Constraint::Property(shape) => {
+                    std::slice::from_mut(shape).get_mut(self.member)
+                }
+                Constraint::Logical(_, shapes) => shapes.get_mut(self.member),
+                Constraint::Qualified {
+                    shape, siblings, ..
+                } => {
+                    // The compiler encounters disjoint siblings before the value shape.
+                    if self.member == siblings.len() {
+                        Some(shape)
+                    } else {
+                        siblings.get_mut(self.member)
+                    }
+                }
+                _ => None,
+            };
+            if let Some(reference) = reference {
+                self.member += 1;
+                self.references_seen += 1;
+                return Some(reference);
+            }
+            self.constraint += 1;
+            self.member = 0;
+        }
+        None
+    }
 }
 
 impl<V: ReadView> Compiler<'_, V> {
@@ -148,10 +193,11 @@ impl<V: ReadView> Compiler<'_, V> {
     }
 
     fn error(&mut self, shape: TermId, message: impl Into<String>) {
-        self.errors.push(ShapeError {
+        let error = ShapeError {
             shape: self.text(shape),
             message: message.into(),
-        });
+        };
+        self.pending_errors.push_back((self.reference_count, error));
     }
 
     /// The single value of `local`, if any; more than one is an error.
@@ -269,7 +315,7 @@ impl<V: ReadView> Compiler<'_, V> {
         match self.list(head) {
             Ok(members) => members
                 .into_iter()
-                .map(|member| self.shape(member))
+                .map(|member| self.reference(member))
                 .collect(),
             Err(problem) => {
                 self.error(node, format!("sh:{local} {problem}"));
@@ -278,13 +324,14 @@ impl<V: ReadView> Compiler<'_, V> {
         }
     }
 
-    /// Compiles `node` as a shape (once), and the shapes it refers to.
+    /// Interns `node` and leaves its new slot pending for the walk.
     fn shape(&mut self, node: TermId) -> ShapeRef {
         if let Some(&shape) = self.index.get(&node) {
             return shape;
         }
         let shape = self.shapes.len();
         self.index.insert(node, shape);
+        self.numbering.push(None);
         // The slot exists before the shape's references are followed: shapes may refer
         // to each other, and to themselves.
         self.shapes.push(Shape {
@@ -296,6 +343,80 @@ impl<V: ReadView> Compiler<'_, V> {
             messages: Vec::new(),
             deactivated: false,
         });
+        shape
+    }
+
+    fn reference(&mut self, node: TermId) -> ShapeRef {
+        self.reference_count += 1;
+        self.shape(node)
+    }
+
+    fn compile_shapes(&mut self, roots: BTreeSet<TermId>) -> Vec<ShapeError> {
+        // Component discovery's errors precede the walk.
+        let mut errors: Vec<_> = self
+            .pending_errors
+            .drain(..)
+            .map(|(_, error)| error)
+            .collect();
+        // References start as interned slots. Visit them one at a time so a child can
+        // reach a pending sibling before the parent does, then replace each with its number.
+        let mut stack = Vec::new();
+        let mut next = 0;
+        for root in roots {
+            let root = self.shape(root);
+            if self.numbering[root].is_some() {
+                continue;
+            }
+            stack.push(self.fill_shape(root, &mut next));
+            while let Some(frame) = stack.last_mut() {
+                // Resume the parent's diagnostics at the same point as its references.
+                let references_seen = frame.references_seen;
+                while let Some((_, error)) = frame
+                    .errors
+                    .pop_front_if(|(after, _)| *after == references_seen)
+                {
+                    errors.push(error);
+                }
+                let shape = &mut self.shapes[frame.shape];
+                let Some(reference) = frame.next_reference(shape) else {
+                    debug_assert!(frame.errors.is_empty());
+                    stack.pop();
+                    continue;
+                };
+                let child = *reference;
+                if let Some(number) = self.numbering[child] {
+                    *reference = number;
+                } else {
+                    *reference = next;
+                    stack.push(self.fill_shape(child, &mut next));
+                }
+            }
+        }
+        if errors.is_empty() {
+            self.reorder_shapes();
+        }
+        errors
+    }
+
+    /// Puts the interned slots into the depth-first order used by their references.
+    fn reorder_shapes(&mut self) {
+        for shape in self.index.values_mut() {
+            *shape = self.numbering[*shape].expect("every interned shape was visited");
+        }
+        for shape in 0..self.shapes.len() {
+            while let Some(position) = self.numbering[shape].filter(|&position| position != shape) {
+                self.shapes.swap(shape, position);
+                self.numbering.swap(shape, position);
+            }
+        }
+    }
+
+    fn fill_shape(&mut self, shape: ShapeRef, next: &mut ShapeRef) -> ShapeFrame {
+        // Number the shape before its descendants, including when an edge closes a cycle.
+        self.numbering[shape] = Some(*next);
+        *next += 1;
+        self.reference_count = 0;
+        let node = self.shapes[shape].node;
 
         let path = self.one(node, "path").and_then(|path| {
             self.path(path, 0)
@@ -324,7 +445,13 @@ impl<V: ReadView> Compiler<'_, V> {
             messages,
             deactivated,
         };
-        shape
+        ShapeFrame {
+            shape,
+            constraint: 0,
+            member: 0,
+            references_seen: 0,
+            errors: std::mem::take(&mut self.pending_errors),
+        }
     }
 
     fn targets(&mut self, node: TermId) -> Vec<Target> {
@@ -490,7 +617,7 @@ impl<V: ReadView> Compiler<'_, V> {
 
         // Logic.
         for shape in self.values(node, "not") {
-            out.push(Constraint::Not(self.shape(shape)));
+            out.push(Constraint::Not(self.reference(shape)));
         }
         for (local, logical) in [
             ("and", Logical::And),
@@ -505,10 +632,10 @@ impl<V: ReadView> Compiler<'_, V> {
 
         // Shapes.
         for shape in self.values(node, "node") {
-            out.push(Constraint::Node(self.shape(shape)));
+            out.push(Constraint::Node(self.reference(shape)));
         }
         for shape in self.values(node, "property") {
-            out.push(Constraint::Property(self.shape(shape)));
+            out.push(Constraint::Property(self.reference(shape)));
         }
         self.qualified(node, &mut out);
 
@@ -567,10 +694,10 @@ impl<V: ReadView> Compiler<'_, V> {
             let siblings = siblings
                 .iter()
                 .filter(|&&sibling| sibling != shape)
-                .map(|&sibling| self.shape(sibling))
+                .map(|&sibling| self.reference(sibling))
                 .collect();
             out.push(Constraint::Qualified {
-                shape: self.shape(shape),
+                shape: self.reference(shape),
                 min,
                 max,
                 siblings,
