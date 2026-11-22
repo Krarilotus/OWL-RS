@@ -666,10 +666,10 @@ class Suite:
             if endpoint.index_ms is not None:
                 self.emit(base, task="index", status=endpoint.index_status, ms=endpoint.index_ms,
                           note=endpoint.index_note)
-                if endpoint.index_status != "ok":
-                    return
             if system.persistent and not in_memory:
                 self.emit(base, task="restart", ms=endpoint.restart_ms if endpoint.restart_ms is not None else "")
+            if endpoint.index_status != "ok":
+                return
             if self.settings.get("SKIP_COUNT") == "1":
                 # A lazy reasoner's count of everything forces its whole closure (Jena's
                 # rules on LUBM 10 ran out of heap there); the queries alone then decide.
