@@ -140,7 +140,10 @@ fn a_deactivated_parent_does_not_hide_a_new_result() {
     let result = &report.results[0];
     assert_eq!(result.focus_node, Term::from(ex("n2")));
     assert_eq!(result.source_shape, Term::from(ex("P11")));
-    assert_eq!(result.component, nrese_shacl::Component::MinCount);
+    assert_eq!(
+        result.component.as_str(),
+        nrese_shacl::Component::MinCount.iri()
+    );
 }
 
 /// SHACL design §7: if a whole validation or a reverse route search runs out
