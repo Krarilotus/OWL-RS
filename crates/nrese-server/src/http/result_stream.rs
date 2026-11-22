@@ -1126,6 +1126,31 @@ mod tests {
         assert_eq!(shared.headers().get(header::RETRY_AFTER), None);
     }
 
+    /// Over HTTP/1.0, an answer the memory all queries share has no room to hold, though no
+    /// other request holds any of it (a frame past that memory's whole limit), gets 503
+    /// without `Retry-After`: sent again, it would be refused again.
+    #[tokio::test]
+    async fn a_held_answer_past_the_whole_shared_memory_is_not_told_to_retry() {
+        let shared = nrese_exec::SharedBudget::new(CHUNK_BYTES / 2);
+        let memory = Envelope::new(Some(1 << 30), Some(shared));
+        let (sender, receiver) = mpsc::channel(CHANNEL_CHUNKS);
+        sender
+            .try_send(Frame::data(Bytes::from(vec![b'x'; CHUNK_BYTES])))
+            .unwrap();
+        drop(sender);
+        let outcome = Outcome::default();
+        outcome.set(Ok(()));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let refused = hold(receiver, &outcome, deadline, memory.clone(), "timeout")
+            .await
+            .err()
+            .map(IntoResponse::into_response)
+            .expect("no room in the shared memory, no answer");
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(refused.headers().get(header::RETRY_AFTER), None);
+        assert_eq!(memory.used(), 0, "the refused answer still holds memory");
+    }
+
     /// Over HTTP/1.0, a producer's work refused before any of its answer was held keeps its
     /// own refusal, though the hold holds the answer it wrote after it by the end: that
     /// refusal was the work's alone, the client's to change (the query's own 413).
