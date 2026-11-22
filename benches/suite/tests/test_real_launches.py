@@ -15,6 +15,7 @@ import io
 import json
 import os
 from pathlib import Path
+import platform
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,11 @@ import abba  # noqa: E402
 import suite  # noqa: E402
 from suitekit import driver, fleet_cells, manifest, ns, schema  # noqa: E402
 from suitekit.workloads import Plan  # noqa: E402
+
+READS = ("benches/datasets.toml", "benches/fast/release_gate.py", "benches/nrese-bench-harness/Cargo.toml",
+         "benches/suite/abba.py", "benches/suite/suite.py", "benches/suite/suitekit/*", "benches/suite/systems.toml",
+         "benches/suite/workloads.toml", "scripts/cargo-guarded.sh", "scripts/lib/gate-publish.sh",
+         "scripts/release-gate.sh")
 
 A = "a" * 40
 
@@ -189,6 +195,10 @@ class Member(Temp):
                              "case": {"workload": "sparqloscope", "tier": "sparqloscope-dblp"}},
                    "identity": {}, "result_root": str(self.root / "private"), "member": "cell", "nrese": A,
                    "harness": A, "deadline_min": 1}
+        # The machine description the manifest records (platform.platform()) runs `uname -p` through
+        # subprocess the first time a process asks, on Linux: asked here first, it is none of the cell's
+        # launches, whether or not another contract in this process asked before.
+        platform.platform()
         with patch.object(subprocess, "run", side_effect=run), patch.object(abba, "git", return_value="t" * 40), \
                 patch.dict(os.environ, {"SUITE_CELL": json.dumps(payload), "FLEET_OUT": str(out),
                                         "NRESE_GATE_DIR": str(gate)}), contextlib.redirect_stderr(io.StringIO()):

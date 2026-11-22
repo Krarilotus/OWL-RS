@@ -11,6 +11,8 @@ import sys
 import tempfile
 import unittest
 
+READS = ("scripts/lib/quiet-watch.py", "scripts/quiet-slot.sh")
+
 
 GUARD = Path(__file__).resolve().parents[3] / "scripts" / "quiet-slot.sh"
 

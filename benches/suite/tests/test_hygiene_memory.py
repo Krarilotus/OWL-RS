@@ -6,6 +6,8 @@ import importlib.util
 import unittest
 from pathlib import Path
 
+READS = ("scripts/hosts/hygiene.py",)
+
 spec = importlib.util.spec_from_file_location(
     "hygiene", Path(__file__).resolve().parents[3] / "scripts" / "hosts" / "hygiene.py")
 hygiene = importlib.util.module_from_spec(spec)

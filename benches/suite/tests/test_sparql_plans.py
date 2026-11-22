@@ -14,6 +14,10 @@ sys.path.insert(0, str(ROOT / "benches/suite"))
 from suitekit import adapters, sparql_plans, workloads  # noqa: E402
 from suitekit.runtime import Mount  # noqa: E402
 
+READS = ("benches/competitors/queries/sparqloscope-dblp/*", "benches/sparql/bsbm/drive.py",
+         "benches/sparql/sp2bench/published.tsv", "benches/sparql/sparqloscope/dblp-checks.toml",
+         "benches/suite/suitekit/*")
+
 
 class KnownAnswers(unittest.TestCase):
     def test_checks_table(self):

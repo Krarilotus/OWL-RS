@@ -9,6 +9,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+READS = ("benches/sparql/nt-numbers.py",)
+
 ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = ROOT / "benches/sparql/nt-numbers.py"
 spec = importlib.util.spec_from_file_location("nt_numbers", SCRIPT)

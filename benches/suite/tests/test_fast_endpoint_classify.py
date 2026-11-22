@@ -21,6 +21,10 @@ sys.path.insert(0, str(ROOT / "benches/fast"))
 import fast  # noqa: E402
 import release_gate as rg  # noqa: E402
 
+READS = ("benches/datasets.toml", "benches/fast/compete.py", "benches/fast/fast.py",
+         "benches/fast/release_gate.py", "benches/hosts.toml", "benches/reasoning/dl/canonical.py",
+         "benches/suite/suitekit/*")
+
 E = "http://example.org/"
 THING, NOTHING = "http://www.w3.org/2002/07/owl#Thing", "http://www.w3.org/2002/07/owl#Nothing"
 CASE = dict(name="ep", data="none", metric="whole_ms", cap_gb=2, tool="endpoint-classify", phases=["request"],

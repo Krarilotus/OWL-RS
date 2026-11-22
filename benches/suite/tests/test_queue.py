@@ -19,6 +19,9 @@ from unittest.mock import patch
 
 import isolation
 
+READS = ("benches/cases/core.toml", "benches/cases/sparql.toml", "benches/suite/measurement_queue.py",
+         "benches/suite/schedule.toml", "benches/suite/suitekit/*", "scripts/lib/quiet-watch.py")
+
 SUITE =Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("queue_runner", SUITE / "measurement_queue.py")
 queue = importlib.util.module_from_spec(spec)

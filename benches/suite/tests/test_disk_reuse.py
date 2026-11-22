@@ -19,6 +19,10 @@ import fast  # noqa: E402
 import isolation  # noqa: E402
 from test_job_namespace import cleanup_checkout  # noqa: E402
 
+READS = ("benches/fast/compete.py", "benches/fast/fast.py", "benches/fast/release_gate.py",
+         "benches/hosts.toml", "benches/suite/suitekit/*", "benches/suite/tests/test_job_namespace.py",
+         "scripts/bench-cleanup.sh", "scripts/lib/disk.sh", "scripts/lib/ns.sh")
+
 
 class SharedPreparedData(unittest.TestCase):
     def test_a_second_gate_links_the_first_gate_s_data_in_one_read_only_copy(self):

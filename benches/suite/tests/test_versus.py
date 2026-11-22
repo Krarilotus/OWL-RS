@@ -16,6 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from suitekit import standings, versus  # noqa: E402
 from suitekit.schema import Result, Writer  # noqa: E402
 
+READS = ("benches/",)
+
 
 def run(directory: Path, times: dict[str, dict[str, float]], wrong: tuple = (), publish=None):
     """A suite run of tier `c~plain`: per system and query a latency (three runs of five)."""

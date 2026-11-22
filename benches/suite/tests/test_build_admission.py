@@ -24,6 +24,9 @@ import unittest
 
 import isolation
 
+READS = ("scripts/cargo-guarded.sh", "scripts/lib/disk.sh", "scripts/lib/memory-cap.ps1",
+         "scripts/lib/prune-stale.py", "scripts/lib/target-cpu.sh")
+
 ROOT = Path(__file__).resolve().parents[3]
 BASH = shutil.which("bash")
 GB =1024 * 1024  # kB

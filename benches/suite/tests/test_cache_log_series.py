@@ -16,6 +16,11 @@ sys.path.insert(0, str(ROOT / "benches/fast"))
 import fast  # noqa: E402
 from suitekit import cases  # noqa: E402
 
+READS = ("benches/cases/core.toml", "benches/cases/sparql.toml", "benches/competitors/queries/",
+         "benches/datasets.toml", "benches/fast/compete.py", "benches/fast/fast.py", "benches/fast/queries/",
+         "benches/fast/release_gate.py", "benches/hosts.toml", "benches/reasoning/queries/lubm/",
+         "benches/reasoning/queries/owl2bench/", "benches/suite/abba.py", "benches/suite/suitekit/*")
+
 
 class ReplayedLog(unittest.TestCase):
     """Spec: abba.py (`N samples of SERIES, F required`) and the release gate's family

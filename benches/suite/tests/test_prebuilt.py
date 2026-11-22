@@ -15,6 +15,8 @@ from suitekit.manifest import Manifest
 from suitekit.runtime import Measured, Mount
 from suitekit.workloads import write_scaling
 
+READS = ("benches/competitors/graphdb/repo-owl2-rl.ttl", "benches/suite/suitekit/*")
+
 
 class PrebuiltHarness(unittest.TestCase):
     def test_skip_build_never_launches_a_build(self):
