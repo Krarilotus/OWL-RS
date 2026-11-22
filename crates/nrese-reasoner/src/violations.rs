@@ -20,6 +20,7 @@ use nrese_exec::{Budget, ChargedVec, Reservation};
 use smallvec::SmallVec;
 
 use super::ir::Violation;
+use crate::eval::{Poller, Stopped};
 
 /// A budget without a limit, for a report nothing charges yet.
 pub(crate) fn unlimited() -> Arc<Budget> {
@@ -78,6 +79,35 @@ impl Group {
         }
         self.records = kept;
         self.words.truncate(kept * stride);
+    }
+
+    /// Subtracts sorted witnesses of the same rule and width, in place.
+    fn remove_previous(&mut self, before: &Self, poll: &Poller<'_>) -> Result<(), Stopped> {
+        let stride = self.stride;
+        let mut old = 0;
+        let mut kept = 0;
+        for i in 0..self.records {
+            if poll.tick() {
+                return Err(Stopped);
+            }
+            while old < before.records && before.record(old) < self.record(i) {
+                old += 1;
+                if poll.tick() {
+                    return Err(Stopped);
+                }
+            }
+            if old < before.records && before.record(old) == self.record(i) {
+                continue;
+            }
+            if kept != i {
+                self.words
+                    .copy_within(i * stride..(i + 1) * stride, kept * stride);
+            }
+            kept += 1;
+        }
+        self.records = kept;
+        self.words.truncate(kept * stride);
+        Ok(())
     }
 }
 
@@ -309,6 +339,34 @@ impl Violations {
     /// No violation found, and none missed.
     pub fn consistent(&self) -> bool {
         !self.refused && self.groups.iter().all(|g| g.records == 0)
+    }
+
+    /// The introduced witnesses, compared by rule and bindings. If the base's report is
+    /// incomplete, a witness it didn't list can't be classified as new: keep the refusal.
+    pub(crate) fn remove_previous(
+        &mut self,
+        before: &Self,
+        poll: &Poller<'_>,
+    ) -> Result<(), Stopped> {
+        if !before.complete() {
+            self.refused = true;
+            self.groups.clear();
+            return Ok(());
+        }
+        self.finish();
+        debug_assert!(before.finished);
+        for group in self.groups.iter_mut() {
+            for old in before.groups.iter() {
+                if poll.tick() {
+                    return Err(Stopped);
+                }
+                if old.name == group.name && old.stride == group.stride {
+                    group.remove_previous(old, poll)?;
+                }
+            }
+        }
+        self.groups.retain(|group| group.records != 0);
+        Ok(())
     }
 
     /// Every violation is listed: the budget had room for all of them.

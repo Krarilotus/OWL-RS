@@ -62,7 +62,17 @@ pub fn materialise_with(
     stop: &OperationStop<'_>,
     memory: &Arc<Budget>,
 ) -> Result<Closure, delta::Interrupted> {
-    closure_with(program, snapshot, stop, memory, None)
+    closure_with(program, snapshot, stop, memory, Output::Stored(None))
+}
+
+/// The rebuild's consistency report by itself, under the same stop and report budget.
+pub(super) fn violations_with(
+    program: &Program,
+    snapshot: &Snapshot,
+    operation: &OperationStop<'_>,
+    memory: &Arc<Budget>,
+) -> Result<Violations, delta::Interrupted> {
+    Ok(closure_with(program, snapshot, operation, memory, Output::Report)?.violations)
 }
 
 /// [`materialise_with`], with the derived facts no store can hold (a literal subject, a
@@ -76,7 +86,13 @@ pub(super) fn materialise_with_unstorable(
     memory: &Arc<Budget>,
     unstorable: &mut Vec<Triple>,
 ) -> Result<Closure, delta::Interrupted> {
-    closure_with(program, snapshot, operation, memory, Some(unstorable))
+    closure_with(
+        program,
+        snapshot,
+        operation,
+        memory,
+        Output::Stored(Some(unstorable)),
+    )
 }
 
 impl Program {
@@ -97,12 +113,17 @@ impl Program {
         }
         debug_assert_eq!(empty.len_in(ReadModel::Asserted), 0);
         let mut unstorable = Vec::new();
-        closure_with(self, empty, operation, memory, Some(&mut unstorable))?;
+        materialise_with_unstorable(self, empty, operation, memory, &mut unstorable)?;
         Ok(*self.axioms_storable.get_or_init(|| unstorable.is_empty()))
     }
 }
 
-/// [`materialise_with`]'s work, the unstorable facts kept where `unstorable` asks for them.
+enum Output<'a> {
+    Stored(Option<&'a mut Vec<Triple>>),
+    Report,
+}
+
+/// [`materialise_with`]'s work, encoding facts for installation only where requested.
 /// Every full closure is a bulk phase ([`nrese_exec::memory::HugePages::Bulk`]): a store's
 /// rematerialisation and a commit's or first load's rebuild ([`super::maintain`]) alike.
 fn closure_with(
@@ -110,8 +131,10 @@ fn closure_with(
     snapshot: &Snapshot,
     stop: &OperationStop<'_>,
     memory: &Arc<Budget>,
-    mut unstorable: Option<&mut Vec<Triple>>,
+    output: Output<'_>,
 ) -> Result<Closure, delta::Interrupted> {
+    #[cfg(test)]
+    crate::witness::add(crate::witness::Site::FullMaterialisation, 1);
     let _huge_pages = nrese_exec::memory::HugePagesPhase::begin();
     nrese_exec::heap::phase("reasoner: input");
     let (input, axioms) = input_of(program, snapshot);
@@ -159,15 +182,18 @@ fn closure_with(
             memory,
         ));
     }
-    nrese_exec::heap::phase("store: encode");
-    // At its exact size: collected by doubling, the list held up to twice the facts, and
-    // at a doubling three times, beside them (LUBM 1000: 6.6 GB at this step's peak).
-    let mut inferred = Vec::with_capacity(result.derived.len() + axioms.len());
-    for t in result.derived.into_iter().chain(axioms) {
-        if storable(t) {
-            inferred.push(encode(t));
-        } else if let Some(unstorable) = unstorable.as_deref_mut() {
-            unstorable.push(t);
+    let mut inferred = Vec::new();
+    if let Output::Stored(mut unstorable) = output {
+        nrese_exec::heap::phase("store: encode");
+        // At its exact size: collected by doubling, the list held up to twice the facts, and
+        // at a doubling three times beside them (LUBM 1000: 6.6 GB at this step's peak).
+        inferred = Vec::with_capacity(result.derived.len() + axioms.len());
+        for t in result.derived.into_iter().chain(axioms) {
+            if storable(t) {
+                inferred.push(encode(t));
+            } else if let Some(unstorable) = unstorable.as_deref_mut() {
+                unstorable.push(t);
+            }
         }
     }
     Ok(Closure {
