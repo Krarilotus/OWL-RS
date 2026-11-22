@@ -26,7 +26,7 @@ import test_release_gate as fixture  # noqa: E402  (the gate's pass fixtures)
 
 READS = ("benches/cases/core.toml", "benches/cases/sparql.toml", "benches/competitors/queries/",
          "benches/datasets.toml", "benches/fast/fast.py", "benches/fast/measurement-sides.toml",
-         "benches/fast/noise-floor/phuoc-yu.toml", "benches/fast/queries/", "benches/fast/release_gate.py",
+         "benches/fast/queries/", "benches/fast/release_gate.py",
          "benches/hosts.toml", "benches/reasoning/prepare-lubm.sh", "benches/reasoning/prepare-owl2bench.sh",
          "benches/reasoning/queries/lubm/", "benches/reasoning/queries/owl2bench/",
          "benches/sparql/prepare.sh", "benches/suite/abba.py", "benches/suite/suitekit/*",

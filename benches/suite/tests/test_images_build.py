@@ -18,7 +18,7 @@ from test_job_namespace import BASH  # noqa: E402
 
 READS = ("benches/competitors/gcare/Dockerfile", "benches/competitors/millenniumdb/Dockerfile",
          "benches/sparql/images.sh", "benches/suite/suitekit/__init__.py",
-         "benches/suite/suitekit/dockerfile.py", "benches/suite/suitekit/lock.py",
+         "benches/suite/suitekit/dockerfile.py", "benches/suite/suitekit/hosts.py", "benches/suite/suitekit/lock.py",
          "benches/suite/suitekit/manifest.py", "benches/suite/suitekit/ns.py",
          "benches/suite/suitekit/runtime.py", "benches/suite/tests/test_job_namespace.py", "scripts/lib/ns.sh")
 
