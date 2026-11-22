@@ -26,6 +26,15 @@ const EMPTY_C: &str = ":p a owl:ObjectProperty ; rdfs:range :B . :A owl:disjoint
 
 /// A store under `owl2-dl` with `dl`, its pipeline, `data` committed.
 fn dl_store(dl: DlConfig, data: &str) -> (Arc<StoreService>, MutationPipeline) {
+    store_under(ReasoningMode::Owl2Dl, dl, data)
+}
+
+/// A store under `mode` with `dl`, its pipeline, `data` committed.
+fn store_under(
+    mode: ReasoningMode,
+    dl: DlConfig,
+    data: &str,
+) -> (Arc<StoreService>, MutationPipeline) {
     let store = Arc::new(
         StoreService::new(StoreConfig {
             dl,
@@ -35,9 +44,7 @@ fn dl_store(dl: DlConfig, data: &str) -> (Arc<StoreService>, MutationPipeline) {
     );
     let pipeline = MutationPipeline::new(
         Arc::clone(&store),
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-            ReasoningMode::Owl2Dl,
-        ))),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(mode))),
     );
     update(&pipeline, &format!("INSERT DATA {{ {data} }}"));
     (store, pipeline)
@@ -287,16 +294,20 @@ fn a_ground_conclusion_the_rules_show_takes_no_dl_check() {
 /// Spec (`entails`: one certified closure, reads that answer only for it): `:x a :P` and
 /// `:x ≠ :y` hold together in neither revision, the one with `:x a :P` (where `:x` may be
 /// `:y`) nor the one after a commit that replaces it with `:x a :D` and `:y a :C` (`:D`
-/// disjoint with `:C`). With that commit between the closure's read and the refutation, the
-/// check gives no answer (undecided), never `Entailed`.
+/// disjoint with `:C`). Under `owl2-rl`, with that commit between the closure's read and the
+/// refutation, the check gives no answer (undecided), never `Entailed`.
 #[test]
 fn a_commit_between_the_closure_and_the_refutation_leaves_the_answer_undecided() {
-    let (store, pipeline) = dl_store(DlConfig::default(), ":D owl:disjointWith :C . :x a :P .");
+    let (store, pipeline) = store_under(
+        ReasoningMode::Owl2Rl,
+        DlConfig::default(),
+        ":D owl:disjointWith :C . :x a :P .",
+    );
     let conclusion = [
         Triple::new(iri("x"), nrese_rdf::vocab::rdf::TYPE, iri("P")),
         ground("x", &format!("{OWL}differentFrom"), "http://example.com/y"),
     ];
-    let rules = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl)
+    let rules = ReasonerConfig::for_mode(ReasoningMode::Owl2Rl)
         .materialised_program()
         .unwrap();
     hooks::BETWEEN_ENTAILMENT_HALVES.set(Some(Box::new(move || {

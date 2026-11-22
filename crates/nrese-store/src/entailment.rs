@@ -18,11 +18,12 @@
 //!
 //! The answer is sound; it is complete as far as the rules are for the premise (OWL 2 RL
 //! premises and the forms above). A conclusion outside them may be entailed although the
-//! answer is no, except under `owl2-dl`: there the rules decide only a conclusion of plain
-//! ground assertions (no blank node, none of the structured forms above); any other, and
-//! what the rules leave unshown, the DL engines decide whole ([`StoreService::entails_dl`]),
-//! an [`StoreError::Undecided`] error where they can't. There the whole check, the rules'
-//! pass included, has one `dl.timeout` from the call; past it, the answer is undecided.
+//! answer is no, except under `owl2-dl`. There none of the above applies: the rules show a
+//! conclusion only if it is ground and the closure holds each of its statements as it is
+//! (one membership test each, nothing set aside, read as a form or evaluated); any other
+//! the DL engines decide whole ([`StoreService::entails_dl`]), an
+//! [`StoreError::Undecided`] error where they can't. The whole check has one `dl.timeout`
+//! from the call; past it, the answer is undecided.
 //! Refutation uses the store's process-memory watch; interruption is an error, never
 //! a negative entailment answer or an assumed-unreachable panic.
 
@@ -63,9 +64,6 @@ struct Split {
     positive: Vec<Triple>,
     /// Sets of statements whose addition must make the data inconsistent.
     refutations: Vec<Vec<Triple>>,
-    /// A structured negative form was read (`owl:AllDifferent`, a complement, a negative
-    /// property assertion): its statements were read apart from the rest.
-    formed: bool,
 }
 
 impl StoreService {
@@ -133,37 +131,33 @@ impl StoreService {
         // One revision for the whole answer: the closure's read, every refutation and the DL
         // check are of it.
         let at = self.engine().snapshot();
-        let split = split(conclusion);
         // The rules are complete under the Direct Semantics only for OWL 2 RL premises
-        // (OWL 2 Profiles §4.3, PR1), and they decide a conclusion's statements apart. Under
-        // owl2-dl they decide only plain ground assertions, which say nothing of each other: a
-        // blank node or a structured form links statements, so that conclusion, and what the
-        // rules leave unshown, the DL engines decide whole.
-        let dl = self.dl().active();
-        let plain = !split.formed && conclusion.iter().all(ground);
-        let shown = (!dl || plain) && self.shown_by_rules(&at, program, &split, deadline)?;
-        if shown {
-            return Ok(Entailment::Entailed);
+        // (OWL 2 Profiles §4.3, PR1). Under owl2-dl they show a conclusion only by holding each
+        // of its statements, as it is: anything else, and what they don't hold, the DL engines
+        // decide whole.
+        if self.dl().active() {
+            let held = conclusion.iter().all(ground) && holds_each(&at, conclusion, deadline)?;
+            #[cfg(test)]
+            crate::service::hooks::run(&crate::service::hooks::BETWEEN_ENTAILMENT_HALVES);
+            return match held {
+                true => Ok(Entailment::Entailed),
+                false => self.decided_by_dl(&at, conclusion, deadline),
+            };
         }
-        if dl {
-            return self.decided_by_dl(&at, conclusion, deadline);
+        match self.shown_by_rules(&at, program, &split(conclusion))? {
+            true => Ok(Entailment::Entailed),
+            false => Ok(Entailment::NotEntailed),
         }
-        Ok(Entailment::NotEntailed)
     }
 
     /// Whether the closure at `at` holds every positive statement and the rules refute every
-    /// opposite over it, before `deadline`.
+    /// opposite over it.
     fn shown_by_rules(
         &self,
         at: &Snapshot,
         program: &RuleProgram,
         split: &Split,
-        deadline: Deadline,
     ) -> StoreResult<bool> {
-        // The ASK has no stop of its own: under owl2-dl it is of ground statements only.
-        if deadline.passed() {
-            return Err(out_of_time());
-        }
         let asked = split.positive.is_empty() || self.ask(at, &split.positive)?;
         #[cfg(test)]
         crate::service::hooks::run(&crate::service::hooks::BETWEEN_ENTAILMENT_HALVES);
@@ -171,7 +165,7 @@ impl StoreService {
             return Ok(false);
         }
         for opposite in &split.refutations {
-            if !self.refutes(at, program, opposite, deadline)? {
+            if !self.refutes(at, program, opposite)? {
                 return Ok(false);
             }
         }
@@ -216,20 +210,15 @@ impl StoreService {
     /// Whether adding `opposite` to the data at `at` makes it inconsistent under `program`:
     /// the reasoner maintains the closure over a speculative transaction, which is dropped.
     /// Undecided where a commit came after `at` (the transaction starts from the latest
-    /// revision): its answer would be another revision's; and where `deadline` passes.
+    /// revision): its answer would be another revision's.
     fn refutes(
         &self,
         at: &Snapshot,
         program: &RuleProgram,
         opposite: &[Triple],
-        deadline: Deadline,
     ) -> StoreResult<bool> {
-        if deadline.passed() {
-            return Err(out_of_time());
-        }
         let memory = self.memory_stop();
-        let stop = || memory.exceeded() || deadline.passed();
-        let room = || memory.room();
+        let (stop, room) = (|| memory.exceeded(), || memory.room());
         let operation = nrese_reasoner::eval::OperationStop::new(&stop).within(&room);
         let config = self.config();
         // Until V1b (the reasoner's maintenance over either transaction kind): the old shared
@@ -260,15 +249,35 @@ impl StoreService {
         .map_err(|interrupted| {
             memory
                 .error(interrupted)
-                .unwrap_or_else(|| match deadline.passed() {
-                    true => out_of_time(),
-                    false => StoreError::ProcessMemoryLimit {
-                        limit: nrese_exec::memory::process_limit().unwrap_or(0),
-                    },
+                .unwrap_or(StoreError::ProcessMemoryLimit {
+                    limit: nrese_exec::memory::process_limit().unwrap_or(0),
                 })
         })?;
         Ok(!done.violations.consistent())
     }
+}
+
+/// Whether the closure at `at` holds each statement of `conclusion` as it is, in the
+/// default graph: one membership test each, before `deadline`.
+fn holds_each(at: &Snapshot, conclusion: &[Triple], deadline: Deadline) -> StoreResult<bool> {
+    for t in conclusion {
+        if deadline.passed() {
+            return Err(out_of_time());
+        }
+        let quad = Quad::new(
+            t.subject.clone(),
+            t.predicate.clone(),
+            t.object.clone(),
+            GraphName::DefaultGraph,
+        );
+        if !at
+            .lookup_quad(quad.as_ref())
+            .is_some_and(|q| at.contains(&q))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Why an entailment check that saw a commit after its start gives no answer.
@@ -371,7 +380,6 @@ fn split(conclusion: &[Triple]) -> Split {
                 for node in &nodes {
                     used.extend(about(node));
                 }
-                split.formed = true;
             }
         }
         // a rdf:type _:c . _:c owl:complementOf C
@@ -387,7 +395,6 @@ fn split(conclusion: &[Triple]) -> Split {
                 )]);
                 used.insert(i);
                 used.extend(about(&class));
-                split.formed = true;
             }
         }
         // [] a owl:NegativePropertyAssertion; source, property, target (or value).
@@ -404,7 +411,6 @@ fn split(conclusion: &[Triple]) -> Split {
                     .refutations
                     .push(vec![Triple::new(a.clone(), p.clone(), b.clone())]);
                 used.extend(about(node));
-                split.formed = true;
             }
         }
     }
@@ -674,7 +680,6 @@ mod memory_tests {
                 &store.engine().snapshot(),
                 &Ruleset::Owl2Rl.into(),
                 std::slice::from_ref(&opposite),
-                Deadline::NONE,
             );
             let diagnostic = store.equality_report(Ruleset::Owl2Rl);
             if limit == 1 {
