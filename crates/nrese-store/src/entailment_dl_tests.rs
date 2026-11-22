@@ -93,6 +93,54 @@ fn the_conclusion_is_tested_in_what_the_premise_check_left() {
     );
 }
 
+/// The store's check of `conclusion` under `owl2-dl` with `dl.timeout` 300 ms over `data`,
+/// its rules' pass taking 600 ms when `late`.
+fn entails_in_300_ms(data: &str, conclusion: &[Triple], late: bool) -> String {
+    let dl = DlConfig {
+        timeout: Some(Duration::from_millis(300)),
+        ..DlConfig::default()
+    };
+    let (store, _pipeline) = dl_store(dl, data);
+    let rules = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl)
+        .materialised_program()
+        .unwrap();
+    if late {
+        hooks::BETWEEN_ENTAILMENT_HALVES.set(Some(Box::new(|| {
+            std::thread::sleep(Duration::from_millis(600));
+        })));
+    }
+    let answer = store.entails(rules, conclusion);
+    hooks::BETWEEN_ENTAILMENT_HALVES.set(None);
+    match answer {
+        Err(crate::StoreError::Undecided(_)) => "undecided".to_owned(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// Spec (`entails` under `owl2-dl`: one `dl.timeout` from the call, which the rules' pass
+/// spends too): where the rules leave the conclusion to the DL engines and their pass uses
+/// up the time, the DL check gets none and the answer is undecided; with the time, entailed.
+#[test]
+fn a_rules_pass_that_uses_up_the_time_leaves_the_dl_check_none() {
+    let conclusion = not_in("a", "C");
+    assert_eq!(
+        [false, true].map(|late| entails_in_300_ms(EMPTY_C, &conclusion, late)),
+        ["Ok(Entailed)".to_owned(), "undecided".to_owned()]
+    );
+}
+
+/// Spec (as above): a refutation by the rules found after the time is up is no answer
+/// either; within it, entailed.
+#[test]
+fn a_rules_refutation_past_the_time_is_undecided() {
+    let data = ":D owl:disjointWith :C . :x a :D .";
+    let conclusion = not_in("x", "C");
+    assert_eq!(
+        [false, true].map(|late| entails_in_300_ms(data, &conclusion, late)),
+        ["Ok(Entailed)".to_owned(), "undecided".to_owned()]
+    );
+}
+
 /// Spec (`entails`: one certified closure, reads that answer only for it): `:x a :P` and
 /// `:x a ¬C` hold together in neither revision, the one with `:x a :P` (where `:x` may be a
 /// `:C`) nor the one after a commit that replaces it with `:x a :D` (`:D` disjoint with
