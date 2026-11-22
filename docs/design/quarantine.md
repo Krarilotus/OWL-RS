@@ -81,6 +81,28 @@ error. Re-admitting one takes the fixed text.
   found at a start is from a load that didn't
   commit (a crash between the engine's commit and the rename loses that load's
   quarantine, not its data) and is removed.
+  The rename is made durable by syncing the directory. If the rename or that sync fails
+  with the file under its name (a failed rename may still have moved it), the name isn't
+  durable. A load that published nothing then takes its file back: it removes the file
+  and syncs the directory again, so that sending it again doesn't quarantine its
+  statements twice. Only when both hold does its error call sending it again safe;
+  otherwise the error names the file the load's quarantine may have been kept as: if
+  that file is there, the load isn't sent again; if it isn't, sending it again is safe,
+  and a restart before it is sent again calls for a second check. A file removed whose
+  removal wasn't made durable can come back after a power loss, which restarts the
+  server; a check after the restart sees what the disk kept, and the load sent again
+  syncs the directory, which makes the removal durable.
+  A load that published keeps its file, listed and counted, so that its statements can
+  still be reviewed; its error names the load, and a power loss may lose the file.
+
+  If a rename reports an error and looking for the file under its name then fails too,
+  the file was never seen there: its records are not counted, and the error says they
+  may be listed. Counting them would over-count whenever the rename didn't move the
+  file. The limit: if the rename did move it, the listing shows the records while the
+  open count leaves them out, until the next start counts the files again; resolving one
+  of them meanwhile lowers no count. The same can
+  happen to a load that published nothing when that check fails and taking the file
+  back then fails with an error other than the file not being there.
 - `resolutions.jsonl`: append-only, one record per resolved statement (`outcome`
   `readmitted` with the commit's revision, or `discarded`; when; the repairs; the text
   admitted where it isn't the quarantined one; a note). On open, an incomplete final

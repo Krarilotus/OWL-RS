@@ -868,6 +868,8 @@ async fn finished(app: &Router, path: &str) -> serde_json::Value {
 
 const MIXED_UPLOAD: &str =
     "<urn:a> <urn:p> \"one\" .\nthis is not a statement\n_:b <urn:p> \"two\" .\n";
+const INVALID_UPLOAD: &str = "this is not a statement\n";
+const UNPUBLISHED_QUARANTINE_FAILURE: &str = "the load published nothing. The quarantine record couldn't be kept: simulated failure. It's safe to send it again once the cause is resolved.";
 
 fn import_with_quarantine_failure() -> (Router, std::sync::Arc<StoreService>) {
     let state = crate::support::test_state_with_store_config(
@@ -931,7 +933,8 @@ async fn quarantine_commit_failure_async_import_completes_with_warning() {
     let job = finished(&app, started["path"].as_str().expect(&body)).await;
     assert_eq!(job["state"], "done", "{job}");
     assert_eq!(
-        job["report"]["warning"], "the quarantine record couldn't be kept: simulated failure",
+        job["report"]["warning"],
+        "the quarantine record couldn't be kept: simulated failure. Don't send it again.",
         "{job}"
     );
     assert_eq!(job["report"]["revision"], revision, "{job}");
@@ -940,7 +943,8 @@ async fn quarantine_commit_failure_async_import_completes_with_warning() {
 #[tokio::test]
 async fn published_answer_followup_only_reports_actual_publications() {
     let (app, store) = import_with_quarantine_failure();
-    let upload = "this is not a statement\n";
+    let initial_revision = store.current_revision();
+    let upload = INVALID_UPLOAD;
     let path = "/api/v1/repositories/nrese/import";
     eprintln!("POST {path}\nContent-Type: application/n-triples\n\n{upload}");
     let (status, body) = send(
@@ -952,12 +956,10 @@ async fn published_answer_followup_only_reports_actual_publications() {
     )
     .await;
     eprintln!("{status}: {body}");
-    assert!(
-        status == StatusCode::BAD_REQUEST
-            && body.contains("i/o error: simulated failure")
-            && !body.contains("published"),
-        "{status}: {body}"
-    );
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    let problem: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(problem["detail"], UNPUBLISHED_QUARANTINE_FAILURE, "{body}");
+    assert_eq!(store.current_revision(), initial_revision);
 
     let seed = "<urn:a> <urn:p> \"one\" .\n";
     eprintln!("POST {path}\nContent-Type: application/n-triples\n\n{seed}");
@@ -991,6 +993,280 @@ async fn published_answer_followup_only_reports_actual_publications() {
         "{status}: {body}"
     );
     assert_eq!(store.current_revision(), revision);
+}
+
+#[tokio::test]
+async fn quarantine_commit_failure_without_publication_fails_import_job() {
+    let (app, store) = import_with_quarantine_failure();
+    let initial_revision = store.current_revision();
+    let (status, body) = send(
+        &app,
+        Method::POST,
+        "/api/v1/repositories/nrese/import?async=true",
+        Some("application/n-triples"),
+        INVALID_UPLOAD,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let started: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let job = finished(&app, started["path"].as_str().expect(&body)).await;
+    assert_eq!(job["state"], "failed", "{job}");
+    assert_eq!(job["error"], UNPUBLISHED_QUARANTINE_FAILURE, "{job}");
+    assert_eq!(store.current_revision(), initial_revision);
+}
+
+#[tokio::test]
+async fn quarantine_failure_in_server_file_import_says_load_again() {
+    let files = tempfile::tempdir().unwrap();
+    std::fs::write(files.path().join("invalid.nt"), INVALID_UPLOAD).unwrap();
+    let state = crate::support::test_state_with_store_config(
+        StoreConfig::in_memory(),
+        PolicyConfig {
+            import_directory: Some(files.path().to_path_buf()),
+            ..PolicyConfig::default()
+        },
+        ReasonerConfig::default(),
+    )
+    .unwrap();
+    state.store().quarantine().fail_next_commit();
+    let app = nrese_server::build_app(state);
+    let (status, body) = send(
+        &app,
+        Method::POST,
+        "/api/v1/repositories/nrese/import/files",
+        Some("application/json"),
+        r#"{"files":["invalid.nt"]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let started: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let job = finished(&app, started["path"].as_str().expect(&body)).await;
+    assert_eq!(job["state"], "failed", "{job}");
+    assert_eq!(
+        job["error"],
+        "the load published nothing. The quarantine record couldn't be kept: simulated failure. It's safe to load it again once the cause is resolved.",
+        "{job}"
+    );
+}
+
+/// A server on a store on disk in `dir`, `fail` setting up its quarantine's next failures.
+fn import_on_disk(
+    dir: &std::path::Path,
+    fail: impl FnOnce(&StoreService),
+) -> (Router, std::sync::Arc<StoreService>) {
+    let state = crate::support::test_state_with_store_config(
+        StoreConfig::on_disk(dir),
+        PolicyConfig::default(),
+        ReasonerConfig::default(),
+    )
+    .unwrap();
+    let store = state.store();
+    fail(&store);
+    (nrese_server::build_app(state), store)
+}
+
+/// The load of the one record the store's quarantine lists.
+fn listed_load(store: &StoreService) -> String {
+    let listed = store
+        .quarantine()
+        .list(&nrese_store::QuarantineFilter::default())
+        .unwrap();
+    assert_eq!(listed.len(), 1, "{listed:#?}");
+    listed[0].statement.load.clone()
+}
+
+/// An upload that published nothing, whose quarantine file was placed but couldn't be made
+/// durable or taken back: 500, naming the load whose record is listed, and saying when
+/// sending the document again is safe.
+#[tokio::test]
+async fn kept_quarantine_without_publication_says_when_to_send_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, store) = import_on_disk(dir.path(), |store| {
+        store.quarantine().fail_next_placement_sync();
+        store.quarantine().fail_next_record_removal();
+    });
+    let (status, body) = send(
+        &app,
+        Method::POST,
+        "/api/v1/repositories/nrese/import",
+        Some("application/n-triples"),
+        INVALID_UPLOAD,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    let problem: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let detail = problem["detail"].as_str().expect(&body);
+    let load = listed_load(&store);
+    assert_eq!(
+        detail,
+        format!(
+            "the load published nothing. The quarantine record couldn't be kept: the quarantine's directory sync failed (a test's). This load's quarantine may have been kept as quarantine/load-{load}.jsonl in the server's data directory. If that file is there, don't send it again. If it isn't, sending it again is safe. If the server restarts before you send it again, check again."
+        )
+    );
+}
+
+/// An import job that published nothing, whose quarantine file was placed but couldn't be
+/// made durable or taken back: failed, saying when sending (an upload) or loading (the
+/// import directory's files) it again is safe, and to check again after a restart.
+#[tokio::test]
+async fn kept_quarantine_without_publication_fails_import_jobs_saying_when_to_retry() {
+    let jobs = [
+        (
+            "/api/v1/repositories/nrese/import?async=true",
+            "application/n-triples",
+            INVALID_UPLOAD,
+            "send",
+        ),
+        (
+            "/api/v1/repositories/nrese/import/files",
+            "application/json",
+            r#"{"files":["invalid.nt"]}"#,
+            "load",
+        ),
+    ];
+    for (uri, content_type, body, retry) in jobs {
+        let dir = tempfile::tempdir().unwrap();
+        let files = tempfile::tempdir().unwrap();
+        std::fs::write(files.path().join("invalid.nt"), INVALID_UPLOAD).unwrap();
+        let state = crate::support::test_state_with_store_config(
+            StoreConfig::on_disk(dir.path()),
+            PolicyConfig {
+                import_directory: Some(files.path().to_path_buf()),
+                ..PolicyConfig::default()
+            },
+            ReasonerConfig::default(),
+        )
+        .unwrap();
+        let store = state.store();
+        store.quarantine().fail_next_placement_sync();
+        store.quarantine().fail_next_record_removal();
+        let app = nrese_server::build_app(state);
+        let (status, text) = send(&app, Method::POST, uri, Some(content_type), body).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{uri}: {text}");
+        let started: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let job = finished(&app, started["path"].as_str().expect(&text)).await;
+        assert_eq!(job["state"], "failed", "{uri}: {job}");
+        let load = listed_load(&store);
+        assert_eq!(
+            job["error"],
+            format!(
+                "the load published nothing. The quarantine record couldn't be kept: the quarantine's directory sync failed (a test's). This load's quarantine may have been kept as quarantine/load-{load}.jsonl in the server's data directory. If that file is there, don't {retry} it again. If it isn't, {retry}ing it again is safe. If the server restarts before you {retry} it again, check again."
+            ),
+            "{uri}"
+        );
+    }
+}
+
+/// An upload that published nothing, whose quarantine file may have been kept: the answer
+/// names that file relative to the server's data directory, and it is where the store kept
+/// the load's records, for the default repository and for another one.
+#[tokio::test]
+async fn kept_quarantine_answer_names_the_file_the_store_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = crate::support::test_state_with_store_config(
+        StoreConfig::on_disk(dir.path()),
+        PolicyConfig::default(),
+        ReasonerConfig::default(),
+    )
+    .unwrap();
+    let app = nrese_server::build_app(state.clone());
+    let json = Some("application/json");
+    let (status, text) = send(&app, Method::PUT, "/api/v1/repositories/r2", json, "{}").await;
+    assert_eq!(status, StatusCode::CREATED, "{text}");
+    for id in ["nrese", "r2"] {
+        let repository = state.repositories().get(id).expect(id);
+        let store = std::sync::Arc::clone(repository.observe().1.store());
+        store.quarantine().fail_next_placement_sync();
+        store.quarantine().fail_next_record_removal();
+        let (status, body) = send(
+            &app,
+            Method::POST,
+            &format!("/api/v1/repositories/{id}/import"),
+            Some("application/n-triples"),
+            INVALID_UPLOAD,
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{id}: {body}");
+        let problem: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let detail = problem["detail"].as_str().expect(&body);
+        let named = detail
+            .split_once("kept as ")
+            .and_then(|(_, rest)| rest.split_once(" in the server's data directory"))
+            .map(|(file, _)| std::path::Path::new(file))
+            .expect(detail);
+        let kept = std::fs::read_to_string(dir.path().join(named)).unwrap_or_default();
+        let record: serde_json::Value =
+            serde_json::from_str(kept.lines().next().unwrap_or("null")).unwrap();
+        assert!(
+            named.is_relative() && record["load"] == listed_load(&store),
+            "{id}: {detail}"
+        );
+    }
+}
+
+/// An import job that published, whose quarantine file was placed but not made durable:
+/// done, its warning naming the load whose record stays listed.
+#[tokio::test]
+async fn published_import_job_warning_names_the_kept_quarantine() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, store) = import_on_disk(dir.path(), |store| {
+        store.quarantine().fail_next_placement_sync();
+    });
+    let (_, body) = send(
+        &app,
+        Method::POST,
+        "/api/v1/repositories/nrese/import?async=true",
+        Some("application/n-triples"),
+        MIXED_UPLOAD,
+    )
+    .await;
+    let started: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let job = finished(&app, started["path"].as_str().expect(&body)).await;
+    assert_eq!(job["state"], "done", "{job}");
+    let warning = job["report"]["warning"].as_str().expect("a warning");
+    let load = listed_load(&store);
+    assert_eq!(
+        warning,
+        format!(
+            "the quarantine record couldn't be kept: the quarantine's directory sync failed (a test's). This load's records are listed under load ID {load}, but a power loss may lose them. Don't send it again."
+        )
+    );
+}
+
+/// An import job of the server's import directory that published, whose quarantine record
+/// couldn't be kept: done, its warning saying not to load the files again.
+#[tokio::test]
+async fn published_server_file_import_job_says_not_to_load_again() {
+    let files = tempfile::tempdir().unwrap();
+    std::fs::write(files.path().join("mixed.nt"), MIXED_UPLOAD).unwrap();
+    let state = crate::support::test_state_with_store_config(
+        StoreConfig::in_memory(),
+        PolicyConfig {
+            import_directory: Some(files.path().to_path_buf()),
+            ..PolicyConfig::default()
+        },
+        ReasonerConfig::default(),
+    )
+    .unwrap();
+    state.store().quarantine().fail_next_commit();
+    let app = nrese_server::build_app(state);
+    let (status, body) = send(
+        &app,
+        Method::POST,
+        "/api/v1/repositories/nrese/import/files",
+        Some("application/json"),
+        r#"{"files":["mixed.nt"]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let started: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let job = finished(&app, started["path"].as_str().expect(&body)).await;
+    assert_eq!(job["state"], "done", "{job}");
+    assert_eq!(
+        job["report"]["warning"],
+        "the quarantine record couldn't be kept: simulated failure. Don't load it again.",
+        "{job}"
+    );
 }
 
 /// Imports run as jobs: an uploaded document with `async=true`, and files from the

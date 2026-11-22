@@ -620,28 +620,28 @@ impl MutationPipeline {
         if rejects {
             ticket.claim_error()?;
         }
-        let first = report.results.first().map_or_else(String::new, |result| {
+        // Formatted only where it is told: a restricted committer's view is told its own.
+        let detail = || {
+            let first = report.results.first().map_or_else(String::new, |result| {
+                format!("; first: {}", crate::shacl::described(result))
+            });
             format!(
-                "; first: focus node {}, {}",
-                result.focus_node, result.component
+                "the commit introduces {} SHACL result(s) and {} failure(s){first}",
+                report.results.len(),
+                report.failures.len()
             )
-        });
-        let detail = format!(
-            "the commit introduces {} SHACL result(s) and {} failure(s){first}",
-            report.results.len(),
-            report.failures.len()
-        );
+        };
         if rejects {
             let full = || evidence::Draft {
                 kind: RejectKind::ShapesViolated,
-                detail,
+                detail: detail(),
                 explanation: None,
                 attribution: None,
             };
             let reject = view.reject(full, |view| restricted(view, &pending));
             Err(MutationError::Rejected(Box::new(reject)))
         } else {
-            tracing::warn!("{detail} (SHACL gate: not rejected)");
+            tracing::warn!("{} (SHACL gate: not rejected)", detail());
             Ok(())
         }
     }
