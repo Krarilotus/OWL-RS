@@ -968,15 +968,16 @@ mod tests {
     }
 
     /// Over HTTP/1.0, a stall bound's first deadline bounds the whole read: a producer still
-    /// going past it gets 408, though it wrote before it and keeps writing well within the
-    /// stall bound (streamed, that would have started a 200 the stall bound then keeps
-    /// going, to its end).
+    /// going past it gets 408 at that deadline, not at its end, though it wrote before it and
+    /// keeps writing well within the stall bound (streamed, that would have started a 200 the
+    /// stall bound then keeps going, to its end).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_held_reads_first_deadline_bounds_all_of_it() {
         let memory = Envelope::new(Some(1 << 30), None);
         let token = CancellationToken::new();
         let stop = token.clone();
         let held = memory.clone();
+        let started = Instant::now();
         let stopped = WHOLE
             .scope(
                 true,
@@ -1003,6 +1004,12 @@ mod tests {
             )
             .await
             .expect_err("past its deadline, no answer");
+        // The deadline is 1 s away, the producer's end 4 s.
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_secs(3),
+            "the read was stopped at the producer's end, after {waited:?}"
+        );
         assert_eq!(
             stopped.into_response().status(),
             StatusCode::REQUEST_TIMEOUT
