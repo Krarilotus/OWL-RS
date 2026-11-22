@@ -566,12 +566,14 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
                 .map(|_| ());
         }
     };
-    let current = shared.versions.load();
-    let watch = shared.watch_after_bulk(&current, &next.asserted, next.asserted_content);
     let Some(durable) = &shared.durable else {
+        let current = shared.versions.load();
+        let watch = shared.watch_after_bulk(&current, &next.asserted, next.asserted_content);
         next.committed_micros = stamp.take(shared).0;
+        let next = Version::new(watch, next);
+        drop(current);
         let _compaction = shared.versions.compaction_slot.lock();
-        shared.versions.install(Version::new(watch, next));
+        shared.versions.install(next);
         return Ok(());
     };
     // The checkpoint image's version: an unpublished snapshot's, never installed. The one
@@ -635,7 +637,12 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
             ..imaged.copy_data()
         },
     };
+    // Decided only now, after the checkpoint is written: what the bulk replaces is let go
+    // here, not held through the write. A form installed meanwhile keeps the same cell.
+    let current = shared.versions.load();
+    let watch = shared.watch_after_bulk(&current, &imaged.asserted, imaged.asserted_content);
     let next = Version::new(watch, data);
+    drop(current);
     // What the image's readers kept in its version's own slots goes with it, before the
     // slots: nothing of it outlives the load.
     drop(imaged);
@@ -773,6 +780,7 @@ fn publish_streamed(
     let current = shared.versions.load();
     let watch = shared.watch_after_bulk(&current, &data.asserted, data.asserted_content);
     let next = Version::new(watch, data);
+    drop(current);
     let compaction = shared.versions.compaction_slot.lock();
     let mut wal = durable.wal.lock();
     shared.versions.install(next);
