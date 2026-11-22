@@ -435,7 +435,7 @@ reached_contracts() {
 windows_contracts() {
   local commit=$1 base files selector out
   base=${NRESE_PUSH_BASE:-$(git merge-base "$commit" refs/remotes/origin/refactor/engine-v2 2> /dev/null)}
-  [ -n "$base" ] && files=$(git diff --name-only "$base" "$commit" 2> /dev/null) || return 0
+  [ -n "$base" ] && files=$(gate_files diff --no-renames --name-only "$base" "$commit" 2> /dev/null) || return 0
   selector=$(mktemp) || return 0
   if git show "$commit:benches/suite/tests/contracts.py" > "$selector" 2> /dev/null \
       && out=$(printf '%s\n' "$files" | python "$selector" select --commit "$commit"); then
@@ -531,19 +531,22 @@ exec_changed() {
 # tested on that side; new is what differs from both (resolved conflicts, files both sides
 # changed). A push: the pushed range, from the base the remote has to the pushed commit
 # (push_base, push_commit); never the work tree, which a push doesn't send. Without a range it
-# fails: an empty list would gate nothing.
+# fails: an empty list would gate nothing. A rename is listed by both its names (what was read
+# from where it left changed too), and a path as it is, not quoted (gate_files).
 
+gate_files() { git -c core.quotePath=false "$@"; }
 changed_files() {
   if [ "$1" = commit ] && git rev-parse -q --verify MERGE_HEAD > /dev/null; then
-    comm -12 <(git diff --name-only --cached HEAD | sort) <(git diff --name-only --cached MERGE_HEAD | sort)
+    comm -12 <(gate_files diff --no-renames --name-only --cached HEAD | sort) \
+      <(gate_files diff --no-renames --name-only --cached MERGE_HEAD | sort)
   elif [ "$1" = commit ]; then
-    git diff --name-only HEAD
+    gate_files diff --no-renames --name-only HEAD
   else
     [ -n "${push_base:-}" ] && [ -n "${push_commit:-}" ] || return 2
-    git diff --name-only "$push_base" "$push_commit"
+    gate_files diff --no-renames --name-only "$push_base" "$push_commit"
     return
   fi
-  git ls-files --others --exclude-standard
+  gate_files ls-files --others --exclude-standard
 }
 
 # A push gates one commit, from the base the remote has: .githooks/pre-push names both

@@ -92,8 +92,9 @@ def work_tree(top: Path) -> dict[str, str]:
 
 def committed(commit: str) -> dict[str, str]:
     """The contracts' sources at COMMIT, read from git in one batch."""
-    names = subprocess.run(["git", "ls-tree", "--name-only", commit, f"{TESTS}/"], capture_output=True, check=True,
-                           timeout=60).stdout.decode().split("\n")
+    # NUL-ended names, as they are: one outside ASCII is never quoted out of the contracts.
+    names = subprocess.run(["git", "ls-tree", "-z", "--name-only", commit, f"{TESTS}/"], capture_output=True,
+                           check=True, timeout=60).stdout.decode("utf-8").split("\0")
     names = [n for n in names if CONTRACT.fullmatch(n)]
     batch = subprocess.run(["git", "cat-file", "--batch"], input="".join(f"{commit}:{n}\n" for n in names).encode(),
                            capture_output=True, check=True, timeout=60).stdout
@@ -115,7 +116,9 @@ def main(argv: list[str]) -> int:
         print("no contracts found", file=sys.stderr)
         return 2
     contracts = {Path(path).stem: (path, declared(text)) for path, text in sources.items()}
-    changed = [line.strip("\r") for line in sys.stdin.read().split("\n") if line.strip("\r")]
+    # The gate's list as git gives it unquoted (scripts/check.sh gate_files): UTF-8 whatever the console's code page.
+    lines = sys.stdin.buffer.read().decode("utf-8", "surrogateescape").split("\n")
+    changed = [line.strip("\r") for line in lines if line.strip("\r")]
     picked = select(contracts, changed)
     if picked is not None:
         print("\n".join(picked) if picked else "none")

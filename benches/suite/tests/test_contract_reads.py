@@ -136,6 +136,15 @@ class Command(unittest.TestCase):
         self.assertEqual(self.select("a.txt", commit=self.commit), ["test_a", "test_c"], "SPEC commit: the commit's own")
         self.assertEqual(self.select("a.txt"), ["test_c"], "the work tree's")
 
+    def test_a_contract_named_outside_ascii_is_one_at_a_commit(self):
+        # Spec (contracts.py: a contract that declares nothing always runs; review r1, 22 Nov 2026): its name as
+        # git has it, never quoted out of the contracts.
+        (self.repo / TESTS / "test_über.py").write_text("import os\n", newline="\n")
+        self.git("add", "-A")
+        self.git("commit", "-qm", "a contract named outside ASCII")
+        picked = self.select("a.txt", commit=self.git("rev-parse", "HEAD"))
+        self.assertEqual(picked, ["test_a", "test_c", "test_über"], "SPEC commit: every contract of the commit")
+
     def test_a_usage_error_prints_nothing_to_run(self):
         done = subprocess.run([sys.executable, f"{TESTS}/contracts.py", "pick"], cwd=self.repo, capture_output=True,
                               text=True, input="", timeout=60)

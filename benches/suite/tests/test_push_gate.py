@@ -505,11 +505,14 @@ class PushGate(Repo):
         merge's listed 2,057 paths, 95 KB). Then the request names the range instead, and its step
         makes the list on the host and hands gate-job.sh the list check.sh hashed here, whatever the
         host's git configuration."""
-        names = [f"many/{n:04}-{'x' * 100}.txt" for n in range(600)]  # 69,000 bytes of paths
+        # 69,000 bytes of paths, one outside ASCII: listed as it is, never quoted (a contract's read
+        # matches the path, review r1 of pkg/contracts-by-reads, 22 Nov 2026).
+        names = [f"many/{n:04}-{'x' * 100}.txt" for n in range(600)] + ["many/über.txt"]
         for name in names:
             (self.repo / name).parent.mkdir(exist_ok=True)
             (self.repo / name).write_text(f"{name}\n", newline="\n")
-        self.git(self.repo, "mv", "a.txt", "many/a.txt")  # a rename: listed once, by its new name
+        # A rename: listed by both its names, as what was read from where it left changed too (the same review).
+        self.git(self.repo, "mv", "a.txt", "many/a.txt")
         self.git(self.repo, "add", "-A")
         self.git(self.repo, "commit", "-q", "-m", "many")
         tip = self.git(self.repo, "rev-parse", "HEAD")
@@ -517,7 +520,7 @@ class PushGate(Repo):
         self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", ZERO))
         request = (self.fake / "job-0.toml").read_text()
         self.assertLess(len(request.encode()), 64 * 1024, "SPEC long-range: the request is over the fleet's limit")
-        listed = "".join(f"{name}\n" for name in sorted([*names, "many/a.txt"])).encode()
+        listed = "".join(f"{name}\n" for name in sorted([*names, "a.txt", "many/a.txt"])).encode()
         want = subprocess.run(["git", "hash-object", "--stdin"], input=listed, capture_output=True, check=True,
                               env=self.env).stdout.decode().strip()
         step = json.loads(re.search(r"^steps = (.*)$", request, re.M).group(1))[0]
@@ -526,8 +529,8 @@ class PushGate(Repo):
         host, order = self.root / "host-gitconfig", self.root / "host-order"
         order.write_text("many/a.txt\n")  # the rename first, where git's order has it last
         # orderFile relative to the work tree's top: no temporary path in the config to quote.
-        host.write_text("[diff]\n\trenames = false\n\trenameLimit = 1\n\torderFile = ../host-order\n"
-                        "[core]\n\tquotePath = false\n")
+        host.write_text("[diff]\n\trenames = true\n\trenameLimit = 1\n\torderFile = ../host-order\n"
+                        "[core]\n\tquotePath = true\n")
         shutil.copy(ROOT / "scripts/lib/gate-job.sh", self.repo / "scripts/lib/gate-job.sh")
         out, cache = self.root / "out", self.root / "cache"
         out.mkdir()

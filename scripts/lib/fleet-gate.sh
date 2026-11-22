@@ -115,7 +115,7 @@ if [ "$mode" != windows ] && [ "$(wc -c < "$list")" -gt 16384 ]; then
   long=1
   [ -n "$base" ] && base=$(git rev-parse -q --verify "$base^{commit}") || no_verdict "a list this long needs its base"
 fi
-from_git='l=$(git -c diff.renames=true -c diff.renameLimit=1000 -c core.quotePath=true diff -O/dev/null --name-only "$4" "$5") || exit 3
+from_git='l=$(git -c core.quotePath=false diff --no-renames -O/dev/null --name-only "$4" "$5") || exit 3
 IFS="
 "; set -f; set -- "$1" "$2" "$3" -- $l; exec bash scripts/lib/gate-job.sh "$@"'
 job=$(mktemp)
