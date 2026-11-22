@@ -1892,7 +1892,7 @@ class Parts(unittest.TestCase):
             logs = Path(tmp)
             (logs / "w3c_owl2_rl.log").write_text(
                 "W3C OWL 2 RL test cases (RDF-based semantics): 86 passed, 0 failed (0 expected), 3 skipped\n"
-                "test result: ok. 1 passed; 0 failed; 0 ignored\n")
+                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.50s\n")
             (logs / "w3c_shacl.log").write_text("W3C SHACL Core: 98 of 98 pass\n")
             (logs / "w3c_sparql11.log").write_text(
                 "W3C SPARQL 1.1 on engine v2: passed / failed / skipped (failures shared with the reference)\n"
@@ -1911,6 +1911,112 @@ class Parts(unittest.TestCase):
             self.assertEqual(errors, ["SHACL-SPARQL: no counts (its kit didn't run, or its data was missing)"])
             counts["OWL 2 RL"]["skipped"] = 89
             self.assertIn("OWL 2 RL: 89 skipped, at most 3 known", gate_module.w3c_check(counts, expected))
+
+    def test_every_runners_summary_lines_are_counted(self):
+        """Each W3C runner's own summary lines, as they print them, give its suite's counts; per-manifest
+        lines are summed under the suite, and a runner's listed failures are `known`, apart from `failed`."""
+        log = "\n".join([
+            "W3C OWL 2 QL test cases (Direct Semantics): 120 passed, 9 failed (9 expected), 4 skipped; 30 conclusions "
+            "asked as queries, 2 through anonymous individuals",
+            "W3C RDF syntax suites: passed / failed",
+            "  untested http://x/y: the test type rdft:X is not run by this runner",
+            "  rdf11/rdf-turtle: 290 / 1",
+            "  rdf11/rdf-xml: 160 / 0",
+            "  rdf12/rdf-turtle/syntax: 80 / 0",
+            "W3C JSON-LD 1.1 suites: passed / failed / not run",
+            "  toRdf-manifest.jsonld: 400 / 0 / 50",
+            "  expand-manifest.jsonld: 350 / 0 / 20",
+            "W3C RDFC-1.0: 82 of 82 passed",
+            "W3C N3 parser suites: passed / failed (expected failures)",
+            "  manifest-parser.ttl: 300 / 1 (1)",
+            "  manifest-extended.ttl: 200 / 0 (0)",
+            "N3 reasoner tests: 90 in scope, 90 passed; 30 out of scope:",
+            "   12  builtins not supported",
+            "sparql10 PositiveQuery: 300/300",
+            "sparql11 NegativeUpdate: 40/41",
+            "400 ontologies of species DL checked",
+            "280 test cases compared",
+            "75 ontologies in both syntaxes compared, 900 axioms",
+        ])
+        counts = gate_module.log_counts(log)
+        self.assertEqual(counts["OWL 2 QL"], {"passed": 120, "failed": 0, "known": 9, "skipped": 4})
+        self.assertEqual(counts["RDF 1.1 syntax"], {"passed": 450, "known": 1, "groups": 2})
+        self.assertEqual(counts["RDF 1.2 syntax"], {"passed": 80, "known": 0, "groups": 1})
+        self.assertEqual(counts["JSON-LD 1.1"], {"passed": 750, "failed": 0, "skipped": 70, "groups": 2})
+        self.assertEqual(counts["RDFC-1.0"], {"passed": 82, "failed": 0})
+        self.assertEqual(counts["N3 parser"], {"passed": 500, "failed": 0, "known": 1, "groups": 2})
+        self.assertEqual(counts["N3 reasoner"], {"passed": 90, "failed": 0, "skipped": 30})
+        self.assertEqual(counts["SPARQL syntax"], {"passed": 340, "known": 1, "groups": 2})
+        self.assertEqual(counts["OWL 2 RDF/XML round trip"], {"checked": 400})
+        self.assertEqual(counts["OWL 2 profiles"], {"checked": 280})
+        self.assertEqual(counts["OWL 2 functional syntax"], {"checked": 75})
+        # A per-manifest line counts only under its runner's own heading.
+        self.assertNotIn("RDF 1.1 syntax", gate_module.log_counts("  rdf11/rdf-turtle: 290 / 1\n"))
+
+    def test_a_summary_the_gate_cannot_trust_fails_its_suite(self):
+        """Run serially, libtest puts `test NAME ... ` before a test's first line: still counted. A manifest
+        reported twice, or a part larger than its whole, makes the suite unreadable, which fails it, so a
+        duplicate can't make up for a missing line and a negative count can't cancel a failure."""
+        serial = gate_module.log_counts("running 1 test\ntest w3c_rdfc10_suite ... W3C RDFC-1.0: 86 of 86 passed\nok\n")
+        self.assertEqual(serial["RDFC-1.0"], {"passed": 86, "failed": 0})
+        twice = gate_module.log_counts("W3C JSON-LD 1.1 suites: passed / failed / not run\n"
+                                       "  toRdf-manifest.jsonld: 455 / 0 / 12\n  toRdf-manifest.jsonld: 455 / 0 / 12\n")
+        self.assertEqual(twice["JSON-LD 1.1"], {"unreadable": "toRdf-manifest.jsonld reported twice"})
+        for log, suite in (("W3C RDFC-1.0: 86 of 85 passed\n", "RDFC-1.0"),
+                           ("W3C N3 parser suites: passed / failed (expected failures)\n"
+                            "  manifest-parser.ttl: 300 / 1 (1)\n  manifest-extended.ttl: 200 / 1 (2)\n", "N3 parser"),
+                           ("sparql11 PositiveQuery: 12/11\n", "SPARQL syntax")):
+            counts = gate_module.log_counts(log)
+            self.assertIn("unreadable", counts[suite], log)
+            self.assertEqual(gate_module.w3c_check(counts, {suite: {"passed": 1}}),
+                             [f"{suite}: its summary can't be read ({counts[suite]['unreadable']})"])
+        # A kit declared without a suite would pass on its exit code alone.
+        _, _, bad = gate_module.load_w3c_expected('[kit."a:b"]\nsuites = []\n')
+        self.assertIn("at least one", " ".join(bad))
+
+    def test_listed_failures_are_counted_exactly_and_checks_at_least(self):
+        """A list that grows or shrinks fails until w3c-expected.toml states the new count; a runner that
+        counts what it checked must check at least its stated number."""
+        expected = {"OWL 2 QL": {"passed": 120, "known": 9}, "OWL 2 profiles": {"checked": 280}}
+        counts = {"OWL 2 QL": {"passed": 120, "failed": 0, "known": 9}, "OWL 2 profiles": {"checked": 280}}
+        self.assertEqual(gate_module.w3c_check(counts, expected), [])
+        for known in (7, 11):
+            counts["OWL 2 QL"]["known"] = known
+            self.assertEqual(gate_module.w3c_check(counts, expected), [
+                f"OWL 2 QL: {known} listed failures, 9 stated (w3c-expected.toml changes with the list)"])
+        counts["OWL 2 QL"]["known"] = 9
+        counts["OWL 2 profiles"]["checked"] = 279
+        self.assertEqual(gate_module.w3c_check(counts, expected),
+                         ["OWL 2 profiles: 279 checked, at least 280 required"])
+        # A suite that states neither a pass nor a check count above 0 is refused when the file is read:
+        # `0 of 0 passed` would meet it.
+        for counts in ("skipped = 1", "passed = 0", "checked = 0"):
+            _, _, bad = gate_module.load_w3c_expected(f'[kit."a:b"]\nsuites = ["S"]\n[suite."S"]\n{counts}\n')
+            self.assertEqual(bad, ["S: no passed or checked count above 0"], counts)
+
+    def test_a_summary_is_read_whole_and_every_manifest_is_reported(self):
+        """Each summary pattern takes the whole line (a trailing `0bad` is no count), a suite reported per
+        manifest is held to its stated number of manifests, and GeoSPARQL's parts add up to its whole."""
+        garbled = gate_module.log_counts("W3C SPARQL 1.1 on engine v2: passed / failed / skipped\n"
+                                         "  total: 531 / 0 / 0bad (0)\n")
+        self.assertNotIn("SPARQL 1.1", garbled)
+        # Round 3's witnesses: a QL summary with a tail of its own, and a libtest footer cut short.
+        ql = "W3C OWL 2 QL test cases (Direct Semantics): 51 passed, 9 failed (9 expected), 2 skipped"
+        self.assertIn("OWL 2 QL", gate_module.log_counts(ql + "\n"))
+        self.assertNotIn("OWL 2 QL", gate_module.log_counts(ql + "; garbage\n"))
+        footer = "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.25s"
+        self.assertEqual(gate_module.log_counts(footer + "\n")["test results"], {"passed": 0, "failed": 1})
+        self.assertNotIn("test results", gate_module.log_counts("test result: ok. 0 passed; 0 failed;\n"))
+        self.assertNotIn("test results", gate_module.log_counts(footer.removesuffix("s") + "\n"))
+        one_missing = gate_module.log_counts("W3C JSON-LD 1.1 suites: passed / failed / not run\n"
+                                             "  toRdf-manifest.jsonld: 900 / 0 / 12\n"
+                                             "  expand-manifest.jsonld: 376 / 0 / 9\n")
+        self.assertEqual(gate_module.w3c_check(one_missing, {"JSON-LD 1.1": {"passed": 884, "groups": 3,
+                                                                             "skipped": 22}}),
+                         ["JSON-LD 1.1: 2 manifests reported, 3 stated"])
+        geo = gate_module.log_counts("GeoSPARQL compliance benchmark: 194 of 193 queries match the reference, "
+                                     "18 don't (18 disputed)\n")
+        self.assertIn("unreadable", geo["GeoSPARQL"])
 
     def test_the_jobs_run_the_whole_gate_in_blocks_asking_by_capability_one_set(self):
         """The gate asks by capability, never a host, and goes as one set.

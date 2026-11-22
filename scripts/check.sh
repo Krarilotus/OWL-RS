@@ -36,7 +36,7 @@
 #                                  probes:: module); the generated-views drift tests, always; one
 #                                  seed of their random tests (push's first); the state explorer's
 #                                  targets (scripts/lib/explorer-targets.txt); the guards that need
-#                                  no build. Its pass is its own tier's (scripts/lib/gate-key.sh):
+#                                  no build; the suite contracts by push's rule. Its pass is its own tier's (scripts/lib/gate-key.sh):
 #                                  it never stands for a push pass, lands nothing, and says nothing
 #                                  of the crates depending on them.
 #        scripts/check.sh windows [COMMIT]
@@ -74,7 +74,7 @@
 # Tests run under cargo-nextest (every test of every binary in parallel, with the features of
 # the crates the run selects): the fleet's gate jobs install the pinned one
 # (scripts/lib/gate-tools.txt; scripts/lib/gate-job.sh, scripts/lib/windows-job.sh), and the
-# Windows job gives no verdict without it (NRESE_NEXTEST_REQUIRED). A run without it elsewhere
+# gate jobs give no verdict without it (NRESE_NEXTEST_REQUIRED). A run without it elsewhere
 # uses cargo test, crate by crate. So the push tier checks that each crate it tests compiles
 # alone, with its own features (crates_alone).
 # Builds go through scripts/cargo-guarded.sh. Every step runs; the summary lists
@@ -109,7 +109,8 @@ step() {
   results+=("$code  $name ($((SECONDS - start)) s)")
   echo "=== $name: exit $code"
 }
-# Where the run's job requires a version (NRESE_NEXTEST_REQUIRED, scripts/lib/windows-job.sh), cargo
+# Where the run's job requires a version (NRESE_NEXTEST_REQUIRED, scripts/lib/gate-job.sh and
+# scripts/lib/windows-job.sh), cargo
 # must run exactly that one, asked right before the tests; any other, or none, ends the run with 3, no
 # verdict: never cargo test or another runner in its place. Elsewhere (a developer's run) any
 # cargo-nextest whose version command succeeds is used.
@@ -441,17 +442,20 @@ w3c_data() {
 side_steps() {
   local files=("$@")
   guards "${files[@]}"
-  # The suite contracts test the gate's own scripts and hooks too (test_push_gate, test_full_gate,
-  # test_commit_tier, ...): a change to them runs the contracts.
-  if printf '%s\n' "${files[@]}" | grep -qE '^(benches/suite/|scripts/|\.githooks/)'; then
-    step "suite contracts" python benches/suite/tests/isolation.py discover -s benches/suite/tests
-  fi
+  suite_contracts "${files[@]}"
   if printf '%s\n' "${files[@]}" | grep -qE '^benches/nrese-bench-harness/'; then
     harness
   fi
   if printf '%s\n' "${files[@]}" | grep -qE '^apps/nrese-console/'; then
     console
   fi
+}
+# The suite contracts, the push and quick tiers' one rule: they test the gate's own scripts and
+# hooks too (test_push_gate, test_quick_check, test_commit_tier, ...), so a change to them runs the
+# contracts.
+suite_contracts() {
+  printf '%s\n' "$@" | grep -qE '^(benches/suite/|scripts/|\.githooks/)' || return 0
+  step "suite contracts" python benches/suite/tests/isolation.py discover -s benches/suite/tests
 }
 # Of those, the guards that build nothing (the quick tier's too).
 guards() {
@@ -751,7 +755,8 @@ case "$mode" in
   quick)
     # The push tier's own steps on the gate's file list, fewer (the header): what finds a mechanical
     # fault of the changed crates in minutes. Not the dependents' tests, the changed crates' other
-    # integration tests, Miri, the W3C suites, the suite contracts, the bench harness or the console.
+    # integration tests, Miri, the W3C suites, the bench harness or the console. The suite contracts
+    # by push's rule (suite_contracts): a change to the gate's own scripts is checked before review.
     if [ -z "${NRESE_FILES_FROM:-}" ]; then
       echo "check.sh quick on a build host needs the gate's file list (NRESE_FILES_FROM): not run" >&2
       exit 2
@@ -783,6 +788,7 @@ case "$mode" in
       fi
     fi
     guards "${files[@]}"
+    suite_contracts "${files[@]}"
     ;;
   windows)
     # Inside its fleet job only, which readies the Windows host (scripts/lib/windows-job.sh).
