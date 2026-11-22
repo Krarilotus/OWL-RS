@@ -32,7 +32,7 @@ its manual.
 | What | Where |
 |---|---|
 | Build, test, format, land: the gate's tiers | `scripts/check.sh commit\|push\|windows\|all`, [CONTRIBUTING.md](../CONTRIBUTING.md#checks), and the hooks in `.githooks/` |
-| Builds and tests on other machines | fleet jobs, which the push hook and `scripts/check.sh windows` submit ([CONTRIBUTING.md](../CONTRIBUTING.md#building-and-measuring)), through `scripts/lib/fleet-job.sh` and `scripts/lib/gate-job.sh` |
+| Builds and tests on other machines | fleet jobs, which the push hook and `scripts/check.sh windows` submit ([CONTRIBUTING.md](../CONTRIBUTING.md#what-runs-only-on-the-projects-machines)), through `scripts/lib/fleet-job.sh` and `scripts/lib/gate-job.sh` |
 | The release gate | `scripts/release-gate.sh` (its header), the checklist §4 in [plan/2026-10-05-v2-merge-checklist.md](plan/2026-10-05-v2-merge-checklist.md), and the approved trade-offs and exceptions in `benches/release-tradeoffs.toml` |
 | Benchmarks: cases, workloads, systems, results | [benches/README.md](../benches/README.md), with the cases in `benches/cases/`, the catalogue [benches/CATALOG.md](../benches/CATALOG.md), the generated [STATUS](../benches/STATUS.md) and [STANDINGS](../benches/STANDINGS.md), and the runner `benches/suite/suite.py` |
 | Timing a change against its base, or bisecting a slowdown (one family per candidate commit) | `benches/suite/abba.py` on the fleet, [benches/abba/README.md](../benches/abba/README.md), and the rules in [benches/PROTOCOL.md](../benches/PROTOCOL.md) |

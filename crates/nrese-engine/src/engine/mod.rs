@@ -78,7 +78,7 @@ pub use snapshot::{
     SnapshotIdentity, TextScope,
 };
 pub use transaction::{CommitSummary, Transaction};
-pub use writer::{CommitNote, Finished, NoteError, WriterHeld};
+pub use writer::{CommitNote, CommitPublication, Finished, NoteError, WriterHeld};
 
 /// `slot` (the writer or checkpoint slot, `name`d), taken if free; otherwise waited for off
 /// the Rayon pool, and refused on a pool thread ([`EngineError::SlotBusy`]). Its holder runs

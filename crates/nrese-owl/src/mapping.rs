@@ -616,6 +616,16 @@ impl AnnotationProperties {
     pub fn contains(&self, term: Term) -> bool {
         self.1.contains(&term)
     }
+
+    /// The `(predicate, object)` of a declaration, in either spelling, where both are known.
+    pub fn declaring(&self) -> impl Iterator<Item = [Term; 2]> + '_ {
+        self.0.iter().filter_map(|&[p, o]| Some([p?, o?]))
+    }
+
+    /// The annotation properties read so far, the built-in ones included.
+    pub fn properties(&self) -> impl Iterator<Item = Term> + '_ {
+        self.1.iter().copied()
+    }
 }
 
 /// `Some(id) == Some(x)` without matching an absent term.

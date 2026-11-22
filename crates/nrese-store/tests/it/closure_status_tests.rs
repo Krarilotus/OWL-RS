@@ -1628,10 +1628,13 @@ fn owl2_rl_reads_only_the_mappings_spelling_of_a_max_cardinality() {
     assert!(wrong.is_empty(), "spellings read otherwise: {wrong:#?}");
 }
 
-/// The rule sets read a property's domain, range and super-property whatever its typing
-/// (prp-dom, prp-rng, prp-spo1; rdfs2, rdfs3, rdfs7): one typed OWL 1's
-/// `owl:OntologyProperty`, which the OWL 2 mapping reads as an annotation property, has
-/// them in the `owl2-rl`, `owl2-ql` and `rdfs` closures, the rewriting on or off.
+/// The RDF-Based rule sets read a property's domain, range and super-property whatever its
+/// typing (prp-dom, prp-rng, prp-spo1; rdfs2, rdfs3, rdfs7): one typed OWL 1's
+/// `owl:OntologyProperty` has them in the `owl2-rl` and `rdfs` closures, the rewriting on or
+/// off. Under `owl2-ql` (Direct Semantics) the OWL 2 mapping reads that property as an
+/// annotation property (Mapping to RDF §3.1.2, Table 6), and annotations "have no semantic
+/// meaning in OWL 2" (Direct Semantics §1): its domain and range type nothing there, and its
+/// super-property gets none of its statements, the rewriting on or off.
 #[test]
 fn the_rule_sets_read_an_ontology_propertys_schema() {
     let data = ":note a owl:OntologyProperty ; rdfs:domain :C ; rdfs:range :D ; \
@@ -1640,14 +1643,21 @@ fn the_rule_sets_read_an_ontology_propertys_schema() {
     for (ruleset, ql) in [
         (Ruleset::Owl2Rl, QlRewritingMode::Auto),
         (Ruleset::Owl2Rl, QlRewritingMode::On),
-        (Ruleset::Owl2Ql, QlRewritingMode::Auto),
-        (Ruleset::Owl2Ql, QlRewritingMode::Off),
         (Ruleset::Rdfs, QlRewritingMode::Auto),
     ] {
         let store = closure(data, ruleset, ql);
         let (text, status) = answer(&store, "ASK { :x a :C . :v a :D . :x :q :v }");
         if !text.contains("true") {
             wrong.push(format!("{} {ql:?}: {text} {status:?}", ruleset.name()));
+        }
+    }
+    for ql in [QlRewritingMode::Auto, QlRewritingMode::Off] {
+        let store = closure(data, Ruleset::Owl2Ql, ql);
+        for question in ["ASK { :x a :C }", "ASK { :v a :D }", "ASK { :x :q :v }"] {
+            let (text, status) = answer(&store, question);
+            if !text.contains("false") {
+                wrong.push(format!("owl2-ql {ql:?}, {question}: {text} {status:?}"));
+            }
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
