@@ -9,6 +9,10 @@ const SAME_AS: &str = "http://www.w3.org/2002/07/owl#sameAs";
 /// Restriction for the known gaps `sameas-insert-unchecked` and `sameas-removal-unchecked`,
 /// removed with them: a step changes no `owl:sameAs`; the start state may hold some.
 const STEPS_CHANGE_SAME_AS: bool = false;
+/// Restriction for the known gap `shapes-change-repeats-shared-result`, removed with it: the
+/// shapes a step changes to have no `sh:property`, the only nesting that reports a child's
+/// results, so full validation reports no result twice; the start's shapes may.
+const SHAPES_CHANGES_MAY_REPEAT: bool = false;
 const OBJECTS: [&str; 5] = ["\"a\"", "\"a\"@en", "\"a\"@de", "1", "\"1\"^^xsd:decimal"];
 const TEMPLATES: [&str; 2] = [
     "SELECT $this ?value WHERE { $this <http://example.com/p0> ?value FILTER(isLiteral(?value)) }",
@@ -26,7 +30,7 @@ pub(super) fn case(index: u64) -> Case {
     let rng = &mut Rng(seed(index));
     let mut asserted = initial(rng, 14, false);
     let mut inferred = initial(rng, 8, true);
-    let mut case = Case::new(shapes(rng), "", Step::default());
+    let mut case = Case::new(shapes(rng, true), "", Step::default());
     case.asserted = asserted.clone();
     case.inferred = inferred.clone();
     case.steps.clear();
@@ -46,7 +50,7 @@ pub(super) fn case(index: u64) -> Case {
             remove: difference(&old_asserted, &asserted),
             infer: difference(&inferred, &old_inferred),
             retract: difference(&old_inferred, &inferred),
-            shapes: (rng.below(3) == 0).then(|| shapes(rng)),
+            shapes: (rng.below(3) == 0).then(|| shapes(rng, SHAPES_CHANGES_MAY_REPEAT)),
         });
     }
     case.equality = case
@@ -135,7 +139,7 @@ fn path(rng: &mut Rng, depth: u8) -> String {
     }
 }
 
-fn shapes(rng: &mut Rng) -> String {
+fn shapes(rng: &mut Rng, nested_results: bool) -> String {
     let names = (0..=rng.below(4))
         .map(|i| {
             if rng.below(2) == 0 {
@@ -155,7 +159,8 @@ fn shapes(rng: &mut Rng) -> String {
             _ => format!("sh:targetObjectsOf ex:p{}", rng.below(4)),
         };
         write!(turtle, "{name} {target} ; sh:path {}", path(rng, 2)).unwrap();
-        let mut options = (0..14).collect::<Vec<_>>();
+        // Kind 13 is `sh:property`.
+        let mut options = (0..if nested_results { 14 } else { 13 }).collect::<Vec<_>>();
         for _ in 0..=rng.below(3) {
             let kind = options.swap_remove(rng.below(options.len() as u64) as usize);
             write!(turtle, " ; {}", constraint(rng, &names, kind)).unwrap();

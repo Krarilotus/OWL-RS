@@ -25,7 +25,8 @@ impl Shrunk {
             return false;
         }
         self.attempts += 1;
-        let same = matches!(check(&attempt), Verdict::Fail(shown) if shown == signature);
+        // Only draws are shrunk, and no entry names a draw.
+        let same = matches!(check(&attempt, "", &[]), Verdict::Fail(shown) if shown == signature);
         if same {
             self.case = attempt;
         }

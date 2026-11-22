@@ -1,36 +1,34 @@
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::case::Case;
-use super::gaps::EntryPoint;
-use super::observe::{Deviation, compare};
+use super::gaps::{Allowances, Gap, Kind, Location};
+use super::observe::compare;
 use super::stops::Outcome;
 use super::{draw, matrix, shrink, witnesses};
 
 /// Draws per invocation; each seed draws different cases.
 const DRAWS: u64 = 64;
-/// Restriction for the known gap `shapes-change-repeats-shared-result`, removed with it: in
-/// a shapes change, the new results the later validation repeats are left out of the
-/// comparison; everything else of the case is compared.
-const SHAPES_CHANGES_MAY_REPEAT: bool = false;
 
 pub(super) enum Verdict {
     /// With the number of evaluations whose change introduces a result: draws that never
     /// do test little.
     Pass(usize),
-    LeftOut(&'static str),
     /// The first deviation, stop or error: its step, entry point and delta.
     Fail(String),
 }
 
-/// Runs every step of `case` through both entry points and compares each with full validation.
-pub(super) fn check(case: &Case) -> Verdict {
+/// Runs every step of `case` through both entry points and compares each exactly with full
+/// validation. Only a verified entry of `gaps` at `location`, the case's own selector,
+/// accepts a deviation, and an entry there that accepts none is closed.
+pub(super) fn check(case: &Case, location: &str, gaps: &[Gap]) -> Verdict {
     let evaluations = match case.run() {
         Ok(evaluations) => evaluations,
         Err(error) => return Verdict::Fail(format!("error: {error}")),
     };
-    let (mut introducing, mut left_out) = (0, false);
+    let mut allowance = Allowances::default();
+    let mut introducing = 0;
     for evaluation in &evaluations {
         let new = |key| !evaluation.before.results.contains_key(key);
         introducing += usize::from(evaluation.after.results.keys().any(new));
@@ -38,27 +36,25 @@ pub(super) fn check(case: &Case) -> Verdict {
         let Outcome::Report(actual) = &evaluation.actual else {
             return Verdict::Fail(format!("{at}: unexpected stop {:?}", evaluation.actual));
         };
-        let mut deviation = compare(&evaluation.before, &evaluation.after, actual);
-        if !SHAPES_CHANGES_MAY_REPEAT && evaluation.entry == EntryPoint::Shapes {
-            // Only a repeat as often as full validation repeats the key; a missed result or
-            // any other count of it stays a deviation.
-            let repeated: BTreeMap<_, _> = (evaluation.after.results.iter())
-                .filter(|(key, count)| **count > 1 && new(*key))
-                .map(|(key, count)| (format!("{key:?}"), *count))
-                .collect();
-            let before = deviation.results.len();
-            (deviation.results).retain(|key, count| repeated.get(key) != Some(&count.actual));
-            left_out |= deviation.results.len() < before;
-        }
-        if deviation != Deviation::default() {
-            return Verdict::Fail(format!("{at}: {deviation:?}"));
+        let deviation = compare(&evaluation.before, &evaluation.after, actual);
+        let here = Location {
+            case: location,
+            step: evaluation.step,
+            entry: evaluation.entry,
+        };
+        for kind in [Kind::Result, Kind::Failure] {
+            if !kind.select(&deviation).is_empty()
+                && allowance.forgive(gaps, &here, kind, &deviation).is_none()
+            {
+                return Verdict::Fail(format!("{at}: {deviation:?}"));
+            }
         }
     }
-    if left_out {
-        Verdict::LeftOut("shapes-change-repeats-shared-result")
-    } else {
-        Verdict::Pass(introducing)
+    let ran = BTreeSet::from([location.to_owned()]);
+    if let Some(closed) = allowance.unused(gaps, &ran).first() {
+        return Verdict::Fail(format!("{closed} shows nothing: fixed, delete the entry"));
     }
+    Verdict::Pass(introducing)
 }
 
 /// Where a failing case's fixtures go: a path its replay line determines, made safe for
@@ -133,8 +129,17 @@ pub(super) fn run() {
             vec![(index.to_string(), draw::case(index), None)]
         }
     };
+    // A saved case is compared exactly; only a verified entry at its own selector accepts a
+    // deviation. No entry names a draw.
+    let saved = selector
+        .as_deref()
+        .is_some_and(|case| case.starts_with("saved:"));
+    let gaps = if saved {
+        witnesses::verified_gaps()
+    } else {
+        Vec::new()
+    };
     let (mut equality, mut shapes_edits, mut inferred_edits, mut introducing) = (0, 0, 0, 0);
-    let mut left_out = BTreeMap::<_, usize>::new();
     let mut failures = Vec::new();
     for (selector, case, recorded) in &draws {
         equality += usize::from(case.equality);
@@ -142,9 +147,9 @@ pub(super) fn run() {
             shapes_edits += usize::from(step.shapes.is_some());
             inferred_edits += usize::from(!step.infer.is_empty() || !step.retract.is_empty());
         }
-        let verdict = check(case);
-        // A saved fixture must still show what it recorded, restriction or not.
-        if let (Some(recorded), Verdict::Pass(_) | Verdict::LeftOut(_)) = (recorded, &verdict) {
+        let verdict = check(case, selector, &gaps);
+        // A saved fixture must still show what it recorded.
+        if let (Some(recorded), Verdict::Pass(_)) = (recorded, &verdict) {
             let replay = replay("random_changes", &outer, selector);
             failures.push(format!(
                 "{replay}\nchanged: the saved case recorded {recorded}, now it shows none"
@@ -153,7 +158,6 @@ pub(super) fn run() {
         }
         match verdict {
             Verdict::Pass(evaluations) => introducing += evaluations,
-            Verdict::LeftOut(restriction) => *left_out.entry(restriction).or_default() += 1,
             Verdict::Fail(signature) => {
                 let replay = replay("random_changes", &outer, selector);
                 let changed = (recorded.as_ref())
@@ -197,7 +201,7 @@ pub(super) fn run() {
     }
     println!(
         "{} draws: {equality} with equality, {shapes_edits} shapes edits, {inferred_edits} \
-         inferred edits, {introducing} evaluations introducing results; left out {left_out:?}",
+         inferred edits, {introducing} evaluations introducing results",
         draws.len()
     );
     if let Some(first) = failures.first() {
