@@ -1857,7 +1857,7 @@ mod tests {
     /// store gives it, without the server's data directory.
     fn may_be_listed(load: &str) -> String {
         format!(
-            "This load's quarantine may have been kept as quarantine/load-{load}.jsonl in the store's data directory. If that file is there, don't send it again. If it isn't, sending it again is safe."
+            "This load's quarantine may have been kept as quarantine/load-{load}.jsonl in the store's data directory. If that file is there, don't send it again. If it isn't, sending it again is safe. If the server restarts before you send it again, check again."
         )
     }
 

@@ -159,7 +159,7 @@ fn kept_quarantine_without_publication_says_when_to_load_again()
     assert_eq!(
         line,
         format!(
-            "Error: the load published nothing. The quarantine record couldn't be kept: the quarantine's directory sync failed (a test's). This load's quarantine may have been kept as quarantine/load-{load}.jsonl in the server's data directory. If that file is there, don't load it again. If it isn't, loading it again is safe."
+            "Error: the load published nothing. The quarantine record couldn't be kept: the quarantine's directory sync failed (a test's). This load's quarantine may have been kept as quarantine/load-{load}.jsonl in the server's data directory. If that file is there, don't load it again. If it isn't, loading it again is safe. If the server restarts before you load it again, check again."
         )
     );
     assert!(!output.status.success(), "{}", output.status);

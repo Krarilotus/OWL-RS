@@ -1099,9 +1099,61 @@ async fn kept_quarantine_without_publication_says_when_to_send_again() {
     assert_eq!(
         detail,
         format!(
-            "the load published nothing. The quarantine record couldn't be kept: the quarantine's directory sync failed (a test's). This load's quarantine may have been kept as quarantine/load-{load}.jsonl in the server's data directory. If that file is there, don't send it again. If it isn't, sending it again is safe."
+            "the load published nothing. The quarantine record couldn't be kept: the quarantine's directory sync failed (a test's). This load's quarantine may have been kept as quarantine/load-{load}.jsonl in the server's data directory. If that file is there, don't send it again. If it isn't, sending it again is safe. If the server restarts before you send it again, check again."
         )
     );
+}
+
+/// An import job that published nothing, whose quarantine file was placed but couldn't be
+/// made durable or taken back: failed, saying when sending (an upload) or loading (the
+/// import directory's files) it again is safe, and to check again after a restart.
+#[tokio::test]
+async fn kept_quarantine_without_publication_fails_import_jobs_saying_when_to_retry() {
+    let jobs = [
+        (
+            "/api/v1/repositories/nrese/import?async=true",
+            "application/n-triples",
+            INVALID_UPLOAD,
+            "send",
+        ),
+        (
+            "/api/v1/repositories/nrese/import/files",
+            "application/json",
+            r#"{"files":["invalid.nt"]}"#,
+            "load",
+        ),
+    ];
+    for (uri, content_type, body, retry) in jobs {
+        let dir = tempfile::tempdir().unwrap();
+        let files = tempfile::tempdir().unwrap();
+        std::fs::write(files.path().join("invalid.nt"), INVALID_UPLOAD).unwrap();
+        let state = crate::support::test_state_with_store_config(
+            StoreConfig::on_disk(dir.path()),
+            PolicyConfig {
+                import_directory: Some(files.path().to_path_buf()),
+                ..PolicyConfig::default()
+            },
+            ReasonerConfig::default(),
+        )
+        .unwrap();
+        let store = state.store();
+        store.quarantine().fail_next_placement_sync();
+        store.quarantine().fail_next_record_removal();
+        let app = nrese_server::build_app(state);
+        let (status, text) = send(&app, Method::POST, uri, Some(content_type), body).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{uri}: {text}");
+        let started: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let job = finished(&app, started["path"].as_str().expect(&text)).await;
+        assert_eq!(job["state"], "failed", "{uri}: {job}");
+        let load = listed_load(&store);
+        assert_eq!(
+            job["error"],
+            format!(
+                "the load published nothing. The quarantine record couldn't be kept: the quarantine's directory sync failed (a test's). This load's quarantine may have been kept as quarantine/load-{load}.jsonl in the server's data directory. If that file is there, don't {retry} it again. If it isn't, {retry}ing it again is safe. If the server restarts before you {retry} it again, check again."
+            ),
+            "{uri}"
+        );
+    }
 }
 
 /// An upload that published nothing, whose quarantine file may have been kept: the answer
