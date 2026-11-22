@@ -1709,9 +1709,9 @@ fn aliases_leave_a_key_built() {
     }
 }
 
-/// A reopen with current reasoning, without a rebuild, keeps the prp-key answer and marks no
-/// list: the answer is true, sound and not `complete`, and its one reason is the reopen's
-/// (whether the rules equated two literals since the last rebuild isn't recorded,
+/// A reopen with current reasoning (OWL 2 RL), without a rebuild, keeps the prp-key answer and
+/// marks no list: the answer is true, sound and not `complete`, and its one reason is the
+/// reopen's (whether the rules equated two literals since the last rebuild isn't recorded,
 /// docs/limits.md). The `complete` comes back
 /// after a rebuild.
 #[test]
