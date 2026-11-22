@@ -666,12 +666,11 @@ async fn the_shapes_are_counted_again_when_the_shapes_graph_changes() -> TestRes
         "{SHAPES}\nex:Named a sh:NodeShape ; sh:targetClass ex:Person ; sh:nodeKind sh:IRI ."
     );
     put(&app, SHAPES_GRAPH, &more).await?;
-    let gate = gate_state(&app).await?;
-    assert_eq!(gate["shapes"], 3, "{gate}");
-    assert!(
-        gate["revision"].as_u64().is_some_and(|now| now > compiled),
-        "{gate}"
-    );
+    let after = report(&app, "/dataset/info").await?;
+    assert_eq!(after["shacl"]["shapes"], 3, "{after}");
+    let written = info["revision"].as_u64().expect("the data revision") + 1;
+    assert_eq!(after["revision"], written, "{after}");
+    assert_eq!(after["shacl"]["revision"], written, "{after}");
     Ok(())
 }
 
@@ -771,5 +770,50 @@ async fn a_restart_counts_the_stored_shapes() -> TestResult {
     assert_eq!(info["shacl"]["vacuous"], false, "{info}");
     let output = server.output();
     assert!(!output.contains("SHACL gate: no shapes"), "{output}");
+    Ok(())
+}
+
+/// Spec (gate-state design §7, S5): malformed stored shapes cause an enforcing gate to
+/// warn at restart and refuse data writes until the shapes are repaired.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_with_malformed_shapes_warns_and_refuses_writes_until_repair() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let config = enforcing(dir.path())?;
+    let file = dir.path().join("malformed.ttl");
+    std::fs::write(
+        &file,
+        format!(
+            "{PREFIXES}ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:property [ sh:path \"bad\" ] ."
+        ),
+    )?;
+    {
+        let store = nrese_store::StoreService::new(StoreConfig::on_disk(dir.path().join("data")))?;
+        store.bulk_load(&nrese_store::BulkLoadRequest {
+            files: vec![file],
+            replace: false,
+            graph: nrese_store::GraphTarget::NamedGraph(SHAPES_GRAPH.to_owned()),
+            invalid: None,
+        })?;
+    }
+
+    let server = Server::start(&config).await?;
+    let info: serde_json::Value = serde_json::from_str(&server.get("/dataset/info").await?)?;
+    assert_eq!(info["shacl"].get("shapes"), Some(&serde_json::Value::Null));
+    let write = "INSERT DATA { <http://example.com/a> a <http://example.com/Person> }";
+    let refusal = server.update("nrese", write).await.unwrap_err().to_string();
+    assert!(refusal.contains("400 Bad Request"), "{refusal}");
+    let output = server.output();
+    assert!(
+        output.lines().any(|line| line.contains("WARN")
+            && line.contains("SHACL gate: the stored shapes don't compile")),
+        "{output}"
+    );
+
+    let repair = format!("CLEAR GRAPH <{SHAPES_GRAPH}>");
+    server.update("nrese", &repair).await?;
+    let info: serde_json::Value = serde_json::from_str(&server.get("/dataset/info").await?)?;
+    assert_eq!(info["shacl"]["shapes"], 0, "{info}");
+    assert_eq!(info["shacl"]["vacuous"], true, "{info}");
+    server.update("nrese", write).await?;
     Ok(())
 }
