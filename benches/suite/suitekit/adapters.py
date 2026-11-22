@@ -199,6 +199,24 @@ class Endpoint:
 
 # --- HTTP -----------------------------------------------------------------------------------
 
+# What post() and upload() answer, with status 0, when no answer came within their bound: a timeout of the cell,
+# never the other system's fault (the bench-adoption wave recorded such counts as "failed, HTTP 0").
+NO_ANSWER = "no answer within"
+
+
+def timed_out(status: int, body: str) -> bool:
+    """Whether a post() or upload() result is its bound running out."""
+    return status == 0 and body.startswith(NO_ANSWER)
+
+
+def no_answer(error: OSError, timeout: float) -> str:
+    """Status 0's body: the bound when it ran out, else the reason there was no response."""
+    reason = error.reason if isinstance(error, urllib.error.URLError) else error
+    if isinstance(reason, TimeoutError):
+        return f"{NO_ANSWER} {timeout:g} s"
+    return f"no response: {reason}"[:300]
+
+
 def post(url: str, data: dict, accept: str = "application/sparql-results+json", timeout: float = 30) -> tuple[int, str]:
     body = urllib.parse.urlencode(data).encode()
     request = urllib.request.Request(url, data=body, headers={"Accept": accept})
@@ -207,8 +225,8 @@ def post(url: str, data: dict, accept: str = "application/sparql-results+json", 
             return response.status, response.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode("utf-8", "replace")
-    except (urllib.error.URLError, ConnectionError, TimeoutError, OSError):
-        return 0, ""
+    except OSError as e:  # URLError, ConnectionError and TimeoutError among them
+        return 0, no_answer(e, timeout)
 
 
 def upload(url: str, data_source: str, path: str, content_type: str, timeout: float) -> tuple[int, str]:
@@ -226,8 +244,8 @@ def upload(url: str, data_source: str, path: str, content_type: str, timeout: fl
                     return response.status, response.read().decode("utf-8", "replace")
             except urllib.error.HTTPError as e:
                 return e.code, e.read().decode("utf-8", "replace")
-            except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
-                return 0, str(e)
+            except OSError as e:
+                return 0, no_answer(e, timeout)
     return 0, f"{path}: uploading from a Docker volume isn't supported; run with --data DIR"
 
 
@@ -284,6 +302,8 @@ def count_all(ctx: Context, endpoint: Endpoint) -> tuple[int | None, float, str]
     status, body = post(endpoint.query, {"query": "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }"},
                         timeout=ctx.timeout_s)
     ms = (time.monotonic() - started) * 1000
+    if status == 0:
+        return None, ms, body  # the bound, or why nothing answered
     if status != 200:
         return None, ms, f"HTTP {status}: {body[:200]}"
     try:
@@ -880,6 +900,7 @@ class Rdf4j(Adapter):
         created = put(endpoint.query, RDF4J_REPOSITORY, "text/turtle")
         rc = 0 if created in (200, 201, 204) else 1
         log.append(f"create repository: HTTP {created}")
+        late = False
         for path in inputs:
             if rc != 0:
                 break
@@ -892,10 +913,11 @@ class Rdf4j(Adapter):
                                     timeout=ctx.timeout_s)
             log.append(f"LOAD {path}: HTTP {status} {text[:500]}")
             rc = 0 if status in (200, 204) else 1
+            late = timed_out(status, text)
         ms = (time.monotonic() - started) * 1000
         (ctx.logs / "load.log").write_text("\n".join(log), encoding="utf-8")
         peak, kind, memory_note = self.stop_memory(ctx)
-        return Step(Measured(ms, peak, rc, memory_kind=kind, memory_note=memory_note),
+        return Step(Measured(ms, peak, rc, late, memory_kind=kind, memory_note=memory_note),
                     note="server start-up excluded; SPARQL LOAD per file")
 
     def serve(self, ctx, store, regime):
@@ -1123,7 +1145,7 @@ class Anzograph(Adapter):
         spec = Spec(ctx.name("serve"), self.images(ctx)[0], [], mounts=mounts, port=port, entrypoint=True)
         base = ctx.runtime.url(spec) + "/sparql"
         self.endpoint = self.start(ctx, spec, Endpoint(base, base), timeout_s=900)
-        started, rc, output = time.monotonic(), 0, []
+        started, rc, output, late = time.monotonic(), 0, [], False
         for path in inputs:
             path = "/bench/" + path[len("/data/"):] if path.startswith("/data/") else path
             if ctx.dry:
@@ -1132,10 +1154,11 @@ class Anzograph(Adapter):
             status, body = post(base, {"update": f"LOAD WITH 'global' <file:{path}>"}, timeout=ctx.timeout_s)
             output.append(f"{path}: HTTP {status} {body[:500]}")
             rc = rc or (0 if status == 200 else 1)
+            late = late or timed_out(status, body)
         ms = (time.monotonic() - started) * 1000
         (ctx.logs / "load.log").write_text("\n".join(output), encoding="utf-8")
         peak, kind, memory_note = memory_now(self.server)  # it serves on: its peak so far
-        return Step(Measured(ms, peak, rc, memory_kind=kind, memory_note=memory_note),
+        return Step(Measured(ms, peak, rc, late, memory_kind=kind, memory_note=memory_note),
                     note="server start-up excluded; in memory")
 
     def serve(self, ctx, store, regime):
