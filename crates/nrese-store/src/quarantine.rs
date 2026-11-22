@@ -269,8 +269,11 @@ struct State {
     resolutions: HashMap<String, Resolution>,
     /// Statements whose readmission's outcome the next open decides ([`readmit`]).
     deciding: std::collections::HashSet<String>,
-    /// Statements quarantined, resolved or not.
+    /// Statements quarantined, resolved or not, of the loads in `counted`.
     total: u64,
+    /// The loads whose statements `total` counts: a load's records can be listed without
+    /// being counted ([`Collector::commit`]).
+    counted: std::collections::HashSet<String>,
 }
 
 impl Quarantine {
@@ -293,6 +296,10 @@ impl Quarantine {
                     .lines()
                     .filter(|line| line.as_ref().is_ok_and(|line| !line.is_empty()))
                     .count() as u64;
+                // `load_files` returns only files named for a load.
+                let stem = path.file_stem().and_then(|stem| stem.to_str());
+                let load = stem.and_then(|stem| stem.strip_prefix("load-"));
+                state.counted.insert(load.unwrap_or_default().to_owned());
             }
             let resolutions = dir.join(RESOLUTIONS);
             if resolutions.exists() {
@@ -445,10 +452,18 @@ impl Quarantine {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Quarantined statements not resolved yet.
+    /// Quarantined statements not resolved yet: those counted, less the resolutions of
+    /// their loads' statements. A statement listed but not counted can be resolved too (a
+    /// file never seen under its name, `Collector::commit`); its resolution lowers no
+    /// count. The resolutions are counted at each call, not kept: no hot path asks for it.
     pub fn open_count(&self) -> u64 {
         let state = self.state();
-        state.total - state.resolutions.len() as u64
+        let resolved = state
+            .resolutions
+            .keys()
+            .filter(|id| state.counted.contains(statement_load(id)))
+            .count();
+        state.total - resolved as u64
     }
 
     /// Calls `f` with every quarantined statement and its resolution in the order they
@@ -918,6 +933,12 @@ fn load_files(dir: &Path, extension: &str) -> StoreResult<Vec<PathBuf>> {
     Ok(files.into_iter().map(|(_, _, path)| path).collect())
 }
 
+/// The load of the quarantined statement `id`, named `<load>.<file>.<offset>`
+/// ([`Collector::add`]).
+fn statement_load(id: &str) -> &str {
+    id.split_once('.').map_or(id, |(load, _)| load)
+}
+
 fn has_blank_node(term: TermRef<'_>) -> bool {
     match term {
         TermRef::BlankNode(_) => true,
@@ -1290,6 +1311,7 @@ impl Collector<'_> {
                 };
                 if seen {
                     state.total += count;
+                    state.counted.insert(self.load.clone());
                 }
                 return Err(QuarantineCommitError::PossiblyListed {
                     reason,
@@ -1301,6 +1323,7 @@ impl Collector<'_> {
         }
         state.held.append(&mut inner.held);
         state.total += count;
+        state.counted.insert(self.load.clone());
         drop(state);
         Ok(Quarantined {
             load: Some(self.load.clone()),

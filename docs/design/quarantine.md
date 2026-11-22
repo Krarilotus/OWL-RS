@@ -99,7 +99,8 @@ error. Re-admitting one takes the fixed text.
   the file was never seen there: its records are not counted, and the error says they
   may be listed. Counting them would over-count whenever the rename didn't move the
   file. The limit: if the rename did move it, the listing shows the records while the
-  open count leaves them out, until the next start counts the files again. The same can
+  open count leaves them out, until the next start counts the files again; resolving one
+  of them meanwhile lowers no count. The same can
   happen to a load that published nothing when that check fails and taking the file
   back then fails with an error other than the file not being there.
 - `resolutions.jsonl`: append-only, one record per resolved statement (`outcome`
