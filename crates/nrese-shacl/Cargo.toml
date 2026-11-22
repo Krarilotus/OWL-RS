@@ -24,6 +24,8 @@ nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
 # A request's memory envelope with a limit, for the tests of stopped validations; `measure`
 # for the compiler's memory guard (tests/compile_memory.rs).
 nrese-exec = { path = "../nrese-exec", features = ["measure"] }
+# The measured tests' data directories.
+tempfile = { workspace = true }
 
 [[test]]
 name = "w3c_shacl"
