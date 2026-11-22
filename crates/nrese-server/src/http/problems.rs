@@ -168,8 +168,12 @@ mod tests {
             .route(
                 "/long-refusal",
                 get(|| async {
-                    let kind = nrese_store::RejectKind::ShapesViolated;
-                    ApiError::rejected(kind, long_text(2 * KIB_64), None, None)
+                    ApiError::Rejected {
+                        kind: nrese_store::RejectKind::ShapesViolated,
+                        detail: long_text(2 * KIB_64),
+                        reject: Box::new(None),
+                        shacl: None,
+                    }
                 }),
             )
             .route(
