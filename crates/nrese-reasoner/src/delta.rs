@@ -2426,6 +2426,96 @@ mod budget_tests {
         assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
     }
 
+    /// Table 5 prp-adp still has the same two property assertions after adding an
+    /// unused first. Neither the bulk insert report nor the bulk filter checking
+    /// the reverse, precomputed closure may count the pair as introduced.
+    #[test]
+    fn list_form_changes_keep_the_same_pair_in_the_bulk_witness_check() {
+        let mut vocab = LocalVocabulary::default();
+        let schema = Schema::owl(&mut vocab);
+        let lists = ListVocabulary::new(&mut vocab);
+        let [list, head, tail, q, a, b, m0] = ["list", "h", "t", "q", "a", "b", "m0"]
+            .map(|local| vocab.iri(&format!("http://example.org/{local}")));
+        let [first, rest, nil] =
+            ["first", "rest", "nil"].map(|local| vocab.iri(&format!("{}{local}", crate::ir::RDF)));
+        let [kind, members] = ["AllDisjointProperties", "members"]
+            .map(|local| vocab.iri(&format!("{}{local}", crate::ir::OWL)));
+        let mut asserted = vec![
+            [list, schema.rdf_type(), kind],
+            [list, members, head],
+            [head, rest, tail],
+            [tail, first, q],
+            [tail, rest, nil],
+            [a, m0, b],
+            [a, q, b],
+        ];
+        asserted
+            .extend((0..64).map(|i| [head, first, vocab.iri(&format!("http://example.org/m{i}"))]));
+        let extra = [head, first, vocab.iri("http://example.org/m64")];
+        let mut larger = asserted.clone();
+        larger.push(extra);
+        let rules = Rules {
+            rules: &[],
+            lists: Some(&lists),
+            schema: &schema,
+            equality: None,
+        };
+        let small = MemoryBase::new(&asserted, &[]);
+        let large = MemoryBase::new(&larger, &[]);
+        let stop = crate::eval::OperationStop::new(crate::eval::NEVER);
+        let memory = Arc::new(Budget::unlimited());
+        let mut errors = Vec::new();
+        for warm in [true, false] {
+            let cache = warm.then(|| program(&small, rules));
+            let grown =
+                introduced_violations(&large, &[extra], &[], rules, cache.as_ref(), &stop, &memory)
+                    .expect("the bulk insert witness check ran");
+            if !grown.consistent() {
+                errors.push(format!("bulk 64 to 65 warm={warm}: {:?}", grown.to_vec()));
+            }
+
+            // The public bulk entry point accepts only inserts. For the reverse
+            // edit, run its consistency filter over the precomputed after state.
+            let cached = warm.then(|| program(&large, rules));
+            let computed = cached.is_none().then(|| program(&large, rules));
+            let old = cached.as_ref().or(computed.as_ref()).unwrap();
+            let after = program(&small, rules);
+            let empty = Store::default();
+            let hidden = HashSet::new();
+            let before = || Overlay {
+                base: &large,
+                hidden: &hidden,
+                extra: &empty,
+                table: old.table.as_deref(),
+            };
+            let filter = old_witness_filter(old, before, &memory, &stop);
+            let state = Overlay {
+                base: &small,
+                hidden: &hidden,
+                extra: &empty,
+                table: after.table.as_deref(),
+            };
+            let mut found = Violations::new(Arc::clone(&memory));
+            check(
+                &state,
+                &after,
+                0..after.consistency.len(),
+                &[],
+                &mut found,
+                crate::eval::NEVER,
+                Some(&filter),
+            )
+            .unwrap();
+            if !found.consistent() {
+                errors.push(format!(
+                    "bulk filter 65 to 64 warm={warm}: {:?}",
+                    found.to_vec()
+                ));
+            }
+        }
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+    }
+
     fn list_update_witnesses(cases: &[(&str, usize, bool, (usize, usize, usize))]) -> Vec<String> {
         let mut vocab = LocalVocabulary::default();
         let schema = Schema::owl(&mut vocab);

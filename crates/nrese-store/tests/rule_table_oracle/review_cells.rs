@@ -379,21 +379,58 @@ fn sixty_five_walks_with_a_clash() -> Write {
 }
 
 #[test]
-fn a_delete_under_sixty_four_walks_keeps_an_older_clash() {
-    // Design row 3, Table 5 prp-adp: a store loaded past the gates holds
-    // the clash at 65 walks. Deleting the 65th first leaves 64 walks and
-    // the same clash, so the delete is refused.
-    let mut load = sixty_five_walks_with_a_clash();
-    load.past_gates = true;
-    check(
-        case(
-            "older-clash-delete",
+fn crossing_sixty_four_walks_reports_no_introduced_clash() {
+    use crate::{judges, sweep};
+    use nrese_reasoner::ReasoningMode;
+
+    let mut errors = Vec::new();
+    for growing in [true, false] {
+        let mut load = sixty_five_walks_with_a_clash();
+        let edge = "ex:h rdf:first ex:m64";
+        let change = if growing {
+            load.insert.pop();
+            insert(edge)
+        } else {
+            delete(edge)
+        };
+        // Table 5 prp-adp finds the same pair in the two closures. The commit
+        // report is about introduced clashes, so it has none and the edit commits.
+        load.past_gates = true;
+        let cell = case(
+            "older-clash-at-a-form-change",
             ["ex:a", "ex:m0", "ex:b"],
-            vec![load, delete("ex:h rdf:first ex:m64")],
-        ),
-        &[false; 2],
-        &[true; 2],
-    );
+            vec![load.clone(), change.clone()],
+        );
+        assert!(
+            sweep::steps(&cell)
+                .iter()
+                .all(|step| step.model.inconsistent)
+        );
+        for mode in judges::MODES {
+            for warm in [true, false] {
+                let store = judges::open(mode, None);
+                assert!(!judges::load_past_gates(&store, &load));
+                let pipeline = judges::pipeline(&store, ReasoningMode::Owl2Rl);
+                if warm {
+                    assert!(judges::apply(&pipeline, &insert("ex:warm ex:tag ex:ready")));
+                }
+                let accepted = judges::apply(&pipeline, &change);
+                let run = pipeline
+                    .last_reasoning_run()
+                    .expect("the edit ran reasoning");
+                if !accepted
+                    || run.consistency_violations != 0
+                    || run.consistency_violations_at_least
+                {
+                    errors.push(format!(
+                        "growing={growing} mode={mode} warm={warm} accepted={accepted} introduced={}",
+                        run.consistency_violations
+                    ));
+                }
+            }
+        }
+    }
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
 }
 
 #[test]
