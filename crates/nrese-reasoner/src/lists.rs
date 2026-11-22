@@ -686,13 +686,12 @@ pub(crate) fn compile(
                 let mut make_walk = |members: &[u64], mut used: Vec<[u64; 3]>, unary: bool| {
                     let before = rules.len();
                     make(subject, members, rules);
-                    if unary {
-                        if rules
+                    if unary
+                        && rules
                             .get(before)
                             .is_some_and(|rule| rule.name == "cls-int1")
-                        {
-                            rules.remove(before);
-                        }
+                    {
+                        rules.remove(before);
                     }
                     used.push(axiom);
                     for class in [
