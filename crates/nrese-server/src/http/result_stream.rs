@@ -440,16 +440,15 @@ async fn hold(
     }
     if let Err(stopped) = outcome.take() {
         // The producer's own work (a query's) draws on the same envelope: refused by its
-        // limit while the hold held part of the answer, it was refused for holding it, as a
-        // refusal of the hold's own charge would be. What was held counts as it was at the
-        // refusal itself, recorded with it, not as frames queued before it and taken since
-        // leave it. Refused by the memory all queries share, its 503 is the producer's.
-        let beside = held
-            .envelope
-            .held_at_refusal()
-            .is_some_and(|bytes| bytes > 0);
+        // limit for what the hold held, it was refused for holding it, as a refusal of the
+        // hold's own charge would be. Judged at the refusal itself: something was held then,
+        // and the work had room with nothing held. Work past the envelope even with nothing
+        // held keeps its own 413, and so does a refusal before anything was held, whatever
+        // was queued then and taken since. Refused by the memory all queries share, its 503
+        // is the producer's.
+        let for_held = held.envelope.refused_for_held();
         return Err(match stopped {
-            ApiError::PayloadTooLarge(_) if beside => too_large_for_http10(bound),
+            ApiError::PayloadTooLarge(_) if for_held => too_large_for_http10(bound),
             stopped => stopped,
         });
     }

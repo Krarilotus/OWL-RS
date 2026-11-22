@@ -355,9 +355,9 @@ pub struct Budget {
     credit_cap: AtomicUsize,
     /// Whether its charges at the server's budget go through [`Self::credit`]: an envelope's.
     credits: bool,
-    /// What is held beside the request's work ([`Self::charge_beside`]), and what was when a
-    /// charge of that work was last refused here. Locked only by those charges and releases
-    /// and by a refusal of this budget's own limit, so that a refusal's count is what `used`
+    /// What is held beside the request's work ([`Self::charge_beside`]), and whether what was
+    /// caused the last refusal of that work here. Locked only by those charges and releases
+    /// and by a refusal of this budget's own limit, so that a refusal is judged by what `used`
     /// held of it then.
     beside: Mutex<Beside>,
 }
@@ -366,7 +366,9 @@ pub struct Budget {
 #[derive(Debug, Default)]
 struct Beside {
     held: usize,
-    at_refusal: Option<usize>,
+    /// The last refusal of the work by this budget's limit had room with nothing held
+    /// beside it, and something was: holding was its cause ([`Budget::refused_for_held`]).
+    refused_for_held: bool,
 }
 
 /// [`Budget::credit_cap`] before it is found.
@@ -628,7 +630,8 @@ impl Budget {
             let Some(next) = used.checked_add(bytes).filter(|&next| next <= self.limit) else {
                 if record {
                     // Decided again under the lock of what is held beside the request's work,
-                    // which `used` then holds exactly: the count recorded is the refusal's.
+                    // which `used` then holds exactly: the refusal is judged by what it held
+                    // then. Holding was its cause only where these bytes had room without it.
                     let mut beside = self.beside.lock().unwrap_or_else(PoisonError::into_inner);
                     let now = self.used.load(Ordering::Relaxed);
                     if now != used {
@@ -636,7 +639,11 @@ impl Budget {
                         continue;
                     }
                     let held = beside.held;
-                    beside.at_refusal = Some(held);
+                    beside.refused_for_held = held > 0
+                        && used
+                            .saturating_sub(held)
+                            .checked_add(bytes)
+                            .is_some_and(|next| next <= self.limit);
                     drop(beside);
                     // Before the credit is returned: see `add_credit`.
                     self.refused.store(true, Ordering::SeqCst);
@@ -660,7 +667,7 @@ impl Budget {
     /// Charges `bytes` held beside the request's work: its output, kept whole for a client
     /// that can be answered only so (an HTTP/1.0 answer). As [`Self::charge`], and counted
     /// apart, so that a later refusal of the request's own work by this budget's limit
-    /// records what was held beside it at that moment ([`Self::held_at_refusal`]).
+    /// records whether what was held beside it then caused it ([`Self::refused_for_held`]).
     pub fn charge_beside(&self, bytes: usize) -> Result<(), BudgetExceeded> {
         let mut beside = self.beside.lock().unwrap_or_else(PoisonError::into_inner);
         if let Err(refused) = self.take_as(bytes, false) {
@@ -684,13 +691,15 @@ impl Budget {
         self.release(bytes);
     }
 
-    /// What was held beside the request's work ([`Self::charge_beside`]) when a charge of
-    /// that work was last refused by this budget's own limit; `None` while none was.
-    pub fn held_at_refusal(&self) -> Option<usize> {
+    /// Whether the last refusal of the request's work by this budget's own limit was caused by
+    /// what was held beside it ([`Self::charge_beside`]) at that refusal: something was, and
+    /// the refused bytes had room with nothing held. A charge past the limit even with nothing
+    /// held is the work's own refusal. False while none was refused.
+    pub fn refused_for_held(&self) -> bool {
         self.beside
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .at_refusal
+            .refused_for_held
     }
 
     /// `bytes` charged at the levels above exactly: refused where one hasn't room, which
