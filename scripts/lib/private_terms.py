@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -101,9 +102,15 @@ def grep(patterns: str, lines: list[str]) -> list[int]:
                               input=("\n".join(lines) + "\n").encode("utf-8"), capture_output=True, timeout=300)
     except (OSError, subprocess.SubprocessError) as error:
         raise Unreadable(f"grep with the overlay's {LIST}") from error
-    if done.returncode > 1:  # 1 is no match; anything above, an error, never "no match"
+    if done.returncode not in (0, 1):  # 1 is no match; an error or a signal is never "no match"
         raise Unreadable(f"grep with the overlay's {LIST}")
-    return [int(line.split(b":", 1)[0]) - 1 for line in done.stdout.splitlines()]
+    found = []
+    for line in done.stdout.split(b"\n")[:-1]:  # grep ends its records at LF; a matched line may hold a CR
+        number = re.match(rb"([0-9]+):", line)
+        if not number:  # never the line itself in a message
+            raise Unreadable(f"grep's output with the overlay's {LIST}")
+        found.append(int(number.group(1)) - 1)
+    return found
 
 
 def git(*args: str) -> bytes:
@@ -279,4 +286,6 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
+    # A stop by SIGTERM unwinds as an exit, through the cleanup that removes the pattern file.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(128 + signal.SIGTERM))
     sys.exit(main(sys.argv[1:]))

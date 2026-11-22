@@ -174,7 +174,8 @@ class PrivateTerms(unittest.TestCase):
     # included: a backslash in brackets is a backslash, and a POSIX class is a class.
     def test_the_list_is_read_as_grep_reads_it(self):
         cases = (("a backslash in brackets", "^[ ]*[\\t]ry:$", "    try:"),
-                 ("a POSIX class", "zz[[:digit:]]+zz", "see zz42zz"))
+                 ("a POSIX class", "zz[[:digit:]]+zz", "see zz42zz"),
+                 ("a CR inside the line it matches", "zzlisted", "zzlisted\rzzlinezz"))
         for name, pattern, line in cases:
             with self.subTest(name):
                 (self.overlay / "publish-deny.txt").write_text(pattern + "\n", newline="\n")
