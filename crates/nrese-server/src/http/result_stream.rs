@@ -977,49 +977,55 @@ mod tests {
     /// Over HTTP/1.0, a stall bound's first deadline bounds the whole read: a producer still
     /// going past it gets 408 at that deadline, not at its end, though it wrote before it and
     /// keeps writing well within the stall bound (streamed, that would have started a 200 the
-    /// stall bound then keeps going, to its end).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    /// stall bound then keeps going, to its end). The clock moves only as the test moves it
+    /// (a blocking producer holds it still otherwise): a chunk each quarter of the bound, for
+    /// three bounds, the producer open throughout.
+    #[tokio::test(start_paused = true)]
     async fn a_held_reads_first_deadline_bounds_all_of_it() {
         let memory = Envelope::new(Some(1 << 30), None);
         let token = CancellationToken::new();
         let stop = token.clone();
         let held = memory.clone();
+        let (go, step) = std::sync::mpsc::channel::<()>();
+        let (wrote, mut written) = mpsc::unbounded_channel::<()>();
         let started = Instant::now();
-        let stopped = WHOLE
-            .scope(
-                true,
-                stream_blocking(
-                    Pace::stalled_after(Duration::from_secs(1)),
-                    token,
-                    move || held,
-                    "text/plain",
-                    "timeout",
-                    // A chunk every 50 ms for 4 s: far past the first deadline, never near
-                    // the stall bound.
-                    move |writer| {
-                        for _ in 0..80 {
-                            if stop.is_cancelled() {
-                                return Err(ApiError::timeout("stopped"));
-                            }
-                            io::Write::write_all(writer, &[b'x'; CHUNK_BYTES])
-                                .map_err(|error| ApiError::internal(error.to_string()))?;
-                            std::thread::sleep(Duration::from_millis(50));
+        let answer = tokio::spawn(WHOLE.scope(true, async move {
+            let answer = stream_blocking(
+                Pace::stalled_after(Duration::from_secs(1)),
+                token,
+                move || held,
+                "text/plain",
+                "timeout",
+                // A chunk at each step it is given, until it is stopped or let go.
+                move |writer| {
+                    while step.recv().is_ok() {
+                        if stop.is_cancelled() {
+                            return Err(ApiError::timeout("stopped"));
                         }
-                        Ok(())
-                    },
-                ),
+                        io::Write::write_all(writer, &[b'x'; CHUNK_BYTES])
+                            .map_err(|error| ApiError::internal(error.to_string()))?;
+                        let _ = wrote.send(());
+                    }
+                    Ok(())
+                },
             )
-            .await
-            .expect_err("past its deadline, no answer");
-        // The deadline is 1 s away, the producer's end 4 s.
-        let waited = started.elapsed();
+            .await;
+            let status = answer.err().map(|stopped| stopped.into_response().status());
+            (status, Instant::now())
+        }));
+        for _ in 0..12 {
+            if go.send(()).is_err() || written.recv().await.is_none() {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(250)).await;
+        }
+        drop(go);
+        let (status, ended) = answer.await.unwrap();
+        assert_eq!(status, Some(StatusCode::REQUEST_TIMEOUT));
+        let waited = ended - started;
         assert!(
-            waited < Duration::from_secs(3),
-            "the read was stopped at the producer's end, after {waited:?}"
-        );
-        assert_eq!(
-            stopped.into_response().status(),
-            StatusCode::REQUEST_TIMEOUT
+            waited <= Duration::from_secs(1),
+            "the read was stopped after {waited:?}, past its first deadline"
         );
         assert_eq!(memory.used(), 0);
     }
@@ -1183,31 +1189,92 @@ mod tests {
         assert_eq!(problem["detail"], "the query's own (budgets.query_memory)");
     }
 
-    /// Over HTTP/1.0, an answer past its deadline is no answer, though the whole of it is
-    /// ready when the hold looks: a hold that resumes only after the deadline, its channel's
-    /// last frame and close both ready, gets 408, not the answer.
-    #[tokio::test]
-    async fn a_held_answer_ready_only_past_its_deadline_is_no_answer() {
+    /// Over HTTP/1.0, what a hold that resumes only past its deadline (1 s) answers, on a
+    /// clock the test moves: the producer is open through expiry, and only after it are
+    /// `frame` bytes queued and, with `end`, its end set (`None`: it stays open).
+    async fn resumed_past_its_deadline(
+        memory: Envelope,
+        frame: usize,
+        end: Option<Result<(), ApiError>>,
+    ) -> Option<StatusCode> {
+        let (sender, receiver) = mpsc::channel(CHANNEL_CHUNKS);
+        let outcome = Outcome::default();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let held = hold(receiver, &outcome, deadline, memory, "timeout");
+        tokio::time::advance(Duration::from_secs(2)).await;
+        if frame > 0 {
+            sender
+                .try_send(Frame::data(Bytes::from(vec![b'x'; frame])))
+                .unwrap();
+        }
+        let open = match end {
+            Some(end) => {
+                outcome.set(end);
+                drop(sender);
+                None
+            }
+            None => Some(sender),
+        };
+        let status = held
+            .await
+            .err()
+            .map(|stopped| stopped.into_response().status());
+        drop(open);
+        status
+    }
+
+    /// Over HTTP/1.0, past its deadline nothing more is taken, though it is ready when the
+    /// hold looks: the answer's end, the producer's error (a graph read's 404, an export's
+    /// 500), and a frame past the envelope (its 413) all give 408.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_answer_ending_only_past_its_deadline_is_a_timeout() {
+        let timeout = Some(StatusCode::REQUEST_TIMEOUT);
+        let ended = |end| resumed_past_its_deadline(Envelope::unlimited(), 16, Some(end));
+        assert_eq!(ended(Ok(())).await, timeout, "the answer");
+        assert_eq!(
+            ended(Err(ApiError::not_found("no such graph"))).await,
+            timeout,
+            "a 404"
+        );
+        assert_eq!(
+            ended(Err(ApiError::internal("the export failed"))).await,
+            timeout,
+            "a 500"
+        );
+        let small = Envelope::new(Some(1 << 10), None);
+        assert_eq!(
+            resumed_past_its_deadline(small, CHUNK_BYTES, None).await,
+            timeout,
+            "a 413"
+        );
+    }
+
+    /// Over HTTP/1.0, a held answer's frame isn't taken past the stall bound, though the timer
+    /// that lets go of the answer hasn't run: the body ends short of its length, its memory
+    /// let go. On a clock the test moves, the timer stopped.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_frame_is_not_taken_past_its_stall_bound() {
+        let memory = Envelope::new(Some(1 << 20), None);
         let (sender, receiver) = mpsc::channel(CHANNEL_CHUNKS);
         sender
-            .try_send(Frame::data(Bytes::from_static(b"the answer")))
+            .try_send(Frame::data(Bytes::from(vec![b'x'; CHUNK_BYTES])))
             .unwrap();
         drop(sender);
         let outcome = Outcome::default();
         outcome.set(Ok(()));
-        let deadline = Instant::now() - Duration::from_millis(1);
-        let held = hold(
-            receiver,
-            &outcome,
-            deadline,
-            Envelope::unlimited(),
-            "timeout",
-        )
-        .await;
-        assert_eq!(
-            held.err().map(|stopped| stopped.into_response().status()),
-            Some(StatusCode::REQUEST_TIMEOUT)
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let holding = hold(receiver, &outcome, deadline, memory.clone(), "timeout")
+            .await
+            .unwrap_or_else(|stopped| panic!("{stopped}"));
+        let mut body = Held::new(holding, Duration::from_secs(1));
+        body.watch.abort();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let taken = http_body_util::BodyExt::frame(&mut body).await;
+        assert!(
+            matches!(taken, Some(Err(_))),
+            "a frame taken past the bound"
         );
+        assert_eq!(memory.used(), 0);
     }
 
     /// Over HTTP/1.0, the first frame's stall bound starts when the answer is ready, not when
