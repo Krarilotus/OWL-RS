@@ -326,8 +326,8 @@ fn a_conclusion_reads_shacl_content_as_one_store_with_its_premise() {
 }
 
 /// Spec (OWL 2 Direct Semantics: an inconsistent ontology has no model, so it entails every
-/// conclusion): from an inconsistent premise a conclusion stating SHACL content follows, however
-/// that content would be read.
+/// conclusion): from an inconsistent premise an admitted conclusion stating SHACL content
+/// follows, however that content would be read.
 #[test]
 fn from_an_inconsistent_premise_a_conclusion_stating_shacl_content_follows() {
     let dl = super::pipeline_with(nrese_store::DlConfig {
