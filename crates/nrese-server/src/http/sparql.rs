@@ -408,9 +408,32 @@ fn build_query_request(operation: QueryOperation) -> SparqlQueryRequest {
 
 #[cfg(test)]
 mod tests {
-    use nrese_store::{GraphResultFormat, QueryResultKind, SolutionsResultFormat};
+    use axum::http::{StatusCode, header};
+    use axum::response::IntoResponse;
+    use nrese_store::{GraphResultFormat, QueryResultKind, SolutionsResultFormat, StoreError};
 
-    use super::negotiate_formats;
+    use super::{map_query_error, negotiate_formats, refused_or};
+    use crate::error::ApiError;
+    use crate::policy::PolicyConfig;
+
+    /// A reader of some graphs refused for the memory all queries share is told the class
+    /// only: whether its own need could fit is hidden with the amounts, so it is never told
+    /// to retry (503, no `Retry-After`), whether it queried or read a graph.
+    #[test]
+    fn a_readers_refusal_told_the_class_only_is_not_told_to_retry() {
+        let class = |limit| StoreError::MemoryLimitWithoutAmounts {
+            limit,
+            shared: true,
+        };
+        let policy = PolicyConfig::default();
+        for response in [
+            map_query_error(&policy, class(Some(1 << 20))).into_response(),
+            refused_or(class(None), ApiError::internal).into_response(),
+        ] {
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers().get(header::RETRY_AFTER), None);
+        }
+    }
 
     #[test]
     fn the_query_form_decides_which_formats_are_negotiated() {

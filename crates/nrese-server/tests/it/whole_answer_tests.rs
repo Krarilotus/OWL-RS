@@ -102,14 +102,10 @@ async fn an_http10_answer_past_its_envelope_is_refused_and_its_memory_released()
     Ok(())
 }
 
-/// While the memory all queries share is taken, an HTTP/1.0 answer that outgrows it is turned
-/// away for now, as any request that can't have its memory: 503 with `Retry-After: 1`, and
-/// what it held goes back. Its own envelope (4 GiB) has room; the shared total (1 MiB) not.
-#[tokio::test]
-async fn an_http10_answer_past_the_shared_memory_is_turned_away_for_now()
--> Result<(), Box<dyn Error>> {
+/// A store whose queries share `total` bytes, and its app.
+fn sharing(total: usize) -> Result<(StoreService, axum::Router), Box<dyn Error>> {
     let store = StoreService::new(StoreConfig {
-        total_query_memory_bytes: 1 << 20,
+        total_query_memory_bytes: total,
         ..StoreConfig::in_memory()
     })?;
     let app = test_app_with_store(
@@ -117,43 +113,99 @@ async fn an_http10_answer_past_the_shared_memory_is_turned_away_for_now()
         PolicyConfig::default(),
         ReasonerConfig::default(),
     )?;
-    let before = held(&store);
-    let response = app.oneshot(query_request(Version::HTTP_10)?).await?;
+    Ok((store, app))
+}
+
+/// The status and `Retry-After` of the HTTP/1.0 query's answer, its body read.
+async fn refusal(app: &axum::Router) -> Result<(StatusCode, Option<HeaderValue>), Box<dyn Error>> {
+    let response = app
+        .clone()
+        .oneshot(query_request(Version::HTTP_10)?)
+        .await?;
     let status = response.status();
     let retry = response.headers().get(header::RETRY_AFTER).cloned();
-    let problem: serde_json::Value =
-        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await?)?;
-    eprintln!("{status}; retry-after {retry:?}; {problem}");
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(retry, Some(HeaderValue::from_static("1")));
-    released_to(&store, before).await;
+    let body = to_bytes(response.into_body(), usize::MAX).await?;
+    eprintln!(
+        "{status}; retry-after {retry:?}; {}",
+        String::from_utf8_lossy(&body)
+    );
+    Ok((status, retry))
+}
+
+/// The HTTP/1.0 query answered whole, as the same request is once there is room.
+async fn answered(app: &axum::Router) -> Result<(), Box<dyn Error>> {
+    let response = app
+        .clone()
+        .oneshot(query_request(Version::HTTP_10)?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(response.into_body(), usize::MAX).await?.len(),
+        WHOLE
+    );
     Ok(())
 }
 
-/// An HTTP/1.0 query that the memory all queries share refuses before any of its answer is
-/// held (the shared total, 64 KiB, has no room for its own work) is turned away for now as
-/// well: 503 with `Retry-After: 1`, as when it is refused for its answer.
+/// While others hold the memory all queries share (all but 1 MiB of 8 MiB), an HTTP/1.0
+/// answer that fits it alone but not beside them (2 MiB) is turned away for now: 503 with
+/// `Retry-After: 1`, and what it held goes back. Once the others let go, the same request is
+/// answered whole. Its own envelope (4 GiB) has room throughout.
 #[tokio::test]
-async fn an_http10_query_refused_by_the_shared_memory_before_its_answer_may_be_retried()
+async fn an_http10_answer_past_the_shared_memory_others_hold_may_be_retried()
 -> Result<(), Box<dyn Error>> {
-    let store = StoreService::new(StoreConfig {
-        total_query_memory_bytes: 64 << 10,
-        ..StoreConfig::in_memory()
-    })?;
-    let app = test_app_with_store(
-        store.clone(),
-        PolicyConfig::default(),
-        ReasonerConfig::default(),
-    )?;
+    let (store, app) = sharing(8 << 20)?;
+    let others = store.envelope(None);
+    others.charge((7 << 20) - held(&store))?;
     let before = held(&store);
-    let response = app.oneshot(query_request(Version::HTTP_10)?).await?;
-    let status = response.status();
-    let retry = response.headers().get(header::RETRY_AFTER).cloned();
-    let problem: serde_json::Value =
-        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await?)?;
-    eprintln!("{status}; retry-after {retry:?}; {problem}");
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(retry, Some(HeaderValue::from_static("1")));
+    let refused = refusal(&app).await?;
+    assert_eq!(
+        refused,
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some(HeaderValue::from_static("1"))
+        )
+    );
+    released_to(&store, before).await;
+    drop(others);
+    answered(&app).await
+}
+
+/// An HTTP/1.0 query whose result table (256 KiB) finds no room in the memory all queries
+/// share because others hold it (all but 128 KiB of 8 MiB), refused before any of its
+/// answer is held, is told to retry: 503 with `Retry-After: 1`. Once the others let go, the
+/// same request is answered.
+#[tokio::test]
+async fn an_http10_query_refused_early_while_others_hold_the_shared_memory_may_be_retried()
+-> Result<(), Box<dyn Error>> {
+    let (store, app) = sharing(8 << 20)?;
+    let others = store.envelope(None);
+    others.charge((8 << 20) - (128 << 10) - held(&store))?;
+    let before = held(&store);
+    let refused = refusal(&app).await?;
+    assert_eq!(
+        refused,
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some(HeaderValue::from_static("1"))
+        )
+    );
+    released_to(&store, before).await;
+    drop(others);
+    answered(&app).await
+}
+
+/// An HTTP/1.0 query whose own work can't fit the memory all queries share even with nothing
+/// else held (64 KiB; its result table needs 256 KiB) is refused for that memory without
+/// being told to retry: 503, no `Retry-After`. Trying again couldn't help.
+#[tokio::test]
+async fn an_http10_query_that_cannot_fit_the_shared_memory_alone_is_not_told_to_retry()
+-> Result<(), Box<dyn Error>> {
+    let (store, app) = sharing(64 << 10)?;
+    let before = held(&store);
+    assert_eq!(
+        refusal(&app).await?,
+        (StatusCode::SERVICE_UNAVAILABLE, None)
+    );
     released_to(&store, before).await;
     Ok(())
 }

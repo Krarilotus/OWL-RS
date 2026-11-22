@@ -259,10 +259,11 @@ async fn a_query_beyond_its_memory_limit_is_rejected() -> Result<(), Box<dyn std
 }
 
 /// The server's budget for all running queries: a query that fits its own limit and asks
-/// for more than the server has left is told to come back, and the server's budget is
-/// free again afterwards.
+/// for more than the server's whole budget is refused for it, 503, though not told to retry
+/// (no `Retry-After`: it can't fit however much is free), and the server's budget is free
+/// again afterwards.
 #[tokio::test]
-async fn a_query_beyond_the_servers_memory_budget_is_told_to_retry()
+async fn a_query_beyond_the_servers_memory_budget_is_refused_for_it()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("data.nt");
@@ -283,6 +284,11 @@ async fn a_query_beyond_the_servers_memory_budget_is_told_to_retry()
         .oneshot(get(&format!("/dataset/query?query={}", encode(query)))?)
         .await?;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let retry = response
+        .headers()
+        .get(axum::http::header::RETRY_AFTER)
+        .cloned();
+    assert_eq!(retry, None);
     let body = body_text(response).await?;
     assert!(
         body.contains("the server's query memory is in use") && body.contains("total_query_memory"),
