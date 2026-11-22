@@ -26,19 +26,19 @@ pub async fn run(
     let policy = state.policy();
     let requester = access.requester();
     let ticket = MutationTicket::checking(access.rights.clone());
-    let worker_ticket = ticket.clone();
-    let mut task =
-        tokio::task::spawn_blocking(move || pipeline.apply(command, &requester, &worker_ticket));
-
-    let joined = match tokio::time::timeout(timeout, &mut task).await {
-        Ok(joined) => joined,
-        Err(_) if ticket.cancel() => return Err(ApiError::timeout(timeout_message)),
-        // The commit already started; report its real outcome instead of a timeout.
-        Err(_) => task.await,
-    };
-    joined
-        .map_err(|error| ApiError::internal(error.to_string()))?
-        .map_err(|error| map_error(&policy, error, timeout_message))
+    super::effect::run(
+        ticket,
+        timeout,
+        timeout_message,
+        super::effect::LostCancel::AwaitEnd,
+        None::<()>,
+        move |ticket, _| {
+            pipeline
+                .apply(command, &requester, ticket)
+                .map_err(|error| map_error(&policy, error, timeout_message))
+        },
+    )
+    .await
 }
 
 /// The HTTP meaning of a failed mutation: the request's fault (4xx) or the server's (5xx).
@@ -137,7 +137,8 @@ mod tests {
                     "{kind:?}"
                 );
             }
-            let engine = StoreError::Engine(EngineError::Corruption("injected".to_owned()));
+            let engine =
+                StoreError::Engine(EngineError::Corruption("simulated failure".to_owned()));
             assert_eq!(
                 status(MutationError::Store {
                     kind,

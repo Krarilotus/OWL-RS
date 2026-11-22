@@ -3095,27 +3095,19 @@ fn rows_of(store: &StoreService, query: &str, scope: nrese_store::ReadScope) -> 
 /// `owl2-rl` with the QL rewriting, `complete` is the OWL 2 Direct Semantics'; Direct
 /// Semantics §2, annotations have no meaning; decided on 17 Nov): a read the
 /// rewriting answers that may return the rules' copy of an annotation statement is `unsound`,
-/// in its run, its EXPLAIN and its plan: `eq-rep-s`'s under `owl2-rl`, `prp-spo1`'s under
-/// `owl2-ql`.
+/// in its run, its EXPLAIN and its plan: `eq-rep-s`'s under `owl2-rl`. (Under `owl2-ql` no
+/// rule reads an annotation, so `prp-spo1` makes no such copy:
+/// `ql_consistency_tests::no_owl2_ql_rule_reads_an_annotation_as_an_axiom`.)
 #[test]
 fn a_rewritten_read_that_may_return_a_copied_annotation_is_unsound() {
     let mut wrong = Vec::new();
-    for (ruleset, ql, data, query, copy) in [
-        (
-            Ruleset::Owl2Rl,
-            QlRewritingMode::On,
-            EQUAL,
-            "SELECT ?s ?o { ?s :note ?o }",
-            "y",
-        ),
-        (
-            Ruleset::Owl2Ql,
-            QlRewritingMode::Auto,
-            SUB,
-            "SELECT ?s ?o { ?s :super ?o }",
-            "x",
-        ),
-    ] {
+    for (ruleset, ql, data, query, copy) in [(
+        Ruleset::Owl2Rl,
+        QlRewritingMode::On,
+        EQUAL,
+        "SELECT ?s ?o { ?s :note ?o }",
+        "y",
+    )] {
         let store = annotation_store(ruleset, ql, data);
         let rows = rows_of(&store, query, nrese_store::ReadScope::All);
         let copied = rows.iter().any(|r| r.contains(&format!("<{E}{copy}>")));

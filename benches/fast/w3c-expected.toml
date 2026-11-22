@@ -106,12 +106,12 @@ checked = 77
 passed = 13
 skipped = 76
 
-# OWL 2 QL (Direct Semantics): 9 listed failures (crates/nrese-store/tests/w3c_owl2_ql/
-# expected-failures.txt) and 2 skips. The list is about to shrink: `known` changes in the same commit
-# as the list, whichever change lands second.
+# OWL 2 QL (Direct Semantics): 5 listed failures (crates/nrese-store/tests/w3c_owl2_ql/
+# expected-failures.txt) and 2 skips. `known` changes in the same commit as the list (the list-count
+# contract, test_w3c_list_counts.py, fails until it does).
 [suite."OWL 2 QL"]
-passed = 51
-known = 9
+passed = 55
+known = 5
 skipped = 2
 
 [suite."RDF 1.1 syntax"]
