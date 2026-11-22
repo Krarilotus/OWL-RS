@@ -630,6 +630,86 @@ fn inline_subtype_tie_through_eager_aggregation() {
     );
 }
 
+/// SPARQL 1.1 §18.5.1.5-6 on a column of inline integers of several datatypes: MIN and MAX
+/// are ORDER BY's first and last term, which ranks equal values by datatype IRI (`xsd:byte`
+/// < `xsd:int` < `xsd:integer` < `xsd:long` < ... < `xsd:unsignedShort`). In one group, per
+/// group, and beside COUNT and SUM, the tied term that order puts first or last wins; it is
+/// neither the first nor the last of its tie in the rows.
+#[test]
+fn inline_subtype_ties_per_group_and_beside_other_aggregates() {
+    let values = [
+        ("g1", "5", "integer"),
+        ("g1", "1", "int"),
+        ("g1", "5", "unsignedByte"),
+        ("g1", "1", "byte"),
+        ("g1", "5", "short"),
+        ("g2", "-3", "long"),
+        ("g2", "7", "positiveInteger"),
+        ("g2", "-3", "integer"),
+        ("g2", "-3", "nonPositiveInteger"),
+        ("g2", "7", "nonNegativeInteger"),
+        ("g3", "9", "unsignedShort"),
+        ("g3", "4", "int"),
+        ("g3", "9", "int"),
+    ];
+    let engine = load(
+        values.map(|(g, value, datatype)| (node(g), node("v"), Term::from(typed(value, datatype)))),
+    );
+    let snapshot = engine.snapshot();
+    let t = |value: &str, datatype: &str| Some(Term::from(typed(value, datatype)));
+    let run = |query: &str| run_both(&snapshot, query, &QueryOptions::default(), false);
+
+    // One group.
+    assert_eq!(
+        run("SELECT (MIN(?v) AS ?lo) { ?g :v ?v }"),
+        vec![vec![t("-3", "integer")]]
+    );
+    assert_eq!(
+        run("SELECT (MAX(?v) AS ?hi) { ?g :v ?v }"),
+        vec![vec![t("9", "unsignedShort")]]
+    );
+    // Per group, MIN and MAX together.
+    let group = |g: &str| Some(Term::from(node(g)));
+    assert_eq!(
+        run("SELECT ?g (MIN(?v) AS ?lo) (MAX(?v) AS ?hi) { ?g :v ?v } GROUP BY ?g"),
+        vec![
+            vec![group("g1"), t("1", "byte"), t("5", "unsignedByte")],
+            vec![group("g2"), t("-3", "integer"), t("7", "positiveInteger")],
+            vec![group("g3"), t("4", "int"), t("9", "unsignedShort")],
+        ]
+    );
+    // Beside COUNT and SUM in one pass.
+    assert_eq!(
+        run(
+            "SELECT ?g (COUNT(?v) AS ?n) (MAX(?v) AS ?hi) (SUM(?v) AS ?sum) (MIN(?v) AS ?lo) \
+             { ?g :v ?v } GROUP BY ?g"
+        ),
+        vec![
+            vec![
+                group("g1"),
+                t("5", "integer"),
+                t("5", "unsignedByte"),
+                t("17", "integer"),
+                t("1", "byte")
+            ],
+            vec![
+                group("g2"),
+                t("5", "integer"),
+                t("7", "positiveInteger"),
+                t("5", "integer"),
+                t("-3", "integer")
+            ],
+            vec![
+                group("g3"),
+                t("3", "integer"),
+                t("9", "unsignedShort"),
+                t("22", "integer"),
+                t("4", "int")
+            ],
+        ]
+    );
+}
+
 #[test]
 fn big_integer_comparisons_with_nan_return_booleans() {
     let engine = load(Vec::new());
