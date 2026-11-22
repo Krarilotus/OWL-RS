@@ -6,7 +6,7 @@ use super::case::Case;
 use super::gaps::EntryPoint;
 use super::observe::{Deviation, compare};
 use super::stops::Outcome;
-use super::{draw, witnesses};
+use super::{draw, shrink, witnesses};
 
 /// Draws per invocation; each seed draws different cases.
 const DRAWS: u64 = 64;
@@ -138,9 +138,33 @@ pub(super) fn run() {
                 let replay = replay(&outer, selector);
                 let dir = fixture_dir(&outer, selector);
                 save(&dir, "original.toml", selector, case, &signature, &replay);
+                // Only the first failing case is shrunk; later ones are saved as drawn.
+                let shrunk = failures.is_empty().then(|| {
+                    let shrunk = shrink::shrink(case, &signature);
+                    let minimal = dir.join("minimal.toml");
+                    let command = self::replay(&outer, &format!("saved:{}", minimal.display()));
+                    save(
+                        &dir,
+                        "minimal.toml",
+                        selector,
+                        &shrunk.case,
+                        &signature,
+                        &command,
+                    );
+                    format!(
+                        "\nshrunk in {} attempts{}",
+                        shrunk.attempts,
+                        if shrunk.ran_out {
+                            ", budget ran out"
+                        } else {
+                            ""
+                        }
+                    )
+                });
                 failures.push(format!(
-                    "{replay}\n{signature}\nfixtures: {}",
-                    dir.display()
+                    "{replay}\n{signature}\nfixtures: {}{}",
+                    dir.display(),
+                    shrunk.unwrap_or_default()
                 ));
             }
         }

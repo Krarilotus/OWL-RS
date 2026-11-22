@@ -4,6 +4,7 @@ mod gaps;
 mod matrix;
 pub(super) mod observe;
 mod random;
+mod shrink;
 mod stops;
 mod witnesses;
 

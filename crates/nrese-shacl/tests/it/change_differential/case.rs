@@ -5,7 +5,7 @@ use nrese_shacl::{
     Selection, Shapes, ValidationReport, compile, validate, validate_changes,
     validate_shapes_change,
 };
-use nrese_sparql::{QueryEvaluationError, Resources};
+use nrese_sparql::{CancellationToken, QueryEvaluationError, Resources};
 
 use super::gaps::EntryPoint;
 use super::observe::{Observation, Observer};
@@ -70,6 +70,8 @@ pub(super) struct Case {
     pub fresh_value: bool,
     pub equality: bool,
     pub stop: Option<(EntryPoint, Stop)>,
+    /// Stops every validation of the case once cancelled: a shrink attempt's deadline.
+    pub cancellation: Option<CancellationToken>,
 }
 
 impl Case {
@@ -82,6 +84,14 @@ impl Case {
             fresh_value: false,
             equality: false,
             stop: None,
+            cancellation: None,
+        }
+    }
+
+    fn resources(&self) -> Resources {
+        Resources {
+            cancellation: self.cancellation.clone(),
+            ..Resources::default()
         }
     }
 
@@ -163,7 +173,7 @@ impl Case {
             let empty = Shapes::default();
             let shapes_before = shapes.as_ref().unwrap_or(&empty);
             let reference = |snapshot, shapes| {
-                let report = validate(snapshot, shapes, data, &Resources::default())
+                let report = validate(snapshot, shapes, data, &self.resources())
                     .map_err(|error| format!("reference stopped: {error}"))?;
                 observer.observe(&report)
             };
@@ -174,7 +184,8 @@ impl Case {
                     .stop
                     .filter(|(api, _)| *api == entry)
                     .map(|(_, stop)| stop);
-                observe_actual(stop, &before, &after, &observer, check)
+                let resources = stop.map_or_else(|| self.resources(), Stop::resources);
+                observe_actual(stop, &resources, &before, &after, &observer, check)
             };
             evaluations.push(Evaluation {
                 step: index + 1,
@@ -217,16 +228,16 @@ type Check<'a> = dyn Fn(&TripView<'_>, &TripView<'_>, &Resources) -> Result<Vali
 
 fn observe_actual(
     stop: Option<Stop>,
+    resources: &Resources,
     before: &Snapshot,
     after: &Snapshot,
     observer: &Observer<'_>,
     check: &Check<'_>,
 ) -> Result<Outcome, String> {
-    let resources = stop.map_or_else(Resources::default, Stop::resources);
     let token = |on| resources.cancellation.as_ref().filter(|_| stop == Some(on));
     let before = TripView::new(before, token(Stop::Before));
     let after = TripView::new(after, token(Stop::After));
-    match check(&before, &after, &resources) {
+    match check(&before, &after, resources) {
         Ok(report) => observer.observe(&report).map(Outcome::Report),
         Err(QueryEvaluationError::Cancelled) => Ok(Outcome::Cancelled {
             before: before.tripped(),

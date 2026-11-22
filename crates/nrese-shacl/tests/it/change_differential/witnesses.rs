@@ -132,6 +132,7 @@ impl Witness {
             fresh_value: false,
             equality: self.equality,
             stop: None,
+            cancellation: None,
         }
     }
 }
