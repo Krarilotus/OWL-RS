@@ -6918,98 +6918,98 @@ impl<'a> Context<'a> {
                 .or_default()
                 .extend(new);
         }
+        /// Every group's states, from every row in order, total `a`'s number of id `id` read
+        /// by `known(a, id)`; `None` once a value isn't a number.
+        fn states<'n>(
+            plans: &[Plan<'_>],
+            table: &IdTable,
+            group_of: &[u32],
+            groups: usize,
+            known: impl Fn(usize, u64) -> Option<&'n Number> + Sync,
+        ) -> Option<Vec<State>> {
+            let width = plans.len();
+            // The states of groups `range`.
+            let pass = |range: std::ops::Range<usize>| {
+                let start = State {
+                    count: 0,
+                    total: Some(Numeric::Integer(Integer::from(0))),
+                    error: false,
+                };
+                let mut states = vec![start; range.len() * width];
+                for (row, &group) in group_of.iter().enumerate() {
+                    let group = group as usize;
+                    if !range.contains(&group) {
+                        continue;
+                    }
+                    let at = (group - range.start) * width;
+                    for (a, plan) in plans.iter().enumerate() {
+                        let state = &mut states[at + a];
+                        match plan {
+                            Plan::Rows => state.count += 1,
+                            Plan::Bound(column) => {
+                                if table.get(row, *column) != UNDEF {
+                                    state.count += 1;
+                                }
+                            }
+                            Plan::Total { column, .. } => {
+                                let id = table.get(row, *column);
+                                state.count += 1;
+                                match known(a, id) {
+                                    Some(Number::Value(number)) => {
+                                        state.total =
+                                            state.total.and_then(|total| total.add(*number));
+                                    }
+                                    Some(Number::Error) => state.error = true,
+                                    Some(Number::Other) | None => return None,
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(states)
+            };
+            // Parts of the groups on every core where there are many rows: each part reads the
+            // rows in order, so every group adds its values in the order the general path does.
+            let parts = rayon::current_num_threads().min(groups).max(1);
+            if group_of.len() < 2 * PARALLEL_EXPRESSION_ROWS || parts < 2 {
+                return pass(0..groups);
+            }
+            let done: Vec<Option<Vec<State>>> = (0..parts)
+                .into_par_iter()
+                .map(|part| pass(part * groups / parts..(part + 1) * groups / parts))
+                .collect();
+            let mut states = Vec::with_capacity(groups * width);
+            for part in done {
+                states.extend(part?);
+            }
+            Some(states)
+        }
         let (numbers, since) = (self.numbers.borrow(), self.since.borrow());
-        let mut lookup_charge = Reservation::new(&*self.budget);
-        let known: Vec<Option<Cow<'_, nrese_exec::IdMap<Number>>>> = plans
+        // Per total, the maps that hold its numbers, read in place: the query's memo and
+        // those since each open save point.
+        let layers: Vec<Vec<&nrese_exec::IdMap<Number>>> = plans
             .iter()
             .map(|plan| match plan {
                 Plan::Total { expr, column, .. } => {
                     let key = ((*expr).clone(), solutions.vars[*column].clone());
-                    let mut maps = remembered(&numbers, &since, &key);
-                    let Some(first) = maps.next() else {
-                        return Ok(None);
-                    };
-                    let Some(second) = maps.next() else {
-                        return Ok(Some(Cow::Borrowed(first)));
-                    };
-                    // A mixed chunk prepares one lookup per row, regardless of save depth.
-                    let maps = [first, second].into_iter().chain(maps);
-                    let len: usize = maps.clone().map(|map| map.len()).sum();
-                    lookup_charge.charge(len.saturating_mul(number_bytes()))?;
-                    let mut combined = nrese_exec::IdMap::default();
-                    combined.reserve(len);
-                    for map in maps {
-                        combined.extend(map.iter().map(|(&id, &number)| (id, number)));
-                    }
-                    Ok(Some(Cow::Owned(combined)))
+                    remembered(&numbers, &since, &key).collect()
                 }
-                _ => Ok(None),
+                _ => Vec::new(),
             })
-            .collect::<Result<_, BudgetExceeded>>()?;
-        // The states of groups `range`, from every row in order; `None` once a value isn't
-        // a number.
-        let pass = |range: std::ops::Range<usize>| {
-            let start = State {
-                count: 0,
-                total: Some(Numeric::Integer(Integer::from(0))),
-                error: false,
-            };
-            let mut states = vec![start; range.len() * width];
-            for (row, &group) in group_of.iter().enumerate() {
-                let group = group as usize;
-                if !range.contains(&group) {
-                    continue;
-                }
-                let at = (group - range.start) * width;
-                for (a, plan) in plans.iter().enumerate() {
-                    let state = &mut states[at + a];
-                    match plan {
-                        Plan::Rows => state.count += 1,
-                        Plan::Bound(column) => {
-                            if table.get(row, *column) != UNDEF {
-                                state.count += 1;
-                            }
-                        }
-                        Plan::Total { column, .. } => {
-                            let id = table.get(row, *column);
-                            state.count += 1;
-                            match known[a].as_deref().and_then(|known| known.get(&id)) {
-                                Some(Number::Value(number)) => {
-                                    state.total = state.total.and_then(|total| total.add(*number));
-                                }
-                                Some(Number::Error) => state.error = true,
-                                Some(Number::Other) | None => return None,
-                            }
-                        }
-                    }
-                }
-            }
-            Some(states)
+            .collect();
+        // One map per total, as where no point is open: one lookup per row. A chunk of a
+        // cross product with numbers in several ([`Self::group_crossed`]) looks in each.
+        let states = if layers.iter().all(|maps| maps.len() <= 1) {
+            let known: Vec<Option<&nrese_exec::IdMap<Number>>> =
+                layers.iter().map(|maps| maps.first().copied()).collect();
+            states(&plans, table, group_of, groups, |a, id| {
+                known[a].and_then(|known| known.get(&id))
+            })
+        } else {
+            states(&plans, table, group_of, groups, |a, id| {
+                layers[a].iter().find_map(|known| known.get(&id))
+            })
         };
-        // Parts of the groups on every core where there are many rows: each part reads the
-        // rows in order, so every group adds its values in the order the general path does.
-        let parts = rayon::current_num_threads().min(groups).max(1);
-        let states: Option<Vec<State>> =
-            if group_of.len() < 2 * PARALLEL_EXPRESSION_ROWS || parts < 2 {
-                pass(0..groups)
-            } else {
-                let done: Vec<Option<Vec<State>>> = (0..parts)
-                    .into_par_iter()
-                    .map(|part| pass(part * groups / parts..(part + 1) * groups / parts))
-                    .collect();
-                let mut states = Vec::with_capacity(groups * width);
-                let mut numbers_only = true;
-                for part in done {
-                    match part {
-                        Some(part) => states.extend(part),
-                        None => {
-                            numbers_only = false;
-                            break;
-                        }
-                    }
-                }
-                numbers_only.then_some(states)
-            };
         let Some(states) = states else {
             return Ok(None);
         };
