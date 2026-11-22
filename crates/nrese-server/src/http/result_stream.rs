@@ -1144,6 +1144,38 @@ mod tests {
         assert_eq!(problem["detail"], "the query's own (budgets.query_memory)");
     }
 
+    /// Over HTTP/1.0, a producer that queued a frame and then had its work refused before the
+    /// hold took that frame (a CONSTRUCT refused reserving its next triple) keeps its own
+    /// refusal, though the hold holds the frame by the end: what is held beside the work
+    /// counts as it was at the refusal itself. Step by step: the frame queued, the refusal,
+    /// the producer's end; then the hold.
+    #[tokio::test]
+    async fn a_producers_work_refused_while_its_queued_frame_is_unheld_keeps_its_own_refusal() {
+        let memory = Envelope::new(Some(1 << 20), None);
+        let (sender, receiver) = mpsc::channel(CHANNEL_CHUNKS);
+        sender
+            .try_send(Frame::data(Bytes::from(vec![b'x'; CHUNK_BYTES])))
+            .unwrap();
+        assert!(memory.part().charge(2 << 20).is_err(), "its work fits");
+        let outcome = Outcome::default();
+        outcome.set(Err(ApiError::payload_too_large(
+            "the query's own (budgets.query_memory)",
+        )));
+        drop(sender);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let stopped = hold(receiver, &outcome, deadline, memory.clone(), "timeout")
+            .await
+            .err()
+            .map(IntoResponse::into_response)
+            .expect("its work refused, no answer");
+        assert_eq!(memory.used(), 0, "the refused answer still holds memory");
+        let body = axum::body::to_bytes(stopped.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(problem["detail"], "the query's own (budgets.query_memory)");
+    }
+
     /// Over HTTP/1.0, an answer past its deadline is no answer, though the whole of it is
     /// ready when the hold looks: a hold that resumes only after the deadline, its channel's
     /// last frame and close both ready, gets 408, not the answer.
