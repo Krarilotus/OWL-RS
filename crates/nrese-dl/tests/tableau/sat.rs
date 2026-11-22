@@ -160,7 +160,7 @@ fn merges_carry_their_dependencies() {
 /// By default, this test checks pinned satisfiable and unsatisfiable cases at every size. With `NRESE_CHECK_TIER=nightly` or `NRESE_FUZZ_SEED` set, it checks 60 rounds.
 #[test]
 fn random_sat_through_nominals() {
-    const SIZES: std::ops::RangeInclusive<u8> = 4..=7;
+    const SIZES: [u8; 4] = [4, 5, 6, 7];
     // Round 0 is the satisfiable case the faulty backtracking refuted.
     let witnesses = [
         (0, true),
@@ -186,7 +186,7 @@ fn random_sat_through_nominals() {
     };
     let mut covered = std::collections::BTreeSet::new();
     for round in 0..cases {
-        let vars = SIZES.nth(round % SIZES.len()).unwrap();
+        let vars = SIZES[round % SIZES.len()];
         let count = (f64::from(vars) * 4.3) as usize + next(5) as usize - 2;
         let clauses: Vec<Vec<i8>> = (0..count)
             .map(|_| {
