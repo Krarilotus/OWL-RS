@@ -503,3 +503,31 @@ fn a_reader_by_support_is_told_of_an_equality_its_graphs_derive() {
         unmet.join("\n")
     );
 }
+
+/// Certification suspended by rules of another ruleset (`use_reasoning_rules`, as an embedding
+/// caller may) while the store keeps its `owl2-rl` record: the `owl2-rl` pipeline still
+/// maintains the closure, and a commit that equates two literals then has no certificate to
+/// mark. Certified again under `owl2-rl`, a read of a later value is still withheld.
+#[test]
+fn an_equality_committed_while_certification_is_suspended_stays_withheld() {
+    use nrese_reasoner::rulesets::Ruleset;
+    let mut unmet = Vec::new();
+    for mode in MODES {
+        let pipeline = open("owl2-rl", config(mode, None));
+        let store = pipeline.store();
+        insert(&pipeline, ":u :r :w .");
+        store.use_reasoning_rules(Some(Ruleset::Rdfs.into()));
+        insert(
+            &pipeline,
+            &format!("{} :s :p {INTEGER} , {DECIMAL} .", SOURCES[0]),
+        );
+        store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
+        insert(&pipeline, &format!(":t :q {INTEGER} ."));
+        told_otherwise(store, mode, &mut unmet);
+    }
+    assert!(
+        unmet.is_empty(),
+        "an equality committed while certification was suspended is told complete after:\n{}",
+        unmet.join("\n")
+    );
+}
