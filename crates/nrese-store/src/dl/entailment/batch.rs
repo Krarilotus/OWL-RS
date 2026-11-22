@@ -3,7 +3,7 @@
 //! may be empty, so their definitions are a conservative extension of the premise.
 //! Search state is created by the existing probe engine and is never shared.
 
-use nrese_dl::limits::Limit;
+use nrese_dl::limits::{Deadline, Limit};
 use nrese_dl::tableau::{self, At, Prepared, Probe, Want};
 use nrese_owl::{Axiom, ClassExpr, EntityKind, ExprId, ObjProp, Ontology};
 
@@ -129,9 +129,9 @@ impl Batch {
         }
     }
 
-    /// Decides `tests[index]` of [`Self::new`] over its premise `ontology`: by the
-    /// compiled probe, or by the scalar reduction where the test has no probe form or the
-    /// probe can't express it.
+    /// Decides `tests[index]` of [`Self::new`] over its premise `ontology` before `deadline`:
+    /// by the compiled probe, or by the scalar reduction where the test has no probe form or
+    /// the probe can't express it, in what is left of `deadline` when it starts.
     pub(crate) fn check(
         &self,
         index: usize,
@@ -139,16 +139,19 @@ impl Batch {
         ontology: &Ontology,
         fresh: &[u64],
         budget: &Budget,
+        deadline: Deadline,
     ) -> Entailed {
+        let scalar = || match test {
+            Test::Axiom(axiom) => super::entails_within(ontology, axiom, fresh, budget, deadline),
+            Test::Nonempty(class) => super::nonempty_within(ontology, *class, budget, deadline),
+        };
         if self.exhausted {
             return Entailed::Unknown(nrese_dl::memory::EXHAUSTED.to_owned());
         }
         let (Some(prepared), Some((class, at))) = (&self.prepared, self.probes[index]) else {
-            return match test {
-                Test::Axiom(axiom) => super::entails(ontology, axiom, fresh, budget),
-                Test::Nonempty(class) => super::nonempty(ontology, *class, budget),
-            };
+            return scalar();
         };
+        let budget = &budget.remaining(deadline);
         if budget
             .cancel
             .as_ref()
@@ -180,7 +183,7 @@ impl Batch {
             &config,
             Want::default(),
         );
-        match outcome.answer {
+        let answer = match outcome.answer {
             tableau::Answer::Inconsistent => Entailed::Yes,
             tableau::Answer::Consistent => match &self.left_out {
                 Some(why) => Entailed::Unknown(why.clone()),
@@ -188,12 +191,10 @@ impl Batch {
             },
             // The scalar reduction can still decide what the compiled probe can't express
             // (its Horn stage, for one): slower, but it keeps every answer the store had.
-            tableau::Answer::Unsupported(_) => match test {
-                Test::Axiom(axiom) => super::entails(ontology, axiom, fresh, budget),
-                Test::Nonempty(class) => super::nonempty(ontology, *class, budget),
-            },
+            tableau::Answer::Unsupported(_) => scalar(),
             tableau::Answer::GaveUp(why) => Entailed::Unknown(format!("gave up: {why}")),
-        }
+        };
+        super::by(deadline, answer)
     }
 }
 

@@ -90,6 +90,10 @@ impl StoreService {
         let epoch = self.certificate_epoch();
         if epoch.is_multiple_of(2) {
             let answer = self.entails_once(&program, conclusion, deadline)?;
+            // No answer of any kind found past the deadline, an inconsistent premise's included.
+            if deadline.passed() {
+                return Err(out_of_time());
+            }
             if self.certificate_epoch() == epoch {
                 return Ok(answer);
             }
@@ -138,10 +142,6 @@ impl StoreService {
         let dl = self.dl().active();
         let plain = !split.formed && conclusion.iter().all(ground);
         let shown = (!dl || plain) && self.shown_by_rules(&at, program, &split, deadline)?;
-        // A rules' answer found late is none either: the deadline bounds the whole answer.
-        if deadline.passed() {
-            return Err(out_of_time());
-        }
         if shown {
             return Ok(Entailment::Entailed);
         }
@@ -160,6 +160,10 @@ impl StoreService {
         split: &Split,
         deadline: Deadline,
     ) -> StoreResult<bool> {
+        // The ASK has no stop of its own: under owl2-dl it is of ground statements only.
+        if deadline.passed() {
+            return Err(out_of_time());
+        }
         let asked = split.positive.is_empty() || self.ask(at, &split.positive)?;
         #[cfg(test)]
         crate::service::hooks::run(&crate::service::hooks::BETWEEN_ENTAILMENT_HALVES);
@@ -484,8 +488,34 @@ impl StoreService {
         self.entails_dl_at(&self.engine().snapshot(), conclusion, deadline)
     }
 
-    /// [`Self::entails_dl`] over the asserted statements at `snapshot`, before `deadline`.
+    /// [`Self::entails_dl`] over the asserted statements at `snapshot`, before `deadline`: past
+    /// it, no verdict of any kind, the premise's included.
     fn entails_dl_at(
+        &self,
+        snapshot: &Snapshot,
+        conclusion: &[Triple],
+        deadline: Deadline,
+    ) -> StoreResult<DlEntailment> {
+        use crate::dl::{Verdict, entailment::Entailed};
+        let decided = self.entails_dl_read(snapshot, conclusion, deadline)?;
+        if !deadline.passed() {
+            return Ok(decided);
+        }
+        let late = || nrese_dl::limits::Limit::Time.reached("the deadline passed");
+        Ok(DlEntailment {
+            answer: match decided.answer {
+                Entailed::Unknown(why) => Entailed::Unknown(why),
+                _ => Entailed::Unknown(late()),
+            },
+            premise: match decided.premise {
+                Verdict::Unknown(why) => Verdict::Unknown(why),
+                _ => Verdict::Unknown(late()),
+            },
+        })
+    }
+
+    /// [`Self::entails_dl_at`] before its check of the deadline.
+    fn entails_dl_read(
         &self,
         snapshot: &Snapshot,
         conclusion: &[Triple],

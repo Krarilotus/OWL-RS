@@ -67,7 +67,14 @@ fn one_program_matches_independent_reductions_without_leaking_assumptions() {
         .chain(0..tests.len())
     {
         assert_eq!(
-            compiled.check(i, &tests[i], &o, &[100, 101, 102], &budget()),
+            compiled.check(
+                i,
+                &tests[i],
+                &o,
+                &[100, 101, 102],
+                &budget(),
+                Deadline::NONE
+            ),
             expected[i],
             "test {i}"
         );
@@ -89,7 +96,8 @@ fn cancellation_and_fresh_class_name_collisions_stay_local() {
     let mut cancelled = budget();
     cancelled.cancel = Some(tableau::Cancel::from_flag(token.flag()));
     token.cancel();
-    let check = |i: usize, budget: &Budget| compiled.check(i, &tests[i], &o, &[], budget);
+    let check =
+        |i: usize, budget: &Budget| compiled.check(i, &tests[i], &o, &[], budget, Deadline::NONE);
     assert!(matches!(check(0, &cancelled), Entailed::Unknown(_)));
     assert_eq!(check(0, &budget()), Entailed::Yes);
     assert_eq!(check(1, &budget()), Entailed::No);
@@ -111,11 +119,11 @@ fn transitive_role_values_use_the_existing_non_simple_role_normalisation() {
     ];
     let compiled = Batch::new(&mut o, &tests, None);
     assert_eq!(
-        compiled.check(0, &tests[0], &o, &[], &budget()),
+        compiled.check(0, &tests[0], &o, &[], &budget(), Deadline::NONE),
         Entailed::Yes
     );
     assert_eq!(
-        compiled.check(1, &tests[1], &o, &[], &budget()),
+        compiled.check(1, &tests[1], &o, &[], &budget(), Deadline::NONE),
         Entailed::No
     );
 }

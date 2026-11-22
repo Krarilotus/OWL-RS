@@ -319,8 +319,24 @@ fn copy(
 /// Whether `premise` (consistent) entails `axiom`, an axiom over `premise`'s interners.
 /// `fresh` are individuals the premise doesn't name (three or more).
 pub fn entails(premise: &Ontology, axiom: &Axiom, fresh: &[u64], budget: &Budget) -> Entailed {
-    // One time for all the tests, from the call; each spends what is left.
-    let deadline = Deadline::after(budget.timeout);
+    entails_within(
+        premise,
+        axiom,
+        fresh,
+        budget,
+        Deadline::after(budget.timeout),
+    )
+}
+
+/// [`entails`] before `deadline`: each test within what is left of it, and no definite
+/// answer past it.
+pub(crate) fn entails_within(
+    premise: &Ontology,
+    axiom: &Axiom,
+    fresh: &[u64],
+    budget: &Budget,
+    deadline: Deadline,
+) -> Entailed {
     let (mut o, _scratch) = match copy(premise, budget) {
         Ok(copy) => copy,
         Err(unknown) => return unknown,
@@ -356,12 +372,22 @@ pub fn entails(premise: &Ontology, axiom: &Axiom, fresh: &[u64], budget: &Budget
             break;
         }
     }
-    answer
+    by(deadline, answer)
 }
 
 /// Whether `premise` (consistent) entails that some individual is an instance of
 /// `class` (of `premise`'s interners): `class ⊑ ⊥` makes it inconsistent.
 pub fn nonempty(premise: &Ontology, class: ExprId, budget: &Budget) -> Entailed {
+    nonempty_within(premise, class, budget, Deadline::after(budget.timeout))
+}
+
+/// [`nonempty`] within what is left of `deadline`, and no definite answer past it.
+pub(crate) fn nonempty_within(
+    premise: &Ontology,
+    class: ExprId,
+    budget: &Budget,
+    deadline: Deadline,
+) -> Entailed {
     let (mut o, _scratch) = match copy(premise, budget) {
         Ok(copy) => copy,
         Err(unknown) => return unknown,
@@ -369,10 +395,21 @@ pub fn nonempty(premise: &Ontology, class: ExprId, budget: &Budget) -> Entailed 
     let nothing = intern(&mut o, ClassExpr::Nothing);
     o.axioms.push(Axiom::SubClassOf(class, nothing));
     o.sources.push(Vec::new());
-    match consistency::check(&o, budget).verdict {
+    let answer = match consistency::check(&o, &budget.remaining(deadline)).verdict {
         Verdict::Inconsistent => Entailed::Yes,
         Verdict::Consistent => Entailed::No,
         Verdict::Unknown(why) => Entailed::Unknown(why),
+    };
+    by(deadline, answer)
+}
+
+/// `answer`, unless `deadline` has passed: then no definite one.
+pub(crate) fn by(deadline: Deadline, answer: Entailed) -> Entailed {
+    match answer {
+        Entailed::Yes | Entailed::No if deadline.passed() => {
+            Entailed::Unknown(nrese_dl::limits::Limit::Time.reached("the deadline passed"))
+        }
+        answer => answer,
     }
 }
 
@@ -398,8 +435,8 @@ pub fn entails_ontology(
     )
 }
 
-/// [`entails_ontology`], each test within what is left of `deadline`: a caller's, that
-/// began before this check.
+/// [`entails_ontology`], each test within what is left of `deadline` (a caller's, that
+/// began before this check), and no definite answer past it.
 pub(crate) fn entails_ontology_within(
     premise: &Ontology,
     conclusion: &Ontology,
@@ -426,7 +463,7 @@ pub(crate) fn entails_ontology_within(
     let compiled = Batch::new(&mut o, &tests, budget.memory.as_ref());
     let mut answer = Entailed::Yes;
     for (index, test) in tests.iter().enumerate() {
-        answer = answer.and(compiled.check(index, test, &o, fresh, &budget.remaining(deadline)));
+        answer = answer.and(compiled.check(index, test, &o, fresh, budget, deadline));
         if answer == Entailed::No {
             break;
         }
@@ -436,5 +473,5 @@ pub(crate) fn entails_ontology_within(
             "not entailed for one value of the conclusion's anonymous individual".into(),
         );
     }
-    answer
+    by(deadline, answer)
 }
