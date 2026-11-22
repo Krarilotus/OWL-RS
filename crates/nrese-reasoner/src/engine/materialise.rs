@@ -12,7 +12,7 @@ use super::{Program, encode, storable};
 use crate::batch::{self, Phases, Schema};
 use crate::delta;
 use crate::eval::OperationStop;
-use crate::ir::{Triple, Violations};
+use crate::ir::{Rule, Triple, Violations};
 use crate::lists::ListDiagnostic;
 
 /// A closure computed over engine term ids.
@@ -116,16 +116,17 @@ fn closure_with(
     nrese_exec::heap::phase("reasoner: input");
     let (input, axioms) = input_of(program, snapshot);
     let schema = program.schema_for(snapshot);
+    let rules = program.rules_for(snapshot);
     let result = match program.same_as.filter(|_| program.by_representatives) {
         Some(same_as) => {
-            match by_representatives(program, input, same_as, &schema, stop, memory)? {
+            match by_representatives(program, &rules, input, same_as, &schema, stop, memory)? {
                 // A class holding rdf:nil reads every list through it as empty: computed
                 // again by replication. A compact stack keeps the closure over
                 // representatives.
                 result if result.nil_merged && !program.store_representatives => {
                     batch::materialise_grouped_with(
                         input_of(program, snapshot).0,
-                        &program.rules,
+                        &rules,
                         program.lists.as_ref(),
                         &schema,
                         stop,
@@ -137,7 +138,7 @@ fn closure_with(
         }
         None => batch::materialise_grouped_with(
             input,
-            &program.rules,
+            &rules,
             program.lists.as_ref(),
             &schema,
             stop,
@@ -211,6 +212,7 @@ fn input_of(program: &Program, snapshot: &Snapshot) -> (Grouped, Vec<Triple>) {
 /// replacement rules.
 fn by_representatives(
     program: &Program,
+    rules: &[Rule],
     input: Grouped,
     same_as: u64,
     schema: &Schema,
@@ -223,7 +225,7 @@ fn by_representatives(
     };
     let mut result = batch::materialise_representatives_with(
         batch::Input::Grouped(input),
-        &program.rules,
+        rules,
         program.lists.as_ref(),
         schema,
         listing,

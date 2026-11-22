@@ -31,6 +31,10 @@ impl WriterHeld<'_> {
 /// revision the commit publishes.
 pub type CommitNote<'e> = Box<dyn FnOnce(u64) -> Result<(), NoteError> + Send + Sync + 'e>;
 
+/// The infallible sibling of [`CommitNote`], called with the revision as soon as it is visible.
+/// It only records: no allocation, locking, I/O or calls into the engine.
+pub type CommitPublication<'e> = Box<dyn FnOnce(u64) + Send + Sync + 'e>;
+
 /// Why a [`CommitNote`] failed, as its journal knows it.
 #[derive(Debug)]
 pub enum NoteError {

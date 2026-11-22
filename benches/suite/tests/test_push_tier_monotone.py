@@ -44,8 +44,13 @@ esac
 exit 0
 """
 RECORD = '#!/bin/sh\necho "{name} $*" >> "$CALLS"\nexit 0\n'
+# ALONE_FAILS ("crate:exit ..."): `check` of each crate it names, with its test targets, exits so: one
+# whose tests don't compile alone (101), or the guard refusing the build (75).
 STUBS = {
-    "scripts/cargo-guarded.sh": '#!/bin/sh\necho "guarded ${NRESE_FUZZ_SEED:+seed=$NRESE_FUZZ_SEED }$*" >> "$CALLS"\nexit 0\n',
+    "scripts/cargo-guarded.sh": '#!/bin/sh\necho "guarded ${NRESE_FUZZ_SEED:+seed=$NRESE_FUZZ_SEED }$*" >> "$CALLS"\n'
+                                '[ "$1" = check ] || exit 0\ncase " $* " in *" --tests "*) ;; *) exit 0 ;; esac\n'
+                                'for fail in ${ALONE_FAILS:-}; do [ "${fail%%:*}" != "$4" ] || exit "${fail#*:}"; done\n'
+                                'exit 0\n',
     "scripts/fetch-w3c-tests.sh": RECORD.format(name="w3c"),
     "scripts/check-locks.sh": RECORD.format(name="locks"),
     "scripts/check-features.sh": RECORD.format(name="features"),
@@ -105,8 +110,8 @@ def side_checks(stdout, calls):
 
 def facts(stdout, calls):
     """What one run of the tier did, as a set: each step of its summary; each crate linted; each crate
-    tested, fully or fast (fully includes fast); each crate whose random tests ran; each Python file
-    whose names were checked."""
+    tested, fully or fast (fully includes fast); each crate whose random tests ran; each crate compiled
+    alone; each Python file whose names were checked."""
     done = {("step", m) for m in re.findall(r"(?m)^ +\d+  (.+) \(\d+ s\)$", stdout)}
     for line in calls:
         words = line.split()
@@ -122,6 +127,8 @@ def facts(stdout, calls):
         elif words[1] == "test":
             fully = "--tests" in words
             done |= {("test", c, "fast") for c in crates} | {("test", c, "full") for c in crates if fully}
+        elif words[1] == "check" and "--tests" in words and len(crates) == 1:
+            done |= {("alone", c) for c in crates}
     return frozenset(done)
 
 
@@ -162,14 +169,15 @@ class PushTierMonotone(unittest.TestCase):
             cls.runs = dict(zip(TABLE, pool.map(cls.tier, range(len(TABLE)), TABLE)))
 
     @classmethod
-    def tier(cls, n, files, first=None):
-        """The tier's run over FILES, with FIRST's tools first on PATH: (exit code, its standard output,
-        its calls, all its output)."""
+    def tier(cls, n, files, first=None, alone_fails=""):
+        """The tier's run over FILES, with FIRST's tools first on PATH and ALONE_FAILS's crate failing to
+        compile alone: (exit code, its standard output, its calls, all its output)."""
         own = cls.root / f"run-{n}"
         own.mkdir()
         (own / "files").write_text("".join(f"{f}\n" for f in sorted(files)), newline="\n")
         calls = own / "calls"
-        env = {**cls.env, "CALLS": calls.as_posix(), "NRESE_FILES_FROM": (own / "files").as_posix()}
+        env = {**cls.env, "CALLS": calls.as_posix(), "NRESE_FILES_FROM": (own / "files").as_posix(),
+               "ALONE_FAILS": alone_fails}
         if first:
             env["PATH"] = first.as_posix() + os.pathsep + env["PATH"]
         done = subprocess.run([BASH, "scripts/check.sh", "push"], cwd=cls.repo, capture_output=True, text=True,
@@ -186,11 +194,26 @@ class PushTierMonotone(unittest.TestCase):
         # Worked by hand from the push tier's description (scripts/check.sh's header): alpha changed,
         # beta depends on it. The fixture's reading of a run, checked once.
         _, stdout, calls, out = self.runs[frozenset({"crates/alpha/src/lib.rs"})]
-        steps = {"fmt", "clippy", "W3C data", "test", "seeds", "locks", "features"}
+        steps = {"fmt", "clippy", "W3C data", "test", "seeds", "locks", "features", "crates alone"}
         expected = {("step", s) for s in steps} | {("clippy", "alpha"), ("test", "alpha", "full"),
                                                    ("test", "alpha", "fast"), ("test", "beta", "fast"),
-                                                   ("seeds", "alpha")}
+                                                   ("seeds", "alpha"), ("alone", "alpha"), ("alone", "beta")}
         self.assertEqual(facts(stdout, calls), expected, f"SPEC push-tier-selection: the run as read\n{out}")
+
+    def test_a_crate_that_fails_to_compile_alone_fails_the_tier(self):
+        """Its tests run in one nextest run with the other crates', whose features it gets there: checked
+        alone, with its own features, it fails, and the tier with it. Here alpha changed and beta,
+        which depends on it, has tests that don't compile alone."""
+        code, stdout, _, out = self.tier(len(TABLE) + 1, {"crates/alpha/src/lib.rs"}, alone_fails="beta:101")
+        self.assertEqual(code, 1, f"SPEC crates-alone: a dependent that doesn't compile alone passed the tier\n{out}")
+        self.assertRegex(stdout, r"(?m)^ +101  crates alone \(\d+ s\)$", out)
+
+    def test_a_guard_refusal_in_the_crates_alone_step_stays_no_verdict(self):
+        """scripts/check.sh's header: the guard's 75 is no verdict, not the tree's failure. alpha's check
+        is refused by the guard (75), then beta's fails (101): the step, and the tier, give no verdict."""
+        code, stdout, _, out = self.tier(len(TABLE) + 2, {"crates/alpha/src/lib.rs"}, alone_fails="alpha:75 beta:101")
+        self.assertEqual(code, 75, f"SPEC crates-alone: a later failure turned the guard's 75 into a verdict\n{out}")
+        self.assertRegex(stdout, r"(?m)^ +75  crates alone \(\d+ s\)$", out)
 
     def test_the_seeds_come_from_the_full_commit_id(self):
         """Review r2 (21 Nov 2026): the random tests' seeds are drawn from the commit, its id's first six
