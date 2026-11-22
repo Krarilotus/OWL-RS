@@ -195,6 +195,9 @@ fn closure_with(
         // at a doubling three times beside them (LUBM 1000: 6.6 GB at this step's peak).
         inferred = Vec::with_capacity(result.derived.len() + axioms.len());
         for t in result.derived.into_iter().chain(axioms) {
+            if let Some(crate::lists::TableKind::Internal) = crate::lists::table_kind(t) {
+                continue;
+            }
             if storable(t) {
                 inferred.push(encode(t));
                 continue;

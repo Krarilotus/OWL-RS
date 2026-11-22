@@ -8,6 +8,7 @@ mod ni;
 mod probes;
 mod resources;
 mod sat;
+mod support;
 mod symmetric_chains;
 
 use std::time::Duration;

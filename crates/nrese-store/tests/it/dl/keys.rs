@@ -16,10 +16,9 @@ use super::{ask, insert, pipeline, update};
 /// the ontology off the RL route, to the bounds.
 const OUTSIDE_RL: &str = ":Pet rdfs:subClassOf [ owl:unionOf ( :Dog :Cat ) ] . :tib a :Pet .";
 
-/// Under reasoning-semantics.md, Freshness, version 7 and the new seeds change the
-/// `owl2-rl` program fingerprint, so stores rebuild once at their next start; so does the
-/// empty-`owl:Thing` check (`cls-thing-empty`) in the rule text.
-const OWL2_RL_FINGERPRINT: &str = "d21b78c6c05606e7";
+/// The version 9 semantics and the OWL 2 RL rule text, including `cls-thing-empty`,
+/// determine this fingerprint. An older store rebuilds at startup.
+const OWL2_RL_FINGERPRINT: &str = "e9f63653de270f96";
 
 /// An object key over `z`, `:a` and `:b` sharing it as value, and `more`.
 fn object_key(z: &str, more: &str) -> String {

@@ -222,22 +222,43 @@ fn assert_matches_model(version: &IndexVersion, model: &BTreeSet<EncodedQuad>, c
     );
 }
 
+/// Replay pinned seeds when the tier is unset or `landing`, with no seed or count.
+fn pinned_compactions() -> bool {
+    !crate::check_tier::nightly()
+        && std::env::var_os("NRESE_FUZZ_CASES").is_none()
+        && std::env::var_os("NRESE_FUZZ_SEED").is_none()
+}
+
+/// The range containing the pinned seed offsets, or all 40 offsets for a full draw.
+fn seeds() -> u64 {
+    if pinned_compactions() { 10 } else { 40 }
+}
+
+/// By default (tier unset or `landing`, with no seed or count), this test replays policy compactions in each layout. With `NRESE_CHECK_TIER=nightly`, `NRESE_FUZZ_SEED` or `NRESE_FUZZ_CASES`, it draws 40 seeds per layout.
 #[test]
 fn random_commits_with_policy_compaction_match_the_model() {
     let policy = CompactionPolicy {
         fanout: 2,
         ..CompactionPolicy::default()
     };
+    let pinned = pinned_compactions();
+    let cases = seeds();
     for layout in LAYOUTS {
-        for seed in 0..40 {
+        let mut compacted = false;
+        let (mut inserted, mut deleted) = (false, false);
+        // Seed 0 catches a fault that drops tombstones during compaction.
+        for seed in (0..cases).filter(|seed| !pinned || [0, 9].contains(seed)) {
             let mut rng = Rng(fuzz(seed));
             let mut model = BTreeSet::new();
             let mut version = IndexVersion::empty(layout);
             for step in 0..60 {
-                version = version.with_run(random_commit(layout, &mut rng, &mut model));
-                if let Some(plan) = policy.plan(version.runs()) {
+                let run = random_commit(layout, &mut rng, &mut model);
+                let edits = (run.inserts() > 0, run.deletes() > 0);
+                version = version.with_run(run);
+                let plan = policy.plan(version.runs());
+                if let Some(plan) = &plan {
                     let merged = merge_runs(&version.runs()[plan.window.clone()]);
-                    version = version.with_compacted(plan.window, merged);
+                    version = version.with_compacted(plan.window.clone(), merged);
                 }
                 let context = format!("{layout:?} seed {seed} step {step}");
                 assert_matches_model(&version, &model, &context);
@@ -248,30 +269,60 @@ fn random_commits_with_policy_compaction_match_the_model() {
                     model.contains(&probe),
                     "{context}"
                 );
+                compacted |= plan.is_some();
+                inserted |= edits.0;
+                deleted |= edits.1;
             }
+        }
+        if pinned {
+            assert!(compacted, "no compaction in {layout:?}");
+            assert!(
+                inserted && deleted,
+                "missing insert or delete in {layout:?}"
+            );
         }
     }
 }
 
+/// By default (tier unset or `landing`, with no seed or count), this test replays fixed windows that touch or leave either boundary in each layout. With `NRESE_CHECK_TIER=nightly`, `NRESE_FUZZ_SEED` or `NRESE_FUZZ_CASES`, it draws 40 seeds per layout.
 #[test]
 fn arbitrary_compaction_windows_preserve_contents() {
+    let pinned = pinned_compactions();
+    let cases = seeds();
     for layout in LAYOUTS {
-        for seed in 100..140 {
+        let mut windows = BTreeSet::new();
+        let (mut inserted, mut deleted) = (false, false);
+        for seed in (100..100 + cases).filter(|seed| !pinned || [100, 103, 109].contains(seed)) {
             let mut rng = Rng(fuzz(seed));
             let mut model = BTreeSet::new();
             let mut version = IndexVersion::empty(layout);
             for step in 0..40 {
-                version = version.with_run(random_commit(layout, &mut rng, &mut model));
+                let run = random_commit(layout, &mut rng, &mut model);
+                let edits = (run.inserts() > 0, run.deletes() > 0);
+                version = version.with_run(run);
                 let runs = version.runs().len() as u64;
-                if runs >= 2 && rng.below(3) == 0 {
+                let window = if runs >= 2 && rng.below(3) == 0 {
                     let start = rng.below(runs - 1) as usize;
                     let end = start + 2 + rng.below(runs - start as u64 - 1) as usize;
                     let merged = merge_runs(&version.runs()[start..end]);
                     version = version.with_compacted(start..end, merged);
-                }
+                    Some((start == 0, end as u64 == runs))
+                } else {
+                    None
+                };
                 let context = format!("{layout:?} seed {seed} step {step}");
                 assert_matches_model(&version, &model, &context);
+                windows.extend(window);
+                inserted |= edits.0;
+                deleted |= edits.1;
             }
+        }
+        if pinned {
+            assert_eq!(windows.len(), 4, "{layout:?}: {windows:?}");
+            assert!(
+                inserted && deleted,
+                "missing insert or delete in {layout:?}"
+            );
         }
     }
 }

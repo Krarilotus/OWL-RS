@@ -9,6 +9,8 @@ use nrese_engine::{
 };
 use nrese_rdf::{GraphName, NamedNode, Quad};
 
+use crate::support::nightly;
+
 fn node(name: &str) -> NamedNode {
     NamedNode::new_unchecked(format!("urn:{name}"))
 }
@@ -389,13 +391,20 @@ fn a_count_up_to_a_limit_answers_at_least_the_limit_or_the_whole_count() {
 }
 
 /// Spec (`CountedSnapshot::count_up_to`): an expanded count stops at its limit. On a compact
-/// snapshot, `? p ?` (20,000 stored matches of 50 copies each, and as many in a named graph)
-/// asked up to 1,000 (above one match's copies) and up to 1 answers [`Count::AtLeast`] and
-/// tells its visitor of less than half the units the whole count does; asked up to one past
-/// the count, it answers the whole count.
+/// snapshot, `? p ?` counts expanded matches in the default graph and stored matches in a
+/// named graph. Limits above one match's copies and at 1 return [`Count::AtLeast`] and ask
+/// the visitor for less than half the work of a whole count. A limit above the count gives
+/// the whole count.
+/// By default, use 10 copies, 20,000 stored matches and limit 100. With
+/// `NRESE_CHECK_TIER=nightly`, use 50 copies, 40,000 matches and limit 1,000.
 #[test]
 fn an_expanded_count_up_to_a_limit_stops_there() {
-    let snapshot = compact(50, 20_000);
+    let (copies, facts, limit) = if nightly() {
+        (50, 20_000, 1_000)
+    } else {
+        (10, 10_000, 100)
+    };
+    let snapshot = compact(copies, facts);
     let p = snapshot.lookup(node("p").as_ref().into()).unwrap();
     let pattern = QuadPattern {
         predicate: Some(p),
@@ -414,13 +423,12 @@ fn an_expanded_count_up_to_a_limit_stops_there() {
     };
     let whole = snapshot.count_in(ReadModel::Materialised, &pattern);
     let n = whole.at_least();
-    assert!(n > 20_000, "{whole:?}: the copies are counted");
+    assert!(n > (2 * facts) as u64, "{whole:?}: the copies are counted");
     let (all, all_units) = units(u64::MAX);
     assert_eq!(all, whole);
     let (past, _) = units(n + 1);
     assert_eq!(past, whole, "a limit past the count: the whole count");
-    // Above one stored match's 50 copies, far below the whole count.
-    let limit = 1_000;
+    // Above one stored match's copies, far below the whole count.
     let (some, some_units) = units(limit);
     assert!(
         matches!(some, Count::AtLeast(k) if (limit..=n).contains(&k)),
@@ -445,9 +453,16 @@ fn an_expanded_count_up_to_a_limit_stops_there() {
 /// answers `Stopped`): a count asked up to a limit it would reach only near its end, its
 /// visitor refusing once half its units are counted, answers `Stopped` and asks for no unit
 /// after the refusal.
+/// By default, use 10 copies and 20,000 stored matches. With `NRESE_CHECK_TIER=nightly`,
+/// use 50 copies and 40,000 matches.
 #[test]
 fn a_count_up_to_a_limit_stops_with_its_visitor() {
-    let snapshot = compact(50, 20_000);
+    let (copies, facts) = if nightly() {
+        (50, 20_000)
+    } else {
+        (10, 10_000)
+    };
+    let snapshot = compact(copies, facts);
     let all = QuadPattern::all();
     let counted = snapshot.counted();
     let limit = snapshot.count_in(ReadModel::Materialised, &all).at_least() - 1;

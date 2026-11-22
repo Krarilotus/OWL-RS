@@ -499,21 +499,22 @@ impl<'v, 'p> Probe<'v, 'p> {
     }
 }
 
-/// A [`Source`]'s facts (all segments) for list instantiation, which is grounding: it runs
-/// to its end ([`Poller::never`]; a program grounded part-way would be kept as if whole).
-pub struct AllFacts<'a, S: ?Sized>(pub &'a S);
+/// A [`Source`]'s facts (all segments) for list instantiation. The caller checks
+/// the poller before using a program that may have been interrupted.
+pub struct AllFacts<'a, 'p, S: ?Sized>(pub &'a S, pub &'a Poller<'p>);
 
-impl<S: Source + ?Sized> Facts for AllFacts<'_, S> {
+impl<S: Source + ?Sized> Facts for AllFacts<'_, '_, S> {
     fn objects(&self, subject: u64, predicate: u64) -> Vec<u64> {
         let mut out = Vec::new();
-        self.0
-            .scan(
-                [Some(subject), Some(predicate), None],
-                Seg::All,
-                &Poller::never(),
-                &mut |t| out.push(t[2]),
-            )
-            .expect("never stopped");
+        let read = self.0.scan(
+            [Some(subject), Some(predicate), None],
+            Seg::All,
+            self.1,
+            &mut |t| out.push(t[2]),
+        );
+        if read.is_err() {
+            return Vec::new();
+        }
         out.sort_unstable();
         out.dedup();
         out
@@ -521,17 +522,21 @@ impl<S: Source + ?Sized> Facts for AllFacts<'_, S> {
 
     fn pairs(&self, predicate: u64) -> Vec<(u64, u64)> {
         let mut out = Vec::new();
-        self.0
-            .scan(
-                [None, Some(predicate), None],
-                Seg::All,
-                &Poller::never(),
-                &mut |t| out.push((t[0], t[2])),
-            )
-            .expect("never stopped");
+        let read = self
+            .0
+            .scan([None, Some(predicate), None], Seg::All, self.1, &mut |t| {
+                out.push((t[0], t[2]))
+            });
+        if read.is_err() {
+            return Vec::new();
+        }
         out.sort_unstable();
         out.dedup();
         out
+    }
+
+    fn stopped(&self) -> bool {
+        self.1.tick()
     }
 }
 
@@ -2303,43 +2308,9 @@ impl<'a> Unpolled<'a> {
         fact: Triple,
         limit: usize,
     ) -> Vec<(String, Vec<Triple>)> {
-        let program = self.0;
-        let transitive = program
-            .transitive
-            .contains(&fact[1])
-            .then(|| transitivity(fact[1]));
-        let rules = self
-            .producers(fact)
-            .into_iter()
-            .map(|r| (&program.rules[r], Grounding::Rule(r)))
-            .chain(
-                transitive
-                    .as_ref()
-                    .map(|rule| (rule, Grounding::Transitive(fact[1]))),
-            );
-        let mut bodies = Vec::new();
-        let poll = Poller::never();
-        for (rule, grounding) in rules {
-            let alternatives = self.premise_alternatives(grounding);
-            derivations(source, rule, fact, Seg::All, &poll, &mut |bindings| {
-                let body: Vec<Triple> = rule
-                    .body
-                    .iter()
-                    .map(|atom| instantiate_head(atom, bindings))
-                    .collect();
-                for premises in &alternatives {
-                    let mut full = body.clone();
-                    full.extend_from_slice(premises);
-                    bodies.push((rule.name.clone(), full));
-                }
-                bodies.len() >= limit
-            })
-            .expect("never stopped");
-            if bodies.len() >= limit {
-                break;
-            }
-        }
-        bodies
+        self.0
+            .named_derivations_with(source, fact, limit, &Poller::never(), true)
+            .expect("never stopped")
     }
 
     /// Whether `fact` has a one-step derivation from the facts of `source` (`Seg::All`):
@@ -2402,6 +2373,9 @@ pub struct GroundProgram {
     consistency_dispatch: Dispatch,
     /// The list axioms of the program's state that weren't instantiated.
     pub list_diagnostics: Vec<super::lists::ListDiagnostic>,
+    pub(crate) list_predicates: super::lists::Predicates,
+    pub(crate) table_rules: Vec<usize>,
+    pub(crate) table: Option<std::sync::Arc<super::batch::Store>>,
 }
 
 impl std::fmt::Debug for GroundProgram {
@@ -2460,6 +2434,12 @@ impl GroundProgram {
             self.dispatch.push(self.rules.len(), &rule);
             if let Head::Facts(heads) = &rule.head {
                 self.heads.push_atoms(self.rules.len(), heads);
+                if heads
+                    .iter()
+                    .any(|head| matches!(head.0[1], Term::Const(p) if super::lists::internal(p)))
+                {
+                    self.table_rules.push(self.rules.len());
+                }
             }
             let equality = same_as.and_then(|id| super::equality_rules::equality_rule(&rule, id));
             self.rules.push(rule);
@@ -2801,23 +2781,43 @@ impl GroundProgram {
         limit: usize,
         poll: &Poller<'_>,
     ) -> Result<Vec<(String, Vec<Triple>)>, Stopped> {
+        self.named_derivations_with(source, fact, limit, poll, false)
+    }
+
+    /// A justification reads every schema premise alternative of a derivation.
+    pub(crate) fn named_derivations_with<S: Source + ?Sized>(
+        &self,
+        source: &S,
+        fact: Triple,
+        limit: usize,
+        poll: &Poller<'_>,
+        all_premises: bool,
+    ) -> Result<Vec<(String, Vec<Triple>)>, Stopped> {
         let mut bodies = Vec::new();
-        let mut search =
-            |rule: &Rule, premises: &[Triple], poll: &Poller<'_>| -> Result<bool, Stopped> {
-                derivations(source, rule, fact, Seg::All, poll, &mut |bindings| {
-                    let mut body: Vec<Triple> = rule
-                        .body
-                        .iter()
-                        .map(|atom| instantiate_head(atom, bindings))
-                        .collect();
-                    body.extend_from_slice(premises);
-                    bodies.push((rule.name.clone(), body));
-                    bodies.len() >= limit
-                })?;
-                Ok(bodies.len() >= limit)
-            };
+        let mut search = |rule: &Rule, grounding, poll: &Poller<'_>| -> Result<bool, Stopped> {
+            derivations(source, rule, fact, Seg::All, poll, &mut |bindings| {
+                let body: Vec<Triple> = rule
+                    .body
+                    .iter()
+                    .map(|atom| instantiate_head(atom, bindings))
+                    .collect();
+                let alternatives = self.for_each_alternative(grounding, poll, |premises, _| {
+                    let mut full = body.clone();
+                    full.extend_from_slice(premises);
+                    bodies.push((rule.name.clone(), full));
+                    Ok(if all_premises {
+                        ControlFlow::Continue(())
+                    } else {
+                        ControlFlow::Break(())
+                    })
+                });
+                alternatives.is_err() || bodies.len() >= limit
+            })?;
+            poll.ended()?;
+            Ok(bodies.len() >= limit)
+        };
         let full = self.for_each_producer(fact, poll, |r, poll| {
-            Ok(match search(&self.rules[r], &self.premises[r], poll)? {
+            Ok(match search(&self.rules[r], Grounding::Rule(r), poll)? {
                 true => ControlFlow::Break(()),
                 false => ControlFlow::Continue(()),
             })
@@ -2826,11 +2826,7 @@ impl GroundProgram {
             if poll.attempt(1) {
                 return Err(Stopped);
             }
-            search(
-                &transitivity(fact[1]),
-                self.transitive_premises(fact[1]),
-                poll,
-            )?;
+            search(&transitivity(fact[1]), Grounding::Transitive(fact[1]), poll)?;
         }
         Ok(bodies)
     }

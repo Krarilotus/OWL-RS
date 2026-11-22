@@ -12,7 +12,7 @@ use nrese_reasoner::ReasonerService;
 use nrese_server::ai::AiSuggestionService;
 use nrese_server::auth::{AuthConfig, StaticBearerConfig};
 use nrese_server::http::MAX_BUFFERED_OUTPUT_BYTES;
-use nrese_server::policy::PolicyConfig;
+use nrese_server::policy::{PolicyConfig, RequestTimeouts};
 use nrese_server::{AppState, DeploymentPosture, ServerConfig, build_app};
 use nrese_store::{ProcessMemory, StoreConfig, StoreService};
 use tower::util::ServiceExt;
@@ -93,7 +93,11 @@ fn opening_repositories_and_system_stores_preserves_the_startup_policy() {
 /// An app over an in-memory store whose graph `urn:n8:g` holds `n` statements about `n`
 /// subjects and whose graph `urn:n8:hub` holds `n` statements about one subject, loaded
 /// through the Graph Store Protocol.
-fn app_with(n: usize, runtime: &tokio::runtime::Runtime) -> axum::Router {
+fn app_with(
+    n: usize,
+    runtime: &tokio::runtime::Runtime,
+    timeouts: RequestTimeouts,
+) -> axum::Router {
     let state = AppState::new(
         StoreService::new(StoreConfig::in_memory()).unwrap(),
         ReasonerService::new(Default::default()),
@@ -102,6 +106,7 @@ fn app_with(n: usize, runtime: &tokio::runtime::Runtime) -> axum::Router {
                 read_token: None,
                 admin_token: "admin".to_owned(),
             }),
+            timeouts,
             ..PolicyConfig::default()
         },
         AiSuggestionService::disabled(),
@@ -178,7 +183,7 @@ fn server_output_holds_the_same_memory_for_a_graph_four_times_larger() {
         .build()
         .unwrap();
     let n = 20_000;
-    let apps = [app_with(n, &runtime), app_with(4 * n, &runtime)];
+    let apps = [n, 4 * n].map(|size| app_with(size, &runtime, RequestTimeouts::default()));
     let rows: [(&str, Method, &str, &str); 4] = [
         (
             "GET N-Triples",
@@ -258,6 +263,7 @@ fn export_growth_accepts_the_bounded_channel_occupancy() {
     assert_output_growth("export", [292_588, 598_064]);
 }
 
+/// Use a 300 ms stall deadline by default and with `NRESE_CHECK_TIER=nightly`.
 #[test]
 fn get_growth_accepts_a_channel_filled_by_an_unread_body() {
     // Spec: SS-15's controlled witness: scheduling alone may fill GET's channel.
@@ -270,7 +276,14 @@ fn get_growth_accepts_a_channel_filled_by_an_unread_body() {
         .enable_all()
         .build()
         .unwrap();
-    let app = app_with(80_000, &runtime);
+    let app = app_with(
+        80_000,
+        &runtime,
+        RequestTimeouts {
+            graph_read: std::time::Duration::from_millis(300),
+            ..RequestTimeouts::default()
+        },
+    );
     let request = (
         Method::GET,
         "/dataset/data?graph=urn%3An8%3Ag",

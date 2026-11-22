@@ -518,6 +518,9 @@ fn restricted_rewrites_tell_nothing_of_hidden_statistics() {
 /// Graph Store's and RDF4J's reads; PR #45: EXPLAIN without running, and each
 /// row's kind and limit; PR #50: an update's WHERE reads a supported reader's
 /// view, refused while it is made.
+/// By default it scans secret graphs of 10,000 and 20,000 statements and checks the live
+/// channel at 2 MiB with 20,000 against 200,000; with `NRESE_CHECK_TIER=nightly` it scans
+/// 100,000 and 200,000 and checks it at 4 MiB with 20,000 against 400,000.
 #[test]
 fn memory_refusals_tell_a_restricted_requester_nothing_of_hidden_sizes() {
     use nrese_reasoner::rulesets::Ruleset;
@@ -671,8 +674,15 @@ fn memory_refusals_tell_a_restricted_requester_nothing_of_hidden_sizes() {
         pipeline
     };
     let store = |hidden: usize, public: &str| store_with(64 << 10, hidden, public);
-    // Scanned: a query of `?s <urn:p> ?o` in every graph reads the secret graph's.
-    let scans = [100_000, 200_000].map(|hidden| store(hidden, "<urn:visible> <urn:p> 1"));
+    // Scanned: a query of `?s <urn:p> ?o` in every graph reads the secret graph's. Both sizes
+    // are well past the 64 KiB (three ids of 8 bytes a statement).
+    let nightly = crate::support::nightly();
+    let scanned = if nightly {
+        [100_000, 200_000]
+    } else {
+        [10_000, 20_000]
+    };
+    let scans = scanned.map(|hidden| store(hidden, "<urn:visible> <urn:p> 1"));
     // Viewed: the rules derive `?s <urn:q> ?o` from each with the public graph's
     // `<urn:p> rdfs:subPropertyOf <urn:q>`, and a view of what the public graph supports hides
     // them.
@@ -774,10 +784,16 @@ fn memory_refusals_tell_a_restricted_requester_nothing_of_hidden_sizes() {
     // the same amounts whatever the secret graph holds (D16-039: before, the whole table was
     // charged at once, and the amounts asked for told its size). An answer from one store
     // against a refusal from the other still tells it, under a limit between what the two
-    // scans need: 20,000 secret rows of three ids fit 4 MiB, 400,000 (9.6 MB) don't.
-    let between = 4 << 20;
+    // scans need: 20,000 secret rows of three ids fit 4 MiB, 400,000 (9.6 MB) don't; at half
+    // the limit, 20,000 fit 2 MiB and 200,000 (4.8 MB) don't. The smaller store is 20,000
+    // either way, past the 16,384 rows a capped scan would refuse at.
+    let (between, sizes) = if nightly {
+        (4 << 20, [20_000, 400_000])
+    } else {
+        (2 << 20, [20_000, 200_000])
+    };
     let [fits, outgrows] =
-        [20_000, 400_000].map(|hidden| store_with(between, hidden, "<urn:visible> <urn:p> 1"));
+        sizes.map(|hidden| store_with(between, hidden, "<urn:visible> <urn:p> 1"));
     assert_eq!(
         run(&fits, &ReadScope::All).map_err(|e| e.to_string()),
         Ok(()),

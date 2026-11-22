@@ -242,19 +242,20 @@ fn pull(primary: &HeldPrimary, replica: AppState) -> JoinHandle<Result<(), Strin
     })
 }
 
-fn start(primary: &HeldPrimary, data: &tempfile::TempDir) -> JoinHandle<Result<(), String>> {
+async fn bootstrap(url: String, dir: std::path::PathBuf) -> Result<(), String> {
     let config = ReplicationConfig {
         mode: ReplicationMode::Replica,
-        primary: Some(primary.url.clone()),
+        primary: Some(url),
         ..ReplicationConfig::default()
     };
-    let dir = data.path().to_path_buf();
-    tokio::spawn(async move {
-        replication::bootstrap(&config, &dir)
-            .await
-            .map(drop)
-            .map_err(|error| format!("{error:#}"))
-    })
+    replication::bootstrap(&config, &dir)
+        .await
+        .map(drop)
+        .map_err(|error| format!("{error:#}"))
+}
+
+fn start(primary: &HeldPrimary, data: &tempfile::TempDir) -> JoinHandle<Result<(), String>> {
+    tokio::spawn(bootstrap(primary.url.clone(), data.path().to_path_buf()))
 }
 
 /// An image answer's head: its manifest, a 1000-byte body to come.
@@ -329,21 +330,39 @@ async fn an_image_whose_body_stops_ends() {
     assert!(failed_with(&ended, "stopped sending"), "{ended:?}");
 }
 
-/// Guard (passes before the limits too): an image prepared for a minute, then sent a piece
-/// every 20 s for more than five minutes, still comes.
+/// An image prepared for a minute, then sent a piece every 20 s for more than five minutes,
+/// still comes. The progress events drive the clock by default and with `NRESE_CHECK_TIER=nightly`.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn a_slow_image_that_keeps_coming_is_not_cut_off() {
     let _clock = hold_clock();
     let primary = HeldPrimary::bind().await;
     let data = tempfile::tempdir().expect("data directory");
-    let mut running = start(&primary, &data);
+    let (read, mut progress) = tokio::sync::mpsc::unbounded_channel();
+    let mut running = tokio::spawn(replication::TEST_BYTES_READ.scope(
+        read,
+        bootstrap(primary.url.clone(), data.path().to_path_buf()),
+    ));
     let mut stream = primary.request(&mut running).await.expect("request");
-    assert!(still_running_after(Duration::from_secs(60), &running).await);
-    send(&mut stream, image_head().as_bytes()).await;
-    for piece in 0..16 {
-        send(&mut stream, b"piece").await;
-        if !still_running_after(Duration::from_secs(20), &running).await {
-            panic!("cut off after piece {piece}: {:?}", running.await);
+    tokio::time::advance(Duration::from_secs(60)).await;
+    stream
+        .write_all(image_head().as_bytes())
+        .await
+        .expect("head");
+    let watchdog = real_time(HANG);
+    tokio::pin!(watchdog);
+    for piece in 0..=16 {
+        if piece > 0 {
+            tokio::time::advance(Duration::from_secs(20)).await;
+        }
+        stream.write_all(b"piece").await.expect("piece sent");
+        let mut received = 0;
+        while received < b"piece".len() {
+            tokio::select! {
+                biased;
+                ended = &mut running => panic!("cut off before reading piece {piece}: {ended:?}"),
+                bytes = progress.recv() => received += bytes.expect("replica still reading"),
+                _ = &mut watchdog => panic!("replica did not read piece {piece}"),
+            }
         }
     }
 }

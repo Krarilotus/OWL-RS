@@ -67,7 +67,14 @@ fn one_program_matches_independent_reductions_without_leaking_assumptions() {
         .chain(0..tests.len())
     {
         assert_eq!(
-            compiled.check(i, &tests[i], &o, &[100, 101, 102], &budget()),
+            compiled.check(
+                i,
+                &tests[i],
+                &o,
+                &[100, 101, 102],
+                &budget(),
+                Deadline::NONE
+            ),
             expected[i],
             "test {i}"
         );
@@ -89,10 +96,52 @@ fn cancellation_and_fresh_class_name_collisions_stay_local() {
     let mut cancelled = budget();
     cancelled.cancel = Some(tableau::Cancel::from_flag(token.flag()));
     token.cancel();
-    let check = |i: usize, budget: &Budget| compiled.check(i, &tests[i], &o, &[], budget);
+    let check =
+        |i: usize, budget: &Budget| compiled.check(i, &tests[i], &o, &[], budget, Deadline::NONE);
     assert!(matches!(check(0, &cancelled), Entailed::Unknown(_)));
     assert_eq!(check(0, &budget()), Entailed::Yes);
     assert_eq!(check(1, &budget()), Entailed::No);
+}
+
+/// `:a` (1) is a `C`, and the probe of that over the premise: entailed when it runs.
+fn probed() -> (Batch, Ontology, [Test; 1]) {
+    let mut o = Ontology::default();
+    let c = intern(&mut o, ClassExpr::Class(7));
+    o.axioms.push(Axiom::ClassAssertion(c, 1));
+    let tests = [Test::Axiom(Axiom::ClassAssertion(c, 1))];
+    let compiled = Batch::new(&mut o, &tests, None);
+    assert!(compiled.probes[0].is_some(), "the test has a probe");
+    (compiled, o, tests)
+}
+
+/// Spec (`Batch::check`: decided before `deadline`): a probe that starts after the deadline
+/// doesn't run on a time of its own from its start: it gives up at once.
+#[test]
+fn a_probe_that_starts_past_the_deadline_gives_up() {
+    let (compiled, o, tests) = probed();
+    let deadline = Deadline::after(Some(Duration::from_millis(50)));
+    BEFORE_PROBE.set(Some(Box::new(|| {
+        std::thread::sleep(Duration::from_millis(100));
+    })));
+    let found = compiled.check(0, &tests[0], &o, &[], &budget(), deadline);
+    BEFORE_PROBE.set(None);
+    assert!(
+        matches!(&found, Entailed::Unknown(why) if why.starts_with("gave up")),
+        "{found:?}"
+    );
+}
+
+/// Spec (as above): a verdict the probe finds after the deadline is no verdict.
+#[test]
+fn a_verdict_found_past_the_deadline_is_unknown() {
+    let (compiled, o, tests) = probed();
+    let deadline = Deadline::after(Some(Duration::from_millis(50)));
+    AFTER_PROBE.set(Some(Box::new(|| {
+        std::thread::sleep(Duration::from_millis(100));
+    })));
+    let found = compiled.check(0, &tests[0], &o, &[], &budget(), deadline);
+    AFTER_PROBE.set(None);
+    assert!(matches!(found, Entailed::Unknown(_)), "{found:?}");
 }
 
 #[test]
@@ -111,11 +160,11 @@ fn transitive_role_values_use_the_existing_non_simple_role_normalisation() {
     ];
     let compiled = Batch::new(&mut o, &tests, None);
     assert_eq!(
-        compiled.check(0, &tests[0], &o, &[], &budget()),
+        compiled.check(0, &tests[0], &o, &[], &budget(), Deadline::NONE),
         Entailed::Yes
     );
     assert_eq!(
-        compiled.check(1, &tests[1], &o, &[], &budget()),
+        compiled.check(1, &tests[1], &o, &[], &budget(), Deadline::NONE),
         Entailed::No
     );
 }

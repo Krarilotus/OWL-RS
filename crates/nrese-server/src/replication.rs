@@ -381,9 +381,22 @@ async fn begin(
 /// [`IDLE`].
 async fn piece(response: &mut reqwest::Response) -> anyhow::Result<Option<axum::body::Bytes>> {
     match tokio::time::timeout(IDLE, response.chunk()).await {
-        Ok(piece) => Ok(piece?),
+        Ok(piece) => {
+            let piece = piece?;
+            #[cfg(feature = "fault-points")]
+            if let Some(bytes) = &piece {
+                let _ = TEST_BYTES_READ.try_with(|read| read.send(bytes.len()));
+            }
+            Ok(piece)
+        }
         Err(_) => anyhow::bail!("the primary stopped sending for {} s", IDLE.as_secs()),
     }
+}
+
+#[cfg(feature = "fault-points")]
+tokio::task_local! {
+    /// The number of bytes read in each body chunk, for tests that control the clock.
+    pub static TEST_BYTES_READ: tokio::sync::mpsc::UnboundedSender<usize>;
 }
 
 /// An error answer's text, as far as it comes within [`IDLE`].

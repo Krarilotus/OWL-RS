@@ -1703,6 +1703,7 @@ fn saturate(
 mod tests {
     use super::*;
     use crate::ir::XSD;
+    use crate::tests::nightly;
     use crate::vocabulary::LocalVocabulary;
 
     const EX: &str = "http://example.com/";
@@ -1918,18 +1919,24 @@ mod tests {
     }
 
     /// Once its stop turns true, each worker does at most `POLL_UNITS` more units of work,
-    /// also where one message fans out to more (10,000 subsumers of one class), wherever in
-    /// the run the stop turns true (every 2048th unit, more than once), on one worker and on
-    /// four; each such stop is reached and ends the run.
+    /// also where one message fans out to more (10,000 subsumers of one class), on one worker
+    /// and on four; each such stop is reached and ends the run.
+    /// By default, stop every 4,096 units. With `NRESE_CHECK_TIER=nightly`, stop every 2,048.
     #[test]
     fn a_fan_out_longer_than_a_poll_stops_within_one_on_every_worker() {
         let text = fan_out(10_000);
         let poll = u64::from(nrese_exec::stop::POLL_UNITS);
+        // Each stride is at most 10,000 - POLL_UNITS (5,904), so at least one stop
+        // lands at least POLL_UNITS before the fan-out ends.
+        let stride = if nightly() { 2_048 } else { 4_096 };
         for threads in [1, 4] {
             let (whole, _, done) = probe(&text, threads, u64::MAX);
             assert!(whole.is_ok(), "{threads} workers");
-            assert!(done > 2048, "{threads} workers: {done} units, one probe");
-            for at in (1..done).step_by(2048) {
+            assert!(
+                done > stride + 1,
+                "{threads} workers: {done} units, one probe"
+            );
+            for at in (1..done).step_by(stride as usize) {
                 let (answer, most, reached) = probe(&text, threads, at);
                 assert!(
                     reached >= at,
