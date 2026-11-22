@@ -23,6 +23,13 @@ from unittest.mock import patch
 
 import test_release_acceptance as acceptance
 
+READS = ("benches/cases/core.toml", "benches/cases/sparql.toml", "benches/datasets.toml",
+         "benches/fast/fast.py", "benches/fast/measurement-sides.toml", "benches/fast/release_gate.py",
+         "benches/fast/w3c-expected.toml", "benches/hosts.toml", "benches/reasoning/prepare-lubm.sh",
+         "benches/reasoning/prepare-owl2bench.sh", "benches/sparql/prepare.sh", "benches/suite/suitekit/*",
+         "benches/suite/tests/test_release_acceptance.py", "benches/suite/tests/test_release_gate.py",
+         "docs/design/performance.md", "scripts/lib/ns.sh", "scripts/release-gate.sh")
+
 ROOT = acceptance.ROOT
 gate_module = acceptance.gate_module
 A, B = "a1" * 16, "b2" * 16  # two runs' attempt ids (release_gate.py attempt: 32 hex digits)

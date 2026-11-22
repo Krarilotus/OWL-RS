@@ -22,6 +22,10 @@ import unittest
 import isolation
 import test_push_gate as fixture  # the push gate's scratch repository and fleet stand-in (its tests aren't rerun here)
 
+READS = (".githooks/pre-push", "benches/suite/suitekit/__init__.py", "benches/suite/suitekit/lock.py",
+         "benches/suite/tests/test_push_gate.py", "rust-toolchain.toml", "scripts/cargo-guarded.sh",
+         "scripts/check.sh", "scripts/lib/*")
+
 ROOT = fixture.ROOT
 BASH = fixture.BASH
 ZERO = fixture.ZERO
@@ -178,6 +182,12 @@ STUBS = {
     "scripts/lib/fuzz-targets.txt": "alpha:lib:random\nbeta:lib:random\n",
     "scripts/lib/explorer-targets.txt": "# a listed explorer\nbeta:lib:explore::\n",
     "benches/suite/tests/isolation.py": 'import os\nopen(os.environ["CALLS"], "a").write("suite\\n")\n',
+    # Contracts the tier selects by what they read (benches/suite/tests/contracts.py, copied in as it
+    # is): the gate's scripts and hooks, one by its own file, and the crate scan, which a crate's
+    # sources reach.
+    "benches/suite/tests/test_gate.py": 'READS = ("scripts/", ".githooks/")\n',
+    "benches/suite/tests/test_push_gate.py": 'READS = (".githooks/pre-push",)\n',
+    "benches/suite/tests/crate_scan.py": 'READS = ("crates/**/src/**/*.rs",)\n',
     "crates/alpha/Cargo.toml": '[package]\nname = "alpha"\n',
     "crates/alpha/tests/it/probes/mod.rs": "mod topic;\n",
     "crates/beta/Cargo.toml": '[package]\nname = "beta"\n',
@@ -212,6 +222,8 @@ class QuickTier(unittest.TestCase):
         subprocess.run(["git", "init", "-q", str(cls.repo)], check=True, capture_output=True, env=cls.env)
         (cls.repo / "scripts").mkdir()
         shutil.copy(ROOT / "scripts/check.sh", cls.repo / "scripts/check.sh")
+        (cls.repo / "benches/suite/tests").mkdir(parents=True)
+        shutil.copy(ROOT / "benches/suite/tests/contracts.py", cls.repo / "benches/suite/tests/contracts.py")
         for rel, text in STUBS.items():
             (cls.repo / rel).parent.mkdir(parents=True, exist_ok=True)
             (cls.repo / rel).write_text(text, newline="\n")
@@ -241,8 +253,9 @@ class QuickTier(unittest.TestCase):
         # Spec (design §1), worked by hand for a change to alpha (beta depends on it, has the listed
         # explorer target; alpha has probes): fmt, message strings; clippy on alpha, every target;
         # alpha's unit tests; its it binary's probes:: module; nrese-server's generated views; one
-        # seed of alpha's random tests; beta's explorer target. Not beta's tests, the W3C data, Miri,
-        # the suite contracts (no gate file changed).
+        # seed of alpha's random tests; beta's explorer target; the crate scan, which alpha's source
+        # reaches (push's selection, contracts.py). Not beta's tests, the W3C data, Miri, the other suite
+        # contracts (none reads it).
         fallback = ["guarded clippy --locked -p alpha --all-targets",
                     "guarded test --locked --no-fail-fast -p alpha --lib",
                     "guarded test --locked --no-fail-fast -p alpha --test it -- probes::",
@@ -257,7 +270,8 @@ class QuickTier(unittest.TestCase):
                    "-E (binary_id(nrese-server::it)) & test(generated_views)",
                    "guarded seed=SEED nextest run --locked --no-fail-fast -p alpha -E (binary_id(alpha) & test(random))",
                    "guarded nextest run --locked --no-fail-fast -p beta -E (binary_id(beta) & test(explore::))"]
-        steps = {"fmt", "message strings", "clippy", "unit tests", "probes", "generated views", "seeds", "explorer"}
+        steps = {"fmt", "message strings", "clippy", "unit tests", "probes", "generated views", "seeds", "explorer",
+                 "crate scan"}
         for has, want in (("", fallback), ("1", nextest)):
             with self.subTest(nextest=bool(has)):
                 code, got, calls, out = self.tier("quick", ALPHA, HAS_NEXTEST=has)
@@ -267,8 +281,8 @@ class QuickTier(unittest.TestCase):
                 self.assertEqual(set(got), steps, f"SPEC quick-steps: the summary\n{out}")
 
     def test_a_change_to_the_gates_own_files_gets_the_suite_contracts_as_in_push(self):
-        # Spec (check.sh suite_contracts, one rule for both tiers): a change under scripts/,
-        # benches/suite/ or .githooks/ runs the suite contracts in quick as in push. The cases are the
+        # Spec (check.sh reached_contracts, one rule for both tiers): a change to the gate's own files
+        # runs the suite contracts that read them in quick as in push. The cases are the
         # gate files of two changes whose contracts failed only in the push gate (21 Nov 2026): the
         # effect check added to the guards, its stand-in missing from this file's fixture; the
         # runner check that took a silent `cargo nextest --version` for no runner. And each of the other

@@ -22,6 +22,9 @@ import fast  # noqa: E402
 from suitekit import cases  # noqa: E402
 from suitekit.schema import problems  # noqa: E402
 
+READS = ("benches/", "crates/nrese-shacl/tests/*", "crates/nrese-sparql/tests/geosparql_compliance/*",
+         "crates/nrese-sparql/tests/w3c_sparql11/*", "crates/nrese-store/tests/w3c_owl2_rl/*", "scripts/*")
+
 
 def report(probe, count, members: int, zero: str = "") -> dict:
     """A support-stress perf lab report as fast.py checks it: the probe's and the count's

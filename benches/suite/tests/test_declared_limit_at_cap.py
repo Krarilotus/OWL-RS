@@ -28,6 +28,9 @@ import fast  # noqa: E402
 import release_gate as rg  # noqa: E402
 from suitekit import compare  # noqa: E402
 
+READS = ("benches/datasets.toml", "benches/fast/compete.py", "benches/fast/fast.py",
+         "benches/fast/release_gate.py", "benches/hosts.toml", "benches/suite/suitekit/*")
+
 CASE = "sparqloscope-dblp"
 CAP_GB = 28  # the case's cap: its scope's MemoryMax=28672M
 CAP = 28672 << 20

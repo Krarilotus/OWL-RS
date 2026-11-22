@@ -19,6 +19,9 @@ import unittest
 
 import isolation  # the suite's git environment policy (inherit())
 
+READS = (".githooks/pre-commit", "scripts/check-locks.sh", "scripts/check-names.sh", "scripts/check.sh",
+         "scripts/lib/private_terms.py")
+
 ROOT = Path(__file__).resolve().parents[3]
 BASH = shutil.which("bash")
 # Run from a git hook or inside a gate job, the caller's variables (git's own: isolation.inherit()

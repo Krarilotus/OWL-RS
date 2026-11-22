@@ -37,6 +37,8 @@ from pathlib import Path
 
 import isolation
 
+READS = ("benches/suite/tests/",)
+
 HERE = Path(__file__).resolve().parent
 HEX = re.compile(r"[0-9a-f]{7,40}")
 SHELL = re.compile(r"(?<![\w./-])git\s+((?:-[Cc]\s+\S+\s+)*[a-z][a-z-]*\b[^\n;&|`)]*)")

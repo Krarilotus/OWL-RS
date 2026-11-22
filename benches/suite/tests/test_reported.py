@@ -16,6 +16,9 @@ sys.path.insert(0, str(HERE))
 
 from suitekit.schema import FIELDS, Result, problems, read  # noqa: E402
 
+READS = ("benches/reasoning/reported/rdfox.csv", "benches/suite/suitekit/__init__.py",
+         "benches/suite/suitekit/schema.py", "benches/suite/workloads.toml")
+
 REPORTED = HERE.parent / "reasoning" / "reported"
 SOURCES = ("motik2014parallel", "nenov2015rdfox", "tsamoura2021triggergraphs", "motik2019maintenance")
 

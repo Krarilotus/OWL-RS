@@ -9,6 +9,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+READS = ("benches/reasoning/dl/canonical.py", "benches/reasoning/dl/nrese.py",
+         "benches/suite/suitekit/__init__.py", "benches/suite/suitekit/lock.py",
+         "benches/suite/suitekit/ns.py")
+
 DL = Path(__file__).resolve().parents[2] / "reasoning" / "dl"
 sys.path.insert(0, str(DL))
 # `reference` resolves its image through Docker on import; `dl` doesn't use it.

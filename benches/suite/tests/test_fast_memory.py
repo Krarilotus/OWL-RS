@@ -9,6 +9,9 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+READS = ("benches/cases/core.toml", "benches/cases/sparql.toml", "benches/fast/fast.py", "benches/hosts.toml",
+         "benches/suite/suitekit/*")
+
 spec = importlib.util.spec_from_file_location(
     "fast_memory_contract", Path(__file__).resolve().parents[2] / "fast" / "fast.py"
 )

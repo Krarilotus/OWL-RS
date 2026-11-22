@@ -16,6 +16,8 @@ import unittest
 
 import isolation
 
+READS = ("scripts/fetch-w3c-tests.sh",)
+
 
 # Also works unchanged under benches/suite/tests when integrated for discovery.
 FETCH_SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "fetch-w3c-tests.sh"

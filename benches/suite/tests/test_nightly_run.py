@@ -62,6 +62,25 @@ class NightlyOnTheFleet(fixture.Repo):
         self.nightly(NRESE_GATE_HOSTS="test-host-1")
         self.assertIn('hosts = ["test-host-1"]', (self.fake / "job-1.toml").read_text(), "SPEC nightly-host")
 
+    def test_no_selection_reaches_it(self):
+        # Spec (22 Nov: the suite contracts' selection by what each reads is the push tier's, the quick
+        # check's and the Windows part's only): with the selector and declared contracts on the line, and a
+        # commit whose range reaches only one of them, the nightly job is still sent with no list.
+        tests = self.repo / "benches/suite/tests"
+        tests.mkdir(parents=True, exist_ok=True)
+        shutil.copy(ROOT / "benches/suite/tests/contracts.py", tests / "contracts.py")
+        (tests / "test_a.py").write_text('READS = ("a.txt",)\n', newline="\n")
+        (tests / "test_b.py").write_text('READS = ("b.txt",)\n', newline="\n")
+        self.git(self.repo, "add", "-A")
+        self.git(self.repo, "commit", "-qm", "the contracts")
+        self.git(self.repo, "push", "-q", "origin", "HEAD:refs/heads/refactor/engine-v2")
+        tip = self.commit("a.txt", "a changed\n")
+        self.fleet("blocked")  # ends the follow at once
+        done = self.nightly()
+        self.assertEqual(self.submitted(), [("nightly", self.tree(tip), [])],
+                         f"SPEC nightly-whole: the nightly job was sent a selection\n{done.stderr}")
+        self.assertNotIn("NRESE_CONTRACTS", (self.fake / "job-0.toml").read_text(), "SPEC nightly-whole")
+
     def test_its_pass_is_its_own_tiers_and_never_opens_a_push(self):
         # Spec (a release never rests on another commit's
         # nightly result): a verified nightly pass is recorded under tier nightly, naming the commit; the

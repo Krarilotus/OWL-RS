@@ -16,6 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "reasoning" / "dl")
 
 import canonical  # noqa: E402
 
+READS = ("benches/reasoning/dl/canonical.py",)
+
 E = "http://e/"
 
 

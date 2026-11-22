@@ -15,6 +15,8 @@ from suitekit import driver, runtime  # noqa: E402
 from suitekit.adapters import Endpoint  # noqa: E402
 from suitekit.workloads import Plan  # noqa: E402
 
+READS = ("benches/suite/suitekit/*",)
+
 
 def done(rc=0, out="", err=""):
     return subprocess.CompletedProcess(["fake"], rc, out, err)

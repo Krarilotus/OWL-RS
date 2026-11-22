@@ -14,6 +14,10 @@ DL = Path(__file__).resolve().parents[2] / "reasoning" / "dl"
 sys.path.insert(0, str(DL))
 sys.path.insert(0, str(DL.parents[1] / "suite"))
 from suitekit import ns  # noqa: E402  (the launcher whose image pins the test stands in for)
+
+READS = ("benches/reasoning/dl/canonical.py", "benches/reasoning/dl/nrese.py",
+         "benches/suite/suitekit/__init__.py", "benches/suite/suitekit/lock.py",
+         "benches/suite/suitekit/ns.py")
 # `reference` resolves its image through Docker on import; a stand-in names it here.
 sys.modules.setdefault("reference", SimpleNamespace(IMAGE="unused"))
 spec = importlib.util.spec_from_file_location("nrese_el_contract", DL / "nrese.py")
