@@ -277,3 +277,20 @@ pub(super) struct Evaluation {
     pub after: Observation,
     pub actual: Outcome,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::validation_tests::FRESH_VALUE_SHAPES;
+
+    // Spec: an error names its step and the validation it came from, so shrinking can't
+    // pass it off as the same error at another step.
+    #[test]
+    fn an_error_names_its_step() {
+        let mut case = Case::new(FRESH_VALUE_SHAPES, "", Step::default());
+        // A query's fresh value where the case expects none is an error, here at step 2.
+        case.steps.push(Step::insert("ex:a ex:p ex:b ."));
+        let error = case.run().err().expect("an unexpected fresh value");
+        assert!(error.starts_with("step 2, full after: "), "{error}");
+    }
+}
