@@ -170,6 +170,7 @@ STUBS = {
     "scripts/check-locks.sh": RECORD.format(name="locks"),
     "scripts/check-features.sh": RECORD.format(name="features"),
     "scripts/check-names.sh": RECORD.format(name="names"),
+    "scripts/check-effect.sh": RECORD.format(name="effect"),
     "scripts/miri.sh": RECORD.format(name="miri"),
     "scripts/check-python-names.py": 'import os, sys\nopen(os.environ["CALLS"], "a")'
                                      '.write("python-names " + " ".join(sys.argv[1:]) + "\\n")\n',

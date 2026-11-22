@@ -15,7 +15,7 @@ use rayon::prelude::*;
 use super::{Program, encode, pattern, storable, triple};
 use crate::delta::{self, Base, MemoryBase, VisitsBase};
 use crate::eval::{GroundProgram, OperationStop, Poller, Probe, Stopped, Visit};
-use crate::ir::{Triple, Violations};
+use crate::ir::{AnnotationIds, Triple, Violations};
 use crate::lists::ListDiagnostic;
 
 /// A transaction's state as the delta executor reads it: the committed indexes (asserted
@@ -306,10 +306,6 @@ pub fn maintain_with(
     } else {
         (program.schema.clone(), false)
     };
-    let rules = delta::Rules {
-        schema: &schema,
-        ..program.rules()
-    };
     // Revived memberships must participate in the delta executor's introduced-only
     // consistency checks. Keep the batch result for installation below: no second run.
     let mut rebuilt = if revived {
@@ -356,8 +352,31 @@ pub fn maintain_with(
             &mut unstorable,
         )?);
     }
+    // The annotation properties the rules read, where they do: the state's before the
+    // change (a first load's, after it). The reader reads asserted declarations only, so a
+    // change after which it reads others asserts or retracts one, whether or not its
+    // statement was inferred: that changes what the rules read throughout the closure, so
+    // the change is rebuilt (`redeclared`).
+    let read_before = match first_load {
+        true => program.annotation_ids(&tx.pending_snapshot()),
+        false => program.annotation_ids(tx.base()),
+    };
+    let declares = |q| (program.annotations.as_ref()).is_some_and(|a| a.declares(triple(q)));
+    let read_after = match !first_load && tx.inserted().chain(tx.deleted()).any(declares) {
+        true => program.annotation_ids(&tx.pending_snapshot()),
+        false => read_before.clone(),
+    };
+    let redeclared = read_after != read_before;
+    let annotated = program.rules_with(read_before.as_ref());
+    let rules = delta::Rules {
+        rules: &annotated,
+        schema: &schema,
+        ..program.rules()
+    };
     let unkept: bool;
     let delta_ran: bool;
+    // A redeclaring change's facts new to the state, for its judgement after the rebuild.
+    let mut new_to_state: Vec<Triple> = Vec::new();
     let deletes: bool;
     let update = {
         let mut base = EngineBase::new(tx, &program.axioms);
@@ -425,7 +444,7 @@ pub fn maintain_with(
         // Facts with an inverse expression as their predicate: the stored closure lacks the
         // base's, so a delta can't read them. Such a change runs its delta, whose consistency
         // check stands, and is then rebuilt: the closure after it is the one a rebuild gives.
-        delta_ran = !(first_load || inserted.is_empty() && deleted.is_empty());
+        delta_ran = !(first_load || redeclared || inserted.is_empty() && deleted.is_empty());
         deletes = !deleted.is_empty();
         unkept = delta_ran && has_inverse_expression(tx.base(), &prep).map_err(interrupted)?;
         // A rebuild reads the asserted facts and writes the closure, both about the size
@@ -438,7 +457,17 @@ pub fn maintain_with(
                 .then(|| tx.base().len_in(ReadModel::Materialised)),
             split_rebuilds: program.stores_representatives(),
         };
-        if inserted.is_empty() && deleted.is_empty() {
+        if redeclared {
+            // Rebuilt, then judged by the rebuild's report or by what it introduces (below).
+            new_to_state = std::mem::take(&mut inserted);
+            delta::Update {
+                policy: delta::policy::Counts {
+                    plan: delta::policy::Plan::Rebuild,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        } else if inserted.is_empty() && deleted.is_empty() {
             delta::Update::default()
         } else if let Some(closure) = rebuilt.as_mut().filter(|_| first_load) {
             // One report is held: the batch's, where the caller uses it (the rebuild below
@@ -579,33 +608,45 @@ pub fn maintain_with(
                 false => found,
             }
         });
-        // Only the difference is applied: O(stored + rebuilt closure) to sort and walk,
-        // and a transaction update per fact that changed. A stored snapshot shares the old
-        // runs and avoids expanding compact equality.
-        let mut before: Vec<EncodedTriple> = tx
-            .pending_snapshot()
-            .stored()
-            .quads_for_pattern_in(ReadModel::Inferred, &QuadPattern::all())
-            .map(EncodedTriple::from)
-            .collect();
-        before.par_sort_unstable();
-        before.dedup();
-        closure.inferred.par_sort_unstable();
-        closure.inferred.dedup();
-        // One merge walk over both (a binary search per fact cost 130 ms of a 1.4 M-fact
-        // stack's rebuild, against 70 for its materialisation).
-        let (old, new) = (&before, &closure.inferred);
-        let (mut i, mut j) = (0, 0);
-        while i < old.len() || j < new.len() {
-            if j == new.len() || (i < old.len() && old[i] < new[j]) {
-                removed += u64::from(tx.remove_inferred(old[i]));
-                i += 1;
-            } else if i == old.len() || new[j] < old[i] {
-                inserted += u64::from(tx.insert_inferred(new[j]));
-                j += 1;
-            } else {
-                (i, j) = (i + 1, j + 1);
-            }
+        let pending = tx.pending_snapshot();
+        let judged = redeclared && !uses_rebuilt_report;
+        // A fact the change retracts and the rebuild still derives was known before: it moves
+        // from asserted to inferred, and is not new to the state (the delta executor's
+        // restored facts). Any other fact the rebuild newly stores as inferred is new.
+        let retracted: HashSet<Triple> = match judged {
+            true => tx.deleted().map(triple).collect(),
+            false => HashSet::new(),
+        };
+        let mut new_inferred = Vec::new();
+        let (added, dropped) =
+            install_closure(&pending, &mut closure.inferred, |fact, add| match add {
+                true => {
+                    let new = tx.insert_inferred(fact);
+                    let fact = triple(fact.in_default_graph());
+                    if new && judged && !retracted.contains(&fact) {
+                        new_inferred.push(fact);
+                    }
+                    new
+                }
+                false => tx.remove_inferred(fact),
+            });
+        (inserted, removed) = (inserted + added, removed + dropped);
+        if judged {
+            let removed_ids: Vec<u64> = (read_before.iter().flat_map(AnnotationIds::ids))
+                .filter(|&&id| !read_after.as_ref().is_some_and(|a| a.contains(id)))
+                .copied()
+                .collect();
+            update.violations = redeclaration_violations(
+                program,
+                tx,
+                &schema,
+                read_after.as_ref(),
+                &removed_ids,
+                std::mem::take(&mut new_to_state),
+                new_inferred,
+                operation,
+                memory,
+            )?;
         }
         update.rounds += closure.rounds;
         // The delta cache may still contain heads rewritten for a formerly hidden
@@ -644,6 +685,110 @@ pub fn maintain_with(
         work: update.policy,
         rebuilt_violations,
     })
+}
+
+/// The consistency violations a change that redeclares an annotation property introduces,
+/// for a caller that doesn't take the rebuild's report (it holds the state's old ones too),
+/// read over the state after it (`tx`, its rebuilt closure installed) by the rules with the
+/// set after it (`after`), as the delta executor finds a change's
+/// ([`delta::introduced_violations`]): those through a statement new to the state (`new`
+/// asserted, `inferred` by the rebuild), or through one the rules read only now, as an
+/// annotation property no longer read (`removed`) in a place their guard covers
+/// (`rulesets::guard_annotation_readings`).
+/// Any other one held before as well: its statements were there and its rule read them. The
+/// set before the change can't judge it: the rules would read what the change made an
+/// annotation, and the closure before it (a declaration used at once would clash with what
+/// its old reading derived). And the datatype checks of the new inferred statements.
+#[allow(clippy::too_many_arguments)]
+fn redeclaration_violations(
+    program: &Program,
+    tx: &Transaction<'_>,
+    schema: &crate::batch::Schema,
+    after: Option<&AnnotationIds>,
+    removed: &[u64],
+    mut new: Vec<Triple>,
+    inferred: Vec<Triple>,
+    operation: &OperationStop<'_>,
+    memory: &Arc<Budget>,
+) -> Result<Violations, delta::Interrupted> {
+    let snapshot = tx.pending_snapshot();
+    let [domain, range, sub] = program.reading_predicates.map(Some);
+    for &id in removed {
+        let id = Some(id);
+        let read = [
+            [None, id, None],
+            [id, domain, None],
+            [id, range, None],
+            [id, sub, None],
+            [None, sub, id],
+        ];
+        for bound in read {
+            let found = snapshot
+                .quads_for_pattern_in(ReadModel::Materialised, &pattern(bound, GraphSelector::Any));
+            new.extend(found.map(triple));
+        }
+    }
+    new.extend_from_slice(&inferred);
+    new.sort_unstable();
+    new.dedup();
+    let rules = program.rules_with(after);
+    let rules = delta::Rules {
+        rules: &rules,
+        schema,
+        ..program.rules()
+    };
+    let base = super::explain::SnapshotBase {
+        snapshot: &snapshot,
+        axioms: &program.axioms,
+    };
+    let mut found = delta::introduced_violations(&base, &new, &[], rules, None, operation, memory)?;
+    if found.complete() {
+        found.append(super::datatypes::violations(
+            &inferred,
+            program.rdf_type,
+            program.same_as,
+            None,
+            &|id| tx.decode(TermId::from_raw(id)),
+            memory,
+        ));
+    }
+    Ok(found)
+}
+
+/// Makes the inferred stack of `pending` hold `closure` instead, applying only the
+/// difference: `change(fact, add)` adds or removes one fact and says whether that changed
+/// the stack. O(stored + closure) to sort and walk, and an update per fact that changed; a
+/// stored snapshot shares the old runs and avoids expanding compact equality. The facts
+/// added and removed.
+pub fn install_closure(
+    pending: &Snapshot,
+    closure: &mut Vec<EncodedTriple>,
+    mut change: impl FnMut(EncodedTriple, bool) -> bool,
+) -> (u64, u64) {
+    let mut before: Vec<EncodedTriple> = (pending.stored())
+        .quads_for_pattern_in(ReadModel::Inferred, &QuadPattern::all())
+        .map(EncodedTriple::from)
+        .collect();
+    before.par_sort_unstable();
+    before.dedup();
+    closure.par_sort_unstable();
+    closure.dedup();
+    // One merge walk over both (a binary search per fact cost 130 ms of a 1.4 M-fact
+    // stack's rebuild, against 70 for its materialisation).
+    let (old, new) = (&before, &*closure);
+    let (mut i, mut j, mut added, mut removed) = (0, 0, 0, 0);
+    while i < old.len() || j < new.len() {
+        if j == new.len() || (i < old.len() && old[i] < new[j]) {
+            removed += u64::from(change(old[i], false));
+            i += 1;
+        } else if i == old.len() || new[j] < old[i] {
+            added += u64::from(change(new[j], true));
+            j += 1;
+        } else {
+            (i, j) = (i + 1, j + 1);
+        }
+    }
+    (added, removed)
 }
 
 /// Applies `update` (over every identity, as the delta executor reads the expanded stack)
@@ -1743,5 +1888,68 @@ mod tests {
                 assert_eq!(engine.snapshot().revision(), before.revision());
             }
         }
+    }
+
+    /// Spec: annotations "have no semantic meaning in OWL 2" (Direct Semantics §1), so under
+    /// `owl2-ql` an annotation property's domain and range entail no membership; a commit
+    /// that changes no declaration stays incremental (a run reads the declarations of its own
+    /// state; only a change to them rebuilds the closure). Over a committed state declaring
+    /// `:note` an annotation property, a commit giving it a domain and a range and using it
+    /// derives neither `:alice a :Doc` nor `:bob a :Doc`, and isn't rebuilt; with `:note`
+    /// undeclared, the same commit derives both.
+    #[test]
+    fn a_commit_through_an_annotation_propertys_domain_derives_nothing_under_owl2_ql() {
+        use crate::delta::policy::Plan;
+        let mut wrong = Vec::new();
+        for declared in [true, false] {
+            let engine = Engine::new(EngineConfig {
+                background_maintenance: false,
+                ..EngineConfig::default()
+            })
+            .unwrap();
+            let mut tx = engine.transaction();
+            let ruleset = crate::rulesets::Ruleset::Owl2Ql;
+            let program = Program::compile(&ruleset.into(), &|t| tx.intern(t));
+            let iri = |s: &str| tx.intern(NamedNodeRef::new_unchecked(s).into()).raw();
+            let [note, doc, person, alice, bob] = ["note", "Doc", "Person", "alice", "bob"]
+                .map(|local| iri(&format!("http://example.com/{local}")));
+            let [rdf_type, annotation, domain, range] = [
+                "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                "http://www.w3.org/2002/07/owl#AnnotationProperty",
+                "http://www.w3.org/2000/01/rdf-schema#domain",
+                "http://www.w3.org/2000/01/rdf-schema#range",
+            ]
+            .map(iri);
+            let mut before = vec![[alice, rdf_type, person]];
+            if declared {
+                before.push([note, rdf_type, annotation]);
+            }
+            for fact in before {
+                tx.insert_encoded(encode(fact).in_default_graph());
+            }
+            tx.commit().unwrap();
+            let remat = engine.rematerialisation();
+            let closure = super::super::materialise(&program, remat.base());
+            remat.finish(closure.inferred).unwrap();
+            let mut tx = engine.transaction();
+            for fact in [[note, domain, doc], [note, range, doc], [alice, note, bob]] {
+                tx.insert_encoded(encode(fact).in_default_graph());
+            }
+            let done = maintain(&program, None, &mut tx, crate::eval::NEVER).unwrap();
+            let inferred = |fact: Triple| {
+                let pattern = pattern(fact.map(Some), GraphSelector::Any);
+                tx.quads_for_pattern_in(ReadModel::Inferred, &pattern)
+                    .next()
+                    .is_some()
+            };
+            let typed = [alice, bob].map(|x| inferred([x, rdf_type, doc]));
+            if typed != [!declared; 2] || (declared && done.work.plan == Plan::Rebuild) {
+                wrong.push(format!(
+                    "declared {declared}: typed {typed:?}, {:?}",
+                    done.work.plan
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }

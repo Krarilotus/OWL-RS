@@ -23,4 +23,4 @@ pub use command::{
 pub use error::{MutationError, MutationReject, RejectKind};
 pub use pipeline::MutationPipeline;
 pub use record::ReasoningRunRecord;
-pub use ticket::MutationTicket;
+pub use ticket::{MutationState, MutationTicket};

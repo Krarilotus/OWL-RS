@@ -48,7 +48,7 @@ fetch() {
   echo "$repository $commit in $target"
 }
 
-fetch w3c/rdf-tests 369a90d1a60c021b746df2e411da0ff36258a758 \
+fetch w3c/rdf-tests 56076c0efec4c353efcae2971be8f6005294ac64 \
   "${NRESE_W3C_TESTS:-$CACHE/rdf-tests}" sparql/sparql10 sparql/sparql11 sparql/sparql12 rdf/rdf11 rdf/rdf12
 fetch w3c/json-ld-api ffdb326121ea89b7b8280e76a5caea923834bcef \
   "${NRESE_W3C_JSONLD_TESTS:-$CACHE/json-ld-api}" tests

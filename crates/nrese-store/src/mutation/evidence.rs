@@ -18,7 +18,7 @@
 use nrese_engine::{EncodedQuad, QuadPattern, ReadModel, Snapshot, TermId, Transaction};
 use nrese_rdf::{Quad, Term, TermRef};
 use nrese_reasoner::{RejectEvidence, RejectExplanation};
-use nrese_sparql::{GraphAccess, QueryEvaluationError, ReadView};
+use nrese_sparql::{GraphAccess, QueryEvaluationError, ReadView, Resources};
 use std::borrow::Cow;
 
 use super::attribution::RejectAttribution;
@@ -77,11 +77,19 @@ impl<'v, 'e> EvidenceView<'v, 'e> {
 
     /// `view` as the committer sees it: only the statements asserted in graphs it may read.
     /// `None` for a committer that may read every graph.
-    pub fn readable<'w, V: ReadView>(&self, view: &'w V) -> Option<Readable<'w, V>>
+    pub fn readable<'w, V: EvidenceSource>(
+        &self,
+        view: &'w V,
+        resources: &'w Resources,
+    ) -> Option<Readable<'w, V>>
     where
         'v: 'w,
     {
-        self.access.map(|access| Readable { view, access })
+        self.access.map(|access| Readable {
+            view,
+            access,
+            resources,
+        })
     }
 
     /// `error` as the committer may be told it. The problems of a shapes graph it may not
@@ -183,28 +191,61 @@ pub(crate) fn trigger(attribution: Option<&RejectAttribution>) -> String {
 pub(crate) struct Readable<'w, V> {
     view: &'w V,
     access: &'w GraphAccess,
+    resources: &'w Resources,
 }
 
-impl<V: ReadView> Readable<'_, V> {
+/// Where scoped validation reads asserted quads. The pending scan polls before
+/// filtering so sparse matches cannot hide a long scan from cancellation.
+pub(crate) trait EvidenceSource: ReadView {
+    fn asserted_until<'a, F: Fn() -> bool + Copy + 'a>(
+        &'a self,
+        pattern: &QuadPattern,
+        stop: F,
+    ) -> impl Iterator<Item = EncodedQuad> + use<'a, Self, F>;
+}
+
+impl EvidenceSource for Snapshot {
+    fn asserted_until<'a, F: Fn() -> bool + Copy + 'a>(
+        &'a self,
+        pattern: &QuadPattern,
+        stop: F,
+    ) -> impl Iterator<Item = EncodedQuad> + use<'a, F> {
+        self.quads_for_pattern_in(ReadModel::Asserted, pattern)
+            .take_while(move |_| !stop())
+    }
+}
+
+impl<'e> EvidenceSource for Transaction<'e> {
+    fn asserted_until<'a, F: Fn() -> bool + Copy + 'a>(
+        &'a self,
+        pattern: &QuadPattern,
+        stop: F,
+    ) -> impl Iterator<Item = EncodedQuad> + use<'a, 'e, F> {
+        self.asserted_quads_for_pattern_until(pattern, stop)
+    }
+}
+
+impl<V: EvidenceSource> Readable<'_, V> {
     fn admits(&self, graph: TermId) -> bool {
         self.access.allows_id(self.view, graph)
     }
 }
 
-impl<'w, V: ReadView> ReadView for Readable<'w, V> {
+impl<'w, V: EvidenceSource> ReadView for Readable<'w, V> {
     fn quads_for_pattern_in<'a>(
         &'a self,
         _model: ReadModel,
         pattern: &QuadPattern,
     ) -> impl Iterator<Item = EncodedQuad> + use<'a, 'w, V> {
         self.view
-            .quads_for_pattern_in(ReadModel::Asserted, pattern)
+            .asserted_until(pattern, || self.resources.check().is_err())
             .filter(move |quad| self.admits(quad.graph))
     }
 
     fn named_graphs<'a>(&'a self) -> impl Iterator<Item = TermId> + use<'a, 'w, V> {
         self.view
             .named_graphs()
+            .take_while(|_| self.resources.check().is_ok())
             .filter(move |&graph| self.admits(graph))
     }
 
