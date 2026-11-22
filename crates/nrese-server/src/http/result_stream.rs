@@ -998,7 +998,10 @@ mod tests {
     }
 
     /// A producer that writes `bytes`, says so, waits until it is cancelled and ends with the
-    /// stop's error, as a query an operator cancels does; it says when it has ended.
+    /// stop's error, as a query an operator cancels does; it says when it has ended. Never
+    /// cancelled, it gives up after 120 s of real time without saying so, so that a test
+    /// whose cancellation fails fails, and its runtime, which waits for this blocking thread
+    /// when it is dropped, still ends.
     fn written_then_stopped(
         bytes: usize,
         token: CancellationToken,
@@ -1006,10 +1009,14 @@ mod tests {
         ended: std::sync::mpsc::Sender<()>,
     ) -> impl FnOnce(&mut ChannelWriter) -> Result<(), ApiError> + Send + 'static {
         move |writer| {
+            let give_up = std::time::Instant::now() + Duration::from_secs(120);
             let written = io::Write::write_all(writer, &vec![b'x'; bytes])
                 .and_then(|()| io::Write::flush(writer));
             let _ = wrote.send(());
             while written.is_ok() && !token.is_cancelled() {
+                if std::time::Instant::now() >= give_up {
+                    return Err(ApiError::timeout("never stopped"));
+                }
                 std::thread::sleep(Duration::from_millis(1));
             }
             let _ = ended.send(());
@@ -1147,18 +1154,46 @@ mod tests {
             let status = answer.err().map(|stopped| stopped.into_response().status());
             (status, Instant::now())
         }));
-        for taken in 1..=12 {
-            if go.send(()).is_err() || written.recv().await.is_none() {
+        // Real time, which the paused clock doesn't hold: a hold or a producer that stops
+        // making progress fails the test past it, rather than hanging it (the clock moves
+        // only as this loop moves it, and a blocking producer keeps it from moving alone).
+        let give_up = std::time::Instant::now() + Duration::from_secs(120);
+        let on_time = || std::time::Instant::now() < give_up;
+        let mut stuck = false;
+        'steps: for taken in 1..=12 {
+            if go.send(()).is_err() {
                 break;
+            }
+            loop {
+                match written.try_recv() {
+                    Ok(()) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => break 'steps,
+                    Err(mpsc::error::TryRecvError::Empty) if on_time() => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        stuck = true;
+                        break 'steps;
+                    }
+                }
             }
             // The order is the test's, not the runtime's: the response task has taken this
             // chunk, or has answered, before the clock moves.
             while memory.used() < taken * CHUNK_BYTES && !answer.is_finished() {
+                if !on_time() {
+                    stuck = true;
+                    break 'steps;
+                }
                 tokio::task::yield_now().await;
             }
             tokio::time::advance(Duration::from_millis(250)).await;
         }
+        // Let go, the producer's step ends; stopped, the answer drops its frames' receiver.
         drop(go);
+        if stuck {
+            answer.abort();
+            panic!("the held read made no progress in 120 s of real time");
+        }
         let (status, ended) = answer.await.unwrap();
         assert_eq!(status, Some(StatusCode::REQUEST_TIMEOUT));
         let waited = ended - started;
