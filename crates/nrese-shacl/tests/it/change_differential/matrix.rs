@@ -5,7 +5,7 @@ use nrese_shacl::{Component, PropertyPath, SH};
 
 use super::case::{Case, Step, ex, quads};
 use super::gaps::{Allowances, EntryPoint, Kind, Location};
-use super::observe::{Deviation, ResultKey, ResultTerm, compare};
+use super::observe::{Deviation, Observation, ResultKey, ResultTerm, compare};
 use super::stops::{Outcome, Stop};
 
 mod data;
@@ -84,6 +84,18 @@ fn rows() -> impl Iterator<Item = Row> {
         .chain(shapes::rows())
         .chain(identity::rows())
         .chain(terminal::rows())
+}
+
+/// Fails with `location`, whose first line is the replay command, unlike `assert_eq!`.
+fn pin<A: PartialEq<B> + std::fmt::Debug, B: std::fmt::Debug>(
+    location: &str,
+    what: &str,
+    actual: A,
+    expected: B,
+) {
+    if actual != expected {
+        panic!("{location}: {what}: expected {expected:?}, got {actual:?}");
+    }
 }
 
 pub(super) fn has_row(id: &str) -> bool {
@@ -174,42 +186,34 @@ pub(super) fn run() {
                     continue;
                 }
                 pinned = true;
-                assert_eq!(
-                    outcome.before.result_set(),
-                    row.before,
-                    "{location}: full before"
+                let (before, after) = (&outcome.before, &outcome.after);
+                pin(&location, "full before", &before.result_set(), &row.before);
+                pin(&location, "full after", &after.result_set(), &row.after);
+                pin(
+                    &location,
+                    "full before failures",
+                    &before.failures,
+                    &row.before_failures,
                 );
-                assert_eq!(
-                    outcome.after.result_set(),
-                    row.after,
-                    "{location}: full after"
-                );
-                assert_eq!(
-                    outcome.before.failures, row.before_failures,
-                    "{location}: full before failures"
-                );
-                assert_eq!(
-                    outcome.after.failures, row.after_failures,
-                    "{location}: full after failures"
+                pin(
+                    &location,
+                    "full after failures",
+                    &after.failures,
+                    &row.after_failures,
                 );
                 // A forgiven failure delta was matched count by count against its entry.
                 if let Some(actual) = actual.filter(|_| !failures_forgiven) {
-                    assert_eq!(
-                        actual.failures, row.after_failures,
-                        "{location}: actual failures"
+                    pin(
+                        &location,
+                        "actual failures",
+                        &actual.failures,
+                        &row.after_failures,
                     );
                 }
                 if case.fresh_value {
-                    assert_eq!(
-                        outcome.before.results.values().sum::<usize>(),
-                        1,
-                        "{location}: one before value"
-                    );
-                    assert_eq!(
-                        outcome.after.results.values().sum::<usize>(),
-                        1,
-                        "{location}: one after value"
-                    );
+                    let values = |o: &Observation| o.results.values().sum::<usize>();
+                    pin(&location, "one before value", values(before), 1_usize);
+                    pin(&location, "one after value", values(after), 1_usize);
                 }
             }
             assert!(pinned, "{context}: missing {:?} observation", row.entry);

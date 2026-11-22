@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -40,12 +40,15 @@ pub(super) fn check(case: &Case) -> Verdict {
         };
         let mut deviation = compare(&evaluation.before, &evaluation.after, actual);
         if !SHAPES_CHANGES_MAY_REPEAT && evaluation.entry == EntryPoint::Shapes {
-            let repeated: BTreeSet<_> = (evaluation.after.results.iter())
+            // Only a repeat as often as full validation repeats the key; a missed result or
+            // any other count of it stays a deviation.
+            let repeated: BTreeMap<_, _> = (evaluation.after.results.iter())
                 .filter(|(key, count)| **count > 1 && new(*key))
-                .map(|(key, _)| format!("{key:?}"))
+                .map(|(key, count)| (format!("{key:?}"), *count))
                 .collect();
-            left_out |= deviation.results.keys().any(|key| repeated.contains(key));
-            deviation.results.retain(|key, _| !repeated.contains(key));
+            let before = deviation.results.len();
+            (deviation.results).retain(|key, count| repeated.get(key) != Some(&count.actual));
+            left_out |= deviation.results.len() < before;
         }
         if deviation != Deviation::default() {
             return Verdict::Fail(format!("{at}: {deviation:?}"));
@@ -139,7 +142,16 @@ pub(super) fn run() {
             shapes_edits += usize::from(step.shapes.is_some());
             inferred_edits += usize::from(!step.infer.is_empty() || !step.retract.is_empty());
         }
-        match check(case) {
+        let verdict = check(case);
+        // A saved fixture must still show what it recorded, restriction or not.
+        if let (Some(recorded), Verdict::Pass(_) | Verdict::LeftOut(_)) = (recorded, &verdict) {
+            let replay = replay("random_changes", &outer, selector);
+            failures.push(format!(
+                "{replay}\nchanged: the saved case recorded {recorded}, now it shows none"
+            ));
+            continue;
+        }
+        match verdict {
             Verdict::Pass(evaluations) => introducing += evaluations,
             Verdict::LeftOut(restriction) => *left_out.entry(restriction).or_default() += 1,
             Verdict::Fail(signature) => {
