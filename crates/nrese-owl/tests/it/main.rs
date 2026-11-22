@@ -762,8 +762,9 @@ fn the_six_entities_of_the_reserved_vocabulary_declared_annotation_properties_ar
 /// bottom properties a class's or a property's role only; §5.6.1: no IRI of the reserved
 /// vocabulary is an individual): each of the six where an individual goes (an assertion's
 /// individual or value, an equality, a difference, a nominal, a `hasValue`, a negative
-/// assertion, a `NamedIndividual` declaration) is reported reserved and its axiom left out;
-/// as a class or a property it is read, unreported.
+/// assertion, a `NamedIndividual` declaration) is reported reserved and its axiom left out,
+/// and is no named individual of the ontology read (the DL engines realise those); as a class
+/// or a property it is read, unreported.
 #[test]
 fn the_six_entities_of_the_reserved_vocabulary_as_individuals_are_left_out() {
     let reserved = |ontology: &Ontology| {
@@ -788,8 +789,17 @@ fn the_six_entities_of_the_reserved_vocabulary_as_individuals_are_left_out() {
         let mut table = Table::default();
         let ontology = read(&load(&mut table, data), &table);
         let lines = rendered(&ontology, &table);
-        if !reserved(&ontology) || lines.iter().any(|l| l.contains("www.w3.org")) {
-            wrong.push(format!("{data}: {lines:?} {:?}", ontology.diagnostics));
+        let individuals: Vec<String> = (ontology.named_individuals().into_iter())
+            .map(|t| table.name(t))
+            .collect();
+        if !reserved(&ontology)
+            || lines.iter().any(|l| l.contains("www.w3.org"))
+            || individuals.iter().any(|i| i.contains("www.w3.org"))
+        {
+            wrong.push(format!(
+                "{data}: {lines:?} {individuals:?} {:?}",
+                ontology.diagnostics
+            ));
         }
     }
     let mut table = Table::default();
@@ -800,6 +810,54 @@ fn the_six_entities_of_the_reserved_vocabulary_as_individuals_are_left_out() {
     if reserved(&ontology) || ontology.axioms.len() < 6 {
         let lines = rendered(&ontology, &table);
         wrong.push(format!("legal: {lines:?} {:?}", ontology.diagnostics));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (Structural Specification §2.4, §5.6.1; the reader reads a repeated operand as what
+/// being disjoint from itself says, `model::Disjoint`): a disjointness or distinctness that
+/// repeats an operand and names a reserved name in its place is left out whole, the axioms its
+/// repeat would give too (`ex:a` different from itself), with the name reported; the rest of the
+/// data, an axiom stated apart from it included, reads as without it.
+#[test]
+fn a_disjointness_with_a_repeat_and_a_reserved_name_is_left_out_whole() {
+    let reserved = |ontology: &Ontology| {
+        (ontology.diagnostics.iter()).any(|d| matches!(d, Diagnostic::Reserved { .. }))
+    };
+    let cases = [
+        (
+            "[] a owl:AllDifferent ; owl:members ( ex:a ex:a owl:Thing ) .",
+            "ex:a a ex:C .",
+        ),
+        (
+            "[] a owl:AllDifferent ; owl:members ( ex:a ex:a owl:Thing ) .",
+            "ex:a owl:differentFrom ex:a . ex:a a ex:C .",
+        ),
+        (
+            "[] a owl:AllDisjointClasses ; owl:members ( ex:A ex:A rdfs:Class ) .",
+            "ex:A a owl:Class . ex:x a ex:A .",
+        ),
+        (
+            "ex:U owl:disjointUnionOf ( ex:A ex:A rdfs:Class ) .",
+            "ex:A a owl:Class . ex:x a ex:A .",
+        ),
+        (
+            "[] a owl:AllDisjointProperties ; owl:members ( ex:p ex:p rdf:type ) .",
+            "ex:p a owl:ObjectProperty . ex:x ex:p ex:y .",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (statement, rest) in cases {
+        let mut table = Table::default();
+        let both = read(&load(&mut table, &format!("{statement} {rest}")), &table);
+        let alone = read(&load(&mut table, rest), &table);
+        let (lines, expected) = (rendered(&both, &table), rendered(&alone, &table));
+        if !reserved(&both) || lines != expected {
+            wrong.push(format!(
+                "{statement} {rest}: {lines:?}, expected {expected:?}; {:?}",
+                both.diagnostics
+            ));
+        }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
