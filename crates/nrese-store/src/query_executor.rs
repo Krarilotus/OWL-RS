@@ -318,6 +318,47 @@ impl PreparedQuery {
         self.dataset.is_some() || self.query.dataset().is_some()
     }
 
+    /// Whether the dataset this query reads by leaves out the store's default graph, where
+    /// the inferred statements are kept: the evaluator's own rule, on the same protocol
+    /// dataset and query dataset it resolves ([`nrese_sparql::dataset::omits_store_default_graph`];
+    /// a dataset of scoped inference, `inference-scope=dataset`, has its own inferred layer).
+    pub(crate) fn omits_default_graph(&self) -> bool {
+        nrese_sparql::dataset::omits_store_default_graph(
+            self.dataset.as_ref(),
+            self.query.dataset(),
+        )
+    }
+
+    /// Explanation when the query's dataset omits the store's default graph from its default
+    /// graph, tailored to the read model so compatibility `GRAPH` aliases and inferred-only
+    /// reads are never misdescribed as asserted-only answers.
+    pub(crate) fn dataset_omission_reason(&self) -> Option<&'static str> {
+        if !self.omits_default_graph() {
+            return None;
+        }
+        match self.read_model() {
+            ReadModel::Asserted => None,
+            ReadModel::Materialised => Some(
+                "this read's dataset leaves out the store's default graph from its default \
+                 graph, where inferred statements are stored; default-graph patterns see only \
+                 the selected graphs' asserted statements",
+            ),
+            ReadModel::Inferred => Some(
+                "this read's dataset leaves out the store's default graph from its default \
+                 graph, where inferred statements are stored; default-graph patterns read no \
+                 inferred statements",
+            ),
+        }
+    }
+
+    /// Explanation under `owl2-dl` when the query names an explicit dataset (`has_dataset`).
+    pub(crate) fn dl_dataset_reason(&self) -> &'static str {
+        self.dataset_omission_reason().unwrap_or(
+            "the query names its dataset: answers are over those graphs, not checked against \
+             the bounds",
+        )
+    }
+
     /// Under `owl2-dl`: which answers the query asks for (`None`: the store's setting).
     pub fn dl_answers(&self) -> Option<crate::DlAnswers> {
         self.dl_answers
@@ -389,9 +430,15 @@ fn scoped_dataset(
     if request.read_model.unwrap_or_default() != ReadModel::Materialised {
         return Err(bad("inference-scope=dataset conflicts with infer=false"));
     }
-    let mut dataset = protocol_dataset(&request.default_graphs, &request.named_graphs)?
-        .or_else(|| query_dataset(query).take().map(Into::into))
-        .unwrap_or_default();
+    // The dataset the evaluator would read by: the protocol's, else the query's own, which
+    // then becomes this one.
+    let protocol = protocol_dataset(&request.default_graphs, &request.named_graphs)?;
+    let own = query_dataset(query);
+    let mut dataset =
+        nrese_sparql::dataset::effective(protocol.as_ref(), own.as_ref()).unwrap_or_default();
+    if protocol.is_none() {
+        *own = None;
+    }
     let defaults = dataset.default_graph_graphs().unwrap_or_default();
     if dataset.available_named_graphs().is_some_and(|named| {
         named

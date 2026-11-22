@@ -17,7 +17,8 @@
 #                                  changed_crates, below), on the fleet only
 #                                  (scripts/lib/fleet-gate.sh). fmt; clippy on them; all their
 #                                  tests, the dependents' fast tests; random tests on new
-#                                  seeds; the lock check; nrese-exec's unsafe code under Miri
+#                                  seeds; the lock check; each of them and their dependents
+#                                  compiled alone (crates_alone); nrese-exec's unsafe code under Miri
 #                                  and its doc tests when it changed (scripts/miri.sh). By
 #                                  hand: HEAD, from its upstream (else from where it left
 #                                  origin's refactor/engine-v2), so a push then finds the pass;
@@ -35,7 +36,7 @@
 #                                  probes:: module); the generated-views drift tests, always; one
 #                                  seed of their random tests (push's first); the state explorer's
 #                                  targets (scripts/lib/explorer-targets.txt); the guards that need
-#                                  no build. Its pass is its own tier's (scripts/lib/gate-key.sh):
+#                                  no build; the suite contracts by push's rule. Its pass is its own tier's (scripts/lib/gate-key.sh):
 #                                  it never stands for a push pass, lands nothing, and says nothing
 #                                  of the crates depending on them.
 #        scripts/check.sh windows [COMMIT]
@@ -56,14 +57,19 @@
 #                                  the workspace crates the push tier lints and tests for
 #                                  these changed files, one per line; nothing else runs.
 #
-# Tests run under cargo-nextest when it is installed (every test of every binary in
-# parallel; `cargo install --locked cargo-nextest`), else under cargo test, crate by
-# crate. Builds go through scripts/cargo-guarded.sh. Every step runs; the summary lists
+# Tests run under cargo-nextest (every test of every binary in parallel, with the features of
+# the crates the run selects): the fleet's gate jobs install the pinned one
+# (scripts/lib/gate-tools.txt; scripts/lib/gate-job.sh, scripts/lib/windows-job.sh), and the
+# gate jobs give no verdict without it (NRESE_NEXTEST_REQUIRED). A run without it elsewhere
+# uses cargo test, crate by crate. So the push tier checks that each crate it tests compiles
+# alone, with its own features (crates_alone).
+# Builds go through scripts/cargo-guarded.sh. Every step runs; the summary lists
 # each one's exit code.
 #
 # Exit: 0 passed, 1 failed; 75 no verdict: the fleet gave none (push, windows), or the PC's
 # guard held or stopped a build (scripts/cargo-guarded.sh's 75), which isn't the tree's
-# failure; 2 a usage error, or nothing to check.
+# failure; 2 a usage error, or nothing to check; 3 no verdict: cargo didn't run the required
+# cargo-nextest.
 #
 # The W3C suites run with their test data required (NRESE_W3C_REQUIRED=1, the data fetched
 # first by scripts/fetch-w3c-tests.sh): a suite without its data fails instead of passing by
@@ -89,7 +95,19 @@ step() {
   results+=("$code  $name ($((SECONDS - start)) s)")
   echo "=== $name: exit $code"
 }
-nextest() { cargo nextest --version > /dev/null 2>&1; }
+# Where the run's job requires a version (NRESE_NEXTEST_REQUIRED, scripts/lib/gate-job.sh and
+# scripts/lib/windows-job.sh), cargo
+# must run exactly that one, asked right before the tests; any other, or none, ends the run with 3, no
+# verdict: never cargo test or another runner in its place. Elsewhere (a developer's run) any
+# cargo-nextest whose version command succeeds is used.
+nextest() {
+  local got
+  [ -n "${NRESE_NEXTEST_REQUIRED:-}" ] || { cargo nextest --version > /dev/null 2>&1; return; }
+  got=$(cargo nextest --version 2> /dev/null) || got=""
+  [ "$(printf '%s\n' "$got" | tr -d '\r' | awk 'NR == 1 { print $2 }')" = "$NRESE_NEXTEST_REQUIRED" ] && return 0
+  echo "cargo-nextest $NRESE_NEXTEST_REQUIRED is required here; cargo runs ${got:-none}: no verdict" >&2
+  exit 3
+}
 # Python under either name: Windows has `python`, some Linux hosts only `python3`. A missing
 # interpreter fails the gate; it must never shrink the gate to nothing.
 python() {
@@ -364,11 +382,7 @@ w3c_data() {
 side_steps() {
   local files=("$@")
   guards "${files[@]}"
-  # The suite contracts test the gate's own scripts and hooks too (test_push_gate, test_full_gate,
-  # test_commit_tier, ...): a change to them runs the contracts.
-  if printf '%s\n' "${files[@]}" | grep -qE '^(benches/suite/|scripts/|\.githooks/)'; then
-    step "suite contracts" python benches/suite/tests/isolation.py discover -s benches/suite/tests
-  fi
+  suite_contracts "${files[@]}"
   if printf '%s\n' "${files[@]}" | grep -qE '^benches/nrese-bench-harness/'; then
     harness
   fi
@@ -376,9 +390,19 @@ side_steps() {
     console
   fi
 }
+# The suite contracts, the push and quick tiers' one rule: they test the gate's own scripts and
+# hooks too (test_push_gate, test_quick_check, test_commit_tier, ...), so a change to them runs the
+# contracts.
+suite_contracts() {
+  printf '%s\n' "$@" | grep -qE '^(benches/suite/|scripts/|\.githooks/)' || return 0
+  step "suite contracts" python benches/suite/tests/isolation.py discover -s benches/suite/tests
+}
 # Of those, the guards that build nothing (the quick tier's too).
 guards() {
   local files=("$@")
+  if printf '%s\n' "${files[@]}" | grep -qE '^(crates/nrese-(server/src/|store/src/mutation/)|scripts/(check|check-effect)\.sh$)'; then
+    step "effectful work" bash scripts/check-effect.sh
+  fi
   if printf '%s\n' "${files[@]}" | grep -qE '(^|/)Cargo\.(toml|lock)$'; then
     step locks bash scripts/check-locks.sh
     # No test-only feature in a product build (scripts/check-features.sh, DUR-4).
@@ -430,6 +454,20 @@ deny_version() {
     echo "cargo-deny version ${got:-unknown}; required ${want:-missing pin} (scripts/lib/gate-tools.txt)" >&2
     return 1
   fi
+}
+
+# Each crate compiled alone, with only the features it and its dev-dependencies turn on: a crate's
+# tests run in one run with other crates' (nextest), which unifies features, so a crate that compiles
+# only because another turns a feature on would pass there and fail `cargo test -p` for its developer.
+crates_alone() {
+  local name code=0 got
+  for name in "$@"; do
+    "$guarded" check --locked -p "$name" --lib --bins --tests && continue
+    got=$?
+    # The guard's 75 (no verdict) stands over a later crate's failure, as in the summary.
+    [ $code -eq 75 ] || code=$got
+  done
+  return $code
 }
 
 # Whether nrese-exec differs from where this branch left refactor/engine-v2, committed or
@@ -637,6 +675,7 @@ case "$mode" in
       step seeds run_seeds 3 "${changed[@]}"
       step locks bash scripts/check-locks.sh
       step features bash scripts/check-features.sh
+      step "crates alone" crates_alone "${changed[@]}" "${dependents[@]}"
     fi
     # nrese-exec's unsafe primitives under Miri (scripts/miri.sh), and its doc tests: the
     # compile-fail rows that keep their misuse unwritable (a settled region grows).
@@ -649,7 +688,8 @@ case "$mode" in
   quick)
     # The push tier's own steps on the gate's file list, fewer (the header): what finds a mechanical
     # fault of the changed crates in minutes. Not the dependents' tests, the changed crates' other
-    # integration tests, Miri, the W3C suites, the suite contracts, the bench harness or the console.
+    # integration tests, Miri, the W3C suites, the bench harness or the console. The suite contracts
+    # by push's rule (suite_contracts): a change to the gate's own scripts is checked before review.
     if [ -z "${NRESE_FILES_FROM:-}" ]; then
       echo "check.sh quick on a build host needs the gate's file list (NRESE_FILES_FROM): not run" >&2
       exit 2
@@ -681,6 +721,7 @@ case "$mode" in
       fi
     fi
     guards "${files[@]}"
+    suite_contracts "${files[@]}"
     ;;
   windows)
     # Inside its fleet job only, which readies the Windows host (scripts/lib/windows-job.sh).

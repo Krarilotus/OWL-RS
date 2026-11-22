@@ -18,7 +18,7 @@ answers under them, [SPARQL 1.1 Entailment Regimes](https://www.w3.org/TR/sparql
 | `rdfs-full` | rdfD2, rdfs2 to rdfs13 (rdfs4a/b included) and 50 axiomatic triples: the RDF and RDFS axioms without the infinitely many about `rdf:_1`, `rdf:_2`, …, and rdfs1 for `rdf:langString`, `rdf:HTML`, `rdf:XMLLiteral` and `xsd:string`. rdfD1 (a blank node per literal) is left out, so no blank node stands for a literal: test a value's type with `FILTER(datatype(?v) = xsd:integer)`. The `rdf:_1`, `rdf:_2`, … axioms are absent: assert those a query needs. Otherwise none known. Axioms seed every closure and no deletion retracts them |
 | `rdfs-plus` | `rdfs` + eq-sym, eq-trans, eq-rep-s/p/o, prp-fp, prp-ifp, prp-symp, prp-trp, prp-eqp1/2, prp-inv1/2, cax-eqc1/2, scm-eqc1/2, scm-eqp1/2 |
 | `owl-horst` | `rdfs-plus` + cls-hv1/2, cls-svf1/2, cls-avf |
-| `owl2-ql` | prp-dom, prp-rng, prp-spo1, prp-eqp1/2, prp-inv1/2, prp-symp, cax-sco, cax-eqc1/2, cls-svf2, the schema rules scm-cls, sco, eqc1/2, op, dp, spo, eqp1/2, dom1/2, rng1/2, and the checks prp-asyp, prp-irp, prp-pdw, cls-nothing2, cax-dw. Existentials on the right of `SubClassOf` are not materialised (they would invent individuals); queries get the answers through them by tree-witness rewriting (`reasoner.ql_rewriting = "auto"`, the default; [design](../design/ql-rewriting.md)), each answer saying whether it is complete |
+| `owl2-ql` | prp-dom, prp-rng, prp-spo1, prp-eqp1/2, prp-inv1/2, prp-symp, cax-sco, cax-eqc1/2, cls-svf2, the schema rules scm-cls, sco, eqc1/2, op, dp, spo, eqp1/2, dom1/2, rng1/2, and the checks prp-asyp, prp-irp, prp-pdw, cls-nothing2, cls-com, cax-dw, and `owl:Thing rdfs:subClassOf owl:Nothing` in the closure (an empty domain, which no model has, with or without individuals; other ways of emptying `owl:Thing` that no individual meets, such as putting it under two disjoint classes, aren't found yet). Existentials on the right of `SubClassOf` are not materialised (they would invent individuals); queries get the answers through them by tree-witness rewriting (`reasoner.ql_rewriting = "auto"`, the default; [design](../design/ql-rewriting.md)), each answer saying whether it is complete. No rule reads what the OWL 2 mapping reads as an annotation, which has no meaning in OWL 2 (Direct Semantics §1): a statement of an annotation property, its domain or range, or a sub-property axiom with one at either end. So no statement follows from an annotation property's sub-property, equivalence, inverse, domain or range (from `:paris skos:prefLabel "Paris"@en`, with `skos:prefLabel` an annotation property under `rdfs:label`, no `:paris rdfs:label "Paris"@en`), and no check applies to it; `rdfs` and `owl2-rl` read them as before. The annotation properties are the nine OWL 2 builds in and the IRIs outside the reserved vocabulary asserted (not inferred) `owl:AnnotationProperty` or `owl:OntologyProperty`, in any graph; a commit that changes that set rebuilds the closure. [User rules](#user-rules-notation3) on top of `owl2-ql` read what they write |
 | `owl2-rl` | below. Its standard semantics: the OWL 2 RL/RDF rules' closure, no answers through existentials on the right, with every answer `sound-only` (the closure's). A repository may add the QL rewriting (`ql_rewriting = "on"`, per repository or `reasoner.ql_rewriting`); `owl2-dl` mode gets those answers through its bounds |
 | `owl2-dl` | the `owl2-rl` rules as the lower bound, and the OWL 2 DL engines: below |
 
@@ -44,8 +44,9 @@ This matches GraphDB's `rdfs` with *partialRDFS*. Full RDFS entailment is `rdfs-
 
 #### Included
 
-- 61 fixed rules, counting the extra `eq-diff1` below. The other 60 come from W3C OWL 2 Profiles §4.3 tables 4 (equality), 5 (properties), 6 (classes), 7 (class axioms) and 9 (schema vocabulary), with the W3C rule names. The three empty-body rules `prp-ap`, `cls-thing` and `cls-nothing1` are implemented as seed statements.
+- 62 fixed rules, counting the extras `eq-diff1` and `cls-thing-empty` below. The other 60 come from W3C OWL 2 Profiles §4.3 tables 4 (equality), 5 (properties), 6 (classes), 7 (class axioms) and 9 (schema vocabulary), with the W3C rule names. The three empty-body rules `prp-ap`, `cls-thing` and `cls-nothing1` are implemented as seed statements.
 - One extra `eq-diff1`, by which `x owl:differentFrom x` is inconsistent (see `eq-ref` below).
+- One extra `cls-thing-empty`, by which `owl:Thing rdfs:subClassOf owl:Nothing` (as `owl:Thing owl:equivalentClass owl:Nothing` gives) is inconsistent: the universe is never empty, and `owl:Thing` covers it (OWL 2 RDF-Based Semantics, Table 5.2).
 - List axioms, instantiated per axiom: `prp-spo2` (property chains), `prp-key`, `cls-int1/2`, `cls-uni`, `cls-oo`, `scm-int`, `scm-uni`, `cax-adc`, `eq-diff2/3`, `prp-adp`.
 - The cardinality rules (`cls-maxc1/2`, `cls-maxqc1-4`) read a cardinality only as the RDF mapping writes it, `"0"^^xsd:nonNegativeInteger` or `"1"^^xsd:nonNegativeInteger`; any other spelling, such as Turtle's plain `1` (an `xsd:integer`) or `"01"^^xsd:nonNegativeInteger`, isn't read, so the QL rewriting's status over such a schema is never `complete`.
 
@@ -166,20 +167,20 @@ OWL 2 DL with arbitrary rules is undecidable; rules whose variables bind to name
 
 The reasoning state (`reasoning.state` in the data directory) records:
 - the ruleset;
-- its semantic fingerprint (the rule text, the base `SEMANTICS_VERSION`, the relations a GraphDB ruleset's `[Context]` statements compile to, and the version of each semantic part the user rules use, such as guards over `owl:sameAs` classes);
+- its semantic fingerprint (the rule text, the base `SEMANTICS_VERSION`, the relations a GraphDB ruleset's `[Context]` statements compile to, and the version of each semantic part the rules use, such as guards over `owl:sameAs` classes in user rules, or `owl2-ql`'s reading of annotation properties);
 - the violation count.
 
 Startup skips rematerialisation only if the ruleset and the fingerprint match. A new build that changes what a ruleset derives rebuilds once: a change of the base rebuilds every store, a change of a semantic part only the stores whose rules use it (`crates/nrese-reasoner/src/rulesets.rs`). `nrese-server check-config` prints the fingerprint. Writes that don't maintain the inferred stack (bulk load, ungated tools, commits with reasoning off, a store changed while opening) drop the state, and the next reasoning write or startup rematerialises.
 
 ## Maintenance
 
-- Commits maintain the inferred stack incrementally: DRed with backward/forward proofs, transitive and equality modules. A store whose ontology uses an inverse property expression rebuilds it at every commit that changes its data, and where a commit can still differ from a rebuild is listed in [limits](../limits.md#reasoning).
+- Commits maintain the inferred stack incrementally: DRed with backward/forward proofs, transitive and equality modules. A store whose ontology uses an inverse property expression rebuilds it at every commit that changes its data; under `owl2-ql` a commit that declares an annotation property, or retracts its declaration, rebuilds it too; and where a commit can still differ from a rebuild is listed in [limits](../limits.md#reasoning).
 - Every program axiom remains in the inferred closure after its last asserted copy is deleted.
 - It's equal to full rematerialisation on 84,000 random changes and 3,000 random engine commits (differential tests).
 
 ## User rules (Notation3)
 
-`reasoner.rules` / `NRESE_REASONING_RULES` names a Notation3 file. Its rules compile into the same rule IR as the built-in rulesets (`crates/nrese-reasoner/src/n3.rs`), so they are materialised, maintained on every commit, and checked for consistency the same way.
+`reasoner.rules` / `NRESE_REASONING_RULES` names a Notation3 file. Its rules compile into the same rule IR as the built-in rulesets (`crates/nrese-reasoner/src/n3.rs`), so they are materialised, maintained on every commit, and checked for consistency the same way. On top of `owl2-ql` they read what they write: unlike the built-in rules there, a user rule that reads a property by a variable (`{ ?p rdfs:subPropertyOf ?q . ?x ?p ?y } => { ?x ?q ?y }`) reads annotation properties too.
 
 | N3 | Meaning |
 |---|---|

@@ -71,7 +71,7 @@ impl<'p, 'm> WitnessIndex<'p, 'm> {
     }
 
     /// The ground schema was already checked in the before-program. Probe the matching
-    /// instances' remaining body atoms and the guards that held before the delete.
+    /// instances' remaining body atoms and guards in the before state.
     pub(crate) fn contains<S: Source + ?Sized>(
         &self,
         source: &S,

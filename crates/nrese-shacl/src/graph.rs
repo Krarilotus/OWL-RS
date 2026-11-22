@@ -5,7 +5,7 @@
 
 use nrese_engine::{EncodedQuad, GraphSelector, QuadPattern, ReadModel, TermId};
 use nrese_rdf::{GraphName, NamedNodeRef, Term};
-use nrese_sparql::{QueryDatasetSpecification, QueryOptions, ReadView};
+use nrese_sparql::{CancellationToken, QueryDatasetSpecification, QueryOptions, ReadView};
 
 /// Which statements a validation reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +92,7 @@ impl Selection {
 pub(crate) struct GraphView<'a, V: ReadView> {
     view: &'a V,
     selection: Selection,
+    cancellation: Option<&'a CancellationToken>,
 }
 
 impl<V: ReadView> Clone for GraphView<'_, V> {
@@ -110,7 +111,21 @@ fn sorted_set(mut ids: Vec<TermId>) -> Vec<TermId> {
 
 impl<'a, V: ReadView> GraphView<'a, V> {
     pub(crate) fn new(view: &'a V, selection: Selection) -> Self {
-        Self { view, selection }
+        Self {
+            view,
+            selection,
+            cancellation: None,
+        }
+    }
+
+    pub(crate) fn with_cancellation(mut self, cancellation: Option<&'a CancellationToken>) -> Self {
+        self.cancellation = cancellation;
+        self
+    }
+
+    pub(crate) fn cancelled(&self) -> bool {
+        self.cancellation
+            .is_some_and(CancellationToken::is_cancelled)
     }
 
     fn scan(
@@ -126,8 +141,10 @@ impl<'a, V: ReadView> GraphView<'a, V> {
             graph: self.selection.graphs,
         };
         let excluded = self.selection.excluded;
+        let cancellation = self.cancellation;
         self.view
             .quads_for_pattern_in(self.selection.model, &pattern)
+            .take_while(move |_| !cancellation.is_some_and(CancellationToken::is_cancelled))
             .filter(move |quad| !excluded.contains(&Some(quad.graph)))
     }
 
@@ -197,8 +214,48 @@ impl<'a, V: ReadView> GraphView<'a, V> {
         self.view.lookup(term.as_ref())
     }
 
+    /// [`Self::lookup`] of `literal`, what it allocates charged first through `charge`: by
+    /// the snapshot's own bound where the view is one (`Snapshot::lookup_charged`), else by
+    /// [`literal_lookup_bound`].
+    pub(crate) fn lookup_literal_charged<E>(
+        &self,
+        literal: &Term,
+        charge: impl FnOnce(usize) -> Result<(), E>,
+    ) -> Result<Option<TermId>, E> {
+        match self.view.snapshot() {
+            Some(snapshot) => snapshot.lookup_charged(literal.as_ref(), charge),
+            None => {
+                charge(literal_lookup_bound(literal))?;
+                Ok(self.view.lookup(literal.as_ref()))
+            }
+        }
+    }
+
     /// The view and the statements it reads: what SHACL-SPARQL queries run over.
     pub(crate) fn parts(&self) -> (&'a V, Selection) {
         (self.view, self.selection)
     }
+}
+
+/// The most bytes a dictionary lookup of `literal` allocates, by the engine's bound for a key
+/// of its encoded length on a plain or a compressed base, whichever is larger (a key grown
+/// by doubling from 64 bytes, and the compressor's buffers), with the key an overlay makes
+/// first and probes with: `8 × encoded + 192` covers both `3 × max(encoded, 64)` and
+/// `2 × max(encoded, 64) + 5 × encoded + 16`, each plus `encoded`. The encoded length is
+/// taken as the text, the datatype IRI and the language tag, and 16 bytes of framing. For a
+/// view that isn't a snapshot, whose lookup has no charged form, and a lookup through a
+/// comparison's frontier (a caller's state after, which may be a private view and so an
+/// overlay; a shared transaction's pending state looks up in the shared dictionary, within
+/// `7 × encoded + 192`).
+pub(crate) fn literal_lookup_bound(literal: &Term) -> usize {
+    let encoded = match literal {
+        Term::Literal(literal) => {
+            literal.value().len()
+                + literal.datatype().as_str().len()
+                + literal.language().map_or(0, str::len)
+                + 16
+        }
+        other => other.to_string().len() + 16,
+    };
+    8 * encoded + 192
 }

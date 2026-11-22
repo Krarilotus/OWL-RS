@@ -8,6 +8,7 @@ mod cache_api;
 mod classification;
 mod console;
 mod draft_check;
+mod effect;
 mod graph_store;
 pub(crate) mod guard;
 mod handlers;

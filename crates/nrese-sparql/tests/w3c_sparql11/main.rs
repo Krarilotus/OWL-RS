@@ -17,7 +17,12 @@
 //!   `expected-failures.txt`. The run fails on any failure not in the list, and on any listed
 //!   test that now passes, so the list never goes stale. The full report is written to
 //!   `<target tmp>/w3c-sparql11-report.txt`.
+//! - **Implementation reports.** Each suite's run also writes its EARL report (`sparql11.ttl`,
+//!   `sparql12.ttl`; nrese-rdf-io's `tests/support/earl.rs`): one assertion per manifest entry,
+//!   an entry this runner doesn't run reported untested with its reason.
 
+#[path = "../../../rdf/nrese-rdf-io/tests/support/earl.rs"]
+mod earl;
 mod manifest;
 mod results;
 
@@ -80,6 +85,7 @@ fn w3c_sparql11() {
         ],
         EXPECTED_FAILURES,
         "w3c-sparql11-report.txt",
+        "sparql11",
     );
 }
 
@@ -101,10 +107,11 @@ fn w3c_sparql12() {
         &["manifest.ttl"],
         EXPECTED_FAILURES_12,
         "w3c-sparql12-report.txt",
+        "sparql12",
     );
 }
 
-/// Runs a suite's tests on ours and on the reference, writes the report, and fails on any
+/// Runs a suite's tests on ours and on the reference, writes the reports, and fails on any
 /// failure not listed in `expected_failures` and on any listed test that now passes.
 fn check_suite(
     title: &str,
@@ -112,12 +119,14 @@ fn check_suite(
     manifests: &[&str],
     expected_failures: &str,
     report_name: &str,
+    earl_name: &str,
 ) {
-    let mut tests = Vec::new();
+    let mut entries = manifest::Entries::default();
     for manifest in manifests {
-        tests.extend(suite.tests(manifest).expect("manifest"));
+        suite.tests(manifest, &mut entries).expect("manifest");
     }
-    let rows: BTreeMap<String, Row> = tests
+    let rows: BTreeMap<String, Row> = entries
+        .tests
         .iter()
         .map(|test| {
             let row = Row {
@@ -130,21 +139,33 @@ fn check_suite(
         .collect();
 
     // Entries are `<iri> # reason`; the IRIs contain `#` themselves.
-    let expected: BTreeSet<&str> = expected_failures
+    let expected: BTreeMap<&str, &str> = expected_failures
         .lines()
         .filter(|line| line.starts_with('<'))
-        .filter_map(|line| line.find('>').map(|end| &line[..=end]))
+        .filter_map(|line| {
+            let end = line.find('>')?;
+            Some((
+                &line[..=end],
+                line[end + 1..].trim().trim_start_matches('#').trim(),
+            ))
+        })
         .collect();
     let failed: BTreeSet<&str> = rows
         .iter()
         .filter(|(_, row)| row.ours.failed())
         .map(|(id, _)| id.as_str())
         .collect();
-    let report = report(title, &rows);
+    let report = report(title, &rows, &entries.untested);
     let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(report_name);
     std::fs::write(&path, &report).expect("report");
     eprintln!("{}", report.lines().take(12).collect::<Vec<_>>().join("\n"));
     eprintln!("full report: {}", path.display());
+    let earl = earl::write(
+        earl_name,
+        &implementation_report(title, suite, &entries, &rows, &expected),
+    );
+    eprintln!("implementation report: {}", earl.display());
+    let expected: BTreeSet<&str> = expected.into_keys().collect();
 
     let new_failures: Vec<_> = failed.difference(&expected).collect();
     let fixed: Vec<_> = expected.difference(&failed).collect();
@@ -237,7 +258,73 @@ impl ServiceClient for Endpoints {
     }
 }
 
-fn report(title: &str, rows: &BTreeMap<String, Row>) -> String {
+/// The suite's EARL report: one assertion per manifest entry, from this run's rows (ours) and the
+/// entries it doesn't run; a listed failure carries its listed reason.
+fn implementation_report(
+    title: &str,
+    suite: &Suite,
+    entries: &manifest::Entries,
+    rows: &BTreeMap<String, Row>,
+    expected: &BTreeMap<&str, &str>,
+) -> earl::Report {
+    let iri = |id: &str| id.trim_start_matches('<').trim_end_matches('>').to_owned();
+    let requires: BTreeMap<&str, &[String]> = entries
+        .tests
+        .iter()
+        .map(|test| (test.id.as_str(), test.requires.as_slice()))
+        .collect();
+    let mut assertions: Vec<earl::Assertion> = rows
+        .iter()
+        .map(|(id, row)| {
+            let (outcome, why) = match &row.ours {
+                Outcome::Passed => (earl::Outcome::Passed, None),
+                Outcome::Failed(message) => (
+                    earl::Outcome::Failed,
+                    Some(expected.get(id.as_str()).map_or_else(
+                        || {
+                            message
+                                .lines()
+                                .next()
+                                .unwrap_or_default()
+                                .chars()
+                                .take(200)
+                                .collect()
+                        },
+                        |reason| (*reason).to_owned(),
+                    )),
+                ),
+                Outcome::Skipped(reason) => (earl::Outcome::Untested, Some((*reason).to_owned())),
+            };
+            let required = requires.get(id.as_str()).copied().unwrap_or_default();
+            let required =
+                (!required.is_empty()).then(|| format!("requires {}", required.join(", ")));
+            let info = [why, required]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("; ");
+            earl::Assertion {
+                test: iri(id),
+                outcome,
+                info: (!info.is_empty()).then_some(info),
+            }
+        })
+        .collect();
+    assertions.extend(entries.untested.iter().map(|(id, reason)| earl::Assertion {
+        test: iri(id),
+        outcome: earl::Outcome::Untested,
+        info: Some(reason.clone()),
+    }));
+    earl::Report {
+        title: title.to_owned(),
+        runner: "crates/nrese-sparql/tests/w3c_sparql11",
+        suite: suite.root().to_owned(),
+        entries: entries.count,
+        assertions,
+    }
+}
+
+fn report(title: &str, rows: &BTreeMap<String, Row>, untested: &[(String, String)]) -> String {
     // passed, failed, skipped for ours; then failures shared with the oracle.
     let mut by_kind: BTreeMap<Kind, [usize; 4]> = BTreeMap::new();
     let mut oracle_passed = 0;
@@ -294,6 +381,9 @@ fn report(title: &str, rows: &BTreeMap<String, Row>) -> String {
             }
             Outcome::Passed => {}
         }
+    }
+    for (id, reason) in untested {
+        let _ = writeln!(out, "UNTESTED {id}: {reason}");
     }
     out
 }
