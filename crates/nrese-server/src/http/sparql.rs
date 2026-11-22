@@ -327,7 +327,8 @@ fn server_memory_in_use(error: StoreError) -> ApiError {
 /// until the store is rematerialised ([`StoreError::NotRematerialised`]): that is 503, with the
 /// store's sentence and, on a primary, the administrator's route. A replica refuses that route
 /// (`guard::enforce_admin_write`), so its answer adds nothing. A reader of some graphs whose
-/// view had no room, told the class only (no limit), gets the 503 a query gets.
+/// view had no room, told the class only (no limit), gets the 503 a query gets; a read past
+/// its own memory limit, the 413 a query gets.
 pub(crate) fn refused_or(error: StoreError, otherwise: fn(String) -> ApiError) -> ApiError {
     match error {
         StoreError::NotRematerialised { replica: false } => ApiError::unavailable(format!(
@@ -336,6 +337,14 @@ pub(crate) fn refused_or(error: StoreError, otherwise: fn(String) -> ApiError) -
         error @ StoreError::NotRematerialised { .. } => ApiError::unavailable(error.to_string()),
         error @ StoreError::MemoryLimitWithoutAmounts { limit: None, .. } => {
             server_memory_in_use(error)
+        }
+        // A read's own memory limit, which a statement or graph read has only where its
+        // answer is held whole (HTTP/1.0: `result_stream`): the client's to change, as a
+        // query's is.
+        error if error.is_memory_limit() && !error.is_server_memory_limit() => {
+            ApiError::payload_too_large(format!(
+                "{error} (budgets.query_memory, NRESE_MAX_QUERY_MEMORY_BYTES)"
+            ))
         }
         error => otherwise(error.to_string()),
     }

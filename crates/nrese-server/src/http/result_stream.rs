@@ -62,8 +62,8 @@ tokio::task_local! {
 
 /// For an answer read without a query (stored statements, the export): an envelope of a
 /// query's size (`budgets.query_memory`) for the answer held whole, opened only if it is.
-/// It holds the answer only: what the read needs besides is its own (a transaction's
-/// pending changes, applied for its read in an envelope of their own).
+/// A statement or graph read draws its working memory from it too (its view, a
+/// transaction's replay: [`ChannelWriter::holding`]), as a query run does from its own.
 pub fn read_envelope(state: &AppState) -> impl FnOnce() -> Envelope + use<> {
     let store = state.store();
     let limit = state.policy().limits.max_query_memory_bytes;
@@ -190,9 +190,19 @@ pub struct ChannelWriter {
     pace: Pace,
     start: Arc<Start>,
     runtime: tokio::runtime::Handle,
+    /// The envelope the answer is held whole in (HTTP/1.0), opened before the producer
+    /// starts; `None` where the answer streams.
+    holding: Option<Envelope>,
 }
 
 impl ChannelWriter {
+    /// The envelope what is written is held in, where the answer is held whole: what makes
+    /// the answer draws its working memory from it too, so that the request's limit bounds
+    /// both together (`nrese_store::ReadContext::within`). `None` where the answer streams.
+    pub fn holding(&self) -> Option<&Envelope> {
+        self.holding.as_ref()
+    }
+
     /// Sends `message`, waiting for room in the channel as long as the pace allows. The
     /// first one claims the start once it has room, before it goes out.
     fn send(&self, message: Message) -> io::Result<()> {
@@ -258,8 +268,9 @@ impl Drop for CancelOnDrop {
 }
 
 /// Runs `produce` on a blocking thread and streams what it writes as the response body,
-/// within `pace`; or holds it whole (HTTP/1.0), charged to the envelope `memory` opens.
-/// `produce` must honour `cancellation`.
+/// within `pace`; or holds it whole (HTTP/1.0), charged to the envelope `memory` opens,
+/// which `produce` is handed as [`ChannelWriter::holding`]. `produce` must honour
+/// `cancellation`.
 pub async fn stream_blocking(
     pace: Pace,
     cancellation: CancellationToken,
@@ -280,12 +291,15 @@ pub async fn stream_blocking(
     let (sender, mut receiver) = mpsc::channel::<Message>(CHANNEL_CHUNKS);
     let start = Arc::new(Start::default());
     let outcome = Arc::new(Outcome::default());
+    // Opened only for an answer held whole, before the producer starts: it draws on it too.
+    let memory = whole.then(memory);
     let mut writer = ChannelWriter {
         sender,
         buffer: Vec::with_capacity(CHUNK_BYTES),
         pace,
         start: Arc::clone(&start),
         runtime: tokio::runtime::Handle::current(),
+        holding: memory.clone(),
     };
     let ended = Arc::clone(&outcome);
     tokio::task::spawn_blocking(move || {
@@ -313,10 +327,10 @@ pub async fn stream_blocking(
     .abort_handle();
 
     let guard = CancelOnDrop(cancellation, watchdog);
-    if whole {
+    if let Some(memory) = memory {
         // The first deadline bounds all of it: no chunk goes out to start a stall bound. On
         // every exit but the answer's end, `guard` cancels the producer.
-        let held = hold(receiver, &outcome, deadline, memory(), timeout_message).await?;
+        let held = hold(receiver, &outcome, deadline, memory, timeout_message).await?;
         return Ok(respond(Body::new(Held::new(held, stall)), media_type));
     }
     let first = match tokio::time::timeout_at(deadline, receiver.recv()).await {

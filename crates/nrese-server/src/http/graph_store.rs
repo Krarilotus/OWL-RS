@@ -38,7 +38,10 @@ pub async fn get_graph(
         media_type,
         "graph read exceeded policy timeout",
         move |out| {
-            let read = nrese_store::ReadContext::new(scope).cancelled_by(token);
+            // Held whole, the read's view draws on the answer's envelope.
+            let read = nrese_store::ReadContext::new(scope)
+                .cancelled_by(token)
+                .within(out.holding().cloned());
             match store.write_graph(&read, &request, out) {
                 Ok(true) => Ok(()),
                 // Graph Store Protocol §5.2: a graph that doesn't exist is 404, not an empty

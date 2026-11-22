@@ -209,6 +209,10 @@ pub struct ReadContext<'a> {
     /// Pending changes the read sees, if any.
     pub pending: Option<&'a crate::StatementsRequest>,
     pub cancel: nrese_sparql::CancellationToken,
+    /// The envelope its transport holds its answer in (an answer held whole), which its
+    /// working memory draws on too ([`Self::within`]); `None` for a read that holds no
+    /// answer, whose working memory is the queries'.
+    pub memory: Option<nrese_exec::Envelope>,
 }
 
 impl<'a> ReadContext<'a> {
@@ -219,7 +223,16 @@ impl<'a> ReadContext<'a> {
             infer: true,
             pending: None,
             cancel: nrese_sparql::CancellationToken::new(),
+            memory: None,
         }
+    }
+
+    /// Its working memory (its view, a transaction's replay) drawn from `memory`, the
+    /// envelope its transport holds its answer in, if it holds it: one envelope and one limit
+    /// for both, as a query run has ([`crate::QueryRun::memory`]).
+    pub fn within(mut self, memory: Option<nrese_exec::Envelope>) -> Self {
+        self.memory = memory;
+        self
     }
 
     /// A read of every graph (the server's own work, tests).

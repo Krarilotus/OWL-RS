@@ -480,10 +480,13 @@ async fn statements(
         media_type,
         "reading the statements exceeded the policy timeout",
         move |out| {
+            // Held whole, the read's view and its transaction's replay draw on the answer's
+            // envelope.
             let read = nrese_store::ReadContext::new(scope)
                 .infer(infer)
                 .on(pending.as_ref())
-                .cancelled_by(token);
+                .cancelled_by(token)
+                .within(out.holding().cloned());
             store
                 .write_statements(&read, &pattern, format, out)
                 .map(|_| ())
