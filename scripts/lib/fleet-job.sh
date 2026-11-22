@@ -13,9 +13,10 @@
 #                                 the fleet expects a pending job to start at a time E (its status'
 #                                 expected_start) from which a run of EST_S seconds (default 0) ends
 #                                 within MAX_S, the start window reaches at least to E + START_S; a
-#                                 later E moves it on, an earlier one never brings it back. An answer
-#                                 with no E it can read (none, malformed, or no answer at all) moves
-#                                 nothing: only the fixed window holds then.
+#                                 later E moves it on, an earlier one never brings it back, and one
+#                                 too late for MAX_S drops it: only the fixed window holds then. An
+#                                 answer with no E it can read (none, not in the fleet's local
+#                                 YYYY-MM-DDTHH:MM:SS form, or no answer at all) moves nothing.
 #   fleet_results                 the directory its results were fetched to (nothing: none came)
 #   fleet_cancel                  cancels it, once (also on an interrupt)
 #   q TEXT                        TEXT as a TOML string
@@ -80,7 +81,9 @@ fleet_submit() {
 
 fleet_follow() {
   local start_s=$1 max_s=$2 est_s=${3:-0} poll_s=${NRESE_FLEET_POLL_S:-10}
-  local start_by=$((SECONDS + start_s)) last="" quiet="" asked now reply expect said="" late e
+  # The fixed window's end (it pauses while the fleet is silent) and, apart, the end an expected start
+  # holds it open to (an absolute time: no silence moves it; 0: none).
+  local start_by=$((SECONDS + start_s)) held_by=0 last="" quiet="" asked now reply expect said="" late e
   fleet_end_by=$((SECONDS + max_s)) fleet_max_s=$max_s
   while :; do
     fleet_may_wait "$quiet" || { fleet_cancel; return 75; }
@@ -95,7 +98,7 @@ import datetime, json, sys
 j = json.load(sys.stdin)
 if j.get("state"):
     try:
-        at = datetime.datetime.fromisoformat(j["expected_start"])
+        at = datetime.datetime.strptime(j["expected_start"], "%Y-%m-%dT%H:%M:%S")
         basis = j.get("basis") or ""
         print(int(at.timestamp()), at.strftime("%H:%M") + (f" ({basis})" if basis else ""))
     except (KeyError, TypeError, ValueError, OverflowError, OSError):
@@ -116,21 +119,23 @@ if j.get("state"):
       [ "$now" = "$last" ] || fleet_say "$now"
       last=$now
       case $fleet_state in
-        running) start_by=$((SECONDS + start_s)) ;;
+        running) start_by=$((SECONDS + start_s)) held_by=0 ;;
         pending | staging)
           # The fleet's expected start, in SECONDS' terms: it holds the window open only if a run
-          # started then ends within MAX_S.
+          # started then ends within MAX_S; one too late for that drops what earlier ones held.
           late=""
           if [ "$expect" != - ]; then
             e=$((SECONDS + ${expect%% *} - EPOCHSECONDS))
             if [ $((e + est_s)) -le $fleet_end_by ]; then
-              [ $((e + start_s)) -le $start_by ] || start_by=$((e + start_s))
-              [ "${expect#* }" = "$said" ] || { said=${expect#* }; fleet_say "expected start $said"; }
+              [ $((e + start_s)) -le $held_by ] || held_by=$((e + start_s))
+              [ "$expect" = "$said" ] || { said=$expect; fleet_say "expected start ${expect#* }"; }
             else
+              held_by=0
               late=" (the fleet expects it at $(printf '%s' "$expect" | awk '{ print $2 }'), past this gate's limit)"
             fi
           fi
-          [ $SECONDS -lt $start_by ] || { fleet_say "no host started it within $start_s s$late"; fleet_cancel; return 75; } ;;
+          [ $SECONDS -lt $start_by ] || [ $SECONDS -lt $held_by ] \
+            || { fleet_say "no host started it within $start_s s$late"; fleet_cancel; return 75; } ;;
         done | failed) return 0 ;;
         cancelled | blocked) fleet_say "it was $fleet_state"; fleet_id=""; return 75 ;;
       esac

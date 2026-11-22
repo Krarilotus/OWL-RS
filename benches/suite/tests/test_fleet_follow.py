@@ -269,7 +269,8 @@ class FleetFollow(push.Repo):
 
     def test_a_start_time_it_cant_read_is_never_taken_as_in_time(self):
         """Spec (22 Nov, the gate's start window): a start time the waiter couldn't read (none, null,
-        malformed, or the answer of a status call that failed, however good) is never taken as fitting:
+        not in the fleet's local YYYY-MM-DDTHH:MM:SS form, or the answer of a status call that failed,
+        however good) is never taken as fitting:
         the fixed window holds, and the job is cancelled when it ends, with no verdict. Here the window is
         3 s and the job would start after 6 s, well inside what a start expected 30 s on (a 1 min
         estimate, a 120 s limit) would hold open."""
@@ -279,6 +280,8 @@ class FleetFollow(push.Repo):
                 ("null", [f"+1 {pending(expected_start=None, basis='not estimated')}"] * 6),
                 ("malformed", [f"+1 {pending(expected_start='soon')}"] * 6),
                 ("a number", [f"+1 {pending(expected_start=1795330592)}"] * 6),
+                ("a zone offset", [f"+1 {pending(expected_start=expected(30) + '+01:00')}"] * 6),
+                ("no seconds", [f"+1 {pending(expected_start=expected(30)[:16])}"] * 6),
                 ("a failed call's", [f"+1 {pending()}", f"!{fits}", *[f"+1 {pending()}"] * 5])):
             with self.subTest(name):
                 self.reset()
@@ -310,8 +313,9 @@ class FleetFollow(push.Repo):
     def test_an_expected_start_that_goes_unanswered_ends_the_window_there(self):
         """A start the fleet expected in time, then answers with no estimate: the window still reaches
         to that expected start + START_S, never further without a new one, so the wait ends there with
-        no verdict, well inside the gate's limit. Here: expected 8 s on, a window of 3 s, a limit of 60 s."""
-        self.env.update(NRESE_GATE_START_S="3", NRESE_GATE_EST_MIN="0", NRESE_GATE_MAX_S="60")
+        no verdict, well inside the gate's limit. Here: expected 8 s on, a window of 5 s (so the wait
+        ends about 13 s on), a limit of 60 s."""
+        self.env.update(NRESE_GATE_START_S="5", NRESE_GATE_EST_MIN="0", NRESE_GATE_MAX_S="60")
         began = time.monotonic()
         self.play("status", f"+1 {pending(expected_start=expected(8), basis='its reservation')}",
                   f"+1 {pending(expected_start=None, basis='not estimated')}")
@@ -320,9 +324,38 @@ class FleetFollow(push.Repo):
         took = time.monotonic() - began
         self.assertEqual((code, where, self.cancels()), (75, "", ["gate-1"]),
                          f"SPEC start-window-last-expected: the wait didn't end with one cancel\n{err}")
-        self.assertRegex(err, "gate-1: no host started it within 3 s")
-        self.assertGreater(took, 6, f"SPEC start-window-last-expected: it ended before the expected start\n{err}")
-        self.assertLess(took, 40, f"SPEC start-window-last-expected: it waited on past the expected start\n{err}")
+        self.assertRegex(err, "gate-1: no host started it within 5 s")
+        self.assertGreater(took, 10.5, f"SPEC start-window-last-expected: it ended before E + START_S\n{err}")
+        self.assertLess(took, 20, f"SPEC start-window-last-expected: it waited on past E + START_S\n{err}")
+
+    def test_an_expected_start_now_too_late_drops_what_an_earlier_one_held(self):
+        """Spec (22 Nov, the gate's start window): a start expected in time, then one the fleet expects
+        too late for the gate's limit: the earlier one no longer holds the window open, so only the fixed
+        window holds, and the job, which would start after it, is cancelled with no verdict. Here: a
+        3 s window, first 20 s on, then 60 s on with a 1 min estimate and a 100 s limit, the job starting
+        after 6 s."""
+        self.env.update(NRESE_GATE_START_S="3", NRESE_GATE_EST_MIN="1", NRESE_GATE_MAX_S="100")
+        self.play("status", f"+1 {pending(expected_start=expected(20), basis='its reservation')}",
+                  *[f"+1 {pending(expected_start=expected(60), basis='its reservation')}"] * 5, state("running"),
+                  state("done"))
+        self.play("results", self.results())
+        code, where, _, err = self.gate()
+        self.assertEqual((code, where, self.cancels()), (75, "", ["gate-1"]),
+                         f"SPEC start-window-now-too-late: an earlier expected start still held the window\n{err}")
+        self.assertIn("past this gate's limit", err)
+
+    def test_a_silence_doesnt_move_what_an_expected_start_holds(self):
+        """Spec (22 Nov, the gate's start window): a silence pauses the fixed window only; the end an
+        expected start holds the window open to is a time, which no silence moves. Here: a 1 s window,
+        expected 10 s on (held to about 11 s), then 10 s of silence (the fixed window to about 12 s),
+        then no estimate, and the job would start after about 16 s: it is cancelled with no verdict."""
+        self.env.update(NRESE_GATE_START_S="1", NRESE_GATE_EST_MIN="0", NRESE_GATE_MAX_S="60")
+        self.play("status", f"+1 {pending(expected_start=expected(10), basis='its reservation')}", "~10",
+                  *[f"+1 {pending(expected_start=None, basis='not estimated')}"] * 5, state("running"), state("done"))
+        self.play("results", self.results())
+        code, where, _, err = self.gate()
+        self.assertEqual((code, where, self.cancels()), (75, "", ["gate-1"]),
+                         f"SPEC start-window-silence-held: the silence moved what the expected start held\n{err}")
 
 
 if __name__ == "__main__":
