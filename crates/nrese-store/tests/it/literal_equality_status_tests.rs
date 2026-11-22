@@ -225,32 +225,49 @@ const QUALIFIED: &str = ":p rdfs:range :C . :D rdfs:subClassOf [ a owl:Restricti
      owl:onProperty :p ; owl:onClass :C ; \
      owl:maxQualifiedCardinality \"1\"^^xsd:nonNegativeInteger ] . :s a :D .";
 
+/// Two sub-properties of one property, each with one of the two spellings for one subject
+/// (Table 5 prp-spo1): their super-property holds both, and the rules equate them where it is
+/// [`FUNCTIONAL`]. Under compact equality the closure keeps one of the two values.
+const SUBPROPERTIES: &str = ":a rdfs:subPropertyOf :p . :b rdfs:subPropertyOf :p . \
+     :a a owl:DatatypeProperty . :b a owl:DatatypeProperty . :p a owl:DatatypeProperty . \
+     :s :a \"1\"^^xsd:integer . :s :b \"1.0\"^^xsd:decimal .";
+
+/// [`SUBPROPERTIES`]' super-property made functional.
+const FUNCTIONAL: &str = ":p a owl:FunctionalProperty .";
+
 /// A library store reopened from disk is not rematerialised: the condition holds across the
-/// reopen all the same, and a value written after it is withheld.
+/// reopen all the same, and a value written after it is withheld: the pair on the functional
+/// property, and the pair through its two sub-properties ([`SUBPROPERTIES`]).
 #[test]
 fn a_reopened_store_withholds_the_word_after_a_literal_equality() {
     let mut unmet = Vec::new();
+    let cases = [
+        (
+            "functional",
+            format!("{} :s :p {INTEGER} , {DECIMAL} .", SOURCES[0]),
+        ),
+        ("sub-properties", format!("{SUBPROPERTIES} {FUNCTIONAL}")),
+    ];
     for ruleset in RULESETS {
         for mode in MODES {
-            let dir = tempfile::tempdir().expect("dir");
-            {
-                let before = open(ruleset, config(mode, Some(dir.path())));
-                insert(
-                    &before,
-                    &format!("{} :s :p {INTEGER} , {DECIMAL} .", SOURCES[0]),
+            for (name, data) in &cases {
+                let dir = tempfile::tempdir().expect("dir");
+                {
+                    let before = open(ruleset, config(mode, Some(dir.path())));
+                    insert(&before, data);
+                }
+                let after = open(ruleset, config(mode, Some(dir.path())));
+                insert(&after, &format!(":t :q {INTEGER} ."));
+                assert!(
+                    after.store().last_materialisation().is_none(),
+                    "{ruleset} {mode}: the reopened store was rematerialised"
+                );
+                told_otherwise(
+                    after.store(),
+                    &format!("{ruleset} {mode} {name} reopened"),
+                    &mut unmet,
                 );
             }
-            let after = open(ruleset, config(mode, Some(dir.path())));
-            insert(&after, &format!(":t :q {INTEGER} ."));
-            assert!(
-                after.store().last_materialisation().is_none(),
-                "{ruleset} {mode}: the reopened store was rematerialised"
-            );
-            told_otherwise(
-                after.store(),
-                &format!("{ruleset} {mode} reopened"),
-                &mut unmet,
-            );
         }
     }
     assert!(
@@ -318,7 +335,8 @@ fn a_reopened_store_finds_an_equality_through_a_literal_typed_by_a_range() {
     );
 }
 
-/// The controls of a reopen: two spellings with nothing to equate them (told `complete`), and
+/// The controls of a reopen: two spellings with nothing to equate them, directly or through
+/// two sub-properties ([`SUBPROPERTIES`], no axiom that equates: told `complete`), and
 /// [`QUALIFIED`] over two IRIs (an equality, of no literal): reopened, each read is told what
 /// it was told before.
 #[test]
@@ -329,6 +347,7 @@ fn a_reopened_store_with_no_literal_equality_keeps_the_word() {
         for mode in MODES {
             for (name, data) in [
                 ("no equality", format!(":s :p {INTEGER} , {DECIMAL} .")),
+                ("sub-properties", SUBPROPERTIES.to_owned()),
                 ("IRIs equated", format!("{QUALIFIED} :s :p :a , :b .")),
             ] {
                 let case = format!("{ruleset} {mode} {name}");
@@ -339,7 +358,7 @@ fn a_reopened_store_with_no_literal_equality_keeps_the_word() {
                     insert(&before, &format!(":t :q {INTEGER} ."));
                     words(before.store())
                 };
-                if name == "no equality" && was != ["complete", "complete"] {
+                if name != "IRIs equated" && was != ["complete", "complete"] {
                     unmet.push(format!("{case}, before the reopen: {was:?}"));
                 }
                 let after = open(ruleset, config(mode, Some(dir.path())));
