@@ -3763,7 +3763,7 @@ fn owl2_qls_annotation_guard_keeps_the_hierarchy_fast_paths() {
         text.push_str(&format!("ex:u{i} ex:p4 ex:v{i}\n"));
     }
     let input = load(&mut vocabulary, &text);
-    let guarded = Ruleset::Owl2Ql.rules(&mut vocabulary).unwrap();
+    let guarded = Ruleset::Owl2Ql.rules_for(&mut vocabulary, &input).unwrap();
     let mut unguarded = guarded.clone();
     for rule in &mut unguarded {
         rule.guards
@@ -3903,17 +3903,87 @@ fn owl2_ql_hierarchy_fast_path_reads_equality_classes() {
         ex:p rdfs:subPropertyOf ex:d
         ex:e rdfs:subPropertyOf ex:r",
     );
-    let mut rules = Ruleset::Owl2Ql.rules_for(&mut v, &input).unwrap();
-    rules.extend(
-        Ruleset::Owl2Rl
-            .rules(&mut v)
-            .unwrap()
-            .into_iter()
-            .filter(|rule| rule.name.starts_with("eq-")),
-    );
+    let rules = owl2_ql_with_equality(&mut v, &input);
     let schema = Schema::owl(&mut v);
     let closure = super::representatives::materialise(&input, &rules, None, &schema);
     let derived = closure.facts.into_iter().collect();
     assert!(has(&mut v, &derived, "ex:p rdfs:subPropertyOf ex:q"));
     assert!(!has(&mut v, &derived, "ex:p rdfs:subPropertyOf ex:r"));
+}
+
+fn owl2_ql_with_equality(v: &mut LocalVocabulary, input: &[Triple]) -> Vec<super::ir::Rule> {
+    let mut rules = Ruleset::Owl2Ql.rules_for(v, input).unwrap();
+    rules.extend(
+        Ruleset::Owl2Rl
+            .rules(v)
+            .unwrap()
+            .into_iter()
+            .filter(|rule| rule.name.starts_with("eq-")),
+    );
+    rules
+}
+
+/// Guarded hierarchy closure over representatives, expanded back to every copy, agrees
+/// with evaluating the original rules directly. In every seed a mixed class whose
+/// representative is an annotation must link the chain. An all-annotation class may not.
+#[test]
+fn owl2_ql_hierarchy_over_representatives_matches_every_copy() {
+    use std::fmt::Write as _;
+
+    let mut next = rng(0x79cc_5162_a91d_74fe);
+    let roles = 3 + next(4);
+    let widths: Vec<_> = (0..roles).map(|_| 2 + next(2)).collect();
+    let property = |role, member| format!("ex:p{role}-{member}");
+    // Intern the annotation first so its non-annotation aliases cannot represent it.
+    let mut text = String::from(
+        "ex:p1-0 rdf:type owl:AnnotationProperty\n\
+         ex:blocked rdf:type owl:AnnotationProperty\n\
+         ex:blockedAlias rdf:type owl:AnnotationProperty\n\
+         ex:blocked owl:sameAs ex:blockedAlias\n",
+    );
+    for (role, &width) in widths.iter().enumerate() {
+        if role != 1 && next(3) != 0 {
+            let annotation = property(role, next(width));
+            writeln!(text, "{annotation} rdf:type owl:AnnotationProperty").unwrap();
+        }
+        for member in 1..width {
+            let parent = next(member);
+            let mut aliases = [property(role, parent), property(role, member)];
+            if next(2) == 0 {
+                aliases.swap(0, 1);
+            }
+            let [left, right] = aliases;
+            writeln!(text, "{left} owl:sameAs {right}").unwrap();
+        }
+    }
+    for role in 0..roles - 1 {
+        let s = property(role, next(widths[role]));
+        let o = property(role + 1, next(widths[role + 1]));
+        writeln!(text, "{s} rdfs:subPropertyOf {o}").unwrap();
+    }
+    let first = property(0, next(widths[0]));
+    let last = property(roles - 1, next(widths[roles - 1]));
+    writeln!(text, "{first} rdfs:subPropertyOf ex:blocked").unwrap();
+    writeln!(text, "ex:blockedAlias rdfs:subPropertyOf {last}").unwrap();
+    writeln!(text, "ex:x {first} ex:y").unwrap();
+
+    let mut v = LocalVocabulary::default();
+    let input = load(&mut v, &text);
+    let rules = owl2_ql_with_equality(&mut v, &input);
+    let mut expected: HashSet<_> = input.iter().copied().collect();
+    expected.extend(materialise(&input, &rules, None).derived);
+    let schema = Schema::owl(&mut v);
+    let closure = super::representatives::materialise(&input, &rules, None, &schema);
+    let expanded: HashSet<_> = closure
+        .facts
+        .iter()
+        .flat_map(|&fact| closure.classes.expand(fact))
+        .collect();
+    assert!(
+        expanded == expected,
+        "guarded hierarchy differs from the every-copy closure\n\
+         missing {:?}\nextra {:?}\n{text}",
+        expected.difference(&expanded).take(8).collect::<Vec<_>>(),
+        expanded.difference(&expected).take(8).collect::<Vec<_>>()
+    );
 }
