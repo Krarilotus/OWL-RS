@@ -272,6 +272,42 @@ fn a_mode_switch_during_the_check_leaves_it_on_its_route() {
     assert_eq!(format!("{answer:?}"), "Ok(NotEntailed)");
 }
 
+/// A rule program whose conversion into one takes 600 ms.
+struct SlowProgram(nrese_reasoner::RuleProgram);
+
+impl From<SlowProgram> for nrese_reasoner::RuleProgram {
+    fn from(slow: SlowProgram) -> Self {
+        std::thread::sleep(Duration::from_millis(600));
+        slow.0
+    }
+}
+
+/// Spec (`entails` under `owl2-dl`: one `dl.timeout` from the call; past it, no answer of
+/// any kind): the caller's conversion of its program is part of the call, so where it takes
+/// the time, the answer is undecided; with a quick one, entailed.
+#[test]
+fn a_program_conversion_that_takes_the_time_leaves_the_answer_undecided() {
+    let answers = [false, true].map(|slow| {
+        let dl = DlConfig {
+            timeout: Some(Duration::from_millis(300)),
+            ..DlConfig::default()
+        };
+        let (store, _pipeline) = dl_store(dl, EMPTY_C);
+        let rules = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl)
+            .materialised_program()
+            .unwrap();
+        let answer = match slow {
+            true => store.entails(SlowProgram(rules), &not_in("a", "C")),
+            false => store.entails(rules, &not_in("a", "C")),
+        };
+        match answer {
+            Err(crate::StoreError::Undecided(_)) => "undecided".to_owned(),
+            other => format!("{other:?}"),
+        }
+    });
+    assert_eq!(answers, ["Ok(Entailed)".to_owned(), "undecided".to_owned()]);
+}
+
 /// Spec (`entails` under `owl2-dl`: one `dl.timeout` from the call; past it, no answer of
 /// any kind): where the time runs out after the check has its answer and has let its
 /// snapshot go, the answer is undecided; within it, entailed.
