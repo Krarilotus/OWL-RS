@@ -349,19 +349,20 @@ fn a_long_chain_of_shapes_compiles_whatever_refers_to_the_next() {
         return;
     }
     let length = 100_000;
-    let kinds: [(&str, bool, &dyn Fn(&str) -> String); 7] = [
-        ("sh:node", false, &|next| format!("sh:node {next}")),
-        ("sh:property", true, &|next| format!("sh:property {next}")),
-        ("sh:not", false, &|next| format!("sh:not {next}")),
-        ("sh:and", false, &|next| format!("sh:and ( {next} )")),
-        ("sh:or", false, &|next| format!("sh:or ( {next} )")),
-        ("sh:xone", false, &|next| format!("sh:xone ( {next} )")),
-        ("sh:qualifiedValueShape", true, &|next| {
+    type Link = fn(&str) -> String;
+    let kinds: [(&str, bool, Link); 7] = [
+        ("sh:node", false, |next| format!("sh:node {next}")),
+        ("sh:property", true, |next| format!("sh:property {next}")),
+        ("sh:not", false, |next| format!("sh:not {next}")),
+        ("sh:and", false, |next| format!("sh:and ( {next} )")),
+        ("sh:or", false, |next| format!("sh:or ( {next} )")),
+        ("sh:xone", false, |next| format!("sh:xone ( {next} )")),
+        ("sh:qualifiedValueShape", true, |next| {
             format!("sh:qualifiedValueShape {next} ; sh:qualifiedMinCount 1")
         }),
     ];
     for (kind, property, link) in kinds {
-        let snapshot = load(&chain(length, property, link));
+        let snapshot = load(&chain(length, property, &link));
         let graph = snapshot
             .lookup(NamedNodeRef::new_unchecked(SHAPES).into())
             .expect("the shapes graph");
