@@ -398,7 +398,14 @@ async fn hold(
         cut: false,
     };
     loop {
-        match tokio::time::timeout_at(deadline, receiver.recv()).await {
+        let received = tokio::time::timeout_at(deadline, receiver.recv()).await;
+        // A wait with a deadline takes what is ready first: a hold that resumes past its
+        // deadline with a frame or the producer's end ready would take it (an answer, a 404,
+        // a 413). Past the deadline nothing more is taken: no answer.
+        if Instant::now() >= deadline {
+            return Err(ApiError::timeout(timeout_message));
+        }
+        match received {
             Err(_elapsed) => return Err(ApiError::timeout(timeout_message)),
             Ok(None) => break,
             Ok(Some(frame)) => {
@@ -429,11 +436,6 @@ async fn hold(
             ApiError::PayloadTooLarge(_) if beside => too_large_for_http10(bound),
             stopped => stopped,
         });
-    }
-    // A wait with a deadline takes what is ready first: a hold that resumed past the
-    // deadline with the rest of the answer ready would take it. Past it, no answer.
-    if Instant::now() >= deadline {
-        return Err(ApiError::timeout(timeout_message));
     }
     Ok(held)
 }
@@ -511,6 +513,7 @@ fn lock(holding: &Mutex<Holding>) -> std::sync::MutexGuard<'_, Holding> {
 /// (sent, or its client gone), it lets go of all it holds.
 struct Held {
     holding: Arc<Mutex<Holding>>,
+    stall: Duration,
     watch: tokio::task::AbortHandle,
 }
 
@@ -539,7 +542,11 @@ impl Held {
             }
         })
         .abort_handle();
-        Self { holding, watch }
+        Self {
+            holding,
+            stall,
+            watch,
+        }
     }
 }
 
@@ -559,6 +566,11 @@ impl http_body::Body for Held {
         _: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
         let mut holding = lock(&self.holding);
+        // Past the stall bound nothing more is taken, though the timer that lets go of what
+        // is left hasn't run yet.
+        if !holding.cut && holding.moved + self.stall <= Instant::now() {
+            holding.cut();
+        }
         if holding.cut {
             return Poll::Ready(Some(Err(io::Error::from(io::ErrorKind::TimedOut))));
         }
