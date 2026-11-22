@@ -69,6 +69,7 @@ pub fn compile_until<V: ReadView>(
         graph,
         shapes: Vec::new(),
         index: HashMap::new(),
+        numbering: Vec::new(),
         errors: Vec::new(),
         components: Vec::new(),
     };
@@ -87,12 +88,7 @@ pub fn compile_until<V: ReadView>(
     for class in ["NodeShape", "PropertyShape"] {
         roots.extend(compiler.instances(&format!("{SH}{class}")));
     }
-    for root in roots {
-        if compiler.graph.cancelled() {
-            return None;
-        }
-        compiler.shape(root);
-    }
+    compiler.compile_shapes(roots)?;
     // Any triple with `sh:entailment` in the shapes graph, whatever its subject (SHACL §1.5).
     let entailments = compiler
         .sh("entailment")
@@ -123,9 +119,49 @@ struct Compiler<'a, V: ReadView> {
     rdf_nil: Option<TermId>,
     shapes: Vec<Shape>,
     index: HashMap<TermId, ShapeRef>,
+    // The depth-first number of each interned slot, or None while it is pending.
+    numbering: Vec<Option<ShapeRef>>,
     errors: Vec<ShapeError>,
     /// The shapes graph's SPARQL-based constraint components.
     components: Vec<ComponentDef>,
+}
+
+/// Where the depth-first walk stopped in a compiled shape's constraints.
+struct ShapeFrame {
+    shape: ShapeRef,
+    constraint: usize,
+    member: usize,
+}
+
+impl ShapeFrame {
+    fn next_reference<'a>(&mut self, shape: &'a mut Shape) -> Option<&'a mut ShapeRef> {
+        for constraint in &mut shape.constraints[self.constraint..] {
+            let reference = match constraint {
+                Constraint::Not(shape) | Constraint::Node(shape) | Constraint::Property(shape) => {
+                    std::slice::from_mut(shape).get_mut(self.member)
+                }
+                Constraint::Logical(_, shapes) => shapes.get_mut(self.member),
+                Constraint::Qualified {
+                    shape, siblings, ..
+                } => {
+                    // The compiler encounters disjoint siblings before the value shape.
+                    if self.member == siblings.len() {
+                        Some(shape)
+                    } else {
+                        siblings.get_mut(self.member)
+                    }
+                }
+                _ => None,
+            };
+            if let Some(reference) = reference {
+                self.member += 1;
+                return Some(reference);
+            }
+            self.constraint += 1;
+            self.member = 0;
+        }
+        None
+    }
 }
 
 impl<V: ReadView> Compiler<'_, V> {
@@ -295,13 +331,14 @@ impl<V: ReadView> Compiler<'_, V> {
         }
     }
 
-    /// Compiles `node` as a shape (once), and the shapes it refers to.
+    /// Interns `node` and leaves its new slot pending for the walk.
     fn shape(&mut self, node: TermId) -> ShapeRef {
         if let Some(&shape) = self.index.get(&node) {
             return shape;
         }
         let shape = self.shapes.len();
         self.index.insert(node, shape);
+        self.numbering.push(None);
         // The slot exists before the shape's references are followed: shapes may refer
         // to each other, and to themselves.
         self.shapes.push(Shape {
@@ -313,6 +350,68 @@ impl<V: ReadView> Compiler<'_, V> {
             messages: Vec::new(),
             deactivated: false,
         });
+        shape
+    }
+
+    /// Fills every shape reachable from `roots`, or `None` if cancelled. Errors come in the
+    /// order the shapes are first visited.
+    fn compile_shapes(&mut self, roots: BTreeSet<TermId>) -> Option<()> {
+        // References start as interned slots. Visit them one at a time so a child can
+        // reach a pending sibling before the parent does, then replace each with its number.
+        let mut stack = Vec::new();
+        let mut next = 0;
+        for root in roots {
+            let root = self.shape(root);
+            if self.numbering[root].is_some() {
+                continue;
+            }
+            if self.graph.cancelled() {
+                return None;
+            }
+            stack.push(self.fill_shape(root, &mut next));
+            while let Some(frame) = stack.last_mut() {
+                let shape = &mut self.shapes[frame.shape];
+                let Some(reference) = frame.next_reference(shape) else {
+                    stack.pop();
+                    continue;
+                };
+                let child = *reference;
+                if let Some(number) = self.numbering[child] {
+                    *reference = number;
+                } else {
+                    *reference = next;
+                    // A walk cut short leaves slots unvisited: nothing of it is kept.
+                    if self.graph.cancelled() {
+                        return None;
+                    }
+                    stack.push(self.fill_shape(child, &mut next));
+                }
+            }
+        }
+        if self.errors.is_empty() {
+            self.reorder_shapes();
+        }
+        Some(())
+    }
+
+    /// Puts the interned slots into the depth-first order used by their references.
+    fn reorder_shapes(&mut self) {
+        for shape in self.index.values_mut() {
+            *shape = self.numbering[*shape].expect("every interned shape was visited");
+        }
+        for shape in 0..self.shapes.len() {
+            while let Some(position) = self.numbering[shape].filter(|&position| position != shape) {
+                self.shapes.swap(shape, position);
+                self.numbering.swap(shape, position);
+            }
+        }
+    }
+
+    fn fill_shape(&mut self, shape: ShapeRef, next: &mut ShapeRef) -> ShapeFrame {
+        // Number the shape before its descendants, including when an edge closes a cycle.
+        self.numbering[shape] = Some(*next);
+        *next += 1;
+        let node = self.shapes[shape].node;
 
         let path = self.one(node, "path").and_then(|path| {
             self.path(path, 0)
@@ -341,7 +440,11 @@ impl<V: ReadView> Compiler<'_, V> {
             messages,
             deactivated,
         };
-        shape
+        ShapeFrame {
+            shape,
+            constraint: 0,
+            member: 0,
+        }
     }
 
     fn targets(&mut self, node: TermId) -> Vec<Target> {

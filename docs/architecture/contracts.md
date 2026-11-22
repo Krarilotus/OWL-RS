@@ -67,6 +67,7 @@ Known bypasses:
 - `crates/nrese-dl/src/context/memory.rs:11`: `Observer` maintains its own sampled capacity counters and per-task limit beside a shared `Gauge`.
 - `crates/nrese-dl/src/tableau/engine.rs:628`: Solver checks estimated current bytes then `Gauge::follow` (:645); this observes after growth rather than enforcing every allocation beforehand.
 - `crates/nrese-engine/src/term/vectors.rs:136`: Vector-space growth parses literals and pushes persistent vectors without a budget parameter; :287 only reports bytes.
+- `crates/nrese-shacl/src/compile.rs:58`: `compile_until` builds the shapes and uses a walk stack, both linear in the compiled shapes graph and uncharged.
 - `crates/nrese-shacl/src/validate.rs:143`: Validator precomputes class/subclass lists into a plain map at :159 without reserving this container there.
 - `crates/nrese-sparql/src/native/mod.rs:1173`: `Solutions` owns a plain IdTable without carrying its charge; manual produced/consumed accounting elsewhere must stay synchronized.
 - `crates/nrese-exec/src/graph.rs:118`: Plain closure produces a growing IdTable with no budget argument.
