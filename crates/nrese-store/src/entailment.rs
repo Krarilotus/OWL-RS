@@ -91,6 +91,9 @@ impl StoreService {
             #[cfg(test)]
             crate::service::hooks::run(&crate::service::hooks::AFTER_MODE_READ);
             let answer = self.entails_once(&program, conclusion, dl)?;
+            // Let go before the checks below, so freeing the caller's program (its user rules,
+            // perhaps large) takes none of the time an answer is judged by.
+            drop(program);
             #[cfg(test)]
             crate::service::hooks::run(&crate::service::hooks::AFTER_ENTAILMENT_READS);
             if self.certificate_epoch() == epoch {
