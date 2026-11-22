@@ -19,15 +19,17 @@ Layer ownership, where to fix what, and the evidence a change needs are in [docs
 
 ## Checks
 
-`scripts/check.sh` is the gate, in three tiers. A test runs where it matters: each crate
+`scripts/check.sh` is the gate, in four tiers. A test runs where it matters: each crate
 owns its tests, and benchmarks never run in a gate. You can run the first and the last tier
-yourself ([on your own machine](#on-your-own-machine)); the middle one runs on the project's own
-machines, for every pull request before it merges ([below](#what-runs-only-on-the-projects-machines)).
+yourself ([on your own machine](#on-your-own-machine)); the middle two run on the project's own
+machines: `push` for every pull request before it merges ([below](#what-runs-only-on-the-projects-machines)),
+`nightly` on the line's head after changes land there.
 
 | Tier | When | What |
 |---|---|---|
 | `commit` | the pre-commit hook, also called by pre-merge-commit for clean merges | seconds, on your machine, with no build: rustfmt; for the changed files, the lock check and the Docker-name check (`scripts/check-names.sh`). A branch may hold commits this tier didn't check: what lands is checked as a whole, by its exact tree, in the `push` tier and the Windows check |
 | `push` | before a commit is pushed to this repository; on the project's machines | changes since the upstream branch: rustfmt and clippy on changed crates (every crate when the root `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/config.toml` or `clippy.toml` changed); all their tests (slow suites too), dependents' fast tests, additional random seeds for changed crates, and the lock check; the benchmark-suite contract tests when `benches/suite/`, `scripts/` or `.githooks/` changed |
+| `nightly` | after changes land on the line, on its new head; on the project's machines only (`scripts/check.sh nightly [COMMIT]`) | every workspace test in its full form (`NRESE_CHECK_TIER=nightly`: the cases, sweeps and sizes the default forms cut down), the 64-bit count check, and a receipt holding one outcome for each test of the tree's inventory. A red nightly run on the line stays an open blocker, and no release is cut while one is open. The release gate runs the nightly forms itself on the commit it releases, so a release never rests on another commit's nightly result (a requirement: the release gate doesn't run them yet) |
 | `all` | milestones, merges to `main`, CI; and on your own machine | everything: both Cargo workspaces, doc tests, the lock check, `cargo-deny` (licences, advisories, bans, sources; `deny.toml`), benchmark-suite contract tests, the console's typecheck and tests |
 
 - A crate declares its slow test binaries (conformance suites, fuzz campaigns: over ~15 s)
