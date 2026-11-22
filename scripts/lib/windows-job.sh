@@ -18,8 +18,8 @@
 # ran with, which scripts/lib/fleet-gate.sh checks against the declared one. The console's Node is
 # the pinned one (scripts/lib/gate-tools.txt node), installed under the cache by
 # scripts/lib/gate-node.sh, never the host's. The tests run under the pinned cargo-nextest
-# (scripts/lib/gate-tools.txt cargo-nextest), installed under the cache (windows_job_nextest_*), as the
-# Linux gate's: every crate's tests in one run with the workspace's features, never cargo test crate by
+# (scripts/lib/gate-tools.txt cargo-nextest), installed under the cache (scripts/lib/gate-nextest.sh), as
+# the Linux gate's: every crate's tests in one run with the workspace's features, never cargo test crate by
 # crate; without it there is no verdict.
 #
 # The fleet starts a Windows step without a usable stdin (fleet backlog I14): Python's subprocess
@@ -52,33 +52,6 @@ windows_job_toolchain() {
   windows_job_toolchain_ready && return
   timeout "${NRESE_RUSTUP_DEADLINE_S:-900}" \
     rustup toolchain install "$1" --no-self-update --profile minimal --component rustfmt,clippy
-}
-
-# DIR VERSION SHA256 EXE-SHA256: DIR, if its cargo-nextest is the pinned executable (EXE-SHA256,
-# checked before it runs: a cache entry no other way made is never run) and its version command
-# succeeds and names VERSION.
-windows_job_nextest_is() {
-  local runner exe=$1/cargo-nextest.exe
-  [ -e "$exe" ] || exe=$1/cargo-nextest
-  [ "$(sha256sum -b < "$exe" 2> /dev/null | cut -c1-64)" = "$4" ] || return 1
-  runner=$("$exe" nextest --version 2> /dev/null) || return 1
-  [ "$(printf '%s\n' "$runner" | tr -d '\r' | awk 'NR == 1 { print $2 }')" = "$2" ] || return 1
-  echo "$1"
-}
-
-# PART VERSION SHA256 EXE-SHA256: nexte.st's Windows build of cargo-nextest VERSION, unpacked at PART,
-# taken only if its archive's sha256 is SHA256 (scripts/lib/gate-tools.txt cargo-nextest-windows):
-# another archive is never unpacked. The cache's one entry maker (scripts/lib/suite-python.sh
-# suite_python_entry) runs it under the cache's lock, aside, and moves PART into place whole once
-# windows_job_nextest_is passes on it (its executable's sha256 too); curl's deadline bounds it. tar
-# reads the archive on its standard input: GNU tar takes `C:` in an archive's name for a host.
-windows_job_nextest_unpack() {
-  local got
-  curl -fsSL --max-time 300 -o "$1/nextest.tar.gz" "https://get.nexte.st/$2/windows-tar" \
-    || { echo "get.nexte.st's cargo-nextest $2 didn't download" >&2; return 1; }
-  got=$(sha256sum -b < "$1/nextest.tar.gz" | cut -c1-64)
-  [ "$got" = "$3" ] || { echo "cargo-nextest $2's archive has sha256 $got, not the pinned $3: not installed" >&2; return 1; }
-  tar -xzf - -C "$1" < "$1/nextest.tar.gz" && rm -f -- "$1/nextest.tar.gz"
 }
 
 run() {
@@ -146,18 +119,15 @@ run() {
   nodebin=$(NRESE_PYTHON=python gate_node "$cache" scripts/lib/gate-tools.txt) || infra "no Node for the console"
   echo "$EPOCHSECONDS" > "$nodebin/.last-used"
   export PATH="$nodebin:$PATH"
-  # The pinned cargo-nextest, each version and archive in a directory of its own under the cache (named
-  # by both), first on PATH. Then the one the tier gets: cargo looks in $CARGO_HOME/bin before PATH,
-  # where a host's own would stand in. Its version counts only from a version command that succeeded.
-  local want sum exe_sum nextest runner
+  # The pinned cargo-nextest (scripts/lib/gate-nextest.sh), first on PATH. Then the one the tier gets:
+  # cargo looks in $CARGO_HOME/bin before PATH, where a host's own would stand in. Its version counts
+  # only from a version command that succeeded.
+  local want nextest runner
   want=$(sed -n 's/^cargo-nextest //p' scripts/lib/gate-tools.txt | tr -d '\r')
-  [ -n "$want" ] || infra "the tree pins no cargo-nextest (scripts/lib/gate-tools.txt)"
-  read -r sum exe_sum < <(awk -v v="$want" '$1 == "cargo-nextest-windows" && $2 == v { print $3, $4 }' \
-    scripts/lib/gate-tools.txt | tr -d '\r')
-  [[ ${sum:-} =~ ^[0-9a-f]{64}$ && ${exe_sum:-} =~ ^[0-9a-f]{64}$ ]] \
-    || infra "the tree pins no sha256 of cargo-nextest $want's Windows archive and executable (scripts/lib/gate-tools.txt)"
-  nextest=$(NRESE_PYTHON=python suite_python_entry "$cache/tools/nextest-$want-${sum:0:12}" windows_job_nextest_is \
-    windows_job_nextest_unpack "$want" "$sum" "$exe_sum") || infra "no cargo-nextest $want"
+  # shellcheck source=gate-nextest.sh
+  . scripts/lib/gate-nextest.sh
+  nextest=$(NRESE_PYTHON=python gate_nextest "$cache" scripts/lib/gate-tools.txt windows) \
+    || infra "no cargo-nextest ${want:-pinned}"
   export PATH="$nextest:$PATH"
   runner=$(cargo nextest --version 2> /dev/null) || runner=""
   [ "$(printf '%s\n' "$runner" | tr -d '\r' | awk 'NR == 1 { print $2 }')" = "$want" ] \
