@@ -612,7 +612,8 @@ impl Shared {
     /// log, whose store may hold a revision memory doesn't (a bulk publication's checkpoint in
     /// place, its version not installed), so that "nothing changed" isn't known until a
     /// reopen. The writes that return without the log ask it: a transaction or bulk load that
-    /// changes nothing, a rematerialisation whose stored rows don't change.
+    /// changes nothing, a rematerialisation whose stored rows don't change, a replica's replay
+    /// (asked once, at its entry).
     fn acknowledge_unchanged(&self) -> EngineResult<()> {
         match &self.durable {
             Some(durable) if durable.wal.lock().is_poisoned() => Err(EngineError::WalPoisoned),
