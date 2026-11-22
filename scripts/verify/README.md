@@ -29,6 +29,8 @@ Run an existing scenario before you write a new one. Each file's `description` s
 | The `NRESE-Completeness` header under `owl2-dl` | `scenarios/owl2-dl-completeness.toml` |
 | Graph Store Protocol CRUD on a named graph | `scenarios/gsp-named-graph.toml` |
 | The first example (README quick start and tutorial): inference, retraction, the SHACL gate | `scenarios/first-example.toml` |
+| SHACL-SPARQL result messages in the validation report | `scenarios/shacl-sparql-messages.toml` |
+| A write the SHACL gate refuses names the result's message | `scenarios/shacl-sparql-message-reject.toml` |
 
 ## Scenario files
 

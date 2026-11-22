@@ -1393,16 +1393,19 @@ fn charged_table<'b>(columns: impl ExactSizeIterator<Item = Scratch<'b, u64>>) -
 
 /// Charges a result's header before it is allocated: the list of its variables `vars`
 /// and their names, and its table's list of `width` columns, which the table's charge (its
-/// columns' bytes) doesn't count. It stays charged while the evaluation runs.
+/// columns' bytes) doesn't count. A restored attempt gives back its headers.
 fn charge_header<'v>(
-    budget: &Budget,
+    ctx: &Context<'_>,
     vars: impl IntoIterator<Item = &'v Variable>,
     width: usize,
 ) -> Result<(), BudgetExceeded> {
     let (count, names) = vars.into_iter().fold((0, 0), |(count, names), v| {
         (count + 1, names + v.as_str().len())
     });
-    budget.charge(count * size_of::<Variable>() + names + width * size_of::<Vec<u64>>())
+    let bytes = count * size_of::<Variable>() + names + width * size_of::<Vec<u64>>();
+    ctx.budget.charge(bytes)?;
+    ctx.returned_table_charge(bytes);
+    Ok(())
 }
 
 impl Context<'_> {
@@ -1469,13 +1472,13 @@ impl Context<'_> {
                     }
                 })
                 .map_err(QueryEvaluationError::MemoryLimit)?;
-            charge_header(&self.budget, [variable], 1)
-                .map_err(QueryEvaluationError::MemoryLimit)?;
+            charge_header(self, [variable], 1).map_err(QueryEvaluationError::MemoryLimit)?;
             let seed = Solutions {
                 vars: vec![variable.clone()],
                 table: charged_table(std::iter::once(literals)),
                 ordered: false,
             };
+            self.returned_table_charge(seed.table.memory_bytes());
             self.check()?;
             return Ok(Some((seed, at)));
         }
@@ -1697,7 +1700,7 @@ impl Context<'_> {
         let width = solutions.vars.len();
         let joined = width + added.iter().flatten().count();
         let header = solutions.vars.iter().chain(added.iter().flatten().copied());
-        charge_header(budget, header, joined).map_err(memory)?;
+        charge_header(self, header, joined).map_err(memory)?;
         let mut vars = Vec::with_capacity(joined);
         vars.extend(solutions.vars.iter().cloned());
         vars.extend(added.iter().flatten().map(|&v| v.clone()));
@@ -1773,6 +1776,7 @@ impl Context<'_> {
             });
         }
         let table = charged_table(columns.into_iter());
+        self.returned_table_charge(table.memory_bytes());
         drop(working);
         Ok(Solutions {
             vars,

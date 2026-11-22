@@ -298,6 +298,50 @@ fn a_first_load_tolerates_a_violation_the_axioms_had_before() {
     );
 }
 
+/// Spec: in OWL 2 Direct Semantics (§1), an annotation assertion has no logical meaning.
+/// When a first load declares `ex:note` an annotation property, its self-edge is consistent
+/// even if a user axiom typed the property irreflexive before the load. A valid warm cache
+/// on that base must give the same introduced-only verdict as a cold one.
+#[test]
+fn a_ql_first_load_judges_its_own_annotation_set_with_a_warm_cache() {
+    use nrese_reasoner::{RuleProgram, UserRules};
+    let user = std::sync::Arc::new(
+        UserRules::n3(
+            "axiom.n3",
+            format!("{PREFIX}ex:note a owl:IrreflexiveProperty ."),
+        )
+        .unwrap(),
+    );
+    let rules = RuleProgram::new(Some(Ruleset::Owl2Ql), Some(user)).unwrap();
+    let engine = Engine::new(EngineConfig {
+        background_maintenance: false,
+        ..EngineConfig::default()
+    })
+    .unwrap();
+    let tx = engine.transaction();
+    let program = Program::compile(&rules, &|term| tx.intern(term));
+    drop(tx);
+    let remat = engine.rematerialisation();
+    let closure = materialise(&program, remat.base());
+    remat.finish(closure.inferred).unwrap();
+    let base = engine.snapshot();
+    assert_eq!(base.len_in(ReadModel::Asserted), 0);
+    let ground = program.ground_program(&base);
+    let load = format!("{PREFIX}ex:note a owl:AnnotationProperty . ex:x ex:note ex:x .");
+    for (case, cache) in [("cold", None), ("warm", Some(&ground))] {
+        let mut tx = engine.transaction();
+        for quad in RdfParser::from_format(RdfFormat::Turtle).for_reader(load.as_bytes()) {
+            tx.insert(quad.unwrap().as_ref());
+        }
+        let done = maintain(&program, cache, &mut tx, &|| false).unwrap();
+        assert!(
+            done.violations.consistent(),
+            "{case} cache: the first load must be accepted, got {:?}",
+            done.violations.first()
+        );
+    }
+}
+
 /// The same for a conclusion no store holds: an axiom's literal outside its range
 /// (`-1 a xsd:nonNegativeInteger`) is old, so an unrelated insert doesn't report its
 /// `dt-not-type`, cached grounding or not, in both non-compact equality modes.

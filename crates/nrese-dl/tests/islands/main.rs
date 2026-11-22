@@ -652,3 +652,37 @@ fn two_members_and_none_split_as_before() {
     split_beside(Some(Axiom::SameIndividual(vec![300, 301])), &[2, 1, 1]);
     split_beside(None, &[1, 1]);
 }
+
+/// A role assertion between two islands carries the range to its object in another batch:
+/// `range(r) = C`, `C ⊓ E ⊑ ⊥`, `r(a, b)`, `E(b)` is inconsistent when `a`'s island
+/// (fifteen more class assertions) fills a batch of its own.
+#[test]
+fn a_split_edge_carries_its_range_across_batches() {
+    let (c, e, r, a, b) = (1, 2, 10, 300, 301);
+    let mut o = Ontology::default();
+    let class = |o: &mut Ontology, t: Term| ExprId(o.classes.intern(ClassExpr::Class(t)));
+    let (cc, ce) = (class(&mut o, c), class(&mut o, e));
+    o.axioms
+        .push(Axiom::ObjectPropertyRange(ObjProp::Named(r), cc));
+    o.axioms.push(Axiom::DisjointClasses(vec![cc, ce]));
+    o.axioms.push(Axiom::ObjectPropertyAssertion(r, a, b));
+    o.axioms.push(Axiom::ClassAssertion(ce, b));
+    for f in 20..35 {
+        let cf = class(&mut o, f);
+        o.axioms.push(Axiom::ClassAssertion(cf, a));
+    }
+    o.sources = vec![Vec::new(); o.axioms.len()];
+    // Batches of 16 assertions.
+    let config = Config {
+        max_nodes: Some(64),
+        ..Config::default()
+    };
+    assert_eq!(
+        islands::by_islands(&o, &config).answer,
+        Answer::Inconsistent
+    );
+    let Split::Islands(split) = islands::split(&o) else {
+        panic!("decided whole");
+    };
+    assert_eq!((split.sizes, split.split_edges), (vec![1, 1], 1));
+}
