@@ -241,6 +241,7 @@ pub fn build_ready_response(
     let posture = state.runtime_posture();
 
     let consistency = state.store().consistency();
+    let shacl = state.store().shacl_gate_state();
     Ok(ReadyResponse {
         status: build_readiness_response(state).status,
         consistency: consistency.as_str(),
@@ -255,7 +256,7 @@ pub fn build_ready_response(
             }
             _ => None,
         },
-        revision: state.store().current_revision(),
+        revision: shacl.view_revision,
         quad_count: stats.quad_count as u64,
         named_graph_count: stats.named_graph_count,
         ontology_path: state
@@ -287,7 +288,7 @@ pub fn build_ready_response(
                     revision: None,
                 },
             }),
-        shacl: state.store().shacl_gate_state().into(),
+        shacl: shacl.into(),
         degraded: state.degraded(),
     })
 }

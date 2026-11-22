@@ -31,7 +31,7 @@ use parking_lot::{Mutex, MutexGuard};
 use rayon::prelude::*;
 
 use super::spill::{Spill, Spiller};
-use super::{CommitSummary, Inner, ReadModel, Snapshot, Stack, Version};
+use super::{CommitSummary, Inner, ReadModel, Snapshot, Stack, Version, VersionData, Watch};
 use crate::durability::{Durable, checkpoint, later};
 use crate::error::{EngineError, EngineResult};
 use crate::index::keys::PackedKeys;
@@ -323,7 +323,7 @@ impl<'e> BulkLoad<'e> {
                     // Replaced by the published version's once it is out.
                     asserted: current.asserted_content,
                 };
-                let next = Version {
+                let next = VersionData {
                     content: super::Content::fresh(),
                     asserted_content: super::AssertedIdentity::fresh(),
                     asserted: IndexVersion::from_quads(Layout::holding(&quads), quads),
@@ -384,7 +384,7 @@ impl<'e> BulkLoad<'e> {
                     Layout::DefaultGraph => current.asserted.clone(),
                 };
                 let run = Run::from_quads(asserted.layout(), inserts);
-                let next = Version {
+                let next = VersionData {
                     content: super::Content::fresh(),
                     asserted_content: super::AssertedIdentity::fresh(),
                     asserted: asserted.with_run(run),
@@ -506,7 +506,7 @@ impl Source {
 /// The version a bulk load publishes.
 enum Next {
     /// Built in memory, its time stamped as it commits.
-    Built(Version, Stamp),
+    Built(VersionData, Stamp),
     /// Asserted quads and nothing else: their permutations are built one at a time, each
     /// written to the checkpoint and dropped before the next (durable, `map_checkpoints`).
     /// The load's peak then holds one packed permutation instead of all of them.
@@ -566,15 +566,17 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
                 .map(|_| ());
         }
     };
+    let current = shared.versions.load();
+    let watch = shared.watch_after_bulk(&current, &next.asserted, next.asserted_content);
     let Some(durable) = &shared.durable else {
         next.committed_micros = stamp.take(shared).0;
         let _compaction = shared.versions.compaction_slot.lock();
-        shared.versions.install(next);
+        shared.versions.install(Version::new(watch, next));
         return Ok(());
     };
     // The checkpoint image's version: an unpublished snapshot's, never installed. The one
     // installed is made from it as a value, with slots of its own (empty).
-    let imaged = Arc::new(next);
+    let imaged = Arc::new(Version::new(Watch::unwatched(), next));
     let revision = imaged.revision;
     let _checkpoint = super::admit(&durable.checkpoint_slot, "checkpoint")?;
     let image = Snapshot::new(
@@ -608,35 +610,32 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     drop(image);
     let mut base = None;
-    let next = match durable
+    let data = match durable
         .config
         .map_checkpoints
         .then(|| checkpoint::map_written(&path))
     {
         Some(Ok((dictionary, [asserted, inferred]))) => {
             base = Some(dictionary);
-            Version {
+            VersionData {
                 // The same statements, mapped from the checkpoint.
-                content: imaged.content,
-                asserted_content: imaged.asserted_content,
-                asserted,
-                inferred,
-                equality: Arc::clone(&imaged.equality),
-                reading: imaged.reading,
-                certificate: imaged.certificate.clone(),
-                revision,
                 committed_micros,
-                dictionary_len: imaged.dictionary_len,
-                canonical: Default::default(),
-                own: Default::default(),
+                ..imaged.data_with_stacks(asserted, inferred)
             }
         }
         Some(Err(error)) => {
             tracing::warn!(%error, "checkpoint not mapped; data stays in memory");
-            imaged.with_time(committed_micros)
+            VersionData {
+                committed_micros,
+                ..imaged.copy_data()
+            }
         }
-        None => imaged.with_time(committed_micros),
+        None => VersionData {
+            committed_micros,
+            ..imaged.copy_data()
+        },
     };
+    let next = Version::new(watch, data);
     // What the image's readers kept in its version's own slots goes with it, before the
     // slots: nothing of it outlives the load.
     drop(imaged);
@@ -676,7 +675,7 @@ fn publish_streamed(
             .collect::<EngineResult<Vec<_>>>()?;
         let asserted =
             IndexVersion::from_packed(packed).map_err(crate::error::EngineError::Corruption)?;
-        let next = Version {
+        let next = VersionData {
             content: super::Content::fresh(),
             asserted_content: super::AssertedIdentity::fresh(),
             asserted,
@@ -755,7 +754,7 @@ fn publish_streamed(
             return Err(EngineError::CommitUnsettled { revision });
         }
     };
-    let next = Version {
+    let data = VersionData {
         content: super::Content::fresh(),
         // New: always sound for a cache keyed by it (a rescan), kept only where certain.
         asserted_content: super::AssertedIdentity::fresh(),
@@ -771,6 +770,9 @@ fn publish_streamed(
         canonical: Default::default(),
         own: Default::default(),
     };
+    let current = shared.versions.load();
+    let watch = shared.watch_after_bulk(&current, &data.asserted, data.asserted_content);
+    let next = Version::new(watch, data);
     let compaction = shared.versions.compaction_slot.lock();
     let mut wal = durable.wal.lock();
     shared.versions.install(next);
@@ -889,7 +891,7 @@ impl<'e> Rematerialisation<'e> {
     /// [`Self::finish`], keeping the writer slot until the returned [`super::Finished`] drops:
     /// what describes the published inferences (a store's reasoning certificate) is recorded
     /// before any other write can change the data they were computed over. The new stack is
-    /// installed with `reading` ([`Version::reading`]), in one install: a reader reads the old
+    /// installed with `reading` ([`VersionData::reading`]), in one install: a reader reads the old
     /// stack in its reading or the new one in this. A stack whose stored rows don't change
     /// still takes `reading`, without a new revision (`Shared::install`). The new stack
     /// carries `certificate` ([`super::Certificate`]). A failure installs nothing.
@@ -954,7 +956,7 @@ impl<'e> Rematerialisation<'e> {
         let current = shared.snapshot();
         let current = current.version();
         debug_assert_eq!(current.revision, base.revision(), "single writer");
-        let next = Version {
+        let next = VersionData {
             content: super::Content::fresh(),
             // Rematerialisation: the inferred stack only.
             asserted_content: current.asserted_content,

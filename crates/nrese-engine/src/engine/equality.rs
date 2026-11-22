@@ -28,7 +28,7 @@ use hashbrown::HashMap;
 use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
 use parking_lot::Mutex;
 
-use super::{ReadModel, Stack, Version};
+use super::{ReadModel, Stack, Version, VersionData, Watch};
 use crate::quad::{AccessPlan, EncodedQuad, GraphSelector, Key, Permutation, QuadPattern};
 use crate::term::TermId;
 use crate::visit::{Account, Free, Stopped};
@@ -342,7 +342,7 @@ fn canonical_version(
     )?;
     let asserted = asserted.with_run(run);
     drop((inserts, renamed));
-    let version = Arc::new(Version {
+    let data = VersionData {
         asserted,
         inferred: version.inferred.clone(),
         revision: version.revision,
@@ -358,7 +358,8 @@ fn canonical_version(
         own: Default::default(),
         // The same statements in another form.
         certificate: version.certificate.clone(),
-    });
+    };
+    let version = Arc::new(Version::new(Watch::unwatched(), data));
     Ok(Some(View(Some(Arc::new(ViewData {
         version,
         _held: held,

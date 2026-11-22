@@ -2,6 +2,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use nrese_engine::{Engine, EngineConfig, EngineError, ReadModel, Snapshot, TermId};
+use nrese_exec::stop::StopSource;
 use nrese_sparql::CancellationToken;
 
 use crate::backup::{DatasetBackupArtifact, DatasetBackupFormat, DatasetExport, export_dataset};
@@ -85,9 +86,8 @@ pub struct StoreService {
     /// ([`Self::unavailable`]): its state is neither the one before a failed change nor the
     /// one after it. Set once.
     unavailable: std::sync::Arc<std::sync::OnceLock<String>>,
-    /// The stored shapes as last compiled ([`Self::shacl_gate_state`]): at the open, and
-    /// after each write that changes the shapes graph.
-    pub(crate) shapes_kept: std::sync::Arc<std::sync::Mutex<crate::shacl::KeptShapes>>,
+    /// Why the published shapes count is still pending, if a refresh was deferred.
+    pub(crate) shapes_deferred: std::sync::Arc<crate::shacl::ShapesDeferred>,
 }
 
 /// The file recording what the inferred stack is exact for ([`crate::reasoning_state`]).
@@ -285,6 +285,9 @@ impl StoreService {
                 Engine::open(&config.data_dir, engine_config)?
             }
         };
+        engine.watch_graph(nrese_rdf::NamedNode::new_unchecked(
+            config.shapes_graph.clone(),
+        ))?;
         // The canonical views versions keep (canonical equality answers) draw on the
         // memory the queries do.
         engine.set_canonical_view_budget(std::sync::Arc::new(
@@ -345,9 +348,6 @@ impl StoreService {
             std::sync::Arc::clone(&namespaces),
             std::sync::Arc::clone(&settings.search_scope),
         ));
-        // After the open's own write (the ontology's preload, into the default graph): the
-        // shapes as the store holds them from here.
-        let shapes_kept = crate::shacl::KeptShapes::compiled(&engine.snapshot(), &config);
         let service = Self {
             process_memory,
             capacity: nrese_exec::memory::capacity,
@@ -370,7 +370,7 @@ impl StoreService {
             ql_mode: std::sync::Arc::new(std::sync::RwLock::new(ql_mode)),
             outside_profile: std::sync::Arc::new(std::sync::RwLock::new(outside_profile)),
             last_materialisation: std::sync::Arc::default(),
-            shapes_kept: std::sync::Arc::new(std::sync::Mutex::new(shapes_kept)),
+            shapes_deferred: Default::default(),
         };
         // Every store a replica server opens is a replica's from its open on, the default and
         // the catalog's others alike: its `owl2-dl` mode interns no term (the default's
@@ -407,6 +407,7 @@ impl StoreService {
                 .unwrap_or_else(|p| p.into_inner()) = Some(state);
         }
         drop(tx);
+        service.refresh_kept_shapes(&service.engine.snapshot(), &StopSource::none());
         service.pin_configured_queries()?;
         Ok(service)
     }
@@ -2184,7 +2185,7 @@ impl StoreService {
         &self,
         frames: &[u8],
         expected: &nrese_engine::LogExpectation,
-        stop: &nrese_exec::stop::StopSource,
+        stop: &StopSource,
     ) -> StoreResult<nrese_engine::Applied> {
         // A marker left from a start as a primary would vouch, after a restart, for the
         // records applied here (nothing reasons on a replica to write one again).
@@ -2193,13 +2194,15 @@ impl StoreService {
         }
         let before = self.current_revision();
         let applied = self.engine.apply_log(frames, expected, stop);
+        #[cfg(test)]
+        hooks::run(&hooks::AFTER_WRITE_PUBLICATION);
+        let view = self.engine.snapshot();
         // Whatever was published, a whole answer or the records before a stop or a
         // failure, the support sets start afresh.
-        if self.current_revision() != before {
+        if view.revision() != before {
             self.supports().forget();
-            // The records don't say which graphs they change.
-            self.compile_kept_shapes();
         }
+        self.refresh_kept_shapes(&view, stop);
         applied.map_err(crate::StoreError::Engine)
     }
 
@@ -2263,11 +2266,10 @@ impl StoreService {
         let cancellation = CancellationToken::new();
         let context = self.update_context(self.envelope(None), &cancellation);
         let report = command.apply(&mut tx, requester, &context)?;
-        let shapes = crate::shacl::changes_shapes(&tx, &self.config.shapes_graph);
         let summary = tx.commit()?;
-        if shapes {
-            self.compile_kept_shapes();
-        }
+        #[cfg(test)]
+        hooks::run(&hooks::AFTER_WRITE_PUBLICATION);
+        self.refresh_kept_shapes(&self.engine.snapshot(), &StopSource::none());
         Ok(report.committed(summary.revision))
     }
 
@@ -2324,7 +2326,6 @@ impl StoreService {
         let invalid = request.invalid.unwrap_or(self.config.invalid_statements);
         // Cleared under the load's writer slot, before it commits (invariant C).
         let invalidate = |writer: nrese_engine::WriterHeld<'_>| self.invalidate_held(writer);
-        let before = self.current_revision();
         let loaded = bulk_load(
             &self.engine,
             request,
@@ -2333,11 +2334,10 @@ impl StoreService {
             &self.quarantine,
             &invalidate,
         );
-        // Whatever it published (a failure may follow the publication): a load may replace
-        // every graph, and doesn't say which it changed.
-        if self.current_revision() != before {
-            self.compile_kept_shapes();
-        }
+        #[cfg(test)]
+        hooks::run(&hooks::AFTER_WRITE_PUBLICATION);
+        // A quarantine error can follow a publication. Count the shapes that are served.
+        self.refresh_kept_shapes(&self.engine.snapshot(), &progress.stop());
         loaded
     }
 
@@ -2952,6 +2952,8 @@ pub(crate) mod hooks {
         pub(crate) static BEFORE_PUBLICATION: Hook = const { RefCell::new(None) };
         /// A rematerialisation has published its inferences and is about to certify them.
         pub(crate) static AFTER_PUBLICATION: Hook = const { RefCell::new(None) };
+        /// A write has published and is about to return or refresh its shapes count.
+        pub(crate) static AFTER_WRITE_PUBLICATION: Hook = const { RefCell::new(None) };
         /// A change of the QL rewriting setting has read the certificate and is about to
         /// install the rewriting it calls for.
         pub(crate) static AFTER_QL_READ: Hook = const { RefCell::new(None) };

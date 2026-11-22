@@ -602,6 +602,12 @@ leave something out.
   fails (one that runs past its timeout, say) stores none. The repository's info says which
   shapes are in force (`GET /dataset/info`, `shacl`: their number and `vacuous`), and the log
   warns at the start while a gate that is on checks nothing.
+- The info reports the count for its dataset revision and the revision that last changed
+  the asserted shapes graph. A bulk load or replica batch can publish new shapes before
+  their count is ready. The info then gives `null` for `shapes` and `vacuous`, with the
+  reason in `not_counted`. Cancelling the count leaves the published data in place.
+  A later load, replica batch or restart can retry a count deferred by a stop or the
+  process memory limit. Malformed shapes have a bounded diagnostic in the info.
 - A commit that changes the shapes is checked against the shapes as they are after it: one
   update that removes the shapes and adds data is checked against none. It needs the right to
   write the shapes graph.

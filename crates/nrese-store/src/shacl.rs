@@ -7,7 +7,8 @@
 //! [`StoreConfig::shapes_graph`]: crate::StoreConfig::shapes_graph
 
 use nrese_engine::{EncodedQuad, GraphSelector, ReadModel, Snapshot, TermId, Transaction};
-use nrese_rdf::{GraphName, NamedNode, Term};
+use nrese_exec::stop::StopSource;
+use nrese_rdf::{GraphName, NamedNode, NamedNodeRef, Term};
 use nrese_shacl::{
     PropertyPath, Selection, ShapeError, Shapes, ValidationReport, compile, compile_until,
     validate, validate_changes, validate_shapes_change,
@@ -219,21 +220,12 @@ fn changes_graph(tx: &Transaction<'_>, graph: TermId) -> bool {
         .any(|quad| quad.graph == graph)
 }
 
-/// Whether the commit in `tx` changes the asserted statements of the graph `shapes_graph`.
-pub(crate) fn changes_shapes(tx: &Transaction<'_>, shapes_graph: &str) -> bool {
-    graph_iri(shapes_graph)
-        .ok()
-        .and_then(|iri| tx.lookup(iri.as_ref().into()))
-        .is_some_and(|graph| changes_graph(tx, graph))
-}
-
 /// Fails if the commit in `tx` changes the graph `shapes_graph` and leaves shapes in it that
 /// don't compile: the shapes graph is a managed object, well-formed whatever wrote it and
 /// whether or not the SHACL gate is on ([`StoreError::ShaclShapes`], one message per
 /// problem, as `view`'s committer may be told them: [`EvidenceView::shapes_error`]).
 /// Where it changes them, the shapes it leaves: their number, nested ones included, and
-/// whether they can report nothing ([`Shapes::is_vacuous`]), for the kept state
-/// ([`StoreService::keep_shapes`]).
+/// whether they can report nothing ([`Shapes::is_vacuous`]), kept with the publication.
 ///
 /// [`EvidenceView::shapes_error`]: crate::mutation::evidence::EvidenceView::shapes_error
 pub(crate) fn check_shapes(
@@ -467,104 +459,155 @@ pub(crate) fn view_reason(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShaclGateState {
     pub gate: crate::ShaclGate,
-    /// The revision the shapes were compiled at: the open's, or that of the latest write
-    /// that changed the shapes graph. Writes that leave it as it was keep it.
+    /// The dataset revision that supplies this state.
+    pub view_revision: u64,
+    /// The revision that last changed the shapes graph, or the open's revision.
     pub revision: u64,
     /// The number of shapes, nested ones included (as a validation counts them); `None`
-    /// where they don't compile ([`Self::not_counted`]).
+    /// where a count isn't available ([`Self::not_counted`]).
     pub shapes: Option<usize>,
     /// Whether the shapes can report nothing: no shape and no `sh:entailment`. An enforcing
-    /// gate then accepts every write. `None` where they don't compile.
+    /// gate then accepts every write. `None` where a count isn't available.
     pub vacuous: Option<bool>,
     /// Why the shapes weren't counted.
     pub not_counted: Option<String>,
 }
 
-/// The stored shapes as the store keeps them for [`ShaclGateState`]: compiled at `revision`,
-/// their number and whether they can report nothing, or why they don't compile. A count and
-/// a flag, never the compiled shapes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct KeptShapes {
-    revision: u64,
-    counted: Result<(usize, bool), String>,
+/// The result of compiling the watched graph, without the compiled shapes.
+pub(crate) struct ShapesCounted(pub(crate) Result<(usize, bool), Box<str>>);
+
+/// A display bound for the info response and its startup log. Validation reports all errors.
+pub(crate) const SHAPES_DIAGNOSTIC_BYTES: usize = 512;
+const SHAPES_DONT_COMPILE: &str = "the stored shapes don't compile";
+
+/// The latest shapes revision whose count was deferred for each reason. An older refresh
+/// can finish later than a newer one. These markers only describe unfilled cells.
+#[derive(Default)]
+pub(crate) struct ShapesDeferred {
+    stopped: DeferredRevision,
+    memory: DeferredRevision,
 }
 
-impl KeptShapes {
-    /// The shapes of `config`'s shapes graph in `view`, compiled.
-    pub(crate) fn compiled(view: &Snapshot, config: &crate::StoreConfig) -> Self {
-        Self {
-            revision: view.revision(),
-            counted: counted(view, &config.shapes_graph),
+type DeferredRevision = std::sync::OnceLock<std::sync::atomic::AtomicU64>;
+
+fn defer(marker: &DeferredRevision, revision: u64) {
+    marker
+        .get_or_init(|| std::sync::atomic::AtomicU64::new(revision))
+        .fetch_max(revision, std::sync::atomic::Ordering::Relaxed);
+}
+
+impl ShapesDeferred {
+    fn why(&self, revision: u64) -> &'static str {
+        let at = |marker: &DeferredRevision| {
+            marker
+                .get()
+                .is_some_and(|at| at.load(std::sync::atomic::Ordering::Relaxed) == revision)
+        };
+        if at(&self.stopped) {
+            "stopped. Retried at the next load, replica batch or start"
+        } else if at(&self.memory) {
+            "not enough memory to count the stored shapes"
+        } else {
+            "being compiled"
         }
-    }
-}
-
-/// The number of shapes in the graph `shapes_graph` of `view` and whether they can report
-/// nothing; or why they don't compile.
-fn counted(view: &Snapshot, shapes_graph: &str) -> Result<(usize, bool), String> {
-    let iri =
-        graph_iri(shapes_graph).map_err(|error| format!("the shapes graph's name: {error}"))?;
-    let Some(graph) = view.lookup(iri.as_ref().into()) else {
-        return Ok((0, true));
-    };
-    match compile(view, Selection::asserted(GraphSelector::Exact(graph))) {
-        Ok(shapes) => Ok((shapes.len(), shapes.is_vacuous())),
-        Err(errors) => Err(not_compiled(&errors)),
     }
 }
 
 /// Why stored shapes don't compile: their first problem and how many more, so that what is
 /// kept stays small whatever the shapes graph holds.
-fn not_compiled(errors: &[ShapeError]) -> String {
-    use std::fmt::Write as _;
-    let mut why = String::from("the stored shapes don't compile");
+fn not_compiled(errors: &[ShapeError]) -> Box<str> {
+    let suffix = if errors.len() > 1 {
+        format!(" (and {} more problems)", errors.len() - 1)
+    } else {
+        String::new()
+    };
+    let mut why = String::from(SHAPES_DONT_COMPILE);
+    let limit = SHAPES_DIAGNOSTIC_BYTES - suffix.len() - '…'.len_utf8();
     if let Some(first) = errors.first() {
-        let _ = write!(why, ": {first}");
+        for part in [": shape ", &first.shape, ": ", &first.message] {
+            let end = part.floor_char_boundary(limit - why.len());
+            why.push_str(&part[..end]);
+            if end < part.len() {
+                why.push('…');
+                break;
+            }
+        }
     }
-    if errors.len() > 1 {
-        let _ = write!(why, " (and {} more problems)", errors.len() - 1);
-    }
-    why
+    why.push_str(&suffix);
+    why.into_boxed_str()
 }
 
 impl StoreService {
-    /// Keeps `counted`, the stored shapes as compiled at `revision`, unless shapes compiled at
-    /// a later revision are kept: writes publish in revision order, but may keep theirs in
-    /// another.
-    pub(crate) fn keep_shapes(&self, revision: u64, counted: Result<(usize, bool), String>) {
-        let mut kept = self
-            .shapes_kept
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if kept.revision <= revision {
-            *kept = KeptShapes { revision, counted };
+    /// Fills the view's cell unless a writer already counted these shapes. A later change
+    /// of the shapes graph has its own cell.
+    pub(crate) fn refresh_kept_shapes(&self, view: &Snapshot, stop: &StopSource) {
+        let cell = view
+            .watched()
+            .expect("the store registered its shapes graph");
+        if cell.kept().is_some() {
+            return;
         }
-    }
-
-    /// Compiles the stored shapes as they are now and keeps them: after a write that can
-    /// change them without the commit path's shapes check ([`check_shapes`]), which the
-    /// mutation pipeline keeps instead.
-    pub(crate) fn compile_kept_shapes(&self) {
-        let kept = KeptShapes::compiled(&self.engine().snapshot(), self.config());
-        self.keep_shapes(kept.revision, kept.counted);
+        if stop.check().is_err() {
+            defer(&self.shapes_deferred.stopped, cell.changed_at());
+            return;
+        }
+        let iri = NamedNodeRef::new_unchecked(&self.config().shapes_graph);
+        let counted = if let Some(graph) = view.lookup(iri.into()) {
+            if self.memory_stop().exceeded() {
+                defer(&self.shapes_deferred.memory, cell.changed_at());
+                return;
+            }
+            let cancel = stop.flag().map(CancellationToken::from);
+            let result = compile_until(
+                view,
+                Selection::asserted(GraphSelector::Exact(graph)),
+                cancel.as_ref(),
+            );
+            match result {
+                Some(Ok(shapes)) => Ok((shapes.len(), shapes.is_vacuous())),
+                Some(Err(errors)) => Err(not_compiled(&errors)),
+                None => {
+                    defer(&self.shapes_deferred.stopped, cell.changed_at());
+                    return;
+                }
+            }
+        } else {
+            Ok((0, true))
+        };
+        if stop.check().is_err() {
+            defer(&self.shapes_deferred.stopped, cell.changed_at());
+            return;
+        }
+        cell.keep(std::sync::Arc::new(ShapesCounted(counted)));
     }
 
     /// The SHACL gate's state ([`ShaclGateState`]): its policy and the shapes as kept,
     /// compiled at the open and after each write that changed the shapes graph. A read of
     /// what is kept: it never compiles, and never waits for a compilation.
     pub fn shacl_gate_state(&self) -> ShaclGateState {
-        let kept = self
-            .shapes_kept
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let (shapes, vacuous, not_counted) = match kept.counted {
-            Ok((shapes, vacuous)) => (Some(shapes), Some(vacuous), None),
-            Err(why) => (None, None, Some(why)),
+        let view = self.engine().snapshot();
+        let cell = view
+            .watched()
+            .expect("the store registered its shapes graph");
+        let counted = cell.kept().map(|value| {
+            &value
+                .downcast_ref::<ShapesCounted>()
+                .expect("shapes count")
+                .0
+        });
+        let (shapes, vacuous, not_counted) = match counted {
+            Some(Ok((shapes, vacuous))) => (Some(*shapes), Some(*vacuous), None),
+            Some(Err(why)) => (None, None, Some(why.to_string())),
+            None => (
+                None,
+                None,
+                Some(self.shapes_deferred.why(cell.changed_at()).to_owned()),
+            ),
         };
         ShaclGateState {
             gate: self.config().shacl_gate,
-            revision: kept.revision,
+            view_revision: view.revision(),
+            revision: cell.changed_at(),
             shapes,
             vacuous,
             not_counted,
@@ -589,13 +632,28 @@ impl StoreService {
                 "SHACL gate: no shapes are compiled from the shapes graph, so it checks nothing \
                  and every write passes it"
             ),
+            (None, _)
+                if on
+                    && state
+                        .not_counted
+                        .as_deref()
+                        .is_some_and(|why| why.starts_with(SHAPES_DONT_COMPILE)) =>
+            {
+                tracing::warn!(
+                    repository,
+                    gate,
+                    severity,
+                    not_counted = state.not_counted.as_deref(),
+                    "SHACL gate: the stored shapes don't compile, so every write is refused until \
+                     the shapes graph is repaired or replaced"
+                )
+            }
             (None, _) if on => tracing::warn!(
                 repository,
                 gate,
                 severity,
                 not_counted = state.not_counted.as_deref(),
-                "SHACL gate: the stored shapes don't compile, so every write is refused until \
-                 the shapes graph is repaired or replaced"
+                "SHACL gate: the stored shapes haven't been counted"
             ),
             _ => tracing::info!(
                 repository,

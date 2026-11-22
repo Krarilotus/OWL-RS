@@ -489,6 +489,9 @@ impl MutationPipeline {
             if let Some(certificate) = tx.base().certificate().cloned() {
                 tx.vouch(certificate);
             }
+            if let Some(shapes) = shapes {
+                tx.keep_watched(Arc::new(crate::shacl::ShapesCounted(Ok(shapes))));
+            }
             let (summary, report) = match ql {
                 Some(ql) => publishing(ticket, report, tx, |tx| ql.commit(tx)),
                 None => publishing(ticket, report, tx, |tx| tx.commit()),
@@ -498,9 +501,8 @@ impl MutationPipeline {
                 source: StoreError::Engine(error),
             })?;
             drop(rights);
-            if let Some(shapes) = shapes {
-                self.store.keep_shapes(summary.revision, Ok(shapes));
-            }
+            #[cfg(test)]
+            crate::service::hooks::run(&crate::service::hooks::AFTER_WRITE_PUBLICATION);
             if let Some(touched) = touched {
                 supports.note_commit(before, summary.revision, touched);
             }
@@ -566,17 +568,18 @@ impl MutationPipeline {
             return Err(MutationError::Cancelled);
         }
         let rights = ticket.hold_rights()?;
-        let (summary, report) =
-            publishing(ticket, report, tx, |tx| tx.commit()).map_err(|error| {
-                MutationError::Store {
-                    kind,
-                    source: StoreError::Engine(error),
-                }
-            })?;
-        drop(rights);
         if let Some(shapes) = shapes {
-            self.store.keep_shapes(summary.revision, Ok(shapes));
+            tx.keep_watched(Arc::new(crate::shacl::ShapesCounted(Ok(shapes))));
         }
+        let (_, report) = publishing(ticket, report, tx, |tx| tx.commit()).map_err(|error| {
+            MutationError::Store {
+                kind,
+                source: StoreError::Engine(error),
+            }
+        })?;
+        drop(rights);
+        #[cfg(test)]
+        crate::service::hooks::run(&crate::service::hooks::AFTER_WRITE_PUBLICATION);
         Ok(report)
     }
 

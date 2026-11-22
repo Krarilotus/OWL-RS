@@ -9,7 +9,7 @@ use super::equality::{
     Visibility as CopyVisibility,
 };
 use super::statistics::Statistics;
-use super::{ReadModel, Stack, Version};
+use super::{ReadModel, Stack, Version, VersionData, Watch, WatchedRef};
 use crate::index::{IndexVersion, QuadScan};
 use crate::quad::{AccessPlan, EncodedQuad, GraphSelector, Permutation, QuadPattern};
 use crate::term::resolve::Vocabulary;
@@ -439,7 +439,7 @@ impl Snapshot {
     }
 
     /// [`Self::new`] of a version the engine has installed or recovered: published, so it
-    /// grants a [`SharedState`], read as installed (its [`Version::reading`]). Only the
+    /// grants a [`SharedState`], read as installed (its [`VersionData::reading`]). Only the
     /// engine's own snapshot acquisition calls it.
     pub(super) fn published(
         version: Arc<Version>,
@@ -870,7 +870,7 @@ impl Snapshot {
     /// its own. Published as its source is if `inferred` only restricts the source's
     /// inferred statements; never if it adds any ([`ViewOf`]).
     fn restricted(&self, inferred: crate::index::IndexVersion, held: Held, of: ViewOf) -> Snapshot {
-        let version = Arc::new(Version {
+        let data = VersionData {
             content: super::Content::fresh(),
             // A masked or restricted view: the same asserted stack.
             asserted_content: self.version.asserted_content,
@@ -893,7 +893,12 @@ impl Snapshot {
                     .certificate_for_rows()
                     .map(|c| Arc::new(Withheld(Arc::clone(c))) as super::Certificate),
             },
-        });
+        };
+        let watch = match of {
+            ViewOf::Restriction | ViewOf::Derived => Watch::Keep(&self.version),
+            ViewOf::Addition | ViewOf::Withheld => Watch::unwatched(),
+        };
+        let version = Arc::new(Version::new(watch, data));
         let canonical_data = self.canonical_view(&version);
         Snapshot {
             canonical_data,
@@ -1374,6 +1379,11 @@ impl Snapshot {
 
     pub fn revision(&self) -> u64 {
         self.version.revision
+    }
+
+    /// The observation cell for the asserted graph watched by this published snapshot.
+    pub fn watched(&self) -> Option<WatchedRef<'_>> {
+        self.version.watched()
     }
 
     /// What was vouched for its version ([`super::Certificate`]). A pending or private
