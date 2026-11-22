@@ -153,12 +153,12 @@ extra = ["volume:univ-bench.nt"]
 args = ["--reason", "owl2-rl", "--runs", "3"]
 queries = "lubm"
 metric = "reason.p50_ms"
-check = { "reason.inferred" = 8726942, "q.q06.rows" = 1048532, "q.q14.rows" = 795970, "q.q09.rows" = 27247 }
+check = { "reason.inferred" = 8726957, "q.q06.rows" = 1048532, "q.q14.rows" = 795970, "q.q09.rows" = 27247 }
 route = { "reason.rounds" = "<= 6" }
 cap_gb = 12
 systems = ["nemo:owl2-rl", "jena:owl-horst", "graphdb:owl2-rl", "qlever:closure", "oxigraph:closure", "virtuoso:closure", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 guards = ["P1-F1 drivers read in place", "P1-F4 no list of derived facts", "P1-F8 candidates deduplicated and probed in order"]
-pinned = "NRESE 5 Oct 2026; to equal Nemo's closure plus NRESE's 32 axiomatic statements (fast.py compete)"
+pinned = "NRESE 5 Oct 2026; to equal Nemo's closure plus NRESE's 32 axiomatic statements (fast.py compete); 21 Nov 2026 +15 (8,726,942 to 8,726,957): the rule table's premise-free statements (prp-ap, cls-thing, cls-nothing1) and the scm-cls statements of owl:Thing and owl:Nothing, by a diff of both closures"
 
 [[case]]
 name = "rl-owl2bench"
@@ -169,12 +169,12 @@ data = "volume:owl2bench-rl-1.nt"
 args = ["--reason", "owl2-rl", "--reason-runs", "10", "--runs", "3"]
 queries = "owl2bench"
 metric = "reason.p50_ms"
-check = { "reason.inferred" = 1399563, "q.q20.rows" = 1311932 }
+check = { "reason.inferred" = 1399575, "q.q20.rows" = 1311932 }
 route = { "reason.rounds" = "<= 6" }
 cap_gb = 6
 systems = ["nemo:owl2-rl", "jena:owl-horst", "graphdb:owl2-rl", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 hangs = { "jena:owl-horst" = "6 Oct 2026: Jena's OWL rules gave no answer to the count within 900 s nor to q01 after 27 min in all (lazy reasoning over a 1.3 M-pair clique); stopped, recorded, not run again" }
-pinned = "NRESE 5 Oct 2026, the closure Nemo and owlrl agree with (run record office-b)"
+pinned = "NRESE 5 Oct 2026, the closure Nemo and owlrl agree with (run record office-b); 21 Nov 2026 +12 (1,399,563 to 1,399,575): the rule table's premise-free statements this data doesn't already hold (prp-ap, cls-nothing1) and owl:Nothing's scm-cls statements, by a diff of both closures"
 [[case]]
 name = "rl-single-thread"
 area = "reasoning"

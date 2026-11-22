@@ -4372,6 +4372,16 @@
               }
             },
             "description": "Unreadable data"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Server error during import"
           }
         },
         "summary": "Bulk-loads the RDF document in the body (its format from `Content-Type`): into the\ngraph `graph` for triple formats (the default graph without), replacing the\nrepository's statements with `replace=true`. Statements with syntax errors go into the\nrepository's quarantine, or stop the load with `invalid=strict` (the repository's\n`store.invalid_statements` without). Then the inferences are recomputed. For large loads: the\nloader's parallel path, not one commit's; administrators only, since a bulk load\nreplaces whole indexes and passes no commit gate.",

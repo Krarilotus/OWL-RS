@@ -67,6 +67,7 @@ Known bypasses:
 - `crates/nrese-dl/src/context/memory.rs:11`: `Observer` maintains its own sampled capacity counters and per-task limit beside a shared `Gauge`.
 - `crates/nrese-dl/src/tableau/engine.rs:628`: Solver checks estimated current bytes then `Gauge::follow` (:645); this observes after growth rather than enforcing every allocation beforehand.
 - `crates/nrese-engine/src/term/vectors.rs:136`: Vector-space growth parses literals and pushes persistent vectors without a budget parameter; :287 only reports bytes.
+- `crates/nrese-shacl/src/compile.rs:58`: `compile_until` builds the shapes and uses a walk stack, both linear in the compiled shapes graph and uncharged.
 - `crates/nrese-shacl/src/validate.rs:143`: Validator precomputes class/subclass lists into a plain map at :159 without reserving this container there.
 - `crates/nrese-sparql/src/native/mod.rs:1173`: `Solutions` owns a plain IdTable without carrying its charge; manual produced/consumed accounting elsewhere must stay synchronized.
 - `crates/nrese-exec/src/graph.rs:118`: Plain closure produces a growing IdTable with no budget argument.
@@ -106,7 +107,10 @@ one index → inner → order → derived bookkeeping, never two locks of one le
 compaction holders run serial work. Vector filters use `SearchInput` after index locks are released (`crates/nrese-engine/src/term/vectors.rs:480`).
 A commit's note (`Transaction::note_commit`, `crates/nrese-engine/src/engine/writer.rs`) runs with the writer slot, the WAL and, where the
 commit converts the stack, the compaction slot held: it takes no lock and calls nothing in the engine, and its journal's sync holds back
-compaction, checkpoints and the served log for its length (quarantine readmissions only). State that changes only between commits takes a
+compaction, checkpoints and the served log for its length (quarantine readmissions only).
+The publication report (`Transaction::note_publication`) runs after the current-version lock is released, under the writer slot, with the
+WAL on durable commits and the compaction slot on layout conversions. A no-op reports the unchanged revision under the writer slot alone.
+State that changes only between commits takes a
 `WriterHeld` proof (the store's reasoning certificate: `StoreService::invalidate_held`, `record_reasoning` under `Rematerialisation::finish_held`).
 
 A write publishes only with the rights it was evaluated with (`RightsCheck::hold`, `crates/nrese-store/src/access/control.rs`): the pipeline holds the access

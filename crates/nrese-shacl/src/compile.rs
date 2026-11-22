@@ -9,14 +9,14 @@ use std::str::FromStr;
 
 use nrese_engine::{GraphSelector, TermId, TermKind};
 use nrese_rdf::{Term, Variable};
-use nrese_sparql::ReadView;
 use nrese_sparql::value::{Value, compile_regex};
+use nrese_sparql::{CancellationToken, ReadView};
 use nrese_sparql_syntax::{Query, SparqlParser};
 
 use crate::graph::{GraphView, Selection};
 use crate::model::{
-    Bound, Component, Constraint, Logical, NodeKind, Path, SH, Severity, Shape, ShapeRef, Shapes,
-    SparqlCheck, Target,
+    Bound, Component, Constraint, Logical, Message, NestedConstraint, Nesting, NodeKind, Path, SH,
+    Severity, Shape, ShapeRef, Shapes, SparqlCheck, Target,
 };
 use crate::sparql;
 
@@ -32,6 +32,42 @@ const MAX_PATH_DEPTH: usize = 64;
 type UnaryPath = fn(Box<Path>) -> Path;
 /// Builds a property pair constraint from the other property.
 type PropertyPair = fn(TermId) -> Constraint;
+
+#[derive(Clone, Copy)]
+enum ShapeParameter {
+    Single(Nesting),
+    List(Logical),
+    Qualified { disjoint: &'static str },
+}
+
+const PROPERTY: &str = "property";
+// Every shape-valued parameter must go through this table so the deep-chain fixture
+// coverage test sees it. Keep entries in constraint evaluation and compilation order.
+const NESTING_PARAMETERS: &[(&str, ShapeParameter)] = &[
+    ("not", ShapeParameter::Single(Nesting::Not)),
+    ("and", ShapeParameter::List(Logical::And)),
+    ("or", ShapeParameter::List(Logical::Or)),
+    ("xone", ShapeParameter::List(Logical::Xone)),
+    ("node", ShapeParameter::Single(Nesting::Node)),
+    (PROPERTY, ShapeParameter::Single(Nesting::Property)),
+    (
+        "qualifiedValueShape",
+        ShapeParameter::Qualified {
+            disjoint: "qualifiedValueShapesDisjoint",
+        },
+    ),
+];
+
+/// Shape nesting parameters, including the option that adds qualified sibling references.
+#[doc(hidden)]
+pub fn nesting_parameters() -> impl Iterator<Item = &'static str> {
+    NESTING_PARAMETERS.iter().flat_map(|(local, parameter)| {
+        std::iter::once(*local).chain(match parameter {
+            ShapeParameter::Qualified { disjoint } => Some(*disjoint),
+            _ => None,
+        })
+    })
+}
 
 /// Why a shapes graph can't be used.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,7 +87,16 @@ impl std::error::Error for ShapeError {}
 
 /// Compiles the shapes in `shapes_graph`.
 pub fn compile<V: ReadView>(view: &V, shapes_graph: Selection) -> Result<Shapes, Vec<ShapeError>> {
-    let graph = GraphView::new(view, shapes_graph);
+    compile_until(view, shapes_graph, None).expect("no cancellation")
+}
+
+/// Compiles the shapes, returning `None` if cancelled. Incomplete shapes are discarded.
+pub fn compile_until<V: ReadView>(
+    view: &V,
+    shapes_graph: Selection,
+    cancellation: Option<&CancellationToken>,
+) -> Option<Result<Shapes, Vec<ShapeError>>> {
+    let graph = GraphView::new(view, shapes_graph).with_cancellation(cancellation);
     let mut compiler = Compiler {
         rdf_type: graph.iri(&format!("{RDF}type")),
         rdf_first: graph.iri(&format!("{RDF}first")),
@@ -60,6 +105,7 @@ pub fn compile<V: ReadView>(view: &V, shapes_graph: Selection) -> Result<Shapes,
         graph,
         shapes: Vec::new(),
         index: HashMap::new(),
+        numbering: Vec::new(),
         errors: Vec::new(),
         components: Vec::new(),
     };
@@ -78,16 +124,16 @@ pub fn compile<V: ReadView>(view: &V, shapes_graph: Selection) -> Result<Shapes,
     for class in ["NodeShape", "PropertyShape"] {
         roots.extend(compiler.instances(&format!("{SH}{class}")));
     }
-    for root in roots {
-        compiler.shape(root);
-    }
+    compiler.compile_shapes(roots)?;
     // Any triple with `sh:entailment` in the shapes graph, whatever its subject (SHACL §1.5).
     let entailments = compiler
         .sh("entailment")
         .map(|predicate| compiler.graph.objects_of(predicate))
         .unwrap_or_default();
-    if compiler.errors.is_empty() {
-        Ok(Shapes {
+    if compiler.graph.cancelled() {
+        None
+    } else if compiler.errors.is_empty() {
+        Some(Ok(Shapes {
             shapes: compiler.shapes,
             index: compiler.index,
             graph: match shapes_graph.graphs {
@@ -95,9 +141,9 @@ pub fn compile<V: ReadView>(view: &V, shapes_graph: Selection) -> Result<Shapes,
                 _ => None,
             },
             entailments,
-        })
+        }))
     } else {
-        Err(compiler.errors)
+        Some(Err(compiler.errors))
     }
 }
 
@@ -109,9 +155,36 @@ struct Compiler<'a, V: ReadView> {
     rdf_nil: Option<TermId>,
     shapes: Vec<Shape>,
     index: HashMap<TermId, ShapeRef>,
+    // The depth-first number of each interned slot, or None while it is pending.
+    numbering: Vec<Option<ShapeRef>>,
     errors: Vec<ShapeError>,
     /// The shapes graph's SPARQL-based constraint components.
     components: Vec<ComponentDef>,
+}
+
+/// Where the depth-first walk stopped in a compiled shape's constraints.
+struct ShapeFrame {
+    shape: ShapeRef,
+    constraint: usize,
+    member: usize,
+}
+
+impl ShapeFrame {
+    fn next_reference<'a>(&mut self, shape: &'a mut Shape) -> Option<&'a mut ShapeRef> {
+        for constraint in &mut shape.constraints[self.constraint..] {
+            let reference = match constraint {
+                Constraint::Nested(nested) => nested.creation_reference(self.member),
+                _ => None,
+            };
+            if let Some(reference) = reference {
+                self.member += 1;
+                return Some(reference);
+            }
+            self.constraint += 1;
+            self.member = 0;
+        }
+        None
+    }
 }
 
 impl<V: ReadView> Compiler<'_, V> {
@@ -202,6 +275,9 @@ impl<V: ReadView> Compiler<'_, V> {
         let mut seen = BTreeSet::new();
         let mut node = head;
         while Some(node) != self.rdf_nil {
+            if self.graph.cancelled() {
+                return Err("compilation cancelled".to_owned());
+            }
             if !seen.insert(node) {
                 return Err("is a cyclic list".to_owned());
             }
@@ -278,13 +354,14 @@ impl<V: ReadView> Compiler<'_, V> {
         }
     }
 
-    /// Compiles `node` as a shape (once), and the shapes it refers to.
+    /// Interns `node` and leaves its new slot pending for the walk.
     fn shape(&mut self, node: TermId) -> ShapeRef {
         if let Some(&shape) = self.index.get(&node) {
             return shape;
         }
         let shape = self.shapes.len();
         self.index.insert(node, shape);
+        self.numbering.push(None);
         // The slot exists before the shape's references are followed: shapes may refer
         // to each other, and to themselves.
         self.shapes.push(Shape {
@@ -296,6 +373,68 @@ impl<V: ReadView> Compiler<'_, V> {
             messages: Vec::new(),
             deactivated: false,
         });
+        shape
+    }
+
+    /// Fills every shape reachable from `roots`, or `None` if cancelled. Errors come in the
+    /// order the shapes are first visited.
+    fn compile_shapes(&mut self, roots: BTreeSet<TermId>) -> Option<()> {
+        // References start as interned slots. Visit them one at a time so a child can
+        // reach a pending sibling before the parent does, then replace each with its number.
+        let mut stack = Vec::new();
+        let mut next = 0;
+        for root in roots {
+            let root = self.shape(root);
+            if self.numbering[root].is_some() {
+                continue;
+            }
+            if self.graph.cancelled() {
+                return None;
+            }
+            stack.push(self.fill_shape(root, &mut next));
+            while let Some(frame) = stack.last_mut() {
+                let shape = &mut self.shapes[frame.shape];
+                let Some(reference) = frame.next_reference(shape) else {
+                    stack.pop();
+                    continue;
+                };
+                let child = *reference;
+                if let Some(number) = self.numbering[child] {
+                    *reference = number;
+                } else {
+                    *reference = next;
+                    // A walk cut short leaves slots unvisited: nothing of it is kept.
+                    if self.graph.cancelled() {
+                        return None;
+                    }
+                    stack.push(self.fill_shape(child, &mut next));
+                }
+            }
+        }
+        if self.errors.is_empty() {
+            self.reorder_shapes();
+        }
+        Some(())
+    }
+
+    /// Puts the interned slots into the depth-first order used by their references.
+    fn reorder_shapes(&mut self) {
+        for shape in self.index.values_mut() {
+            *shape = self.numbering[*shape].expect("every interned shape was visited");
+        }
+        for shape in 0..self.shapes.len() {
+            while let Some(position) = self.numbering[shape].filter(|&position| position != shape) {
+                self.shapes.swap(shape, position);
+                self.numbering.swap(shape, position);
+            }
+        }
+    }
+
+    fn fill_shape(&mut self, shape: ShapeRef, next: &mut ShapeRef) -> ShapeFrame {
+        // Number the shape before its descendants, including when an edge closes a cycle.
+        self.numbering[shape] = Some(*next);
+        *next += 1;
+        let node = self.shapes[shape].node;
 
         let path = self.one(node, "path").and_then(|path| {
             self.path(path, 0)
@@ -324,7 +463,11 @@ impl<V: ReadView> Compiler<'_, V> {
             messages,
             deactivated,
         };
-        shape
+        ShapeFrame {
+            shape,
+            constraint: 0,
+            member: 0,
+        }
     }
 
     fn targets(&mut self, node: TermId) -> Vec<Target> {
@@ -488,29 +631,27 @@ impl<V: ReadView> Compiler<'_, V> {
             }
         }
 
-        // Logic.
-        for shape in self.values(node, "not") {
-            out.push(Constraint::Not(self.shape(shape)));
-        }
-        for (local, logical) in [
-            ("and", Logical::And),
-            ("or", Logical::Or),
-            ("xone", Logical::Xone),
-        ] {
-            for head in self.values(node, local) {
-                let shapes = self.shape_list(node, head, local);
-                out.push(Constraint::Logical(logical, shapes));
+        for &(local, parameter) in NESTING_PARAMETERS {
+            match parameter {
+                ShapeParameter::Single(kind) => {
+                    for shape in self.values(node, local) {
+                        out.push(Constraint::Nested(NestedConstraint::single(
+                            kind,
+                            self.shape(shape),
+                        )));
+                    }
+                }
+                ShapeParameter::List(kind) => {
+                    for head in self.values(node, local) {
+                        let members = self.shape_list(node, head, local);
+                        out.push(Constraint::Nested(NestedConstraint::logical(kind, members)));
+                    }
+                }
+                ShapeParameter::Qualified { disjoint } => {
+                    self.qualified(node, local, disjoint, &mut out);
+                }
             }
         }
-
-        // Shapes.
-        for shape in self.values(node, "node") {
-            out.push(Constraint::Node(self.shape(shape)));
-        }
-        for shape in self.values(node, "property") {
-            out.push(Constraint::Property(self.shape(shape)));
-        }
-        self.qualified(node, &mut out);
 
         // Others.
         if self
@@ -526,7 +667,16 @@ impl<V: ReadView> Compiler<'_, V> {
         );
         for head in self.values(node, "in") {
             match self.list(head) {
-                Ok(members) => out.push(Constraint::In(members.into_iter().collect())),
+                Ok(members) => {
+                    let mut allowed = BTreeSet::new();
+                    for member in members.into_iter().take_while(|_| !self.graph.cancelled()) {
+                        allowed.insert(member);
+                    }
+                    if self.graph.cancelled() {
+                        break;
+                    }
+                    out.push(Constraint::In(allowed));
+                }
                 Err(problem) => self.error(node, format!("sh:in {problem}")),
             }
         }
@@ -539,8 +689,8 @@ impl<V: ReadView> Compiler<'_, V> {
         out
     }
 
-    fn qualified(&mut self, node: TermId, out: &mut Vec<Constraint>) {
-        let qualified = self.values(node, "qualifiedValueShape");
+    fn qualified(&mut self, node: TermId, local: &str, disjoint: &str, out: &mut Vec<Constraint>) {
+        let qualified = self.values(node, local);
         if qualified.is_empty() {
             return;
         }
@@ -551,15 +701,15 @@ impl<V: ReadView> Compiler<'_, V> {
             .one(node, "qualifiedMaxCount")
             .and_then(|value| self.count(node, value, "qualifiedMaxCount"));
         let disjoint = self
-            .one(node, "qualifiedValueShapesDisjoint")
+            .one(node, disjoint)
             .is_some_and(|value| self.is_true(value));
         // Sibling shapes: the qualified value shapes of the other property shapes of this
         // shape's parents.
         let mut siblings: BTreeSet<TermId> = BTreeSet::new();
-        if disjoint && let Some(property) = self.sh("property") {
+        if disjoint && let Some(property) = self.sh(PROPERTY) {
             for parent in self.graph.subjects(property, node) {
                 for child in self.graph.objects(parent, property) {
-                    siblings.extend(self.values(child, "qualifiedValueShape"));
+                    siblings.extend(self.values(child, local));
                 }
             }
         }
@@ -569,12 +719,12 @@ impl<V: ReadView> Compiler<'_, V> {
                 .filter(|&&sibling| sibling != shape)
                 .map(|&sibling| self.shape(sibling))
                 .collect();
-            out.push(Constraint::Qualified {
-                shape: self.shape(shape),
+            out.push(Constraint::Nested(NestedConstraint::qualified(
+                self.shape(shape),
                 min,
                 max,
                 siblings,
-            });
+            )));
         }
     }
 
@@ -582,7 +732,7 @@ impl<V: ReadView> Compiler<'_, V> {
     /// `sh:ignoredProperties`.
     fn allowed_properties(&mut self, node: TermId) -> BTreeSet<TermId> {
         let mut allowed = BTreeSet::new();
-        for property in self.values(node, "property") {
+        for property in self.values(node, PROPERTY) {
             allowed.extend(
                 self.values(property, "path")
                     .into_iter()
@@ -618,6 +768,20 @@ impl<V: ReadView> Compiler<'_, V> {
             .first()
             .and_then(|&value| self.literal(value))
             .map(|literal| literal.value().to_owned())
+    }
+
+    /// A SPARQL check's `sh:message`s, each with its template if it has blocks to fill in.
+    /// Once the compile is cancelled the rest are left out: nothing of it is kept.
+    fn messages(&self, ids: Vec<TermId>) -> Vec<Message> {
+        ids.into_iter()
+            .take_while(|_| !self.graph.cancelled())
+            .map(|id| Message {
+                id,
+                template: self
+                    .literal(id)
+                    .and_then(|literal| sparql::Template::parse(&literal)),
+            })
+            .collect()
     }
 
     /// The `PREFIX` lines `node`'s `sh:prefixes` declare: the `sh:declare`s of each value
@@ -729,7 +893,7 @@ impl<V: ReadView> Compiler<'_, V> {
                 query,
                 ask: false,
                 parameters: Vec::new(),
-                messages: self.values(constraint, "message"),
+                messages: self.messages(self.values(constraint, "message")),
             })));
         }
     }
@@ -742,6 +906,9 @@ impl<V: ReadView> Compiler<'_, V> {
         };
         let mut out = Vec::new();
         for node in self.graph.subjects_of(parameter) {
+            if self.graph.cancelled() {
+                break;
+            }
             let (validator, node_validator, property_validator) = (
                 self.one(node, "validator"),
                 self.one(node, "nodeValidator"),
@@ -793,6 +960,9 @@ impl<V: ReadView> Compiler<'_, V> {
         out: &mut Vec<Constraint>,
     ) {
         for component in components {
+            if self.graph.cancelled() {
+                break;
+            }
             let mut values: Vec<(Variable, Vec<TermId>)> = Vec::new();
             let mut applies = true;
             for (predicate, variable, optional) in &component.parameters {
@@ -858,7 +1028,7 @@ impl<V: ReadView> Compiler<'_, V> {
                 query,
                 ask,
                 parameters: values,
-                messages,
+                messages: self.messages(messages),
             })));
         }
     }

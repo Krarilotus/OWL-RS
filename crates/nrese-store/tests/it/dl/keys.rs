@@ -17,8 +17,9 @@ use super::{ask, insert, pipeline, update};
 const OUTSIDE_RL: &str = ":Pet rdfs:subClassOf [ owl:unionOf ( :Dog :Cat ) ] . :tib a :Pet .";
 
 /// Under reasoning-semantics.md, Freshness, version 7 and the new seeds change the
-/// `owl2-rl` program fingerprint, so stores rebuild once at their next start.
-const OWL2_RL_FINGERPRINT: &str = "8373f9bd2f1319f8";
+/// `owl2-rl` program fingerprint, so stores rebuild once at their next start; so does the
+/// empty-`owl:Thing` check (`cls-thing-empty`) in the rule text.
+const OWL2_RL_FINGERPRINT: &str = "d21b78c6c05606e7";
 
 /// An object key over `z`, `:a` and `:b` sharing it as value, and `more`.
 fn object_key(z: &str, more: &str) -> String {

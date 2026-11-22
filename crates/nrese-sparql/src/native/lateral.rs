@@ -142,7 +142,9 @@ impl Context<'_> {
         if results.vars.is_empty() {
             return self.drop_added(left, 1);
         }
-        let joined = self.join(left, results.into_solutions())?;
+        let results = results.into_solutions();
+        self.returned_table_charge(results.table.memory_bytes());
+        let joined = self.join(left, results)?;
         let variables: Vec<_> = joined
             .vars
             .iter()

@@ -15,10 +15,12 @@ use nrese_sparql::{QueryEvaluationError, ReadView, Resources};
 use crate::datatype::well_formed;
 use crate::graph::{GraphView, Selection};
 use crate::model::{
-    Bound, Component, Constraint, Logical, NodeKind, Path, Shape, ShapeRef, Shapes, SparqlCheck,
-    Target,
+    Bound, Component, Constraint, Logical, Nesting, NodeKind, Path, Shape, ShapeRef, Shapes,
+    SparqlCheck, Target,
 };
-use crate::{path, sparql};
+use crate::sparql;
+
+mod nesting;
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const RDF_LANG_STRING: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString";
@@ -124,8 +126,10 @@ pub(crate) struct RawResult {
     pub(crate) component: Component,
     /// `sh:sourceConstraint` (SHACL-SPARQL).
     pub(crate) source: Option<TermId>,
-    /// The result's messages, where they aren't the shape's (SHACL-SPARQL).
-    pub(crate) messages: Option<Vec<TermId>>,
+    /// The result's messages, where they aren't the shape's (SHACL-SPARQL): an `sh:message`
+    /// as it is, or one a query bound or a template filled in, stored or computed as a value
+    /// is ([`Validator::result_term`]).
+    pub(crate) messages: Option<Vec<ResultTerm>>,
 }
 
 impl RawResult {
@@ -146,7 +150,14 @@ impl RawResult {
                 _ => 0,
             }
             + self.messages.as_ref().map_or(0, |messages| {
-                messages.capacity() * std::mem::size_of::<TermId>()
+                messages.capacity() * std::mem::size_of::<ResultTerm>()
+                    + messages
+                        .iter()
+                        .map(|message| match message {
+                            ResultTerm::Computed(computed) => computed.bytes(),
+                            ResultTerm::Stored(_) => 0,
+                        })
+                        .sum::<usize>()
             })
     }
 }
@@ -319,15 +330,12 @@ fn can_fail(shapes: &Shapes) -> Vec<bool> {
     let mut named_by: Vec<Vec<ShapeRef>> = vec![Vec::new(); count];
     for (shape, compiled) in shapes.shapes.iter().enumerate() {
         for constraint in &compiled.constraints {
-            let nested: &[ShapeRef] = match constraint {
-                Constraint::Node(nested) | Constraint::Property(nested) => {
-                    std::slice::from_ref(nested)
+            if let Constraint::Nested(nested) = constraint
+                && nested.depends_on_members()
+            {
+                for member in nested.references() {
+                    named_by[member].push(shape);
                 }
-                Constraint::Logical(_, nested) => nested,
-                _ => &[],
-            };
-            for &nested in nested {
-                named_by[nested].push(shape);
             }
         }
     }
@@ -353,21 +361,23 @@ fn can_fail(shapes: &Shapes) -> Vec<bool> {
 /// Whether `constraint` can fail, given which shapes can (`fails`).
 fn constraint_can_fail(constraint: &Constraint, fails: &[bool]) -> bool {
     match constraint {
-        // A node that conforms to the nested shape fails `sh:not`; one always does.
-        Constraint::Not(_) => true,
-        Constraint::Node(nested) | Constraint::Property(nested) => fails[*nested],
-        Constraint::Logical(Logical::And, nested) => nested.iter().any(|&nested| fails[nested]),
-        // Fails where no member conforms: never if one always does (`sh:or ()`: always).
-        Constraint::Logical(Logical::Or, nested) => nested.iter().all(|&nested| fails[nested]),
-        // Fails unless exactly one member conforms: never only for one member that always
-        // does.
-        Constraint::Logical(Logical::Xone, nested) => match nested.as_slice() {
-            [only] => fails[*only],
-            _ => true,
-        },
-        // A count of conforming values: below a positive minimum (no values) or above a
-        // maximum (every value conforming) whatever the nested shape.
-        Constraint::Qualified { min, max, .. } => min.is_some_and(|min| min > 0) || max.is_some(),
+        Constraint::Nested(nested) => {
+            let mut members = nested.references().map(|member| fails[member]);
+            match nested.kind {
+                // A conforming node fails sh:not, even when the nested shape cannot fail.
+                Nesting::Not => true,
+                Nesting::Node | Nesting::Property => members.next().expect("a direct reference"),
+                Nesting::Logical(Logical::And) => members.any(|fails| fails),
+                // Never fails if one member always conforms.
+                Nesting::Logical(Logical::Or) => members.all(|fails| fails),
+                // Never fails only if there is one member that always conforms.
+                Nesting::Logical(Logical::Xone) => {
+                    members.next() != Some(false) || members.next().is_some()
+                }
+                // A count can be below a positive minimum or above a maximum.
+                Nesting::Qualified { min, max } => min.is_some_and(|min| min > 0) || max.is_some(),
+            }
+        }
         _ => true,
     }
 }
@@ -403,9 +413,6 @@ pub(crate) struct Validator<'a, V: ReadView> {
     /// Each class the shapes name, with its subclasses (itself included).
     classes: HashMap<TermId, BTreeSet<TermId>>,
 }
-
-/// The shapes and nodes being validated further up: recursion stops there.
-type Stack = Vec<(ShapeRef, TermId)>;
 
 /// A frontier view's lookup ([`ResultTerm`]): the id of a term it knows.
 pub(crate) type Frontier<'a> = dyn Fn(&Term) -> Option<TermId> + Sync + 'a;
@@ -696,9 +703,23 @@ impl<'a, V: ReadView> Validator<'a, V> {
     /// Keeps `result` in `results`, charged first to the task's own reservation (no lock); a
     /// refusal is the validation's stop.
     fn keep(&self, results: &mut TaskResults, result: RawResult) {
-        match results.held.charge(result.retained_bytes()) {
-            Ok(()) => results.list.push(result),
+        self.keep_prepaid(results, result, 0);
+    }
+
+    /// [`Validator::keep`] of a result `prepaid` of whose bytes the task's reservation holds
+    /// already (texts charged as they were made): the rest is charged, so the result is
+    /// charged once as a whole, with no moment uncharged. A refusal drops the result, then
+    /// returns `prepaid`.
+    fn keep_prepaid(&self, results: &mut TaskResults, result: RawResult, prepaid: usize) {
+        let bytes = result.retained_bytes();
+        match results.held.charge(bytes.saturating_sub(prepaid)) {
+            Ok(()) => {
+                results.list.push(result);
+                results.held.release(prepaid.saturating_sub(bytes));
+            }
             Err(refused) => {
+                drop(result);
+                results.held.release(prepaid);
                 let _ = self.stop.set(QueryEvaluationError::MemoryLimit(refused));
             }
         }
@@ -735,8 +756,9 @@ impl<'a, V: ReadView> Validator<'a, V> {
     }
 
     /// The results of validating each `(shape, focus node)` of `work`, in that order: in
-    /// parallel, a few dozen nodes per task, each task charging its own reservation, taken
-    /// over by the validation's when it ends ([`Validator::adopt`]).
+    /// parallel, a few dozen nodes per task. Each task reuses its walk and charges results
+    /// to its own reservation, taken over by the validation's when it ends
+    /// ([`Validator::adopt`]).
     pub(crate) fn validate_all(&self, work: &[(ShapeRef, TermId)]) -> Vec<RawResult>
     where
         V: Sync,
@@ -745,13 +767,18 @@ impl<'a, V: ReadView> Validator<'a, V> {
         work.par_iter()
             .with_min_len(32)
             .fold(
-                || TaskResults::new(&self.results_budget),
-                |mut task, &(shape, focus)| {
-                    self.validate_node(shape, focus, &mut task, &mut Vec::new());
-                    task
+                || {
+                    (
+                        TaskResults::new(&self.results_budget),
+                        nesting::Walk::new(&self.results_budget),
+                    )
+                },
+                |(mut task, mut walk), &(shape, focus)| {
+                    self.validate_node(shape, focus, &mut task, &mut walk);
+                    (task, walk)
                 },
             )
-            .map(|task| self.adopt(task))
+            .map(|(task, _)| self.adopt(task))
             .flat_map_iter(|list| list)
             .collect()
     }
@@ -789,43 +816,6 @@ impl<'a, V: ReadView> Validator<'a, V> {
                 .objects(node, rdf_type)
                 .iter()
                 .any(|class| subclasses.contains(class))
-    }
-
-    /// Whether `node` conforms to `shape`: validating it produces no result.
-    fn conforms(&self, shape: ShapeRef, node: TermId, stack: &mut Stack) -> bool {
-        let mut results = TaskResults::new(&self.results_budget);
-        self.validate_node(shape, node, &mut results, stack);
-        // Only their existence counts: dropped, they are freed, then their charge returned.
-        results.list.is_empty()
-    }
-
-    pub(crate) fn validate_node(
-        &self,
-        shape_ref: ShapeRef,
-        focus: TermId,
-        results: &mut TaskResults,
-        stack: &mut Stack,
-    ) {
-        // Every validation of a node against a shape, nested ones included, looks at the
-        // stop first: the work after one is bounded by one call's.
-        if self.stopped() {
-            return;
-        }
-        let shape = &self.shapes.shapes[shape_ref];
-        // Recursive shapes are undefined in SHACL: a node already being validated against
-        // the shape is taken to conform.
-        if shape.deactivated || stack.contains(&(shape_ref, focus)) {
-            return;
-        }
-        stack.push((shape_ref, focus));
-        let values = match &shape.path {
-            None => vec![focus],
-            Some(path) => path::values(&self.graph, path, focus),
-        };
-        for constraint in &shape.constraints {
-            self.check(shape_ref, focus, &values, constraint, results, stack);
-        }
-        stack.pop();
     }
 
     /// The string `sh:minLength`, `sh:maxLength` and `sh:pattern` look at: an IRI or a
@@ -871,25 +861,15 @@ impl<'a, V: ReadView> Validator<'a, V> {
     }
 
     #[expect(clippy::too_many_lines)]
-    fn check(
+    fn check_local(
         &self,
         shape_ref: ShapeRef,
         focus: TermId,
         values: &[TermId],
         constraint: &Constraint,
         results: &mut TaskResults,
-        stack: &mut Stack,
     ) {
-        let shape = &self.shapes.shapes[shape_ref];
-        let result = |component: Component, value: Option<TermId>| RawResult {
-            focus,
-            path: shape.path.clone().map(ResultPath::Path),
-            value: value.map(ResultTerm::Stored),
-            shape: shape_ref,
-            component,
-            source: None,
-            messages: None,
-        };
+        let result = |component, value| self.core_result(shape_ref, focus, component, value);
         // One result per value node that fails `ok`.
         let mut each = |component: Component, ok: &mut dyn FnMut(TermId) -> bool| {
             for &value in values {
@@ -1015,57 +995,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
                     }
                 }
             }
-            Constraint::Not(shape) => {
-                each(Component::Not, &mut |v| !self.conforms(*shape, v, stack));
-            }
-            Constraint::Logical(logical, shapes) => {
-                let component = match logical {
-                    Logical::And => Component::And,
-                    Logical::Or => Component::Or,
-                    Logical::Xone => Component::Xone,
-                };
-                // `all` and `any` stop at the first shape that decides it.
-                each(component, &mut |v| match logical {
-                    Logical::And => shapes.iter().all(|&s| self.conforms(s, v, stack)),
-                    Logical::Or => shapes.iter().any(|&s| self.conforms(s, v, stack)),
-                    Logical::Xone => {
-                        shapes
-                            .iter()
-                            .filter(|&&s| self.conforms(s, v, stack))
-                            .count()
-                            == 1
-                    }
-                });
-            }
-            Constraint::Node(shape) => {
-                each(Component::Node, &mut |v| self.conforms(*shape, v, stack));
-            }
-            Constraint::Property(shape) => {
-                // The nested property shape reports its own results.
-                for &value in values {
-                    self.validate_node(*shape, value, results, stack);
-                }
-            }
-            Constraint::Qualified {
-                shape,
-                min,
-                max,
-                siblings,
-            } => {
-                let count = values
-                    .iter()
-                    .filter(|&&v| {
-                        self.conforms(*shape, v, stack)
-                            && !siblings.iter().any(|&s| self.conforms(s, v, stack))
-                    })
-                    .count() as u64;
-                if min.is_some_and(|min| count < min) {
-                    self.keep(results, result(Component::QualifiedMinCount, None));
-                }
-                if max.is_some_and(|max| count > max) {
-                    self.keep(results, result(Component::QualifiedMaxCount, None));
-                }
-            }
+            Constraint::Nested(_) => unreachable!("nested checks are handled by the shape walk"),
             Constraint::Closed(allowed) => {
                 for &value in values {
                     for (predicate, object) in self.graph.edges(value) {
@@ -1096,6 +1026,24 @@ impl<'a, V: ReadView> Validator<'a, V> {
         }
     }
 
+    fn core_result(
+        &self,
+        shape: ShapeRef,
+        focus: TermId,
+        component: Component,
+        value: Option<TermId>,
+    ) -> RawResult {
+        RawResult {
+            focus,
+            path: self.shapes.shapes[shape].path.clone().map(ResultPath::Path),
+            value: value.map(ResultTerm::Stored),
+            shape,
+            component,
+            source: None,
+            messages: None,
+        }
+    }
+
     /// A SHACL-SPARQL check for `focus` ([`sparql`]): its results, or a failure, or the
     /// validation's stop.
     fn sparql(
@@ -1108,14 +1056,16 @@ impl<'a, V: ReadView> Validator<'a, V> {
     ) {
         let shape = &self.shapes.shapes[shape_ref];
         let (view, data) = self.graph.parts();
-        let raw = |value: Option<ResultTerm>, path: Option<ResultPath>| RawResult {
+        let raw = |value: Option<ResultTerm>,
+                   path: Option<ResultPath>,
+                   messages: Option<Vec<ResultTerm>>| RawResult {
             focus,
             path,
             value,
             shape: shape_ref,
             component: check.component,
             source: check.source,
-            messages: (!check.messages.is_empty()).then(|| check.messages.clone()),
+            messages,
         };
         let failure = |problem: &str| {
             // Where failures are thrown away, none is made.
@@ -1164,13 +1114,28 @@ impl<'a, V: ReadView> Validator<'a, V> {
                 }
                 Err(sparql::Problem::Failed(error)) => failure(&error),
                 Ok(sparql::Outcome::Failed(failed)) => {
+                    // An ASK validator's solution is `$this` and `$value` (SHACL §6.3).
                     for value in failed {
-                        self.keep(
+                        let Ok((messages, prepaid)) = self.sparql_messages(
+                            check,
+                            None,
+                            Vec::new(),
+                            parameters,
+                            focus,
+                            Some(value),
+                            shape,
+                            &mut results.held,
+                        ) else {
+                            return ControlFlow::Break(());
+                        };
+                        self.keep_prepaid(
                             results,
                             raw(
                                 Some(ResultTerm::Stored(value)),
                                 shape.path.clone().map(ResultPath::Path),
+                                messages,
                             ),
+                            prepaid,
                         );
                     }
                 }
@@ -1197,7 +1162,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
                         };
                         // The solution's terms are moved into the result, not copied; a
                         // `?failure` row's are dropped unread.
-                        let found = sparql::found(solution);
+                        let found = sparql::found(solution, check);
                         if found.failure {
                             failure("the query reported ?failure");
                             continue;
@@ -1213,12 +1178,169 @@ impl<'a, V: ReadView> Validator<'a, V> {
                             .path
                             .map(|path| self.result_path(path))
                             .or_else(|| shape.path.clone().map(ResultPath::Path));
-                        self.keep(results, raw(value, path));
+                        let Ok((messages, prepaid)) = self.sparql_messages(
+                            check,
+                            found.message,
+                            found.bindings,
+                            parameters,
+                            focus,
+                            None,
+                            shape,
+                            &mut results.held,
+                        ) else {
+                            return ControlFlow::Break(());
+                        };
+                        self.keep_prepaid(results, raw(value, path, messages), prepaid);
                     }
                 }
             }
             ControlFlow::Continue(())
         });
+    }
+
+    /// A SHACL-SPARQL result's messages (SHACL §5.3.2, "executed from top to bottom, so that
+    /// the first bound value will be used"): `bound`, the solution's `?message`; else
+    /// `check`'s `sh:message`s, each template filled in from the solution's `bindings`, then
+    /// the `parameters`, `$this` (the `focus`) and, for an ASK validator, `$value`; else the
+    /// shape's (§2.1.5).
+    ///
+    /// In one form for one set of messages, so that results compare by the messages in
+    /// effect ([`RawResult`]'s order, the changes' comparisons): sorted, each once, and None
+    /// where they are the `shape`'s (whose ids are sorted and distinct, as every node's values
+    /// are). A filled-in text is charged to `held` before it is made, and its dictionary
+    /// lookup before that runs ([`Validator::result_message`]); the charge of the texts the
+    /// messages keep is returned with them, for [`Validator::keep_prepaid`] to carry into the
+    /// result's. A refusal is the validation's stop: `Err`, with what was made dropped and its
+    /// charge returned.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one result's message sources: the check, the solution's message and bindings, the pre-bound terms, the shape's messages and the task's charge"
+    )]
+    fn sparql_messages(
+        &self,
+        check: &SparqlCheck,
+        bound: Option<nrese_rdf::Literal>,
+        mut bindings: Vec<(String, Term)>,
+        parameters: &[(nrese_rdf::Variable, TermId)],
+        focus: TermId,
+        value: Option<TermId>,
+        shape: &Shape,
+        held: &mut Reservation,
+    ) -> Result<(Option<Vec<ResultTerm>>, usize), ()> {
+        let canonical = |mut messages: Vec<ResultTerm>| {
+            messages.sort();
+            messages.dedup();
+            let the_shape_s = messages
+                .iter()
+                .map(|message| match message {
+                    ResultTerm::Stored(id) => Some(*id),
+                    ResultTerm::Computed(_) => None,
+                })
+                .eq(shape.messages.iter().copied().map(Some));
+            (!the_shape_s).then_some(messages)
+        };
+        if let Some(message) = bound {
+            return match self.result_message(message, held) {
+                Ok(message) => Ok((canonical(vec![message]), 0)),
+                Err(refused) => {
+                    let _ = self.stop.set(QueryEvaluationError::MemoryLimit(refused));
+                    Err(())
+                }
+            };
+        }
+        if check.messages.is_empty() {
+            return Ok((None, 0));
+        }
+        if check
+            .messages
+            .iter()
+            .any(|message| message.template.is_some())
+        {
+            let pre_bound = parameters
+                .iter()
+                .map(|(variable, id)| (variable.as_str(), *id))
+                .chain([(sparql::THIS, focus)])
+                .chain(value.map(|value| (sparql::VALUE, value)));
+            for (name, id) in pre_bound {
+                if let Some(term) = self.graph.decode(id) {
+                    bindings.push((name.to_owned(), term));
+                }
+            }
+        }
+        let value_of = |name: &str| {
+            bindings
+                .iter()
+                .find(|(bound, _)| bound == name)
+                .map(|(_, term)| term)
+        };
+        let mut messages = Vec::with_capacity(check.messages.len());
+        // What the computed texts kept in `messages` hold, charged: the result's charge.
+        let mut prepaid = 0;
+        for message in &check.messages {
+            let Some(template) = &message.template else {
+                messages.push(ResultTerm::Stored(message.id));
+                continue;
+            };
+            // The text and the tag or datatype the filled literal copies.
+            let len = template.filled_len(&value_of) + template.tag_len();
+            let made = match held.charge(len) {
+                Ok(()) => {
+                    let made = self.result_message(template.fill(&value_of), held);
+                    // A stored message, or a refusal, has dropped the text.
+                    if !matches!(made, Ok(ResultTerm::Computed(_))) {
+                        held.release(len);
+                    }
+                    made
+                }
+                Err(refused) => Err(refused),
+            };
+            match made {
+                Ok(made) => {
+                    if matches!(made, ResultTerm::Computed(_)) {
+                        prepaid += len;
+                    }
+                    messages.push(made);
+                }
+                Err(refused) => {
+                    // What was made is dropped before its charge is returned.
+                    drop(messages);
+                    held.release(prepaid);
+                    let _ = self.stop.set(QueryEvaluationError::MemoryLimit(refused));
+                    return Err(());
+                }
+            }
+        }
+        Ok((canonical(messages), prepaid))
+    }
+
+    /// A filled-in message as a result holds it ([`Validator::result_term`] of a literal,
+    /// which holds no blank node): its id where the frontier (else this view) knows it, else
+    /// owned. What the lookup allocates is charged to `held` first and returned after it.
+    fn result_message(
+        &self,
+        message: nrese_rdf::Literal,
+        held: &mut Reservation,
+    ) -> Result<ResultTerm, nrese_exec::BudgetExceeded> {
+        let term = Term::Literal(message);
+        let mut scratch = 0;
+        let id = match self.frontier {
+            Some(frontier) => {
+                let bound = crate::graph::literal_lookup_bound(&term);
+                held.charge(bound)?;
+                scratch = bound;
+                frontier(&term)
+            }
+            None => self.graph.lookup_literal_charged(&term, |bytes| {
+                held.charge(bytes)?;
+                scratch = bytes;
+                Ok::<(), nrese_exec::BudgetExceeded>(())
+            })?,
+        };
+        held.release(scratch);
+        Ok(match id {
+            Some(id) => ResultTerm::Stored(id),
+            None => ResultTerm::Computed(Box::new(Computed { term, key: None })),
+        })
     }
 }
 

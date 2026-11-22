@@ -122,6 +122,7 @@ pub(crate) struct Certificate {
 const PENDING: &str = "a read inside a transaction: its pending operations aren't reasoned over \
                        before the commit";
 const CLOSURE: &str = " (the committed closure, no DL bounds)";
+const NO_BOUNDS: &str = " (no DL bounds)";
 const DELETES: &str = "the pending operations may delete statements whose inferences remain \
                        until the commit";
 
@@ -1408,7 +1409,16 @@ impl StoreService {
         let mut status = route?;
         let source = if certificate.dl { "dl" } else { "transaction" };
         if let Revision::Pending { deletes, .. } = at {
-            let closure = if certificate.dl { CLOSURE } else { "" };
+            // Under `owl2-dl` a pending read has no DL bounds whatever its dataset; it reads the
+            // committed closure where it surely reads the default graph.
+            let closure = match (
+                certificate.dl,
+                crate::dl::query::reads_store_closure(prepared),
+            ) {
+                (false, _) => "",
+                (true, true) => CLOSURE,
+                (true, false) => NO_BOUNDS,
+            };
             status.incomplete(source, format!("{PENDING}{closure}"));
             if deletes {
                 status.unsound("transaction", DELETES.to_owned());
@@ -1469,12 +1479,15 @@ impl StoreService {
             return None;
         }
         let certificate = Certificate::of(at.snapshot())?;
+        let omission_reason = prepared.dataset_omission_reason();
         if certificate.dl {
             // A read of every statement inside a transaction lacks only the pending
             // operations' reasoning (`Self::assess`); any other read, the DL bounds.
             let mut status = nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Dl);
             let pending = matches!(at, Revision::Pending { .. });
-            if prepared.read_model() != ReadModel::Materialised || !pending {
+            if let Some(reason) = omission_reason {
+                status.incomplete("dl", reason.to_owned());
+            } else if prepared.read_model() != ReadModel::Materialised || !pending {
                 status.incomplete(
                     "dl",
                     "a read of the rules' closure alone, without the DL \
@@ -1488,14 +1501,15 @@ impl StoreService {
         let ruleset = certificate.state.ruleset.clone();
         let mut status =
             nrese_sparql::Completeness::under(nrese_sparql::Regime::of_ruleset(&ruleset));
-        status.incomplete(
-            "rules",
-            format!(
+        let reason = match omission_reason {
+            Some(reason) => reason.to_owned(),
+            None => format!(
                 "answers over the {ruleset} closure: what its rules derive, complete for \
                  the ontologies of their profile, which isn't checked per query; not every \
                  certain answer under OWL 2 DL (reasoner.mode = \"owl2-dl\" gives those)"
             ),
-        );
+        };
+        status.incomplete("rules", reason);
         certify_closure(&mut status, prepared.reads(), "rules", Some(at.snapshot()));
         Some(status)
     }
@@ -1816,6 +1830,7 @@ impl StoreService {
             },
         )
         .map_err(crate::StoreError::refusal_within)?;
+        self.rebuild_pending_declarations(&mut tx, &budget, cancellation)?;
         let keeps_record = self.dl().bounds.keeps_record(&tx);
         let view = match self.reading(scope.access(), memory, Some(cancellation)) {
             Some(reading) => reading.pending(&tx, &budget)?,
@@ -1842,6 +1857,48 @@ impl StoreService {
         read(&view, keeps_record)
     }
 
+    /// A pending change that changes the set of annotation properties the rules read
+    /// rebuilds `tx`'s inferred stack over its pending state, as its commit does. A read
+    /// inside the transaction answers by that set. Other pending changes read the committed
+    /// inferred stack until commit.
+    fn rebuild_pending_declarations(
+        &self,
+        tx: &mut nrese_engine::PrivateTransaction<'_>,
+        budget: &std::sync::Arc<nrese_exec::Budget>,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<()> {
+        use crate::reasoning::Program;
+        let Some(rules) = self.supports.rules() else {
+            return Ok(());
+        };
+        let changes = tx.inserted().chain(tx.deleted());
+        if !Program::touches_a_declaration(&|term| tx.lookup(term), changes) {
+            return Ok(());
+        }
+        let pending = tx.pending_snapshot_within(budget)?;
+        let program = self.bound_program(&pending, rules)?;
+        if !program.annotation_set_changed(tx.base(), &pending) {
+            return Ok(());
+        }
+        let program = (program.by_representatives(self.config.equality_by_representatives))
+            .storing_representatives(self.config.equality_compact);
+        let memory = self.memory_stop();
+        let stop = || cancellation.is_cancelled() || memory.exceeded();
+        let room = || memory.room();
+        let operation = nrese_reasoner::eval::OperationStop::new(&stop).within(&room);
+        let cancelled = || nrese_sparql::QueryEvaluationError::Cancelled.into();
+        let mut closure =
+            crate::reasoning::materialise_with(&program, &pending, &operation, budget)
+                .map_err(|interrupted| memory.error(interrupted).unwrap_or_else(cancelled))?;
+        nrese_reasoner::engine::install_closure(&pending, &mut closure.inferred, |fact, add| {
+            match add {
+                true => tx.insert_inferred(fact),
+                false => tx.remove_inferred(fact),
+            }
+        });
+        Ok(())
+    }
+
     /// [`run_query`](Self::run_query) on the data as `pending` would leave it.
     pub fn run_query_pending(
         &self,
@@ -1856,8 +1913,9 @@ impl StoreService {
     /// [`Self::run_query_pending`], handing `report` the answers' status as
     /// [`Self::run_query_reporting`] does. A transaction reads the latest revision: with
     /// no operations pending, exactly as a query outside it (under `owl2-dl`, through that
-    /// revision's bounds). Pending operations aren't reasoned over until the commit: the
-    /// status says so, sound only, and not sound where they may delete statements whose
+    /// revision's bounds). Pending operations aren't reasoned over until the commit (but for
+    /// a change of the declarations the rules read, `Self::rebuild_pending_declarations`):
+    /// the status says so, sound only, and not sound where they may delete statements whose
     /// inferences remain.
     pub fn run_query_pending_reporting(
         &self,

@@ -13,6 +13,8 @@
 //!   with the blank nodes as existential terms, so the rewriting answers it. Any other
 //!   conclusion goes to the store's entailment check (the closure, and refutation for the
 //!   negative statements), as in the RL runner.
+//! - Two positive conclusions are bare class expressions. The OWL 2 DL path checks
+//!   those entailments, as in the RL runner.
 //! - The tests the store can't pass are listed in `expected-failures.txt`; the run fails on
 //!   any failure not in the list, and on any listed test that passes.
 
@@ -31,6 +33,10 @@ const EXPECTED_FAILURES: &str = include_str!("expected-failures.txt");
 const OWL: &str = "http://www.w3.org/2002/07/owl#";
 const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
 const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+
+/// Bare class expressions (a minCardinality restriction and a union) state no axiom
+/// under the Direct Semantics. Only these two positive entailments can fall back to DL.
+const THROUGH_DL: &[&str] = &["WebOnt-I5.26-010", "WebOnt-I5.5-005"];
 
 /// What a test needed of the store.
 #[derive(Default)]
@@ -87,7 +93,18 @@ fn query_shaped(conclusion: &[Triple]) -> Option<Vec<&Triple>> {
     Some(out)
 }
 
-fn run(name: &str, case: &Case, dir: &std::path::Path, tally: &mut Tally) -> Result<(), String> {
+/// How a case passed.
+enum Passed {
+    Ql,
+    Dl,
+}
+
+fn run(
+    name: &str,
+    case: &Case,
+    dir: &std::path::Path,
+    tally: &mut Tally,
+) -> Result<Passed, String> {
     let stem = name.replace(|c: char| !c.is_ascii_alphanumeric(), "_");
     let premise = case.premise.as_ref().ok_or("no RDF premise")?;
     let file = dir.join(format!("{stem}.rdf"));
@@ -134,6 +151,7 @@ fn run(name: &str, case: &Case, dir: &std::path::Path, tally: &mut Tally) -> Res
             .map(nrese_store::Entailment::holds)
             .map_err(|e| e.to_string())
     };
+    let mut passed = Passed::Ql;
     for kind in &case.kinds {
         match kind.as_str() {
             "ConsistencyTest" if inconsistent => {
@@ -148,7 +166,19 @@ fn run(name: &str, case: &Case, dir: &std::path::Path, tally: &mut Tally) -> Res
             "PositiveEntailmentTest" if !inconsistent => {
                 let conclusion = case.conclusion.as_ref().ok_or("no RDF/XML conclusion")?;
                 if !entailed(conclusion)? {
-                    return Err("the conclusion isn't entailed".to_owned());
+                    if !THROUGH_DL.contains(&name) {
+                        return Err("the conclusion isn't entailed".to_owned());
+                    }
+                    let dl = store
+                        .entails_dl(&parse_rdf_xml(conclusion)?)
+                        .map_err(|e| e.to_string())?;
+                    if !dl.holds() {
+                        return Err(format!(
+                            "the conclusion isn't entailed (OWL 2 DL: {:?})",
+                            dl.answer
+                        ));
+                    }
+                    passed = Passed::Dl;
                 }
             }
             "NegativeEntailmentTest" => {
@@ -163,7 +193,7 @@ fn run(name: &str, case: &Case, dir: &std::path::Path, tally: &mut Tally) -> Res
             _ => {}
         }
     }
-    Ok(())
+    Ok(passed)
 }
 
 #[test]
@@ -183,6 +213,7 @@ fn w3c_owl2_ql_test_cases() {
     let dir = tempfile::tempdir().unwrap();
     let mut failed: BTreeMap<String, String> = BTreeMap::new();
     let (mut passed, mut skipped) = (0, Vec::new());
+    let mut through_dl = BTreeSet::new();
     let mut tally = Tally::default();
     for (name, case) in &all {
         if !(case.profiles.contains("QL") && case.semantics.contains("DIRECT")) || case.rejected {
@@ -197,7 +228,12 @@ fn w3c_owl2_ql_test_cases() {
             continue;
         }
         match run(name, case, dir.path(), &mut tally) {
-            Ok(()) => passed += 1,
+            Ok(path) => {
+                passed += 1;
+                if let Passed::Dl = path {
+                    through_dl.insert(name.as_str());
+                }
+            }
             Err(reason) => {
                 failed.insert(name.clone(), reason);
             }
@@ -228,5 +264,10 @@ fn w3c_owl2_ql_test_cases() {
     assert!(
         new.is_empty() && fixed.is_empty(),
         "failures not in expected-failures.txt: {new:#?}\nlisted but now passing (remove from expected-failures.txt): {fixed:#?}"
+    );
+    assert_eq!(
+        through_dl,
+        THROUGH_DL.iter().copied().collect::<BTreeSet<_>>(),
+        "the positive entailments decided through the OWL 2 DL path changed"
     );
 }
