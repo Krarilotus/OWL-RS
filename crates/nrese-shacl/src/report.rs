@@ -222,7 +222,16 @@ pub(crate) fn decode<V: ReadView>(
             Severity::Other(severity) => Some(severity),
             _ => None,
         };
-        let messages = result.messages.as_deref().unwrap_or(&shape.messages);
+        // The result's own messages (stored, or computed by a query), else its shape's.
+        let own = result.messages;
+        let shape_messages: &[TermId] = match own {
+            None => &shape.messages,
+            Some(_) => &[],
+        };
+        let own_stored = own.iter().flatten().filter_map(|message| match message {
+            ResultTerm::Stored(id) => Some(*id),
+            ResultTerm::Computed(_) => None,
+        });
         let stored_value = match &result.value {
             Some(ResultTerm::Stored(id)) => Some(*id),
             _ => None,
@@ -237,7 +246,8 @@ pub(crate) fn decode<V: ReadView>(
         ]
         .into_iter()
         .flatten()
-        .chain(messages.iter().copied())
+        .chain(shape_messages.iter().copied())
+        .chain(own_stored)
         {
             terms.load(id)?;
         }
@@ -261,9 +271,16 @@ pub(crate) fn decode<V: ReadView>(
             + result.source.map_or(0, |id| term_bytes(terms.get(id)))
             + 2 * sh_bytes
             + path.as_ref().map_or(0, property_path_bytes)
-            + messages.len() * std::mem::size_of::<Literal>();
-        for &message in messages {
+            + (shape_messages.len() + own.as_ref().map_or(0, Vec::len))
+                * std::mem::size_of::<Literal>();
+        for &message in shape_messages {
             bytes += term_bytes(terms.get(message));
+        }
+        for message in own.iter().flatten() {
+            bytes += match message {
+                ResultTerm::Stored(id) => term_bytes(terms.get(*id)),
+                ResultTerm::Computed(computed) => term_bytes(&computed.term),
+            };
         }
         for id in [custom, severity_id].into_iter().flatten() {
             bytes += term_bytes(terms.get(id));
@@ -295,10 +312,15 @@ pub(crate) fn decode<V: ReadView>(
             },
             source_constraint: result.source.map(|id| terms.get(id).clone()),
             severity,
-            messages: messages
+            messages: shape_messages
                 .iter()
-                .filter_map(|&message| match terms.get(message) {
-                    Term::Literal(message) => Some(message.clone()),
+                .map(|&id| terms.get(id).clone())
+                .chain(own.into_iter().flatten().map(|message| match message {
+                    ResultTerm::Stored(id) => terms.get(id).clone(),
+                    ResultTerm::Computed(computed) => computed.term,
+                }))
+                .filter_map(|message| match message {
+                    Term::Literal(message) => Some(message),
                     _ => None,
                 })
                 .collect(),

@@ -805,7 +805,8 @@ fn invalid_statements(
         ("invalid" = Option<String>, Query, description = "Statements with syntax errors: `quarantine` (the rest loads) or `strict` (the load stops); the repository's setting without")),
     request_body(content = String, description = "An RDF document (`Content-Type` names its format)"),
     responses((status = 200, description = "Loaded, inferences recomputed", body = ImportReport),
-        (status = 400, description = "Unreadable data", body = crate::http::openapi::Problem)))]
+        (status = 400, description = "Unreadable data", body = crate::http::openapi::Problem),
+        (status = 500, description = "Server error during import", body = crate::http::openapi::Problem)))]
 /// Bulk-loads the RDF document in the body (its format from `Content-Type`): into the
 /// graph `graph` for triple formats (the default graph without), replacing the
 /// repository's statements with `replace=true`. Statements with syntax errors go into the
@@ -878,14 +879,14 @@ pub async fn import(
         return Ok(job.into_response());
     }
     let store = state.store();
+    let data_dir = state.repositories().data_dir().to_path_buf();
     let loaded = super::effect::untracked(move || {
         let _file = file;
         store.bulk_load(&request).map_err(|error| match error {
-            nrese_store::StoreError::LoadPublished { .. } => ApiError::internal(error.to_string()),
-            // Keep the released answer when only the quarantine record could have changed.
-            nrese_store::StoreError::LoadQuarantineNotRecorded(_) => {
-                ApiError::bad_request(error.to_string())
+            nrese_store::StoreError::LoadQuarantineNotRecorded(error) => {
+                ApiError::internal(error.unpublished_message("send", Some(&data_dir)))
             }
+            nrese_store::StoreError::LoadPublished { .. } => ApiError::internal(error.to_string()),
             error if error.is_request_error() => ApiError::bad_request(error.to_string()),
             _ => super::effect::unknown(),
         })
@@ -956,15 +957,25 @@ fn start_import(
         job.phase("loading");
         let store = state.store();
         let loaded = store.bulk_load_with(&request, job.progress());
+        // How the caller sends the data again: an upload, or the import directory's files.
+        let retry = if remove.is_some() { "send" } else { "load" };
         drop(remove);
         if let Err(nrese_store::StoreError::LoadPublished { revision, reason }) = &loaded {
-            let warning = format!("the quarantine record couldn't be kept: {reason}");
+            let warning = format!(
+                "the quarantine record couldn't be kept: {reason}.{} Don't {retry} it again.",
+                reason.published_note()
+            );
             let report = serde_json::json!({ "revision": revision, "warning": warning });
             job.finish(Ok(report));
             return;
         }
         let outcome = loaded
-            .map_err(|error| error.to_string())
+            .map_err(|error| match error {
+                nrese_store::StoreError::LoadQuarantineNotRecorded(error) => {
+                    error.unpublished_message(retry, Some(state.repositories().data_dir()))
+                }
+                error => error.to_string(),
+            })
             .and_then(|loaded| {
                 job.phase("reasoning");
                 let reasoning = match state.pipeline().reasoner().config().materialised_program() {
