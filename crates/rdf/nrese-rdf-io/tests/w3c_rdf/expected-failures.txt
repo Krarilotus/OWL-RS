@@ -1,0 +1,4 @@
+# W3C RDF 1.1 and 1.2 syntax tests this crate knowingly fails (rdf-tests pinned in
+# scripts/fetch-w3c-tests.sh). Format: <test IRI> # reason, one per line.
+#
+# None.

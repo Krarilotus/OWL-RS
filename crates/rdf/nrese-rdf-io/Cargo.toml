@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
 
 
 # Test binaries that take more than ~15 s (the W3C N3 suites): the push tier runs them when this

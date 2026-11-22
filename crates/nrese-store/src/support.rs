@@ -2347,6 +2347,11 @@ impl Supports {
         (self.state().generation.rules.as_ref()).is_none_or(|rules| state.made_by(rules, hide))
     }
 
+    /// The rules registered here ([`Self::use_rules`]), if any.
+    pub(crate) fn rules(&self) -> Option<RuleProgram> {
+        self.state().generation.rules.clone()
+    }
+
     /// Whether rules were ever registered here ([`Self::use_rules`]): a reasoner maintains,
     /// or maintained, the stack. Clearing the rules doesn't lower it; a store opened again
     /// starts without it.
