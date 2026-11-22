@@ -10,8 +10,15 @@ use nrese_owl::{Axiom, ClassExpr, EntityKind, ExprId, ObjProp, Ontology};
 use super::{Budget, Entailed, consistency, intern};
 
 #[cfg(test)]
+type Hook = std::cell::Cell<Option<Box<dyn FnOnce()>>>;
+
+#[cfg(test)]
 thread_local! {
     static COMPILATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Run by [`Batch::check`] once the probe's time is read, just before it starts.
+    static BEFORE_PROBE: Hook = const { std::cell::Cell::new(None) };
+    /// Run by [`Batch::check`] just after the probe ends.
+    static AFTER_PROBE: Hook = const { std::cell::Cell::new(None) };
 }
 
 #[derive(Clone)]
@@ -174,6 +181,10 @@ impl Batch {
             portfolio: false,
             ..tableau::Config::default()
         };
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_PROBE.take() {
+            hook();
+        }
         let outcome = prepared.probe(
             &Probe {
                 at,
@@ -183,6 +194,10 @@ impl Batch {
             &config,
             Want::default(),
         );
+        #[cfg(test)]
+        if let Some(hook) = AFTER_PROBE.take() {
+            hook();
+        }
         match outcome.answer {
             tableau::Answer::Inconsistent => Entailed::Yes,
             tableau::Answer::Consistent => match &self.left_out {
