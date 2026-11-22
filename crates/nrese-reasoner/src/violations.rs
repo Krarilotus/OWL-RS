@@ -20,6 +20,7 @@ use nrese_exec::{Budget, ChargedVec, Reservation};
 use smallvec::SmallVec;
 
 use super::ir::Violation;
+use crate::eval::{Poller, Stopped};
 
 /// A budget without a limit, for a report nothing charges yet.
 pub(crate) fn unlimited() -> Arc<Budget> {
@@ -78,6 +79,35 @@ impl Group {
         }
         self.records = kept;
         self.words.truncate(kept * stride);
+    }
+
+    /// Subtracts sorted witnesses of the same rule and width, in place.
+    fn remove_previous(&mut self, before: &Self, poll: &Poller<'_>) -> Result<(), Stopped> {
+        let stride = self.stride;
+        let mut old = 0;
+        let mut kept = 0;
+        for i in 0..self.records {
+            if poll.tick() {
+                return Err(Stopped);
+            }
+            while old < before.records && before.record(old) < self.record(i) {
+                old += 1;
+                if poll.tick() {
+                    return Err(Stopped);
+                }
+            }
+            if old < before.records && before.record(old) == self.record(i) {
+                continue;
+            }
+            if kept != i {
+                self.words
+                    .copy_within(i * stride..(i + 1) * stride, kept * stride);
+            }
+            kept += 1;
+        }
+        self.records = kept;
+        self.words.truncate(kept * stride);
+        Ok(())
     }
 }
 
@@ -311,6 +341,68 @@ impl Violations {
         !self.refused && self.groups.iter().all(|g| g.records == 0)
     }
 
+    /// The introduced witnesses, compared by rule and bindings. If the base's report is
+    /// incomplete, a witness it didn't list can't be classified as new: keep the refusal.
+    pub(crate) fn remove_previous(
+        &mut self,
+        before: &Self,
+        poll: &Poller<'_>,
+    ) -> Result<(), Stopped> {
+        if !before.complete() {
+            self.refused = true;
+            self.groups.clear();
+            return Ok(());
+        }
+        self.finish();
+        debug_assert!(before.finished);
+        for group in self.groups.iter_mut() {
+            for old in before.groups.iter() {
+                if poll.tick() {
+                    return Err(Stopped);
+                }
+                if old.name == group.name && old.stride == group.stride {
+                    group.remove_previous(old, poll)?;
+                }
+            }
+        }
+        self.groups.retain(|group| group.records != 0);
+        Ok(())
+    }
+
+    /// Takes this report out of the comparison's workspace and charges its retained
+    /// witnesses to `memory`. A refusal in either budget stays a refusal.
+    pub(crate) fn charged_to(
+        self,
+        memory: &Arc<Budget>,
+        poll: &Poller<'_>,
+    ) -> Result<Self, Stopped> {
+        if Arc::ptr_eq(&self.budget, memory) {
+            return Ok(self);
+        }
+        let mut report = Self::new(Arc::clone(memory));
+        let (groups, _held) = self.groups.into_parts();
+        'groups: for old in groups {
+            if poll.tick() {
+                return Err(Stopped);
+            }
+            report.section = old.section;
+            let Some(group) = report.group(&old.name, old.stride) else {
+                break;
+            };
+            for i in 0..old.records {
+                if poll.tick() {
+                    return Err(Stopped);
+                }
+                if !report.record(group, old.record(i).iter().copied()) {
+                    break 'groups;
+                }
+            }
+        }
+        report.refused |= self.refused;
+        report.finish();
+        Ok(report)
+    }
+
     /// Every violation is listed: the budget had room for all of them.
     pub fn complete(&self) -> bool {
         !self.refused
@@ -384,4 +476,58 @@ fn grow(g: &mut Group) -> bool {
     }
     g.compact();
     g.words.len() <= capacity / 2 && g.words.len() + g.stride <= capacity
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn report(words: &[u64]) -> Violations {
+        let mut report = Violations::unlimited();
+        let group = report.group("rule", 1).unwrap();
+        for &word in words {
+            assert!(report.record(group, [word]));
+        }
+        report.finish();
+        report
+    }
+
+    /// Spec: an introduced-only judgement cannot certify a complete answer if it could
+    /// not list all old witnesses. With a complete list it removes exactly equal witnesses.
+    #[test]
+    fn a_witness_difference_requires_a_complete_base_report() {
+        let mut before = Violations::new(Arc::new(Budget::new(1)));
+        assert!(before.group("rule", 1).is_none());
+        before.finish();
+        let mut after = report(&[1]);
+        after.remove_previous(&before, &Poller::never()).unwrap();
+        assert!(
+            !after.complete() && !after.consistent(),
+            "an incomplete base report must retain the refusal"
+        );
+
+        let mut after = report(&[1, 2]);
+        after
+            .remove_previous(&report(&[1, 3]), &Poller::never())
+            .unwrap();
+        assert!(after.complete());
+        assert_eq!(after.iter().collect::<Vec<_>>(), [("rule", &[2][..])]);
+    }
+
+    /// Spec: a cancellation during witness comparison interrupts the judgement.
+    #[test]
+    fn a_witness_difference_stops_while_comparing_bindings() {
+        let fired = AtomicBool::new(false);
+        let stop = || fired.load(Ordering::Relaxed);
+        let poll = Poller::new(&stop).unwrap();
+        assert!(!poll.attempt(nrese_exec::POLL_UNITS as usize - 2));
+        fired.store(true, Ordering::Relaxed);
+
+        let mut after = report(&[1]);
+        assert!(
+            after.remove_previous(&report(&[1]), &poll).is_err(),
+            "a stopped comparison must interrupt the judgement"
+        );
+    }
 }

@@ -34,7 +34,7 @@ from collections import defaultdict
 from collections.abc import Mapping
 from pathlib import Path
 
-from .adapters import ADAPTERS, Context, Endpoint, Nrese, adapter, count_all, post
+from .adapters import ADAPTERS, Context, Endpoint, Nrese, adapter, count_all, post, timed_out
 from . import hosts, ns
 from .answers import Recorder, capped_post
 from .runtime import (KINDS, ApptainerRuntime, DockerRuntime, DryRuntime, Mount, ProcessRuntime, RootfsRuntime,
@@ -664,16 +664,20 @@ class Suite:
             endpoint = system.serve(ctx, store, regime)
             base["version"] = system.version(ctx, endpoint)
             if endpoint.index_ms is not None:
-                self.emit(base, task="index", ms=endpoint.index_ms, note=endpoint.index_note)
+                self.emit(base, task="index", status=endpoint.index_status, ms=endpoint.index_ms,
+                          note=endpoint.index_note)
             if system.persistent and not in_memory:
                 self.emit(base, task="restart", ms=endpoint.restart_ms if endpoint.restart_ms is not None else "")
+            if endpoint.index_status != "ok":
+                return
             if self.settings.get("SKIP_COUNT") == "1":
                 # A lazy reasoner's count of everything forces its whole closure (Jena's
                 # rules on LUBM 10 ran out of heap there); the queries alone then decide.
                 self.emit(base, task="count", status="skipped", note="SKIP_COUNT=1")
             else:
                 n, ms, error = count_all(ctx, endpoint)
-                self.emit(base, task="count", status="failed" if error else "ok",
+                outcome = "timeout" if timed_out(0, error) else "failed" if error else "ok"
+                self.emit(base, task="count", status=outcome,
                           ms="" if system.answers_only else ms, rows=n if n is not None else "",
                           note=error or ("the rules run at this first query" if system.lazy(regime) else ""))
             if plan.queries or plan.external:
