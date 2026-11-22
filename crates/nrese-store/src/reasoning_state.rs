@@ -39,9 +39,9 @@ pub struct ReasoningState {
     /// The rules equate a literal with another term, a fact no store holds, so statements
     /// written since lack its copies (`nrese_reasoner::engine::Closure::literal_equality`):
     /// reads of typed values aren't `complete` (`dl::query::withhold`). Set by a
-    /// rematerialisation as its closure tells, by a commit that derives one, and at an
-    /// open without one from the stored statements; cleared only by a rematerialisation
-    /// that finds none. Never written: the marker's form is unchanged.
+    /// rematerialisation as its closure tells, by a commit that derives one, and by every
+    /// open without a rematerialisation; cleared only by a rematerialisation that finds none.
+    /// Never written: the marker's form is unchanged.
     pub(crate) literal_equality: bool,
 }
 

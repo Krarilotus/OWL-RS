@@ -19,8 +19,7 @@
 //! that turn them back into storable facts (an `owl:inverseOf` on a datatype property,
 //! which OWL 2 doesn't allow), and for an `owl:sameAs` between two spellings of one value,
 //! whose copies of a later commit's statements are missing: the closure and each commit
-//! report one ([`Closure::literal_equality`], [`Maintenance::literal_equality`]), and
-//! [`Program::derives_literal_equality`] finds one in a stored state.
+//! report one ([`Closure::literal_equality`], [`Maintenance::literal_equality`]).
 
 mod datatypes;
 mod explain;
@@ -348,167 +347,6 @@ impl Program {
         )
     }
 
-    /// Whether the rules equate a literal with another term over `snapshot`'s statements (an
-    /// `owl:sameAs` with a literal subject), as its closure did and dropped: for a store
-    /// reopened without a rematerialisation, which kept no record of it. Those statements
-    /// are the closure but for statements about literals (a literal subject or predicate,
-    /// which no store holds) and what an equality of one would copy, so one step of each rule
-    /// that can conclude one decides. Where a body atom reads a term of the conclusion at its
-    /// subject or predicate, it may need such a statement (`prp-rng` types a literal, and
-    /// `cls-maxqc3` reads that type): the rule runs without it, and a match counts where the
-    /// conclusion's subject is a literal or left unbound, so the answer errs towards an
-    /// equality (`literal_equality_atoms`). Where the program holds a statement with a literal
-    /// subject without premises (an axiom, a bodiless instance: `cls-oo` over a literal), or a
-    /// rule concludes one over the statements held (the first such statement the closure had
-    /// has only held premises: `prp-rng` typing a literal), such statements may fill any atom whose
-    /// subject is a variable no atom reads as a predicate (`cls-hv1` giving that literal two
-    /// values of a functional property, which `prp-fp` reads): those atoms are left out too.
-    /// `Err` once `stop` fires.
-    pub fn derives_literal_equality(
-        &self,
-        snapshot: &Snapshot,
-        stop: crate::eval::Stop<'_>,
-    ) -> Result<bool, delta::Interrupted> {
-        use crate::eval::{Poller, Seg, plan, value, walk_until};
-        use crate::ir::{Head, Term};
-        let Some(same_as) = self.same_as else {
-            return Ok(false);
-        };
-        let interrupted = || delta::Interrupted::default();
-        let poll = Poller::new(stop).ok_or_else(interrupted)?;
-        let base = explain::SnapshotBase {
-            snapshot,
-            axioms: &self.axioms,
-        };
-        let source = crate::explain::Whole(&base);
-        let ground = self.ground_program(snapshot);
-        // Whether `atoms` of `rule` match with `found` taking a match: every atom left out
-        // matches, as nothing the store holds decides against it.
-        let search =
-            |rule: &Rule, atoms: &[usize], found: &mut dyn FnMut(&[Option<u64>]) -> bool| {
-                let Some(&first) = atoms.first() else {
-                    return true;
-                };
-                let order = plan(&source, rule, atoms, first, |_| Seg::All, &poll);
-                let mut bindings = vec![None; rule.variables()];
-                walk_until(
-                    &source,
-                    &rule.body,
-                    &rule.guards,
-                    &order,
-                    0,
-                    &mut bindings,
-                    &poll,
-                    found,
-                )
-            };
-        let literal = |id: u64| {
-            !matches!(
-                TermId::from_raw(id).kind(),
-                TermKind::Iri | TermKind::BlankNode
-            )
-        };
-        let concluded = std::cell::OnceCell::new();
-        // Every source of a first statement with a literal subject: a fact the program holds
-        // without premises (an axiom, a bodiless instance: `cls-oo` typing a literal its
-        // `owl:oneOf` lists), or a rule's conclusion over held premises, whose subject is then
-        // a constant or a term a premise reads at its object (a premise's subject is held,
-        // never a literal; one at its predicate needs `eq-rep-p` over an `owl:sameAs` with a
-        // literal, the equality looked for). The transitive closure's subject is a premise's.
-        let literal_subjects = || {
-            *concluded.get_or_init(|| {
-                let fact = |triple: &crate::ir::Triple| literal(triple[0]);
-                (self.axioms.iter()).any(fact)
-                    || ground.bodiless.iter().any(fact)
-                    || ground.rules.iter().any(|rule| {
-                        let Head::Facts(heads) = &rule.head else {
-                            return false;
-                        };
-                        heads.iter().any(|head| {
-                            let subject = head.0[0];
-                            let may = match subject {
-                                Term::Const(c) => literal(c),
-                                Term::Var(_) => rule.body.iter().any(|atom| atom.0[2] == subject),
-                            };
-                            let all: Vec<usize> = (0..rule.body.len()).collect();
-                            may && search(rule, &all, &mut |b| {
-                                value(subject, b).is_some_and(literal)
-                            })
-                        })
-                    })
-            })
-        };
-        for rule in &ground.rules {
-            let Head::Facts(heads) = &rule.head else {
-                continue;
-            };
-            if rule.body.is_empty() {
-                continue;
-            }
-            for head in heads {
-                let Some(atoms) = literal_equality_atoms(rule, head, same_as, false) else {
-                    continue;
-                };
-                let [subject, _, object] = head.0;
-                let mut equates = |bindings: &[Option<u64>]| {
-                    let object = value(object, bindings);
-                    value(subject, bindings)
-                        .is_none_or(|subject| object != Some(subject) && literal(subject))
-                };
-                let mut found = search(rule, &atoms, &mut equates);
-                let wider = literal_equality_atoms(rule, head, same_as, true).unwrap_or_default();
-                if !found && !poll.stopped() && wider.len() < atoms.len() && literal_subjects() {
-                    found = search(rule, &wider, &mut equates);
-                }
-                if poll.stopped() {
-                    return Err(interrupted());
-                }
-                if found {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
-    }
-
-    /// Whether the rules can conclude an `owl:sameAs` at all over `snapshot`'s schema, whatever
-    /// its data: a rule instance concludes one from premises none of which is an `owl:sameAs`
-    /// (a functional or inverse-functional property, an at-most-one restriction, a key, a
-    /// property a schema term makes `owl:sameAs`; the equality rules only spread one), or a
-    /// fact the program holds without premises is an `owl:sameAs` with a literal. For a store
-    /// whose closure keeps one representative of equal values (`storing_representatives`),
-    /// whose statements can't show what a premise held ([`Self::derives_literal_equality`]
-    /// counts them): its premises are counted as present.
-    pub fn concludes_equality(&self, snapshot: &Snapshot) -> bool {
-        use crate::ir::{Head, Term};
-        let Some(same_as) = self.same_as else {
-            return false;
-        };
-        let ground = self.ground_program(snapshot);
-        let literal = |id: u64| {
-            !matches!(
-                TermId::from_raw(id).kind(),
-                TermKind::Iri | TermKind::BlankNode
-            )
-        };
-        let fact = |t: &Triple| t[1] == same_as && (literal(t[0]) || literal(t[2]));
-        // A head whose predicate is `owl:sameAs`, or a variable that may be.
-        let may_be = |p: Term| p == Term::Const(same_as) || matches!(p, Term::Var(_));
-        (self.axioms.iter()).any(fact)
-            || ground.bodiless.iter().any(fact)
-            || ground.rules.iter().any(|rule| {
-                let Head::Facts(heads) = &rule.head else {
-                    return false;
-                };
-                rule.body
-                    .iter()
-                    .all(|atom| atom.0[1] != Term::Const(same_as))
-                    && heads
-                        .iter()
-                        .any(|head| may_be(head.0[1]) && head.0[0] != head.0[2])
-            })
-    }
-
     /// The schema for a run over `snapshot`: with the unnamed classes to leave out, when
     /// the program does.
     fn schema_for(&self, snapshot: &Snapshot) -> Schema {
@@ -623,38 +461,6 @@ pub(crate) fn equates_literal([subject, predicate, object]: Triple, same_as: Opt
             TermId::from_raw(subject).kind(),
             TermKind::Iri | TermKind::BlankNode
         )
-}
-
-/// The body atoms of `rule` that a search for an equality of a literal by `head` runs
-/// ([`equates_literal`]), or `None` where `head` concludes none: it isn't an `owl:sameAs`
-/// whose subject is a variable other than its object. Every atom but one that reads a term
-/// of `head` at its subject or predicate: no stored statement has a literal there, while
-/// the closure had such statements and dropped them (`prp-rng` typing a literal). An
-/// `owl:sameAs` atom stays: a literal at its subject is an equality of a literal already,
-/// and the first one the rules conclude is found by a run of the rule that concluded it.
-/// `wide`, where the rules conclude statements with a literal subject: also every other atom
-/// whose subject is a variable that no atom reads as a predicate, which may be a literal.
-fn literal_equality_atoms(
-    rule: &Rule,
-    head: &crate::ir::Atom,
-    same_as: u64,
-    wide: bool,
-) -> Option<Vec<usize>> {
-    use crate::ir::Term;
-    let [subject, predicate, object] = head.0;
-    if !matches!(subject, Term::Var(_)) || predicate != Term::Const(same_as) || object == subject {
-        return None;
-    }
-    let concluded =
-        |term: Term| matches!(term, Term::Var(_)) && (term == subject || term == object);
-    let literal = |term: Term| {
-        wide && matches!(term, Term::Var(_)) && rule.body.iter().all(|atom| atom.0[1] != term)
-    };
-    let kept = (0..rule.body.len()).filter(|&i| {
-        let [s, p, _] = rule.body[i].0;
-        !concluded(p) && (p == Term::Const(same_as) || !(concluded(s) || literal(s)))
-    });
-    Some(kept.collect())
 }
 
 pub(crate) fn encode([s, p, o]: Triple) -> EncodedTriple {

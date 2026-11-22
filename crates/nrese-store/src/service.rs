@@ -390,8 +390,10 @@ impl StoreService {
             service.invalidate_held(writer)?;
         }
         if let Some(mut state) = service.reasoning_state() {
-            // The marker doesn't record a literal equality: the stored statements tell.
-            state.literal_equality = service.literal_equality_at_open(tx.base(), &state);
+            // The marker doesn't record whether the rules equated two literals, and no reading
+            // of the stored statements can tell (a closure stored over representatives keeps
+            // one of equal values): until a rebuild finds none, they count as equated.
+            state.literal_equality = true;
             // The reading isn't on disk: the certified stack's is installed before the store
             // is anyone's, with its certificate. Without one the stack is read as stored.
             service.certify(&tx, state.clone());
@@ -753,8 +755,8 @@ impl StoreService {
     /// such a fact; the same object where it is marked already or isn't this store's. The
     /// state kept in memory is marked too ([`Self::mark_literal_equality`]), for a version
     /// with no certificate; a certificate made again takes the mark from either
-    /// ([`Self::certify`]). The marker on disk isn't changed (an open finds the equality
-    /// again, [`Self::literal_equality_at_open`]).
+    /// ([`Self::certify`]). The marker on disk isn't changed: an open without a rebuild counts
+    /// the equality as made.
     pub(crate) fn with_literal_equality(
         certificate: nrese_engine::Certificate,
     ) -> nrese_engine::Certificate {
@@ -789,39 +791,6 @@ impl StoreService {
         if let Some(kept) = kept.as_mut() {
             kept.literal_equality = true;
         }
-    }
-
-    /// Whether the rules of `state` equate a literal with another term over the statements
-    /// of a store opened without a rematerialisation, whose marker keeps no such record
-    /// ([`crate::ReasoningState::literal_equality`]): asked of the ruleset the marker names.
-    /// A ruleset it can't name (user rules) or a check the process's memory stops is taken
-    /// to equate one: the word is withheld, never given wrongly. So is a store that keeps one
-    /// representative of equal values (`reasoner.equality = "compact"`) wherever its rules can
-    /// conclude an `owl:sameAs` at all: its statements don't show the values a rule read
-    /// (two values of a functional property, one through each sub-property, kept as one).
-    fn literal_equality_at_open(
-        &self,
-        snapshot: &nrese_engine::Snapshot,
-        state: &crate::ReasoningState,
-    ) -> bool {
-        use nrese_reasoner::{RuleProgram, rulesets::Ruleset};
-        let Some(ruleset) = Ruleset::from_name(&state.ruleset) else {
-            return true;
-        };
-        let Ok(program) = self.bound_program(snapshot, RuleProgram::builtin(ruleset)) else {
-            return true;
-        };
-        let program = program
-            .by_representatives(self.config.equality_by_representatives)
-            .storing_representatives(self.config.equality_compact);
-        if self.config.equality_compact && program.concludes_equality(snapshot) {
-            return true;
-        }
-        let memory = self.memory_stop();
-        let stop = || memory.exceeded();
-        program
-            .derives_literal_equality(snapshot, &stop)
-            .unwrap_or(true)
     }
 
     /// Certifies `state` for the inferred stack just published, still under the writer slot
@@ -3215,7 +3184,10 @@ mod certificate_tests {
             .unwrap();
         let existential = format!("ASK {{ <{EX}a> <{EX}p> ?o }}");
         assert!(ask(&store, &existential), "the rewriting answers it");
-        let certified = (store.reasoning_state(), store.consistency(), marker());
+        // The certificate as recorded: an open sets the literal-equality flag, which the marker
+        // doesn't hold (`ReasoningState::literal_equality`).
+        let recorded = |store: &StoreService| store.reasoning_state().map(|s| s.to_text());
+        let certified = (recorded(&store), store.consistency(), marker());
         assert!(certified.0.is_some() && certified.2.is_some(), "certified");
         crate::metadata::tests::FAIL_REMOVE.set(true);
         let failed = store.bulk_load(&crate::BulkLoadRequest {
@@ -3237,7 +3209,7 @@ mod certificate_tests {
                     "nothing published",
                 ),
                 (
-                    (store.reasoning_state(), store.consistency(), marker()) == certified,
+                    (recorded(store), store.consistency(), marker()) == certified,
                     "the certificate and its marker",
                 ),
             ];
