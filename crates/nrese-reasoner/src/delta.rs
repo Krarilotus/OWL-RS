@@ -2498,9 +2498,12 @@ mod budget_tests {
 
             // The public bulk entry point accepts only inserts. For the reverse
             // edit, run its consistency filter over the precomputed after state.
-            let cached = warm.then(|| program(&large, rules));
-            let computed = cached.is_none().then(|| program(&large, rules));
-            let old = cached.as_ref().or(computed.as_ref()).unwrap();
+            let old = match cache.as_ref() {
+                Some(small_program) => update(&large, &[extra], &[], rules, Some(small_program))
+                    .program
+                    .expect("the growth edit refreshed the ground program"),
+                None => program(&large, rules),
+            };
             let after = program(&small, rules);
             let empty = Store::default();
             let hidden = HashSet::new();
@@ -2510,7 +2513,7 @@ mod budget_tests {
                 extra: &empty,
                 table: old.table.as_deref(),
             };
-            let filter = old_witness_filter(old, before, &memory, &stop);
+            let filter = old_witness_filter(&old, before, &memory, &stop);
             let state = Overlay {
                 base: &small,
                 hidden: &hidden,

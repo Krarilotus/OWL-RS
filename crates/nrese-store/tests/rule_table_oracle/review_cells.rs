@@ -361,15 +361,22 @@ fn later_writes_agree_with_a_cold_per_cell_intersection() {
 /// Table 5 prp-adp over 65 walks: `ex:a` relates to `ex:b` by `ex:m0` and `ex:q`,
 /// two properties of one walk.
 fn sixty_five_walks_with_a_clash() -> Write {
-    let mut write = insert(
+    sixty_five_walks(
         "ex:ax rdf:type owl:AllDisjointProperties
          ex:ax owl:members ex:h
-         ex:h rdf:rest ex:t
-         ex:t rdf:first ex:q
-         ex:t rdf:rest rdf:nil
          ex:a ex:m0 ex:b
          ex:a ex:q ex:b",
-    );
+        "ex:q",
+    )
+}
+
+fn sixty_five_walks(axiom_and_data: &str, tail: &str) -> Write {
+    let mut write = insert(&format!(
+        "{axiom_and_data}
+         ex:h rdf:rest ex:t
+         ex:t rdf:first {tail}
+         ex:t rdf:rest rdf:nil",
+    ));
     for i in 0..65 {
         write
             .insert
@@ -380,12 +387,79 @@ fn sixty_five_walks_with_a_clash() -> Write {
 
 #[test]
 fn crossing_sixty_four_walks_reports_no_introduced_clash() {
-    use crate::{judges, sweep};
-    use nrese_reasoner::ReasoningMode;
+    // Table 5 prp-adp finds the same pair in the two closures.
+    check_old_clash_at_form_change("prp-adp", &sixty_five_walks_with_a_clash());
+}
 
-    let mut errors = Vec::new();
+const DISJOINT_CLASSES: &str = "ex:ax rdf:type owl:AllDisjointClasses
+    ex:ax owl:members ex:h
+    ex:a rdf:type ex:m0
+    ex:a rdf:type ex:q";
+
+#[test]
+fn crossing_sixty_four_walks_keeps_the_other_pairwise_clashes_old() {
+    // Profiles §4.3, Tables 4 and 6: the extra first gives a walk but no new
+    // cax-adc or eq-diff2/3 clash. This includes eq-ref on a repeated member.
+    for (rule, axiom_and_data, tail) in [
+        ("cax-adc", DISJOINT_CLASSES, "ex:q"),
+        (
+            "eq-diff2",
+            "ex:ax rdf:type owl:AllDifferent
+             ex:ax owl:members ex:h
+             ex:q owl:sameAs ex:m0",
+            "ex:q",
+        ),
+        (
+            "eq-diff3",
+            "ex:ax rdf:type owl:AllDifferent
+             ex:ax owl:distinctMembers ex:h
+             ex:q owl:sameAs ex:m0",
+            "ex:q",
+        ),
+        (
+            "eq-diff3-repeated-member",
+            "ex:ax rdf:type owl:AllDifferent
+             ex:ax owl:distinctMembers ex:h",
+            "ex:m0",
+        ),
+    ] {
+        check_old_clash_at_form_change(rule, &sixty_five_walks(axiom_and_data, tail));
+    }
+}
+
+#[test]
+fn crossing_sixty_four_walks_reports_a_distinct_new_class_clash_once() {
+    // Table 6 cax-adc: (m0, q) already clashes. Adding a walk over (m64, q)
+    // introduces exactly that second pair because a belongs to both classes.
+    let mut load = sixty_five_walks(DISJOINT_CLASSES, "ex:q");
+    load.insert.pop();
+    load.insert.push(triple(["ex:a", "rdf:type", "ex:m64"]));
+    let change = insert("ex:h rdf:first ex:m64");
+
+    // Isolate the new pair for the oracle, which reports consistency of the
+    // whole closure. The store test below retains the older pair as well.
+    let mut new_pair_only = load.clone();
+    let old_pair_membership = triple(["ex:a", "rdf:type", "ex:m0"]);
+    new_pair_only
+        .insert
+        .retain(|fact| *fact != old_pair_membership);
+    assert_eq!(
+        crate::sweep::steps(&case(
+            "new-class-pair-only",
+            ["ex:a", "rdf:type", "ex:q"],
+            vec![new_pair_only, change.clone()],
+        ))
+        .iter()
+        .map(|step| step.model.inconsistent)
+        .collect::<Vec<_>>(),
+        [false, true]
+    );
+    check_form_change_report("new-class-pair", &load, &change, (false, 1));
+}
+
+fn check_old_clash_at_form_change(shape: &'static str, list: &Write) {
     for growing in [true, false] {
-        let mut load = sixty_five_walks_with_a_clash();
+        let mut load = list.clone();
         let edge = "ex:h rdf:first ex:m64";
         let change = if growing {
             load.insert.pop();
@@ -397,36 +471,44 @@ fn crossing_sixty_four_walks_reports_no_introduced_clash() {
         // report is about introduced clashes, so it has none and the edit commits.
         load.past_gates = true;
         let cell = case(
-            "older-clash-at-a-form-change",
-            ["ex:a", "ex:m0", "ex:b"],
+            shape,
+            ["ex:h", "rdf:rest", "ex:t"],
             vec![load.clone(), change.clone()],
         );
         assert!(
-            sweep::steps(&cell)
+            crate::sweep::steps(&cell)
                 .iter()
-                .all(|step| step.model.inconsistent)
+                .all(|step| step.model.inconsistent),
+            "{shape}: growing={growing}"
         );
-        for mode in judges::MODES {
-            for warm in [true, false] {
-                let store = judges::open(mode, None);
-                assert!(!judges::load_past_gates(&store, &load));
-                let pipeline = judges::pipeline(&store, ReasoningMode::Owl2Rl);
-                if warm {
-                    assert!(judges::apply(&pipeline, &insert("ex:warm ex:tag ex:ready")));
-                }
-                let accepted = judges::apply(&pipeline, &change);
-                let run = pipeline
-                    .last_reasoning_run()
-                    .expect("the edit ran reasoning");
-                if !accepted
-                    || run.consistency_violations != 0
-                    || run.consistency_violations_at_least
-                {
-                    errors.push(format!(
-                        "growing={growing} mode={mode} warm={warm} accepted={accepted} introduced={}",
-                        run.consistency_violations
-                    ));
-                }
+        check_form_change_report(shape, &load, &change, (true, 0));
+    }
+}
+
+fn check_form_change_report(shape: &str, load: &Write, change: &Write, expected: (bool, u64)) {
+    use crate::judges;
+    use nrese_reasoner::ReasoningMode;
+
+    let mut errors = Vec::new();
+    for mode in judges::MODES {
+        for warm in [true, false] {
+            let store = judges::open(mode, None);
+            assert!(!judges::load_past_gates(&store, load), "{shape}");
+            let pipeline = judges::pipeline(&store, ReasoningMode::Owl2Rl);
+            if warm {
+                assert!(judges::apply(&pipeline, &insert("ex:warm ex:tag ex:ready")));
+            }
+            let accepted = judges::apply(&pipeline, change);
+            let run = pipeline
+                .last_reasoning_run()
+                .expect("the edit ran reasoning");
+            let report = (accepted, run.consistency_violations);
+            if report != expected || run.consistency_violations_at_least {
+                errors.push(format!(
+                    "{shape} growing={} mode={mode} warm={warm} accepted={accepted} introduced={} expected={expected:?}",
+                    change.delete.is_empty(),
+                    run.consistency_violations
+                ));
             }
         }
     }
