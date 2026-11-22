@@ -911,6 +911,9 @@ impl Inner {
                     false => None,
                 };
                 let committed = wal.append(record, stamp, note)?;
+                // The record is durable and memory doesn't hold it yet: a panic before the
+                // install leaves the log poisoned, so that no later commit takes its revision.
+                wal.poison();
                 if !local {
                     shared
                         .clock
@@ -919,6 +922,7 @@ impl Inner {
                 shared
                     .versions
                     .publish(|current| publish(current, committed));
+                wal.installed();
                 if let Some(publication) = publication {
                     publication(revision);
                 }

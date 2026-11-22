@@ -15,7 +15,8 @@
 //! appears under its name only with its magic synced (written under a temporary name, then
 //! renamed): a rotation that fails before the rename leaves the log as it was; one whose
 //! outcome is unknown after it poisons the log. So does any exit between a bulk publication's
-//! checkpoint and the install of its version ([`PendingInstall`]).
+//! checkpoint and the install of its version ([`PendingInstall`]), or between a commit's append
+//! and the install of its version ([`Wal::installed`]).
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
@@ -460,6 +461,13 @@ impl Wal {
     /// into memory and opens the log unpoisoned.
     pub(crate) fn poison(&mut self) {
         self.poisoned = true;
+    }
+
+    /// The version that names the record just appended is installed: lifts the poison its
+    /// committer set when the append returned, under the same guard ([`Self::poison`]). The
+    /// log was taking writes then, and nothing else wrote to it since.
+    pub(crate) fn installed(&mut self) {
+        self.poisoned = false;
     }
 }
 
