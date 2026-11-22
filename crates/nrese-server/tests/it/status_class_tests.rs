@@ -605,8 +605,8 @@ async fn seen(state: &AppState) -> TestResult<Seen> {
     })
 }
 
-/// The words of the reason a read is withheld for after a literal equality.
-const LITERAL_EQUALITY: &str = "the rules equate two literals as one value";
+/// The words of the reason a read is withheld for after an open without a rebuild.
+const LITERAL_EQUALITY: &str = "opened without a rebuild of its inferences";
 
 /// A restart that skips the rebuild (the start, where the stack is current) doesn't know
 /// whether the rules equated two literals since the last rebuild: a read may be withheld for

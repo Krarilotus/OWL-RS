@@ -1007,6 +1007,14 @@ const LITERAL_EQUALITY_UNTOLD: &str = "the rules may equate two literals as one 
                                        so a statement of one may lack its copy with the other: \
                                        a reader of some graphs isn't told whether they do";
 
+/// [`LITERAL_EQUALITY`] where it is unknown ([`crate::ReasoningState::literal_equality_unknown`]),
+/// told every reader alike.
+const LITERAL_EQUALITY_UNKNOWN: &str = "the store was opened without a rebuild of its \
+                                        inferences, so its rules may have equated two literals \
+                                        as one value (an owl:sameAs between literals, which no \
+                                        store can hold) and a statement of one may lack its copy \
+                                        with the other, until a rebuild (rematerialise) finds none";
+
 /// Whether the graphs a reader by support reads (`access`) may give its view an equality of two
 /// literals, read from its view alone (`snapshot`: what its graphs assert, and the inferences
 /// they support). An inference it sees has its support there, so an equality it misses copies
@@ -1069,7 +1077,9 @@ fn may_equate_literals(
 ///   every inference, never `complete` here (a rewriting's
 ///   assessment is withheld from it, the closure alone is `sound-only`, and `owl2-dl` is
 ///   `not-certified` to every reader of some graphs: `status_for_its_reader`), is told nothing
-///   of it.
+///   of it. Where it is unknown since an open without a rebuild, every reader is told
+///   [`LITERAL_EQUALITY_UNKNOWN`], with no view consulted: every such open sets it, so it
+///   tells nothing of the data.
 /// - An import no loaded ontology answers ([`unread_import`]; for a reader of some graphs, in
 ///   the graphs it reads): every read.
 pub(crate) fn withhold(
@@ -1105,6 +1115,7 @@ fn conditions(
     };
     let read = reads.predicates.get_or_init(|| predicates(query));
     let told = state.and_then(|state| match access {
+        _ if state.literal_equality_unknown => Some(LITERAL_EQUALITY_UNKNOWN),
         None => state.literal_equality.then_some(LITERAL_EQUALITY),
         Some(access) if access.inferred_by_support => {
             (may_equate_literals(snapshot, access, state)).then_some(LITERAL_EQUALITY_UNTOLD)

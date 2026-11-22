@@ -392,8 +392,10 @@ impl StoreService {
         if let Some(mut state) = service.reasoning_state() {
             // The marker doesn't record whether the rules equated two literals, and no reading
             // of the stored statements can tell (a closure stored over representatives keeps
-            // one of equal values): until a rebuild finds none, they count as equated.
+            // one of equal values): until a rebuild finds none, they count as equated, for
+            // every reader.
             state.literal_equality = true;
+            state.literal_equality_unknown = true;
             // The reading isn't on disk: the certified stack's is installed before the store
             // is anyone's, with its certificate. Without one the stack is read as stored.
             service.certify(&tx, state.clone());
