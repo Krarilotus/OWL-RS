@@ -51,7 +51,7 @@ UNKNOWN = "a field the check doesn't know"  # its name may itself be private: ne
 HOME = re.compile(r"(?:/home/|/Users/|[A-Za-z]:[/\\](?i:users)[/\\])([^/\\\s'\"]+)")
 # What Python reads otherwise than an extended regular expression (a push-deny list's dialect): refused, not
 # silently matched as something else.
-FOREIGN = ("[[:", r"\<", r"\>")
+FOREIGN = ("[[:", "[[=", "[[.", r"\<", r"\>")
 # Literal pathspecs whatever the caller's environment sets (a conflicting mode makes git fail: could not check),
 # and the objects as stored: no replace ref or graft stands in for what a push sends (suitekit/checkout.py's
 # STORED_OBJECTS).
@@ -68,9 +68,6 @@ class Terms:
 
     def __init__(self, patterns: list[re.Pattern]):
         self.patterns = patterns
-
-    def matches(self, value: str) -> list[re.Match]:
-        return [m for line in value.split("\n") for p in self.patterns for m in p.finditer(line)]
 
     def search(self, value: str) -> bool:
         return any(p.search(line) for line in value.split("\n") for p in self.patterns)
@@ -94,10 +91,11 @@ def derive(hosts: dict) -> tuple[set[str], list[str]]:
     """The host table's terms, and the fields of the terms too short to match as a word."""
     terms, short = set(), []
 
-    def add(term: str, field: str):
-        term = term.strip()
-        if term:
-            (terms.add(term.lower()) if len(term) >= SHORTEST else short.append(field))
+    def add(value: str, field: str):
+        for term in value.split("\n"):  # matched line by line: a value over several lines is a term per line
+            term = term.strip()
+            if term:
+                (terms.add(term.lower()) if len(term) >= SHORTEST else short.append(field))
 
     def walk(value, field: str):
         verdict = HOST_FIELDS.get(field, WHOLE)
@@ -108,10 +106,11 @@ def derive(hosts: dict) -> tuple[set[str], list[str]]:
         elif isinstance(value, list):
             for item in value:
                 walk(item, field)
-        elif verdict == NOT or isinstance(value, bool):  # a flag names nothing
+        elif verdict == NOT:
             return
-        elif verdict == WHOLE:  # a number, a date or a text: as it is written
-            add(str(value), label)
+        elif verdict == WHOLE:  # a number, a date or a text: as it is written; a flag names nothing
+            if not isinstance(value, bool):
+                add(str(value), label)
         elif not isinstance(value, str):
             raise Unreadable(f"the overlay's {label}: not text")
         elif verdict == SSH:
@@ -168,11 +167,11 @@ def matcher(folder: str) -> tuple[Terms, str]:
 
 
 def where(path: str, terms: Terms) -> str:
-    """A changed path's directory, unless a match reaches into it."""
+    """A changed path's directory, unless the path or the directory matches."""
     directory = path.rpartition("/")[0]
     if not directory:
         return "."
-    hidden = terms.search(directory) or any(m.start() < len(directory) for m in terms.matches(path))
+    hidden = terms.search(path) or terms.search(directory)
     return "a directory whose name matches (not shown)" if hidden else directory
 
 

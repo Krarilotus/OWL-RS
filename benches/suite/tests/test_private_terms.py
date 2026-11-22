@@ -28,6 +28,8 @@ config = [{ since = "2026-01-01", toolchain = "rustc 1.98.1", note = "kept in /h
 zzfield = "zzunknownzz"
 zznumberfield = 424242
 zzshortfield = "ab"
+zzmultifield = \"\"\"zzlineonezz
+zzlinetwozz\"\"\"
 
 [host.q]
 hostname = "zzotherzz"
@@ -38,9 +40,11 @@ DERIVED = {"the host's key": "zzkeyzz", "hostname": "zznamezz", "ssh user": "zzu
            "a path's home directory": "zzhomezz", "a Windows home in lower case": "zzwinzz",
            "a note's home directory": "zznotezz", "a field the check doesn't know": "zzunknownzz",
            "a number in a field the check doesn't know": "424242", "another host's hostname": "zzotherzz",
-           "an ssh user beside an IPv6 host": "zzuser6zz", "an IPv6 ssh host": "fd00::5eed"}
+           "an ssh user beside an IPv6 host": "zzuser6zz", "an IPv6 ssh host": "fd00::5eed",
+           "a line of a value over several lines": "zzlinetwozz"}
 # Never printed: the terms, the list's, and the names of the fields the check doesn't know.
-TERMS = (*DERIVED.values(), "zzlisted", "zzdirzz", "zzlinezz", "zzfield", "zznumberfield", "zzshortfield")
+TERMS = (*DERIVED.values(), "zzlineonezz", "zzlisted", "zzdirzz", "zzlinezz", "zzfield", "zznumberfield",
+         "zzshortfield", "zzmultifield")
 
 
 class PrivateTerms(unittest.TestCase):
@@ -101,16 +105,21 @@ class PrivateTerms(unittest.TestCase):
             "hosts.toml unparsable": lambda: (self.overlay / "hosts.toml").write_text("[host\n"),
             "a list line that is no pattern": lambda: (self.overlay / "publish-deny.txt").write_text("zz(\n"),
             "a list line Python reads otherwise": lambda: (self.overlay / "publish-deny.txt").write_text("[[:alpha:]]\n"),
+            "an equivalence class": lambda: (self.overlay / "publish-deny.txt").write_text("[[=h=]]ostname\n"),
             "a list that links to nothing": lambda: os.symlink(self.root / "gone", self.overlay / "publish-deny.txt"),
             "an identifying field that isn't text": lambda: (self.overlay / "hosts.toml").write_text(
                 "[host.zzkeyzz]\nssh = 42\n"),
+            "an identifying field that is a flag": lambda: (self.overlay / "hosts.toml").write_text(
+                "[host.zzkeyzz]\nssh = false\n"),
         }
         for name, spoil in cases.items():
             with self.subTest(name):
                 self.setUp()
                 try:
                     spoil()
-                except OSError as error:  # Windows without the right to make a link
+                except OSError as error:
+                    if getattr(error, "winerror", None) != 1314:  # only Windows without the right to make a link
+                        raise
                     self.skipTest(f"{name}: {error}")
                 done = self.staged("b.txt", "ordinary\n")
                 self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
@@ -143,13 +152,13 @@ class PrivateTerms(unittest.TestCase):
     def test_a_term_too_short_is_counted_by_field(self):
         done = self.staged("b.txt", "a q in a line\n")
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
-        self.assertIn("12 derived terms, 0 patterns from publish-deny.txt; 2 derived terms too short to match as a "
+        self.assertIn("14 derived terms, 0 patterns from publish-deny.txt; 2 derived terms too short to match as a "
                       "word, not checked alone (fields: a field the check doesn't know, the host's key)", done.stdout)
 
     # Spec (03:11 3.): the overlay's optional list adds patterns, matched ignoring case and each line on its own
     # (^ and $ are a line's ends); blank lines are none. A match that reaches into a directory withholds it.
     def test_the_overlays_list_adds_patterns(self):
-        (self.overlay / "publish-deny.txt").write_text("\nzzlisted[0-9]+\n\n^zzdirzz/\n^zzlinezz$\n", newline="\n")
+        (self.overlay / "publish-deny.txt").write_text("\nzzlisted[0-9]+\n\n(?<=zzdirzz)/\n^zzlinezz$\n", newline="\n")
         done = self.staged("b.txt", "ZZLISTED42\n")
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
         self.assertIn("3 patterns from publish-deny.txt", done.stdout)
