@@ -5351,15 +5351,13 @@ fn rows_by_value(
 }
 
 /// A query whose one pass over all aggregates takes a `COUNT` of an expression beside its
-/// `SUM` or `AVG`, a shape the per-column path counts otherwise, keeping nothing after it.
-/// What that pass would hold past itself, `held` bytes (the expression's numbers it
-/// remembers, 114 bytes each, or the terms it decodes), must not outlive it: a later
-/// operator (the cross product with `?k`) would then be refused at a limit where the
-/// per-column path answers. The window is measured on the tree itself: B is the least
-/// limit, to 4 KiB, at which `control` answers (the same query with `COUNT(e + 0)` for
-/// `COUNT(e)`, whose values are the same and which the pass declines, as the per-column
-/// path counts it); the query must give `expected` at B + `held` / 2, inside [B, B + `held`).
-fn answers_where_a_kept_memo_would_not_fit(
+/// `SUM` or `AVG`, crossed with `?k` afterwards, answered under a limit just past the least
+/// one where the per-column path answers it. That least limit B is measured on the tree, to
+/// 4 KiB: the one at which `control` answers (the same query with `COUNT(e + 0)` for
+/// `COUNT(e)`, whose values are the same and which the pass declines, as the per-column path
+/// counts it). The query must give `expected` at B + `held` / 2, inside [B, B + `held`), where
+/// `held` bytes kept past the pass would refuse the cross product.
+fn answers_just_past_where_its_control_fits(
     snapshot: &nrese_engine::Snapshot,
     query: &str,
     control: &str,
@@ -5406,11 +5404,11 @@ fn capped_options(limit: Option<usize>, as_written: bool, stream: Option<usize>)
     }
 }
 
-/// [`answers_where_a_kept_memo_would_not_fit`] for a user's `SUM(?v * 2)` and `COUNT(?v * 2)`
+/// [`answers_just_past_where_its_control_fits`] for a user's `SUM(?v * 2)` and `COUNT(?v * 2)`
 /// over 4,096 groups of one value g each (2g and 1), crossed with `?k` in 1 to 32, as
 /// written: SPARQL 1.1 §18.5.1 and §18.4's join of compatible mappings, every pair once.
 #[test]
-fn a_sum_and_count_of_one_expression_keep_no_numbers_past_their_pass() {
+fn a_sum_and_count_of_one_expression_crossed_with_values_answer_under_a_limit() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
     let values: String = (0..4_096).map(|g| format!("({g} {g}) ")).collect();
     let ks: String = (1..=32).map(|k| format!("{k} ")).collect();
@@ -5424,7 +5422,7 @@ fn a_sum_and_count_of_one_expression_keep_no_numbers_past_their_pass() {
         .flat_map(|g| (1..=32).map(move |k| format!("{g}\t{}\t1\t{k}", 2 * g)))
         .collect();
     expected.sort();
-    answers_where_a_kept_memo_would_not_fit(
+    answers_just_past_where_its_control_fits(
         &engine.snapshot(),
         &text("COUNT(?v * 2)"),
         &text("COUNT(?v * 2 + 0)"),
@@ -5434,12 +5432,12 @@ fn a_sum_and_count_of_one_expression_keep_no_numbers_past_their_pass() {
     );
 }
 
-/// [`answers_where_a_kept_memo_would_not_fit`] for eager aggregation (planned) of
+/// [`answers_just_past_where_its_control_fits`] for eager aggregation (planned) of
 /// `AVG(?price * 2)` beside a user's `COUNT(?price * 2)`: 256 teams of two products of eight
 /// offers each, the 4,096 prices 0 to 4,095 (team t's are 16t to 16t + 15: AVG 32t + 15,
 /// COUNT 16), crossed with `?k` in 1 to 512.
 #[test]
-fn an_eager_average_beside_a_count_of_its_argument_keeps_no_numbers_past_its_pass() {
+fn an_eager_average_beside_a_count_of_its_argument_crossed_with_values_answers_under_a_limit() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
     let mut tx = engine.transaction();
     for offer in 0..4_096_i64 {
@@ -5481,7 +5479,7 @@ fn an_eager_average_beside_a_count_of_its_argument_keeps_no_numbers_past_its_pas
         .flat_map(|t| (1..=512).map(move |k| format!("<{EX}t{t}>\t{}\t16\t{k}", 32 * t + 15)))
         .collect();
     expected.sort();
-    answers_where_a_kept_memo_would_not_fit(
+    answers_just_past_where_its_control_fits(
         &snapshot,
         &text("COUNT(?price * 2)"),
         &text("COUNT(?price * 2 + 0)"),
@@ -5491,13 +5489,12 @@ fn an_eager_average_beside_a_count_of_its_argument_keeps_no_numbers_past_its_pas
     );
 }
 
-/// [`answers_where_a_kept_memo_would_not_fit`] for a streamed `AVG(?v * 2)` (morsels of 256
+/// [`answers_just_past_where_its_control_fits`] for a streamed `AVG(?v * 2)` (morsels of 256
 /// rows, each grouped to a `SUM` and a `COUNT` of `?v * 2`), with `COUNT(?s)` beside it:
 /// 4,096 subjects, s_i in group i mod 256 with value i (group g's are g + 256j: AVG
-/// 2g + 3,840, COUNT 16), crossed with `?k` in 1 to 512. Over the stream the pass would
-/// remember all 4,096 values.
+/// 2g + 3,840, COUNT 16), crossed with `?k` in 1 to 512.
 #[test]
-fn a_streamed_average_keeps_no_numbers_past_each_morsel() {
+fn a_streamed_average_crossed_with_values_answers_under_a_limit() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
     let mut tx = engine.transaction();
     for i in 0..4_096_i64 {
@@ -5527,7 +5524,7 @@ fn a_streamed_average_keeps_no_numbers_past_each_morsel() {
         .flat_map(|g| (1..=512).map(move |k| format!("<{EX}g{g}>\t{}\t16\t{k}", 2 * g + 3_840)))
         .collect();
     expected.sort();
-    answers_where_a_kept_memo_would_not_fit(
+    answers_just_past_where_its_control_fits(
         &snapshot,
         &text("COUNT(?s)"),
         &text("COUNT(?v * 2 + 0)"),
@@ -5537,7 +5534,7 @@ fn a_streamed_average_keeps_no_numbers_past_each_morsel() {
     );
 }
 
-/// [`answers_where_a_kept_memo_would_not_fit`] for a user's `SUM(STRLEN(?v))` and
+/// [`answers_just_past_where_its_control_fits`] for a user's `SUM(STRLEN(?v))` and
 /// `COUNT(STRLEN(?v))` over 16 subjects each with the same 1,024 strings of 1,024
 /// characters (16,384 rows: each group sums to 1,048,576 and counts 1,024), crossed with
 /// `?k` in 1 to 16,384, as written: what the pass would keep past itself is the strings it
@@ -5565,7 +5562,7 @@ fn a_sum_and_count_of_a_string_expression_keep_no_decoded_terms_past_their_pass(
         .flat_map(|g| (1..=16_384).map(move |k| format!("<{EX}g{g}>\t1048576\t1024\t{k}")))
         .collect();
     expected.sort();
-    answers_where_a_kept_memo_would_not_fit(
+    answers_just_past_where_its_control_fits(
         &engine.snapshot(),
         &text("COUNT(STRLEN(?v))"),
         &text("COUNT(STRLEN(?v) + 0)"),
