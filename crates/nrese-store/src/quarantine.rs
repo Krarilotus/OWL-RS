@@ -1073,7 +1073,7 @@ impl QuarantineCommitError {
                 format!("It's safe to {retry_action} it again once the cause is resolved.")
             }
             Self::PossiblyListed { file, .. } => format!(
-                "This load's quarantine may have been kept as {}. If that file is there, don't {retry_action} it again. If it isn't, {retry_action}ing it again is safe.",
+                "This load's quarantine may have been kept as {}. If that file is there, don't {retry_action} it again. If it isn't, {retry_action}ing it again is safe. If the server restarts before you {retry_action} it again, check again.",
                 kept_as(file, data_dir)
             ),
         };

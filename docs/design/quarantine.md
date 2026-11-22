@@ -87,7 +87,11 @@ error. Re-admitting one takes the fixed text.
   and syncs the directory again, so that sending it again doesn't quarantine its
   statements twice. Only when both hold does its error call sending it again safe;
   otherwise the error names the file the load's quarantine may have been kept as: if
-  that file is there, the load isn't sent again; if it isn't, sending it again is safe.
+  that file is there, the load isn't sent again; if it isn't, sending it again is safe,
+  and a restart before it is sent again calls for a second check. A file removed whose
+  removal wasn't made durable can come back after a power loss, which restarts the
+  server; a check after the restart sees what the disk kept, and the load sent again
+  syncs the directory, which makes the removal durable.
   A load that published keeps its file, listed and counted, so that its statements can
   still be reviewed; its error names the load, and a power loss may lose the file.
 
