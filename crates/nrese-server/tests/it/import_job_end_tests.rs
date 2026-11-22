@@ -1,5 +1,5 @@
 //! An import job that panics still ends, and its words claim only what its worker knew: a
-//! panic after the load returned names the published revision (or that it changed nothing),
+//! panic after the load returned names the published revision (or that it published none),
 //! one inside the load says the effect is unknown (`nrese_store::LoadPanic`).
 
 use std::time::Duration;
@@ -89,16 +89,18 @@ async fn a_panic_after_the_load_returned_ends_the_job_at_its_published_revision(
 }
 
 // Spec: as above; a panic after a load returned that changed nothing (its statement was
-// there already, so it published no revision) -> `failed`, saying it changed nothing and
-// needn't be sent again, with the store's unchanged revision in the report; never that it
-// published.
+// there already, so it published no revision) -> `failed`, saying it published no new
+// revision and needn't be sent again, with the store's unchanged revision in the report;
+// never that it was published.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_panic_after_a_load_that_changed_nothing_ends_the_job_as_unchanged() {
     let (_, revision, job) = import_panicking_at(LoadPanic::AfterReturn, true).await;
     assert_eq!(job["state"], "failed", "{job}");
+    let error = job["error"].as_str().unwrap_or_default();
+    assert!(!error.contains("was published"), "{job}");
     assert_eq!(
-        job["error"],
-        "the load changed nothing (its statements were already there), then the import stopped (an internal error). There's no need to send it again; any statements it couldn't read are in the quarantine list.",
+        error,
+        "the load published no new revision (nothing in it changed the data), then the import stopped (an internal error). There's no need to send it again; any statements it couldn't read are in the quarantine list.",
         "{job}"
     );
     assert_eq!(job["report"]["revision"], revision, "{job}");

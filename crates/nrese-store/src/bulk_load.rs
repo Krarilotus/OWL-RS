@@ -59,8 +59,9 @@ pub struct BulkLoadRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BulkLoadReport {
     pub revision: u64,
-    /// Whether the load published `revision`; `false`: it changed nothing (its statements
-    /// were there already), and `revision` is the one the store served before.
+    /// Whether the load published `revision`; `false`: it changed nothing, whether its
+    /// statements were there already or none could be read (its quarantine may still be
+    /// recorded), and `revision` is the one the store served before.
     pub published: bool,
     /// Quads parsed, including duplicates.
     pub parsed: u64,

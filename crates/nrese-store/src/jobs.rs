@@ -75,8 +75,9 @@ pub struct JobView {
     /// When it started, in seconds since the Unix epoch, and how long it ran.
     pub started: u64,
     pub elapsed_ms: u64,
-    /// Its report when done; a failed import that stopped after its load returned has one
-    /// too, with the `revision` the store serves.
+    /// Its report when done. A failed import that stopped unexpectedly after its load
+    /// returned has one too, with the `revision` the store serves, beside its `error`; one
+    /// whose step after the load returned an error (its reasoning, say) has the `error` alone.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(value_type = Option<Object>))]
     pub report: Option<serde_json::Value>,
@@ -107,7 +108,8 @@ enum Stage {
     Running,
     /// The load returned, published at `revision`.
     Loaded { revision: u64 },
-    /// The load returned having changed nothing; the store serves `revision` as before.
+    /// The load returned having published no new revision (its statements were there
+    /// already, or none could be read); the store serves `revision` as before.
     Unchanged { revision: u64 },
 }
 
@@ -126,7 +128,7 @@ impl Stage {
                 "the load was published at revision {revision}, then the import stopped (an internal error); reasoning may not be up to date. Don't {retry} it again."
             ),
             Self::Unchanged { .. } => format!(
-                "the load changed nothing (its statements were already there), then the import stopped (an internal error). There's no need to {retry} it again; any statements it couldn't read are in the quarantine list."
+                "the load published no new revision (nothing in it changed the data), then the import stopped (an internal error). There's no need to {retry} it again; any statements it couldn't read are in the quarantine list."
             ),
         }
     }
@@ -204,7 +206,8 @@ impl Job {
         self.stage = Stage::Loaded { revision };
     }
 
-    /// Its load returned having changed nothing, the store at `revision`: as [`Self::loaded`].
+    /// Its load returned having published no new revision, the store at `revision`: as
+    /// [`Self::loaded`].
     pub fn unchanged(&mut self, revision: u64) {
         self.stage = Stage::Unchanged { revision };
     }
