@@ -2474,7 +2474,9 @@ fn batch_equals_naive_on_random_ontologies() {
         if !draws_on(case, cases, covered(derived, rules.len())) {
             break;
         }
-        let lines = families.input(&mut next, pinned);
+        // A case's witnesses count only once its comparison has passed.
+        let mut case_families = OntologyFamilies::default();
+        let lines = case_families.input(&mut next, pinned);
         let mut vocabulary = LocalVocabulary::default();
         let input = load(&mut vocabulary, &lines.join("\n"));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2483,6 +2485,7 @@ fn batch_equals_naive_on_random_ontologies() {
         let Ok((d, v)) = result else {
             panic!("case {case}:\n{}", lines.join("\n"));
         };
+        families.extend(case_families);
         derived += d.len();
         violations += v.len();
         rules.extend(v.into_iter().map(|v| v.rule));
