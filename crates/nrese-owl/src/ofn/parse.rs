@@ -765,12 +765,24 @@ impl<'t, 'm> Parser<'t, 'm> {
     }
 
     /// The rest of a disjointness axiom (its operands read): its axioms
-    /// (`Disjoint::axioms`), a repeated operand reported.
+    /// (`Disjoint::axioms`), a repeated operand reported, and then, where they name a reserved
+    /// name in its place, all of them left out with it (`diagnostics::reserved_in`).
     fn disjoint(&mut self, d: Disjoint) -> R<()> {
         self.close()?;
         let (axioms, repeated) = d.axioms(&mut self.model.classes, &mut self.model.ranges);
         if repeated {
             self.model.diagnostics.push(Diagnostic::RepeatedOperand);
+            let terms: &dyn crate::mapping::Terms = &*self.terms;
+            let reserved = crate::diagnostics::reserved_in(&self.model.classes, &axioms, terms);
+            if !reserved.is_empty() {
+                for term in reserved {
+                    let d = Diagnostic::Reserved { term };
+                    if !self.model.diagnostics.contains(&d) {
+                        self.model.diagnostics.push(d);
+                    }
+                }
+                return Ok(());
+            }
         }
         for a in axioms {
             self.add(a);

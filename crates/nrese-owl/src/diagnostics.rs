@@ -5,7 +5,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::mapping::{Ontology, Terms};
-use crate::model::{Axiom, Characteristic, ClassExpr, EntityKind, ObjProp, Term};
+use crate::model::{Axiom, Characteristic, ClassExpr, EntityKind, Interner, ObjProp, Term};
 
 /// What the store does with a part of the data that breaks the premise of the OWL 2 RL rules'
 /// closure (theorem PR1, OWL 2 Profiles §4.3: the graph is exactly the mapping of the ontology
@@ -571,12 +571,8 @@ pub(crate) fn leave_out_reserved(ontology: &mut Ontology, terms: &dyn Terms) {
     // Per term: reserved as a class or property, and as an individual.
     let mut cache: HashMap<Term, [bool; 2], foldhash::fast::RandomState> = HashMap::default();
     let mut reserved = |t: Term, individual: bool| -> bool {
-        let [entity, as_individual] = *cache.entry(t).or_insert_with(|| {
-            (terms.iri_text(t)).map_or([false; 2], |iri| {
-                [reserved_name(&iri), reserved_as_individual(&iri)]
-            })
-        });
-        if individual { as_individual } else { entity }
+        let roles = *cache.entry(t).or_insert_with(|| reserved_roles(terms, t));
+        roles[usize::from(individual)]
     };
     let mut walk = Walk::new(ontology.classes.len());
     let mut kept = Vec::with_capacity(ontology.axioms.len());
@@ -593,7 +589,7 @@ pub(crate) fn leave_out_reserved(ontology: &mut Ontology, terms: &dyn Terms) {
     let all_sources = std::mem::take(&mut ontology.sources);
     for (axiom, source) in axioms.into_iter().zip(all_sources) {
         let mut any = false;
-        let (names, individuals) = entities_of(ontology, &axiom, &mut walk);
+        let (names, individuals) = entities_of(&ontology.classes, &axiom, &mut walk);
         let roles =
             (names.iter().map(|&t| (t, false))).chain(individuals.iter().map(|&t| (t, true)));
         for (term, individual) in roles {
@@ -612,6 +608,40 @@ pub(crate) fn leave_out_reserved(ontology: &mut Ontology, terms: &dyn Terms) {
     ontology.axioms = kept;
     ontology.sources = sources;
     ontology.diagnostics.extend(found);
+}
+
+/// Whether `t`'s IRI is reserved as a class or property ([`reserved_name`]), and where an
+/// individual goes ([`reserved_as_individual`]); neither where the source gives no IRI.
+fn reserved_roles(terms: &dyn Terms, t: Term) -> [bool; 2] {
+    (terms.iri_text(t)).map_or([false; 2], |iri| {
+        [reserved_name(&iri), reserved_as_individual(&iri)]
+    })
+}
+
+/// The reserved names that the axioms one statement is read as name in their places, each
+/// once, as [`leave_out_reserved`] asks of each axiom. A reader asks it of a disjointness or
+/// distinctness that repeats an operand, which it reads as several axioms (the n-ary one and
+/// the repeat's own, `model::Disjoint::axioms`), and leaves them all out where one names any:
+/// left out one by one, the repeat's axiom alone (`ex:a` different from itself) would stay,
+/// a part of a statement read where the rest is not.
+pub(crate) fn reserved_in(
+    classes: &Interner<ClassExpr>,
+    axioms: &[Axiom],
+    terms: &dyn Terms,
+) -> Vec<Term> {
+    let mut walk = Walk::new(0);
+    let mut found = Vec::new();
+    for axiom in axioms {
+        let (names, individuals) = entities_of(classes, axiom, &mut walk);
+        let roles =
+            (names.iter().map(|&t| (t, false))).chain(individuals.iter().map(|&t| (t, true)));
+        for (term, individual) in roles {
+            if reserved_roles(terms, term)[usize::from(individual)] && !found.contains(&term) {
+                found.push(term);
+            }
+        }
+    }
+    found
 }
 
 /// [`entities_of`]'s lists, kept from one axiom to the next so that the walk over every
@@ -640,8 +670,12 @@ impl Walk {
 }
 
 /// The classes and properties an axiom names, then the individuals (datatypes, literals and
-/// facets aside), in `walk`'s lists.
-fn entities_of<'w>(o: &Ontology, axiom: &Axiom, walk: &'w mut Walk) -> (&'w [Term], &'w [Term]) {
+/// facets aside), in `walk`'s lists; its class expressions in `classes`.
+fn entities_of<'w>(
+    classes: &Interner<ClassExpr>,
+    axiom: &Axiom,
+    walk: &'w mut Walk,
+) -> (&'w [Term], &'w [Term]) {
     use crate::model::EntityKind;
     if walk.round == u32::MAX {
         walk.seen.fill(0);
@@ -704,11 +738,14 @@ fn entities_of<'w>(o: &Ontology, axiom: &Axiom, walk: &'w mut Walk) -> (&'w [Ter
     }
     push_expressions(axiom, stack);
     while let Some(id) = stack.pop() {
+        if seen.len() <= id as usize {
+            seen.resize(classes.len(), 0);
+        }
         if seen[id as usize] == *round {
             continue;
         }
         seen[id as usize] = *round;
-        match o.classes.get(id) {
+        match classes.get(id) {
             ClassExpr::Class(t) => out.push(*t),
             ClassExpr::And(xs) | ClassExpr::Or(xs) => stack.extend(xs.iter().map(|x| x.0)),
             ClassExpr::Not(x) => stack.push(x.0),

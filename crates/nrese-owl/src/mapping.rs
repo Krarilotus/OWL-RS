@@ -169,7 +169,9 @@ impl Ontology {
     }
 
     /// The named individuals: declared, asserted about, or in a nominal (blank nodes, the
-    /// anonymous individuals, left out). Sorted. O(axioms + class expressions).
+    /// anonymous individuals, left out, and so is a reserved name the reader left out,
+    /// [`Diagnostic::Reserved`]: the nominal or `hasValue` of an axiom left out stays among the
+    /// class expressions). Sorted. O(axioms + class expressions).
     pub fn named_individuals(&self) -> Vec<Term> {
         let mut out: Vec<Term> = Vec::new();
         for a in &self.axioms {
@@ -179,7 +181,13 @@ impl Ontology {
             out.extend(individuals(a));
         }
         out.extend(in_expressions(self));
-        out.retain(|t| !self.anonymous.contains(t));
+        let reserved: HashSet<Term> = (self.diagnostics.iter())
+            .filter_map(|d| match *d {
+                Diagnostic::Reserved { term } => Some(term),
+                _ => None,
+            })
+            .collect();
+        out.retain(|t| !self.anonymous.contains(t) && !reserved.contains(t));
         out.sort_unstable();
         out.dedup();
         out
@@ -1504,12 +1512,21 @@ impl<'a> Reader<'a> {
 
     // Axioms ---------------------------------------------------------------------------
 
-    /// A disjointness's axioms (`Disjoint::axioms`): a repeated operand reported. Whether
-    /// one was.
+    /// A disjointness's axioms (`Disjoint::axioms`): a repeated operand reported, and then,
+    /// where they name a reserved name in its place, all of them left out with it
+    /// (`diagnostics::reserved_in`). Whether one was.
     fn disjoint(&mut self, d: Disjoint, triple: [Term; 3]) -> bool {
         let (axioms, repeated) = d.axioms(&mut self.classes, &mut self.ranges);
         if repeated {
             self.report(Diagnostic::RepeatedOperand);
+            let reserved = crate::diagnostics::reserved_in(&self.classes, &axioms, self.terms);
+            if !reserved.is_empty() {
+                for term in reserved {
+                    self.report(Diagnostic::Reserved { term });
+                }
+                self.collected.clear();
+                return repeated;
+            }
         }
         // Each axiom comes from the whole form: each gets its list's statements.
         let collected = std::mem::take(&mut self.collected);

@@ -926,7 +926,8 @@ pub fn premise(o: &Ontology) -> Premise {
         diagnostics,
         // Read past: no axiom (an annotation-property axiom is in `annotation_schema`).
         annotations: _,
-        annotation_schema,
+        // Read by `rules_read_differently`, as are `empty_list` and `list_cell_outside`.
+        annotation_schema: _,
         // A name of two kinds among them is a `Diagnostic::TwoKinds` (`crate::typing`).
         annotation_uses: _,
         annotation_axioms: _,
@@ -940,20 +941,15 @@ pub fn premise(o: &Ontology) -> Premise {
         // Each is a `Diagnostic::Rule`, fatal.
         rules: _,
         noncanonical_cardinality,
-        empty_list,
+        empty_list: _,
         // Read by `reads_data_values`.
         qualified_data_max: _,
         rules_unread,
-        list_cell_outside,
+        list_cell_outside: _,
     } = o;
-    let diagnostics = || diagnostics.iter();
     Premise {
-        fatal: diagnostics().any(crate::Diagnostic::is_fatal),
-        reads_otherwise: !annotation_schema.is_empty()
-            || !punned(o).is_empty()
-            || empty_list.is_some()
-            || list_cell_outside.is_some()
-            || diagnostics().any(crate::Diagnostic::reads_otherwise),
+        fatal: diagnostics.iter().any(crate::Diagnostic::is_fatal),
+        reads_otherwise: rules_read_differently(o),
         reads_less: noncanonical_cardinality.is_some()
             || rules_unread.is_some()
             || crate::ql::reads_data_values(o).is_some(),
@@ -961,9 +957,14 @@ pub fn premise(o: &Ontology) -> Premise {
 }
 
 /// Whether the OWL 2 RL rules may read `o` otherwise than OWL 2 DL does
-/// ([`Premise::reads_otherwise`]): what a clash of theirs needs to be a verdict.
+/// ([`Premise::reads_otherwise`], as [`premise`] says): what a clash of theirs needs to be a
+/// verdict.
 pub fn rules_read_differently(o: &Ontology) -> bool {
-    premise(o).reads_otherwise
+    !o.annotation_schema.is_empty()
+        || !punned(o).is_empty()
+        || o.empty_list.is_some()
+        || o.list_cell_outside.is_some()
+        || o.diagnostics.iter().any(crate::Diagnostic::reads_otherwise)
 }
 
 /// The profiles every axiom of `o` is in.
