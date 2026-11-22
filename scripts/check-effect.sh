@@ -61,6 +61,18 @@ BEGIN {
     allow["http/result_stream.rs|let watchdog = tokio::spawn(async move {"] = "stream watchdog"
     allow["http/result_stream.rs|let busy = tokio::spawn(async {"] = "stream tests"
     count["http/result_stream.rs|let busy = tokio::spawn(async {"] = 2
+    # The stall timer of an answer held whole: aborted when its body drops, else ends a stall
+    # bound after the last frame taken, letting go of what is left.
+    allow["http/result_stream.rs|let watch = tokio::spawn(async move {"] = "whole answer stall timer"
+    # The whole-answer tests: each answer task ends by its stop, its abort or its 120 s
+    # deadline; each wait for the producer, by its write or the drop of its sender, or by 120 s of
+    # real time.
+    allow["http/result_stream.rs|let answer = tokio::spawn(WHOLE.scope("] = "whole answer stop tests"
+    count["http/result_stream.rs|let answer = tokio::spawn(WHOLE.scope("] = 2
+    allow["http/result_stream.rs|tokio::task::spawn_blocking(move || written.recv())"] = "whole answer stop tests"
+    count["http/result_stream.rs|tokio::task::spawn_blocking(move || written.recv())"] = 2
+    allow["http/result_stream.rs|let ended = tokio::task::spawn_blocking(move || {"] = "whole answer client-gone test"
+    allow["http/result_stream.rs|let answer = tokio::spawn(WHOLE.scope(true, async move {"] = "whole answer deadline test"
 }
 {
     key = $0

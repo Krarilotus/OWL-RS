@@ -1256,6 +1256,7 @@ dependencies = [
  "base64",
  "dotenvy",
  "futures-util",
+ "h2",
  "http-body",
  "http-body-util",
  "jsonwebtoken",

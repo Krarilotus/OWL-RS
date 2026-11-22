@@ -2049,6 +2049,7 @@ impl<'a> Context<'a> {
                 used: self.budget.used(),
                 shared: true,
                 unread: true,
+                for_held: false,
                 rows: None,
             })
             .into();
@@ -2059,6 +2060,7 @@ impl<'a> Context<'a> {
             used: self.budget.used(),
             shared: self.budget.bounded_by_shared(),
             unread: false,
+            for_held: false,
             rows: Some(nrese_exec::RowsPast {
                 rows,
                 width,
