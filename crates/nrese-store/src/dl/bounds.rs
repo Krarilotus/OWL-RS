@@ -184,22 +184,14 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// The route the ontology's profile gives (`nrese_owl::profile`): an OWL 2 RL ontology (its
-/// data's literals of RL's datatypes too) to the RL rules alone, unless an axiom's rules
-/// would compare or type data values: the rule set leaves out dt-eq and dt-type2
-/// (`nrese_owl::ql::reads_data_values`), so the DL path decides it by value; or where theorem
-/// PR1 doesn't hold, which needs no punning and no annotation-property axioms
-/// (`query::reads_differently` says what that costs); or unless a cardinality is spelled
-/// otherwise than the rules name it (`Ontology::noncanonical_cardinality`), so they
-/// wouldn't read it, or a statement the rules don't read was read as axioms they would
-/// (`Ontology::rules_unread`). Its callers also leave the route where the closure leaves out
-/// a list axiom (`StoreService::lists_left_out`): the rules lack that axiom's conclusions,
-/// and PR1's premise doesn't hold.
+/// data's literals of RL's datatypes too) to the RL rules alone where the premise of their
+/// closure holds, the graph exactly the mapping of what the reader read
+/// (`nrese_owl::profile::premise`, the one place that tells it; `query::reads_differently`
+/// says what a break costs). Its callers also leave the route where the closure leaves out
+/// a list axiom (`StoreService::lists_left_out`), the store's own: the rules lack that
+/// axiom's conclusions.
 fn routed_to_rules(ontology: &Ontology) -> bool {
-    nrese_owl::profile::of_ontology(ontology).rl
-        && nrese_owl::ql::reads_data_values(ontology).is_none()
-        && !nrese_owl::profile::rules_read_differently(ontology)
-        && ontology.noncanonical_cardinality.is_none()
-        && ontology.rules_unread.is_none()
+    nrese_owl::profile::of_ontology(ontology).rl && nrese_owl::profile::premise(ontology).exact()
 }
 
 /// What the RL route was decided on: the TBox signature as the reader typed it, the
@@ -809,8 +801,7 @@ pub(crate) fn prepare(
             ontology: None,
         };
     };
-    let fatal = ontology.diagnostics.iter().any(|d| d.is_fatal());
-    if routed_to_rules(&ontology) && !fatal && !lists_left_out {
+    if routed_to_rules(&ontology) && !lists_left_out {
         // The RL gate that ran before has decided the commit's consistency.
         let lookup = |iri: &str| tx.lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into());
         return Preparation {
@@ -1362,8 +1353,7 @@ fn afresh(
         Ok(ontology) => ontology,
         Err(_) => return (Err(GaveUp::refused(source::refused("the revision"))), None),
     };
-    let fatal = ontology.diagnostics.iter().any(|d| d.is_fatal());
-    if routed_to_rules(&ontology) && !fatal && !store.lists_left_out(snapshot) {
+    if routed_to_rules(&ontology) && !store.lists_left_out(snapshot) {
         let lookup =
             |iri: &str| snapshot.lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into());
         return (Err(not_compiled()), Some(Kinds::of(&ontology, &lookup)));
