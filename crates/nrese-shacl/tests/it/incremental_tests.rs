@@ -4,15 +4,16 @@
 
 use std::collections::BTreeSet;
 
-use nrese_engine::{Engine, EngineConfig, GraphSelector, TermId};
+use nrese_engine::{Engine, EngineConfig, GraphSelector, Snapshot, TermId};
 use nrese_rdf::vocab::xsd;
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term};
 use nrese_rdf_io::{RdfFormat, RdfParser};
-use nrese_shacl::{Selection, ValidationReport, compile, validate, validate_changes};
-use nrese_sparql::Resources;
+use nrese_shacl::{Selection, Shapes, ValidationReport, compile, validate, validate_changes};
+use nrese_sparql::{QueryEvaluationError, Resources};
 
 const EX: &str = "http://example.com/";
 const SHAPES_GRAPH: &str = "http://example.com/shapes";
+const DATA: Selection = Selection::of(GraphSelector::Exact(TermId::DEFAULT_GRAPH));
 
 const SHAPES: &str = r#"
 @prefix ex: <http://example.com/> .
@@ -58,13 +59,23 @@ fn ex(local: &str) -> NamedNode {
     NamedNode::new_unchecked(format!("{EX}{local}"))
 }
 
+fn type_quad(subject: NamedNode, class: NamedNode) -> Quad {
+    let rdf_type = NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+    Quad::new(subject, rdf_type, class, GraphName::DefaultGraph)
+}
+
 fn random_quad(rng: &mut Rng) -> Quad {
     let node = |rng: &mut Rng| ex(&format!("n{}", rng.below(12)));
+    let class = |rng: &mut Rng| ex(&format!("C{}", rng.below(3)));
     let subject = node(rng);
-    if rng.below(4) == 0 {
-        let class = ex(&format!("C{}", rng.below(3)));
-        let rdf_type = NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
-        return Quad::new(subject, rdf_type, class, GraphName::DefaultGraph);
+    match rng.below(16) {
+        0 | 4 | 8 | 12 => return type_quad(subject, class(rng)),
+        1 => {
+            let subclass =
+                NamedNode::new_unchecked("http://www.w3.org/2000/01/rdf-schema#subClassOf");
+            return Quad::new(class(rng), subclass, class(rng), GraphName::DefaultGraph);
+        }
+        _ => {}
     }
     let predicate = ex(&format!("p{}", rng.below(4)));
     let object: Term = if rng.below(3) == 0 {
@@ -88,38 +99,8 @@ fn keys(report: &ValidationReport) -> BTreeSet<String> {
         .collect()
 }
 
-/// Shapes that refer to themselves or to each other, through `sh:property` and `sh:node`: a
-/// change anywhere along such a cycle's paths can change the result of a target several
-/// steps away (validated by the recursion rule: a node already being checked conforms).
-const CYCLIC_SHAPES: &str = r#"
-@prefix ex: <http://example.com/> .
-@prefix sh: <http://www.w3.org/ns/shacl#> .
-ex:S6 a sh:NodeShape ; sh:targetClass ex:C1 ; sh:property ex:P6 .
-ex:P6 sh:path ex:p1 ; sh:class ex:C0 ; sh:property ex:P6 .
-ex:S7 a sh:NodeShape ; sh:targetSubjectsOf ex:p0 ; sh:property ex:P7 .
-ex:P7 sh:path ex:p2 ; sh:node ex:S8 .
-ex:S8 a sh:NodeShape ; sh:property [ sh:path ex:p3 ; sh:class ex:C2 ] ; sh:property ex:P7 .
-ex:S9 a sh:NodeShape ; sh:targetNode ex:n0 , ex:n1 ; sh:node ex:S10 .
-ex:S10 a sh:NodeShape ; sh:property [ sh:path ex:p1 ; sh:maxCount 1 ] ;
-  sh:property [ sh:path ex:p0 ; sh:node ex:S9 ] .
-"#;
-
-/// Shapes without a cycle, each nested shape reached from several targets and by several
-/// constructs: one result can be found through more than one route, and a change can add or
-/// remove a route to a result that is there before and after.
-const SHARED_SHAPES: &str = r#"
-@prefix ex: <http://example.com/> .
-@prefix sh: <http://www.w3.org/ns/shacl#> .
-ex:S11 a sh:NodeShape ; sh:targetClass ex:C2 ; sh:property ex:P11 .
-ex:P11 sh:path ex:p1 ; sh:minCount 1 ; sh:class ex:C0 .
-ex:S12 a sh:NodeShape ; sh:targetSubjectsOf ex:p3 ; sh:property ex:P12 ; sh:node ex:N13 .
-ex:P12 sh:path ex:p2 ; sh:property ex:P11 , ex:P16 ; sh:node ex:N13 .
-ex:P16 sh:path ex:p1 ; sh:targetObjectsOf ex:p0 ; sh:minCount 1 .
-ex:N13 a sh:NodeShape ; sh:property [ sh:path ex:p0 ; sh:maxCount 1 ] .
-ex:S14 a sh:NodeShape ; sh:targetNode ex:n0 , ex:n1 ; sh:not ex:N15 ;
-  sh:property [ sh:path [ sh:inversePath ex:p2 ] ; sh:node ex:N13 ] .
-ex:N15 a sh:NodeShape ; sh:class ex:C1 ; sh:node ex:N13 .
-"#;
+const CYCLIC_SHAPES: &str = include_str!("fixtures/cyclic.ttl");
+const SHARED_SHAPES: &str = include_str!("fixtures/shared.ttl");
 
 #[test]
 fn incremental_validation_equals_the_difference_of_full_validations() {
@@ -136,6 +117,125 @@ fn incremental_validation_equals_the_difference_under_shapes_reached_from_severa
     differences_agree(SHARED_SHAPES, 20_261_152);
 }
 
+/// SHACL §2.1.6. A deactivated parent reports no result, even if the same
+/// property shape later reports a result through an active parent.
+#[test]
+fn a_deactivated_parent_does_not_hide_a_new_result() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let (before, shapes) = load(&engine, SHARED_SHAPES, [type_quad(ex("n2"), ex("C1"))]);
+    let mut tx = engine.transaction();
+    tx.insert(type_quad(ex("n2"), ex("C2")).as_ref());
+    let changed: Vec<_> = tx.inserted().collect();
+    let after = tx.pending_snapshot();
+    let report = validate_changes(
+        &before,
+        &after,
+        &shapes,
+        DATA,
+        &changed,
+        &Resources::default(),
+    )
+    .unwrap();
+    assert_eq!(report.results.len(), 1);
+    let result = &report.results[0];
+    assert_eq!(result.focus_node, Term::from(ex("n2")));
+    assert_eq!(result.source_shape, Term::from(ex("P11")));
+    assert_eq!(result.component, nrese_shacl::Component::MinCount);
+}
+
+/// SHACL design §7: if a whole validation or a reverse route search runs out
+/// of request memory, the change has no partial report.
+#[test]
+fn change_validation_returns_the_stop_instead_of_partial_results() {
+    let recursive = "
+        @prefix ex: <http://example.com/> .
+        @prefix sh: <http://www.w3.org/ns/shacl#> .
+        ex:T sh:targetClass ex:C ; sh:property ex:Q .
+        ex:Q sh:path ex:age ; sh:minCount 1 ; sh:property ex:Q .
+    ";
+    let hub = "
+        @prefix ex: <http://example.com/> .
+        @prefix sh: <http://www.w3.org/ns/shacl#> .
+        ex:T1 sh:targetClass ex:C ; sh:property ex:Q .
+        ex:T2 sh:targetClass ex:D ; sh:property ex:R .
+        ex:R sh:path ex:likes ; sh:property ex:Q .
+        ex:Q sh:path ex:age ; sh:minCount 1 .
+    ";
+    for (case, turtle, data) in [
+        (
+            "cyclic full validation",
+            recursive,
+            (0..1024)
+                .map(|i| type_quad(ex(&format!("y{i}")), ex("C")))
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "reverse route search",
+            hub,
+            (0..1024)
+                .map(|i| {
+                    Quad::new(
+                        ex(&format!("y{i}")),
+                        ex("likes"),
+                        ex("v"),
+                        GraphName::DefaultGraph,
+                    )
+                })
+                .collect(),
+        ),
+    ] {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let (before, shapes) = load(&engine, turtle, data);
+        let mut tx = engine.transaction();
+        tx.insert(type_quad(ex("v"), ex("C")).as_ref());
+        let changed: Vec<_> = tx.inserted().collect();
+        let after = tx.pending_snapshot();
+        let resources = Resources {
+            memory: nrese_exec::Envelope::new(Some(16 * 1024), None),
+            ..Resources::default()
+        };
+        let outcome = validate_changes(&before, &after, &shapes, DATA, &changed, &resources);
+        assert!(
+            matches!(outcome, Err(QueryEvaluationError::MemoryLimit(_))),
+            "{case}"
+        );
+    }
+}
+
+fn load(
+    engine: &Engine,
+    shapes_turtle: &str,
+    data: impl IntoIterator<Item = Quad>,
+) -> (Snapshot, Shapes) {
+    let mut tx = engine.transaction();
+    let shapes_graph = ex("shapes");
+    let parser = RdfParser::from_format(RdfFormat::Turtle);
+    for quad in parser.for_slice(shapes_turtle.as_bytes()) {
+        let quad = quad.unwrap();
+        let quad = Quad::new(
+            quad.subject,
+            quad.predicate,
+            quad.object,
+            GraphName::NamedNode(shapes_graph.clone()),
+        );
+        tx.insert(quad.as_ref());
+    }
+    for quad in data {
+        tx.insert(quad.as_ref());
+    }
+    tx.commit().unwrap();
+    let before = engine.snapshot();
+    let shapes_id = before
+        .lookup(NamedNode::new_unchecked(SHAPES_GRAPH).as_ref().into())
+        .unwrap();
+    let shapes = compile(
+        &before,
+        Selection::asserted(GraphSelector::Exact(shapes_id)),
+    )
+    .unwrap_or_else(|errors| panic!("{errors:?}"));
+    (before, shapes)
+}
+
 /// On random data and random changes, under `shapes`, the results `validate_changes`
 /// reports are exactly those full validation finds after the change and not before.
 fn differences_agree(shapes_turtle: &str, seed: u64) {
@@ -150,33 +250,8 @@ fn differences_agree(shapes_turtle: &str, seed: u64) {
             break;
         }
         let engine = Engine::new(EngineConfig::default()).unwrap();
-        let mut tx = engine.transaction();
-        let shapes_graph = ex("shapes");
-        let parser = RdfParser::from_format(RdfFormat::Turtle);
-        for quad in parser.for_slice(shapes_turtle.as_bytes()) {
-            let quad = quad.unwrap();
-            let quad = Quad::new(
-                quad.subject,
-                quad.predicate,
-                quad.object,
-                GraphName::NamedNode(shapes_graph.clone()),
-            );
-            tx.insert(quad.as_ref());
-        }
-        for _ in 0..rng.below(60) {
-            tx.insert(random_quad(&mut rng).as_ref());
-        }
-        tx.commit().unwrap();
-        let before = engine.snapshot();
-        let shapes_id: TermId = before
-            .lookup(NamedNode::new_unchecked(SHAPES_GRAPH).as_ref().into())
-            .unwrap();
-        let shapes = compile(
-            &before,
-            Selection::asserted(GraphSelector::Exact(shapes_id)),
-        )
-        .unwrap_or_else(|errors| panic!("{errors:?}"));
-        let data = Selection::of(GraphSelector::Exact(TermId::DEFAULT_GRAPH));
+        let data = (0..rng.below(60)).map(|_| random_quad(&mut rng));
+        let (before, shapes) = load(&engine, shapes_turtle, data);
 
         let mut tx = engine.transaction();
         for _ in 0..1 + rng.below(6) {
@@ -199,10 +274,10 @@ fn differences_agree(shapes_turtle: &str, seed: u64) {
         let changed: Vec<_> = tx.inserted().chain(tx.deleted()).collect();
         let after = tx.pending_snapshot();
         let resources = Resources::default();
-        let incremental = validate_changes(&before, &after, &shapes, data, &changed, &resources)
+        let incremental = validate_changes(&before, &after, &shapes, DATA, &changed, &resources)
             .expect("nothing stops it");
-        let full_before = keys(&validate(&before, &shapes, data, &resources).expect("validated"));
-        let full_after = keys(&validate(&after, &shapes, data, &resources).expect("validated"));
+        let full_before = keys(&validate(&before, &shapes, DATA, &resources).expect("validated"));
+        let full_after = keys(&validate(&after, &shapes, DATA, &resources).expect("validated"));
         let expected: BTreeSet<String> = full_after.difference(&full_before).cloned().collect();
         assert_eq!(
             keys(&incremental),

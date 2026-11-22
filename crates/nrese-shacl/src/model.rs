@@ -22,7 +22,7 @@ pub struct Shapes {
     /// The `sh:entailment` values of the shapes graph (SHACL §1.5): regimes the data must be
     /// validated under. None is supported, so each is a failure of every validation.
     pub(crate) entailments: Vec<TermId>,
-    /// A cycle in the compiled shape references.
+    /// A cycle reachable from an active target through active shape references.
     pub(crate) has_cycles: bool,
 }
 

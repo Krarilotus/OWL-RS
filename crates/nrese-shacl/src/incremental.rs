@@ -11,13 +11,14 @@
 //!
 //! The affected focus nodes supply the candidate results. A candidate is new only if no
 //! validation route in the state before produced it, including routes from unaffected
-//! focus nodes.
+//! focus nodes. Reverse route searches share a limit of [`MAX_AFFECTED`] pair visits per
+//! call. At the limit, the reporting roots are validated whole in the state before.
 //!
 //! Some shapes can't be bounded this way, and are validated whole: closed shapes (any
 //! predicate counts), SPARQL constraints (a query reads anything), and any shape when a
 //! changed statement is an `rdfs:subClassOf` (class membership of every node may move).
-//! So is a shape whose affected nodes pass [`MAX_AFFECTED`]. When the shape references
-//! contain a cycle, the difference is taken over both full reports.
+//! So is a shape whose affected nodes pass [`MAX_AFFECTED`]. When an active target can
+//! reach a cycle through active shapes, the difference is taken over both full reports.
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -36,11 +37,13 @@ use crate::report::{ValidationReport, decode};
 use crate::validate::{self, RawResult, ResultTerm, Validator};
 
 mod before_routes;
+#[cfg(test)]
+mod tests;
 
 use before_routes::BeforeRoutes;
 
-/// Affected focus nodes per shape beyond which the shape is validated whole: following
-/// that many nodes back costs about what a full validation does.
+/// Affected nodes per shape or reverse route pair visits per call before whole-root
+/// validation: following that many nodes back costs about what a full validation does.
 const MAX_AFFECTED: usize = 100_000;
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
@@ -118,6 +121,11 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
             if validator_after.stopped() || validator_before.stopped() {
                 break;
             }
+            let after_focus = validator_after.focus_nodes(&shapes.shapes[shape]);
+            resources.check()?;
+            if after_focus.is_empty() {
+                continue;
+            }
             let affected = if classes_moved {
                 None
             } else {
@@ -148,9 +156,7 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
                     .map(|node| (shape, node))
                     .collect()
             };
-            let after_results = validator_after.validate_all(&work(focus(
-                validator_after.focus_nodes(&shapes.shapes[shape]),
-            )));
+            let after_results = validator_after.validate_all(&work(focus(after_focus)));
             resources.check()?;
             if after_results.is_empty() {
                 continue;
@@ -171,10 +177,8 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
             }
             // Results kept are charged to their state's validator; those dropped here are
             // returned to it once freed.
-            let unchecked_target = |root, focus| {
-                let already_checked =
-                    root == shape && affected.as_ref().is_none_or(|nodes| nodes.contains(&focus));
-                !already_checked && validator_before.is_focus(&shapes.shapes[root], focus)
+            let already_checked = |root, focus| {
+                root == shape && affected.as_ref().is_none_or(|nodes| nodes.contains(&focus))
             };
             let mut dropped = 0;
             for (i, result) in after_results.into_iter().enumerate() {
@@ -192,17 +196,9 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
                     before_routes = Some(BeforeRoutes::new(shapes, &walk_budget, resources)?);
                 }
                 let routes = before_routes
-                    .as_ref()
+                    .as_mut()
                     .expect("the reverse shape references");
-                if routes.reaches_target(
-                    shapes,
-                    &graph_before,
-                    (result.shape, result.focus),
-                    unchecked_target,
-                    &walk_budget,
-                    resources,
-                )? && validator_before.has_result(&result)
-                {
+                if routes.contains(&validator_before, &graph_before, &result, already_checked)? {
                     dropped += result.retained_bytes();
                     continue;
                 }
@@ -478,7 +474,10 @@ fn predicates(
                 }
                 Constraint::Nested(nested) => {
                     for child in nested.references() {
-                        if child != root && seen.get_or_insert_with(child, || ())?.1 {
+                        if child != root
+                            && !shapes.shapes[child].deactivated
+                            && seen.get_or_insert_with(child, || ())?.1
+                        {
                             pending.push(child)?;
                         }
                     }
@@ -562,7 +561,12 @@ fn affected<A: ReadView, B: ReadView>(
                 if before.cancelled() {
                     return Ok(None);
                 }
-                debug_assert!(child != current && !callers.contains(&child));
+                if shapes.shapes[child].deactivated {
+                    continue;
+                }
+                if child == current || callers.contains(&child) {
+                    return Ok(None);
+                }
                 callers.park(current, frame)?;
                 frame = AffectedFrame {
                     parent: Some(current),

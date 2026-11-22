@@ -89,11 +89,28 @@ Validate RDF data against SHACL shapes, natively and fast enough to run on every
   - subjects and objects of changed statements, carried backwards along each shape's paths to the focus nodes that reach them;
   - nodes whose target membership changed (a type added or removed).
 
-  It validates only those, against the transaction's state.
+  It compares results at those foci before and after the change. A result may also have
+  been reported at its source shape and focus through another target in the state before.
+  The gate checks backward along the reporting paths, sharing a verdict per candidate
+  (shape, focus) and a limit of 100,000 pair visits per call. If the walk exceeds that
+  limit, it checks against whole validations in the state before, once per targeted
+  ancestor of the candidate shapes. Individual compound property paths can still expand
+  before the walk counts the pairs they yield.
+- **Full validation cases.** Closed and SPARQL constraints, changes to `rdfs:subClassOf`,
+  and affected sets over 100,000 nodes can require validating a targeted shape whole.
+  When any active target can reach a cycle through active shape references, a nonempty
+  data change runs full validation of every target in the state after and, if it has
+  results, in the state before. Besides the full validations, it sorts the earlier
+  result keys, searches them for each later result, then sorts and deduplicates the
+  surviving results. Peak memory can include both raw result sets, the comparison keys
+  for the earlier results and the state after's failures, charged to the request.
 - **Existing invalid data** (shapes added later, data loaded in bulk): as with inconsistency, the store reports it and isn't bricked. A commit is rejected for results it introduces, not for ones that were already there.
 - **Changing the shapes graph** recompiles the shapes and revalidates in full.
 - **Cancellation:** the gate polls the same stop check as commit-path reasoning.
-- **Gate:** incremental validation equals full revalidation on random deltas (differential test), and its cost follows the number of affected focus nodes.
+- **Gate:** on random deltas the reported results equal the full after report less the
+  full before report. Incremental validation limits the affected focus and reverse route
+  walks, with the whole validations above when a walk exceeds its limit or a shape
+  requires them.
 
 This slice needs the per-repository configuration of D1 first.
 

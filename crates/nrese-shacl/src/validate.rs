@@ -205,6 +205,11 @@ impl TaskResults {
         }
     }
 
+    /// Membership in a comparison-only task sorted by [`Validator::results_at`].
+    pub(crate) fn contains(&self, result: &RawResult) -> bool {
+        self.list.binary_search(result).is_ok()
+    }
+
     /// Drops the results from `start` on, then returns their charge.
     fn truncate(&mut self, start: usize) {
         let dropped: usize = self.list[start..]
@@ -822,13 +827,14 @@ impl<'a, V: ReadView> Validator<'a, V> {
         })
     }
 
-    /// A result at its source shape and focus. In acyclic shapes the validation at this
-    /// pair is independent of its callers, so any reporting route produces the same results.
-    pub(crate) fn has_result(&self, result: &RawResult) -> bool {
+    /// Results at a source shape and focus, sorted for membership checks. In acyclic
+    /// shapes the validation at this pair is independent of its callers.
+    pub(crate) fn results_at(&self, shape: ShapeRef, focus: TermId) -> TaskResults {
         let mut task = TaskResults::new(&self.results_budget);
         let mut walk = nesting::Walk::new(&self.results_budget);
-        self.validate_node(result.shape, result.focus, &mut task, &mut walk);
-        task.list.contains(result)
+        self.validate_node(shape, focus, &mut task, &mut walk);
+        task.list.sort_unstable();
+        task
     }
 
     /// Whether `node` is a SHACL instance of `class`: typed by it or by a subclass.

@@ -106,7 +106,7 @@ pub fn compile_until<V: ReadView>(
         shapes: Vec::new(),
         index: HashMap::new(),
         numbering: Vec::new(),
-        has_cycles: false,
+        may_have_cycles: false,
         errors: Vec::new(),
         components: Vec::new(),
     };
@@ -134,7 +134,7 @@ pub fn compile_until<V: ReadView>(
     if compiler.graph.cancelled() {
         None
     } else if compiler.errors.is_empty() {
-        Some(Ok(Shapes {
+        let mut shapes = Shapes {
             shapes: compiler.shapes,
             index: compiler.index,
             graph: match shapes_graph.graphs {
@@ -142,11 +142,62 @@ pub fn compile_until<V: ReadView>(
                 _ => None,
             },
             entailments,
-            has_cycles: compiler.has_cycles,
-        }))
+            has_cycles: false,
+        };
+        if compiler.may_have_cycles {
+            shapes.has_cycles = active_cycles(&shapes, cancellation)?;
+        }
+        Some(Ok(shapes))
     } else {
         Some(Err(compiler.errors))
     }
+}
+
+/// Compilation visits all references for diagnostics and numbering. A data change needs
+/// full validation only when a cycle can be followed from an active target.
+fn active_cycles(shapes: &Shapes, cancellation: Option<&CancellationToken>) -> Option<bool> {
+    fn children(shape: &Shape) -> impl Iterator<Item = ShapeRef> + '_ {
+        shape
+            .constraints
+            .iter()
+            .filter_map(|constraint| match constraint {
+                Constraint::Nested(nested) => Some(nested),
+                _ => None,
+            })
+            .flat_map(NestedConstraint::references)
+    }
+
+    let mut visiting = vec![None; shapes.len()];
+    let mut stack = Vec::new();
+    for root in shapes.targeted() {
+        if visiting[root].is_some() {
+            continue;
+        }
+        visiting[root] = Some(true);
+        stack.push((root, children(&shapes.shapes[root])));
+        while let Some((shape, references)) = stack.last_mut() {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return None;
+            }
+            let Some(child) = references.next() else {
+                visiting[*shape] = Some(false);
+                stack.pop();
+                continue;
+            };
+            if shapes.shapes[child].deactivated {
+                continue;
+            }
+            match visiting[child] {
+                Some(true) => return Some(true),
+                Some(false) => {}
+                None => {
+                    visiting[child] = Some(true);
+                    stack.push((child, children(&shapes.shapes[child])));
+                }
+            }
+        }
+    }
+    (!cancellation.is_some_and(CancellationToken::is_cancelled)).then_some(false)
 }
 
 struct Compiler<'a, V: ReadView> {
@@ -159,7 +210,7 @@ struct Compiler<'a, V: ReadView> {
     index: HashMap<TermId, ShapeRef>,
     // The depth-first number of each interned slot, or None while it is pending.
     numbering: Vec<Option<NumberedShape>>,
-    has_cycles: bool,
+    may_have_cycles: bool,
     errors: Vec<ShapeError>,
     /// The shapes graph's SPARQL-based constraint components.
     components: Vec<ComponentDef>,
@@ -414,7 +465,7 @@ impl<V: ReadView> Compiler<'_, V> {
                 let child = *reference;
                 if let Some(number) = self.numbering[child] {
                     // Only a reference into the active branch closes a cycle.
-                    self.has_cycles |= number.visiting;
+                    self.may_have_cycles |= number.visiting;
                     *reference = number.position;
                 } else {
                     *reference = next;
