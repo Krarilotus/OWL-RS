@@ -81,6 +81,8 @@ pub struct Tbox {
     base_sup: HashMap<Role, HashSet<Role>>,
     reflexive: HashSet<Term>,
     data: HashSet<Term>,
+    /// Each universal property, with whether its target domain is data.
+    universal: HashMap<Term, bool>,
     pub(crate) generators: Vec<Generator>,
     pub(crate) types: Vec<Type>,
     /// Per role, the types whose incoming role is included in it: the elements an edge of
@@ -239,16 +241,27 @@ impl Tbox {
             .or_else(|| self.hazards.affected.get(&term).copied())
     }
 
-    /// Whether some answer through anonymous individuals may be missing: a term has a
-    /// [`Self::concern`].
+    /// Whether a query may need a completeness warning even without tree witnesses.
     pub fn has_concerns(&self) -> bool {
-        self.hazards.global.is_some() || !self.hazards.affected.is_empty()
+        self.hazards.global.is_some()
+            || !self.hazards.affected.is_empty()
+            || self.has_universal_roles()
+    }
+
+    /// Whether any property in the schema relates its entire pair of domains.
+    pub fn has_universal_roles(&self) -> bool {
+        !self.universal.is_empty()
+    }
+
+    /// The kind of a universal property's target, if the property is universal.
+    pub fn universal_role_is_data(&self, property: Term) -> Option<bool> {
+        self.universal.get(&property).copied()
     }
 
     /// Whether the rewriting may change an atom on `term` (a class or property): for the
     /// patterns it doesn't enter, which then may miss answers.
     pub fn rewrites_term(&self, term: Term) -> bool {
-        !self.is_empty() && self.rewritable.contains(&term)
+        self.universal.contains_key(&term) || (!self.is_empty() && self.rewritable.contains(&term))
     }
 
     /// The hazard that reaches every term, if there is one.
@@ -852,17 +865,24 @@ impl Builder {
         // Every individual has an edge of each top role and each role above it.
         // A stored edge is still required for the base domain and range rules.
         let thing = self.basic(Basic::Thing);
-        let mut universal: Vec<u32> = [
-            builtin.top_object.map(ObjProp::Named),
-            builtin.top_object.map(ObjProp::Inverse),
-            builtin.top_data.map(ObjProp::Named),
-        ]
-        .into_iter()
-        .flatten()
-        .filter_map(|top| self.tbox.sup.get(&top))
-        .flatten()
-        .map(|&role| self.tbox.ids[&Basic::Exists(role)])
-        .collect();
+        let mut universal = Vec::new();
+        for (top, is_data) in [
+            (builtin.top_object.map(ObjProp::Named), false),
+            (builtin.top_object.map(ObjProp::Inverse), false),
+            (builtin.top_data.map(ObjProp::Named), true),
+        ] {
+            let Some(top) = top else { continue };
+            for &role in self.tbox.sup.get(&top).into_iter().flatten() {
+                let property = role.named();
+                universal.push(self.tbox.ids[&Basic::Exists(role)]);
+                if object(&role) != is_data
+                    && Some(property) != builtin.top_object
+                    && Some(property) != builtin.top_data
+                {
+                    self.tbox.universal.insert(property, is_data);
+                }
+            }
+        }
         universal.sort_unstable();
         universal.dedup();
         for target in universal {
