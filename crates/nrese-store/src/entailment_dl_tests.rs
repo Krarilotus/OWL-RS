@@ -124,30 +124,6 @@ fn a_dl_check_out_of_time_leaves_the_answer_undecided() {
     );
 }
 
-/// The store's check of `conclusion` under `owl2-dl` with `dl.timeout` 300 ms over `data`,
-/// its rules' pass taking 600 ms when `late`.
-fn entails_in_300_ms(data: &str, conclusion: &[Triple], late: bool) -> String {
-    let dl = DlConfig {
-        timeout: Some(Duration::from_millis(300)),
-        ..DlConfig::default()
-    };
-    let (store, _pipeline) = dl_store(dl, data);
-    let rules = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl)
-        .materialised_program()
-        .unwrap();
-    if late {
-        hooks::BETWEEN_ENTAILMENT_HALVES.set(Some(Box::new(|| {
-            std::thread::sleep(Duration::from_millis(600));
-        })));
-    }
-    let answer = store.entails(rules, conclusion);
-    hooks::BETWEEN_ENTAILMENT_HALVES.set(None);
-    match answer {
-        Err(crate::StoreError::Undecided(_)) => "undecided".to_owned(),
-        other => format!("{other:?}"),
-    }
-}
-
 /// The ground statement `:s <predicate> <object>`, both full IRIs.
 fn ground(s: &str, predicate: &str, object: &str) -> Triple {
     let named = NamedNode::new_unchecked;
@@ -156,38 +132,43 @@ fn ground(s: &str, predicate: &str, object: &str) -> Triple {
 
 const OWL: &str = "http://www.w3.org/2002/07/owl#";
 
-/// Spec (`entails` under `owl2-dl`: one `dl.timeout` from the call, which the rules' pass
-/// spends too): where the rules leave a ground conclusion (`:C ⊑ ⊥`) to the DL engines and
-/// their pass uses up the time, the DL check gets none and the answer is undecided; with
-/// the time, entailed.
+/// Spec (`entails` under `owl2-dl`: one `dl.timeout` from the call): where the time is used
+/// up before the DL check starts, it gets none and the answer to a ground conclusion
+/// (`:C ⊑ ⊥`) is undecided; with the time, entailed.
 #[test]
-fn a_rules_pass_that_uses_up_the_time_leaves_the_dl_check_none() {
+fn time_spent_before_the_dl_check_leaves_it_none() {
     let conclusion = [ground(
         "C",
         "http://www.w3.org/2000/01/rdf-schema#subClassOf",
         &format!("{OWL}Nothing"),
     )];
-    assert_eq!(
-        [false, true].map(|late| entails_in_300_ms(EMPTY_C, &conclusion, late)),
-        ["Ok(Entailed)".to_owned(), "undecided".to_owned()]
-    );
-}
-
-/// Spec (as above): an answer the rules find after the time is up is no answer either;
-/// within it, entailed.
-#[test]
-fn a_rules_answer_past_the_time_is_undecided() {
-    let data = ":D rdfs:subClassOf :C . :x a :D .";
-    let conclusion = vec![Triple::new(iri("x"), nrese_rdf::vocab::rdf::TYPE, iri("C"))];
-    assert_eq!(
-        [false, true].map(|late| entails_in_300_ms(data, &conclusion, late)),
-        ["Ok(Entailed)".to_owned(), "undecided".to_owned()]
-    );
+    let answers = [false, true].map(|late| {
+        let dl = DlConfig {
+            timeout: Some(Duration::from_millis(300)),
+            ..DlConfig::default()
+        };
+        let (store, _pipeline) = dl_store(dl, EMPTY_C);
+        let rules = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl)
+            .materialised_program()
+            .unwrap();
+        if late {
+            hooks::AFTER_CERTIFIED.set(Some(Box::new(|| {
+                std::thread::sleep(Duration::from_millis(600));
+            })));
+        }
+        let answer = store.entails(rules, &conclusion);
+        hooks::AFTER_CERTIFIED.set(None);
+        match answer {
+            Err(crate::StoreError::Undecided(_)) => "undecided".to_owned(),
+            other => format!("{other:?}"),
+        }
+    });
+    assert_eq!(answers, ["Ok(Entailed)".to_owned(), "undecided".to_owned()]);
 }
 
 /// Spec (`entails` under `owl2-dl`: one `dl.timeout` from the call; past it, no answer of
-/// any kind): data inconsistent under the rules entails everything, but that found after
-/// the time is up is no answer; within it, `InconsistentPremise`.
+/// any kind): inconsistent data entails everything, but that found after the time is up is
+/// no answer; within it, `InconsistentPremise`.
 #[test]
 fn an_inconsistent_premise_found_past_the_time_is_undecided() {
     let answers = [false, true].map(|late| {
@@ -263,10 +244,10 @@ fn the_empty_conclusion_past_the_time_is_unknown() {
     assert_eq!(answers, ["Yes".to_owned(), "unknown".to_owned()]);
 }
 
-/// Spec (`entailment` module docs: under `owl2-dl` the rules decide plain ground
-/// assertions): a ground conclusion the rules show is entailed with no DL check.
+/// Spec (`entailment` module docs: under `owl2-dl` the DL engines decide the whole
+/// conclusion): a ground conclusion the closure holds is entailed by the DL check.
 #[test]
-fn a_ground_conclusion_the_rules_show_takes_no_dl_check() {
+fn a_ground_conclusion_the_closure_holds_takes_the_dl_check() {
     let (store, _pipeline) = dl_store(DlConfig::default(), ":D rdfs:subClassOf :C . :x a :D .");
     let rules = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl)
         .materialised_program()
@@ -286,7 +267,7 @@ fn a_ground_conclusion_the_rules_show_takes_no_dl_check() {
             format!("{answer:?}"),
             checked.load(std::sync::atomic::Ordering::Relaxed)
         ),
-        ("Ok(Entailed)".to_owned(), false),
+        ("Ok(Entailed)".to_owned(), true),
         "the answer, whether the DL check ran"
     );
 }

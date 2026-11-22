@@ -18,12 +18,12 @@
 //!
 //! The answer is sound; it is complete as far as the rules are for the premise (OWL 2 RL
 //! premises and the forms above). A conclusion outside them may be entailed although the
-//! answer is no, except under `owl2-dl`. There none of the above applies: the rules show a
-//! conclusion only if it is ground and the closure holds each of its statements as it is
-//! (one membership test each, nothing set aside, read as a form or evaluated); any other
-//! the DL engines decide whole ([`StoreService::entails_dl`]), an
-//! [`StoreError::Undecided`] error where they can't. The whole check has one `dl.timeout`
-//! from the call; past it, the answer is undecided.
+//! answer is no, except under `owl2-dl`. There none of the above applies, as the closure
+//! proves nothing under the Direct Semantics (an annotation property's domain puts its
+//! subjects in the closure, for one): the DL engines decide the whole conclusion
+//! ([`StoreService::entails_dl`]), an [`StoreError::Undecided`] error where they can't,
+//! within one `dl.timeout` from the call. A store whose rules' consistency is undecided
+//! gives no answer in any mode.
 //! Refutation uses the store's process-memory watch; interruption is an error, never
 //! a negative entailment answer or an assumed-unreachable panic.
 
@@ -76,7 +76,7 @@ impl StoreService {
         conclusion: &[Triple],
     ) -> StoreResult<Entailment> {
         let program = program.into();
-        // Under owl2-dl, one dl.timeout from the call: the rules' pass and the DL check spend it.
+        // Under owl2-dl, one dl.timeout from the call.
         let deadline = match self.dl().active() {
             true => Deadline::after(self.config().dl.timeout),
             false => Deadline::NONE,
@@ -88,10 +88,6 @@ impl StoreService {
         let epoch = self.certificate_epoch();
         if epoch.is_multiple_of(2) {
             let answer = self.entails_once(&program, conclusion, deadline)?;
-            // No answer of any kind found past the deadline, an inconsistent premise's included.
-            if deadline.passed() {
-                return Err(out_of_time());
-            }
             if self.certificate_epoch() == epoch {
                 return Ok(answer);
             }
@@ -103,7 +99,7 @@ impl StoreService {
     }
 
     /// One try of [`Self::entails`]; it stands only if the certificate didn't change meanwhile.
-    /// Past `deadline`, no answer.
+    /// Under owl2-dl, decided by the DL engines before `deadline`.
     fn entails_once(
         &self,
         program: &RuleProgram,
@@ -118,32 +114,21 @@ impl StoreService {
         }
         #[cfg(test)]
         crate::service::hooks::run(&crate::service::hooks::AFTER_CERTIFIED);
-        match self.consistency() {
-            crate::ConsistencyStatus::Inconsistent { .. } => {
-                return Ok(Entailment::InconsistentPremise);
-            }
-            // Not known to entail everything: no answer.
-            crate::ConsistencyStatus::Undecided { violations, why } => {
-                return Err(StoreError::Undecided(why.text(violations)));
-            }
-            _ => {}
+        let consistency = self.consistency();
+        // Not known to entail everything, nor not to: no answer.
+        if let crate::ConsistencyStatus::Undecided { violations, why } = consistency {
+            return Err(StoreError::Undecided(why.text(violations)));
         }
-        // One revision for the whole answer: the closure's read, every refutation and the DL
-        // check are of it.
-        let at = self.engine().snapshot();
-        // The rules are complete under the Direct Semantics only for OWL 2 RL premises
-        // (OWL 2 Profiles §4.3, PR1). Under owl2-dl they show a conclusion only by holding each
-        // of its statements, as it is: anything else, and what they don't hold, the DL engines
-        // decide whole.
+        // Under owl2-dl the closure is no proof, its inconsistency included: the DL engines
+        // decide, the premise's consistency too.
         if self.dl().active() {
-            let held = conclusion.iter().all(ground) && holds_each(&at, conclusion, deadline)?;
-            #[cfg(test)]
-            crate::service::hooks::run(&crate::service::hooks::BETWEEN_ENTAILMENT_HALVES);
-            return match held {
-                true => Ok(Entailment::Entailed),
-                false => self.decided_by_dl(&at, conclusion, deadline),
-            };
+            return self.decided_by_dl(&self.engine().snapshot(), conclusion, deadline);
         }
+        if let crate::ConsistencyStatus::Inconsistent { .. } = consistency {
+            return Ok(Entailment::InconsistentPremise);
+        }
+        // One revision for the whole answer: the closure's read and every refutation are of it.
+        let at = self.engine().snapshot();
         match self.shown_by_rules(&at, program, &split(conclusion))? {
             true => Ok(Entailment::Entailed),
             false => Ok(Entailment::NotEntailed),
@@ -257,36 +242,8 @@ impl StoreService {
     }
 }
 
-/// Whether the closure at `at` holds each statement of `conclusion` as it is, in the
-/// default graph: one membership test each, before `deadline`.
-fn holds_each(at: &Snapshot, conclusion: &[Triple], deadline: Deadline) -> StoreResult<bool> {
-    for t in conclusion {
-        if deadline.passed() {
-            return Err(out_of_time());
-        }
-        let quad = Quad::new(
-            t.subject.clone(),
-            t.predicate.clone(),
-            t.object.clone(),
-            GraphName::DefaultGraph,
-        );
-        if !at
-            .lookup_quad(quad.as_ref())
-            .is_some_and(|q| at.contains(&q))
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
 /// Why an entailment check that saw a commit after its start gives no answer.
 const CHANGED: &str = "the data changed during the entailment check: ask again";
-
-/// An entailment check whose deadline passed gives no answer.
-fn out_of_time() -> StoreError {
-    StoreError::Undecided(nrese_dl::limits::Limit::Time.reached("the deadline passed"))
-}
 
 /// `triple` as a SPARQL triple pattern: see [`term_pattern`].
 fn triple_pattern(triple: &Triple) -> String {
@@ -424,16 +381,6 @@ fn split(conclusion: &[Triple]) -> Split {
 }
 
 const OWL_ONTOLOGY: &str = "http://www.w3.org/2002/07/owl#Ontology";
-
-/// Whether `triple` has no blank node, at any depth.
-fn ground(triple: &Triple) -> bool {
-    !matches!(triple.subject, NamedOrBlankNode::BlankNode(_))
-        && match &triple.object {
-            Term::BlankNode(_) => false,
-            Term::Triple(t) => ground(t),
-            _ => true,
-        }
-}
 
 /// The items of the RDF list at `head` in `triples`, and its nodes; `None` if malformed.
 fn list_items(triples: &[Triple], head: &Term) -> Option<(Vec<Term>, Vec<NamedOrBlankNode>)> {
