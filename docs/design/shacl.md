@@ -104,6 +104,19 @@ Validate RDF data against SHACL shapes, natively and fast enough to run on every
   result keys, searches them for each later result, then sorts and deduplicates the
   surviving results. Peak memory can include both raw result sets, the comparison keys
   for the earlier results and the state after's failures, charged to the request.
+- **Measured** (4 cores, LUBM 10's asserted data: 1,272,868 statements; one `enforce` commit
+  inserting a new node that no shape faults; the median of 5 timed commits and of 5
+  measured for their peak):
+  - With LUBM's shapes and no SPARQL constraint, a commit took 4.8 ms and peaked at 1.7 MB.
+  - With one recursive shape added (`ex:Person`, whose `ub:advisor` values must conform to
+    `ex:Person` again, through `sh:node`), it
+    took 87 ms and peaked at 12.0 MB. The full validation it runs takes 57 ms on that store.
+    Before this check, the gate took 4.8 ms there and could miss a result.
+  - With LUBM's SPARQL shape too, a commit took 32 s without the recursive shape and 36 s
+    with it (peaks 36 MB and 45 MB), since a SPARQL constraint is validated whole.
+  - Without cycles, the reverse walk keeps the incremental path's cost. On the same data, a
+    one-statement change took 2.6 ms under shallow shapes and 3.5 ms under shapes reached
+    from several targets, as before the walk. Comparing whole validations takes 56–83 ms.
 - **Existing invalid data** (shapes added later, data loaded in bulk): as with inconsistency, the store reports it and isn't bricked. A commit is rejected for results it introduces, not for ones that were already there.
 - **Changing the shapes graph** recompiles the shapes and revalidates in full.
 - **Cancellation:** the gate polls the same stop check as commit-path reasoning.
