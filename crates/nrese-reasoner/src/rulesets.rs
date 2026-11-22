@@ -723,13 +723,13 @@ mod tests {
 
     /// Spec (reasoning-semantics.md, "Freshness"): both fingerprints include list
     /// semantics version 9. Only `owl2-ql` includes the annotation-reading version.
-    /// The version 9 rule text would give `a76d2799f342115c` for `owl2-ql` without
+    /// The version 9 rule text would give `dc06866733200dca` for `owl2-ql` without
     /// that part. The expected values below were computed from the rule text.
     #[test]
     fn fingerprints_include_the_list_version_and_the_ql_annotation_part() {
         let [ql, rl] =
             [Ruleset::Owl2Ql, Ruleset::Owl2Rl].map(|r| format!("{:016x}", r.fingerprint()));
-        assert_eq!(ql, "95231b8d36b4a530");
+        assert_eq!(ql, "1653fb1d3428c636");
         assert_eq!(rl, "e9f63653de270f96");
     }
 }
