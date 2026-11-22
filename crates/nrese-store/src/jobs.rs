@@ -391,7 +391,10 @@ mod tests {
     }
 
     // Spec: docs/ops/http-api.md says a failed job's error is its load's message. A load that
-    // returned an unsettled commit -> `failed` with the engine's own words for it.
+    // returned an unsettled commit -> `failed` with the engine's own words for it. This checks
+    // the error's mapping and the registry, not the import route's forwarding of the error:
+    // nothing outside the engine can make a load return it, and the engine is not this
+    // change's to touch.
     #[test]
     fn a_returned_unsettled_commit_keeps_its_own_words() {
         let jobs = Arc::new(Jobs::default());
