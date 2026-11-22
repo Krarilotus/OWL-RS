@@ -353,8 +353,8 @@ impl<V: ReadView> Compiler<'_, V> {
         shape
     }
 
-    /// Fills every shape reachable from `roots`, or `None` if cancelled. A shape's own errors
-    /// come before those of the shapes it refers to.
+    /// Fills every shape reachable from `roots`, or `None` if cancelled. Errors come in the
+    /// order the shapes are first visited.
     fn compile_shapes(&mut self, roots: BTreeSet<TermId>) -> Option<()> {
         // References start as interned slots. Visit them one at a time so a child can
         // reach a pending sibling before the parent does, then replace each with its number.
