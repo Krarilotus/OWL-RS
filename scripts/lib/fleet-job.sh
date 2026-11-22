@@ -98,7 +98,10 @@ import datetime, json, sys
 j = json.load(sys.stdin)
 if j.get("state"):
     try:
-        at = datetime.datetime.strptime(j["expected_start"], "%Y-%m-%dT%H:%M:%S")
+        form = "%Y-%m-%dT%H:%M:%S"
+        at = datetime.datetime.strptime(j["expected_start"], form)
+        if at.strftime(form) != j["expected_start"]:  # strptime also takes a `t`, or unpadded fields
+            raise ValueError
         basis = j.get("basis") or ""
         print(int(at.timestamp()), at.strftime("%H:%M") + (f" ({basis})" if basis else ""))
     except (KeyError, TypeError, ValueError, OverflowError, OSError):

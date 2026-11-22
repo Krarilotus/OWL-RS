@@ -7,6 +7,7 @@ Run: python -m unittest discover -s benches/suite/tests -p test_fleet_follow.py
 An assertion tagged `SPEC <tag>` states the behaviour its test is for.
 """
 
+import datetime
 import json
 import time
 import unittest
@@ -272,21 +273,26 @@ class FleetFollow(push.Repo):
         not in the fleet's local YYYY-MM-DDTHH:MM:SS form, or the answer of a status call that failed,
         however good) is never taken as fitting:
         the fixed window holds, and the job is cancelled when it ends, with no verdict. Here the window is
-        3 s and the job would start after 6 s, well inside what a start expected 30 s on (a 1 min
-        estimate, a 120 s limit) would hold open."""
-        fits = pending(expected_start=expected(30), basis="its reservation")
-        for name, replies in (
-                ("none", [f"+1 {pending()}"] * 6),
-                ("null", [f"+1 {pending(expected_start=None, basis='not estimated')}"] * 6),
-                ("malformed", [f"+1 {pending(expected_start='soon')}"] * 6),
-                ("a number", [f"+1 {pending(expected_start=1795330592)}"] * 6),
-                ("a zone offset", [f"+1 {pending(expected_start=expected(30) + '+01:00')}"] * 6),
-                ("no seconds", [f"+1 {pending(expected_start=expected(30)[:16])}"] * 6),
-                ("a failed call's", [f"+1 {pending()}", f"!{fits}", *[f"+1 {pending()}"] * 5])):
+        3 s and the job would start after 6 s, well inside what each start time, read as a time, would
+        hold open: 30 to 90 s on, with a 1 min estimate and a 200 s limit. Each is made as its case runs."""
+        def zoned():  # 30 s on, as an instant with its zone: the same time on any host's clock
+            return (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=30)).isoformat("T", "seconds")
+
+        cases = (
+            ("none", lambda: [f"+1 {pending()}"] * 6),
+            ("null", lambda: [f"+1 {pending(expected_start=None, basis='not estimated')}"] * 6),
+            ("malformed", lambda: [f"+1 {pending(expected_start='soon')}"] * 6),
+            ("a number", lambda: [f"+1 {pending(expected_start=1795330592)}"] * 6),
+            ("a zone offset", lambda: [f"+1 {pending(expected_start=zoned())}"] * 6),
+            ("no seconds", lambda: [f"+1 {pending(expected_start=expected(90)[:16])}"] * 6),
+            ("a lowercase t", lambda: [f"+1 {pending(expected_start=expected(30).replace('T', 't'))}"] * 6),
+            ("a failed call's", lambda: [f"+1 {pending()}", f"!{pending(expected_start=expected(30))}",
+                                         *[f"+1 {pending()}"] * 5]))
+        for name, replies in cases:
             with self.subTest(name):
                 self.reset()
-                self.env.update(NRESE_GATE_START_S="3", NRESE_GATE_EST_MIN="1", NRESE_GATE_MAX_S="120")
-                self.play("status", *replies, state("running"), state("done"))
+                self.env.update(NRESE_GATE_START_S="3", NRESE_GATE_EST_MIN="1", NRESE_GATE_MAX_S="200")
+                self.play("status", *replies(), state("running"), state("done"))
                 self.play("results", self.results())
                 code, where, _, err = self.gate()
                 self.assertEqual((code, where, self.cancels()), (75, "", ["gate-1"]),
