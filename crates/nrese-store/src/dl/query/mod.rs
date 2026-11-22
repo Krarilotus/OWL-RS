@@ -818,7 +818,9 @@ pub(crate) fn certify_closure(
 /// report (`StoreService::status_outside_dl`), so the two are one value. Under `owl2-rl`, where
 /// the closure leaves out a list axiom (`lists_left_out`, asked only of a report still
 /// `complete` after the composition's other steps, so an earlier reason keeps its place), whose
-/// conclusions an answer may miss, it isn't `complete` ([`LIST`]); then the operator rule, last.
+/// conclusions an answer may miss, it isn't `complete` ([`LIST`]); then the store's conditions
+/// of the certificate `snapshot` carries ([`withhold`], as the answer's composition takes
+/// them, with its sources), and the operator rule, last.
 pub(crate) fn certify_report(
     completeness: Option<&mut Completeness>,
     query: (&Query, &Reads),
@@ -834,6 +836,18 @@ pub(crate) fn certify_report(
     let rl = completeness.regime == Some(nrese_sparql::Regime::Owl2Rl);
     if completeness.complete && rl && lists_left_out() {
         completeness.incomplete("rules", LIST.to_owned());
+    }
+    // With or without a certificate (`print-query --schema` prints over schema files nothing
+    // reasons over): the import is read from the statements; the literal equality, from it.
+    if let Some(snapshot) = snapshot {
+        let certificate = crate::service::Certificate::of(snapshot);
+        let source = if certificate.is_some_and(|c| c.dl) {
+            "dl"
+        } else {
+            "rules"
+        };
+        let state = certificate.map(|c| &c.state);
+        conditions(completeness, query, source, snapshot, state);
     }
     negation_rule(completeness, query, "ql");
 }
@@ -978,6 +992,238 @@ fn annotation_rule(
     let what = p.as_ref().map(|p| format!("reads <{p}>"));
     let what = what.unwrap_or_else(|| "may read any predicate".into());
     completeness.unsound(source, format!("the query {what} {COPIES}"));
+}
+
+/// Why a read of literals may miss rows while the rules equate a literal with another
+/// term ([`crate::ReasoningState::literal_equality`]).
+const LITERAL_EQUALITY: &str = "the rules equate two literals as one value (an owl:sameAs \
+                                between literals, which no store can hold), so a statement \
+                                of one may lack its copy with the other";
+
+/// [`LITERAL_EQUALITY`] as a reader by support is told it ([`may_equate_literals`]): whether the
+/// rules equate two literals is read from every graph.
+const LITERAL_EQUALITY_UNTOLD: &str = "the rules may equate two literals as one value (an \
+                                       owl:sameAs between literals, which no store can hold), \
+                                       so a statement of one may lack its copy with the other: \
+                                       a reader of some graphs isn't told whether they do";
+
+/// [`LITERAL_EQUALITY`] where it is unknown ([`crate::ReasoningState::literal_equality_unknown`]),
+/// told every reader alike.
+const LITERAL_EQUALITY_UNKNOWN: &str = "the store was opened without a rebuild of its \
+                                        inferences, so its rules may have equated two literals \
+                                        as one value (an owl:sameAs between literals, which no \
+                                        store can hold) and a statement of one may lack its copy \
+                                        with the other, until a rebuild (rematerialise) finds none";
+
+/// Whether the graphs a reader by support reads (`access`) may give its view an equality of two
+/// literals, read from its view alone (`snapshot`: what its graphs assert, and the inferences
+/// they support). An inference it sees has its support there, so an equality it misses copies
+/// of rests on premises there. The rules that conclude `owl:sameAs` read either one of these
+/// (a functional or inverse-functional property, a maximum cardinality, qualified or not, a
+/// key; an exact cardinality counted too) or an `owl:sameAs` (eq-sym, eq-trans: one with a
+/// literal), or conclude a property a schema term names (eq-rep-p, prp-spo1, prp-eqp, prp-inv,
+/// prp-symp, prp-trp, prp-spo2, cls-hv1), which is `owl:sameAs` only where a statement names it
+/// as a subject or an object. Each is read in the view, declarations the rules derive included.
+/// Rules other than a built-in ruleset's (`state`) may conclude one from anything.
+fn may_equate_literals(
+    snapshot: &Snapshot,
+    access: &nrese_sparql::GraphAccess,
+    state: &crate::ReasoningState,
+) -> bool {
+    const OWL: &str = "http://www.w3.org/2002/07/owl#";
+    if nrese_reasoner::rulesets::Ruleset::from_name(&state.ruleset).is_none() {
+        return true;
+    }
+    let id = |iri: &str| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into());
+    let owl = |name: &str| id(&format!("{OWL}{name}"));
+    // A statement of its view: asserted in a graph it reads, or inferred where it sees them.
+    let held = |pattern: QuadPattern| {
+        (snapshot.quads_for_pattern_in(ReadModel::Asserted, &pattern))
+            .any(|q| access.allows_id(snapshot, q.graph))
+            || (access.inferred && snapshot.exists_in(ReadModel::Inferred, &pattern))
+    };
+    let stated =
+        |p: Option<TermId>, o: Option<TermId>| p.is_some_and(|p| held(any_graph(None, Some(p), o)));
+    let ty = id(RDF_TYPE);
+    let typed = ["FunctionalProperty", "InverseFunctionalProperty"];
+    let axioms = [
+        "maxCardinality",
+        "maxQualifiedCardinality",
+        "cardinality",
+        "qualifiedCardinality",
+        "hasKey",
+    ];
+    let same = owl("sameAs");
+    (typed.iter()).any(|class| owl(class).is_some_and(|class| stated(ty, Some(class))))
+        || axioms.iter().any(|p| stated(owl(p), None))
+        || same.is_some_and(|same| {
+            holds_literals(snapshot, Some(same), Some(access))
+                || held(any_graph(Some(same), None, None))
+                || held(any_graph(None, None, Some(same)))
+        })
+}
+
+/// The conditions of the store under which a read that rests on reasoning isn't told
+/// `complete`, whatever its route (the closure, the QL rewriting, the bounds): one list,
+/// applied by `StoreService::assess`, and by [`certify_report`] to the QL rewriting's report,
+/// to a status under an OWL 2 regime, then the operator rule ([`negation_rule`]) over what it
+/// took away. Each entry: the condition, the reads it touches, its reason. A reader of some
+/// graphs is told nothing of the graphs it can't read.
+/// - The rules equate a literal with another term (`state`): a read of a property that may
+///   hold literals in `snapshot` ([`holds_literals`]; a variable predicate, any),
+///   [`LITERAL_EQUALITY`]. That condition is the whole store's, so a reader by support is told
+///   [`LITERAL_EQUALITY_UNTOLD`] of a read of a literal its view holds where its own graphs may
+///   equate one ([`may_equate_literals`]), whether the rules do or not, and a reader who sees
+///   every inference, never `complete` here (a rewriting's
+///   assessment is withheld from it, the closure alone is `sound-only`, and `owl2-dl` is
+///   `not-certified` to every reader of some graphs: `status_for_its_reader`), is told nothing
+///   of it. Where it is unknown since an open without a rebuild, every reader is told
+///   [`LITERAL_EQUALITY_UNKNOWN`], with no view consulted: every such open sets it, so it
+///   tells nothing of the data.
+/// - An import no loaded ontology answers ([`unread_import`]; for a reader of some graphs, in
+///   the graphs it reads): every read.
+pub(crate) fn withhold(
+    completeness: &mut Completeness,
+    (query, reads): (&Query, &Reads),
+    source: &'static str,
+    snapshot: &Snapshot,
+    state: &crate::ReasoningState,
+) {
+    if conditions(completeness, (query, reads), source, snapshot, Some(state)) {
+        negation_rule(completeness, (query, reads), source);
+    }
+}
+
+/// [`withhold`]'s conditions, without the operator rule; `false` (none taken) where the regime
+/// isn't one of OWL 2's.
+fn conditions(
+    completeness: &mut Completeness,
+    (query, reads): (&Query, &Reads),
+    source: &'static str,
+    snapshot: &Snapshot,
+    state: Option<&crate::ReasoningState>,
+) -> bool {
+    use nrese_sparql::Regime::{Owl2Dl, Owl2Ql, Owl2Rl};
+    if !matches!(completeness.regime, Some(Owl2Dl | Owl2Ql | Owl2Rl)) {
+        return false;
+    }
+    let access = reads.access.as_deref();
+    let literals = |predicate: &Option<String>| match predicate {
+        Some(p) => (snapshot.lookup(NamedNodeRef::new_unchecked(p).into()))
+            .is_some_and(|p| holds_literals(snapshot, Some(p), access)),
+        None => holds_literals(snapshot, None, access),
+    };
+    let read = reads.predicates.get_or_init(|| predicates(query));
+    let told = state.and_then(|state| match access {
+        _ if state.literal_equality_unknown => Some(LITERAL_EQUALITY_UNKNOWN),
+        None => state.literal_equality.then_some(LITERAL_EQUALITY),
+        Some(access) if access.inferred_by_support => {
+            (may_equate_literals(snapshot, access, state)).then_some(LITERAL_EQUALITY_UNTOLD)
+        }
+        Some(_) => None,
+    });
+    if let Some(reason) = told.filter(|_| read.iter().any(literals)) {
+        completeness.incomplete(source, reason.to_owned());
+    }
+    if let Some(target) = unread_import(snapshot, access) {
+        completeness.incomplete(
+            source,
+            format!(
+                "the store holds owl:imports {target}, and no ontology with that IRI is \
+                 loaded: its axioms take no part in reasoning"
+            ),
+        );
+    }
+    true
+}
+
+/// The W3C vocabulary documents, whose meaning is built in: an import of one counts as read.
+const BUILT_IN_ONTOLOGIES: [&str; 4] = [
+    "http://www.w3.org/1999/02/22-rdf-syntax-ns",
+    "http://www.w3.org/2000/01/rdf-schema",
+    "http://www.w3.org/2002/07/owl",
+    "http://www.w3.org/2001/XMLSchema",
+];
+
+/// The first ontology an asserted `owl:imports` names that the statements a read reasons over
+/// don't hold (OWL 2 Structural Specification §3.4): no `<t> a owl:Ontology` and no
+/// `?o owl:versionIRI <t>` among them, and not a W3C vocabulary ([`BUILT_IN_ONTOLOGIES`], with
+/// or without its trailing `#`). The store follows no import, so that ontology's axioms take
+/// no part in reasoning. Every `owl:imports` the store holds is checked, an imported
+/// ontology's own too, so the closure of imports is checked link by link. A document address
+/// is no ontology IRI: it is read only where a header names it. The statements read are the
+/// whole store's, or, for a reader of some graphs (`access`), its own graphs': a reader by
+/// support reasons over them alone, and one who sees every inference is told nothing of a
+/// graph it can't read. One index lookup where the store never held `owl:imports`.
+fn unread_import(
+    snapshot: &Snapshot,
+    access: Option<&nrese_sparql::GraphAccess>,
+) -> Option<String> {
+    let id = |iri: &str| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into());
+    let imports = id("http://www.w3.org/2002/07/owl#imports")?;
+    let readable = |g: TermId| access.is_none_or(|a| a.allows_id(snapshot, g));
+    let held = |pattern: QuadPattern| {
+        (snapshot.quads_for_pattern_in(ReadModel::Asserted, &pattern)).any(|q| readable(q.graph))
+    };
+    let (ty, ontology) = (id(RDF_TYPE), id("http://www.w3.org/2002/07/owl#Ontology"));
+    let version = id("http://www.w3.org/2002/07/owl#versionIRI");
+    let pattern = any_graph(None, Some(imports), None);
+    (snapshot.quads_for_pattern_in(ReadModel::Asserted, &pattern))
+        .filter(|q| readable(q.graph))
+        .map(|q| q.object)
+        .find(|&target| {
+            let built_in = matches!(snapshot.decode(target), Some(Term::NamedNode(iri))
+                if BUILT_IN_ONTOLOGIES.contains(&iri.as_str().trim_end_matches('#')));
+            let header = || {
+                ty.zip(ontology)
+                    .is_some_and(|(ty, o)| held(any_graph(Some(target), Some(ty), Some(o))))
+            };
+            let versioned =
+                || version.is_some_and(|v| held(any_graph(None, Some(v), Some(target))));
+            !(built_in || header() || versioned())
+        })
+        .map(|target| {
+            snapshot
+                .decode(target)
+                .map_or_else(|| format!("term {}", target.raw()), |t| t.to_string())
+        })
+}
+
+/// Whether a statement read with `predicate` (any, where `None`) has a literal object, of
+/// any kind: strings have spellings too (`"Rex"` and `"Rex"^^xsd:token`, `"Rex"@en` and
+/// `"Rex@en"^^rdf:PlainLiteral`). The literal kinds' ids are two ranges, so this is up to
+/// two seeks in the predicate-first index (object-first without a predicate); `true` where
+/// the index can't answer by range. For a reader of some graphs (`access`), a statement it
+/// reads: asserted in its graphs, or an inferred one where it sees them (`snapshot` is its
+/// view: a reader by support's holds the inferences its graphs support).
+fn holds_literals(
+    snapshot: &Snapshot,
+    predicate: Option<TermId>,
+    access: Option<&nrese_sparql::GraphAccess>,
+) -> bool {
+    use nrese_engine::{TermKind, quad::Permutation};
+    let mut pattern = QuadPattern::all();
+    pattern.predicate = predicate;
+    let index = predicate.map_or(Permutation::Ospg, |_| Permutation::Posg);
+    let held = |model, readable: &dyn Fn(TermId) -> bool| {
+        [
+            (TermKind::String, TermKind::TypedLiteral),
+            (TermKind::DerivedInteger, TermKind::DerivedInteger),
+        ]
+        .into_iter()
+        .any(|(first, last)| {
+            let (low, high) = (TermId::kind_range(first).0, TermId::kind_range(last).1);
+            (snapshot.scan_range_in(model, &pattern, index, low, high))
+                .is_none_or(|mut quads| quads.any(|q| readable(q.graph)))
+        })
+    };
+    match access {
+        None => held(ReadModel::Materialised, &|_| true),
+        Some(access) => {
+            held(ReadModel::Asserted, &|g| access.allows_id(snapshot, g))
+                || (access.inferred && held(ReadModel::Inferred, &|_| true))
+        }
+    }
 }
 
 /// Why a read [`annotation_rule`] names may give wrong rows.
