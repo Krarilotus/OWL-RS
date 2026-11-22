@@ -269,9 +269,16 @@ const CHAINED: &str = ":r rdfs:range :H . :H rdfs:subClassOf \
      [ a owl:Restriction ; owl:onProperty :f ; owl:hasValue \"1.0\"^^xsd:decimal ] . \
      :f a owl:DatatypeProperty , owl:FunctionalProperty . :s :r \"x\" .";
 
-/// The equalities of [`QUALIFIED`] and [`CHAINED`] rest on statements about literals, which
-/// the store never held: a reopened store, which finds an equality again over what it holds,
-/// finds them all the same.
+/// [`CHAINED`] with the literal's class from an enumeration (Table 6 cls-oo, a rule with no
+/// body) where the range gave it: no stored statement seeds the chain.
+const ENUMERATED: &str = ":H owl:oneOf ( \"1\"^^xsd:integer ) . :H rdfs:subClassOf \
+     [ a owl:Restriction ; owl:onProperty :f ; owl:hasValue \"1\"^^xsd:integer ] , \
+     [ a owl:Restriction ; owl:onProperty :f ; owl:hasValue \"1.0\"^^xsd:decimal ] . \
+     :f a owl:DatatypeProperty , owl:FunctionalProperty .";
+
+/// The equalities of [`QUALIFIED`], [`CHAINED`] and [`ENUMERATED`] rest on statements about
+/// literals, which the store never held: a reopened store, which finds an equality again over
+/// what it holds, finds them all the same.
 #[test]
 fn a_reopened_store_finds_an_equality_through_a_literal_typed_by_a_range() {
     let mut unmet = Vec::new();
@@ -281,6 +288,7 @@ fn a_reopened_store_finds_an_equality_through_a_literal_typed_by_a_range() {
             format!("{QUALIFIED} :s :p {INTEGER} , {DECIMAL} ."),
         ),
         ("chained", CHAINED.to_owned()),
+        ("enumerated", ENUMERATED.to_owned()),
     ];
     for mode in MODES {
         for (name, data) in &cases {
