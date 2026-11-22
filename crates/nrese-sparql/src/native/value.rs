@@ -1018,13 +1018,32 @@ mod tests {
         }
     }
 
-    /// [`order_key`] against [`order`] on every pair of canonical inline integers: each of the
-    /// 13 datatypes at the bounds of its value space and of the inline ranges, and at values
-    /// all of them share. The keys compare as [`order`] compares the terms, and give their
-    /// ids back. Swapping two ranks in `DERIVED_RANK` (`xsd:int`'s and `xsd:byte`'s) fails it.
+    /// [`order_key`] on canonical inline integers: each of the 13 datatypes at the bounds of
+    /// its value space and of the inline ranges, and at small values all of them share. Each
+    /// key holds the term's value plus 2^59 above its datatype's position among the 13 sorted
+    /// IRIs, gives the term's id back, and compares with every other key as [`order`] compares
+    /// the two terms. That comparison is exhaustive over these terms only; values between them
+    /// are covered by the key's form, the same affine map (value + 2^59) for every value of
+    /// one datatype, which keeps order and is undone exactly.
     #[test]
     fn order_key_is_term_order_on_inline_integers() {
         use nrese_engine::{Engine, EngineConfig, TermKind};
+        const BY_IRI: [&str; 13] = [
+            "byte",
+            "int",
+            "integer",
+            "long",
+            "negativeInteger",
+            "nonNegativeInteger",
+            "nonPositiveInteger",
+            "positiveInteger",
+            "short",
+            "unsignedByte",
+            "unsignedInt",
+            "unsignedLong",
+            "unsignedShort",
+        ];
+        assert!(BY_IRI.is_sorted());
         let (plain, derived) = (1i128 << 59, 1i128 << 55);
         let types: [(&str, i128, i128); 13] = [
             ("integer", i128::MIN, i128::MAX),
@@ -1041,7 +1060,7 @@ mod tests {
             ("unsignedByte", 0, u8::MAX.into()),
             ("positiveInteger", 1, i128::MAX),
         ];
-        let mut values: Vec<i128> = vec![-2, -1, 0, 1, 2];
+        let mut values: Vec<i128> = (-4..=4).collect();
         for bound in [
             plain,
             derived,
@@ -1073,15 +1092,18 @@ mod tests {
                     (-inline..inline).contains(&value),
                     "inline {term}"
                 );
-                terms.extend(id.map(|id| (term, id)));
+                terms.extend(id.map(|id| (term, id, value, datatype)));
             }
         }
         assert!(terms.len() > 150, "{} terms", terms.len());
-        for (term, id) in &terms {
+        for (term, id, value, datatype) in &terms {
             let key = order_key(*id).unwrap();
+            let rank = BY_IRI.iter().position(|d| d == datatype).unwrap();
+            assert_eq!(key & 15, rank as u64, "rank of {term}");
+            assert_eq!(i128::from(key >> 4), value + plain, "offset of {term}");
             assert!(key != 0 && key != u64::MAX, "{term}");
             assert_eq!(order_key_id(key), *id, "round trip of {term}");
-            for (other, other_id) in &terms {
+            for (other, other_id, ..) in &terms {
                 let ours = key.cmp(&order_key(*other_id).unwrap());
                 assert_eq!(
                     ours,

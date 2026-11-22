@@ -1,7 +1,7 @@
 //! Integers beyond signed 64-bit range: ORDER BY, MIN, MAX, comparisons, equality,
 //! grouping, casts, and non-panicking operators across native and reference evaluation.
 
-use nrese_engine::{Engine, EngineConfig, Snapshot};
+use nrese_engine::{EncodedQuad, Engine, EngineConfig, Snapshot, TermId, TermKind};
 use nrese_rdf::vocab::xsd;
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term};
 use nrese_sparql::{QueryOptions, QueryResults, evaluate_query, explain_query, runs_natively};
@@ -707,6 +707,52 @@ fn inline_subtype_ties_per_group_and_beside_other_aggregates() {
                 t("4", "int")
             ],
         ]
+    );
+}
+
+/// A replayed log record carries its object id as it was written, and an id of an inline
+/// derived integer may hold a datatype code no datatype has. MIN and MAX over a column with
+/// such an id and plain integers answer, by value, without a panic.
+#[test]
+fn min_and_max_beside_an_id_with_a_reserved_datatype_code() {
+    let engine = load([
+        (node("a"), node("v"), Term::from(typed("1", "integer"))),
+        (node("b"), node("v"), Term::from(typed("9", "integer"))),
+    ]);
+    // "3"^^xsd:byte's id with its datatype code (the payload's low four bits) set to 12,
+    // which no datatype has.
+    let byte = engine
+        .snapshot()
+        .lookup(Term::from(typed("3", "byte")).as_ref())
+        .unwrap();
+    let reserved = TermId::from_raw((byte.raw() & !15) | 12);
+    assert_eq!(reserved.kind(), TermKind::DerivedInteger);
+    assert_eq!(reserved.as_inline_integer(), Some(3));
+    let mut tx = engine.transaction();
+    let subject = tx.intern(Term::from(node("c")).as_ref());
+    let predicate = tx.intern(Term::from(node("v")).as_ref());
+    tx.insert_encoded(EncodedQuad::new(
+        subject,
+        predicate,
+        reserved,
+        TermId::DEFAULT_GRAPH,
+    ));
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let run = |body: &str| {
+        let text = format!("{PREFIX}{body}");
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        assert!(runs_natively(&query), "query must run natively: {text}");
+        collect_rows(evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap())
+    };
+
+    assert_eq!(
+        run("SELECT (MIN(?v) AS ?lo) { ?s :v ?v }"),
+        vec![vec![Some(Term::from(typed("1", "integer")))]]
+    );
+    assert_eq!(
+        run("SELECT (MAX(?v) AS ?hi) { ?s :v ?v }"),
+        vec![vec![Some(Term::from(typed("9", "integer")))]]
     );
 }
 
