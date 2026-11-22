@@ -499,21 +499,22 @@ impl<'v, 'p> Probe<'v, 'p> {
     }
 }
 
-/// A [`Source`]'s facts (all segments) for list instantiation, which is grounding: it runs
-/// to its end ([`Poller::never`]; a program grounded part-way would be kept as if whole).
-pub struct AllFacts<'a, S: ?Sized>(pub &'a S);
+/// A [`Source`]'s facts (all segments) for list instantiation. The caller checks
+/// the poller before using a program that may have been interrupted.
+pub struct AllFacts<'a, 'p, S: ?Sized>(pub &'a S, pub &'a Poller<'p>);
 
-impl<S: Source + ?Sized> Facts for AllFacts<'_, S> {
+impl<S: Source + ?Sized> Facts for AllFacts<'_, '_, S> {
     fn objects(&self, subject: u64, predicate: u64) -> Vec<u64> {
         let mut out = Vec::new();
-        self.0
-            .scan(
-                [Some(subject), Some(predicate), None],
-                Seg::All,
-                &Poller::never(),
-                &mut |t| out.push(t[2]),
-            )
-            .expect("never stopped");
+        let read = self.0.scan(
+            [Some(subject), Some(predicate), None],
+            Seg::All,
+            self.1,
+            &mut |t| out.push(t[2]),
+        );
+        if read.is_err() {
+            return Vec::new();
+        }
         out.sort_unstable();
         out.dedup();
         out
@@ -521,17 +522,21 @@ impl<S: Source + ?Sized> Facts for AllFacts<'_, S> {
 
     fn pairs(&self, predicate: u64) -> Vec<(u64, u64)> {
         let mut out = Vec::new();
-        self.0
-            .scan(
-                [None, Some(predicate), None],
-                Seg::All,
-                &Poller::never(),
-                &mut |t| out.push((t[0], t[2])),
-            )
-            .expect("never stopped");
+        let read = self
+            .0
+            .scan([None, Some(predicate), None], Seg::All, self.1, &mut |t| {
+                out.push((t[0], t[2]))
+            });
+        if read.is_err() {
+            return Vec::new();
+        }
         out.sort_unstable();
         out.dedup();
         out
+    }
+
+    fn stopped(&self) -> bool {
+        self.1.tick()
     }
 }
 
@@ -2013,15 +2018,19 @@ fn all_hold<S: Source + ?Sized>(
 /// The predicate `p` of a transitivity rule `(?x p ?y), (?y p ?z) -> (?x p ?z)`: `prp-trp`
 /// after grounding, `scm-sco` and `scm-spo` before.
 pub fn transitive_predicate(rule: &Rule) -> Option<u64> {
+    if !rule.guards.is_empty() {
+        return None;
+    }
+    transitive_shape(rule).map(|(p, _)| p)
+}
+
+fn transitive_shape(rule: &Rule) -> Option<(u64, [Term; 3])> {
     let ([a, b], Head::Facts(head)) = (rule.body.as_slice(), &rule.head) else {
         return None;
     };
     let [Atom([hx, Term::Const(p), hz])] = head.as_slice() else {
         return None;
     };
-    if !rule.guards.is_empty() {
-        return None;
-    }
     for (first, second) in [(a, b), (b, a)] {
         let (Atom([x, Term::Const(p1), y]), Atom([y2, Term::Const(p2), z])) = (first, second)
         else {
@@ -2029,10 +2038,83 @@ pub fn transitive_predicate(rule: &Rule) -> Option<u64> {
         };
         let distinct = matches!((x, y, z), (Term::Var(x), Term::Var(y), Term::Var(z)) if x != y && y != z && x != z);
         if distinct && p1 == p && p2 == p && y == y2 && x == hx && z == hz {
-            return Some(*p);
+            return Some((*p, [*x, *y, *z]));
         }
     }
     None
+}
+
+/// Transitivity over the subgraph induced by the terms that pass an annotation guard.
+/// Over representatives, a class passes exactly when at least one member passes.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct AnnotationFilter {
+    ids: super::ir::AnnotationIds,
+    classes: Option<super::ir::SharedClasses>,
+}
+
+impl AnnotationFilter {
+    fn allows(&self, id: u64, poll: &Poller<'_>) -> bool {
+        !self.ids.contains(id)
+            || self.classes.as_ref().is_some_and(|classes| {
+                classes.read().class_of(id).is_some_and(|members| {
+                    members
+                        .iter()
+                        .any(|&id| !poll.tick() && !self.ids.contains(id))
+                })
+            })
+    }
+
+    pub(crate) fn keeps(&self, s: u64, o: u64, poll: &Poller<'_>) -> bool {
+        self.allows(s, poll) && self.allows(o, poll)
+    }
+
+    fn guards(&self, terms: [Term; 3]) -> Vec<Guard> {
+        let guards = terms
+            .map(|term| Guard::NotAnnotation(term, self.ids.clone()))
+            .into();
+        match &self.classes {
+            Some(classes) => vec![Guard::OverClasses {
+                guards,
+                bound: Vec::new(),
+                classes: classes.clone(),
+            }],
+            None => guards,
+        }
+    }
+}
+
+/// Recognise the same unary test on every link variable. A test affecting only one
+/// position, or a test coupling variables, cannot use an induced subgraph.
+fn annotation_filter(guards: &[Guard], terms: &[Term]) -> Option<Option<AnnotationFilter>> {
+    if guards.is_empty() {
+        return Some(None);
+    }
+    let (guards, classes) = match guards {
+        [
+            Guard::OverClasses {
+                guards,
+                bound,
+                classes,
+            },
+        ] if bound.is_empty() => (guards.as_slice(), Some(classes)),
+        guards => (guards, None),
+    };
+    let [Guard::NotAnnotation(_, ids), ..] = guards else {
+        return None;
+    };
+    if guards.len() != terms.len()
+        || !terms.iter().all(|term| {
+            guards
+                .iter()
+                .any(|g| matches!(g, Guard::NotAnnotation(t, set) if t == term && set == ids))
+        })
+    {
+        return None;
+    }
+    Some((!ids.ids().is_empty()).then(|| AnnotationFilter {
+        ids: ids.clone(),
+        classes: classes.cloned(),
+    }))
 }
 
 /// `rule` without the head atoms that are one of its body atoms; `None` if no head is
@@ -2052,7 +2134,7 @@ fn without_tautologies(mut rule: Rule) -> Option<Rule> {
 }
 
 /// The schema link of `rule` if it is a closed family: one schema atom `(?a S ?b)` over
-/// two variables, one instance atom `A` mentioning `?a` and not `?b`, no guard, and one
+/// two variables, one instance atom `A` mentioning `?a` and not `?b`, and one
 /// head atom, `A` with `?a` replaced by `?b`. `cax-sco` (`S` = `rdfs:subClassOf`:
 /// `(?x type ?a) -> (?x type ?b)`) and `prp-spo1` (`rdfs:subPropertyOf`:
 /// `(?x ?a ?y) -> (?x ?b ?y)`) are such families.
@@ -2065,15 +2147,22 @@ fn without_tautologies(mut rule: Rule) -> Option<Rule> {
 /// produced: the investigation's idempotent propagators, which the batch executor uses
 /// to keep a deep hierarchy from re-deriving every inherited type once per ancestor.
 pub fn closed_family(schema: &Schema, rule: &Rule) -> Option<u64> {
+    closed_family_with_filter(schema, rule).map(|family| family.link)
+}
+
+#[derive(PartialEq, Eq, Clone)]
+struct ClosedFamily {
+    link: u64,
+    filter: Option<AnnotationFilter>,
+}
+
+fn closed_family_with_filter(schema: &Schema, rule: &Rule) -> Option<ClosedFamily> {
     let ([first, second], Head::Facts(heads)) = (rule.body.as_slice(), &rule.head) else {
         return None;
     };
     let [head] = heads.as_slice() else {
         return None;
     };
-    if !rule.guards.is_empty() {
-        return None;
-    }
     let (link, instance) = match (schema.is_schema_atom(first), schema.is_schema_atom(second)) {
         (true, false) => (first, second),
         (false, true) => (second, first),
@@ -2089,7 +2178,11 @@ pub fn closed_family(schema: &Schema, rule: &Rule) -> Option<u64> {
         Term::Var(v) if v == a => Term::Var(b),
         t => t,
     });
-    (head.0 == replaced).then_some(s)
+    if head.0 != replaced {
+        return None;
+    }
+    let filter = annotation_filter(&rule.guards, &[Term::Var(a), Term::Var(b)])?;
+    Some(ClosedFamily { link: s, filter })
 }
 
 /// Identity of a ground rule, for deduplication (the name doesn't matter).
@@ -2303,43 +2396,9 @@ impl<'a> Unpolled<'a> {
         fact: Triple,
         limit: usize,
     ) -> Vec<(String, Vec<Triple>)> {
-        let program = self.0;
-        let transitive = program
-            .transitive
-            .contains(&fact[1])
-            .then(|| transitivity(fact[1]));
-        let rules = self
-            .producers(fact)
-            .into_iter()
-            .map(|r| (&program.rules[r], Grounding::Rule(r)))
-            .chain(
-                transitive
-                    .as_ref()
-                    .map(|rule| (rule, Grounding::Transitive(fact[1]))),
-            );
-        let mut bodies = Vec::new();
-        let poll = Poller::never();
-        for (rule, grounding) in rules {
-            let alternatives = self.premise_alternatives(grounding);
-            derivations(source, rule, fact, Seg::All, &poll, &mut |bindings| {
-                let body: Vec<Triple> = rule
-                    .body
-                    .iter()
-                    .map(|atom| instantiate_head(atom, bindings))
-                    .collect();
-                for premises in &alternatives {
-                    let mut full = body.clone();
-                    full.extend_from_slice(premises);
-                    bodies.push((rule.name.clone(), full));
-                }
-                bodies.len() >= limit
-            })
-            .expect("never stopped");
-            if bodies.len() >= limit {
-                break;
-            }
-        }
-        bodies
+        self.0
+            .named_derivations_with(source, fact, limit, &Poller::never(), true)
+            .expect("never stopped")
     }
 
     /// Whether `fact` has a one-step derivation from the facts of `source` (`Seg::All`):
@@ -2348,6 +2407,44 @@ impl<'a> Unpolled<'a> {
         self.0
             .derivable_with(source, fact, true, NEVER)
             .expect("never stopped")
+    }
+}
+
+/// List rule templates indexed by the atoms that grounding consumes. Keep the templates
+/// even when they ground to no rules yet: a later schema edge may be their first binding.
+#[derive(Default)]
+pub(crate) struct ListOperands {
+    templates: Vec<(Rule, Vec<Triple>)>,
+    dispatch: Dispatch,
+}
+
+pub(crate) enum ListRuleHeads {
+    All,
+    FactsOnly,
+}
+
+impl ListOperands {
+    /// Grounds the templates that read changed schema atoms, keeping their list premises.
+    /// Overdeletion asks only for rules that derive facts.
+    pub(crate) fn ground_delta<S: Source + ?Sized>(
+        &self,
+        target: &mut GroundProgram,
+        source: &S,
+        schema: &Schema,
+        delta: &super::batch::Store,
+        poll: &Poller<'_>,
+        heads: ListRuleHeads,
+    ) -> Result<(), Stopped> {
+        for (index, _) in self.dispatch.matching(delta, poll)? {
+            if poll.tick() {
+                return Err(Stopped);
+            }
+            let (rule, premises) = &self.templates[index];
+            if matches!(heads, ListRuleHeads::All) || rule.head != Head::Inconsistent {
+                target.ground_one(source, schema, rule, true, premises);
+            }
+        }
+        poll.ended()
     }
 }
 
@@ -2371,7 +2468,8 @@ impl<'a> Unpolled<'a> {
 pub struct GroundProgram {
     pub rules: Vec<Rule>,
     /// Per rule: the closed family it is an instance of, if any ([`closed_family`]).
-    families: Vec<Option<u64>>,
+    families: Vec<Option<usize>>,
+    closed_families: Vec<ClosedFamily>,
     /// Per rule: the built-in equality rule it is over `owl:sameAs`, if any, asked once as
     /// it is filed ([`super::equality_rules`]); one filed by [`Self::add`] is none.
     pub equality: Vec<Option<&'static str>>,
@@ -2381,6 +2479,7 @@ pub struct GroundProgram {
     known: hashbrown::HashMap<RuleKey, usize>,
     dispatch: Dispatch,
     pub transitive: std::collections::BTreeSet<u64>,
+    transitive_filters: hashbrown::HashMap<u64, AnnotationFilter>,
     /// Facts of bodiless instances, not yet handed out ([`Self::take_facts`]).
     facts: Vec<Triple>,
     /// Facts of all bodiless instances.
@@ -2402,6 +2501,10 @@ pub struct GroundProgram {
     consistency_dispatch: Dispatch,
     /// The list axioms of the program's state that weren't instantiated.
     pub list_diagnostics: Vec<super::lists::ListDiagnostic>,
+    pub(crate) list_predicates: super::lists::Predicates,
+    pub(crate) list_operands: Option<std::sync::Arc<ListOperands>>,
+    pub(crate) table_rules: Vec<usize>,
+    pub(crate) table: Option<std::sync::Arc<super::batch::Store>>,
 }
 
 impl std::fmt::Debug for GroundProgram {
@@ -2428,11 +2531,13 @@ impl GroundProgram {
         &mut self,
         rule: Rule,
         premises: Vec<Triple>,
-        family: Option<u64>,
+        family: Option<usize>,
         same_as: Option<u64>,
     ) -> Option<usize> {
-        if let Some(p) = transitive_predicate(&rule) {
-            self.transitive_with(p, premises);
+        if let Some(p) = transitive_predicate(&rule)
+            && self.transitive_filter(p).is_none()
+        {
+            self.transitive_with(p, None, premises);
             None
         } else if rule.body.is_empty() {
             if let Head::Facts(heads) = &rule.head {
@@ -2460,6 +2565,12 @@ impl GroundProgram {
             self.dispatch.push(self.rules.len(), &rule);
             if let Head::Facts(heads) = &rule.head {
                 self.heads.push_atoms(self.rules.len(), heads);
+                if heads
+                    .iter()
+                    .any(|head| matches!(head.0[1], Term::Const(p) if super::lists::internal(p)))
+                {
+                    self.table_rules.push(self.rules.len());
+                }
             }
             let equality = same_as.and_then(|id| super::equality_rules::equality_rule(&rule, id));
             self.rules.push(rule);
@@ -2471,8 +2582,11 @@ impl GroundProgram {
     }
 
     /// Makes `p` transitive, grounded on `premises`.
-    fn transitive_with(&mut self, p: u64, premises: Vec<Triple>) {
+    fn transitive_with(&mut self, p: u64, filter: Option<AnnotationFilter>, premises: Vec<Triple>) {
         self.transitive.insert(p);
+        if let Some(filter) = filter {
+            self.transitive_filters.entry(p).or_insert(filter);
+        }
         match self.transitive_premises.get(&p) {
             None => {
                 self.transitive_premises.insert(p, premises);
@@ -2482,6 +2596,18 @@ impl GroundProgram {
             }
             Some(_) => {}
         }
+    }
+
+    pub(crate) fn transitive_filter(&self, p: u64) -> Option<&AnnotationFilter> {
+        self.transitive_filters.get(&p)
+    }
+
+    pub(crate) fn transitive_rule(&self, p: u64) -> Rule {
+        let mut rule = transitivity(p);
+        if let Some(filter) = self.transitive_filter(p) {
+            rule.guards = filter.guards([Term::Var(0), Term::Var(1), Term::Var(2)]);
+        }
+        rule
     }
 
     /// Records a further set of schema facts for `grounding` (once each).
@@ -2626,9 +2752,37 @@ impl GroundProgram {
         }
     }
 
-    /// Grounds `rules` through the delta of `source` only (rules without schema atoms, list
-    /// rules among them, in full); returns the indices of the new fact rules and
-    /// consistency rules.
+    /// Grounds the current list reading and replaces its schema-operand index.
+    pub(crate) fn ground_lists<S: Source + ?Sized>(
+        &mut self,
+        source: &S,
+        schema: &Schema,
+        rules: Vec<Rule>,
+        premises: Vec<Vec<Triple>>,
+    ) {
+        self.ground_with_premises(source, schema, &rules, &premises);
+        let mut operands = ListOperands::default();
+        for (rule, premises) in rules.into_iter().zip(premises) {
+            let mut reads = rule.body.iter().filter(|atom| schema.is_schema_atom(atom));
+            if let Some(first) = reads.next() {
+                let index = operands.templates.len();
+                // Dispatch only needs the template index. Use the same atom index for
+                // every read so its matching step deduplicates the template.
+                for atom in std::iter::once(first).chain(reads) {
+                    operands
+                        .dispatch
+                        .push_atoms(index, std::slice::from_ref(atom));
+                }
+                operands.templates.push((rule, premises));
+            }
+        }
+        self.list_operands =
+            (!operands.templates.is_empty()).then(|| std::sync::Arc::new(operands));
+    }
+
+    /// Grounds `rules` through the delta of `source` (rules without schema atoms in full).
+    /// Returns the indices of new fact and consistency rules. Incremental list operands
+    /// use `ListOperands::ground_delta` so their list premises stay attached.
     pub fn ground_delta<S: Source + ?Sized>(
         &mut self,
         source: &S,
@@ -2655,33 +2809,53 @@ impl GroundProgram {
         let (mut facts, mut checks) = (Vec::new(), Vec::new());
         // Source-level transitivity rules (`scm-sco`, `scm-spo`) don't depend on the
         // delta: full grounding registers them, delta grounding leaves them alone.
-        if let Some(p) = transitive_predicate(rule) {
+        if let Some((p, terms)) = transitive_shape(rule)
+            && let Some(filter) = annotation_filter(&rule.guards, &terms)
+        {
+            let schema_rule = rule.body.iter().any(|a| schema.is_schema_atom(a));
+            if self.transitive.contains(&p) && self.transitive_filter(p) != filter.as_ref() {
+                // Keep a competing rule and its premises separate. Its body stays on the
+                // dispatch so overdeletion still follows it through a deleted schema edge.
+                if !delta || !schema_rule || !extra.is_empty() {
+                    facts.extend(self.add_with(rule.clone(), extra.to_vec(), None, None));
+                }
+                return (facts, checks);
+            }
             // A property chain `p ∘ p ⊑ p` from a list axiom that holds only now (its
             // facts derived, or rewritten by equality, during a materialisation) is new
             // in delta grounding too; the vocabulary's (`scm-sco`, over schema atoms)
             // were registered by full grounding.
-            let new_chain = !self.transitive.contains(&p)
-                && !rule.body.iter().any(|a| schema.is_schema_atom(a));
+            let new_chain = !self.transitive.contains(&p) && !schema_rule;
             if !delta || new_chain {
                 // With the facts it came from (a property chain `p ∘ p ⊑ p` from a list
                 // axiom); vocabulary rules (`scm-sco`, `eq-trans`) come with none.
-                self.transitive_with(p, extra.to_vec());
+                self.transitive_with(p, filter, extra.to_vec());
             }
             return (facts, checks);
         }
         let mut grounded = Vec::new();
         let has_schema_atoms = rule.body.iter().any(|a| schema.is_schema_atom(a));
         // Hidden unnamed classes rewrite heads (W7): the family's shape no longer holds.
-        let family = closed_family(schema, rule).filter(|_| schema.hidden().is_empty());
-        if let Some(family) = family
+        let family = closed_family_with_filter(schema, rule).filter(|_| schema.hidden().is_empty());
+        if let Some(family) = &family
             && let Some(Term::Const(p)) = rule
                 .body
                 .iter()
                 .find(|a| !schema.is_schema_atom(a))
                 .map(|a| a.0[1])
         {
-            self.family_relations.entry(p).or_insert(family);
+            self.family_relations.entry(p).or_insert(family.link);
         }
+        let family = family.map(|family| {
+            self.closed_families
+                .iter()
+                .position(|known| *known == family)
+                .unwrap_or_else(|| {
+                    let index = self.closed_families.len();
+                    self.closed_families.push(family);
+                    index
+                })
+        });
         if delta && has_schema_atoms {
             ground_delta(source, schema, rule, &mut |g| grounded.push(g));
         } else {
@@ -2739,7 +2913,7 @@ impl GroundProgram {
     /// Every fact rule, with the transitive predicates as transitivity rules.
     pub fn with_transitivity(&self) -> Vec<Rule> {
         let mut rules = self.rules.clone();
-        rules.extend(self.transitive.iter().map(|&p| transitivity(p)));
+        rules.extend(self.transitive.iter().map(|&p| self.transitive_rule(p)));
         rules
     }
 
@@ -2801,23 +2975,43 @@ impl GroundProgram {
         limit: usize,
         poll: &Poller<'_>,
     ) -> Result<Vec<(String, Vec<Triple>)>, Stopped> {
+        self.named_derivations_with(source, fact, limit, poll, false)
+    }
+
+    /// A justification reads every schema premise alternative of a derivation.
+    pub(crate) fn named_derivations_with<S: Source + ?Sized>(
+        &self,
+        source: &S,
+        fact: Triple,
+        limit: usize,
+        poll: &Poller<'_>,
+        all_premises: bool,
+    ) -> Result<Vec<(String, Vec<Triple>)>, Stopped> {
         let mut bodies = Vec::new();
-        let mut search =
-            |rule: &Rule, premises: &[Triple], poll: &Poller<'_>| -> Result<bool, Stopped> {
-                derivations(source, rule, fact, Seg::All, poll, &mut |bindings| {
-                    let mut body: Vec<Triple> = rule
-                        .body
-                        .iter()
-                        .map(|atom| instantiate_head(atom, bindings))
-                        .collect();
-                    body.extend_from_slice(premises);
-                    bodies.push((rule.name.clone(), body));
-                    bodies.len() >= limit
-                })?;
-                Ok(bodies.len() >= limit)
-            };
+        let mut search = |rule: &Rule, grounding, poll: &Poller<'_>| -> Result<bool, Stopped> {
+            derivations(source, rule, fact, Seg::All, poll, &mut |bindings| {
+                let body: Vec<Triple> = rule
+                    .body
+                    .iter()
+                    .map(|atom| instantiate_head(atom, bindings))
+                    .collect();
+                let alternatives = self.for_each_alternative(grounding, poll, |premises, _| {
+                    let mut full = body.clone();
+                    full.extend_from_slice(premises);
+                    bodies.push((rule.name.clone(), full));
+                    Ok(if all_premises {
+                        ControlFlow::Continue(())
+                    } else {
+                        ControlFlow::Break(())
+                    })
+                });
+                alternatives.is_err() || bodies.len() >= limit
+            })?;
+            poll.ended()?;
+            Ok(bodies.len() >= limit)
+        };
         let full = self.for_each_producer(fact, poll, |r, poll| {
-            Ok(match search(&self.rules[r], &self.premises[r], poll)? {
+            Ok(match search(&self.rules[r], Grounding::Rule(r), poll)? {
                 true => ControlFlow::Break(()),
                 false => ControlFlow::Continue(()),
             })
@@ -2827,8 +3021,8 @@ impl GroundProgram {
                 return Err(Stopped);
             }
             search(
-                &transitivity(fact[1]),
-                self.transitive_premises(fact[1]),
+                &self.transitive_rule(fact[1]),
+                Grounding::Transitive(fact[1]),
                 poll,
             )?;
         }
@@ -2900,7 +3094,7 @@ impl GroundProgram {
         if transitivity_too && self.transitive.contains(&fact[1]) {
             derivations(
                 source,
-                &transitivity(fact[1]),
+                &self.transitive_rule(fact[1]),
                 fact,
                 Seg::All,
                 &poll,
@@ -2923,7 +3117,14 @@ impl GroundProgram {
             .get(r)
             .copied()
             .flatten()
-            .filter(|link| self.transitive.contains(link))
+            .map(|family| &self.closed_families[family])
+            .filter(|family| {
+                self.transitive.contains(&family.link)
+                    && self
+                        .transitive_filter(family.link)
+                        .is_none_or(|filter| family.filter.as_ref() == Some(filter))
+            })
+            .map(|family| family.link)
     }
 
     /// The rules (indexes into `rules`) whose head can give `fact`, each once, ascending.

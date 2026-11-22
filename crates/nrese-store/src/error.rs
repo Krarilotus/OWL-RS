@@ -263,6 +263,16 @@ impl StoreError {
             )
     }
 
+    /// The budget's refusal this error is, with its amounts and its cause as the budget
+    /// judged it ([`nrese_exec::BudgetExceeded::for_held`]); `None` for any other error, and
+    /// for a refusal told without its amounts ([`Self::MemoryLimitWithoutAmounts`]).
+    pub fn memory_refusal(&self) -> Option<&nrese_exec::BudgetExceeded> {
+        match self.evaluation() {
+            Some(QueryEvaluationError::MemoryLimit(exceeded)) => Some(exceeded),
+            _ => None,
+        }
+    }
+
     /// True if the request is at fault (syntax, invalid IRIs or payloads, unsupported query
     /// features) rather than the store. Transports map these to client errors. A cancelled
     /// evaluation is neither: the transport decides what cancelled it.
@@ -402,6 +412,7 @@ mod unread_tests {
             used: 1 << 20,
             shared: true,
             unread: true,
+            for_held: false,
             rows: None,
         });
         assert!(!unread.is_memory_limit());

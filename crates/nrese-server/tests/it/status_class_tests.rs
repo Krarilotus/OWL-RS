@@ -2,7 +2,9 @@
 //! is read, answers as a freshly loaded store does: the same rows for a fixed set of reads,
 //! the same completeness status for each, the same consistency and readiness. Reader state
 //! that derives from the reasoning state (the equality reading, the QL rewriting, the status,
-//! consistency) must follow the data however it arrived. A read replica is no loaded store:
+//! consistency) must follow the data however it arrived, but for one ruled cost: a restart
+//! that skips the rebuild may withhold a read for a literal equality it can't rule out, with
+//! that reason ([`withheld_after_a_restart`]). A read replica is no loaded store:
 //! it reads its primary's rows and says `not-certified` (the replica's fail-closed form).
 //!
 //! One test walks the whole table, one the replicas, and each lists every wrong cell, one
@@ -603,6 +605,25 @@ async fn seen(state: &AppState) -> TestResult<Seen> {
     })
 }
 
+/// The words of the reason a read is withheld for after an open without a rebuild.
+const LITERAL_EQUALITY: &str = "opened without a rebuild of its inferences";
+
+/// A restart that skips the rebuild (the start, where the stack is current) doesn't know
+/// whether the rules equated two literals since the last rebuild: a read may be withheld for
+/// that, with its reason, until a rebuild (docs/limits.md), and nothing else may change. Each
+/// read of `got` withheld so is taken as `want`'s.
+fn withheld_after_a_restart(cell: &str, got: &mut Seen, want: &Seen) {
+    for (i, (name, _)) in READS.iter().enumerate() {
+        let (got_status, want_status) = (&mut got.reads[i].1, &want.reads[i].1);
+        let withheld = (got_status.as_deref())
+            .is_some_and(|s| !s.starts_with("complete") && s.contains(LITERAL_EQUALITY));
+        if withheld && got_status != want_status {
+            eprintln!("DETAIL {cell} | {name}: withheld after the restart: {got_status:?}");
+            got_status.clone_from(want_status);
+        }
+    }
+}
+
 /// Lists each aspect of `got` that differs from `want`, with what each was.
 fn compare(cell: &str, got: &Seen, want: &Seen, wrong: &mut Vec<String>) {
     for (i, (name, _)) in READS.iter().enumerate() {
@@ -885,7 +906,12 @@ async fn every_way_to_a_store_reads_as_a_loaded_store() -> TestResult<()> {
                     eprintln!("DETAIL {cell}: served");
                     wrong.push(format!("{cell} | served"));
                 }
-                Ok(Ok(got)) => compare(&cell, &got, &want, &mut wrong),
+                Ok(Ok(mut got)) => {
+                    if *way == "reopen" {
+                        withheld_after_a_restart(&cell, &mut got, &want);
+                    }
+                    compare(&cell, &got, &want, &mut wrong)
+                }
                 Ok(Err(error)) if refused(way, &column) && error.to_string().contains(REFUSED) => {}
                 Ok(Err(error)) => errors.push(format!("{cell} | {error}")),
                 Err(_) => errors.push(format!("{cell} | timed out")),

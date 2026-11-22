@@ -15,9 +15,11 @@
 //! Rules match over the union of all graphs and inferences go to the default graph
 //! (design §6.2). OWL 2 RL derives some generalised triples, such as a literal typed by a
 //! datatype property's range; RDF can't store a literal subject or a non-IRI predicate, so
-//! those are dropped. Commits therefore don't see them either, which matters only for
-//! rules that turn them back into storable facts (an `owl:inverseOf` on a datatype
-//! property, which OWL 2 doesn't allow).
+//! those are dropped. Commits therefore don't see them either, which matters for rules
+//! that turn them back into storable facts (an `owl:inverseOf` on a datatype property,
+//! which OWL 2 doesn't allow), and for an `owl:sameAs` between two spellings of one value,
+//! whose copies of a later commit's statements are missing: the closure and each commit
+//! report one ([`Closure::literal_equality`], [`Maintenance::literal_equality`]).
 
 mod datatypes;
 mod explain;
@@ -40,7 +42,8 @@ use crate::unnamed::UnnamedVocabulary;
 
 pub use explain::{
     InferenceStep, JUSTIFICATIONS_AT_MOST, JustificationAnswer, JustificationMode,
-    JustifiedStatement, explain_fact, explain_violation, justify_fact,
+    JustifiedStatement, explain_fact, explain_fact_until, explain_violation,
+    explain_violation_until, justify_fact, justify_fact_until,
 };
 pub use maintain::{
     EngineBase, Maintenance, install_closure, maintain, maintain_with, maintain_with_report_budget,
@@ -122,8 +125,9 @@ impl Program {
             snapshot,
             axioms: &[],
         };
-        let facts = crate::eval::AllFacts(&crate::explain::Whole(&base));
-        !crate::lists::instantiate(&lists, &facts).1.is_empty()
+        let facts =
+            crate::eval::AllFacts(&crate::explain::Whole(&base), &crate::eval::Poller::never());
+        lists.leaves_out(&facts)
     }
 
     /// Whether one of `quads` (by `at`'s ids) can change what [`Self::leaves_out_a_list`]
@@ -329,19 +333,33 @@ impl Program {
     /// The ground program of the committed state `snapshot`, as the delta executor
     /// builds it.
     pub fn ground_program(&self, snapshot: &Snapshot) -> GroundProgram {
+        self.ground_program_until(snapshot, crate::eval::NEVER)
+            .expect("unbounded grounding")
+    }
+
+    /// Grounds the snapshot's rules and private tables under the caller's stop.
+    pub fn ground_program_until(
+        &self,
+        snapshot: &Snapshot,
+        stop: crate::eval::Stop<'_>,
+    ) -> Result<GroundProgram, crate::eval::Stopped> {
+        if stop() {
+            return Err(crate::eval::Stopped);
+        }
         let schema = self.schema_for(snapshot);
         let rules = self.rules_for(snapshot);
         let base = explain::SnapshotBase {
             snapshot,
             axioms: &self.axioms,
         };
-        delta::program(
+        delta::program_until(
             &base,
             delta::Rules {
                 rules: &rules,
                 schema: &schema,
                 ..self.rules()
             },
+            stop,
         )
     }
 
@@ -441,11 +459,27 @@ impl<E> Vocabulary for Constants<'_, E> {
 }
 
 /// Whether RDF can store the triple: an IRI or blank node subject and an IRI predicate.
-pub(crate) fn storable([subject, predicate, _]: Triple) -> bool {
+pub(crate) fn storable(fact @ [subject, predicate, _]: Triple) -> bool {
+    if fact.into_iter().any(crate::lists::internal) {
+        return false;
+    }
     matches!(
         TermId::from_raw(subject).kind(),
         TermKind::Iri | TermKind::BlankNode
     ) && TermId::from_raw(predicate).kind() == TermKind::Iri
+}
+
+/// Whether `fact` equates a literal with another term: an `owl:sameAs` (`same_as`) between
+/// two different terms whose subject no store holds (a literal: [`storable`]). The rules
+/// derive one where a functional property or an at-most-one restriction holds one value in
+/// two spellings; dropped, it copies nothing into a later commit's statements.
+pub(crate) fn equates_literal([subject, predicate, object]: Triple, same_as: Option<u64>) -> bool {
+    Some(predicate) == same_as
+        && subject != object
+        && !matches!(
+            TermId::from_raw(subject).kind(),
+            TermKind::Iri | TermKind::BlankNode
+        )
 }
 
 pub(crate) fn encode([s, p, o]: Triple) -> EncodedTriple {
@@ -466,5 +500,56 @@ pub(crate) fn pattern([s, p, o]: [Option<u64>; 3], graph: GraphSelector) -> Quad
         predicate: p.map(TermId::from_raw),
         object: o.map(TermId::from_raw),
         graph,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::{Program, RuleProgram};
+    use crate::program::{EQUALITY_RULES_N3, UserRules};
+    use crate::rulesets::{ALL, Ruleset};
+    use nrese_engine::{Engine, EngineConfig};
+
+    /// The reopen verdict for each built-in program must agree with the gate that
+    /// lets the engine act on an `owl:sameAs` and report literal equality. User
+    /// rules can supply the whole equality module to a program without it.
+    #[test]
+    fn the_reopen_verdict_follows_the_compiled_equality_gate() {
+        let engine = Engine::new(EngineConfig {
+            background_maintenance: false,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let tx = engine.transaction();
+        for ruleset in ALL {
+            let expected = match ruleset {
+                Ruleset::Rdfs | Ruleset::RdfsFull | Ruleset::Owl2Ql => false,
+                Ruleset::RdfsPlus | Ruleset::OwlHorst | Ruleset::Owl2Rl => true,
+            };
+            let program = RuleProgram::builtin(ruleset);
+            let verdict = program.may_equate_literals();
+            assert_eq!(verdict, expected, "{}", ruleset.name());
+            let compiled = Program::compile(&program, &|term| tx.intern(term));
+            assert_eq!(
+                verdict,
+                compiled.same_as.is_some(),
+                "{}: compiled engine gate",
+                ruleset.name()
+            );
+        }
+
+        let user = Arc::new(UserRules::n3("equality.n3", EQUALITY_RULES_N3).unwrap());
+        let ql = RuleProgram::new(Some(Ruleset::Owl2Ql), Some(user)).unwrap();
+        let compiled = Program::compile(&ql, &|term| tx.intern(term));
+        assert!(
+            compiled.same_as.is_some(),
+            "OWL 2 QL with user equality rules"
+        );
+        assert!(
+            ql.may_equate_literals(),
+            "OWL 2 QL with user equality rules"
+        );
     }
 }

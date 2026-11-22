@@ -17,6 +17,7 @@ use std::collections::HashSet;
 
 use nrese_engine::{GraphSelector, QuadPattern, Snapshot, TermId};
 use nrese_owl::ObjProp;
+use nrese_owl::diagnostics::reserved_vocabulary;
 use nrese_owl::ql::{
     Atom, Basic, Branch, Budget, Cq, Limits, Outcome, Part, Probe, QTerm, Tbox, rewrite_with,
 };
@@ -482,10 +483,7 @@ impl Rewriter<'_> {
 
     /// A basic graph pattern, rewritten if the QL part of the schema adds to it.
     fn bgp(&mut self, patterns: &[TriplePattern], needed: &Needed, set: bool) -> GraphPattern {
-        let original = GraphPattern::Bgp {
-            patterns: patterns.to_vec(),
-        };
-        let (cq, terms) = self.query(patterns, needed);
+        let (mut cq, mut terms) = self.query(patterns, needed);
         for (term, hazard) in self.tbox.concerns(&cq) {
             let name = |t: u64| self.name(t);
             self.report.completeness.incomplete(
@@ -503,6 +501,14 @@ impl Rewriter<'_> {
                 "a variable predicate or class: the rewriting reads constant ones only".to_owned(),
             );
         }
+        let reduced = self.reduce_universal_roles(&cq, patterns, set);
+        let patterns = reduced.as_deref().unwrap_or(patterns);
+        if reduced.is_some() {
+            (cq, terms) = self.query(patterns, needed);
+        }
+        let original = GraphPattern::Bgp {
+            patterns: patterns.to_vec(),
+        };
         let (tbox, limits) = (self.tbox, self.limits);
         // Out of `self` while the data check borrows it.
         let budget = std::mem::replace(&mut self.budget, Budget::new(0));
@@ -511,12 +517,16 @@ impl Rewriter<'_> {
         });
         self.budget = budget;
         let rewriting = match outcome {
-            Outcome::Unchanged => return original,
+            Outcome::Unchanged => {
+                self.report.patterns += usize::from(reduced.is_some());
+                return original;
+            }
             Outcome::Exceeded(what) => {
                 self.report.limits.push(what);
                 self.report.completeness.incomplete("ql", format!(
                     "a basic graph pattern reached the rewriting's bound on {what} and ran as written"
                 ));
+                self.report.patterns += usize::from(reduced.is_some());
                 return original;
             }
             Outcome::Rewritten(r) => r,
@@ -578,6 +588,88 @@ impl Rewriter<'_> {
             }),
         };
         GraphPattern::union_all(vec![original, added])
+    }
+
+    /// In set patterns, a universal edge from a named individual to another
+    /// named individual is unconditional. An existential target needs only its
+    /// domain to be nonempty. A joined object target can also be supplied by
+    /// a class atom, which already restricts the target to individuals.
+    fn reduce_universal_roles(
+        &mut self,
+        cq: &Cq,
+        patterns: &[TriplePattern],
+        set: bool,
+    ) -> Option<Vec<TriplePattern>> {
+        if !self.tbox.has_universal_roles() {
+            return None;
+        }
+        let roles: Vec<_> = cq
+            .atoms
+            .iter()
+            .enumerate()
+            .filter_map(|(i, atom)| match *atom {
+                Atom::Role(_, p, target) => {
+                    Some((i, p, target, self.tbox.universal_role_is_data(p)?))
+                }
+                _ => None,
+            })
+            .collect();
+        if roles.is_empty() {
+            return None;
+        }
+        let mut other_uses = vec![0; cq.vars as usize];
+        let mut in_class = vec![false; cq.vars as usize];
+        if set {
+            for (atom, pattern) in cq.atoms.iter().zip(patterns) {
+                match *atom {
+                    Atom::Class(QTerm::Var(v), _)
+                        if matches!(&pattern.object, TermPattern::NamedNode(c)
+                            if !reserved_vocabulary(c.as_str())) =>
+                    {
+                        in_class[v as usize] = true;
+                    }
+                    _ => {
+                        for v in atom.vars() {
+                            other_uses[v as usize] += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let mut removed = HashSet::new();
+        let mut unlisted = HashSet::new();
+        let individual = |term: &TermPattern| match term {
+            TermPattern::NamedNode(n) => !reserved_vocabulary(n.as_str()),
+            _ => false,
+        };
+        for (i, property, target, data) in roles {
+            let covered = set
+                && individual(&patterns[i].subject)
+                && match target {
+                    QTerm::Const(_) => !data && individual(&patterns[i].object),
+                    QTerm::Var(v) => {
+                        let v = v as usize;
+                        cq.existential[v] && other_uses[v] == 1 && (!data || !in_class[v])
+                    }
+                };
+            if covered {
+                removed.insert(i);
+            } else if unlisted.insert(property) {
+                let name = self.name(property);
+                self.report.completeness.incomplete(
+                    "ql",
+                    format!("pairs of the universal property {name} may be missing"),
+                );
+            }
+        }
+        (!removed.is_empty()).then(|| {
+            patterns
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !removed.contains(i))
+                .map(|(_, pattern)| pattern.clone())
+                .collect()
+        })
     }
 
     /// Whether the data the query reads has the tree of `probe` at every individual of

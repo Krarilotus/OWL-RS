@@ -62,6 +62,28 @@ const DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 /// (`docker stop`) waits before it kills, with room for the process to end.
 const STOP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
 
+#[test]
+fn the_stop_deadline_fits_inside_docker_stop() {
+    assert!(STOP_DEADLINE < std::time::Duration::from_secs(10));
+    #[cfg(all(debug_assertions, feature = "fault-points"))]
+    if std::env::var_os("NRESE_TEST_STOP_DEADLINE_MS").is_some() {
+        eprintln!("skipping the default deadline check: NRESE_TEST_STOP_DEADLINE_MS is set");
+        return;
+    }
+    assert_eq!(stop_deadline(), STOP_DEADLINE);
+}
+
+fn stop_deadline() -> std::time::Duration {
+    #[cfg(all(debug_assertions, feature = "fault-points"))]
+    if let Some(ms) = std::env::var("NRESE_TEST_STOP_DEADLINE_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+    {
+        return std::time::Duration::from_millis(ms);
+    }
+    STOP_DEADLINE
+}
+
 /// What a stop under way waits for: an index into [`STOP_STEPS`], for the line the deadline
 /// logs.
 static STOP_STEP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -76,9 +98,9 @@ fn stop_step(step: usize) {
 }
 
 /// A close that takes long (a checkpoint of a large store), for the stop deadline's test:
-/// `NRESE_TEST_HOLD_CLOSE_MS` in a debug build. A release build has no such hold.
+/// `NRESE_TEST_HOLD_CLOSE_MS` in a debug build with the test hooks enabled.
 fn hold_the_close_for_a_test() {
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, feature = "fault-points"))]
     if let Some(ms) = std::env::var("NRESE_TEST_HOLD_CLOSE_MS")
         .ok()
         .and_then(|ms| ms.parse().ok())
@@ -102,7 +124,8 @@ impl StopDeadline {
             .spawn(move || {
                 // Never armed: the server ended without a signal.
                 let Ok(signal) = armed.recv() else { return };
-                std::thread::sleep(STOP_DEADLINE);
+                let deadline = stop_deadline();
+                std::thread::sleep(deadline);
                 let step = STOP_STEP.load(std::sync::atomic::Ordering::SeqCst);
                 let waiting_for = STOP_STEPS[step.min(STOP_STEPS.len() - 1)];
                 // The line on a thread of its own, given a moment: a log reader that stopped
@@ -110,7 +133,7 @@ impl StopDeadline {
                 let _ = std::thread::Builder::new().spawn(move || {
                     tracing::warn!(
                         signal,
-                        seconds = STOP_DEADLINE.as_secs(),
+                        seconds = deadline.as_secs(),
                         waiting_for,
                         "nrese-server stop deadline reached: ending the process"
                     );

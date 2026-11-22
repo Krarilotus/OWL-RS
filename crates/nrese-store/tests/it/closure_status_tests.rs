@@ -13,6 +13,7 @@ use nrese_store::{
 
 use crate::dl::{PREFIXES, insert, pipeline, pipeline_with};
 use crate::ql_rewriting_tests::Rng;
+use crate::support::nightly;
 
 /// eq-ref (OWL 2 Profiles §4.3, table 4), which the RL rules leave out: `:rex owl:sameAs
 /// :rex` is entailed, so NOT EXISTS removes `:rex` and the certain answers are none.
@@ -116,6 +117,14 @@ const MEMBERS: [(&str, &str, &str, &str); 8] = [
 const RDF: &str = "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> ";
 
 fn closure(data: &str, ruleset: Ruleset, ql: QlRewritingMode) -> StoreService {
+    let store = loaded(data, ql);
+    store.rematerialise(ruleset).unwrap();
+    store
+}
+
+/// A store with `data` bulk-loaded and nothing reasoned over it, as `print-query --schema`
+/// loads its schema files.
+fn loaded(data: &str, ql: QlRewritingMode) -> StoreService {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("case.ttl");
     let prefixes = PREFIXES.replace("PREFIX", "@prefix").replace("> ", "> . ");
@@ -133,8 +142,26 @@ fn closure(data: &str, ruleset: Ruleset, ql: QlRewritingMode) -> StoreService {
             invalid: Some(nrese_store::InvalidStatements::Strict),
         })
         .unwrap();
-    store.rematerialise(ruleset).unwrap();
     store
+}
+
+/// [`DATA`] and `more`, committed in one commit through the `owl2-rl` mode with the QL
+/// rewriting on: a store whose commits maintain the closure, which [`closure`]'s rebuild
+/// doesn't.
+fn committed(more: &str) -> nrese_store::MutationPipeline {
+    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    let config = StoreConfig {
+        ql_rewriting: QlRewritingMode::On,
+        ..StoreConfig::in_memory()
+    };
+    let pipeline = nrese_store::MutationPipeline::new(
+        std::sync::Arc::new(StoreService::new(config).unwrap()),
+        std::sync::Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Rl,
+        ))),
+    );
+    insert(&pipeline, &format!("{DATA} {more}")).expect("data");
+    pipeline
 }
 
 /// The rows of `query` and its statuses, as the answer and its plan give them.
@@ -605,7 +632,11 @@ fn only_operators_that_can_make_a_row_wrong_label_a_dl_answer_unsound() {
 /// status and reason kind: a plain read, a denied one (an annotation, the one part of the
 /// reserved vocabulary print prints), that under NOT EXISTS, an ordered slice, and the
 /// `owl:sameAs` entry, on and off the RL route; under OWL 2 DL also with user rules and
-/// with `dl.consistency = "off"`, whose reasons the run adds whatever path decides.
+/// with `dl.consistency = "off"`, whose reasons the run adds whatever path decides. Under
+/// `owl2-rl` with the rewriting also the store's own conditions, whatever the route: rules
+/// that equated two literals (read through a property that holds one), and an import no
+/// loaded ontology answers; that import printed for too over schema files loaded as
+/// `print-query --schema` loads them, with no rematerialisation and so no certificate.
 #[test]
 fn every_place_gives_a_query_the_answers_status() {
     use nrese_sparql::Completeness;
@@ -621,8 +652,17 @@ fn every_place_gives_a_query_the_answers_status() {
         ),
         ("SELECT ?x { ?x a :Animal } ORDER BY ?x LIMIT 1", None),
         ("ASK { :rex owl:sameAs :ann }", None),
+        ("SELECT ?v { :ann :age ?v }", None),
     ];
     let printed_for = closure(DATA, Ruleset::Owl2Rl, QlRewritingMode::On);
+    let equated = committed(
+        ":p a owl:FunctionalProperty . :s :p \"1\"^^xsd:integer , \"1.0\"^^xsd:decimal .",
+    );
+    let unread = closure(
+        &format!("{DATA} :o a owl:Ontology ; owl:imports <http://example.com/missing> ."),
+        Ruleset::Owl2Rl,
+        QlRewritingMode::On,
+    );
     let ql = closure(DATA, Ruleset::Owl2Ql, QlRewritingMode::Auto);
     let rl = closure(DATA, Ruleset::Owl2Rl, QlRewritingMode::Auto);
     let (on, off) = (dl(false), dl(true));
@@ -642,6 +682,18 @@ fn every_place_gives_a_query_the_answers_status() {
     let (unchecked_on, unchecked_off) = (dl_in(unchecked(), false), dl_in(unchecked(), true));
     let stores = [
         ("owl2-rl with the rewriting", &printed_for, true),
+        // Unprinted: a functional property makes no query printable (an equality of
+        // individuals isn't expressible), so print-query has no status here.
+        (
+            "owl2-rl with the rewriting, literals equated",
+            equated.store(),
+            false,
+        ),
+        (
+            "owl2-rl with the rewriting, an import unread",
+            &unread,
+            true,
+        ),
         ("owl2-ql", &ql, false),
         ("owl2-rl", &rl, false),
         ("owl2-dl on the RL route", on.store(), false),
@@ -747,6 +799,36 @@ fn every_place_gives_a_query_the_answers_status() {
     // What print can't print carries no status: `owl:Thing` is of the schema vocabulary.
     if !matches!(printed, Ok(Printed::NotExpressible(_))) {
         wrong.push(format!("print-query of owl:Thing: {printed:?}"));
+    }
+    // `print-query --schema` prints over the schema files loaded alone, which nothing reasons
+    // over, so no certificate: an import no loaded ontology answers is told there too.
+    let schema = loaded(
+        &format!("{DATA} :o a owl:Ontology ; owl:imports <http://example.com/missing> ."),
+        QlRewritingMode::Auto,
+    );
+    let mut printed = 0;
+    for (query, _) in reads {
+        let text = format!("{PREFIXES}{RDF}{query}");
+        if let Ok(Printed::Query { completeness, .. }) = schema.print_query(&text, PrintForm::Paths)
+        {
+            printed += 1;
+            let reasons: Vec<&str> = completeness
+                .reasons
+                .iter()
+                .map(|r| r.text.as_str())
+                .collect();
+            if completeness.complete
+                || !reasons
+                    .iter()
+                    .any(|r| r.contains("no ontology with that IRI"))
+            {
+                let word = completeness.as_str();
+                wrong.push(format!("print-query --schema: {query}: {word} {reasons:?}"));
+            }
+        }
+    }
+    if printed == 0 {
+        wrong.push("setup: print-query --schema printed no read".to_owned());
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
@@ -1090,6 +1172,19 @@ fn owl2_rl_answers_an_undeclared_data_existential_over_any_literal() {
 /// The generated tests' seed, in their names.
 const SEED: u64 = 0x5eed_da7a;
 
+const DATA_CONSTRUCTORS: [&str; 6] = [
+    "datatype",
+    "oneOf",
+    "onDatatype",
+    "datatypeComplementOf",
+    "intersectionOf",
+    "unionOf",
+];
+const RL_CONSTRUCTORS: [&str; 2] = ["datatype", "intersectionOf"];
+/// Kept by hand: [`Fillers::classes`] chooses by chance, not from this list, so a constructor
+/// added there must be added here too.
+const CLASS_CONSTRUCTORS: [&str; 4] = ["class", "intersectionOf", "unionOf", "complementOf"];
+
 /// Fillers in Turtle, from a seed. Each composite node is written in place (`[ … ]`) or as
 /// a shared blank node defined once (`_:sN …`), which later nodes may name again, twice in
 /// one list too; a node names only earlier ones, so there is no cycle.
@@ -1144,23 +1239,25 @@ impl Fillers {
         } else {
             ""
         };
-        let po = match self.random.below(if depth == 0 { 3 } else { 6 }) {
-            0 => {
+        let count = if depth == 0 {
+            3
+        } else {
+            DATA_CONSTRUCTORS.len()
+        };
+        let po = match DATA_CONSTRUCTORS[self.random.below(count)] {
+            "datatype" => {
                 let datatypes = ["xsd:integer", "xsd:decimal", "xsd:int", "xsd:string"];
                 return datatypes[self.random.below(4)].to_owned();
             }
-            1 => format!("{typed}owl:oneOf ( 5 7 )"),
-            2 => format!(
+            "oneOf" => format!("{typed}owl:oneOf ( 5 7 )"),
+            "onDatatype" => format!(
                 "{typed}owl:onDatatype xsd:integer ; owl:withRestrictions ( [ xsd:minInclusive 1 ] )"
             ),
-            3 => format!("{typed}owl:datatypeComplementOf {}", self.data(depth - 1)),
-            kind => {
+            "datatypeComplementOf" => {
+                format!("{typed}owl:datatypeComplementOf {}", self.data(depth - 1))
+            }
+            operator => {
                 let operands: Vec<String> = (0..2).map(|_| self.data(depth - 1)).collect();
-                let operator = if kind == 4 {
-                    "intersectionOf"
-                } else {
-                    "unionOf"
-                };
                 format!("{typed}owl:{operator} ( {} )", operands.join(" "))
             }
         };
@@ -1178,12 +1275,14 @@ impl Fillers {
         } else {
             ""
         };
-        if self.random.below(if depth == 0 { 1 } else { 2 }) == 0 {
+        let count = if depth == 0 { 1 } else { RL_CONSTRUCTORS.len() };
+        let constructor = RL_CONSTRUCTORS[self.random.below(count)];
+        if constructor == "datatype" {
             return ["xsd:int", "xsd:integer", "xsd:decimal"][self.random.below(3)].to_owned();
         }
         let operands: Vec<String> = (0..2).map(|_| self.rl_data(depth - 1)).collect();
         let operands = operands.join(" ");
-        self.node(format!("{typed}owl:intersectionOf ( {operands} )"))
+        self.node(format!("{typed}owl:{constructor} ( {operands} )"))
     }
 
     /// A class expression of depth at most `depth` that `:x`, in `:B`, `:C` and `:D`, is in:
@@ -1203,68 +1302,170 @@ impl Fillers {
             ""
         };
         let mut operands: Vec<String> = (0..2).map(|_| self.classes(depth - 1)).collect();
+        let [_, intersection, union, complement] = CLASS_CONSTRUCTORS;
         let operator = if self.random.chance(50) {
-            "intersectionOf"
+            intersection
         } else {
             if self.random.chance(50) {
-                operands.push(format!("[ owl:complementOf {} ]", named(&mut self.random)));
+                operands.push(format!("[ owl:{complement} {} ]", named(&mut self.random)));
             }
-            "unionOf"
+            union
         };
         self.node(format!("{typed}owl:{operator} ( {} )", operands.join(" ")))
     }
 }
 
 /// [`owl2_rl_reads_an_undeclared_existential_by_its_filler`] over generated fillers, a wrong
-/// case named by its half and index:
-/// - 200 data ranges ([`Fillers::data`]: every constructor the reader classifies, nested to
+/// case named by its stream and index:
+/// - Data ranges ([`Fillers::data`]: every constructor the reader classifies, nested to
 ///   depth three, with shared nodes named again). Each says the undeclared `:age` is a data
 ///   property: the places say what the table's data rows say, whatever the answer.
-/// - Most of those are outside RL, where a class reading is `sound-only` too. So 200 of RL's
-///   own ([`Fillers::rl_data`]), each holding the `xsd:int` 5 by its build: `:a a :Aged` is
+/// - Most of those are outside RL, where a class reading is `sound-only` too. RL's own
+///   ranges ([`Fillers::rl_data`]) each hold the `xsd:int` 5 by construction: `:a a :Aged` is
 ///   entailed, so the answer is `true` or no place calls it complete.
-/// - The mirror, 200 class expressions `:x` is in ([`Fillers::classes`]): object ones, the
+/// - Class expressions `:x` is in ([`Fillers::classes`]) provide the object controls. The
 ///   rules derive `:a a :Social`, `complete` in every place with the rewriting on. With a
 ///   complement in them it is `sound-only`: RL has no complement in a subclass expression
 ///   (Profiles §4.2.3, `subClassExpression`).
+///
+/// By default use fixed constructors, including the shared class union that exposed a
+/// kind error. With `NRESE_CHECK_TIER=nightly` draw 200 cases per stream.
 #[test]
 fn generated_fillers_are_read_by_their_kind_seed_5eedda7a() {
+    let full = nightly();
+    let data_witnesses = [
+        ("datatype", "xsd:integer"),
+        ("oneOf", "[ a rdfs:Datatype ; owl:oneOf ( 5 7 ) ]"),
+        (
+            "onDatatype",
+            "[ owl:onDatatype xsd:integer ; owl:withRestrictions ( [ xsd:minInclusive 1 ] ) ]",
+        ),
+        (
+            "datatypeComplementOf",
+            "[ owl:datatypeComplementOf xsd:string ]",
+        ),
+        (
+            "intersectionOf",
+            "[ owl:intersectionOf ( xsd:integer xsd:decimal ) ]",
+        ),
+        ("unionOf", "[ owl:unionOf ( xsd:integer xsd:string ) ]"),
+    ];
+    let class_witnesses = [
+        ("class", "", ":B", true),
+        (
+            "intersectionOf",
+            "",
+            "[ owl:intersectionOf ( :B :C ) ]",
+            true,
+        ),
+        // The shared class expression from draw 5, where the kind error changed all four statuses.
+        (
+            "unionOf",
+            "_:s0 owl:unionOf ( :D :C ) . _:s1 a owl:Class ; owl:unionOf ( [ owl:intersectionOf ( :C _:s0 ) ] _:s0 ) .",
+            "_:s1",
+            true,
+        ),
+        (
+            "complementOf",
+            "",
+            "[ owl:unionOf ( :B [ owl:complementOf :C ] ) ]",
+            false,
+        ),
+    ];
+    let rl_witnesses = [
+        ("datatype", "xsd:int"),
+        (
+            "intersectionOf",
+            "[ owl:intersectionOf ( xsd:int xsd:decimal ) ]",
+        ),
+    ];
     let mut wrong = Vec::new();
-    let mut check = |name: String, data: &str, read: &str, answer: &str, complete: bool| {
+    let mut check = |name: &str, data: &str, read: &str, answer: &str, complete| {
         for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
             let (text, line, statuses, _) = places(data, read, ql);
-            if !text.contains(answer) || statuses != matrix(complete, ql) {
+            let right = match complete {
+                Some(complete) => text.contains(answer) && statuses == matrix(complete, ql),
+                None => text.contains(answer) || !statuses.contains(&"complete"),
+            };
+            if !right {
                 wrong.push(format!("{name}: {data} / {line}"));
             }
         }
     };
     let (aged, social) = ("ASK { :a a :Aged }", "ASK { :a a :Social }");
-    let mut fillers = Fillers::new();
-    for i in 0..200 {
-        let range = fillers.data(3);
-        let data = format!("{} {}", fillers.take(), data_existential(&range));
-        check(format!("data {i}"), &data, aged, "", false);
-        let classes = fillers.classes(3);
-        let control = format!("{} {}", fillers.take(), object_existential(&classes));
-        let complete = !control.contains("owl:complementOf");
-        check(format!("control {i}"), &control, social, "true", complete);
-    }
-    let mut fillers = Fillers::new();
-    for i in 0..200 {
-        let range = fillers.rl_data(3);
-        let data = format!(
-            "{} {} :a :age \"5\"^^xsd:int .",
-            fillers.take(),
-            data_existential(&range)
-        );
-        for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
-            let (text, line, statuses, _) = places(&data, aged, ql);
-            if !text.contains("true") && statuses.contains(&"complete") {
-                wrong.push(format!("rl {i}: {data} / {line}"));
-            }
+    let rl_data = |range: &str| format!("{} :a :age \"5\"^^xsd:int .", data_existential(range));
+    if full {
+        let mut fillers = Fillers::new();
+        for i in 0..200 {
+            let range = fillers.data(3);
+            let data = format!("{} {}", fillers.take(), data_existential(&range));
+            check(&format!("data {i}"), &data, aged, "", Some(false));
+            let classes = fillers.classes(3);
+            let control = format!("{} {}", fillers.take(), object_existential(&classes));
+            let complete = !control.contains("owl:complementOf");
+            check(
+                &format!("control {i}"),
+                &control,
+                social,
+                "true",
+                Some(complete),
+            );
+        }
+        let mut fillers = Fillers::new();
+        for i in 0..200 {
+            let range = fillers.rl_data(3);
+            let data = format!("{} {}", fillers.take(), rl_data(&range));
+            check(&format!("rl {i}"), &data, aged, "true", None);
+        }
+    } else {
+        for (kind, range) in data_witnesses {
+            check(kind, &data_existential(range), aged, "", Some(false));
+        }
+        for (kind, definitions, classes, complete) in class_witnesses {
+            let control = format!("{definitions} {}", object_existential(classes));
+            check(
+                &format!("class {kind}"),
+                &control,
+                social,
+                "true",
+                Some(complete),
+            );
+        }
+        for (kind, range) in rl_witnesses {
+            check(&format!("rl {kind}"), &rl_data(range), aged, "true", None);
         }
     }
     assert!(wrong.is_empty(), "{} wrong: {wrong:#?}", wrong.len());
+    if !full {
+        use std::collections::BTreeSet;
+        let witnesses = [
+            (
+                "data",
+                &DATA_CONSTRUCTORS[..],
+                data_witnesses
+                    .iter()
+                    .map(|row| row.0)
+                    .collect::<BTreeSet<_>>(),
+            ),
+            (
+                "class",
+                &CLASS_CONSTRUCTORS[..],
+                class_witnesses.iter().map(|row| row.0).collect(),
+            ),
+            (
+                "rl",
+                &RL_CONSTRUCTORS[..],
+                rl_witnesses.iter().map(|row| row.0).collect(),
+            ),
+        ];
+        for (stream, constructors, pinned) in witnesses {
+            assert_eq!(
+                constructors.iter().copied().collect::<BTreeSet<_>>(),
+                pinned,
+                "the {stream} stream's constructors and its pinned witnesses"
+            );
+        }
+    }
 }
 
 /// Thirty intersections, each of the one before twice (`_:c1` is `( _:c0 _:c0 )`, …): a data
@@ -2342,11 +2543,10 @@ fn no_query_with_a_triple_term_is_complete_under_owl_2() {
 /// A reader of `:open` (and of the default graph, or not), with the inferences their graphs
 /// support, under `owl2-ql` and `owl2-rl` with the rewriting on. A triple term in a graph
 /// the reader can't read takes no part in their answers, so it has no say in their status.
-/// Spec: the status is `complete` (run and planned, rows kept) where no graph they read holds
-/// a triple term: none in the store, one only in a hidden named graph, one only in the
-/// default graph when they can't read it; and not `complete` where one they read does: in
-/// `:open`, in the default graph they read, or inferred where they see it (`rdfs:subPropertyOf`
-/// copies the object, so `:claims` holds the triple term).
+/// Spec: the run and plan name a triple term only where the reader can read it, and keep the
+/// rows. A term can be in `:open`, in the default graph they read, or inferred where they see
+/// it (`rdfs:subPropertyOf` copies the object, so `:claims` holds the triple term). Without a
+/// readable triple term the `owl2-rl` read is `complete`; the `owl2-ql` grant caps it at `sound-only`.
 #[test]
 fn a_readers_status_follows_the_triple_terms_they_may_read() {
     use std::sync::Arc;
@@ -2402,7 +2602,7 @@ fn a_readers_status_follows_the_triple_terms_they_may_read() {
         ("owl2-ql", Ruleset::Owl2Ql, QlRewritingMode::Auto),
         ("owl2-rl rewriting on", Ruleset::Owl2Rl, QlRewritingMode::On),
     ] {
-        for (default_graph, case, data, read, complete) in &cases {
+        for &(default_graph, case, ref data, read, no_visible_term) in &cases {
             let store = StoreService::new(StoreConfig {
                 ql_rewriting: ql,
                 ..StoreConfig::in_memory()
@@ -2416,7 +2616,7 @@ fn a_readers_status_follows_the_triple_terms_they_may_read() {
             store.use_reasoning_rules(Some(ruleset.into()));
             let scope = ReadScope::Graphs(Arc::new(GraphAccess {
                 graphs: vec!["http://example.com/open".to_owned()],
-                default_graph: *default_graph,
+                default_graph,
                 inferred: true,
                 inferred_by_support: true,
                 ..GraphAccess::default()
@@ -2427,17 +2627,26 @@ fn a_readers_status_follows_the_triple_terms_they_may_read() {
             let planned = store
                 .plan_query(&prepared, &CancellationToken::new())
                 .expect("planned");
-            let status = [result.completeness, planned.completeness]
-                .map(|c| c.map_or("none", |c| c.as_str()));
+            let statuses = [result.completeness, planned.completeness];
             let rows = String::from_utf8(result.payload).unwrap();
-            eprintln!("{regime}, {case}: {rows} {status:?}");
+            eprintln!("{regime}, {case}: {rows} {statuses:?}");
             let kept = rows.contains("example.com/a\"") || rows.contains("example.com/b\"");
-            let right = match complete {
-                true => status == ["complete"; 2],
-                false => !status.contains(&"complete"),
+            let expected = if ruleset == Ruleset::Owl2Ql || !no_visible_term {
+                "sound-only"
+            } else {
+                "complete"
             };
+            let right = statuses.iter().all(|status| {
+                status.as_ref().is_some_and(|status| {
+                    let names_triple = status
+                        .reasons
+                        .iter()
+                        .any(|r| r.text.contains("the data read holds a triple term"));
+                    status.as_str() == expected && names_triple != no_visible_term
+                })
+            });
             if !kept || !right {
-                wrong.push(format!("{regime}, {case}: {rows} {status:?}"));
+                wrong.push(format!("{regime}, {case}: {rows} {statuses:?}"));
             }
         }
     }

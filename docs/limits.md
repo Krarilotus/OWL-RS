@@ -132,37 +132,26 @@ leave something out.
   `rdfs-plus`: without a range, `∃:p.xsd:integer ⊑ :C` and `:a :p 5` give no `:a a :C`, even in
   one commit, where `owl2-dl` gives it
   ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)).
-  The reader uses well-formed walks to `rdf:nil`. It ignores branches that cannot reach
-  `rdf:nil`, including loops with no exit to it. If the part that reaches `rdf:nil` contains a
-  cycle, including one created by `owl:sameAs`, the reader falls back to stopping at its
-  first visit to `rdf:nil` and reports the cycle. A row or clash
-  that needs an omitted walk can still be missed.
-  A walk past its limit (a chain of more than 250 properties, a key of more than 127, or an
-  intersection of more than 256 classes) is left out. Other walks that fit still give rules.
-  A list with more than 64 walks is handled [below](#a-list-past-the-cap). These limits are
-  reported in the log and reasoning diagnostics. While a list read is incomplete, an answer
-  that reads the inferences isn't `complete`
-  ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)).
-  A write after which an axiom's list is read otherwise (left out where it was read, read where it was left out, or
-  left out for another reason) is rebuilt after its incremental maintenance
-  ([list limits](spec/reasoning-semantics.md#list-limits)): such a write is rematerialised, and
-  other writes stay incremental. For example, on one 32-core machine and a store of 2.8 million
-  stated facts, an edit that made a chain's list cyclic took 5.9 s and the edit that repaired it
-  7.5 s, against 1.5 s and 2.9 s incrementally, and the peak memory was 2.2 GB against 1.5 GB
-  (medians of 24 edits each). A list written as the OWL 2 RDF mapping writes it, one `rdf:first` and one
-  `rdf:rest` per cell, ending in `rdf:nil`, has no cycle or branch. Literals aren't
+  The reader follows every accepting walk to `rdf:nil`, including through cycles. A head
+  with no such walk gives no rules. The diagnostic can make reads over the inferences
+  incomplete. A write that changes whether a head has an accepting walk is rebuilt after
+  incremental maintenance ([list limits](spec/reasoning-semantics.md#list-limits)).
+  Lists whose walks exceed the encoder's bounds use rules over individual cells.
+  The walk search has a deterministic work bound and uses the cell form when it
+  reaches that bound. Operations with an existing reasoner stop also use it while
+  compiling and evaluating lists.
+  An adversarially branched head can reach this bound and use the cell form while giving
+  the same answers.
+  With QL rewriting on, a list outside OWL 2 DL's RDF syntax can still make a read
+  `sound-only` through the structural reader's `BrokenList` hazard.
+  Literals aren't
   equated by value (`"1"^^xsd:integer` and `"01"^^xsd:integer` stay two terms): compare
   values in a `FILTER` (`?v = 1`), which SPARQL does by value. Otherwise none known.
-- Under `owl2-rl` with the QL rewriting on, over a store holding a list axiom whose one walk
-  is past the [list limits](spec/reasoning-semantics.md#list-limits) (a chain of more than 250
-  properties, a key of more than 127, an intersection of more than 256 classes), so that the
-  rules leave it out, v1.5.0 tells a committed read under
-  `NOT EXISTS`, `MINUS`, `OPTIONAL` or another operator
-  [the rule](spec/reasoning-semantics.md#what-may-be-complete) names, whose QL report would
-  otherwise be `complete`, `sound-only` in its status, its plan's status and EXPLAIN's
-  `completeness`, and `complete` in its QL report (`ql`: the run's, the plan's and EXPLAIN's)
-  and in the printed query's status, where each should be `unsound`: it can return a row that
-  the left-out axiom's conclusions would remove. From v1.5.1 all of them say `unsound`.
+- Under `owl2-rl` with the QL rewriting on, a committed read over a left-out list axiom may be
+  `unsound` under `NOT EXISTS`, `MINUS`, `OPTIONAL` or another operator
+  [the rule](spec/reasoning-semantics.md#what-may-be-complete) names. The query result, plan
+  and EXPLAIN report that status. Lists with accepting walks use their rule conclusions
+  at any length.
 - Without the OWL 2 QL rewriting, every answer over a
   ruleset's closure is `sound-only`. The rewriting runs by default under `owl2-ql` only;
   under `owl2-rl`, `reasoner.ql_rewriting = "on"` checks each query as under `owl2-ql`.
@@ -224,6 +213,14 @@ leave something out.
   the read answers `false` and is told `complete`. For one:
   `:x a [ owl:onProperty owl:topObjectProperty ; owl:allValuesFrom :D ] . :y a :Y`, asked
   `:y a :D`. At the defaults it isn't told `complete`.
+- Under `owl2-ql`, a read that lists every partner of a top property, or of a property
+  equivalent to, above, or inverse to one, isn't told `complete`: every individual is a
+  partner, and the rewriting doesn't list them. For one: with
+  `:q owl:equivalentProperty owl:topObjectProperty`, `SELECT ?y { :a :q ?y }`. The same holds
+  for listing the members of a top property's domain or range, `SELECT ?x { ?x a :B }`.
+  Asking whether such a pair exists is answered for a property equivalent to, above, or
+  inverse to a top property, and whether an individual is such a member is answered; asked
+  of the top property itself, it isn't told `complete`.
 - Under `owl2-ql`, and under `owl2-rl` with the rewriting on, a store inconsistent only through
   an existential the rewriting gives isn't found inconsistent: a read every inconsistent store
   entails answers `false` and is told `complete`. For one: `:A ⊑ ∃:p.:B`, `:N ⊑ ¬∃:p.:B`,
@@ -547,46 +544,17 @@ leave something out.
   an `EXISTS` or a `LATERAL` builds from an outer binding, when it is built. A `SERVICE` body is
   answered by its endpoint.
 - An OWL list (of an intersection, a union, a property chain or a key, say) is read over the
-  whole store. Where statements in other graphs make it malformed (an `rdf:rest` back to one of
-  its nodes, or more than 64 member sequences), its rules are left out, so a read with
-  `inference-scope=dataset`, or a reader of some graphs who sees inferred statements by support,
-  can miss rows that the list's own graphs give.
+  whole store. A read that sees inferred statements by support still needs access to the
+  statements of at least one derivation, including its list premises.
 - A query whose dataset is named (`FROM`, or `default-graph-uri`) without
   `inference-scope=dataset` reads the asserted statements of those graphs and none of the
   inferred ones, which are in the default graph. Under `owl2-rl` its status is `sound-only`
   with the reason of a read over the closure, which doesn't say that the inferred statements
   are outside its dataset. For what follows from those graphs, add `inference-scope=dataset`.
-- <a id="a-list-past-the-cap"></a>A list axiom with more than 64 walks to `rdf:nil` is reported
-  (`too-many-list-variants`). Walks with identical member sequences count separately. The clash checks of such an
-  `owl:AllDifferent`, `owl:AllDisjointClasses` or `owl:AllDisjointProperties` list are made from
-  the list as written. A write that leaves the store holding such a list, one it held already or
-  one the write brings, is rebuilt after its incremental check, and the rebuild makes what the
-  list gives while its cells give it at most 64 walks
-  ([list limits](spec/reasoning-semantics.md#list-limits)). A write that deletes nothing is
-  refused if either check refuses it; a write that deletes is judged by the rebuild alone. Such a
-  write is rematerialised. For example, on one 12-core machine and a store of 2.8 million stated
-  facts (60,000 disjoint-class and 60,000 intersection lists, 2 million typed individuals, 20,000
-  `owl:sameAs` pairs) holding one list past the cap, a one-fact insert took about 6.5 to 7.1 s
-  instead of about 0.1 ms, and the peak memory over the writes rose from about 1.0 GiB to 1.6 GiB
-  (medians of 32 writes per equality mode). A store with no list past the cap is not affected.
-  An answer that
-  reads the inferences of a store with such a list isn't `complete`, but its reason need not name
-  the list: under `owl2-rl` it can name only the QL rewriting. These cases are left as they are:
-  - A write whose every statement is already inferred is not reasoned over again. Over a store
-    holding an axiom's list past the cap it can change what a rebuild would read of that list,
-    since a member then reaches the list in an earlier round. Such a store keeps its rows until
-    its next write that changes something, which is rebuilt; a restart doesn't. The rows it keeps
-    stay entailed, and a read over the inferences says `sound-only`.
-  - A list that is past the cap as written (a cell with more than 64 asserted `rdf:first`
-    values) gets no rules from a rebuild either: an inference made while it was within the cap
-    goes with the first rebuilt write.
-  - Where the store isn't marked consistent, such a write is judged by its incremental check
-    alone.
-  - Under equality by representatives, a first write whose list goes past the cap through an
-    alias of its head, or through other lists on the same axiom node, is accepted over the clash
-    the list gives, where the earlier `main` refuses it.
-  - With equality replicated, a clash through a cell that an alias of a list node gives
-    (`ex:l2 owl:sameAs ex:l2b . ex:l2b rdf:first ex:D`) is accepted.
+- <a id="a-list-past-the-cap"></a>The 64-walk bound selects a rule form.
+  Cyclic lists with exits and lists past the encoder bounds contribute
+  the conclusions of their accepting walks during ordinary incremental maintenance
+  ([list limits](spec/reasoning-semantics.md#list-limits)).
 
 ## SHACL
 
@@ -604,17 +572,14 @@ leave something out.
 - A commit that changes the shapes is checked against the shapes as they are after it: one
   update that removes the shapes and adds data is checked against none. It needs the right to
   write the shapes graph.
-- The gate follows a recursive shape (one that refers to itself through `sh:node`, inside
-  `sh:or` too) one step back from the changed statements. A write whose new violation lies two
-  or more such steps from the target node is accepted, and a full validation
-  (`GET /dataset/shacl`) reports it afterwards. Where recursive shapes matter, run one after
-  writes.
+- When a target reaches a recursive shape (one that refers to itself through `sh:node` or
+  `sh:property`, inside `sh:or` too), every data commit under the gate validates the whole
+  store, after the commit and, if that finds results, before it too. The cost grows with the
+  store. With LUBM 10's asserted data (1.27 million statements) and one recursive shape, a commit
+  of one new node took 87 ms and peaked at 12 MB on 4 cores. Without the recursive shape, it
+  took 5 ms and 1.7 MB.
 - Under `reasoner.equality = "compact"`, a write of `owl:sameAs` can pass the gate though it
   brings a result ([reasoning](#reasoning)).
-- A write can be refused for a result that was already there: a result reached through a nested
-  shape (a `sh:property` inside a `sh:property`) counts as introduced when a new focus node
-  reaches it, though another focus node reached it before. Repair that result first
-  (`GET /dataset/shacl` lists it).
 - Shapes that don't compile refuse every write, and a validation stopped by its budget fails
   the write, with the gate set to `report` as to `enforce`.
 
@@ -714,12 +679,7 @@ leave something out.
   the library's status of a query (`status_without_dl`) tells it `not-certified` on a reasoned
   store, also with `infer=false`, where the read itself carries no status (over HTTP, `complete`
   with no regime).
-- A reader of some graphs who sees inferred statements by support can lose an inferred answer
-  through graphs it can't read. Where statements there (`owl:sameAs` on a list's members) push a
-  list past the list limits, the support computation leaves that list axiom out, and the reader's
-  view lacks what it infers: an `ASK` a reader of every graph answers `true` can be `false` for
-  it. It is then told `not-certified`. This is a way the content of graphs it can't read shows in
-  what it sees. A list left out in such a graph that its own answer doesn't need (an unrelated
-  broken list, say) can change its status, from `complete` to `not-certified`, but not its rows.
+- An unrelated broken list in a graph the reader cannot see can change a read's status
+  from `complete` to `not-certified` while its rows stay the same.
 - A refusal for memory or work can hint at how much data a reader of only some graphs may not see. v2.0 admits
   requests by what the reader sees.

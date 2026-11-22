@@ -20,6 +20,8 @@ use nrese_rdf_io::{RdfFormat, RdfParser};
 use nrese_reasoner::rulesets::Ruleset;
 use nrese_store::{DlAnswers, SparqlQueryRequest, StoreService};
 
+use crate::support::nightly;
+
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const OWL: &str = "http://www.w3.org/2002/07/owl#";
 const VOCABULARY: [&str; 4] = [
@@ -656,6 +658,82 @@ fn query(
     }
 }
 
+/// FNV-1a (64-bit) of `text`: fixed by its definition, the same on every Rust version.
+fn fnv1a(text: &str) -> u64 {
+    text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// Check one fixed query per generator family. The disjoint case keeps the exact input
+/// from seed 15, where a false completeness claim hid two certain rows.
+fn pinned_oracle_witnesses(expiry: &Expiry) {
+    use Verdict::{Agree, Reported};
+    use nrese_owl::fuzz::templates::FAMILIES;
+
+    let disjoint = Case {
+        name: "disjoint",
+        turtle: include_str!("dl/oracle_seed_15.nt"),
+        query: "SELECT ?x WHERE { ?x <http://example.org/fuzz#p1> ?y0 }",
+    };
+    // Its certain answers `a0` and `a2` are not in the QL or RL rows, so a `complete` claim
+    // misses them and `Reported` is the only right verdict.
+    assert_eq!(
+        verdicts(&disjoint, Relation::Direct, expiry),
+        [(Ruleset::Owl2Ql, Reported), (Ruleset::Owl2Rl, Reported)],
+        "seed 15, disjoint: {}",
+        disjoint.query,
+    );
+    let mut witnessed = BTreeSet::from([disjoint.name]);
+    // Family, exact generation seed (after any redraw), query index, and the FNV-1a hash of the
+    // N-Triples, a newline and the query, so that a changed generator can't swap the input
+    // unnoticed. Each witness is compared in both regimes, `Agree` or `Reported`: which of the
+    // two is the rulesets' precision.
+    for (family, seed, query, frozen) in [
+        ("asserted", 23, 0, 0x460b_e6cd_97bf_a9f0),
+        ("bounded", 37, 0, 0x182f_54eb_af35_b1be),
+        ("left", 7, 0, 0x0aa7_f7c3_dd0c_f526),
+        ("review", 21, 0, 0xbd85_4fd0_82e2_5720),
+        ("self-nominal", 42_880_953_483_324, 0, 0x389d_f3df_b226_82fb),
+        ("sol", 8, 0, 0xe691_5290_cd3f_146c),
+        ("uniform", 2_199_023_255_552, 0, 0x1965_0058_b34c_146f),
+        ("universal", 8_796_093_022_283, 1, 0x230b_a045_7987_9ca4),
+    ] {
+        let (turtle, actual_family, queries) = generated(seed);
+        assert_eq!(actual_family, family, "pinned seed {seed}");
+        assert_eq!(
+            fnv1a(&format!("{turtle}\n{}", queries[query])),
+            frozen,
+            "pinned seed {seed} ({family}) generates another input: choose its witness again"
+        );
+        let case = Case {
+            name: family,
+            turtle: &turtle,
+            query: &queries[query],
+        };
+        let found = verdicts(&case, Relation::Direct, expiry);
+        let compared: Vec<_> = (found.iter())
+            .map(|(ruleset, verdict)| (ruleset, matches!(verdict, Agree | Reported)))
+            .collect();
+        assert_eq!(
+            compared,
+            [(&Ruleset::Owl2Ql, true), (&Ruleset::Owl2Rl, true)],
+            "seed {seed}, {family}: {}: {found:?}",
+            case.query,
+        );
+        witnessed.insert(actual_family);
+    }
+    assert_eq!(
+        witnessed,
+        FAMILIES
+            .into_iter()
+            .chain(["uniform"])
+            .collect::<BTreeSet<_>>(),
+        "pinned oracle witnesses must cover every generator family"
+    );
+    println!("pinned oracle families {witnessed:?}");
+}
+
 /// The generator's cases.
 /// Under the direct relation, no QL or RL answer labelled `complete` misses a certain
 /// answer of owl2-dl, and none claimed `sound` holds an uncertain one. Each failure names
@@ -666,22 +744,29 @@ fn query(
 /// least half its verdicts, and at least one verdict is compared. A case still inconsistent
 /// or declined after its redraws is counted so, never compared.
 /// Every family's counts are printed (`FAMILY` lines), and each failure its replay.
+/// By default check one pinned witness per family. With `NRESE_CHECK_TIER=nightly` draw
+/// 100 cases. An explicit seed or count also selects generated cases.
 ///
 /// Settings, each refused before any work where invalid ([`setting`]):
 /// - `NRESE_FUZZ_SEED` (default 0) varies the seeds;
-/// - `NRESE_FUZZ_CASES` (default 100, at least 1) sets their number;
+/// - `NRESE_FUZZ_CASES` (at least 1) overrides either default count;
 /// - `NRESE_FUZZ_DEADLINE_S` (default 1800) bounds the whole test. Past it, the run stops
 ///   and is inconclusive. The bound stops a hung run; it is not a speed
 ///   check: a slow shared host has taken about 320 s for the 100 cases beside the rest of
 ///   the suite, and the default leaves room for one five times slower than that.
 #[test]
 fn generated_cases_answer_as_the_dl_oracle() {
+    let pinned = !nightly()
+        && std::env::var_os("NRESE_FUZZ_SEED").is_none()
+        && std::env::var_os("NRESE_FUZZ_CASES").is_none();
     let base = env_setting("NRESE_FUZZ_SEED", 0, 0);
-    // 100 cases, about 20 s on one test thread (`dlorc-g1-measure5-51a049c1`: 120 cases in
-    // 24 s, redraws included).
     let cases = env_setting("NRESE_FUZZ_CASES", 100, 1);
     let deadline_s = env_setting("NRESE_FUZZ_DEADLINE_S", 1800, 1);
     let expiry = Expiry::at(std::time::Instant::now() + std::time::Duration::from_secs(deadline_s));
+    if pinned {
+        pinned_oracle_witnesses(&expiry);
+        return;
+    }
     let deadline = expiry.deadline;
     // Every setting, so a custom deadline replays too.
     let replay = |i: u64| {

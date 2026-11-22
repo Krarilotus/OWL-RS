@@ -2020,6 +2020,28 @@ pub(crate) fn set_query(rng: &mut Rng) -> (String, bool) {
     )
 }
 
+/// A fixture's size: `default`, or the line's `full` one with `NRESE_CHECK_TIER=nightly`.
+fn size(default: usize, full: usize) -> usize {
+    if crate::support::nightly() {
+        full
+    } else {
+        default
+    }
+}
+
+/// A random test's count: `default` for pinned witnesses, or `full` for a full draw.
+fn cases(default: usize, full: usize) -> usize {
+    if pinned_cases() { default } else { full }
+}
+
+/// Replay pinned witnesses when the tier is unset or `landing`, with no seed or count
+/// (`NRESE_FUZZ_SEED` and `NRESE_FUZZ_CASES`).
+fn pinned_cases() -> bool {
+    !crate::support::nightly()
+        && std::env::var_os("NRESE_FUZZ_CASES").is_none()
+        && std::env::var_os("NRESE_FUZZ_SEED").is_none()
+}
+
 /// Set evaluation (`native/sets.rs`): queries whose consumers ignore duplicates give the
 /// results of the same queries evaluated as written, and the reference evaluator's. Order-dependent
 /// results (`GROUP_CONCAT`, `SAMPLE`) are compared with the as-written evaluation only:
@@ -2262,15 +2284,41 @@ fn count_star_of_one_pattern_reads_the_index() {
 
 /// Cyclic BGPs (triangles, 4-cycles, with types, constants, repeated variables and a
 /// variable predicate) over dense graphs: the worst-case-optimal join equals the reference evaluator.
+/// By default (tier unset or `landing`, with no seed or count), this test compares pinned queries for each cycle shape with and without a type. With `NRESE_CHECK_TIER=nightly`, `NRESE_FUZZ_SEED` or `NRESE_FUZZ_CASES`, it draws 40 datasets.
 #[test]
 fn cyclic_bgps_equal_the_reference() {
+    let witnesses = [
+        (0, 0),
+        (0, 1),
+        (0, 2),
+        (0, 3),
+        (0, 4),
+        (0, 5),
+        (0, 6),
+        (0, 7),
+        (0, 9),
+        (0, 11),
+        (0, 12),
+        (0, 13),
+        (0, 14),
+        (0, 16),
+        (0, 18),
+        (0, 24),
+        (1, 2),
+        (1, 7),
+        (2, 8),
+    ];
+    let pinned = pinned_cases();
+    let cases = cases(3, 40);
     let mut rng = Rng::seeded(20_260_929);
     let oracle = QueryOptions {
         ..QueryOptions::default()
     };
     let rdf_type = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
     let mut checked = 0;
-    for _ in 0..40 {
+    let mut families = std::collections::BTreeSet::new();
+    const SHAPES: u64 = 9;
+    for dataset_case in 0..cases {
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         for _ in 0..40 + rng.below(120) {
@@ -2295,7 +2343,7 @@ fn cyclic_bgps_equal_the_reference() {
         }
         tx.commit().unwrap();
         let snapshot = engine.snapshot();
-        for _ in 0..25 {
+        for query_case in 0..25 {
             let p = |rng: &mut Rng| format!("<{EX}p{}>", rng.below(3));
             let edge = |rng: &mut Rng, a: &str, b: &str| {
                 let predicate = p(rng);
@@ -2305,7 +2353,8 @@ fn cyclic_bgps_equal_the_reference() {
                     format!("{b} {predicate} {a} .")
                 }
             };
-            let mut body = match rng.below(9) {
+            let shape = rng.below(SHAPES);
+            let mut body = match shape {
                 0 | 1 => format!(
                     "{} {} {}",
                     edge(&mut rng, "?a", "?b"),
@@ -2370,8 +2419,12 @@ fn cyclic_bgps_equal_the_reference() {
                     )
                 }
             };
-            if rng.below(2) == 0 {
+            let typed = rng.below(2) == 0;
+            if typed {
                 body.push_str(&format!(" ?a a <{EX}T{}> .", rng.below(2)));
+            }
+            if pinned && !witnesses.contains(&(dataset_case, query_case)) {
+                continue;
             }
             let text = format!("SELECT * WHERE {{ {body} }}");
             let query = SparqlParser::new()
@@ -2401,9 +2454,24 @@ fn cyclic_bgps_equal_the_reference() {
                 "{count}"
             );
             checked += 1;
+            if pinned && !expected.is_empty() {
+                families.insert((shape, typed));
+            }
         }
     }
-    assert_eq!(checked, 1000);
+    if pinned {
+        assert_eq!(checked, witnesses.len());
+        for shape in 0..SHAPES {
+            for typed in [false, true] {
+                assert!(
+                    families.contains(&(shape, typed)),
+                    "cycle {shape}, typed {typed}"
+                );
+            }
+        }
+    } else {
+        assert_eq!(checked, cases * 25);
+    }
 }
 
 /// COUNT(*) of a cyclic BGP, counted by its join, is exact while 64 bits hold it and fails
@@ -2462,12 +2530,14 @@ fn a_cyclic_count_past_64_bits_fails_as_a_range_limit() {
 
 /// A selective pattern joined with a much larger one runs as a parallel index nested-loop
 /// join (enough rows for several chunks); it equals the reference evaluator.
+/// By default, this test uses 10,000 probe subjects, 1,808 above the two-chunk minimum. With `NRESE_CHECK_TIER=nightly`, it uses 12,000 with proportional background.
 #[test]
 fn parallel_probe_join_equals_the_reference() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
     let mut tx = engine.transaction();
     let rdf_type = NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
-    for i in 0..12_000 {
+    let subjects = size(10_000, 12_000);
+    for i in 0..subjects {
         let quad = Quad::new(
             ex(&format!("t{i}")),
             rdf_type.clone(),
@@ -2485,7 +2555,7 @@ fn parallel_probe_join_equals_the_reference() {
             tx.insert(quad.as_ref());
         }
     }
-    for i in 0..400_000 {
+    for i in 0..subjects / 3 * 100 {
         let quad = Quad::new(
             ex(&format!("u{}", i / 4)),
             ex("p"),
@@ -2510,8 +2580,8 @@ fn parallel_probe_join_equals_the_reference() {
             false,
         );
         let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), false);
-        assert!(native.len() >= 12_000, "{text}");
         assert_eq!(native, expected, "{text}");
+        assert!(native.len() >= subjects, "{text}");
     }
 }
 
@@ -2690,11 +2760,12 @@ fn explain_reports_the_plan() {
 
 /// Filters and aggregates over tables large enough to run in parallel chunks (with terms
 /// computed by BIND, regular expressions, strings, decimals) equal the reference evaluator.
+/// By default, this test uses 34,000 subjects so the post-BIND filter sees over 18,000 rows against a 16,384-row parallel threshold. With `NRESE_CHECK_TIER=nightly`, it uses 40,000.
 #[test]
 fn parallel_filters_and_aggregates_equal_the_reference() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
     let mut tx = engine.transaction();
-    for i in 0..40_000u32 {
+    for i in 0..size(34_000, 40_000) as u32 {
         let s = ex(&format!("s{i}"));
         let values: [Term; 3] = [
             Literal::new_typed_literal((i % 997).to_string(), xsd::INTEGER).into(),
@@ -3559,6 +3630,7 @@ fn the_merged_default_graph_equals_the_reference() {
 /// data where most statements are held by two or three graphs: `COUNT(*)` of one pattern,
 /// `GROUP BY` with row counts, a streamed `LIMIT`, and an index nested-loop join. Each
 /// statement must count once (the index itself counts one per graph).
+/// By default, this test keeps the query and graph shapes with 1,000 typed subjects. With `NRESE_CHECK_TIER=nightly`, it uses 3,000.
 #[test]
 fn merged_default_graph_shortcuts_count_statements_once() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
@@ -3581,7 +3653,8 @@ fn merged_default_graph_shortcuts_count_statements_once() {
             }
         }
     };
-    for i in 0..3_000 {
+    let subjects = size(1_000, 3_000);
+    for i in 0..subjects {
         insert(ex(&format!("t{i}")), rdf_type.clone(), ex("T"), i);
         for j in 0..(i % 4) {
             insert(
@@ -3592,7 +3665,7 @@ fn merged_default_graph_shortcuts_count_statements_once() {
             );
         }
     }
-    for i in 0..60_000 {
+    for i in 0..subjects * 20 {
         insert(
             ex(&format!("u{}", i / 4)),
             ex("p"),
@@ -3609,9 +3682,6 @@ fn merged_default_graph_shortcuts_count_statements_once() {
     let oracle = QueryOptions {
         ..native_options.clone()
     };
-    // More quads than statements: the copies are there.
-    assert!(snapshot.len() as usize > statements * 3 / 2);
-
     let run = |text: &str, options: &QueryOptions| {
         let query = SparqlParser::new().parse_query(text).unwrap();
         assert!(runs_natively(&query), "{text}");
@@ -3629,6 +3699,8 @@ fn merged_default_graph_shortcuts_count_statements_once() {
         ),
         [integer(statements)]
     );
+    // More quads than statements: the copies are there.
+    assert!(snapshot.len() as usize > statements * 3 / 2);
     for text in [
         format!("SELECT (COUNT(*) AS ?n) WHERE {{ ?s a <{EX}T> }}"),
         format!("SELECT (COUNT(*) AS ?n) WHERE {{ ?s <{EX}p> ?o }}"),

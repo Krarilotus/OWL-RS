@@ -28,22 +28,37 @@ const STATEMENTS: usize = 50_000;
 /// restore; before UPLOAD 155 to 632 MiB. 1 MiB is 70 times the most measured and
 /// 155 times below the least of before.
 const PEAK: usize = 1 << 20;
+/// The least bound a smaller document gets: twice the most it measured at 5,000 statements
+/// (33,063 bytes into three contexts).
+const PEAK_FLOOR: usize = 64 << 10;
 
-/// `STATEMENTS` times the same statement, its terms in a 1,000-character namespace.
-fn long_prefix_turtle() -> Vec<u8> {
+/// [`PEAK`] in proportion to a document of `statements`, at least [`PEAK_FLOOR`]. A 32-byte
+/// copy per statement crosses it at both sizes tested here, 5,000 and 50,000 statements (1.8
+/// and 1.6 times the bound); what doesn't grow with the document stays far below it.
+fn peak_for(statements: usize) -> usize {
+    // In u64: `PEAK * statements` passes `usize::MAX` on a 32-bit target at either size.
+    let peak = PEAK as u64 * statements as u64 / STATEMENTS as u64;
+    usize::try_from(peak).expect("at most PEAK").max(PEAK_FLOOR)
+}
+
+#[path = "it/support/tier.rs"]
+mod tier;
+
+/// The same statement repeated, its terms in a 1,000-character namespace.
+fn long_prefix_turtle(statements: usize) -> Vec<u8> {
     let namespace = format!("http://example.com/{}/", "x".repeat(1_000));
     let mut document = format!("@prefix : <{namespace}> .\n");
-    for _ in 0..STATEMENTS {
+    for _ in 0..statements {
         document.push_str(":s :p :o .\n");
     }
     document.into_bytes()
 }
 
 /// The same statements as N-Quads, as a restore reads them.
-fn long_iri_nquads() -> Vec<u8> {
+fn long_iri_nquads(statements: usize) -> Vec<u8> {
     let iri = format!("<http://example.com/{}/s>", "x".repeat(1_000));
     let line = format!("{iri} {iri} {iri} .\n");
-    line.repeat(STATEMENTS).into_bytes()
+    line.repeat(statements).into_bytes()
 }
 
 fn pipeline() -> MutationPipeline {
@@ -60,14 +75,14 @@ fn apply(pipeline: &MutationPipeline, command: MutationCommand) -> usize {
     peak
 }
 
-fn below(what: &str, peak: usize) {
+/// `peak`, of a document of `statements`, is below its bound ([`peak_for`]).
+fn below(what: &str, peak: usize, statements: usize) {
+    let bound = peak_for(statements);
     // The measurement, for the limit's calibration (run with --nocapture).
-    eprintln!("measured: {what}: peak {peak} bytes");
+    eprintln!("measured: {what}: peak {peak} bytes, bound {bound}");
     assert!(
-        peak < PEAK,
-        "{what}: {} MiB at its peak, more than {} MiB",
-        peak >> 20,
-        PEAK >> 20
+        peak < bound,
+        "{what}: {peak} bytes at its peak for {statements} statements, more than {bound}"
     );
 }
 
@@ -77,7 +92,7 @@ fn a_graph_store_write_holds_no_copy_of_its_document() {
         return;
     }
     let pipeline = pipeline();
-    let payload = long_prefix_turtle();
+    let payload = long_prefix_turtle(STATEMENTS);
     let peak = apply(
         &pipeline,
         MutationCommand::GraphWrite(GraphWriteRequest {
@@ -88,9 +103,11 @@ fn a_graph_store_write_holds_no_copy_of_its_document() {
             replace: true,
         }),
     );
-    below("Graph Store PUT", peak);
+    below("Graph Store PUT", peak, STATEMENTS);
 }
 
+/// By default 5,000 statements; with `NRESE_CHECK_TIER=nightly`, 50,000. The bound is in
+/// proportion.
 #[test]
 fn statements_added_into_contexts_hold_no_copy_of_their_document() {
     if !measure::alone() {
@@ -100,34 +117,38 @@ fn statements_added_into_contexts_hold_no_copy_of_their_document() {
     let contexts = (0..3)
         .map(|i| nrese_rdf::NamedNode::new_unchecked(format!("http://example.com/c{i}")).into())
         .collect();
+    let statements = if tier::nightly() { STATEMENTS } else { 5_000 };
     let peak = apply(
         &pipeline,
         MutationCommand::Statements(StatementsRequest::new(vec![StatementOp::Add {
             data: RdfPayload {
-                payload: long_prefix_turtle().into(),
+                payload: long_prefix_turtle(statements).into(),
                 format: GraphResultFormat::Turtle,
                 base_iri: None,
             },
             contexts,
         }])),
     );
-    below("statements into three contexts", peak);
+    below("statements into three contexts", peak, statements);
 }
 
+/// By default 5,000 statements; with `NRESE_CHECK_TIER=nightly`, 50,000. The bound is in
+/// proportion.
 #[test]
 fn a_restore_holds_no_copy_of_its_dataset() {
     if !measure::alone() {
         return;
     }
     let pipeline = pipeline();
+    let statements = if tier::nightly() { STATEMENTS } else { 5_000 };
     let peak = apply(
         &pipeline,
         MutationCommand::Restore(DatasetRestoreRequest {
             format: nrese_store::DatasetBackupFormat::NQuads,
-            payload: long_iri_nquads(),
+            payload: long_iri_nquads(statements),
         }),
     );
-    below("restore", peak);
+    below("restore", peak, statements);
 }
 
 #[test]
@@ -140,7 +161,7 @@ fn shapes_sent_with_a_validation_hold_no_copy_of_their_document() {
         shapes: ShapesSource::Payload {
             format: GraphResultFormat::Turtle,
             base_iri: None,
-            payload: long_prefix_turtle(),
+            payload: long_prefix_turtle(STATEMENTS),
         },
         ..ShaclValidationRequest::default()
     };
@@ -152,5 +173,5 @@ fn shapes_sent_with_a_validation_hold_no_copy_of_their_document() {
         )
     });
     outcome.expect("validated");
-    below("request shapes", peak);
+    below("request shapes", peak, STATEMENTS);
 }

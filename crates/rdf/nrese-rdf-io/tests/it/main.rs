@@ -9,6 +9,7 @@ mod rdfxml_tests;
 mod reader_contract_tests;
 mod recovery_inputs;
 mod split_contract_tests;
+mod support;
 mod table;
 mod turtle_tests;
 mod writer_contract_tests;

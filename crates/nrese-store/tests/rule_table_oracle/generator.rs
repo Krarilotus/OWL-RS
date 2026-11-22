@@ -6,6 +6,9 @@ use crate::{Facts, Triple, triple};
 pub struct Write {
     pub insert: Vec<Triple>,
     pub delete: Vec<Triple>,
+    /// Loaded past the gates: unreasoned, then rebuilt. The store keeps it even when the
+    /// oracle finds it inconsistent.
+    pub past_gates: bool,
 }
 
 impl Write {
@@ -76,18 +79,7 @@ pub fn draws_on(drawn: u64, cases: u64, covered: bool) -> bool {
     drawn < cases || (!covered && drawn < cases.saturating_mul(10))
 }
 
-pub const RED_SHAPES: &[&str] = &[
-    "redundant",
-    "cycle",
-    "schema-insert",
-    "schema-delete",
-    "equality-member",
-    "long-chain",
-    "equality-schema",
-    "literal-functional",
-    "nil-head",
-    "nil-cell",
-];
+pub const RED_SHAPES: &[&str] = &["equality-schema", "literal-functional"];
 
 pub const SHAPES: &[&str] = &[
     "redundant",
@@ -266,6 +258,7 @@ pub fn generated(seed: u64, plain: bool) -> Case {
             Write {
                 delete: rows("ex:b ex:q ex:z"),
                 insert: rows("ex:u rdf:type ex:Marker"),
+                past_gates: false,
             },
         ]),
         "schema-insert" | "schema-delete" => schema_operand(shape == "schema-insert"),

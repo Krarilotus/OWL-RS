@@ -76,7 +76,7 @@ pub fn steps(case: &Case) -> Vec<Step> {
                     .cloned(),
             );
             let model = oracle::evaluate(&asserted, Datatypes::Standard);
-            if !model.inconsistent {
+            if !model.inconsistent || write.past_gates {
                 committed = asserted.clone();
                 ordered = candidate.clone();
             }
@@ -259,9 +259,12 @@ fn run<'a>(case: &'a Case, steps: &[Step], focus: Option<&'a Difference>) -> Com
             for (index, ((write, step), expected)) in
                 case.writes.iter().zip(steps).zip(&projected).enumerate()
             {
-                let accepted = judges::apply(&pipeline, write);
+                let accepted = match write.past_gates {
+                    true => judges::load_past_gates(&store, write),
+                    false => judges::apply(&pipeline, write),
+                };
                 let wanted = !step.model.inconsistent;
-                let visible = if accepted {
+                let visible = if accepted || write.past_gates {
                     (step, expected)
                 } else {
                     committed
@@ -288,7 +291,7 @@ fn run<'a>(case: &'a Case, steps: &[Step], focus: Option<&'a Difference>) -> Com
                         );
                     }
                 }
-                if wanted {
+                if wanted || write.past_gates {
                     committed = (step, expected);
                 }
             }
@@ -323,10 +326,7 @@ fn required_red<'a>(case: &Case, differences: &'a [Difference]) -> Option<&'a Di
             ("nil-head" | "nil-cell", Answer::Row(row, true)) => {
                 difference.write == 0 && row == &case.watch
             }
-            ("schema-insert" | "literal-functional", Answer::Row(row, true)) => {
-                delta && difference.write == 1 && row == &case.watch
-            }
-            ("schema-delete", Answer::Row(row, false)) => {
+            ("literal-functional", Answer::Row(row, true)) => {
                 delta && difference.write == 1 && row == &case.watch
             }
             ("equality-member" | "equality-schema", Answer::Accept(false)) => difference.write == 1,
@@ -491,6 +491,13 @@ fn seeds() {
         }
         println!("SEED {seed} shape={} required-red={known}", case.shape);
         result.print("RESULT ");
+        if demonstrate_red {
+            assert!(
+                generator::RED_SHAPES.contains(&case.shape),
+                "unexpected red shape {}",
+                case.shape
+            );
+        }
         for difference in result.differences {
             // Verdict and redundancy mismatches have no row key. Keep their
             // originating write so different inconsistency inputs stay distinct.

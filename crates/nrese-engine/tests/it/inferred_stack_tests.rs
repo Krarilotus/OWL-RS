@@ -368,6 +368,7 @@ impl Model {
 }
 
 const TERMS: u64 = 3;
+const OPERATIONS: usize = 4;
 
 fn random_quad(rng: &mut Rng) -> EncodedQuad {
     let graph = match rng.below(3) {
@@ -383,11 +384,12 @@ fn random_quad(rng: &mut Rng) -> EncodedQuad {
 }
 
 /// One random operation on both the transaction and the model; return values must agree.
-fn random_operation(rng: &mut Rng, tx: &mut Transaction<'_>, model: &mut Model) {
+fn random_operation(rng: &mut Rng, tx: &mut Transaction<'_>, model: &mut Model) -> (usize, bool) {
     let quad = random_quad(rng);
     let statement = EncodedTriple::from(quad);
     let inferred_quad = statement.in_default_graph();
-    let (got, expected) = match rng.below(4) {
+    let operation = rng.below(OPERATIONS as u64) as usize;
+    let (got, expected) = match operation {
         0 => (tx.insert_encoded(quad), model.asserted.insert(quad)),
         1 => (tx.remove_encoded(quad), model.asserted.remove(&quad)),
         2 => (
@@ -403,6 +405,7 @@ fn random_operation(rng: &mut Rng, tx: &mut Transaction<'_>, model: &mut Model) 
         ),
     };
     assert_eq!(got, expected, "operation result for {quad:?}");
+    (operation, expected)
 }
 
 fn patterns() -> Vec<QuadPattern> {
@@ -573,32 +576,59 @@ fn assert_transaction(tx: &Transaction<'_>, model: &Model, context: &str) {
 }
 
 /// Runs `steps` random transactions against `engine`, committing most and aborting some.
-fn run_random_transactions(engine: &Engine, rng: &mut Rng, committed: &mut Model, steps: u32) {
+fn run_random_transactions(
+    engine: &Engine,
+    rng: &mut Rng,
+    committed: &mut Model,
+    steps: u32,
+) -> BTreeSet<(usize, bool, bool)> {
+    let mut witnessed = BTreeSet::new();
     for step in 0..steps {
         let context = format!("step {step}");
         let mut tx = engine.transaction();
         let mut pending = committed.clone();
-        for _ in 0..=rng.below(6) {
-            random_operation(rng, &mut tx, &mut pending);
-        }
+        let operations: Vec<_> = (0..=rng.below(6))
+            .map(|_| random_operation(rng, &mut tx, &mut pending))
+            .collect();
         assert_transaction(&tx, &pending, &context);
-        if rng.below(5) == 0 {
+        let abort = rng.below(5) == 0;
+        if abort {
             drop(tx); // abort
         } else {
             tx.commit().expect("commit");
             *committed = pending.committed();
         }
         assert_snapshot(&engine.snapshot(), committed, &context);
+        witnessed.extend(
+            operations
+                .into_iter()
+                .map(|(kind, changed)| (kind, changed, abort)),
+        );
     }
+    witnessed
 }
 
+/// By default (tier unset or `landing`, with no seed or count), this test replays committed and aborted edits of both stacks. With `NRESE_CHECK_TIER=nightly`, `NRESE_FUZZ_SEED` or `NRESE_FUZZ_CASES`, it draws 25 seeds.
 #[test]
 fn both_stacks_match_the_model_with_compaction() {
-    for seed in 0..25 {
+    let pinned = !crate::support::nightly()
+        && std::env::var_os("NRESE_FUZZ_CASES").is_none()
+        && std::env::var_os("NRESE_FUZZ_SEED").is_none();
+    let mut kinds = BTreeSet::new();
+    let seeds = if pinned { 8 } else { 25 };
+    for seed in (0..seeds).filter(|seed| !pinned || [0, 2, 4, 7].contains(seed)) {
         let engine = engine(); // inline compaction after every commit
         let mut rng = Rng(fuzz(seed));
         let mut committed = Model::default();
-        run_random_transactions(&engine, &mut rng, &mut committed, 40);
+        kinds.extend(run_random_transactions(
+            &engine,
+            &mut rng,
+            &mut committed,
+            40,
+        ));
+    }
+    if pinned {
+        assert_eq!(kinds.len(), OPERATIONS * 4, "witnessed edits: {kinds:?}");
     }
 }
 

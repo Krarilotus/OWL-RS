@@ -26,6 +26,10 @@ pub struct Closure {
     pub diagnostics: Vec<ListDiagnostic>,
     pub rounds: usize,
     pub phases: Phases,
+    /// The closure equates a literal with another term (an `owl:sameAs` with a literal
+    /// subject), a fact no store holds: the copies it makes of statements a later commit
+    /// writes are missing from that commit's maintenance.
+    pub literal_equality: bool,
 }
 
 /// The closure of `asserted` (any graphs) under `program`, its axioms included.
@@ -183,15 +187,23 @@ fn closure_with(
         ));
     }
     let mut inferred = Vec::new();
+    // Only a closure stored has a reader of the flag (the report's has none).
+    let mut literal_equality = false;
     if let Output::Stored(mut unstorable) = output {
         nrese_exec::heap::phase("store: encode");
         // At its exact size: collected by doubling, the list held up to twice the facts, and
         // at a doubling three times beside them (LUBM 1000: 6.6 GB at this step's peak).
         inferred = Vec::with_capacity(result.derived.len() + axioms.len());
         for t in result.derived.into_iter().chain(axioms) {
+            if let Some(crate::lists::TableKind::Internal) = crate::lists::table_kind(t) {
+                continue;
+            }
             if storable(t) {
                 inferred.push(encode(t));
-            } else if let Some(unstorable) = unstorable.as_deref_mut() {
+                continue;
+            }
+            literal_equality |= super::equates_literal(t, program.same_as);
+            if let Some(unstorable) = unstorable.as_deref_mut() {
                 unstorable.push(t);
             }
         }
@@ -202,6 +214,7 @@ fn closure_with(
         diagnostics: result.diagnostics,
         rounds: result.rounds,
         phases: result.phases,
+        literal_equality,
     })
 }
 

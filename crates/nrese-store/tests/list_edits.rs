@@ -231,9 +231,7 @@ fn an_insert_that_relists_and_clashes_through_a_kept_path_is_refused() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// A list left out before a write and after it, but for another reason, can still change
-/// what the closure holds: a list past the cap gets its rules from a rebuild's rounds, so its
-/// inferences are in the closure, and once a write breaks the list they have no proof. Spec:
+/// An accepting list gives its inference, and once a write breaks the list it has no proof. Spec:
 /// OWL 2 Profiles §4.3, Table 6, `cls-int1`, whose `LIST[...]` is a sequence of `rdf:first`
 /// and `rdf:rest` ending in `rdf:nil`: `ex:I owl:intersectionOf (ex:C1 … ex:C7)`, each `ex:Ck owl:sameAs ex:Dk` (128
 /// member sequences, past the 64 a list axiom is instantiated for), and `ex:x` in each `ex:Ck`
@@ -242,7 +240,7 @@ fn an_insert_that_relists_and_clashes_through_a_kept_path_is_refused() {
 /// else gives `ex:x rdf:type ex:I`. The write also inserts an unrelated fact, so it isn't one
 /// that only deletes. As a later write and after a restart, under each equality mode.
 #[test]
-fn an_inference_of_a_list_past_the_cap_goes_when_a_write_breaks_the_list() {
+fn an_inference_of_many_aliased_walks_goes_when_a_write_breaks_the_list() {
     let mut cells = String::new();
     for k in 1..=7 {
         let rest = match k {
@@ -270,6 +268,8 @@ fn an_inference_of_a_list_past_the_cap_goes_when_a_write_breaks_the_list() {
             let mut store = open();
             let mut commits = pipeline(&store, ReasoningMode::Owl2Rl);
             apply(&commits, &setup).unwrap_or_else(|e| panic!("{case}: setup: {e}"));
+            let diagnostics = commits.last_reasoning_run().unwrap().diagnostics;
+            assert!(diagnostics.is_empty(), "{case}: {diagnostics:?}");
             // The setup's own answer, so a red run fails at the change, not before it.
             if !read(&store, ask).0.contains("true") {
                 wrong.push(format!("{case}: the setup lacks ex:x rdf:type ex:I"));
@@ -292,14 +292,11 @@ fn an_inference_of_a_list_past_the_cap_goes_when_a_write_breaks_the_list() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// Kind (ii): the expected value is a rebuild of the same asserted facts, the store's own
-/// batch reasoner, not an independent source. An axiom's list left out (malformed, cyclic,
-/// or a 300-class intersection past the rule format's 256 atoms) that no write touches gives
-/// no rules to the delta or to a rebuild; ordinary writes to such a store stay incremental
-/// and leave every row and the status a rebuild of the same facts gives. Data inserts and
-/// deletes, with a restart between, under each equality mode.
+/// The malformed and dead cyclic lists have no accepting walk. Table 6 cls-int1
+/// gives membership once the last operand is asserted for the 300-class intersection.
+/// Each write stays incremental and yields the same state as a rebuild.
 #[test]
-fn a_list_left_out_and_untouched_leaves_writes_incremental_and_equal_to_a_rebuild() {
+fn writes_over_untouched_list_axioms_remain_incremental() {
     let background = "ex:p rdfs:subPropertyOf ex:s . ex:K1 rdfs:subClassOf ex:K2 . ";
     let chain = |cells: &str| format!("{background}ex:ch owl:propertyChainAxiom ex:m1 . {cells}");
     let long: String = {
@@ -310,6 +307,9 @@ fn a_list_left_out_and_untouched_leaves_writes_incremental_and_equal_to_a_rebuil
                 _ => format!("ex:t{}", k + 1),
             };
             out.push_str(&format!("ex:t{k} rdf:first ex:K{k} ; rdf:rest {rest} . "));
+            if k < 300 {
+                out.push_str(&format!("ex:x rdf:type ex:K{k} . "));
+            }
         }
         out
     };
@@ -324,7 +324,7 @@ fn a_list_left_out_and_untouched_leaves_writes_incremental_and_equal_to_a_rebuil
                 "ex:m1 rdf:first ex:p ; rdf:rest ex:m2 . ex:m2 rdf:first ex:q ; rdf:rest ex:m1 . ",
             ),
         ),
-        ("too long", long),
+        ("long intersection", long),
     ];
     let writes = [
         (
@@ -333,7 +333,7 @@ fn a_list_left_out_and_untouched_leaves_writes_incremental_and_equal_to_a_rebuil
         ),
         (
             true,
-            "INSERT DATA { ex:c ex:p ex:d . ex:d ex:q ex:e . ex:x rdf:type ex:K2 . }",
+            "INSERT DATA { ex:c ex:p ex:d . ex:d ex:q ex:e . ex:x rdf:type ex:K300 . }",
         ),
         // Each write inserts something: the policy may rebuild one that only deletes
         // ([`nrese_reasoner`]'s `Plan::Rebuild`), whatever its lists.
@@ -379,6 +379,12 @@ fn a_list_left_out_and_untouched_leaves_writes_incremental_and_equal_to_a_rebuil
                 }
                 apply(&commits, body).unwrap_or_else(|e| panic!("{case}: {e}"));
                 asserted.push((*body).to_owned());
+                if *name == "long intersection" {
+                    let answer = read(&store, "ASK { ex:x rdf:type ex:I }").0;
+                    if answer.contains("true") != (step >= 1) {
+                        wrong.push(format!("{case}: {answer}"));
+                    }
+                }
                 let plan = commits
                     .last_reasoning_run()
                     .map(|run| format!("{:?}", run.work.plan));

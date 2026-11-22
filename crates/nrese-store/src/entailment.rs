@@ -18,13 +18,20 @@
 //!
 //! The answer is sound; it is complete as far as the rules are for the premise (OWL 2 RL
 //! premises and the forms above). A conclusion outside them may be entailed although the
-//! answer is no.
+//! answer is no, except under `owl2-dl`. There none of the above applies, as the closure
+//! proves nothing under the Direct Semantics (an annotation property's domain puts its
+//! subjects in the closure, for one): the DL engines decide the whole conclusion
+//! ([`StoreService::entails_dl`]), an [`StoreError::Undecided`] error where they can't,
+//! within one `dl.timeout` from the call. A store whose rules' consistency is undecided
+//! gives no answer in any mode.
 //! Refutation uses the store's process-memory watch; interruption is an error, never
 //! a negative entailment answer or an assumed-unreachable panic.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use nrese_dl::limits::Deadline;
+use nrese_engine::Snapshot;
 use nrese_rdf::vocab::{owl, rdf};
 use nrese_rdf::{GraphName, NamedOrBlankNode, Quad, Term, Triple};
 use nrese_reasoner::RuleProgram;
@@ -68,17 +75,36 @@ impl StoreService {
         program: impl Into<RuleProgram>,
         conclusion: &[Triple],
     ) -> StoreResult<Entailment> {
+        // Under owl2-dl, one dl.timeout from the call, the caller's conversion of its program
+        // included.
+        let from_the_call = Deadline::after(self.config().dl.timeout);
         let program = program.into();
         // One certified closure: reads start only on a settled certificate (an
         // even epoch; odd, a change is in progress and the old certificate may still be
         // visible), and an answer stands only if no change began while they took their
         // snapshots. An open or changed certificate refuses without waiting or retrying.
+        // The mode is one of those reads: switching it is a change of the certificate.
         let epoch = self.certificate_epoch();
         if epoch.is_multiple_of(2) {
-            let answer = self.entails_once(&program, conclusion)?;
+            // The mode, read once: under owl2-dl, the DL route with the call's deadline.
+            let dl = self.dl().active().then_some(from_the_call);
+            #[cfg(test)]
+            crate::service::hooks::run(&crate::service::hooks::AFTER_MODE_READ);
+            let answer = self.entails_once(&program, conclusion, dl)?;
+            // Let go before the checks below, so freeing the caller's program (its user rules,
+            // perhaps large) takes none of the time an answer is judged by.
+            drop(program);
+            #[cfg(test)]
+            crate::service::hooks::run(&crate::service::hooks::AFTER_ENTAILMENT_READS);
             if self.certificate_epoch() == epoch {
+                // Under owl2-dl, an answer stands only within its time, the snapshot let go.
+                if dl.is_some_and(Deadline::passed) {
+                    return Err(out_of_time());
+                }
                 return Ok(answer);
             }
+            // The certificate changed during the reads: the closure may be certified already.
+            return Err(StoreError::Undecided(CHANGED.to_owned()));
         }
         Err(StoreError::Configuration(format!(
             "the inferred statements aren't {}'s closure: rematerialise first",
@@ -87,10 +113,12 @@ impl StoreService {
     }
 
     /// One try of [`Self::entails`]; it stands only if the certificate didn't change meanwhile.
+    /// Under owl2-dl, `dl` is the deadline before which the DL engines decide it.
     fn entails_once(
         &self,
         program: &RuleProgram,
         conclusion: &[Triple],
+        dl: Option<Deadline>,
     ) -> StoreResult<Entailment> {
         if !self.reasoning_is_current(program.clone()) {
             return Err(StoreError::Configuration(format!(
@@ -100,30 +128,70 @@ impl StoreService {
         }
         #[cfg(test)]
         crate::service::hooks::run(&crate::service::hooks::AFTER_CERTIFIED);
-        match self.consistency() {
-            crate::ConsistencyStatus::Inconsistent { .. } => {
-                return Ok(Entailment::InconsistentPremise);
-            }
-            // Not known to entail everything: no answer.
-            crate::ConsistencyStatus::Undecided { violations, why } => {
-                return Err(StoreError::Undecided(why.text(violations)));
-            }
-            _ => {}
+        let consistency = self.consistency();
+        // Not known to entail everything, nor not to: no answer.
+        if let crate::ConsistencyStatus::Undecided { violations, why } = consistency {
+            return Err(StoreError::Undecided(why.text(violations)));
         }
-        let split = split(conclusion);
-        if !split.positive.is_empty() && !self.ask(&split.positive)? {
-            return Ok(Entailment::NotEntailed);
+        // Under owl2-dl the closure is no proof, its inconsistency included: the DL engines
+        // decide, the premise's consistency too.
+        if let Some(deadline) = dl {
+            return self.decided_by_dl(&self.engine().snapshot(), conclusion, deadline);
         }
-        for opposite in &split.refutations {
-            if !self.refutes(program, opposite)? {
-                return Ok(Entailment::NotEntailed);
-            }
+        if let crate::ConsistencyStatus::Inconsistent { .. } = consistency {
+            return Ok(Entailment::InconsistentPremise);
         }
-        Ok(Entailment::Entailed)
+        // One revision for the whole answer: the closure's read and every refutation are of it.
+        let at = self.engine().snapshot();
+        match self.shown_by_rules(&at, program, &split(conclusion))? {
+            true => Ok(Entailment::Entailed),
+            false => Ok(Entailment::NotEntailed),
+        }
     }
 
-    /// Whether the materialised data matches `pattern`, blank nodes read as variables.
-    fn ask(&self, pattern: &[Triple]) -> StoreResult<bool> {
+    /// Whether the closure at `at` holds every positive statement and the rules refute every
+    /// opposite over it.
+    fn shown_by_rules(
+        &self,
+        at: &Snapshot,
+        program: &RuleProgram,
+        split: &Split,
+    ) -> StoreResult<bool> {
+        let asked = split.positive.is_empty() || self.ask(at, &split.positive)?;
+        #[cfg(test)]
+        crate::service::hooks::run(&crate::service::hooks::BETWEEN_ENTAILMENT_HALVES);
+        if !asked {
+            return Ok(false);
+        }
+        for opposite in &split.refutations {
+            if !self.refutes(at, program, opposite)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// [`Self::entails_dl`]'s answer at `at` before `deadline`, as an [`Entailment`];
+    /// undecided where it is unknown.
+    fn decided_by_dl(
+        &self,
+        at: &Snapshot,
+        conclusion: &[Triple],
+        deadline: Deadline,
+    ) -> StoreResult<Entailment> {
+        let decided = self.entails_dl_at(at, conclusion, deadline)?;
+        match (decided.premise, decided.answer) {
+            (crate::dl::Verdict::Inconsistent, _) => Ok(Entailment::InconsistentPremise),
+            (_, crate::dl::entailment::Entailed::Yes) => Ok(Entailment::Entailed),
+            (_, crate::dl::entailment::Entailed::No) => Ok(Entailment::NotEntailed),
+            (_, crate::dl::entailment::Entailed::Unknown(why)) => {
+                Err(StoreError::Undecided(format!("under OWL 2 DL: {why}")))
+            }
+        }
+    }
+
+    /// Whether the materialised data at `at` matches `pattern`, blank nodes read as variables.
+    fn ask(&self, at: &Snapshot, pattern: &[Triple]) -> StoreResult<bool> {
         let patterns: Vec<String> = pattern
             .iter()
             .map(|t| format!("{} .", triple_pattern(t)))
@@ -132,16 +200,22 @@ impl StoreService {
         let query = SparqlParser::new()
             .parse_query(&text)
             .map_err(|error| StoreError::Configuration(format!("{error}: {text}")))?;
-        let snapshot = self.engine().snapshot();
-        match nrese_sparql::evaluate_query(&snapshot, &query, &QueryOptions::default())? {
+        match nrese_sparql::evaluate_query(at, &query, &QueryOptions::default())? {
             QueryResults::Boolean(found) => Ok(found),
             _ => unreachable!("an ASK answers with a boolean"),
         }
     }
 
-    /// Whether adding `opposite` to the data makes it inconsistent under `program`: the
-    /// reasoner maintains the closure over a speculative transaction, which is dropped.
-    fn refutes(&self, program: &RuleProgram, opposite: &[Triple]) -> StoreResult<bool> {
+    /// Whether adding `opposite` to the data at `at` makes it inconsistent under `program`:
+    /// the reasoner maintains the closure over a speculative transaction, which is dropped.
+    /// Undecided where a commit came after `at` (the transaction starts from the latest
+    /// revision): its answer would be another revision's.
+    fn refutes(
+        &self,
+        at: &Snapshot,
+        program: &RuleProgram,
+        opposite: &[Triple],
+    ) -> StoreResult<bool> {
         let memory = self.memory_stop();
         let (stop, room) = (|| memory.exceeded(), || memory.room());
         let operation = nrese_reasoner::eval::OperationStop::new(&stop).within(&room);
@@ -150,6 +224,9 @@ impl StoreService {
         // form, so the rule constants this compiles still enter the dictionary.
         #[allow(clippy::disallowed_methods)]
         let mut tx = self.engine().speculative_shared();
+        if tx.base().revision() != at.revision() {
+            return Err(StoreError::Undecided(CHANGED.to_owned()));
+        }
         for t in opposite {
             let quad = Quad::new(
                 t.subject.clone(),
@@ -177,6 +254,14 @@ impl StoreService {
         })?;
         Ok(!done.violations.consistent())
     }
+}
+
+/// Why an entailment check that saw a commit after its start gives no answer.
+const CHANGED: &str = "the data changed during the entailment check: ask again";
+
+/// An entailment check whose deadline passed gives no answer.
+fn out_of_time() -> StoreError {
+    StoreError::Undecided(nrese_dl::limits::Limit::Time.reached("the deadline passed"))
 }
 
 /// `triple` as a SPARQL triple pattern: see [`term_pattern`].
@@ -367,10 +452,48 @@ impl StoreService {
     /// Whether the asserted statements (every graph) entail `conclusion` under the OWL 2
     /// Direct Semantics: each logical axiom of the conclusion read as an OWL 2 ontology
     /// (declarations and annotations hold no logical content), decided by the DL engines
-    /// ([`crate::dl::entailment`]) within `dl.timeout` per test. A conclusion that isn't
-    /// well-formed OWL 2 DL is `unknown`. Reads only; never commits.
+    /// ([`crate::dl::entailment`]) within one `dl.timeout` from the call: the premise's
+    /// check and the conclusion's tests share it. A conclusion that isn't well-formed OWL 2 DL,
+    /// or one left undecided at the deadline, is `unknown`. Reads only; never commits.
     pub fn entails_dl(&self, conclusion: &[Triple]) -> StoreResult<DlEntailment> {
-        use crate::dl::entailment::{Entailed, entails_ontology};
+        let deadline = Deadline::after(self.config().dl.timeout);
+        self.entails_dl_at(&self.engine().snapshot(), conclusion, deadline)
+    }
+
+    /// [`Self::entails_dl`] over the asserted statements at `snapshot`, before `deadline`: past
+    /// it, no verdict of any kind, the premise's included.
+    fn entails_dl_at(
+        &self,
+        snapshot: &Snapshot,
+        conclusion: &[Triple],
+        deadline: Deadline,
+    ) -> StoreResult<DlEntailment> {
+        use crate::dl::{Verdict, entailment::Entailed};
+        let decided = self.entails_dl_read(snapshot, conclusion, deadline)?;
+        if !deadline.passed() {
+            return Ok(decided);
+        }
+        let late = || nrese_dl::limits::Limit::Time.reached("the deadline passed");
+        Ok(DlEntailment {
+            answer: match decided.answer {
+                Entailed::Unknown(why) => Entailed::Unknown(why),
+                _ => Entailed::Unknown(late()),
+            },
+            premise: match decided.premise {
+                Verdict::Unknown(why) => Verdict::Unknown(why),
+                _ => Verdict::Unknown(late()),
+            },
+        })
+    }
+
+    /// [`Self::entails_dl_at`] before its check of the deadline.
+    fn entails_dl_read(
+        &self,
+        snapshot: &Snapshot,
+        conclusion: &[Triple],
+        deadline: Deadline,
+    ) -> StoreResult<DlEntailment> {
+        use crate::dl::entailment::{Entailed, entails_ontology_within};
         use crate::dl::{Verdict, consistency, gate, source};
         use nrese_rdf::{BlankNode, NamedNodeRef, NamedOrBlankNode};
         if self.dl().replica() {
@@ -379,12 +502,11 @@ impl StoreService {
                 "entailment checks run on the primary, not on a read replica".to_owned(),
             ));
         }
-        let snapshot = self.engine().snapshot();
         let memory = self.envelope(None);
         // Undecided where the request's envelope can't take reading the premise (SYN-61).
         let treatments = &self.config().dl.treatments;
         let Ok((premise, read_statements)) =
-            source::read_premise(&snapshot, memory.clone(), treatments)
+            source::read_premise(snapshot, memory.clone(), treatments)
         else {
             let why = source::refused("the premise");
             return Ok(DlEntailment {
@@ -393,7 +515,7 @@ impl StoreService {
             });
         };
         let budget = gate::budget(self, None, &memory);
-        let checked = consistency::check(&premise, &budget);
+        let checked = consistency::check(&premise, &budget.remaining(deadline));
         if checked.verdict != Verdict::Consistent {
             let answer = match &checked.verdict {
                 Verdict::Unknown(why) => Entailed::Unknown(format!("the premise: {why}")),
@@ -404,11 +526,13 @@ impl StoreService {
                 premise: checked.verdict,
             });
         }
+        #[cfg(test)]
+        crate::service::hooks::run(&crate::service::hooks::AFTER_DL_PREMISE);
         // The OWL vocabulary and the fresh names are system vocabulary, shared (dictionary
         // lifecycle V1); the conclusion's terms are the request's own, in a private
         // vocabulary charged to its envelope, past the premise's ids.
         source::intern_system_vocabulary(self.engine())?;
-        let tx = source::private_over(self.engine(), &snapshot, Arc::new(memory.part()));
+        let tx = source::private_over(self.engine(), snapshot, Arc::new(memory.part()));
         let n = CONCLUSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let blank = |b: &BlankNode| BlankNode::new_unchecked(format!("nresec{n}x{}", b.as_str()));
         let id = |t: Term| -> nrese_engine::EngineResult<u64> {
@@ -490,7 +614,7 @@ impl StoreService {
             .collect();
         let fresh = fresh?;
         Ok(DlEntailment {
-            answer: entails_ontology(&premise, &read, &fresh, &budget),
+            answer: entails_ontology_within(&premise, &read, &fresh, &budget, deadline),
             premise: checked.verdict,
         })
     }
@@ -518,7 +642,11 @@ mod memory_tests {
                 ..StoreConfig::in_memory()
             })
             .unwrap();
-            let result = store.refutes(&Ruleset::Owl2Rl.into(), std::slice::from_ref(&opposite));
+            let result = store.refutes(
+                &store.engine().snapshot(),
+                &Ruleset::Owl2Rl.into(),
+                std::slice::from_ref(&opposite),
+            );
             let diagnostic = store.equality_report(Ruleset::Owl2Rl);
             if limit == 1 {
                 assert!(matches!(
@@ -534,3 +662,7 @@ mod memory_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "entailment_dl_tests.rs"]
+mod dl_tests;
