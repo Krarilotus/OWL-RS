@@ -1,4 +1,4 @@
-//! A shapes graph is well-formed however deeply its shapes nest (SHACL §2: the values of
+//! A shapes graph can be well-formed however deeply its shapes nest (SHACL §2: the values of
 //! `sh:node`, `sh:property`, `sh:not`, `sh:and`, `sh:or`, `sh:xone` and
 //! `sh:qualifiedValueShape` are shapes, with no limit on how they nest), so every entry that
 //! walks shape structure takes a chain of 100,000 nested shapes: compiling it, validating
@@ -12,7 +12,7 @@ use nrese_engine::{Engine, EngineConfig, GraphSelector, Snapshot, TermId};
 use nrese_exec::measure;
 use nrese_rdf::{GraphNameRef, NamedNodeRef, QuadRef};
 use nrese_rdf_io::{RdfFormat, RdfParser};
-use nrese_shacl::{Selection, Shapes, compile, validate, validate_changes};
+use nrese_shacl::{Selection, Shapes, compile, nesting_parameters, validate, validate_changes};
 use nrese_sparql::Resources;
 
 #[global_allocator]
@@ -21,36 +21,31 @@ static ALLOCATOR: measure::Measured<std::alloc::System> = measure::Measured(std:
 const SHAPES: &str = "http://example.com/shapes";
 const LENGTH: usize = 100_000;
 
-/// How one shape of a chain refers to the next: Turtle for the referring shape's own
-/// statements, given the next shape's name.
-type Link = fn(&str) -> String;
+const PREFIXES: &str =
+    "@prefix ex: <http://example.com/> . @prefix sh: <http://www.w3.org/ns/shacl#> .\n";
+const TARGET: &str = "ex:s0 a sh:NodeShape ; sh:targetNode ex:a .\n";
 
-/// The kinds of nesting: the parameter, whether the nested shapes are property shapes, and
-/// the link.
-const KINDS: [(&str, bool, Link); 7] = [
-    ("sh:node", false, |next| format!("sh:node {next}")),
-    ("sh:property", true, |next| format!("sh:property {next}")),
-    ("sh:not", false, |next| format!("sh:not {next}")),
-    ("sh:and", false, |next| format!("sh:and ( {next} )")),
-    ("sh:or", false, |next| format!("sh:or ( {next} )")),
-    ("sh:xone", false, |next| format!("sh:xone ( {next} )")),
-    ("sh:qualifiedValueShape", true, |next| {
-        format!("sh:qualifiedValueShape {next} ; sh:qualifiedMinCount 1")
-    }),
-];
+enum Link {
+    /// Turtle for the referring shape's statements, given the next shape's name.
+    Direct {
+        property: bool,
+        statement: fn(&str) -> String,
+    },
+    QualifiedSibling,
+}
 
 /// The chain `ex:s0` … `ex:s{LENGTH}` of `kind`, `ex:s0` targeting `ex:a`, the last shape
-/// requiring `sh:class ex:C`. For property shapes, `ex:s1` on have the path `ex:p` and
+/// requiring `sh:class ex:C`. For property shapes, `ex:s1` onward have the path `ex:p` and
 /// `ex:s0` has `ex:s1` as its `sh:property`.
-fn chain(kind: &str) -> String {
-    let (_, property, link) = KINDS
-        .iter()
-        .find(|(name, ..)| *name == kind)
-        .expect("a kind of nesting");
-    let mut turtle = String::from(
-        "@prefix ex: <http://example.com/> . @prefix sh: <http://www.w3.org/ns/shacl#> .
-         ex:s0 a sh:NodeShape ; sh:targetNode ex:a .\n",
-    );
+fn chain(link: &Link) -> (String, usize) {
+    let Link::Direct {
+        property,
+        statement,
+    } = link
+    else {
+        return sibling_chain();
+    };
+    let mut turtle = format!("{PREFIXES}{TARGET}");
     for i in 0..=LENGTH {
         let path = if *property && i > 0 {
             " ; sh:path ex:p"
@@ -60,11 +55,34 @@ fn chain(kind: &str) -> String {
         let next = match i {
             LENGTH => " ; sh:class ex:C".to_owned(),
             0 if *property => " ; sh:property ex:s1".to_owned(),
-            _ => format!(" ; {}", link(&format!("ex:s{}", i + 1))),
+            _ => format!(" ; {}", statement(&format!("ex:s{}", i + 1))),
         };
         turtle.push_str(&format!("ex:s{i} ex:in ex:chain{path}{next} .\n"));
     }
-    turtle
+    (turtle, LENGTH + 1)
+}
+
+/// Between the first and last property shapes, only the qualified sibling references
+/// lead down the chain. Each primary shape always conforms. Every link therefore flips
+/// conformance, so the first property shape gives the same answer as the last.
+fn sibling_chain() -> (String, usize) {
+    use std::fmt::Write;
+
+    let mut turtle = format!("{PREFIXES}{TARGET}ex:s0 sh:property ex:s1 .\n");
+    for i in 1..=LENGTH {
+        let next = i + 1;
+        writeln!(
+            turtle,
+            "ex:s{i} sh:path ex:p ; sh:qualifiedValueShape ex:always ;
+                sh:qualifiedMinCount 1 ; sh:qualifiedValueShapesDisjoint true .
+             ex:parent{i} sh:property ex:s{i}, ex:bridge{i} .
+             ex:bridge{i} sh:qualifiedValueShape ex:s{next} ."
+        )
+        .expect("write Turtle");
+    }
+    writeln!(turtle, "ex:s{} sh:path ex:p ; sh:class ex:C .", LENGTH + 1).expect("write Turtle");
+    // The root, the chain's property shapes, and ex:always.
+    (turtle, LENGTH + 3)
 }
 
 fn insert(tx: &mut nrese_engine::Transaction<'_>, turtle: &str, graph: GraphNameRef<'_>) {
@@ -98,8 +116,7 @@ enum Entry {
     /// level by level, `ex:s0` (for `sh:not`, the chain's even length gives the same), one
     /// result in all.
     Validate,
-    /// Validating a change (`ex:a a ex:D` added, a statement the last shape reads): `ex:a`
-    /// fails `ex:s0` before and after it, so the change introduces nothing.
+    /// Removing `ex:a a ex:C` makes the last shape fail, introducing one result.
     Change,
 }
 
@@ -107,73 +124,116 @@ fn deep(entry: Entry, kind: &str) {
     if !measure::alone() {
         return;
     }
+    let (_, link) = KINDS
+        .iter()
+        .find(|(name, _)| *name == kind)
+        .expect("a kind of nesting");
+    let (turtle, shape_count) = chain(link);
     let engine = Engine::new(EngineConfig::default()).expect("engine");
     let mut tx = engine.transaction();
     insert(
         &mut tx,
-        &chain(kind),
+        &turtle,
         GraphNameRef::from(NamedNodeRef::new_unchecked(SHAPES)),
     );
+    drop(turtle);
     insert(&mut tx, DATA, GraphNameRef::DefaultGraph);
+    let class = QuadRef::new(
+        NamedNodeRef::new_unchecked("http://example.com/a"),
+        NamedNodeRef::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+        NamedNodeRef::new_unchecked("http://example.com/C"),
+        GraphNameRef::DefaultGraph,
+    );
+    if matches!(entry, Entry::Change) {
+        tx.insert(class);
+    }
     tx.commit().expect("commit");
     let before = engine.snapshot();
     let shapes = compiled(&before, kind);
     let data = Selection::of(GraphSelector::Exact(TermId::DEFAULT_GRAPH));
     let resources = Resources::default();
     match entry {
-        Entry::Compile => assert_eq!(shapes.len(), LENGTH + 1, "{kind}"),
+        Entry::Compile => assert_eq!(shapes.len(), shape_count, "{kind}"),
         Entry::Validate => {
             let report = validate(&before, &shapes, data, &resources).expect("validated");
             assert_eq!(report.results.len(), 1, "{kind}");
         }
         Entry::Change => {
             let mut tx = engine.transaction();
-            insert(
-                &mut tx,
-                "@prefix ex: <http://example.com/> . ex:a a ex:D .",
-                GraphNameRef::DefaultGraph,
-            );
-            let changed: Vec<_> = tx.inserted().collect();
+            tx.remove(class);
+            let changed: Vec<_> = tx.deleted().collect();
             let after = tx.pending_snapshot();
             let report = validate_changes(&before, &after, &shapes, data, &changed, &resources)
                 .expect("validated");
-            assert_eq!(report.results.len(), 0, "{kind}");
+            assert_eq!(report.results.len(), 1, "{kind}");
         }
     }
 }
 
-/// One test per entry and kind of nesting.
+/// Every fixture supplies one test for each entry.
 macro_rules! deep_tests {
-    ($($test:ident: $entry:ident, $kind:literal;)*) => {
+    ($($kind:literal => $link:expr; $compile:ident, $validate:ident, $change:ident;)*) => {
+        const KINDS: &[(&str, Link)] = &[$(($kind, $link)),*];
         $(
             #[test]
-            fn $test() {
-                deep(Entry::$entry, $kind);
+            fn $compile() {
+                deep(Entry::Compile, $kind);
+            }
+
+            #[test]
+            fn $validate() {
+                deep(Entry::Validate, $kind);
+            }
+
+            #[test]
+            fn $change() {
+                deep(Entry::Change, $kind);
             }
         )*
     };
 }
 
 deep_tests! {
-    a_long_sh_node_chain_compiles: Compile, "sh:node";
-    a_long_sh_property_chain_compiles: Compile, "sh:property";
-    a_long_sh_not_chain_compiles: Compile, "sh:not";
-    a_long_sh_and_chain_compiles: Compile, "sh:and";
-    a_long_sh_or_chain_compiles: Compile, "sh:or";
-    a_long_sh_xone_chain_compiles: Compile, "sh:xone";
-    a_long_sh_qualified_value_shape_chain_compiles: Compile, "sh:qualifiedValueShape";
-    a_long_sh_node_chain_validates: Validate, "sh:node";
-    a_long_sh_property_chain_validates: Validate, "sh:property";
-    a_long_sh_not_chain_validates: Validate, "sh:not";
-    a_long_sh_and_chain_validates: Validate, "sh:and";
-    a_long_sh_or_chain_validates: Validate, "sh:or";
-    a_long_sh_xone_chain_validates: Validate, "sh:xone";
-    a_long_sh_qualified_value_shape_chain_validates: Validate, "sh:qualifiedValueShape";
-    a_change_under_a_long_sh_node_chain_validates: Change, "sh:node";
-    a_change_under_a_long_sh_property_chain_validates: Change, "sh:property";
-    a_change_under_a_long_sh_not_chain_validates: Change, "sh:not";
-    a_change_under_a_long_sh_and_chain_validates: Change, "sh:and";
-    a_change_under_a_long_sh_or_chain_validates: Change, "sh:or";
-    a_change_under_a_long_sh_xone_chain_validates: Change, "sh:xone";
-    a_change_under_a_long_sh_qualified_value_shape_chain_validates: Change, "sh:qualifiedValueShape";
+    "node" => Link::Direct { property: false, statement: |next| format!("sh:node {next}") };
+    a_long_sh_node_chain_compiles, a_long_sh_node_chain_validates,
+    a_change_under_a_long_sh_node_chain_validates;
+
+    "property" => Link::Direct { property: true, statement: |next| format!("sh:property {next}") };
+    a_long_sh_property_chain_compiles, a_long_sh_property_chain_validates,
+    a_change_under_a_long_sh_property_chain_validates;
+
+    "not" => Link::Direct { property: false, statement: |next| format!("sh:not {next}") };
+    a_long_sh_not_chain_compiles, a_long_sh_not_chain_validates,
+    a_change_under_a_long_sh_not_chain_validates;
+
+    "and" => Link::Direct { property: false, statement: |next| format!("sh:and ( {next} )") };
+    a_long_sh_and_chain_compiles, a_long_sh_and_chain_validates,
+    a_change_under_a_long_sh_and_chain_validates;
+
+    "or" => Link::Direct { property: false, statement: |next| format!("sh:or ( {next} )") };
+    a_long_sh_or_chain_compiles, a_long_sh_or_chain_validates,
+    a_change_under_a_long_sh_or_chain_validates;
+
+    "xone" => Link::Direct { property: false, statement: |next| format!("sh:xone ( {next} )") };
+    a_long_sh_xone_chain_compiles, a_long_sh_xone_chain_validates,
+    a_change_under_a_long_sh_xone_chain_validates;
+
+    "qualifiedValueShape" => Link::Direct { property: true, statement: |next| {
+        format!("sh:qualifiedValueShape {next} ; sh:qualifiedMinCount 1")
+    } };
+    a_long_sh_qualified_value_shape_chain_compiles, a_long_sh_qualified_value_shape_chain_validates,
+    a_change_under_a_long_sh_qualified_value_shape_chain_validates;
+
+    "qualifiedValueShapesDisjoint" => Link::QualifiedSibling;
+    a_long_sh_qualified_sibling_chain_compiles, a_long_sh_qualified_sibling_chain_validates,
+    a_change_under_a_long_sh_qualified_sibling_chain_validates;
+}
+
+#[test]
+fn every_nesting_parameter_has_a_deep_chain_fixture() {
+    let mut tested: Vec<_> = KINDS.iter().map(|&(name, _)| name).collect();
+    let mut accepted: Vec<_> = nesting_parameters().collect();
+    tested.sort_unstable();
+    accepted.sort_unstable();
+    assert_eq!(tested, accepted);
 }

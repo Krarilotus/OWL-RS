@@ -15,8 +15,8 @@ use nrese_sparql_syntax::{Query, SparqlParser};
 
 use crate::graph::{GraphView, Selection};
 use crate::model::{
-    Bound, Component, Constraint, Logical, NodeKind, Path, SH, Severity, Shape, ShapeRef, Shapes,
-    SparqlCheck, Target,
+    Bound, Component, Constraint, Logical, NestedConstraint, Nesting, NodeKind, Path, SH, Severity,
+    Shape, ShapeRef, Shapes, SparqlCheck, Target,
 };
 use crate::sparql;
 
@@ -32,6 +32,41 @@ const MAX_PATH_DEPTH: usize = 64;
 type UnaryPath = fn(Box<Path>) -> Path;
 /// Builds a property pair constraint from the other property.
 type PropertyPair = fn(TermId) -> Constraint;
+
+#[derive(Clone, Copy)]
+enum ShapeParameter {
+    Single(Nesting),
+    List(Logical),
+    Qualified { disjoint: &'static str },
+}
+
+const PROPERTY: &str = "property";
+// Keep the shape-valued parameters in constraint evaluation and compilation order.
+const NESTING_PARAMETERS: &[(&str, ShapeParameter)] = &[
+    ("not", ShapeParameter::Single(Nesting::Not)),
+    ("and", ShapeParameter::List(Logical::And)),
+    ("or", ShapeParameter::List(Logical::Or)),
+    ("xone", ShapeParameter::List(Logical::Xone)),
+    ("node", ShapeParameter::Single(Nesting::Node)),
+    (PROPERTY, ShapeParameter::Single(Nesting::Property)),
+    (
+        "qualifiedValueShape",
+        ShapeParameter::Qualified {
+            disjoint: "qualifiedValueShapesDisjoint",
+        },
+    ),
+];
+
+/// Shape nesting parameters, including the option that adds qualified sibling references.
+#[doc(hidden)]
+pub fn nesting_parameters() -> impl Iterator<Item = &'static str> {
+    NESTING_PARAMETERS.iter().flat_map(|(local, parameter)| {
+        std::iter::once(*local).chain(match parameter {
+            ShapeParameter::Qualified { disjoint } => Some(*disjoint),
+            _ => None,
+        })
+    })
+}
 
 /// Why a shapes graph can't be used.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,20 +172,7 @@ impl ShapeFrame {
     fn next_reference<'a>(&mut self, shape: &'a mut Shape) -> Option<&'a mut ShapeRef> {
         for constraint in &mut shape.constraints[self.constraint..] {
             let reference = match constraint {
-                Constraint::Not(shape) | Constraint::Node(shape) | Constraint::Property(shape) => {
-                    std::slice::from_mut(shape).get_mut(self.member)
-                }
-                Constraint::Logical(_, shapes) => shapes.get_mut(self.member),
-                Constraint::Qualified {
-                    shape, siblings, ..
-                } => {
-                    // The compiler encounters disjoint siblings before the value shape.
-                    if self.member == siblings.len() {
-                        Some(shape)
-                    } else {
-                        siblings.get_mut(self.member)
-                    }
-                }
+                Constraint::Nested(nested) => nested.creation_reference(self.member),
                 _ => None,
             };
             if let Some(reference) = reference {
@@ -608,29 +630,27 @@ impl<V: ReadView> Compiler<'_, V> {
             }
         }
 
-        // Logic.
-        for shape in self.values(node, "not") {
-            out.push(Constraint::Not(self.shape(shape)));
-        }
-        for (local, logical) in [
-            ("and", Logical::And),
-            ("or", Logical::Or),
-            ("xone", Logical::Xone),
-        ] {
-            for head in self.values(node, local) {
-                let shapes = self.shape_list(node, head, local);
-                out.push(Constraint::Logical(logical, shapes));
+        for &(local, parameter) in NESTING_PARAMETERS {
+            match parameter {
+                ShapeParameter::Single(kind) => {
+                    for shape in self.values(node, local) {
+                        out.push(Constraint::Nested(NestedConstraint::single(
+                            kind,
+                            self.shape(shape),
+                        )));
+                    }
+                }
+                ShapeParameter::List(kind) => {
+                    for head in self.values(node, local) {
+                        let members = self.shape_list(node, head, local);
+                        out.push(Constraint::Nested(NestedConstraint::logical(kind, members)));
+                    }
+                }
+                ShapeParameter::Qualified { disjoint } => {
+                    self.qualified(node, local, disjoint, &mut out);
+                }
             }
         }
-
-        // Shapes.
-        for shape in self.values(node, "node") {
-            out.push(Constraint::Node(self.shape(shape)));
-        }
-        for shape in self.values(node, "property") {
-            out.push(Constraint::Property(self.shape(shape)));
-        }
-        self.qualified(node, &mut out);
 
         // Others.
         if self
@@ -668,8 +688,8 @@ impl<V: ReadView> Compiler<'_, V> {
         out
     }
 
-    fn qualified(&mut self, node: TermId, out: &mut Vec<Constraint>) {
-        let qualified = self.values(node, "qualifiedValueShape");
+    fn qualified(&mut self, node: TermId, local: &str, disjoint: &str, out: &mut Vec<Constraint>) {
+        let qualified = self.values(node, local);
         if qualified.is_empty() {
             return;
         }
@@ -680,15 +700,15 @@ impl<V: ReadView> Compiler<'_, V> {
             .one(node, "qualifiedMaxCount")
             .and_then(|value| self.count(node, value, "qualifiedMaxCount"));
         let disjoint = self
-            .one(node, "qualifiedValueShapesDisjoint")
+            .one(node, disjoint)
             .is_some_and(|value| self.is_true(value));
         // Sibling shapes: the qualified value shapes of the other property shapes of this
         // shape's parents.
         let mut siblings: BTreeSet<TermId> = BTreeSet::new();
-        if disjoint && let Some(property) = self.sh("property") {
+        if disjoint && let Some(property) = self.sh(PROPERTY) {
             for parent in self.graph.subjects(property, node) {
                 for child in self.graph.objects(parent, property) {
-                    siblings.extend(self.values(child, "qualifiedValueShape"));
+                    siblings.extend(self.values(child, local));
                 }
             }
         }
@@ -698,12 +718,12 @@ impl<V: ReadView> Compiler<'_, V> {
                 .filter(|&&sibling| sibling != shape)
                 .map(|&sibling| self.shape(sibling))
                 .collect();
-            out.push(Constraint::Qualified {
-                shape: self.shape(shape),
+            out.push(Constraint::Nested(NestedConstraint::qualified(
+                self.shape(shape),
                 min,
                 max,
                 siblings,
-            });
+            )));
         }
     }
 
@@ -711,7 +731,7 @@ impl<V: ReadView> Compiler<'_, V> {
     /// `sh:ignoredProperties`.
     fn allowed_properties(&mut self, node: TermId) -> BTreeSet<TermId> {
         let mut allowed = BTreeSet::new();
-        for property in self.values(node, "property") {
+        for property in self.values(node, PROPERTY) {
             allowed.extend(
                 self.values(property, "path")
                     .into_iter()

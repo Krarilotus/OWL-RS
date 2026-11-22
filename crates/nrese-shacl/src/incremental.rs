@@ -23,12 +23,13 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use nrese_engine::{EncodedQuad, GraphSelector, TermId};
-use nrese_exec::Reservation;
+use nrese_exec::{Budget, ChargedMap, ChargedVec, Reservation};
 use nrese_rdf::Term;
 use nrese_sparql::{QueryEvaluationError, ReadView, Resources};
 
 use crate::graph::{GraphView, Selection};
 use crate::model::{Constraint, Path, Shape, ShapeRef, Shapes, Target};
+use crate::nested_walk::Suspended;
 use crate::path;
 use crate::report::{ValidationReport, decode};
 use crate::validate::{self, RawResult, Validator};
@@ -92,6 +93,7 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
     let validator_after = Validator::new(after, shapes, data, resources).comparing();
     let mut introduced: BTreeSet<RawResult> = BTreeSet::new();
     if !changed.is_empty() {
+        let walk_budget = resources.memory.part();
         let rdf_type = graph_after.iri(RDF_TYPE);
         for shape in shapes.targeted() {
             // After a stop in either state the difference means nothing: it is the outcome.
@@ -101,15 +103,15 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
             let affected = if classes_moved {
                 None
             } else {
-                let seeds = seeds(shapes, shape, &changed, rdf_type, resources)?;
+                let seeds = seeds(shapes, shape, &changed, rdf_type, resources, &walk_budget)?;
                 affected(
                     shapes,
                     shape,
                     &seeds,
                     &graph_before,
                     &graph_after,
-                    &mut Vec::new(),
-                )
+                    &walk_budget,
+                )?
                 .filter(|nodes| nodes.len() <= MAX_AFFECTED)
             };
             resources.check()?;
@@ -345,9 +347,10 @@ fn seeds(
     changed: &[EncodedQuad],
     rdf_type: Option<TermId>,
     resources: &Resources,
+    budget: &Budget,
 ) -> Result<Vec<TermId>, QueryEvaluationError> {
     let mut read = BTreeSet::new();
-    let bounded = predicates(shapes, shape, &mut read, &mut Vec::new());
+    let bounded = predicates(shapes, shape, &mut read, resources, budget)?;
     if let Some(rdf_type) = rdf_type {
         read.insert(rdf_type);
     }
@@ -372,40 +375,50 @@ fn seeds(
 /// nested shapes; `false` if it can read any predicate (closed, SPARQL).
 fn predicates(
     shapes: &Shapes,
-    shape: ShapeRef,
+    root: ShapeRef,
     read: &mut BTreeSet<TermId>,
-    seen: &mut Vec<ShapeRef>,
-) -> bool {
-    if seen.contains(&shape) {
-        return true;
-    }
-    seen.push(shape);
-    let shape_ = &shapes.shapes[shape];
-    if let Some(path) = &shape_.path {
-        path_predicates(path, read);
-    }
-    for target in &shape_.targets {
-        if let Target::SubjectsOf(p) | Target::ObjectsOf(p) = target {
-            read.insert(*p);
+    resources: &Resources,
+    budget: &Budget,
+) -> Result<bool, QueryEvaluationError> {
+    let mut seen = ChargedMap::new(budget);
+    let mut pending = ChargedVec::new(budget);
+    let mut current = root;
+    loop {
+        resources.check()?;
+        let shape = &shapes.shapes[current];
+        if let Some(path) = &shape.path {
+            path_predicates(path, read);
         }
-    }
-    let mut bounded = true;
-    for constraint in &shape_.constraints {
-        bounded &= match constraint {
-            Constraint::Closed(_) | Constraint::Sparql(_) => false,
-            Constraint::Equals(p)
-            | Constraint::Disjoint(p)
-            | Constraint::LessThan(p)
-            | Constraint::LessThanOrEquals(p) => {
+        for target in &shape.targets {
+            if let Target::SubjectsOf(p) | Target::ObjectsOf(p) = target {
                 read.insert(*p);
-                true
             }
-            _ => nested(constraint)
-                .iter()
-                .all(|&inner| predicates(shapes, inner, read, seen)),
+        }
+        for constraint in &shape.constraints {
+            match constraint {
+                Constraint::Closed(_) | Constraint::Sparql(_) => return Ok(false),
+                Constraint::Equals(p)
+                | Constraint::Disjoint(p)
+                | Constraint::LessThan(p)
+                | Constraint::LessThanOrEquals(p) => {
+                    read.insert(*p);
+                }
+                Constraint::Nested(nested) => {
+                    for child in nested.references() {
+                        if child != root && seen.get_or_insert_with(child, || ())?.1 {
+                            pending.push(child)?;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(next) = pending.last().copied() else {
+            return Ok(true);
         };
+        pending.truncate(pending.len() - 1);
+        current = next;
     }
-    bounded
 }
 
 fn path_predicates(path: &Path, read: &mut BTreeSet<TermId>) {
@@ -423,19 +436,32 @@ fn path_predicates(path: &Path, read: &mut BTreeSet<TermId>) {
     }
 }
 
-/// The shapes a constraint validates value nodes against.
-fn nested(constraint: &Constraint) -> Vec<ShapeRef> {
-    match constraint {
-        Constraint::Not(shape) | Constraint::Node(shape) | Constraint::Property(shape) => {
-            vec![*shape]
+#[derive(Default)]
+struct AffectedFrame {
+    parent: Option<ShapeRef>,
+    constraint: usize,
+    member: usize,
+    reached: BTreeSet<TermId>,
+}
+
+impl AffectedFrame {
+    /// Resumes at the next child, or signals a constraint that reads the whole graph.
+    fn next_child(&mut self, shape: &Shape) -> Result<Option<ShapeRef>, ()> {
+        for constraint in &shape.constraints[self.constraint..] {
+            match constraint {
+                Constraint::Closed(_) | Constraint::Sparql(_) => return Err(()),
+                Constraint::Nested(nested) => {
+                    if let Some(child) = nested.reference(self.member) {
+                        self.member += 1;
+                        return Ok(Some(child));
+                    }
+                }
+                _ => {}
+            }
+            self.constraint += 1;
+            self.member = 0;
         }
-        Constraint::Logical(_, shapes) => shapes.clone(),
-        Constraint::Qualified {
-            shape, siblings, ..
-        } => std::iter::once(*shape)
-            .chain(siblings.iter().copied())
-            .collect(),
-        _ => Vec::new(),
+        Ok(None)
     }
 }
 
@@ -443,67 +469,92 @@ fn nested(constraint: &Constraint) -> Vec<ShapeRef> {
 /// change, in either state; `None` if unbounded.
 fn affected<A: ReadView, B: ReadView>(
     shapes: &Shapes,
-    shape: ShapeRef,
+    root: ShapeRef,
     seeds: &[TermId],
     before: &GraphView<'_, A>,
     after: &GraphView<'_, B>,
-    stack: &mut Vec<ShapeRef>,
-) -> Option<BTreeSet<TermId>> {
+    budget: &Budget,
+) -> Result<Option<BTreeSet<TermId>>, QueryEvaluationError> {
     if seeds.len() > MAX_AFFECTED || before.cancelled() {
-        return None;
+        return Ok(None);
     }
-    if stack.contains(&shape) {
-        // A recursive reference: the shape's own walk covers it.
-        return Some(BTreeSet::new());
-    }
-    stack.push(shape);
-    let shape_ = &shapes.shapes[shape];
-    // The nodes this shape's checks start from: the seeds themselves (a node's own
-    // statements), and, for nested shapes, their affected value nodes.
-    let mut reached: Vec<TermId> = seeds.to_vec();
-    for constraint in &shape_.constraints {
-        match constraint {
-            Constraint::Closed(_) | Constraint::Sparql(_) => {
-                stack.pop();
-                return None;
+    let mut callers = Suspended::new(budget);
+    let mut current = root;
+    let mut frame = AffectedFrame::default();
+    loop {
+        let shape = &shapes.shapes[current];
+        match frame.next_child(shape) {
+            Err(()) => return Ok(None),
+            Ok(Some(child)) => {
+                if before.cancelled() {
+                    return Ok(None);
+                }
+                // A recursive reference contributes no additional affected nodes.
+                if child == current || callers.contains(&child) {
+                    continue;
+                }
+                callers.park(current, frame)?;
+                frame = AffectedFrame {
+                    parent: Some(current),
+                    ..AffectedFrame::default()
+                };
+                current = child;
             }
-            _ => {
-                for inner in nested(constraint) {
-                    let inner = affected(shapes, inner, seeds, before, after, stack);
-                    match inner {
-                        Some(nodes) => reached.extend(nodes),
-                        None => {
-                            stack.pop();
-                            return None;
-                        }
-                    }
+            Ok(None) => {
+                let Some(nodes) =
+                    affected_through_path(shape.path.as_ref(), seeds, frame.reached, before, after)
+                else {
+                    return Ok(None);
+                };
+                let Some(parent) = frame.parent else {
+                    return Ok(Some(nodes));
+                };
+                current = parent;
+                frame = callers.resume(&parent);
+                if frame.reached.is_empty() {
+                    frame.reached = nodes;
+                } else {
+                    frame.reached.extend(nodes);
                 }
             }
         }
     }
-    stack.pop();
-    reached.sort_unstable();
-    reached.dedup();
-    let mut out: BTreeSet<TermId> = seeds.iter().copied().collect();
-    match &shape_.path {
+}
+
+fn affected_through_path<A: ReadView, B: ReadView>(
+    path: Option<&Path>,
+    seeds: &[TermId],
+    mut reached: BTreeSet<TermId>,
+    before: &GraphView<'_, A>,
+    after: &GraphView<'_, B>,
+) -> Option<BTreeSet<TermId>> {
+    let Some(path) = path else {
         // A node shape's value is its focus node.
-        None => out.extend(reached),
-        Some(path) => {
-            // Value nodes affected, and the seeds anywhere along the path: back along every
-            // prefix of it, in both states.
-            for prefix in prefixes(&normalised(path)) {
-                if before.cancelled() {
-                    return None;
-                }
-                for graph_nodes in [
-                    path::back(before, &prefix, &reached),
-                    path::back(after, &prefix, &reached),
-                ] {
-                    out.extend(graph_nodes);
-                    if out.len() > MAX_AFFECTED {
-                        return None;
-                    }
-                }
+        reached.extend(seeds);
+        return Some(reached);
+    };
+    // Value nodes affected, and the seeds anywhere along the path: back along every
+    // prefix of it, in both states. Seeds from the change are already sorted and unique.
+    let merged;
+    let reached = if reached.is_empty() {
+        seeds
+    } else {
+        reached.extend(seeds);
+        merged = reached.into_iter().collect::<Vec<_>>();
+        &merged
+    };
+    let mut out: BTreeSet<TermId> = seeds.iter().copied().collect();
+    for prefix in prefixes(&normalised(path)) {
+        if before.cancelled() {
+            return None;
+        }
+        for graph_nodes in [
+            path::back(before, &prefix, reached),
+            path::back(after, &prefix, reached),
+        ] {
+            out.extend(graph_nodes);
+            if out.len() > MAX_AFFECTED {
+                return None;
             }
         }
     }

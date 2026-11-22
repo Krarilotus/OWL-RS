@@ -158,18 +158,7 @@ pub(crate) enum Constraint {
     Disjoint(TermId),
     LessThan(TermId),
     LessThanOrEquals(TermId),
-    Not(ShapeRef),
-    Logical(Logical, Vec<ShapeRef>),
-    Node(ShapeRef),
-    Property(ShapeRef),
-    Qualified {
-        shape: ShapeRef,
-        min: Option<u64>,
-        max: Option<u64>,
-        /// The sibling shapes a value must not conform to
-        /// (`sh:qualifiedValueShapesDisjoint`); empty otherwise.
-        siblings: Vec<ShapeRef>,
-    },
+    Nested(NestedConstraint),
     /// The predicates a closed shape allows.
     Closed(BTreeSet<TermId>),
     HasValue(TermId),
@@ -177,6 +166,97 @@ pub(crate) enum Constraint {
     /// SHACL-SPARQL: an `sh:sparql` constraint, or a SPARQL-based constraint component's
     /// validator with the shape's parameter values.
     Sparql(Box<SparqlCheck>),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Nesting {
+    Not,
+    Logical(Logical),
+    Node,
+    Property,
+    Qualified { min: Option<u64>, max: Option<u64> },
+}
+
+#[derive(Debug)]
+pub(crate) struct NestedConstraint {
+    pub(crate) kind: Nesting,
+    /// The single shape of a direct reference, or the primary qualified value shape.
+    /// Unused for a logical list, whose references all live in `others`.
+    first: ShapeRef,
+    /// The logical list members, or the disjoint qualified siblings.
+    others: Vec<ShapeRef>,
+}
+
+impl NestedConstraint {
+    pub(crate) fn single(kind: Nesting, shape: ShapeRef) -> Self {
+        Self {
+            kind,
+            first: shape,
+            others: Vec::new(),
+        }
+    }
+
+    pub(crate) fn logical(kind: Logical, members: Vec<ShapeRef>) -> Self {
+        Self {
+            kind: Nesting::Logical(kind),
+            first: 0,
+            others: members,
+        }
+    }
+
+    pub(crate) fn qualified(
+        shape: ShapeRef,
+        min: Option<u64>,
+        max: Option<u64>,
+        siblings: Vec<ShapeRef>,
+    ) -> Self {
+        Self {
+            kind: Nesting::Qualified { min, max },
+            first: shape,
+            others: siblings,
+        }
+    }
+
+    /// References in validation order: the primary qualified shape before its siblings.
+    pub(crate) fn references(&self) -> impl Iterator<Item = ShapeRef> + '_ {
+        self.has_first()
+            .then_some(self.first)
+            .into_iter()
+            .chain(self.others.iter().copied())
+    }
+
+    /// Random access in the same order, for a suspended validation.
+    pub(crate) fn reference(&self, member: usize) -> Option<ShapeRef> {
+        if self.has_first() {
+            if member == 0 {
+                return Some(self.first);
+            }
+            self.others.get(member - 1).copied()
+        } else {
+            self.others.get(member).copied()
+        }
+    }
+
+    /// References in creation order: the compiler encounters qualified siblings first.
+    pub(crate) fn creation_reference(&mut self, member: usize) -> Option<&mut ShapeRef> {
+        if member == self.others.len() && self.has_first() {
+            Some(&mut self.first)
+        } else {
+            self.others.get_mut(member)
+        }
+    }
+
+    fn has_first(&self) -> bool {
+        !matches!(self.kind, Nesting::Logical(_))
+    }
+
+    /// Whether the conservative applicability check depends on the referenced shapes.
+    pub(crate) fn depends_on_members(&self) -> bool {
+        match self.kind {
+            Nesting::Node | Nesting::Property | Nesting::Logical(_) => true,
+            Nesting::Not | Nesting::Qualified { .. } => false,
+        }
+    }
 }
 
 /// A SPARQL query that checks a focus node (SHACL §5, §6).
