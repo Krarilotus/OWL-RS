@@ -274,7 +274,7 @@ impl Kinds {
         if self.cell(tx, s) || self.cell(tx, o) {
             return false;
         }
-        if self.shacl.contains(&p) || (k.annotations.contains(&p) && !named(tx, p, false)) {
+        if self.shacl.contains(&p) || (k.annotations.contains(&p) && !named(tx, p, None)) {
             return true;
         }
         if changes_schema(tx, triple)
@@ -840,22 +840,31 @@ pub(crate) fn prepare(
     }
 }
 
-/// Whether a statement's subject or object is a reserved name, which the reader leaves out,
-/// or it names a SHACL property (`nrese_owl::shacl_properties`) anywhere, which can change
+/// Whether a statement's subject or object is a name the reader leaves out in its place, or
+/// it names a SHACL property (`nrese_owl::shacl_properties`) anywhere, which can change
 /// whether the reader reads SHACL content as content or as any other statement
-/// (`Ontology::shacl`).
+/// (`Ontology::shacl`). The object of `rdf:type` is a class's place
+/// (`nrese_owl::diagnostics::reserved_name`); the subject, and any other object, is taken as
+/// an individual's (`reserved_as_individual`, which also refuses `owl:Thing` and the five
+/// other names OWL 2 gives a class or a property). Where the reader reads such a statement
+/// otherwise (an annotation's subject, OWL's vocabulary) that only reads again.
 fn reserved_named(tx: &impl PendingView, [s, p, o]: Triple) -> bool {
-    named(tx, s, true) || named(tx, o, true) || named(tx, p, false)
+    use nrese_owl::diagnostics::{reserved_as_individual, reserved_name};
+    let object: fn(&str) -> bool = if iri(tx, p).is_some_and(|p| p == RDF_TYPE) {
+        reserved_name
+    } else {
+        reserved_as_individual
+    };
+    named(tx, s, Some(reserved_as_individual)) || named(tx, o, Some(object)) || named(tx, p, None)
 }
 
-/// Whether the term `t` is a SHACL property (`nrese_owl::shacl_properties`) or, with
-/// `reserved`, a reserved name (`nrese_owl::diagnostics::reserved_name`).
-fn named(tx: &impl PendingView, t: u64, reserved: bool) -> bool {
+/// Whether the term `t` is a SHACL property (`nrese_owl::shacl_properties`) or one `reserved`
+/// leaves out.
+fn named(tx: &impl PendingView, t: u64, reserved: Option<fn(&str) -> bool>) -> bool {
     match tx.decode(TermId::from_raw(t)) {
         Some(nrese_rdf::Term::NamedNode(n)) => {
             let iri = n.as_str();
-            nrese_owl::is_shacl_property(iri)
-                || (reserved && nrese_owl::diagnostics::reserved_name(iri))
+            nrese_owl::is_shacl_property(iri) || reserved.is_some_and(|reserved| reserved(iri))
         }
         _ => false,
     }

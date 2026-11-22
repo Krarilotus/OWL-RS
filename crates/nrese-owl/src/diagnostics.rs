@@ -524,8 +524,9 @@ fn uses_any<'a>(
 
 /// Whether an IRI is of the reserved vocabulary (`rdf:`, `rdfs:`, `xsd:`, `owl:`) and not
 /// one of the names OWL 2 DL gives it (`owl:Thing`, `owl:Nothing`, the top and bottom
-/// properties): an entity the reader leaves out (`leave_out_reserved`). Callers that
-/// choose input for the reader ask it here, not by a copy of the list.
+/// properties): a class or property the reader leaves out (`leave_out_reserved`); where an
+/// individual goes, [`reserved_as_individual`]. Callers that choose input for the reader ask
+/// it here, not by a copy of the list.
 pub fn reserved_name(iri: &str) -> bool {
     const ALLOWED: [&str; 6] = [
         "Thing",
@@ -541,6 +542,13 @@ pub fn reserved_name(iri: &str) -> bool {
     reserved_vocabulary(iri) && !allowed
 }
 
+/// Whether an IRI where an individual goes is one the reader leaves out: every IRI of the
+/// reserved vocabulary, the six names [`reserved_name`] allows included, which OWL 2 DL
+/// gives a class's or a property's role only (*Structural Specification* §2.4, §5.6.1).
+pub fn reserved_as_individual(iri: &str) -> bool {
+    reserved_vocabulary(iri)
+}
+
 /// Whether an IRI is of the reserved vocabulary (`rdf:`, `rdfs:`, `xsd:`, `owl:`; §2.4).
 pub fn reserved_vocabulary(iri: &str) -> bool {
     use crate::vocab::{OWL, RDF, RDFS, XSD};
@@ -549,8 +557,9 @@ pub fn reserved_vocabulary(iri: &str) -> bool {
 
 /// Leaves out the axioms that use an IRI of the reserved vocabulary (`rdf:`, `rdfs:`,
 /// `xsd:`, `owl:`; *OWL 2 Structural Specification* §2.4) as a class, a property or an
-/// individual, but for those §2.4 gives OWL 2 DL (`owl:Thing`, `owl:Nothing`, the top and
-/// bottom properties; datatypes are data ranges, not touched here): every such name an
+/// individual, but for those §2.4 gives OWL 2 DL as a class or a property (`owl:Thing`,
+/// `owl:Nothing`, the top and bottom properties; [`reserved_name`] and
+/// [`reserved_as_individual`]; datatypes are data ranges, not touched here): every such name an
 /// axiom uses, each with a [`Diagnostic::Reserved`] (not only its first: what is reported
 /// doesn't depend on the order the statements are read in). Such a name means in OWL 2
 /// DL nothing of what it means in RDF (`rdfs:Class`, `rdf:type`, `rdf:first` as entities
@@ -559,11 +568,15 @@ pub fn reserved_vocabulary(iri: &str) -> bool {
 /// follows from the rest still follows. Terms whose IRI the source doesn't give
 /// ([`Terms::iri_text`]) aren't checked.
 pub(crate) fn leave_out_reserved(ontology: &mut Ontology, terms: &dyn Terms) {
-    let mut cache: HashMap<Term, bool, foldhash::fast::RandomState> = HashMap::default();
-    let mut reserved = |t: Term| -> bool {
-        *cache
-            .entry(t)
-            .or_insert_with(|| terms.iri_text(t).is_some_and(|iri| reserved_name(&iri)))
+    // Per term: reserved as a class or property, and as an individual.
+    let mut cache: HashMap<Term, [bool; 2], foldhash::fast::RandomState> = HashMap::default();
+    let mut reserved = |t: Term, individual: bool| -> bool {
+        let [entity, as_individual] = *cache.entry(t).or_insert_with(|| {
+            (terms.iri_text(t)).map_or([false; 2], |iri| {
+                [reserved_name(&iri), reserved_as_individual(&iri)]
+            })
+        });
+        if individual { as_individual } else { entity }
     };
     let mut walk = Walk::new(ontology.classes.len());
     let mut kept = Vec::with_capacity(ontology.axioms.len());
@@ -580,8 +593,11 @@ pub(crate) fn leave_out_reserved(ontology: &mut Ontology, terms: &dyn Terms) {
     let all_sources = std::mem::take(&mut ontology.sources);
     for (axiom, source) in axioms.into_iter().zip(all_sources) {
         let mut any = false;
-        for &term in entities_of(ontology, &axiom, &mut walk) {
-            if reserved(term) {
+        let (names, individuals) = entities_of(ontology, &axiom, &mut walk);
+        let roles =
+            (names.iter().map(|&t| (t, false))).chain(individuals.iter().map(|&t| (t, true)));
+        for (term, individual) in roles {
+            if reserved(term, individual) {
                 any = true;
                 if met.insert(term) {
                     found.push(Diagnostic::Reserved { term });
@@ -599,10 +615,12 @@ pub(crate) fn leave_out_reserved(ontology: &mut Ontology, terms: &dyn Terms) {
 }
 
 /// [`entities_of`]'s lists, kept from one axiom to the next so that the walk over every
-/// axiom allocates nothing per axiom: the names found, the expressions left to visit, and
-/// per expression the round of the axiom that last visited it.
+/// axiom allocates nothing per axiom: the classes and properties found, the individuals found,
+/// the expressions left to visit, and per expression the round of the axiom that last visited
+/// it.
 struct Walk {
     names: Vec<Term>,
+    individuals: Vec<Term>,
     stack: Vec<u32>,
     seen: Vec<u32>,
     round: u32,
@@ -613,6 +631,7 @@ impl Walk {
     fn new(expressions: usize) -> Self {
         Self {
             names: Vec::new(),
+            individuals: Vec::new(),
             stack: Vec::new(),
             seen: vec![0; expressions],
             round: 0,
@@ -620,9 +639,10 @@ impl Walk {
     }
 }
 
-/// The classes, properties and individuals an axiom names (datatypes, literals and
-/// facets aside), in `walk`'s list.
-fn entities_of<'w>(o: &Ontology, axiom: &Axiom, walk: &'w mut Walk) -> &'w [Term] {
+/// The classes and properties an axiom names, then the individuals (datatypes, literals and
+/// facets aside), in `walk`'s lists.
+fn entities_of<'w>(o: &Ontology, axiom: &Axiom, walk: &'w mut Walk) -> (&'w [Term], &'w [Term]) {
+    use crate::model::EntityKind;
     if walk.round == u32::MAX {
         walk.seen.fill(0);
         walk.round = 0;
@@ -630,20 +650,20 @@ fn entities_of<'w>(o: &Ontology, axiom: &Axiom, walk: &'w mut Walk) -> &'w [Term
     walk.round += 1;
     let Walk {
         names: out,
+        individuals: ind,
         stack,
         seen,
         round,
     } = walk;
     out.clear();
+    ind.clear();
     stack.clear();
     let p = |q: &ObjProp| q.named();
     match axiom {
+        Axiom::Declaration(EntityKind::NamedIndividual, t) => ind.push(*t),
         Axiom::Declaration(kind, t) => {
             // Datatypes and annotation properties of the reserved vocabulary are OWL 2's.
-            if !matches!(
-                kind,
-                crate::model::EntityKind::Datatype | crate::model::EntityKind::AnnotationProperty
-            ) {
+            if !matches!(kind, EntityKind::Datatype | EntityKind::AnnotationProperty) {
                 out.push(*t);
             }
         }
@@ -669,13 +689,17 @@ fn entities_of<'w>(o: &Ontology, axiom: &Axiom, walk: &'w mut Walk) -> &'w [Term
             out.extend(os.iter().map(p));
             out.extend(ds);
         }
-        Axiom::ClassAssertion(_, a) => out.push(*a),
+        Axiom::ClassAssertion(_, a) => ind.push(*a),
         Axiom::ObjectPropertyAssertion(q, a, b2)
-        | Axiom::NegativeObjectPropertyAssertion(q, a, b2) => out.extend([*q, *a, *b2]),
-        Axiom::DataPropertyAssertion(q, a, _) | Axiom::NegativeDataPropertyAssertion(q, a, _) => {
-            out.extend([*q, *a]);
+        | Axiom::NegativeObjectPropertyAssertion(q, a, b2) => {
+            out.push(*q);
+            ind.extend([*a, *b2]);
         }
-        Axiom::SameIndividual(xs) | Axiom::DifferentIndividuals(xs) => out.extend(xs),
+        Axiom::DataPropertyAssertion(q, a, _) | Axiom::NegativeDataPropertyAssertion(q, a, _) => {
+            out.push(*q);
+            ind.push(*a);
+        }
+        Axiom::SameIndividual(xs) | Axiom::DifferentIndividuals(xs) => ind.extend(xs),
         _ => {}
     }
     push_expressions(axiom, stack);
@@ -688,7 +712,7 @@ fn entities_of<'w>(o: &Ontology, axiom: &Axiom, walk: &'w mut Walk) -> &'w [Term
             ClassExpr::Class(t) => out.push(*t),
             ClassExpr::And(xs) | ClassExpr::Or(xs) => stack.extend(xs.iter().map(|x| x.0)),
             ClassExpr::Not(x) => stack.push(x.0),
-            ClassExpr::OneOf(xs) => out.extend(xs),
+            ClassExpr::OneOf(xs) => ind.extend(xs),
             ClassExpr::Some(q, x)
             | ClassExpr::All(q, x)
             | ClassExpr::Min(_, q, x)
@@ -697,7 +721,10 @@ fn entities_of<'w>(o: &Ontology, axiom: &Axiom, walk: &'w mut Walk) -> &'w [Term
                 out.push(q.named());
                 stack.push(x.0);
             }
-            ClassExpr::HasValue(q, a) => out.extend([q.named(), *a]),
+            ClassExpr::HasValue(q, a) => {
+                out.push(q.named());
+                ind.push(*a);
+            }
             ClassExpr::HasSelf(q) => out.push(q.named()),
             ClassExpr::DataSome(q, _)
             | ClassExpr::DataAll(q, _)
@@ -708,5 +735,5 @@ fn entities_of<'w>(o: &Ontology, axiom: &Axiom, walk: &'w mut Walk) -> &'w [Term
             ClassExpr::Thing | ClassExpr::Nothing => {}
         }
     }
-    out
+    (out, ind)
 }
