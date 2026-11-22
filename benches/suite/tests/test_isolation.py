@@ -19,6 +19,8 @@ from pathlib import Path
 
 import isolation
 
+READS = ("benches/suite/suitekit/lock.py", "benches/suite/tests/", "scripts/lib/ns.sh")
+
 ISOLATION = Path(__file__).with_name("isolation.py")
 INNER_TEST = '''
 import subprocess, tempfile, unittest
@@ -116,12 +118,14 @@ class Isolation(unittest.TestCase):
         without suitekit/lock.py, which ns.sh locks with where there is no flock (Git Bash); #153's
         Windows gate failed on one. No fixture's list of files to copy (a module's constant) names
         ns.sh itself: it takes isolation.NS_SH; and a checkout of ns.sh without its lock is refused.
-        (A test making a file of that name in a repository of its own copies nothing.)"""
+        (A test making a file of that name in a repository of its own copies nothing; a contract's
+        READS, what it reads (contracts.py), copies nothing either.)"""
         found = []
         for path in sorted(ISOLATION.parent.glob("*.py")):
             if path != ISOLATION:
                 found += [f"{path.name}:{node.lineno}" for node in ast.parse(path.read_text("utf-8")).body
                           if isinstance(node, ast.Assign) and isinstance(node.value, (ast.Tuple, ast.List, ast.Set))
+                          and not any(isinstance(t, ast.Name) and t.id == "READS" for t in node.targets)
                           and any(isinstance(e, ast.Constant) and e.value == "scripts/lib/ns.sh"
                                   for e in node.value.elts)]
         self.assertEqual(found, [], "SPEC a fixture copies ns.sh through isolation.NS_SH, its lock with it")

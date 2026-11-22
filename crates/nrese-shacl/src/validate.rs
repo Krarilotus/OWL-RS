@@ -15,10 +15,12 @@ use nrese_sparql::{QueryEvaluationError, ReadView, Resources};
 use crate::datatype::well_formed;
 use crate::graph::{GraphView, Selection};
 use crate::model::{
-    Bound, Component, Constraint, Logical, NodeKind, Path, Shape, ShapeRef, Shapes, SparqlCheck,
-    Target,
+    Bound, Component, Constraint, Logical, Nesting, NodeKind, Path, Shape, ShapeRef, Shapes,
+    SparqlCheck, Target,
 };
-use crate::{path, sparql};
+use crate::sparql;
+
+mod nesting;
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const RDF_LANG_STRING: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString";
@@ -328,15 +330,12 @@ fn can_fail(shapes: &Shapes) -> Vec<bool> {
     let mut named_by: Vec<Vec<ShapeRef>> = vec![Vec::new(); count];
     for (shape, compiled) in shapes.shapes.iter().enumerate() {
         for constraint in &compiled.constraints {
-            let nested: &[ShapeRef] = match constraint {
-                Constraint::Node(nested) | Constraint::Property(nested) => {
-                    std::slice::from_ref(nested)
+            if let Constraint::Nested(nested) = constraint
+                && nested.depends_on_members()
+            {
+                for member in nested.references() {
+                    named_by[member].push(shape);
                 }
-                Constraint::Logical(_, nested) => nested,
-                _ => &[],
-            };
-            for &nested in nested {
-                named_by[nested].push(shape);
             }
         }
     }
@@ -362,21 +361,23 @@ fn can_fail(shapes: &Shapes) -> Vec<bool> {
 /// Whether `constraint` can fail, given which shapes can (`fails`).
 fn constraint_can_fail(constraint: &Constraint, fails: &[bool]) -> bool {
     match constraint {
-        // A node that conforms to the nested shape fails `sh:not`; one always does.
-        Constraint::Not(_) => true,
-        Constraint::Node(nested) | Constraint::Property(nested) => fails[*nested],
-        Constraint::Logical(Logical::And, nested) => nested.iter().any(|&nested| fails[nested]),
-        // Fails where no member conforms: never if one always does (`sh:or ()`: always).
-        Constraint::Logical(Logical::Or, nested) => nested.iter().all(|&nested| fails[nested]),
-        // Fails unless exactly one member conforms: never only for one member that always
-        // does.
-        Constraint::Logical(Logical::Xone, nested) => match nested.as_slice() {
-            [only] => fails[*only],
-            _ => true,
-        },
-        // A count of conforming values: below a positive minimum (no values) or above a
-        // maximum (every value conforming) whatever the nested shape.
-        Constraint::Qualified { min, max, .. } => min.is_some_and(|min| min > 0) || max.is_some(),
+        Constraint::Nested(nested) => {
+            let mut members = nested.references().map(|member| fails[member]);
+            match nested.kind {
+                // A conforming node fails sh:not, even when the nested shape cannot fail.
+                Nesting::Not => true,
+                Nesting::Node | Nesting::Property => members.next().expect("a direct reference"),
+                Nesting::Logical(Logical::And) => members.any(|fails| fails),
+                // Never fails if one member always conforms.
+                Nesting::Logical(Logical::Or) => members.all(|fails| fails),
+                // Never fails only if there is one member that always conforms.
+                Nesting::Logical(Logical::Xone) => {
+                    members.next() != Some(false) || members.next().is_some()
+                }
+                // A count can be below a positive minimum or above a maximum.
+                Nesting::Qualified { min, max } => min.is_some_and(|min| min > 0) || max.is_some(),
+            }
+        }
         _ => true,
     }
 }
@@ -412,9 +413,6 @@ pub(crate) struct Validator<'a, V: ReadView> {
     /// Each class the shapes name, with its subclasses (itself included).
     classes: HashMap<TermId, BTreeSet<TermId>>,
 }
-
-/// The shapes and nodes being validated further up: recursion stops there.
-type Stack = Vec<(ShapeRef, TermId)>;
 
 /// A frontier view's lookup ([`ResultTerm`]): the id of a term it knows.
 pub(crate) type Frontier<'a> = dyn Fn(&Term) -> Option<TermId> + Sync + 'a;
@@ -758,8 +756,9 @@ impl<'a, V: ReadView> Validator<'a, V> {
     }
 
     /// The results of validating each `(shape, focus node)` of `work`, in that order: in
-    /// parallel, a few dozen nodes per task, each task charging its own reservation, taken
-    /// over by the validation's when it ends ([`Validator::adopt`]).
+    /// parallel, a few dozen nodes per task. Each task reuses its walk and charges results
+    /// to its own reservation, taken over by the validation's when it ends
+    /// ([`Validator::adopt`]).
     pub(crate) fn validate_all(&self, work: &[(ShapeRef, TermId)]) -> Vec<RawResult>
     where
         V: Sync,
@@ -768,13 +767,18 @@ impl<'a, V: ReadView> Validator<'a, V> {
         work.par_iter()
             .with_min_len(32)
             .fold(
-                || TaskResults::new(&self.results_budget),
-                |mut task, &(shape, focus)| {
-                    self.validate_node(shape, focus, &mut task, &mut Vec::new());
-                    task
+                || {
+                    (
+                        TaskResults::new(&self.results_budget),
+                        nesting::Walk::new(&self.results_budget),
+                    )
+                },
+                |(mut task, mut walk), &(shape, focus)| {
+                    self.validate_node(shape, focus, &mut task, &mut walk);
+                    (task, walk)
                 },
             )
-            .map(|task| self.adopt(task))
+            .map(|(task, _)| self.adopt(task))
             .flat_map_iter(|list| list)
             .collect()
     }
@@ -812,43 +816,6 @@ impl<'a, V: ReadView> Validator<'a, V> {
                 .objects(node, rdf_type)
                 .iter()
                 .any(|class| subclasses.contains(class))
-    }
-
-    /// Whether `node` conforms to `shape`: validating it produces no result.
-    fn conforms(&self, shape: ShapeRef, node: TermId, stack: &mut Stack) -> bool {
-        let mut results = TaskResults::new(&self.results_budget);
-        self.validate_node(shape, node, &mut results, stack);
-        // Only their existence counts: dropped, they are freed, then their charge returned.
-        results.list.is_empty()
-    }
-
-    pub(crate) fn validate_node(
-        &self,
-        shape_ref: ShapeRef,
-        focus: TermId,
-        results: &mut TaskResults,
-        stack: &mut Stack,
-    ) {
-        // Every validation of a node against a shape, nested ones included, looks at the
-        // stop first: the work after one is bounded by one call's.
-        if self.stopped() {
-            return;
-        }
-        let shape = &self.shapes.shapes[shape_ref];
-        // Recursive shapes are undefined in SHACL: a node already being validated against
-        // the shape is taken to conform.
-        if shape.deactivated || stack.contains(&(shape_ref, focus)) {
-            return;
-        }
-        stack.push((shape_ref, focus));
-        let values = match &shape.path {
-            None => vec![focus],
-            Some(path) => path::values(&self.graph, path, focus),
-        };
-        for constraint in &shape.constraints {
-            self.check(shape_ref, focus, &values, constraint, results, stack);
-        }
-        stack.pop();
     }
 
     /// The string `sh:minLength`, `sh:maxLength` and `sh:pattern` look at: an IRI or a
@@ -894,25 +861,15 @@ impl<'a, V: ReadView> Validator<'a, V> {
     }
 
     #[expect(clippy::too_many_lines)]
-    fn check(
+    fn check_local(
         &self,
         shape_ref: ShapeRef,
         focus: TermId,
         values: &[TermId],
         constraint: &Constraint,
         results: &mut TaskResults,
-        stack: &mut Stack,
     ) {
-        let shape = &self.shapes.shapes[shape_ref];
-        let result = |component: Component, value: Option<TermId>| RawResult {
-            focus,
-            path: shape.path.clone().map(ResultPath::Path),
-            value: value.map(ResultTerm::Stored),
-            shape: shape_ref,
-            component,
-            source: None,
-            messages: None,
-        };
+        let result = |component, value| self.core_result(shape_ref, focus, component, value);
         // One result per value node that fails `ok`.
         let mut each = |component: Component, ok: &mut dyn FnMut(TermId) -> bool| {
             for &value in values {
@@ -1038,57 +995,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
                     }
                 }
             }
-            Constraint::Not(shape) => {
-                each(Component::Not, &mut |v| !self.conforms(*shape, v, stack));
-            }
-            Constraint::Logical(logical, shapes) => {
-                let component = match logical {
-                    Logical::And => Component::And,
-                    Logical::Or => Component::Or,
-                    Logical::Xone => Component::Xone,
-                };
-                // `all` and `any` stop at the first shape that decides it.
-                each(component, &mut |v| match logical {
-                    Logical::And => shapes.iter().all(|&s| self.conforms(s, v, stack)),
-                    Logical::Or => shapes.iter().any(|&s| self.conforms(s, v, stack)),
-                    Logical::Xone => {
-                        shapes
-                            .iter()
-                            .filter(|&&s| self.conforms(s, v, stack))
-                            .count()
-                            == 1
-                    }
-                });
-            }
-            Constraint::Node(shape) => {
-                each(Component::Node, &mut |v| self.conforms(*shape, v, stack));
-            }
-            Constraint::Property(shape) => {
-                // The nested property shape reports its own results.
-                for &value in values {
-                    self.validate_node(*shape, value, results, stack);
-                }
-            }
-            Constraint::Qualified {
-                shape,
-                min,
-                max,
-                siblings,
-            } => {
-                let count = values
-                    .iter()
-                    .filter(|&&v| {
-                        self.conforms(*shape, v, stack)
-                            && !siblings.iter().any(|&s| self.conforms(s, v, stack))
-                    })
-                    .count() as u64;
-                if min.is_some_and(|min| count < min) {
-                    self.keep(results, result(Component::QualifiedMinCount, None));
-                }
-                if max.is_some_and(|max| count > max) {
-                    self.keep(results, result(Component::QualifiedMaxCount, None));
-                }
-            }
+            Constraint::Nested(_) => unreachable!("nested checks are handled by the shape walk"),
             Constraint::Closed(allowed) => {
                 for &value in values {
                     for (predicate, object) in self.graph.edges(value) {
@@ -1116,6 +1023,24 @@ impl<'a, V: ReadView> Validator<'a, V> {
             }
             Constraint::In(allowed) => each(Component::In, &mut |v| allowed.contains(&v)),
             Constraint::Sparql(check) => self.sparql(shape_ref, focus, values, check, results),
+        }
+    }
+
+    fn core_result(
+        &self,
+        shape: ShapeRef,
+        focus: TermId,
+        component: Component,
+        value: Option<TermId>,
+    ) -> RawResult {
+        RawResult {
+            focus,
+            path: self.shapes.shapes[shape].path.clone().map(ResultPath::Path),
+            value: value.map(ResultTerm::Stored),
+            shape,
+            component,
+            source: None,
+            messages: None,
         }
     }
 

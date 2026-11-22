@@ -19,7 +19,10 @@
 #                                  tests, the dependents' fast tests; random tests on new
 #                                  seeds; the lock check; each of them and their dependents
 #                                  compiled alone (crates_alone); nrese-exec's unsafe code under Miri
-#                                  and its doc tests when it changed (scripts/miri.sh). By
+#                                  and its doc tests when it changed (scripts/miri.sh); the
+#                                  suite contracts the files reach, by what each declares it
+#                                  reads (benches/suite/tests/contracts.py), the crate scan its
+#                                  own step. By
 #                                  hand: HEAD, from its upstream (else from where it left
 #                                  origin's refactor/engine-v2), so a push then finds the pass;
 #                                  NRESE_PUSH_REF names the ref it will go to, as the hook's
@@ -43,14 +46,31 @@
 #                                  the merge check's Windows part, on the fleet only
 #                                  (scripts/lib/fleet-gate.sh windows): COMMIT (default HEAD)
 #                                  built whole, clippy on it all, all its tests and doc tests,
-#                                  the suite contracts, the console, by its own tier here, which its own
-#                                  scripts/lib/windows-job.sh runs on a Windows host. A commit
-#                                  whose inputs (scripts/lib/gate-key.sh windows_inputs)
-#                                  passed before, under the Python runtime it declares
-#                                  (gate_runtime), carries that pass: "carried from <commit>".
+#                                  the suite contracts its range reaches (from NRESE_PUSH_BASE,
+#                                  else from where it left origin's refactor/engine-v2; all of
+#                                  them without one: windows_contracts), the console, by its own
+#                                  tier here, which its own scripts/lib/windows-job.sh runs on a
+#                                  Windows host. A commit whose inputs (scripts/lib/gate-key.sh
+#                                  windows_inputs) passed before with the same contracts or all
+#                                  of them, under the Python runtime it declares (gate_runtime),
+#                                  carries that pass: "carried from <commit>".
 #                                  NRESE_PUSH_REF as for push: the merge check's Windows part
 #                                  for refactor/engine-v2 or a release branch is a merge gate,
 #                                  a package's isn't.
+#        scripts/check.sh nightly [COMMIT]
+#                                  on the line's head after changes land, on the fleet only (scripts/lib/fleet-gate.sh
+#                                  nightly): COMMIT (default HEAD) with every test in its full
+#                                  form (NRESE_CHECK_TIER=nightly), the forms the other tiers
+#                                  cut down, and a receipt of one outcome per test of the
+#                                  tree's inventory (scripts/lib/nightly-receipt.py). Its steps
+#                                  are listed, each with what it guards, where the tier runs
+#                                  (below). A red nightly run on the line stays an open
+#                                  blocker: no release is cut while one is open. The release
+#                                  gate is to run these forms itself on the commit it
+#                                  releases, never resting on another commit's nightly result
+#                                  (a requirement it doesn't meet yet). Its pass is its own tier's
+#                                  (scripts/lib/gate-key.sh): it never stands for a push pass,
+#                                  nor a push pass for it, and it lands nothing.
 #        scripts/check.sh [all]    milestones and CI: everything, both Cargo workspaces,
 #                                  doc tests, cargo-deny, the console.
 #        scripts/check.sh crates FILE...
@@ -262,6 +282,52 @@ run_tests() {
   fi
 }
 
+# The nightly tier's steps (below), under nextest only: its receipt (scripts/lib/nightly-receipt.py)
+# needs nextest's inventory and reports. Each run uses nextest's `nightly` profile (.config/nextest.toml:
+# no retries, no fail-fast, a JUnit report), with the check tier NRESE_CHECK_TIER=nightly, which gives
+# every test its full form; the inventory, the receipt and the reports go to $receipts.
+#
+# The inventory, pinned before any filter: every test of the given crates, #[ignore]d ones marked.
+inventory() {
+  nextest || { echo "the nightly tier runs under cargo-nextest only (its inventory and reports)" >&2; return 2; }
+  # shellcheck disable=SC2046
+  "$guarded" nextest list --locked --ignore-default-filter --run-ignored all --message-format json \
+    $(package_args "$@") > "$receipts/inventory.json"
+}
+# STEP CMD...: CMD in the nightly profile and tier, its JUnit report kept as $receipts/STEP.junit.xml.
+reported() {
+  local name=$1 junit code
+  shift
+  # nextest's store is the workspace's target/nextest, wherever CARGO_TARGET_DIR puts the builds.
+  junit=$(cargo metadata --format-version 1 --no-deps --offline \
+    | python -c "import json,sys; print(json.load(sys.stdin)['workspace_root'])" | tr -d '\r') || return 2
+  junit=$junit/target/nextest/nightly/junit.xml
+  # An earlier step's report left there would stand for this step's.
+  rm -f -- "$junit" && [ ! -e "$junit" ] || { echo "$name: the earlier report $junit can't be removed" >&2; return 2; }
+  (export NEXTEST_PROFILE=nightly NRESE_CHECK_TIER=nightly; "$@")
+  code=$?
+  cp -- "$junit" "$receipts/$name.junit.xml" || { [ $code -ne 0 ] || code=2; }
+  return $code
+}
+# CRATE TARGET NAME: the #[ignore]d test NAME (its path in the binary) of CRATE's test binary TARGET,
+# alone; a run that selects no test fails.
+ignored_test() {
+  "$guarded" nextest run --locked --no-fail-fast --no-tests=fail --run-ignored only -p "$1" \
+    -E "binary_id($1::$2) & test(=$3)"
+}
+# STEP=SELECTION...: the receipt of the run (scripts/lib/nightly-receipt.py), with the gate's own
+# fields: the commit, its tree, tracked changes, the build identity (scripts/lib/gate-key.sh), the host,
+# the job and its attempt (scripts/lib/gate-job.sh).
+receipt() {
+  # shellcheck source=lib/gate-key.sh
+  . scripts/lib/gate-key.sh
+  RECEIPT_COMMIT=$(git rev-parse HEAD) RECEIPT_TREE=$(git rev-parse 'HEAD^{tree}') \
+    RECEIPT_DIRTY=$(git status --porcelain --untracked-files=no) RECEIPT_IDENTITY=$(gate_identity HEAD) \
+    RECEIPT_HOST=${FLEET_HOST:-$(hostname)} RECEIPT_JOB=${FLEET_JOB:-} \
+    RECEIPT_ATTEMPT=$(cat "${FLEET_OUT:-/nonexistent}/attempt" 2> /dev/null) \
+    python scripts/lib/nightly-receipt.py "$receipts" "$@"
+}
+
 # EMPTY ARGS...: cargo test ARGS; with EMPTY fail, a run in which no test ran fails (4, as nextest's).
 cargo_test() {
   local empty=$1 out code=0
@@ -378,11 +444,27 @@ w3c_data() {
   fi
 }
 
+# A private bench host's names (the overlay NRESE_BENCH_PRIVATE names, benches/hosts.toml's header) are
+# refused where they would be published: by the commit tier for the staged change, and on the pusher's machine
+# for the commits a push publishes, before the fleet's tier, whose remembered pass knows neither the overlay
+# nor the messages (scripts/lib/private_terms.py). With no overlay there is nothing to check and nothing is read.
+private_terms() {
+  if [ -z "${NRESE_BENCH_PRIVATE:-}" ]; then
+    echo "private terms: no overlay configured (NRESE_BENCH_PRIVATE), nothing to check"
+    return 0
+  fi
+  python scripts/lib/private_terms.py "$@"
+}
+
 # The steps for files outside the Rust workspace: the guards, then what tests them.
 side_steps() {
   local files=("$@")
   guards "${files[@]}"
-  suite_contracts "${files[@]}"
+  # The suite contracts these files reach, by what each declares it reads (the gate's own scripts
+  # and hooks too: test_push_gate, test_full_gate, test_commit_tier, ...).
+  local -a reached
+  mapfile -t reached < <(printf '%s\n' "${files[@]}" | reached_contracts)
+  suite_contracts "${reached[@]}"
   if printf '%s\n' "${files[@]}" | grep -qE '^benches/nrese-bench-harness/'; then
     harness
   fi
@@ -390,12 +472,49 @@ side_steps() {
     console
   fi
 }
-# The suite contracts, the push and quick tiers' one rule: they test the gate's own scripts and
-# hooks too (test_push_gate, test_quick_check, test_commit_tier, ...), so a change to them runs the
-# contracts.
+# The suite contracts of the given module names, the crate scan (crate_scan) its own step: every
+# contract when none is given, none for `none` (benches/suite/tests/contracts.py select's answers).
 suite_contracts() {
-  printf '%s\n' "$@" | grep -qE '^(benches/suite/|scripts/|\.githooks/)' || return 0
-  step "suite contracts" python benches/suite/tests/isolation.py discover -s benches/suite/tests
+  local name
+  local -a rest=()
+  if [ $# -eq 0 ]; then
+    step "crate scan" python benches/suite/tests/isolation.py crate_scan
+    step "suite contracts" python benches/suite/tests/isolation.py discover -s benches/suite/tests
+    return
+  fi
+  for name in "$@"; do
+    case $name in
+      none) ;;
+      crate_scan) step "crate scan" python benches/suite/tests/isolation.py crate_scan ;;
+      *) rest+=("$name") ;;
+    esac
+  done
+  [ ${#rest[@]} -eq 0 ] || step "suite contracts" python benches/suite/tests/isolation.py "${rest[@]}"
+}
+# The suite contracts the files on stdin (one per line) reach, one per line, by what each declares it
+# reads (benches/suite/tests/contracts.py; with COMMIT, COMMIT's own declarations): nothing for every
+# contract, which is also the answer where the selector fails.
+reached_contracts() {
+  local out
+  out=$(python benches/suite/tests/contracts.py select ${1:+--commit "$1"}) || return 0
+  printf '%s\n' "$out" | tr -d '\r' | grep .
+  return 0
+}
+# The suite contracts the Windows part of COMMIT runs: those its range reaches, by COMMIT's own
+# selector and declarations, from NRESE_PUSH_BASE, else from where it left origin's
+# refactor/engine-v2 (as push). Nothing, so every contract, without a base, where COMMIT has no
+# selector, or where the range or the selector fails.
+windows_contracts() {
+  local commit=$1 base files selector out
+  base=${NRESE_PUSH_BASE:-$(git merge-base "$commit" refs/remotes/origin/refactor/engine-v2 2> /dev/null)}
+  [ -n "$base" ] && files=$(gate_files diff --no-renames --name-only "$base" "$commit" 2> /dev/null) || return 0
+  selector=$(mktemp) || return 0
+  if git show "$commit:benches/suite/tests/contracts.py" > "$selector" 2> /dev/null \
+      && out=$(printf '%s\n' "$files" | python "$selector" select --commit "$commit"); then
+    printf '%s\n' "$out" | tr -d '\r' | grep .
+  fi
+  rm -f -- "$selector"
+  return 0
 }
 # Of those, the guards that build nothing (the quick tier's too).
 guards() {
@@ -484,19 +603,22 @@ exec_changed() {
 # tested on that side; new is what differs from both (resolved conflicts, files both sides
 # changed). A push: the pushed range, from the base the remote has to the pushed commit
 # (push_base, push_commit); never the work tree, which a push doesn't send. Without a range it
-# fails: an empty list would gate nothing.
+# fails: an empty list would gate nothing. A rename is listed by both its names (what was read
+# from where it left changed too), and a path as it is, not quoted (gate_files).
 
+gate_files() { git -c core.quotePath=false "$@"; }
 changed_files() {
   if [ "$1" = commit ] && git rev-parse -q --verify MERGE_HEAD > /dev/null; then
-    comm -12 <(git diff --name-only --cached HEAD | sort) <(git diff --name-only --cached MERGE_HEAD | sort)
+    comm -12 <(gate_files diff --no-renames --name-only --cached HEAD | sort) \
+      <(gate_files diff --no-renames --name-only --cached MERGE_HEAD | sort)
   elif [ "$1" = commit ]; then
-    git diff --name-only HEAD
+    gate_files diff --no-renames --name-only HEAD
   else
     [ -n "${push_base:-}" ] && [ -n "${push_commit:-}" ] || return 2
-    git diff --name-only "$push_base" "$push_commit"
+    gate_files diff --no-renames -O/dev/null --name-only "$push_base" "$push_commit"  # git's order, as the host's
     return
   fi
-  git ls-files --others --exclude-standard
+  gate_files ls-files --others --exclude-standard
 }
 
 # A push gates one commit, from the base the remote has: .githooks/pre-push names both
@@ -508,6 +630,9 @@ if [ "$mode" = push ] && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
   push_base=${NRESE_PUSH_BASE:-$(git rev-parse -q --verify '@{upstream}' 2> /dev/null \
     || git merge-base "$push_commit" refs/remotes/origin/refactor/engine-v2 2> /dev/null)}
   [ -n "$push_base" ] || { echo "no base for the push range: no upstream, and no origin/refactor/engine-v2" >&2; exit 2; }
+  # What this push publishes, checked here on every push before the fleet's tier, whose remembered pass
+  # knows neither the overlay nor the messages (private_terms): the range's commits and the branch.
+  private_terms push "$push_base" "$push_commit" "${NRESE_PUSH_REF:-}" || exit $?
   # A measurement commit (refs/measure/*, benches/PROTOCOL.md §5) is a commit on an old side's tree,
   # which this tier isn't for: its one check is the measurement rule against the declared sides, the
   # side on a branch of the remote the push goes to (NRESE_PUSH_REMOTE, from the hook).
@@ -538,20 +663,32 @@ if [ "$mode" = windows ] && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
   git cat-file -e "$push_commit:scripts/lib/windows-job.ps1" 2> /dev/null \
     || { echo "$(git rev-parse --short "$push_commit") has no Windows tier (scripts/lib/windows-job.ps1): it can't be checked" >&2; exit 2; }
 fi
+# The nightly run checks one commit, whole, by its own check.sh, so a commit from before the tier
+# can't be checked.
+if [ "$mode" = nightly ] && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
+  push_commit=$(git rev-parse -q --verify "${2:-HEAD}^{commit}") || { echo "no commit ${2:-HEAD} to check" >&2; exit 2; }
+  git show "$push_commit:scripts/check.sh" 2> /dev/null | grep -qx '  nightly)' \
+    || { echo "$(git rev-parse --short "$push_commit") has no nightly tier (scripts/check.sh): it can't be checked" >&2; exit 2; }
+fi
 
-# The push tier, the quick check and the Windows part run on the fleet only
-# (scripts/lib/fleet-gate.sh), for the commit's own tree and the range's files (Windows: none,
-# everything runs). A pass is a verified fleet result, remembered by content
+# The push tier, the quick check, the Windows part and the nightly run run on the fleet only
+# (scripts/lib/fleet-gate.sh), for the commit's own tree and the range's files (Windows: the suite
+# contracts it runs, none listed, all, and everything else runs; nightly: none, everything runs, in
+# its full form). A pass is a verified fleet result, remembered by content
 # (scripts/lib/gate-key.sh: the tier, the tree, the files, the toolchain), and only check.sh writes
 # it. No verdict, no pass (no push): nothing runs here instead.
-if { [ "$mode" = windows ] || [ "$mode" = push ] || [ "$mode" = quick ]; } && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
+if [[ $mode =~ ^(windows|push|quick|nightly)$ ]] && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
   # shellcheck source=lib/gate-key.sh
   . scripts/lib/gate-key.sh
   list=$(mktemp)
   where=$(mktemp)
   trap 'rm -f "$list" "$where"' EXIT
-  if [ "$mode" != windows ]; then
+  if [ "$mode" = push ] || [ "$mode" = quick ]; then
     changed_files push > "$list" || { echo "the range $push_base..$push_commit isn't all here: fetch first" >&2; exit 2; }
+  elif [ "$mode" = windows ]; then
+    # The Windows part's list is the suite contracts it runs (windows_contracts): none listed, all.
+    # The nightly run's stays empty: nothing selects what it runs.
+    windows_contracts "$push_commit" > "$list"
   fi
   tree=$(git rev-parse "$push_commit^{tree}")
   list_hash=$(git hash-object "$list")
@@ -570,7 +707,9 @@ if { [ "$mode" = windows ] || [ "$mode" = push ] || [ "$mode" = quick ]; } && [ 
     identity="$identity $(gate_python "$runtime")"
   fi
   key=$(gate_key "$mode" "$keyed" "$list_hash" "$identity")
-  if record=$(gate_pass "$key"); then
+  # A Windows pass that ran every suite contract (its list empty) stands for any selection of them.
+  if record=$(gate_pass "$key") || { [ "$mode" = windows ] && [ -s "$list" ] \
+      && record=$(gate_pass "$(gate_key "$mode" "$keyed" "$(git hash-object --stdin < /dev/null)" "$identity")"); }; then
     if [ "$mode" = windows ]; then
       echo "=== windows: $(git rev-parse --short "$push_commit") carried from $record (the same inputs)"
     else
@@ -639,6 +778,9 @@ case "$mode" in
     # tree, the merge check's Windows part for its Windows inputs (scripts/lib/gate-key.sh
     # windows_inputs; process review 20 Oct 2026, §3A).
     mapfile -t files < <(changed_files commit)
+    step "private terms" private_terms commit
+    # A refusal ends the tier: a later step's output (rustfmt's diff) could show the line it refused.
+    [ "${results[-1]%% *}" = 0 ] || exit "${results[-1]%% *}"
     step fmt cargo fmt --all --check
     step "message strings" message_strings
     if printf '%s\n' "${files[@]}" | grep -qE '(^|/)Cargo\.(toml|lock)$'; then
@@ -689,7 +831,8 @@ case "$mode" in
     # The push tier's own steps on the gate's file list, fewer (the header): what finds a mechanical
     # fault of the changed crates in minutes. Not the dependents' tests, the changed crates' other
     # integration tests, Miri, the W3C suites, the bench harness or the console. The suite contracts
-    # by push's rule (suite_contracts): a change to the gate's own scripts is checked before review.
+    # the files reach, by push's rule (reached_contracts): a change to the gate's own scripts is checked
+    # before review.
     if [ -z "${NRESE_FILES_FROM:-}" ]; then
       echo "check.sh quick on a build host needs the gate's file list (NRESE_FILES_FROM): not run" >&2
       exit 2
@@ -721,7 +864,8 @@ case "$mode" in
       fi
     fi
     guards "${files[@]}"
-    suite_contracts "${files[@]}"
+    mapfile -t reached < <(printf '%s\n' "${files[@]}" | reached_contracts)
+    suite_contracts "${reached[@]}"
     ;;
   windows)
     # Inside its fleet job only, which readies the Windows host (scripts/lib/windows-job.sh).
@@ -735,9 +879,41 @@ case "$mode" in
     step clippy "$guarded" clippy --locked --workspace --all-targets
     step test run_tests "${everything[@]}"
     step "doc tests" "$guarded" test --locked --workspace --doc --no-fail-fast
-    step "suite contracts" python benches/suite/tests/isolation.py discover -s benches/suite/tests
+    # The suite contracts its range reaches, as its gate sent them (NRESE_CONTRACTS, from
+    # windows_contracts; scripts/lib/gate-key.sh gate_contracts_list); none sent: all of them.
+    # shellcheck source=lib/gate-key.sh
+    . scripts/lib/gate-key.sh
+    mapfile -t reached < <(gate_contracts_list)
+    suite_contracts "${reached[@]}"
     # The console's typecheck and tests, with the gate's own Node (scripts/lib/windows-job.sh).
     console
+    ;;
+  nightly)
+    # Inside its fleet job (scripts/lib/fleet-gate.sh nightly): the runs too long for a landing, one
+    # job for all of them, under nextest (the helpers above). Each step guards:
+    # - inventory: every workspace test, #[ignore]d ones marked, listed before anything is filtered:
+    #   what the receipt holds each step to.
+    # - test (full forms): every workspace crate's tests not #[ignore]d, unselected, each in its full
+    #   form (NRESE_CHECK_TIER=nightly): the cases, sweeps and sizes the default forms cut down, so a
+    #   fault that shows only beyond them is still found. No retries and no fail-fast, so the log names
+    #   every failing test. The W3C data is required, as for push.
+    # - count past 64 bits: a COUNT past 2^64 (the n³ statements of 2.7 M equal identities) fails as
+    #   the engine's range limit and never answers a wrapped number (nrese-sparql's
+    #   a_count_past_64_bits_fails_as_a_range_limit, #[ignore]d for its size: alone, by its exact name).
+    # - receipt: one outcome per test of the inventory, each step's selection whole: no test it
+    #   selected without an outcome, none with two, none outside the inventory.
+    # A later full run (the status sweep's, the whole suite contracts') is a step here, not a job, with
+    # its selection in the receipt.
+    mapfile -t everything < <(workspace_packages)
+    [ ${#everything[@]} -gt 0 ] || { echo "no workspace packages found" >&2; exit 2; }
+    receipts=${FLEET_OUT:-$(mktemp -d)}/receipt
+    mkdir -p "$receipts" || exit 2
+    w3c_data
+    step inventory inventory "${everything[@]}"
+    step "test (full forms)" reported full-forms run_tests "${everything[@]}"
+    count=equality_answer_tests::a_count_past_64_bits_fails_as_a_range_limit
+    step "count past 64 bits" reported count ignored_test nrese-sparql it "$count"
+    step receipt receipt full-forms=not-ignored "count=exact:nrese-sparql::it/$count"
     ;;
   all)
     step fmt cargo fmt --all --check
@@ -750,7 +926,7 @@ case "$mode" in
     harness
     step locks bash scripts/check-locks.sh
     step features bash scripts/check-features.sh
-    step "suite contracts" python benches/suite/tests/isolation.py discover -s benches/suite/tests
+    suite_contracts
     step names bash scripts/check-names.sh
     step "cargo-deny version" deny_version
     step deny cargo deny --all-features check
@@ -759,7 +935,7 @@ case "$mode" in
     console
     ;;
   *)
-    echo "usage: scripts/check.sh commit|push|quick|windows [COMMIT]|all" >&2
+    echo "usage: scripts/check.sh commit|push|quick|windows [COMMIT]|nightly [COMMIT]|all" >&2
     exit 2
     ;;
 esac

@@ -11,20 +11,20 @@ use crate::budget::{Hold, Pool, Reservation, Share};
 use crate::{Budget, BudgetExceeded};
 
 /// A hash map whose table is charged before it is allocated, to a budget or to a [`Pool`]
-/// ([`Hold`]): the table grows on one path ([`ChargedMap::get_or_insert_with`] where it is
-/// full), which charges an upper bound of the new table beside the old (a rehash holds both),
-/// lets the table grow, releases the old table's charge once it is freed, and trims the new
-/// charge to the table's allocation. Between growths it is charged exactly its allocation;
-/// it never grows otherwise (no entry is removed, so an insert into a table with room never
-/// rehashes). Dropped, it frees the table, then releases the charge. Keys and values that own
-/// memory elsewhere are not counted. The upper bound follows hashbrown's bucket and layout rule;
-/// a test checks it against the allocation at every growth.
+/// ([`Hold`]). When an insertion needs room, the table reuses tombstones in place if it
+/// can. To grow, it charges an upper bound of the new table beside the old, lets the table
+/// grow, releases the old table's charge once it is freed, and trims the new charge to the
+/// table's allocation. Between growths it is charged exactly its allocation. Dropped, it
+/// frees the table, then releases the charge. Keys and values that own memory elsewhere
+/// are not counted. The upper bound follows hashbrown's bucket and layout rule.
 #[derive(Debug)]
 pub struct ChargedMap<K, V, H: Hold = Reservation> {
     /// Before `held`: fields drop in order, the table first.
     map: hashbrown::HashMap<K, V, FixedState>,
     /// Exactly the table's allocation, between growths.
     held: H,
+    /// Usable entry slots before any are lost to tombstones.
+    full_capacity: usize,
 }
 
 impl<K, V, B: Deref<Target = Budget>> ChargedMap<K, V, Reservation<B>> {
@@ -46,6 +46,7 @@ impl<K, V, H: Hold> ChargedMap<K, V, H> {
         Self {
             map: hashbrown::HashMap::with_hasher(FixedState::default()),
             held,
+            full_capacity: 0,
         }
     }
 
@@ -71,6 +72,12 @@ impl<K: Eq + Hash, V, H: Hold> ChargedMap<K, V, H> {
 
     pub fn get(&self, key: &K) -> Option<&V> {
         self.map.get(key)
+    }
+
+    /// Removes a key, retaining the allocation and its charge. Its tombstone may make
+    /// the next insertion rehash even below the original capacity.
+    pub fn remove(&mut self, key: &K) -> Option<V> {
+        self.map.remove(key)
     }
 
     /// The value under `key`, `value()` put there first where there is none, and whether it
@@ -100,19 +107,37 @@ impl<K: Eq + Hash, V, H: Hold> ChargedMap<K, V, H> {
         Ok(self.map.insert(key, value))
     }
 
-    /// Room for at least one more entry, doubling: the new table's bound charged beside the
-    /// old table's charge, the table grown, then the old charge released (its table freed in
-    /// the growth) and the new trimmed to the allocation.
+    /// Room for at least one more entry, reusing tombstones or doubling the table.
     fn grow(&mut self) -> Result<(), BudgetExceeded> {
         let wanted = self
             .map
             .len()
             .checked_add(1)
             .ok_or_else(|| self.held.too_large(TOKEN))?;
-        let to = wanted.max(self.map.capacity().saturating_mul(2));
+        // hashbrown 0.16 rehashes in place when the entries fit in half the table.
+        if wanted <= self.full_capacity / 2 {
+            Self::reserve(&mut self.map, 1);
+            assert_eq!(self.map.allocation_size(), self.held.held(TOKEN));
+            return Ok(());
+        }
+        let to = wanted.max(self.full_capacity.saturating_mul(2));
         let bound = table_bound::<(K, V)>(to).ok_or_else(|| self.held.too_large(TOKEN))?;
         let old = self.held.renew(TOKEN, bound)?;
-        match self.map.try_reserve(to - self.map.len()) {
+        let additional = to - self.map.len();
+        Self::reserve(&mut self.map, additional);
+        drop(old);
+        self.full_capacity = self.map.capacity();
+        let allocated = self.map.allocation_size();
+        assert!(
+            allocated <= bound,
+            "the table's allocation, {allocated} bytes, past its bound of {bound}"
+        );
+        self.held.trim(TOKEN, allocated);
+        Ok(())
+    }
+
+    fn reserve(map: &mut hashbrown::HashMap<K, V, FixedState>, additional: usize) {
+        match map.try_reserve(additional) {
             Ok(()) => {}
             Err(hashbrown::TryReserveError::AllocError { layout }) => {
                 std::alloc::handle_alloc_error(layout)
@@ -121,14 +146,6 @@ impl<K: Eq + Hash, V, H: Hold> ChargedMap<K, V, H> {
                 unreachable!("a table within its bound has a layout")
             }
         }
-        drop(old);
-        let allocated = self.map.allocation_size();
-        assert!(
-            allocated <= bound,
-            "the table's allocation, {allocated} bytes, past its bound of {bound}"
-        );
-        self.held.trim(TOKEN, allocated);
-        Ok(())
     }
 }
 
@@ -188,6 +205,72 @@ mod tests {
             grown::<(u64, u64)>(&budget);
         });
         assert_eq!((excess, budget.used()), (0, 0));
+    }
+
+    /// Spec: removing entries keeps the table charged. When tombstones exhaust its
+    /// capacity, inserting must reuse or grow the table as hashbrown does, and any
+    /// allocation must be covered by a charge before it happens.
+    #[test]
+    fn tombstones_are_reused_or_grown_within_the_charge() {
+        if !crate::measure::alone() {
+            return;
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        struct Collision(u64);
+
+        impl Hash for Collision {
+            fn hash<S: std::hash::Hasher>(&self, state: &mut S) {
+                0_u64.hash(state);
+            }
+        }
+
+        const FULL: u64 = 112;
+        for remaining in [FULL / 2 - 1, FULL - 1] {
+            let budget = Budget::unlimited();
+            let mut map = ChargedMap::new(&budget);
+            for key in 0..FULL {
+                map.insert(Collision(key), key).unwrap();
+            }
+            let mut reference = map.map.clone();
+            let allocated = reference.allocation_size();
+            let peak = budget.peak();
+            for _ in remaining..FULL {
+                // Choose a removal that leaves a tombstone. Collisions keep the probe
+                // groups dense enough for both the in-place and allocating cases.
+                let key = reference
+                    .keys()
+                    .copied()
+                    .find(|key| {
+                        let mut copy = reference.clone();
+                        copy.remove(key);
+                        copy.capacity() < reference.capacity()
+                    })
+                    .expect("a removal that leaves a tombstone");
+                assert_eq!(map.remove(&key), reference.remove(&key));
+            }
+            assert_eq!(reference.len(), reference.capacity());
+            assert_eq!(budget.used(), allocated);
+
+            reference.reserve(1);
+            let reuses_table = remaining < FULL / 2;
+            assert_eq!(reference.allocation_size() == allocated, reuses_table);
+            let key = Collision(FULL);
+            let expected = reference.insert(key, FULL);
+            let (inserted, excess) =
+                crate::measure::measure_within(&budget, || map.insert(key, FULL).unwrap());
+            assert_eq!(inserted, expected);
+            assert_eq!(map.len(), reference.len());
+            for (key, value) in &reference {
+                assert_eq!(map.get(key), Some(value));
+            }
+            assert_eq!(excess, 0);
+            assert_eq!(map.allocation_size(), reference.allocation_size());
+            assert_eq!(budget.used(), reference.allocation_size());
+            if reuses_table {
+                assert_eq!(budget.peak(), peak, "in-place rehash needs no charge");
+            }
+        }
     }
 
     /// A growth the budget refuses changes nothing and allocates nothing: the map keeps its

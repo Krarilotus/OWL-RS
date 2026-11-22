@@ -30,6 +30,9 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "benches" / "suite"))
 from suitekit.lock import lock  # noqa: E402
 
+READS = (".gitattributes", ".githooks/pre-push", "benches/fast/release_gate.py", "benches/suite/suitekit/",
+         "rust-toolchain.toml", "scripts/cargo-guarded.sh", "scripts/check.sh", "scripts/lib/*")
+
 BASH = shutil.which("bash")
 # Run from a git hook or inside a gate job, the caller's variables (git's own: isolation.inherit()
 # drops them; the gate's, the fleet's, the thread counts, the Windows job's RUSTUP_AUTO_INSTALL)
@@ -44,7 +47,7 @@ COPIED = (".githooks/pre-push", "scripts/check.sh", "scripts/cargo-guarded.sh", 
           "scripts/lib/gate-publish.sh", "rust-toolchain.toml",
           "scripts/lib/gate-record.py", "scripts/lib/windows-job.ps1", "scripts/lib/windows-job.sh",
           "scripts/lib/suite-python.sh", "scripts/lib/gate-node.sh", "scripts/lib/gate-nextest.sh", *isolation.NS_SH,
-          "benches/suite/requirements.txt", "scripts/lib/gate-job.sh")
+          "benches/suite/requirements.txt", "scripts/lib/gate-job.sh", "scripts/lib/private_terms.py")
 # A stand-in for the fleet's CLI: each submit keeps its job file; status, results and cancel as told.
 FLEET = """#!/bin/sh
 answer() {
@@ -252,6 +255,24 @@ class PushGate(Repo):
                     self.assertIn("rustc-1.99.0-", own)
                 self.git(self.repo, "checkout", "-q", "--detach", tip)
                 previous = own
+
+    def test_a_private_host_name_stops_the_push_before_the_fleet(self):
+        # Spec (22 Nov: the private-terms rule, scripts/check.sh private_terms, read on the pusher's machine
+        # before the fleet's tier): a private host name in a pushed commit's message stops the push, no job sent.
+        overlay = self.root / "overlay"
+        overlay.mkdir()
+        (overlay / "hosts.toml").write_text('[host.zzkeyzz]\nhostname = "zznamezz"\n', newline="\n")
+        self.env["NRESE_BENCH_PRIVATE"] = overlay.as_posix()
+        (self.repo / "a.txt").write_text("changed\n", newline="\n")
+        self.git(self.repo, "commit", "-q", "-am", "runs on zznamezz")
+        tip = self.git(self.repo, "rev-parse", "HEAD")
+        self.fleet("pending")  # a job that is sent is refused at once: no verdict
+        done = self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", ZERO))
+        self.assertEqual(sorted(self.fake.glob("job-*.toml")), [],
+                         f"SPEC push-private-terms: no job is sent:\n{done.stdout}{done.stderr}")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("message matches", done.stdout)
+        self.assertNotIn("zznamezz", done.stdout + done.stderr)
 
     def test_fake_submit_refuses_a_job_it_cannot_copy(self):
         # Spec: D16-150: the fleet fake cannot acknowledge a submission it lost.
@@ -551,19 +572,27 @@ class PushGate(Repo):
         merge's listed 2,057 paths, 95 KB). Then the request names the range instead, and its step
         makes the list on the host and hands gate-job.sh the list check.sh hashed here, whatever the
         host's git configuration."""
-        names = [f"many/{n:04}-{'x' * 100}.txt" for n in range(600)]  # 69,000 bytes of paths
+        # 69,000 bytes of paths, one outside ASCII: listed as it is, never quoted (a contract's read
+        # matches the path, review r1 of pkg/contracts-by-reads, 22 Nov 2026).
+        names = [f"many/{n:04}-{'x' * 100}.txt" for n in range(600)] + ["many/über.txt"]
         for name in names:
             (self.repo / name).parent.mkdir(exist_ok=True)
             (self.repo / name).write_text(f"{name}\n", newline="\n")
-        self.git(self.repo, "mv", "a.txt", "many/a.txt")  # a rename: listed once, by its new name
+        # A rename: listed by both its names, as what was read from where it left changed too (the same review).
+        self.git(self.repo, "mv", "a.txt", "many/a.txt")
         self.git(self.repo, "add", "-A")
         self.git(self.repo, "commit", "-q", "-m", "many")
         tip = self.git(self.repo, "rev-parse", "HEAD")
         self.fleet("pending")
+        # The pusher's own order for diffs, the rename's new name first, where git's order has it near the
+        # end: the list is in git's order still, as the host makes it (review r2 of pkg/contracts-by-reads,
+        # 22 Nov 2026).
+        (self.root / "pusher-order").write_text("many/a.txt\n")
+        self.git(self.repo, "config", "diff.orderFile", "../pusher-order")
         self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", ZERO))
         request = (self.fake / "job-0.toml").read_text()
         self.assertLess(len(request.encode()), 64 * 1024, "SPEC long-range: the request is over the fleet's limit")
-        listed = "".join(f"{name}\n" for name in sorted([*names, "many/a.txt"])).encode()
+        listed = "".join(f"{name}\n" for name in sorted([*names, "a.txt", "many/a.txt"])).encode()
         want = subprocess.run(["git", "hash-object", "--stdin"], input=listed, capture_output=True, check=True,
                               env=self.env).stdout.decode().strip()
         step = json.loads(re.search(r"^steps = (.*)$", request, re.M).group(1))[0]
@@ -572,8 +601,8 @@ class PushGate(Repo):
         host, order = self.root / "host-gitconfig", self.root / "host-order"
         order.write_text("many/a.txt\n")  # the rename first, where git's order has it last
         # orderFile relative to the work tree's top: no temporary path in the config to quote.
-        host.write_text("[diff]\n\trenames = false\n\trenameLimit = 1\n\torderFile = ../host-order\n"
-                        "[core]\n\tquotePath = false\n")
+        host.write_text("[diff]\n\trenames = true\n\trenameLimit = 1\n\torderFile = ../host-order\n"
+                        "[core]\n\tquotePath = true\n")
         shutil.copy(ROOT / "scripts/lib/gate-job.sh", self.repo / "scripts/lib/gate-job.sh")
         out, cache = self.root / "out", self.root / "cache"
         out.mkdir()
@@ -686,11 +715,12 @@ esac
         (out / "attempt").write_text(f"gate-{n}:1\n")
         (out / "gate.log").write_text("=== summary\n  0  test (1 s)\n")
 
-    def gate(self, mode="push"):
-        """(exit, where it passed, jobs submitted, stderr) of one fleet-gate.sh run for the tip."""
+    def gate(self, mode="push", listed="/dev/null"):
+        """(exit, where it passed, jobs submitted, stderr) of one fleet-gate.sh run for the tip, its list
+        LISTED and that list's hash L."""
         where = self.fake / "where"
         done = subprocess.run(
-            [BASH, "scripts/lib/fleet-gate.sh", mode, "/dev/null", self.tree(self.tip), "L", "ID", where.as_posix(),
+            [BASH, "scripts/lib/fleet-gate.sh", mode, listed, self.tree(self.tip), "L", "ID", where.as_posix(),
              self.tip], cwd=self.repo, capture_output=True, text=True, env=self.env, timeout=120)
         submitted = int((self.fake / "n").read_text()) if (self.fake / "n").exists() else 0
         return done.returncode, where.read_text().strip() if where.exists() else "", submitted, done.stderr
@@ -720,6 +750,25 @@ esac
             code, where, _, err = self.gate()
             self.assertEqual((code, where), (want, "fleet:gate-1@office-pc cpu=znver3" if want == 0 else ""),
                              f"SPEC whole-record: {state} {result}\n{err}")
+
+    def test_a_windows_job_runs_the_contracts_its_list_names_and_counts_only_for_that_list(self):
+        """SPEC case 4 (pkg/contracts-by-reads): the Windows job is told the suite contracts its list
+        names (NRESE_CONTRACTS; none for an empty list: all of them), and its record counts only with
+        that list's hash: a record of another list is no verdict."""
+        listed = self.root / "contracts"
+        listed.write_text("test_a\ntest_c\n", newline="\n")
+        for record, want in (("L", 0), ("another list", 75)):
+            with self.subTest(record):
+                self.reset()
+                self.job(1, "office-pc", "done", tier="windows", list_hash=record)
+                code, _, _, err = self.gate("windows", listed.as_posix())
+                self.assertEqual(code, want, f"SPEC windows-select: a record of list {record!r}\n{err}")
+                job = (self.fake / "job-1.toml").read_text()
+                self.assertIn('NRESE_CONTRACTS = "test_a test_c"', job, "SPEC windows-select: the job isn't told")
+        self.reset()
+        self.job(1, "office-pc", "done", tier="windows")
+        self.assertEqual(self.gate("windows")[0], 0)
+        self.assertNotIn("NRESE_CONTRACTS", (self.fake / "job-1.toml").read_text(), "SPEC windows-select: all of them")
 
     def test_a_job_compiles_and_tests_on_the_cores_it_asks_for(self):
         """A host shared under a presence cap (the shared host, the development machine) limits memory, not CPUs: the job's
@@ -1402,6 +1451,120 @@ class WindowsCheck(Repo):
                          (2, [], True), f"SPEC windows-runtime\n{done.stderr}")
 
 
+class WindowsSelection(Repo):
+    """The Windows part runs the suite contracts its range reaches (scripts/check.sh windows_contracts,
+    benches/suite/tests/contracts.py), and its pass is keyed by them. Spec (the order for
+    pkg/contracts-by-reads, 21 Nov 2026): "each contract declares what it reads, the gate runs it when
+    one of those changed, and a contract that declares nothing always runs"; the full run stays where
+    the selection can't be made. Here the line holds the selector and four contracts: test_a reads
+    a.txt, test_b b.txt, test_d d.txt, and test_c declares nothing."""
+
+    CONTRACTS = {"test_a.py": 'READS = ("a.txt",)\n', "test_b.py": 'READS = ("b.txt",)\n',
+                 "test_c.py": "import os\n", "test_d.py": 'READS = ("d.txt",)\n'}
+
+    def setUp(self):
+        super().setUp()
+        tests = self.repo / "benches/suite/tests"
+        tests.mkdir(parents=True, exist_ok=True)
+        shutil.copy(ROOT / "benches/suite/tests/contracts.py", tests / "contracts.py")
+        for name, text in self.CONTRACTS.items():
+            (tests / name).write_text(text, newline="\n")
+        self.git(self.repo, "add", "-A")
+        self.git(self.repo, "commit", "-qm", "the contracts")
+        self.git(self.repo, "push", "-q", "origin", "HEAD:refs/heads/refactor/engine-v2")
+        self.base = self.git(self.repo, "rev-parse", "HEAD")
+
+    check = WindowsCheck.check
+    submitted = WindowsCheck.submitted
+
+    def sent(self, job):
+        """The contracts JOB (a submitted job file) asks the Windows part to run: None for all."""
+        found = re.search(r'^NRESE_CONTRACTS = "(.*)"$', job.read_text(), re.M)
+        return found.group(1).split() if found else None
+
+    def key(self, commit, names):
+        """The Windows pass key of COMMIT for a run of the contracts NAMES (none: all of them)."""
+        # The list on stdin: an argument with line breaks doesn't reach Git Bash whole on Windows.
+        return subprocess.run(
+            [BASH, "-c", '. scripts/lib/gate-key.sh && h=$(git hash-object --stdin) && r=$(gate_runtime "$1") && '
+             'gate_key windows "inputs-$(windows_inputs "$1")" "$h" "$(gate_identity "$1") $(gate_python "$r")"',
+             "-", commit],
+            input="".join(f"{n}\n" for n in names).encode(), cwd=self.repo, capture_output=True, env=self.env,
+            check=True).stdout.decode().strip()
+
+    def recorded(self):
+        common = Path(self.git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+        passed = common / "nrese-gate-passed"
+        return [line.split(" | ")[0] for line in passed.read_text().splitlines()] if passed.exists() else []
+
+    def test_a_pass_of_every_contract_stands_for_any_selection(self):
+        """SPEC case 1: a full pass (its list empty) covers any selection of the same inputs."""
+        tip = self.commit("a.txt", "a changed\n")
+        common = Path(self.git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+        (common / "nrese-gate-passed").write_text(f"{self.key(tip, [])} | {tip} fleet:gate-0@office-pc cpu=znver3\n",
+                                                  newline="\n")
+        self.fleet("pending")
+        done = self.check(tip)
+        self.assertEqual((done.returncode, len(self.submitted())), (0, 0),
+                         f"SPEC windows-select: a pass of every contract wasn't carried to a selection\n{done.stdout}{done.stderr}")
+        self.assertIn(f"carried from {tip} fleet:gate-0", done.stdout)
+
+    def test_a_pass_of_one_selection_never_carries_to_another(self):
+        """SPEC case 2: the same commit (the same inputs) from two bases reaches two selections; a pass
+        of the narrower one carries to the same selection only. The job is told what to run."""
+        first = self.commit("b.txt", "b changed\n")
+        tip = self.commit("a.txt", "a changed\n")
+        self.env["NRESE_PUSH_BASE"] = first  # the range reaches test_a; test_c always runs
+        self.fleet("done", self.tree(tip), ["test_a", "test_c"], tier="windows")
+        done = self.check(tip)
+        self.assertEqual(done.returncode, 0, f"the narrower selection's pass\n{done.stdout}{done.stderr}")
+        self.assertEqual(self.sent(self.submitted()[0]), ["test_a", "test_c"], "SPEC windows-select: the job's list")
+        self.assertIn(self.key(tip, ["test_a", "test_c"]), self.recorded(), "SPEC windows-select: keyed by it")
+        self.fleet("pending")
+        self.assertEqual(self.check(tip).returncode, 0, "SPEC windows-select: the same selection carries")
+        self.env["NRESE_PUSH_BASE"] = self.base  # the range reaches test_a and test_b too
+        wider = self.check(tip)
+        self.assertEqual((wider.returncode, len(self.submitted())), (75, 2),
+                         f"SPEC windows-select: a narrower selection's pass carried to a wider one\n{wider.stdout}")
+        self.assertEqual(self.sent(self.submitted()[1]), ["test_a", "test_b", "test_c"], "SPEC windows-select")
+
+    def test_without_a_base_or_a_selector_it_runs_every_contract_and_records_that(self):
+        """SPEC case 3: no base (no NRESE_PUSH_BASE, no origin/refactor/engine-v2 here), a commit whose
+        selector fails or that has none: the job is told nothing (all of them), and the pass is
+        recorded as one of all of them."""
+        broken = self.repo / "benches/suite/tests/contracts.py"
+        cases = {
+            "no base": lambda: self.git(self.repo, "update-ref", "-d", "refs/remotes/origin/refactor/engine-v2"),
+            "a failing selector": lambda: broken.write_text("raise SystemExit(3)\n", newline="\n"),
+            "no selector": lambda: broken.unlink(),
+        }
+        for n, (case, make) in enumerate(cases.items()):
+            with self.subTest(case):
+                self.git(self.repo, "checkout", "-q", "--detach", self.base)
+                make()
+                (self.repo / "a.txt").write_text(f"a changed {n}\n", newline="\n")
+                self.git(self.repo, "commit", "-qam", case)
+                tip = self.git(self.repo, "rev-parse", "HEAD")
+                self.fleet("done", self.tree(tip), [], tier="windows")
+                done = self.check(tip)
+                self.assertEqual(done.returncode, 0, f"SPEC windows-select: {case}: a run of all of them isn't its "
+                                 f"verdict\n{done.stdout}{done.stderr}")
+                self.assertIsNone(self.sent(self.submitted()[-1]), f"SPEC windows-select: {case}: not all of them")
+                self.assertIn(self.key(tip, []), self.recorded(), f"SPEC windows-select: {case}: not recorded as all")
+                self.git(self.repo, "update-ref", "refs/remotes/origin/refactor/engine-v2", self.base)
+
+    def test_the_hook_selects_from_the_pushed_range(self):
+        """The hook tells the Windows part the base the remote has, as it tells the push tier."""
+        first = self.commit("b.txt", "b changed\n")
+        tip = self.commit("a.txt", "a changed\n")
+        self.fleet("done", self.tree(tip), ["a.txt"], separate=True)
+        self.fleet("done", self.tree(tip), ["test_a", "test_c"], tier="windows", separate=True)
+        pushed = self.push(("refs/heads/v2", tip, "refs/heads/refactor/engine-v2", first))
+        windows = [p for p in self.submitted() if "windows-job.ps1" in p.read_text()]
+        self.assertEqual((pushed.returncode, [self.sent(p) for p in windows]), (0, [["test_a", "test_c"]]),
+                         f"SPEC windows-select: by the hook\n{pushed.stdout}{pushed.stderr}")
+
+
 class WindowsJob(Repo):
     """scripts/lib/windows-job.sh, the Windows part's step on its host, in the job's checkout of the
     commit: it readies the host and runs the tree's own check.sh windows, with stand-ins for the
@@ -1516,6 +1679,12 @@ class WindowsJob(Repo):
         subprocess.run([BASH, "-c", '. scripts/lib/gate-node.sh && gate_node_seal "$@"', "-", node_entry.as_posix(),
                         platform, node_version, node_sha], cwd=self.repo, check=True, capture_output=True,
                        env=self.env, timeout=60)
+        # The contracts its gate sent, with the pinned cargo-nextest in the cache (each case below lays out its own).
+        nextest_entry = cache / "tools" / f"nextest-{pinned_nextest}-{good_sum[:12]}"
+        nextest_entry.mkdir(parents=True)
+        (nextest_entry / "cargo-nextest").write_text(runner, newline="\n")
+        (nextest_entry / "cargo-nextest").chmod(0o755)
+        self.selected_run(stubs, cache, tree, seen, pinned_npm)
         # The toolchain: there; missing, or there without clippy (another job installed the release with
         # a minimal profile), and rustup installs it; or missing and rustup can't install it.
         there, missing, no_clippy, uninstallable = None, ("toolchain", ""), ("clippy", ""), ("toolchain", "1")
@@ -1527,7 +1696,6 @@ class WindowsJob(Repo):
         # first on cargo's path in between). `tampered`: an entry whose executable isn't the pinned one,
         # with the pinned archive to fetch. `host-own`: the pinned entry, and a runner of the host's own in
         # $CARGO_HOME/bin, which cargo would run first.
-        nextest_entry = cache / "tools" / f"nextest-{pinned_nextest}-{good_sum[:12]}"
         pinned, other, failing, absent, split, swapped = "pinned", "other", "failing", None, "split", "swapped"
         tampered, host_own = "tampered", "host-own"
         cargo_home, tampered_ran = self.root / "cargo-home", self.root / "tampered-ran"
@@ -1634,8 +1802,8 @@ class WindowsJob(Repo):
             self.assertEqual([(s["name"], s["code"]) for s in result["steps"]],
                              [("W3C data", 0), ("build", int(failed.get("build", 0))),
                               ("clippy", int(failed.get("clippy", 0))), ("test", 0), ("doc tests", 0),
-                              ("suite contracts", 0), ("console dependencies", 0), ("console typecheck", 0),
-                              ("console tests", 0)],
+                              ("crate scan", 0), ("suite contracts", 0), ("console dependencies", 0),
+                              ("console typecheck", 0), ("console tests", 0)],
                              f"SPEC windows-run: case {case}")
             ran_tests = [(c.split()[0], "--doc" in c.split()) for c in (out / "guarded").read_text().splitlines()
                          if c.split()[0] in ("test", "nextest")]
@@ -1656,6 +1824,31 @@ class WindowsJob(Repo):
             self.assertIn("ci --no-audit --no-fund", pinned_npm.read_text() if pinned_npm.exists() else "",
                           f"SPEC windows-node: the console step ran with the pinned Node's npm: case {case}")
             pinned_npm.unlink()
+
+    def selected_run(self, stubs, cache, tree, seen, pinned_npm):
+        """The contracts its gate sent (NRESE_CONTRACTS, pkg/contracts-by-reads): those alone run, the
+        crate scan its own step, and the record's list is theirs, which the gate checks it against."""
+        out = self.root / "out-selected"
+        out.mkdir()
+        done = subprocess.run(
+            [BASH, "scripts/lib/windows-job.sh", tree], cwd=self.repo, stdin=subprocess.DEVNULL, capture_output=True,
+            text=True, timeout=120,
+            env={**self.env, "PATH": stubs.as_posix() + os.pathsep + self.env["PATH"], "FLEET_OUT": str(out),
+                 "FLEET_JOB": "win-selected", "FLEET_STEP": "1", "FLEET_HOST": "kraris-gptler",
+                 "STUB_RUSTUP_LOG": (self.root / "rustup-selected").as_posix(), "NRESE_GATE_CACHE": cache.as_posix(),
+                 "NRESE_CONTRACTS": "crate_scan test_a test_c"})
+        self.assertEqual(done.returncode, 0, f"{done.stdout}{done.stderr}")
+        result = json.loads((out / "gate.json").read_text())
+        listed = subprocess.run(["git", "hash-object", "--stdin"], input=b"crate_scan\ntest_a\ntest_c\n",
+                                capture_output=True, cwd=self.repo, env=self.env, check=True).stdout.decode().strip()
+        self.assertEqual(result["list_hash"], listed, "SPEC windows-select: the record names the list it ran")
+        self.assertIn(("crate scan", 0), [(s["name"], s["code"]) for s in result["steps"]], "SPEC windows-select")
+        ran = seen.read_text().splitlines()
+        self.assertIn("benches/suite/tests/isolation.py crate_scan", ran, "SPEC windows-select: the crate scan")
+        self.assertIn("benches/suite/tests/isolation.py test_a test_c", ran, "SPEC windows-select: those alone")
+        self.assertFalse(any("discover" in line for line in ran), "SPEC windows-select: all of them ran")
+        seen.unlink()
+        pinned_npm.unlink()
 
 
 class SuitePython(unittest.TestCase):

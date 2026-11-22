@@ -14,6 +14,10 @@ import unittest
 
 import test_push_gate as push  # the scratch repository and the gate's job records (a module: its tests aren't rerun here)
 
+READS = (".gitattributes", ".githooks/pre-push", "benches/fast/release_gate.py", "benches/suite/suitekit/",
+         "benches/suite/tests/test_push_gate.py", "rust-toolchain.toml", "scripts/cargo-guarded.sh", "scripts/check.sh",
+         "scripts/lib/*")
+
 # A stand-in for the fleet's CLI whose status and results play $FAKE/<command>-<job>.seq, one reply
 # a call, the last again once they are used up: "~N" waits N s and answers nothing (a call that
 # times out), "+N TEXT" waits N s and then answers TEXT (a slow answer), "!TEXT" prints TEXT and

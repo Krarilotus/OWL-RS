@@ -13,6 +13,7 @@
 # scripts/cargo-guarded.sh), each entry's last use recorded, one sweep for the whole cache
 # (NRESE_HOST_CACHE_GB).
 #
+# MODE nightly (scripts/check.sh nightly) runs in push's entries and under its lock.
 # MODE quick (scripts/check.sh quick) keeps what it uses in a directory of its own, quick/ (its lock,
 # wt, files, target-quick-<release>, py-*), so it never waits behind a push gate, nor a push gate
 # behind it, and no sweep of push's, an older runner's or /verify's (bin-*, target-*, py-*, node-*,
