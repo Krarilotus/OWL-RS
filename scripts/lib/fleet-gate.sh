@@ -39,7 +39,8 @@
 #
 # Exit: 0 passed (WHERE then names the job, its host and the CPU), 1 failed (its log is shown),
 # 75 no verdict: no FLEET_OWNER, the fleet refused or didn't answer, no host started it within
-# NRESE_GATE_START_S (default 180 s; again after a host stopped it), it ran past NRESE_GATE_MAX_S
+# NRESE_GATE_START_S (default 180 s; again after a host stopped it; longer while the fleet expects it
+# to start in time for the tier's estimate to end within the limit), it ran past NRESE_GATE_MAX_S
 # (default 10800 s), or its result is missing or for something else. The job is cancelled then,
 # and nothing runs here instead: no verdict, no push. For windows the start window is 1800 s and
 # the ask 4 cores, measured: a 4-core run took 899 s and started within 11 min, where a 6-core
@@ -178,7 +179,9 @@ gate() {
   } > "$job"
   fleet_submit "$job" || no_verdict "the fleet refused the job"
   fleet_say "submitted (priority $priority, asks $cores cores and $ram GB${1:+, on $1})"
-  fleet_follow "$start_s" "$max_s" || no_verdict "no result"
+  # The tier's estimate in seconds: a start the fleet expects holds the window open only if a run
+  # that long still ends within the limit (fleet-job.sh).
+  fleet_follow "$start_s" "$max_s" "$(awk -v m="$est" 'BEGIN { printf "%d", m * 60 }')" || no_verdict "no result"
   host=$fleet_host
   local results out
   results=$(fleet_results)

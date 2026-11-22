@@ -46,6 +46,16 @@ def state(name):
     return json.dumps({"state": name, "host": "office-pc"})
 
 
+def pending(**fields):
+    """A pending job's status, with FIELDS (expected_start, basis) as the fleet gives them."""
+    return json.dumps({"state": "pending", "host": None, "reason": "office-pc: needs 8.0 cores, 2.0 free", **fields})
+
+
+def expected(in_s):
+    """The fleet's expected start IN_S seconds from now: its CLI's local time, without a zone."""
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() + in_s))
+
+
 class FleetFollow(push.Repo):
     """scripts/lib/fleet-gate.sh's push tier for one commit, its fleet's answers scripted."""
 
@@ -240,6 +250,77 @@ class FleetFollow(push.Repo):
         code, where, _, err = self.gate()
         self.assertEqual((code, where, self.cancels()), (0, "fleet:gate-1@office-pc cpu=znver3", []),
                          f"SPEC silence-start-window: the silence ran the start window out\n{err}")
+
+    def test_a_start_the_fleet_expects_in_time_holds_the_window_open(self):
+        """Spec (22 Nov, the gate's start window): a pending job the fleet expects to
+        start at E, from which the tier's estimate still ends within the gate's limit, isn't cancelled
+        when the fixed window ends; the window reaches to E + START_S. Here the window is 3 s, the fleet
+        expects the start 20 s on and the job starts after 6 s: it passes. The expected start is said
+        once."""
+        self.env.update(NRESE_GATE_START_S="3", NRESE_GATE_EST_MIN="1")
+        at = expected(20)
+        basis = "first in its host's order: when a job there is estimated to end"
+        self.play("status", *[f"+1 {pending(expected_start=at, basis=basis)}"] * 6, state("running"), state("done"))
+        self.play("results", self.results())
+        code, where, _, err = self.gate()
+        self.assertEqual((code, where, self.cancels()), (0, "fleet:gate-1@office-pc cpu=znver3", []),
+                         f"SPEC start-window-expected: a start expected in time didn't hold the window open\n{err}")
+        self.assertEqual(err.count(f"gate-1: expected start {at[11:16]} ({basis})"), 1, err)
+
+    def test_a_start_time_it_cant_read_is_never_taken_as_in_time(self):
+        """Spec (22 Nov, the gate's start window): a start time the waiter couldn't read (none, null,
+        malformed, or the answer of a status call that failed, however good) is never taken as fitting:
+        the fixed window holds, and the job is cancelled when it ends, with no verdict."""
+        fits = pending(expected_start=expected(60), basis="its reservation")
+        for name, replies in (
+                ("none", [f"+1 {pending()}"]),
+                ("null", [f"+1 {pending(expected_start=None, basis='not estimated')}"]),
+                ("malformed", [f"+1 {pending(expected_start='soon')}"]),
+                ("a number", [f"+1 {pending(expected_start=1795330592)}"]),
+                ("a failed call's", [f"+1 {pending()}", f"!{fits}", f"+1 {pending()}"])):
+            with self.subTest(name):
+                self.reset()
+                self.env.update(NRESE_GATE_START_S="3", NRESE_GATE_EST_MIN="1", NRESE_GATE_MAX_S="60")
+                self.play("status", *replies)
+                self.play("results", self.results())
+                code, where, _, err = self.gate()
+                self.assertEqual((code, where, self.cancels()), (75, "", ["gate-1"]),
+                                 f"SPEC start-window-unread: an unread start time held the window open\n{err}")
+                self.assertRegex(err, "gate-1: no host started it within 3 s")
+                self.assertNotIn("expected start", err)
+
+    def test_a_start_expected_too_late_for_the_limit_keeps_the_fixed_window(self):
+        """Spec (22 Nov, the gate's start window): a start the fleet expects so late that the
+        tier's estimate would run past the gate's limit doesn't hold the window open; the fixed window
+        ends the wait, and its message names the expected start. Here: 5 s on, a 2 min estimate, a
+        100 s limit."""
+        self.env.update(NRESE_GATE_START_S="3", NRESE_GATE_EST_MIN="2", NRESE_GATE_MAX_S="100")
+        at = expected(5)
+        self.play("status", *[f"+1 {pending(expected_start=at, basis='its reservation')}"] * 6, state("running"),
+                  state("done"))
+        self.play("results", self.results())
+        code, where, _, err = self.gate()
+        self.assertEqual((code, where, self.cancels()), (75, "", ["gate-1"]),
+                         f"SPEC start-window-too-late: a start too late for the limit held the window open\n{err}")
+        self.assertIn(f"gate-1: no host started it within 3 s (the fleet expects it at {at[11:16]}, past this "
+                      "gate's limit)", err)
+
+    def test_an_expected_start_that_goes_unanswered_ends_the_window_there(self):
+        """A start the fleet expected in time, then answers with no estimate: the window still reaches
+        to that expected start + START_S, never further without a new one, so the wait ends there with
+        no verdict, well inside the gate's limit. Here: expected 8 s on, a window of 3 s, a limit of 60 s."""
+        self.env.update(NRESE_GATE_START_S="3", NRESE_GATE_EST_MIN="0", NRESE_GATE_MAX_S="60")
+        began = time.monotonic()
+        self.play("status", f"+1 {pending(expected_start=expected(8), basis='its reservation')}",
+                  f"+1 {pending(expected_start=None, basis='not estimated')}")
+        self.play("results", self.results())
+        code, where, _, err = self.gate()
+        took = time.monotonic() - began
+        self.assertEqual((code, where, self.cancels()), (75, "", ["gate-1"]),
+                         f"SPEC start-window-last-expected: the wait didn't end with one cancel\n{err}")
+        self.assertRegex(err, "gate-1: no host started it within 3 s")
+        self.assertGreater(took, 6, f"SPEC start-window-last-expected: it ended before the expected start\n{err}")
+        self.assertLess(took, 40, f"SPEC start-window-last-expected: it waited on past the expected start\n{err}")
 
 
 if __name__ == "__main__":
