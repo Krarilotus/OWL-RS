@@ -2006,9 +2006,13 @@ impl StoreService {
         cancellation: &CancellationToken,
         read: impl FnOnce(&nrese_engine::Snapshot, bool) -> StoreResult<T>,
     ) -> StoreResult<T> {
+        #[cfg(test)]
+        hooks::run(&hooks::BEFORE_PENDING_GENERATION);
         // The rules the view is decided under, read before it is made: one made under later
         // rules is kept as of these, never the reverse.
         let epoch = self.supports.epoch();
+        #[cfg(test)]
+        hooks::run(&hooks::AFTER_PENDING_GENERATION);
         if let Some((view, keeps_record)) =
             self.sessions
                 .view(&self.engine.snapshot(), scope, pending, epoch)
@@ -3217,6 +3221,10 @@ pub(crate) mod hooks {
         pub(crate) static BEFORE_REVALIDATION: Hook = const { RefCell::new(None) };
         /// A quarantine reading has read the mark and is about to read the assessment.
         pub(crate) static BETWEEN_QUARANTINE_READS: Hook = const { RefCell::new(None) };
+        /// A transaction's read is about to capture its first pending generation.
+        pub(crate) static BEFORE_PENDING_GENERATION: Hook = const { RefCell::new(None) };
+        /// A transaction's read has captured the generation for its pending view.
+        pub(crate) static AFTER_PENDING_GENERATION: Hook = const { RefCell::new(None) };
     }
 
     pub(crate) fn run(hook: &'static LocalKey<Hook>) {
