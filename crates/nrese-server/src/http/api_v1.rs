@@ -957,14 +957,14 @@ fn start_import(
         job.phase("loading");
         let store = state.store();
         let loaded = store.bulk_load_with(&request, job.progress());
-        let uploaded = remove.is_some();
+        // How the caller sends the data again: an upload, or the import directory's files.
+        let retry = if remove.is_some() { "send" } else { "load" };
         drop(remove);
         if let Err(nrese_store::StoreError::LoadPublished { revision, reason }) = &loaded {
-            let mut warning = format!("the quarantine record couldn't be kept: {reason}");
-            let note = reason.published_note();
-            if !note.is_empty() {
-                warning += &format!(".{note}");
-            }
+            let warning = format!(
+                "the quarantine record couldn't be kept: {reason}.{} Don't {retry} it again.",
+                reason.published_note()
+            );
             let report = serde_json::json!({ "revision": revision, "warning": warning });
             job.finish(Ok(report));
             return;
@@ -972,7 +972,6 @@ fn start_import(
         let outcome = loaded
             .map_err(|error| match error {
                 nrese_store::StoreError::LoadQuarantineNotRecorded(error) => {
-                    let retry = if uploaded { "send" } else { "load" };
                     error.unpublished_message(retry, Some(state.repositories().data_dir()))
                 }
                 error => error.to_string(),
