@@ -17,9 +17,12 @@ const SUBPROPERTY: &str = ":q a owl:ObjectProperty ; rdfs:subPropertyOf owl:topO
 #[derive(Debug)]
 enum Expected {
     True,
+    False,
     FalseComplete,
     TrueOrIncomplete,
     Incomplete,
+    /// A `SELECT` with no row, or one not told `complete`.
+    NoRowOrIncomplete,
 }
 
 // OWL 2 Direct Semantics §2.2–2.3.3: the top object and data properties relate
@@ -27,15 +30,29 @@ enum Expected {
 // and superproperties keep that relation. A subproperty may be empty.
 #[test]
 fn reads_of_universal_roles() {
-    use Expected::{FalseComplete, Incomplete, True, TrueOrIncomplete};
+    use Expected::{False, FalseComplete, Incomplete, NoRowOrIncomplete, True, TrueOrIncomplete};
 
     let cases = [
         ("equivalent", EQUIVALENT, "ASK { :a :q ?y }", True),
+        ("named pair", EQUIVALENT, "ASK { :a :q :b }", True),
+        // `:a` has a `:q` partner, so its absence is not entailed: `true` would be unsound.
         (
-            "named pair",
+            "negation",
             EQUIVALENT,
-            "ASK { :a :q :b }",
-            TrueOrIncomplete,
+            "ASK { FILTER NOT EXISTS { :a :q ?y } }",
+            False,
+        ),
+        (
+            "minus",
+            EQUIVALENT,
+            "SELECT ?x { VALUES ?x { :a } MINUS { ?x :q ?y } }",
+            NoRowOrIncomplete,
+        ),
+        (
+            "control: negation over a subproperty",
+            SUBPROPERTY,
+            "ASK { FILTER NOT EXISTS { :a :q ?y } }",
+            True,
         ),
         ("class join", EQUIVALENT, "ASK { :a :q ?y . ?y a :C }", True),
         (
@@ -130,9 +147,16 @@ fn reads_of_universal_roles() {
             let complete = result.completeness.map(|status| status.complete);
             let correct = match expected {
                 True => answer == Some(true),
+                False => answer == Some(false),
                 FalseComplete => answer == Some(false) && complete == Some(true),
                 TrueOrIncomplete => answer == Some(true) || complete == Some(false),
                 Incomplete => complete == Some(false),
+                NoRowOrIncomplete => {
+                    value["results"]["bindings"]
+                        .as_array()
+                        .is_some_and(|rows| rows.is_empty())
+                        || complete == Some(false)
+                }
             };
             if !correct {
                 failures.push(format!(
