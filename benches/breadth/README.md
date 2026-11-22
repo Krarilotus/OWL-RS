@@ -5,9 +5,9 @@ GeoSPARQL, full-text search, RDF 1.2, federation, vector search and data larger 
 Each benchmark is the one its competitors publish on, run in their documented best
 configuration ([CATALOG.md](../CATALOG.md) §3.7–3.11, §3.13, §3.16–3.17), on equal and fair terms. A win counts only where NRESE beats a system at what that system does best.
 
-The rules are [PROTOCOL.md](../PROTOCOL.md)'s. The families, their order and the queue are the
-suite's ([suite/workloads.toml](../suite/workloads.toml), [suite/schedule.toml](../suite/schedule.toml),
-[suite/measurement_queue.py](../suite/measurement_queue.py)); results go through its one schema
+The rules are [PROTOCOL.md](../PROTOCOL.md)'s. The families and their order are the
+suite's ([suite/workloads.toml](../suite/workloads.toml), [suite/schedule.toml](../suite/schedule.toml));
+results go through its one schema
 ([suitekit/schema.py](../suite/suitekit/schema.py)) to `suite.py report` and `compare`.
 
 ## The benchmarks, in order of priority
@@ -17,7 +17,7 @@ the backlog.
 
 | Benchmark | Home turf of | Contenders as run | Published numbers | NRESE's support | State |
 |---|---|---|---|---|---|
-| Filtered vector search (`vector-recall`) | – (NRESE's own gate) | the fast cases `vector-knn-exact`, `vector-knn-filtered` | – | `SERVICE nrv:search` | **fixed**: recall 0.56 → 0.98 on the timed host ([record](../runs/2026-10-12-vector-filtered-fix-phuoc.toml)); the checks host's jobs queued |
+| Filtered vector search (`vector-recall`) | – (NRESE's own gate) | the fast cases `vector-knn-exact`, `vector-knn-filtered` | – | `SERVICE nrv:search` | **fixed**: recall 0.56 → 0.98 on the timed host (a run record of 12 Oct 2026, kept privately); the checks host's jobs queued |
 | [ann-benchmarks](vectors/) | Qdrant, pgvector; hnswlib as the library reference | upstream's harness at 2e081ad, NRESE as a module (its server in the container, SPARQL per query); all at M 16; Qdrant 1.19.2, pgvector v0.8.7 | ann-benchmarks.com | HNSW over vector literals, through SPARQL | images and SIFT, GloVe jobs queued |
 | [Geographica 2](geographica2/) | Jena GeoSPARQL, RDF4J; QLever and Virtuoso as far as they go | the suite's adapters, each system's spatial setup when a workload needs `geosparql` | RDF4J 2.4.3, Strabon, uSeekM, Parliament (2019, the paper's Tables 13/14) | GeoSPARQL 1.1 | data pinned; jobs queued |
 | [ERA-SHACL](era-shacl/) | Jena, TopBraid, RDF4J, pySHACL; maplib (the Rust rival) | upstream's engines at fe109c9, their versions, prebuilt; one memory cap and heap for all | per engine in upstream's `results/` | SHACL Core and SHACL-SPARQL, in memory | data pinned; jobs queued |
@@ -36,13 +36,13 @@ the backlog.
 2. Images: each contender as its benchmark builds it, at the pinned commit; NRESE from
    this worktree in the pinned Rust image ([kit.py](kit.py), binaries recorded by SHA-256).
    Builds wait for the quiet slot (at most as long as `cargo-guarded.sh` does).
-3. Qualify (`jobs/*-qualify.toml`, any window): every answer checked against the
-   reference before a time counts.
-4. Measure (`jobs/*-timed.toml`, the quiet window): three interleaved repetitions, every
+3. Qualify (the job files `*-qualify.toml`, any window; in the private overlay's
+   `jobs/breadth/`): every answer checked against the reference before a time counts.
+4. Measure (`*-timed.toml`, the quiet window): three interleaved repetitions, every
    system on one host under one memory cap, then `suite.py report` and `compare` and a run
    record in [runs/](../runs/).
 
-> Superseded on 2 Nov 2026: these job files were written for `suite/measurement_queue.py`, the queue before the fleet; they name hosts and aren't submitted any more. A run of this kit is a fleet job ([../README.md](../README.md#on-the-fleet)); porting them is a follow-up.
+> Superseded on 2 Nov 2026: these job files were written for the measurement queue before the fleet (kept in the private overlay); they name hosts and aren't submitted any more. A run of this kit is a fleet job ([../README.md](../README.md#on-the-fleet)); porting them is a follow-up.
 
 Licensed systems run on our machines only; their rows carry
 `publish = permission` and their numbers are never committed ([competitors/README.md](../competitors/README.md)).
@@ -55,7 +55,7 @@ Licensed systems run on our machines only; their rows carry
   widened it by 1/share. 200,000 uniform 64-d vectors, one kind in ten: 0.50 → 0.98
   ([filtered_recall.rs](../../crates/nrese-vector/examples/filtered_recall.rs)); guard
   `a_filtered_search_that_goes_first_finds_the_true_nearest`. On this data the widened beam
-  costs about what the exact scan does (runs/2026-10-12-vector-recall-phuoc.toml: beam 1024
+  costs about what the exact scan does (a run record of 12 Oct 2026, kept privately: beam 1024
   11.1 ms against 10.7 ms for the five queries): the graph's own recall at the default beam
   (0.44–0.48 unfiltered) is the next cause, for the index's owner.
 - Vector search, no index status: the server doesn't say when a vector graph is built

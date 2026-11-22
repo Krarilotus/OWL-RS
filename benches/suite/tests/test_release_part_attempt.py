@@ -21,6 +21,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import isolation
 import test_release_acceptance as acceptance
 
 READS = ("benches/cases/core.toml", "benches/cases/sparql.toml", "benches/datasets.toml",
@@ -33,6 +34,11 @@ READS = ("benches/cases/core.toml", "benches/cases/sparql.toml", "benches/datase
 ROOT = acceptance.ROOT
 gate_module = acceptance.gate_module
 A, B = "a1" * 16, "b2" * 16  # two runs' attempt ids (release_gate.py attempt: 32 hex digits)
+
+
+def setUpModule():  # noqa: N802
+    """The job writers stop without the private bench overlay: this module's own."""
+    isolation.writers_overlay()
 
 
 class PartAttempt(acceptance.Scratch):

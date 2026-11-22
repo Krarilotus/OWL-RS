@@ -13,7 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import abba
-from . import adapters, cases, driver, ledger, manifest, schema, status, workloads as definitions
+from . import adapters, cases, driver, hosts, ledger, manifest, schema, status, workloads as definitions
 from .runtime import Mount
 
 
@@ -64,7 +64,7 @@ def eligible(root, key, system, workload, plan, settings, passed):
 
 def select(root, systems, workloads, args):
     catalog = cases.load()
-    records = ledger.load_records(root / "benches/runs")
+    records = ledger.all_records(root)
     passed = {p["system"] for r in records for p in r.get("pairs", []) if p.get("outcome") == "ok"}
     indexed = status.newest(records)
     settings = {"SPARQL_DATA": str(abba.rg.sparql_data())}
@@ -126,6 +126,11 @@ def select(root, systems, workloads, args):
 
 def jobs(groups, args):
     members = []
+    if not groups:
+        return members
+    # Each cell's host entry, from the private overlay: one commit for the whole set, part of each
+    # cell's identity.
+    overlay = hosts.overlay_env()
     for group in groups:
         case = group["case"]
         key = group["systems"][0]
@@ -154,7 +159,8 @@ def jobs(groups, args):
         needs = {**needs, "ram_gb": asked["ram_gb"],
                  "cores": max([needs["cores"]] + [c["cpus"] for c in containers if "cpus" in c])}
         identity = {"cell": [case["workload"], case["tier"], key], "nrese": args.nrese, "harness_tree": args.harness_tree,
-                    "inputs": group["input_hashes"], "scenario": {"name": "native", "memory_gb": cap, "references": group["references"]}}
+                    "inputs": group["input_hashes"], "scenario": {"name": "native", "memory_gb": cap, "references": group["references"]},
+                    "overlay": overlay[hosts.OVERLAY_REV]}
         token = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
         member = f"suite-cell-{case['name']}-{key}-{token[:16]}"
         adapter_needs = ["docker"] if "docker" in adapters.adapter(key).runtimes else []
@@ -163,7 +169,7 @@ def jobs(groups, args):
         print(f"{key} / {case['workload']} / {case['tier']}: resource basis {basis}; ask {needs}; adapter needs {adapter_needs}; workload/driver needs {workload_needs}")
         payload = {"identity": identity, "group": group, "nrese": args.nrese, "harness": args.harness, "member": member,
                    "result_root": args.result_root, "deadline_min": group["minutes"] * args.deadline_factor}
-        members.append({"spec": 9, "containers": containers, "id": member, "group": "suite-cells", "kind": "owlrs.timed", "class": "exclusive",
+        members.append(hosts.overlay_job({"spec": 9, "containers": containers, "id": member, "group": "suite-cells", "kind": "owlrs.timed", "class": "exclusive",
                         "purpose": "timing", "priority": 600, "priority_reason": "catalogue cells below confirmation and merge gates",
                         "notify": False, "hold_between_steps": True, "est_min": group["minutes"],
                         "step_deadline_min": payload["deadline_min"], "results_at": f"{args.result_root}/{member}",
@@ -175,7 +181,7 @@ def jobs(groups, args):
                                 "NRESE_SUITE_MEMORY_GB": f"{cap:g}", **data_env,
                                 "NRESE_GATE_DIR": f"~/owlrs/{member}", "GATE_NAME": member, "GATE_CASES": case["name"]},
                         "inputs": [{"name": "checkout", "source": {"git": str(args.checkout), "rev": args.harness}}]
-                                  + abba.rg.side_inputs(str(args.checkout), args.harness, [args.nrese])})
+                                  + abba.rg.side_inputs(str(args.checkout), args.harness, [args.nrese])}, overlay))
     return members
 
 
@@ -192,6 +198,7 @@ def request(members):
     return set_id, token, 1
 
 
+@hosts.run_snapshot
 def member(root, systems):
     """Fleet step glue only: existing build/data helpers, then the unchanged suite run."""
     payload = json.loads(os.environ["SUITE_CELL"])
@@ -204,23 +211,22 @@ def member(root, systems):
         if why := publication_problem(key, systems.get(key, {})):
             print(f"{key}: {why}", file=sys.stderr)
             return 2
-    landing = Path(payload["result_root"]).expanduser() / payload["member"]
-    if landing.resolve().is_relative_to(root.resolve()):
-        raise ValueError("private result root must be outside the checkout")
+    landing = hosts.private_output(Path(payload["result_root"]).expanduser() / payload["member"], root)
+    out = hosts.private_output(Path(os.environ["FLEET_OUT"]), root)
     landing.mkdir(parents=True, exist_ok=True)
-    (landing / "identity.json").write_text(json.dumps({**payload["identity"], "nrese": payload["nrese"], "harness": payload["harness"],
+    hosts.evidence_path(landing / "identity.json", True, root).write_text(json.dumps({**payload["identity"], "nrese": payload["nrese"], "harness": payload["harness"],
         "git": manifest.git(root), "machine": manifest.machine("process"), "classification": "private/free"}, indent=2), encoding="utf-8")
-    out = Path(os.environ["FLEET_OUT"])
-    env = {**os.environ, "PATH": str(Path.home() / ".cargo/bin") + os.pathsep + os.environ["PATH"]}
+    env = dict(os.environ)
+    env["PATH"] = str(Path.home() / ".cargo/bin") + os.pathsep + os.environ["PATH"]
     env.pop("DOCKER_CPUS", None)
     gate = Path(env["NRESE_GATE_DIR"]).expanduser()
     env.update(NRESE_GATE_DIR=str(gate), SPARQL_DATA=str(abba.rg.sparql_data()))
     target = out.parent / "suite-client-target"
     env["CARGO_TARGET_DIR"] = str(target)
     code = 1
-    with (landing / "stdout.log").open("a") as stdout, (landing / "stderr.log").open("a") as stderr:
+    with hosts.evidence_path(landing / "stdout.log", True, root).open("a") as stdout, hosts.evidence_path(landing / "stderr.log", True, root).open("a") as stderr:
         def run(command, capture=False):
-            done = subprocess.run(command, cwd=root, env=env, stdout=subprocess.PIPE if capture else stdout,
+            done = hosts.launch(subprocess.run, command, cwd=root, environ=env, stdout=subprocess.PIPE if capture else stdout,
                                   stderr=stderr, timeout=payload["deadline_min"] * 60, text=True)
             done.check_returncode()
             return done.stdout.strip() if capture else None
@@ -247,7 +253,7 @@ def member(root, systems):
                             build_identity=(Path(binary_dir) / "IDENTITY").read_text(),
                             inputs=(gate / "inputs.txt").read_text(),
                             classification="private/free", machine=manifest.machine("process"))
-            (landing / "identity.json").write_text(json.dumps(identity, indent=2), encoding="utf-8")
+            hosts.evidence_path(landing / "identity.json", True, root).write_text(json.dumps(identity, indent=2), encoding="utf-8")
             command = ["uv", "run", "--no-project", "python", "-B", "benches/suite/suite.py", "run", "--skip-build",
                        "--systems", ",".join(chosen), "--workloads", group["case"]["workload"], "--tier",
                        f"{group['case']['workload']}={group['case']['tier']}", "--data", str(gate / "data"),
@@ -269,7 +275,12 @@ def member(root, systems):
             except (OSError, subprocess.SubprocessError) as error:
                 print(f"cleanup: {error}", file=stderr)
                 code = 1
-    shutil.copytree(landing, out / "cell", dirs_exist_ok=True)
+    def copy_evidence(source, destination):
+        # copytree gives the callback each file's destination, including in reused directories.
+        return shutil.copyfile(source, hosts.evidence_path(destination, True, root))
+
+    shutil.copytree(landing, hosts.evidence_path(out / "cell", True, root),
+                    dirs_exist_ok=True, copy_function=copy_evidence)
     return code
 
 
@@ -323,11 +334,10 @@ def main(argv, systems, workloads, root):
             if sum(j["est_min"] for j in proposed) + job["est_min"] < args.budget_hours * 60: proposed.append(job)
         _, _, reused = request(proposed)
         if reused is not None: return reused
-        args.out.mkdir(parents=True, exist_ok=True)
         retained = []
         for job in members:
-            probe = args.out / f"{job['id']}.toml"
-            probe.write_text(abba.rg.toml_job({**job, "id": job["id"] + "-placement"}), encoding="utf-8")
+            probe = hosts.write_job(args.out / f"{job['id']}.toml",
+                                    abba.rg.toml_job({**job, "id": job["id"] + "-placement"}), root, [job])
             code, said = abba.rg.fleet_call("check", str(probe), "--json")
             print(f"fleet check {job['id']} (exit {code}):\n{said}")
             reading = json.loads(said) if said.startswith("{") else {}
@@ -348,8 +358,9 @@ def main(argv, systems, workloads, root):
             return 0
         set_id, token, reused = request(members)
         if reused is not None: return reused
-        path = args.out / f"{set_id}.set.toml"
-        path.write_text(abba.rg.toml_set({"id": set_id, "request": token, "fail": "stop-rest"}, members), encoding="utf-8")
+        path = hosts.write_job(args.out / f"{set_id}.set.toml",
+                               abba.rg.toml_set({"id": set_id, "request": token, "fail": "stop-rest"}, members),
+                               root, members)
         print(f"set:{set_id}: {path}; NRESE {args.nrese}, harness {args.harness}")
         for job in members:
             print(f"job:{job['id']}: {job['est_min'] / 60:.2f} host-hours, unmeasured; results {job['results_at']}")

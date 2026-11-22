@@ -72,6 +72,8 @@ from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 from pathlib import Path
 
+from . import hosts
+
 XSD = "http://www.w3.org/2001/XMLSchema#"
 INTEGER = XSD + "integer"
 # XSD's decimal and the types derived from it (the integers), and its two floating types.
@@ -686,7 +688,7 @@ class Recorder:
             code, body = post(url, {"query": text}, timeout=timeout)
             if code == -1:
                 raise ValueError(body)
-            path.write_bytes(body.encode())  # as hashed: the file shows it holds this capture
+            hosts.evidence_path(path).write_bytes(body.encode())  # as hashed: the file shows it holds this capture
             capture.sha256 = hashlib.sha256(body.encode()).hexdigest()
             if code == 0:
                 waited = time.monotonic() - started
@@ -912,7 +914,7 @@ class Recorder:
                 return Path(p).resolve().relative_to(path.parent.resolve()).as_posix()
             except ValueError:
                 return p
-        path.write_text(json.dumps(dict(
+        hosts.evidence_path(path).write_text(json.dumps(dict(
             references=self.references,
             items=[dict(item=list(i), query_sha256=self.queries.get(i), order=self.orders.get(i, ("bag", None))[0],
                         limit=self.orders.get(i, ("bag", None))[1], operators=self.operators.get(i, {}),

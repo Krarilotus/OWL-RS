@@ -393,7 +393,7 @@ def designs(rounds: list[list[Path]], splits: int, seed: int, hosts: dict[str, l
         out["unpowered cases"] = sum(n == 0 for n, _ in stage2.values())
         n_big = st.median(n for n, _ in stage2.values())
         p_big = st.median(p for _, p in stage2.values())
-        out["hours"]["khaleesi-wsl (est.)"] = round(sum(6 * s * (first + p_big * n_big) for s in big.values()) / 3600, 1)
+        out["hours"]["the big-memory host (est.)"] = round(sum(6 * s * (first + p_big * n_big) for s in big.values()) / 3600, 1)
         return out
 
     # Statistical rejections only: a series the readings block on blocks alike under every design
@@ -445,7 +445,7 @@ def main() -> int:
     s = sub.add_parser("designs")
     s.add_argument("rounds", type=Path, nargs=2, help="A/A passes: the screen's, then the confirmation's")
     s.add_argument("--host", action="append", default=[], metavar="NAME=DIR", help="a host's passes, for its hours")
-    s.add_argument("--big-seconds", type=float, default=60.0, help="a run of each big case on khaleesi-wsl (est.)")
+    s.add_argument("--big-seconds", type=float, default=60.0, help="a run of each big case on the big-memory host (est.)")
     s.add_argument("--blocks1", type=int, default=3)
     s.add_argument("--splits", type=int, default=300)
     s.add_argument("--seed", type=int, default=1)

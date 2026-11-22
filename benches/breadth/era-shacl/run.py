@@ -105,9 +105,18 @@ def parse(log: str) -> dict:
     return found
 
 
+@kit.hosts.run_snapshot
 def steps(args) -> int:
     subsets, shapes, engines = (args.subsets.split(","), args.shapes.split(","), args.engines.split(","))
-    out = Path(args.results or kit.RESULTS / args.label).resolve()
+    out = kit.result_dir(args.results, args.label)
+    # A reused directory keeps its earlier rows, and the manifest below describes only this run:
+    # rows of another privacy class, or of unknown provenance, would then be saved under it.
+    if (out / "results.csv").exists() and (saved_invocations(out) is None
+                                           or private_results(out) != kit.hosts.private_session()):
+        print(f"{out}: its saved rows are not this run's privacy class, or their provenance is unknown; "
+              "give a new --results directory", file=sys.stderr)
+        return 2
+    manifest_path = kit.hosts.evidence_path(out / "manifest.json", kit.hosts.private_session(), kit.ROOT)
     (out / "reports").mkdir(parents=True, exist_ok=True)
     (out / "logs").mkdir(exist_ok=True)
     writer = kit.Writer(out / "results.csv", echo=print)
@@ -119,7 +128,10 @@ def steps(args) -> int:
                       {"runs": args.runs, "memory": args.memory, "heap": args.heap, "timeout_s": args.timeout_s,
                        "scenario": f"matched: every engine in one container capped at {args.memory} without swap, "
                                    f"all host CPUs; JVM heap {args.heap}"})
-    (out / "manifest.json").write_text(json.dumps({"invocations": [entry]}, indent=1), encoding="utf-8")
+    # The earlier invocations whose rows the reused results.csv keeps stay beside this one.
+    earlier = saved_invocations(out) if (out / "results.csv").exists() else None
+    kit.hosts.evidence_path(manifest_path).write_text(json.dumps({"invocations": [*(earlier or []), entry]}, indent=1),
+                                                      encoding="utf-8")
     date = entry["started"][:16]
     try:
         for rep, (subset, shape, engine) in plan:
@@ -228,9 +240,44 @@ def canonical(path: Path) -> collections.Counter:
     return bag
 
 
+def saved_invocations(out: Path) -> list | None:
+    """The saved manifest's invocations; None when there's no readable, non-empty list."""
+    try:
+        data = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    invocations = data.get("invocations") if isinstance(data, dict) else None
+    return invocations if isinstance(invocations, list) and invocations else None
+
+
+def private_results(out: Path) -> bool:
+    """Saved runs are private unless every invocation records public machine provenance."""
+    invocations = saved_invocations(out)
+    if invocations is None:
+        return True
+    for invocation in invocations:
+        machine = invocation.get("machine") if isinstance(invocation, dict) else None
+        if not isinstance(machine, dict):
+            return True
+        host = machine.get("host")
+        if not isinstance(host, str) or not host or "overlay" not in machine:
+            return True
+        if kit.hosts.private_run(machine):
+            return True
+    return False
+
+
 def check(args) -> int:
     out = Path(args.results).resolve()
-    rows = list(csv.DictReader(open(out / "results.csv", encoding="utf-8")))
+    private = private_results(out)
+    try:
+        raw = kit.hosts.evidence_path(out / "results.raw.csv", private)
+        results = kit.hosts.evidence_path(out / "results.csv", private)
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        return 2
+    with results.open(encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
     reports = out / "reports"
     verdicts, reference_bags = {}, {}
     for row in rows:
@@ -253,8 +300,8 @@ def check(args) -> int:
         else:
             missing, extra = sum((theirs - mine).values()), sum((mine - theirs).values())
             verdicts[name] = ("wrong", f"against {args.reference}: {missing} results missing, {extra} extra")
-    shutil.copy(out / "results.csv", out / "results.raw.csv")
-    with open(out / "results.csv", "w", newline="", encoding="utf-8") as f:
+    shutil.copyfile(results, kit.hosts.evidence_path(raw, private))
+    with open(kit.hosts.evidence_path(results, private), "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, rows[0].keys())
         w.writeheader()
         for row in rows:

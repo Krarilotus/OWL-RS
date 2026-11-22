@@ -52,6 +52,15 @@ READS = (".gitignore", "benches/cases/core.toml", "benches/cases/sparql.toml", "
          "crates/nrese-store/examples/perf_lab/generate.rs", "docs/design/performance.md", "scripts/lib/",
          "scripts/release-gate.sh")
 
+OVERLAY_HEAD = ""  # the commit of this module's private bench overlay (setUpModule)
+
+
+def setUpModule():  # noqa: N802
+    """The job writers stop without the private bench overlay: this module's own."""
+    global OVERLAY_HEAD
+    OVERLAY_HEAD = isolation.writers_overlay()
+
+
 def LOCAL_TABLES(checkout, harness):  # noqa: N802
     """A fake harness (a test's "c" * 40 in "C:/repo") reads as this tree's dataset metadata."""
     return gate_module.local_tables()
@@ -129,8 +138,8 @@ def harness_commit(repo: Path, lubm_size: tuple | None = (4, 8), lubm_made_by: s
 HARNESS = "h" * 40
 REVS = {"cand": "c" * 40, "base": "b" * 40, "main": "m" * 40}
 SIDES = ("base", "main", "cand")
-MACHINE = {"host": "phuoc-yu", "cpu": "Ryzen", "governor": "performance", "fleet_host": "phuoc-yu"}
-CONTEXT = {"host": "phuoc-yu", "round": 0, "prefix": "rg-cccccccc", "max_gb": 24.0, "ram_gb": 24.0}
+MACHINE = {"host": "timed-host", "cpu": "Ryzen", "governor": "performance", "fleet_host": "timed-host"}
+CONTEXT = {"host": "timed-host", "round": 0, "prefix": "rg-cccccccc", "max_gb": 24.0, "ram_gb": 24.0}
 
 
 def remove_checkout(tree, repo=ROOT) -> subprocess.CompletedProcess:
@@ -241,6 +250,7 @@ def passes(records_of=None, blocks=2, layouts=None, sides=SIDES, order_of=None):
     runs back to back as a palindrome (`order_of(block)` another order). records_of(side, n) gives
     a run's records, n its pass number (6 (block - 1) + its place)."""
     records_of = records_of or (lambda side, n: [record()])
+    timing = gate_module.round_inputs(MACHINE["fleet_host"])
     out, t = [], 1000
     for b in range(1, blocks + 1):
         layout = layouts[b - 1] if layouts else 1
@@ -256,7 +266,8 @@ def passes(records_of=None, blocks=2, layouts=None, sides=SIDES, order_of=None):
                         rec.update(started_ns=t, finished_ns=t + 10, block=b, layout=layout, side=side, run=run)
                         t += 10
         for (side, run), (n, rep) in runs.items():
-            rep.update(block=b, run=run, layout=layout, side=side,
+            rep.update(block=b, run=run, layout=layout, side=side, timing_inputs=timing,
+                       machine={**rep["machine"], "overlay": timing["overlay"]},
                        started_ns=min(r["started_ns"] for r in rep["records"]),
                        finished_ns=max(r["finished_ns"] for r in rep["records"]))
             if layout > 1:
@@ -270,7 +281,9 @@ def passes(records_of=None, blocks=2, layouts=None, sides=SIDES, order_of=None):
 
 def run_gate(ps, sides=("cand", "base", "main"), require=("base", "main"), **kw):
     kw.setdefault("context", CONTEXT)
-    return gate_module.gate(ps, {s: REVS[s] for s in sides}, "cand", list(require), HARNESS, **kw)
+    summary = gate_module.gate(ps, {s: REVS[s] for s in sides}, "cand", list(require), HARNESS, **kw)
+    summary["timing_inputs"] = gate_module.round_inputs(kw["context"].get("host", ""))
+    return summary
 
 
 def worse(factor, n):
@@ -478,7 +491,7 @@ class Rounds(unittest.TestCase):
         self.assertIn("**pending**", text)
         with patch.object(gate_module, "checkout_rev", lambda checkout, cand, harness: harness):  # no repository
             job = gate_module.confirm_job([first], "C:/repo")
-        self.assertEqual((job["id"], job["requires"]["hosts"]), ("rg-cccccccc-confirm", ["phuoc-yu"]))
+        self.assertEqual((job["id"], job["requires"]["hosts"]), ("rg-cccccccc-confirm", ["timed-host"]))
         self.assertEqual(job["steps"][0][2:], ["plan-cases", "lab-olympics"])
         self.assertEqual({s[2] for s in job["steps"][1:-2]}, {"block"})
         confirmed, text = gate_module.verdict([first, self.round_(1.08, 1)], self.W3C, self.GUARDS)
@@ -572,13 +585,13 @@ class Rounds(unittest.TestCase):
         """`release_gate.py jobs --plan` returned 0 when the
         fleet check refused the set, as abba.py run --plan did. It exits 1; a taken plan 0."""
         with tempfile.TemporaryDirectory() as tmp:
-            subprocess.run(["git", "init", "-q", tmp], check=True, capture_output=True)
-            subprocess.run(["git", "-C", tmp, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
-                            "--allow-empty", "-m", "x"], check=True, capture_output=True)
+            checkout = Path(tmp) / "checkout"
+            isolation.repo(checkout, 1)
             for code, expected in ((1, 1), (0, 0)):
                 with self.subTest(fleet_check=code), \
                         patch.object(sys, "argv", ["release_gate.py", "jobs", "HEAD", "--base", "HEAD", "--main", "HEAD",
-                                                   "--checkout", tmp, "--out", str(Path(tmp) / "out"), "--plan"]), \
+                                                   "--checkout", str(checkout), "--out", str(Path(tmp) / "out"),
+                                                   "--plan"]), \
                         patch.object(gate_module, "jobs", return_value={"rg-x": {"id": "rg-x"}}), \
                         patch.object(gate_module, "set_plan", return_value="plan"), \
                         patch.object(gate_module, "toml_set", return_value=""), \
@@ -609,8 +622,11 @@ class Rounds(unittest.TestCase):
         first = self.round_(1.08)
         with patch.object(gate_module, "checkout_rev", lambda checkout, cand, harness: harness):
             job = gate_module.confirm_job([first], "C:/repo")
-            self.assertEqual((job["requires"]["hosts"], job["requires"]["roles"]), (["phuoc-yu"], ["measure", "build"]))
+            self.assertEqual((job["requires"]["hosts"], job["requires"]["roles"]), (["timed-host"], ["measure", "build"]))
             self.assertIn("first round", job["pin_reason"])
+            # Its host's floor and entry, from the private overlay, as every timed job's.
+            self.assertEqual((job["env"]["NRESE_BENCH_OVERLAY_REV"], [i["name"] for i in job["inputs"]]),
+                             (OVERLAY_HEAD, ["checkout"]))
             hostless = run_gate(passes(slower(1.08)), context={**CONTEXT, "host": ""})
             with self.assertRaises(SystemExit):
                 gate_module.confirm_job([hostless], "C:/repo")
@@ -624,9 +640,9 @@ class Rounds(unittest.TestCase):
                 p["report"]["machine"] = {**MACHINE, "fleet_host": host} if host else \
                     {k: v for k, v in MACHINE.items() if k != "fleet_host"}
             return out
-        self.assertEqual(run_gate(ran_on("phuoc-yu"))["errors"], [])
+        self.assertEqual(run_gate(ran_on("timed-host"))["errors"], [])
         moved = run_gate(ran_on("shared-a"))["errors"]
-        self.assertTrue(any("passes ran on shared-a, not on phuoc-yu" in e for e in moved), moved)
+        self.assertTrue(any("passes ran on shared-a, not on timed-host" in e for e in moved), moved)
         unsaid = run_gate(ran_on(None))["errors"]
         self.assertTrue(any("don't say which fleet host ran them" in e for e in unsaid), unsaid)
         # A report naming no host (a run outside a fleet job) holds them to none.
@@ -2068,6 +2084,65 @@ class Parts(unittest.TestCase):
         import tomllib
         self.assertEqual(tomllib.loads(gate_module.toml_job(timed))["steps"], timed["steps"])
 
+    def test_every_timed_job_reads_the_private_overlay_on_its_host(self):
+        """The lead's decision of 21 Nov 2026 (the fleet stages one git input, the checkout): a timed
+        job carries the private overlay's hosts.toml and commit in its environment, written where the
+        overlay is, and its inputs are as they were, so its checkout is exactly the harness's tree.
+        A writer without the overlay stops: its jobs would run without their hosts (no CPU pinning,
+        no cold-cache command, every configuration "-")."""
+        found = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, "lab-olympics", big_gb=None)
+        timed = [job for job in found.values() if job["kind"] == "owlrs.timed"]
+        self.assertEqual([j["id"] for j in timed], ["rg-test-timed"])
+        for job in timed:
+            self.assertEqual((job["env"]["NRESE_BENCH_HOSTS"], job["env"]["NRESE_BENCH_OVERLAY_REV"]),
+                             (isolation.OVERLAY_HOSTS, OVERLAY_HEAD), job["id"])
+            self.assertEqual([(i["name"], i["source"].get("rev")) for i in job["inputs"]], [("checkout", "c" * 40)],
+                             "the harness's commit, alone: no input of the overlay's")
+        with patch.dict(os.environ, {"NRESE_BENCH_PRIVATE": "", "BENCH_INPUTS_GIT": str(ROOT / "no-such-inputs")}), \
+                self.assertRaises(SystemExit) as stopped:
+            gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, "lab-olympics")
+        self.assertIn("private bench overlay", str(stopped.exception))
+
+    def test_on_its_host_a_report_judges_by_the_floor_its_writer_had(self):
+        """The lead's decision of 21 Nov 2026: a host's A-A' noise floor travels with the job as its
+        hosts do. `release_gate.py report` on the timed host, with only the job's environment, judges
+        by the floor the overlay folder gives on the writing machine; without it the host found none,
+        and its verdict fell silently back to the round's own spread."""
+        def report_floor(root: Path) -> str | None:
+            """The floor `report` judged a round on timed-host by (its source), None for none."""
+            directory = root / "passes"
+            directory.mkdir(exist_ok=True)
+            for p in passes():
+                (directory / p["path"]).write_text(json.dumps(p["report"]), encoding="utf-8")
+            argv = ["release_gate.py", "report", "--passes", str(directory), "--candidate", "cand",
+                    *[a for s in SIDES for a in ("--side", f"{s}={REVS[s]}")], "--require", "base,main",
+                    "--harness-revision", HARNESS, "--min-blocks", "2", "--context", "host=timed-host",
+                    "--json", str(root / "release-gate.json")]
+            with patch.object(sys, "argv", argv), \
+                    contextlib.redirect_stdout(io.TextIOWrapper(io.BytesIO(), encoding="utf-8")):
+                gate_module.main()
+            return json.loads((root / "release-gate.json").read_text(encoding="utf-8"))["policy"]["floor"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            inputs = Path(tmp) / "inputs"
+            (inputs / "overlay" / "noise-floor").mkdir(parents=True)
+            (inputs / "overlay" / "noise-floor" / "timed-host.toml").write_text(gate_module.write_floor(
+                {"host": "timed-host", "blocks": 8, "cases": {"lab-olympics": {"time/q06": 0.04}}}, "aa-fixture"),
+                encoding="utf-8", newline="\n")
+            isolation.overlay_repo(inputs)
+            folder = {"NRESE_BENCH_PRIVATE": (inputs / "overlay").as_posix()}
+            with patch.dict(os.environ, folder):
+                here = report_floor(Path(tmp))
+                job = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, "lab-olympics",
+                                       big_gb=None)["rg-test-timed"]
+            carried = {k: v for k, v in job["env"].items() if k.startswith("NRESE_BENCH_")}
+            with patch.dict(os.environ, {**folder, "NRESE_BENCH_PRIVATE": "", **carried}):  # the host: no folder
+                there = report_floor(Path(tmp))
+            self.assertEqual(there, "timed-host.toml: aa-fixture, 8 blocks")
+            self.assertEqual(here, there)
+            with patch.dict(os.environ, {**folder, **carried}), self.assertRaises(ValueError):  # two overlays
+                gate_module.host_floor("timed-host")
+
     def test_the_big_cases_run_on_a_linux_host_never_native_windows(self):
         """Round 8: the big job went to the development machine, native Windows, with the build's ELF binaries. It
         asks for Linux and the memory of its cases, and builds its own binaries there."""
@@ -2771,7 +2846,7 @@ class Instances(unittest.TestCase):
         summary = gate_module.gate(aa, {s: REVS["base"] for s in ("cand", "base", "main")}, "cand",
                                    ["base", "main"], HARNESS, context=CONTEXT)
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "phuoc-yu.toml"
+            path = Path(tmp) / "timed-host.toml"
             path.write_text(gate_module.write_floor(gate_module.noise_floor(summary), "aa-test"), encoding="utf-8")
             floor = gate_module.read_floor(path)
         self.assertGreater(floor["cases"]["lab-olympics"]["time/q06"], 0.03)
@@ -3122,9 +3197,8 @@ find "$b" -maxdepth 2 -exec touch -d "$4" {} +'''
 
     def test_a_callers_paths_are_the_launching_checkouts(self):
         """PR #60: the gate runs its code from a checkout of its own, and
-        `jobs HEAD --out jobs` wrote its jobs into that checkout, named it their repository, and
-        left it unclean, so the gate's next start refused it. A caller's paths, and the jobs'
-        repository, are the launching checkout's."""
+        `jobs HEAD --out ../plans` resolved its paths from the worktree that runs the gate.
+        The output is relative to the caller and the jobs name the caller's checkout."""
         if shutil.which("bash") is None:
             self.skipTest("needs bash")
         loop = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
@@ -3132,10 +3206,11 @@ find "$b" -maxdepth 2 -exec touch -d "$4" {} +'''
         Path(self.repo, "benches").mkdir(exist_ok=True)
         shutil.copy(ROOT / "benches/hosts.toml", Path(self.repo, "benches/hosts.toml"))
         tmp = self.gate_beside(loop)
+        plans = tmp / "plans"
         for start in ("first", "next"):
             output = self.run_gate(tmp, "jobs", "jobs", "HEAD", "--base", "HEAD", "--main", "HEAD", "--no-checks",
-                                   "--out", "jobs")
-            written = sorted(Path(self.repo, "jobs").glob("*.toml"))
+                                   "--out", os.path.relpath(plans, self.repo))
+            written = sorted(plans.glob("*.toml"))
             self.assertTrue(written, f"SPEC the {start} start writes the jobs where the caller said:\n{output}")
         for file in written:
             repositories = re.findall(r'git = "([^"]+)"', file.read_text(encoding="utf-8"))
@@ -3257,7 +3332,8 @@ exec "{Path(shutil.which("git")).as_posix()}" "$@"
 ''', encoding="utf-8", newline="\n")
         hold.chmod(0o755)
         path = hold.parent.as_posix() + os.pathsep + os.environ.get("PATH", "")
-        jobs = lambda out: ("jobs", "HEAD", "--base", "HEAD", "--main", "HEAD", "--no-checks", "--out", out)
+        jobs = lambda out: ("jobs", "HEAD", "--base", "HEAD", "--main", "HEAD", "--no-checks", "--out",
+                            (tmp / out).as_posix())
         start = lambda out: subprocess.Popen(
             [shutil.which("bash"), "scripts/release-gate.sh", *jobs(out)], cwd=self.repo,
             env=self.gate_env(tmp, "at-once", path), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -3278,11 +3354,11 @@ exec "{Path(shutil.which("git")).as_posix()}" "$@"
         output = first.communicate(timeout=300)[0]
         self.assertEqual(first.returncode, 0, f"SPEC so does the one paused while making it:\n{output}")
         for out in ("jobs-a", "jobs-b"):
-            self.assertTrue(list(Path(self.repo, out).glob("*.toml")), f"{out}: no jobs written")
+            self.assertTrue(list((tmp / out).glob("*.toml")), f"{out}: no jobs written")
         self.assertEqual(list((tmp / "at-once" / "gate" / "run").glob("*/[0-9]*-*")), [], "SPEC each removes its own")
         self.assertIn("MiB reclaimed", self.run_gate(tmp, "at-once", "clean"), "SPEC a clean after them runs")
         output = self.run_gate(tmp, "at-once", *jobs("jobs-c"))
-        self.assertTrue(list(Path(self.repo, "jobs-c").glob("*.toml")), f"SPEC and a restart:\n{output}")
+        self.assertTrue(list((tmp / "jobs-c").glob("*.toml")), f"SPEC and a restart:\n{output}")
         listed = self.git("worktree", "list", "--porcelain")
         self.assertEqual(listed.count("worktree "), 1, f"SPEC no checkout stays registered:\n{listed}")
 

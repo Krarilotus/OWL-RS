@@ -3,8 +3,8 @@
 Job Object over the whole process tree (the job's memory limit; every process of it killed
 when it closes), elsewhere a systemd user scope (MemoryMax, no swap, in the fleet step's
 slice) where there is one. A declaration caps nothing (13 Oct 2026: a Konclude declared at
-22 GB took 30 on the shared host); a host on hold (hosts.toml queue.hold_mem_gb) needs its jobs to
-stay under it.
+22 GB took 30 on the shared host); a shared host needs its jobs to stay under what they
+declare.
 
     python scripts/capped-chunk.py --memory-mib 4000 --budget-min 28 [--budget-ok] -- COMMAND...
 

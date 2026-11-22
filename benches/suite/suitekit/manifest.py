@@ -37,6 +37,7 @@ import subprocess
 import uuid
 from pathlib import Path
 
+from . import hosts
 from .lock import lock
 
 # The variables the suite and its adapters read; licence variables are recorded as set or not.
@@ -158,6 +159,14 @@ def machine(runtime: str, root: Path | None = None) -> dict:
     # (`host` is the machine's own name, which the fleet's may not be).
     if os.environ.get("FLEET_HOST"):
         out["fleet_host"] = os.environ["FLEET_HOST"]
+    # The private overlay the host's entry came from (hosts.py): part of a run's identity, so that
+    # compare never sets side by side runs whose hosts two overlays described.
+    from . import hosts
+    overlay = hosts.resolve_overlay()
+    out["overlay"] = overlay.identity if overlay else None
+    registry = hosts.load()  # the run snapshot, when recording an invocation
+    host = hosts.run_identity(out, None, registry)
+    out.update(host_key=host["host"], host_config=host["config"])
     # What changes timings on the host, as the run found it (hosts.toml `config` records the
     # intended configuration; compare checks both).
     for key, path in (("governor", "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
@@ -276,6 +285,12 @@ def sync_directory(directory: Path):
 
 
 ATTEMPTS = "attempts.jsonl"
+FILES = ("manifest.json", "manifest.json.tmp", "manifest.lock", ATTEMPTS)
+
+
+def _preflight(results: Path, private: bool, root: Path):
+    for name in FILES:
+        hosts.evidence_path(results / name, private, root, within=results)
 
 
 def append_attempts(results: Path, attempts: dict[str, dict]):
@@ -289,8 +304,13 @@ def append_attempts(results: Path, attempts: dict[str, dict]):
     _append(results, [{"cell": cell, **attempt} for cell, attempt in attempts.items()])
 
 
-def _append(results: Path, records: list[dict]):
-    with open(results / ATTEMPTS, "a", encoding="utf-8", newline="\n") as f:
+def _append(results: Path, records: list[dict], private: bool | None = None, root: Path = hosts.ROOT):
+    results = results.resolve()
+    if private is None:
+        private = hosts.private_session()
+    _preflight(results, private, root)
+    with open(hosts.evidence_path(results / ATTEMPTS, private, root, within=results),
+              "a", encoding="utf-8", newline="\n") as f:
         f.write("".join("\n" + json.dumps(record) for record in records))
         f.flush()
         os.fsync(f.fileno())
@@ -318,9 +338,13 @@ class Manifest:
     directory, from here to finish() or close() (or its process's end): a second is refused."""
 
     def __init__(self, results: Path, root: Path, argv: list[str], args, runtime: str, settings: dict):
+        results = results.resolve()
+        self.private, self.root = hosts.private_session(), root
+        _preflight(results, self.private, root)
         self.path, self._owner = results / "manifest.json", contextlib.ExitStack()
         try:
-            self._owner.enter_context(lock(results / "manifest.lock", wait=False))
+            self._owner.enter_context(lock(hosts.evidence_path(results / "manifest.lock", self.private, root,
+                                                                within=results), wait=False))
         except OSError as error:
             raise ManifestError(f"{results}: another run is writing into it ({error}); let it finish, "
                                 "or give this one its own --results") from error
@@ -356,7 +380,8 @@ class Manifest:
         sync_directory(self.path.parent.parent)
         # The invocation in the journal before the manifest names it: a journal lacking an
         # invocation its manifest names has lost records (ledger).
-        _append(self.path.parent, [{"invocation": self.entry["invocation"], "started": self.entry["started"]}])
+        _append(self.path.parent, [{"invocation": self.entry["invocation"], "started": self.entry["started"]}],
+                self.private, self.root)
         data.setdefault("invocations", []).append(self.entry)
         self.index = len(data["invocations"]) - 1
         self._write(data)
@@ -365,10 +390,11 @@ class Manifest:
         """The manifest as it is: none yet is an empty one; one that can't be read or parsed is
         refused (ManifestError), never taken for empty: the next write would drop every earlier
         invocation's evidence."""
-        if not self.path.exists():
+        path = hosts.evidence_path(self.path, self.private, self.root, within=self.path.parent)
+        if not path.exists():
             return {"schema": 1, "invocations": []}
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as error:
             raise ManifestError(f"{self.path}: can't be read as a manifest ({error}); it is left as it is") from error
         if not isinstance(data, dict) or not isinstance(data.get("invocations", []), list):
@@ -379,14 +405,18 @@ class Manifest:
         """The manifest, durably: its bytes on disk before it replaces the old one, and the
         replacement itself on disk, before this returns (a cell's attempt must survive a host crash
         before its work starts). Raises if any of that fails."""
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        results = self.path.parent
+        results.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".json.tmp")
-        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        hosts.evidence_path(self.path, self.private, self.root, within=results)
+        with open(hosts.evidence_path(tmp, self.private, self.root, within=results),
+                  "w", encoding="utf-8", newline="\n") as f:
             f.write(json.dumps(data, indent=2) + "\n")
             f.flush()
             os.fsync(f.fileno())  # on Windows _commit, i.e. FlushFileBuffers
-        os.replace(tmp, self.path)
-        sync_directory(self.path.parent)
+        os.replace(hosts.evidence_path(tmp, self.private, self.root, within=results),
+                   hosts.evidence_path(self.path, self.private, self.root, within=results))
+        sync_directory(results)
 
     def update(self, **fields):
         for key, value in fields.items():

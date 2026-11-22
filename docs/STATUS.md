@@ -51,7 +51,7 @@ each with its run record.
 
 - Performance acceptance against the PR's implementation base, of 9 October 2026, is open.
   Horn context saturation is about 6 % slower, serial and at 16 threads, with the retained
-  accounting, and there is no 95-case matrix of the final revision ([run record](../benches/runs/2026-10-11-horn-recovery.toml)).
+  accounting, and there is no 95-case matrix of the final revision.
 - Resource ownership in `nrese-dl` now gives the envelope what it needed. An engine's budget is
   an owned value (no longer `Copy`), its observer and the tableau reserve from the request's
   envelope and return it when the engine drops, and exhaustion stays sticky per engine (an
@@ -66,7 +66,7 @@ each with its run record.
   October).
 - In vector search, the filtered search that goes first widens its beam by the joined
   pattern's share (12 October). `vector-knn-filtered`'s recall went from 0.56 to 0.98, and its
-  gate passes ([record](../benches/runs/2026-10-12-vector-filtered-fix-phuoc.toml)). On its
+  gate passes. On its
   uniform 64-d vectors the graph search now costs what the exact scan does (10.5 against
   10.4 ms). Still open are choosing the scan by cost and the graph's own recall at the default
   beam (0.44).

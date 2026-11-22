@@ -50,9 +50,11 @@ from fractions import Fraction
 from pathlib import Path
 
 try:
+    from . import hosts
     from .lock import lock
 except ImportError:  # run as a script, or imported beside it (runtime.py's scope entry)
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import hosts
     from lock import lock
 
 LABEL_NS, LABEL_CHECKOUT, LABEL_OWNER = "nrese.ns", "nrese.checkout", "nrese.owner"
@@ -204,7 +206,7 @@ def executable() -> str:
 def docker(argv: list[str], **kw) -> subprocess.CompletedProcess:
     kw.setdefault("capture_output", True)
     kw.setdefault("text", True)
-    return subprocess.run([executable(), *argv], **kw)
+    return hosts.launch(subprocess.run, [executable(), *argv], **kw)
 
 
 def clean(root: Path | str, owner: str | None = None, everything: bool = False,
@@ -264,7 +266,7 @@ def pin_images(tags, root: Path | str, environ: dict | None = None, run=None) ->
             new[tag] = image
         if new:
             path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "a", encoding="utf-8", newline="\n") as out:
+            with open(hosts.evidence_path(path, checkout=root), "a", encoding="utf-8", newline="\n") as out:
                 out.writelines(f"{tag}\t{image}\n" for tag, image in new.items())
         return {**pins, **new}
 

@@ -55,7 +55,7 @@ sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE.parent / "maintenance"))
 
 from maintenance import NreseBinary  # noqa: E402
-from suitekit import ns, quiet  # noqa: E402
+from suitekit import hosts, ns, quiet  # noqa: E402
 from suitekit.adapters import Context, Graphdb, images_for  # noqa: E402
 from suitekit.manifest import Manifest  # noqa: E402
 from suitekit.runtime import DockerRuntime, Mount, Spec, memory_fields  # noqa: E402
@@ -125,9 +125,9 @@ def run_driver(name: str, work: Path, data: Path, log: Path, timeout_s: int) -> 
     for m in spec.mounts:
         command += ["-v", f"{m.source}:{m.target}{':ro' if m.readonly else ''}"]
     command += [ns.image_id(spec.image, ROOT), *spec.command]
-    with open(log, "w", encoding="utf-8") as out:
+    with open(hosts.evidence_path(log), "w", encoding="utf-8") as out:
         try:
-            return subprocess.run(command, stdout=out, stderr=subprocess.STDOUT, timeout=timeout_s).returncode
+            return hosts.launch(subprocess.run, command, stdout=out, stderr=subprocess.STDOUT, timeout=timeout_s).returncode
         except subprocess.TimeoutExpired:
             subprocess.run(["docker", "rm", "-f", name], capture_output=True)
             return 124
@@ -249,8 +249,9 @@ def parse_summary(text: str) -> dict:
     return out
 
 
+@hosts.run_snapshot
 def cmd_run(args):
-    results = Path(args.results)
+    results = hosts.evidence_path(Path(args.results), hosts.private_session(), ROOT)
     results.mkdir(parents=True, exist_ok=True)
     data = data_root(args.size)
     if not (data / "generated" / "files.json").exists():

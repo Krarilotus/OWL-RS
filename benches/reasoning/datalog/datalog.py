@@ -53,7 +53,7 @@ sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(ROOT / "benches/suite"))
 
 import program as P  # noqa: E402
-from suitekit import ns, quiet  # noqa: E402
+from suitekit import hosts, ns, quiet  # noqa: E402
 from suitekit.manifest import Manifest  # noqa: E402
 from suitekit.runtime import DockerRuntime, Mount, Spec, memory_fields  # noqa: E402
 from suitekit.schema import Result, Writer  # noqa: E402
@@ -163,7 +163,7 @@ def docker_as_user(image: str, args: list[str], mounts: dict[str, str], entrypoi
         command += ["-v", f"{source}:{target}" + (":ro" if source == target else "")]
     if entrypoint:
         command += ["--entrypoint", entrypoint]
-    subprocess.run(command + [image, *args], check=True)
+    hosts.launch(subprocess.run, command + [image, *args], check=True)
 
 
 def prepare(case: dict):
@@ -189,7 +189,10 @@ def prepare(case: dict):
         prepare_lubm(case, target)
     elif kind == "frozen":
         # A frozen dataset of benches/datasets.toml (BENCH_DATA), linked, never copied.
-        source = Path(setting("BENCH_DATA", "/home/krarilotus/nrese-assets/kraris-gptler-20261009/snapshots/windows/nrese-data")) / case["file"]
+        data = hosts.input_path("data")
+        if data is None:
+            raise SystemExit("no frozen datasets here: set BENCH_DATA (benches/hosts.toml inputs.data)")
+        source = data / case["file"]
         got = sha256(source) if not (target / "facts.nt").exists() else case["sha256"]
         if got != case["sha256"]:
             raise SystemExit(f"{source}: SHA-256 {got}, the registry pins {case['sha256']}")
@@ -389,7 +392,7 @@ class Run:
                                 note=note + ("" if status != "wrong" else f"; expected {expected}")))
         if passed and getattr(self, "derived", None) is not None:
             known = self.qualified() | {f"{self.case['name']}/{self.system}": self.derived}
-            (Path(self.args.results) / "qualified.json").write_text(json.dumps(known, indent=1) + "\n", encoding="utf-8")
+            hosts.evidence_path(Path(self.args.results) / "qualified.json").write_text(json.dumps(known, indent=1) + "\n", encoding="utf-8")
 
     def go(self):
         getattr(self, f"run_{self.system}")()
@@ -640,6 +643,7 @@ def version(system: str) -> str:
     return IMAGES[system].rsplit(":", 1)[-1] if ":" in IMAGES[system] else "-"
 
 
+@hosts.run_snapshot
 def cmd_run(args):
     import datetime
     import platform
@@ -647,7 +651,7 @@ def cmd_run(args):
         raise SystemExit("set NRESE_BIN to the nrese-server binary")
     if args.qualified and not Path(args.qualified).is_file():
         raise SystemExit(f"no qualified totals at {args.qualified}: the qualifying run hasn't passed; nothing timed")
-    results = Path(args.results)
+    results = hosts.evidence_path(Path(args.results), hosts.private_session(), ROOT)
     results.mkdir(parents=True, exist_ok=True)
     args.date = datetime.datetime.now().isoformat(timespec="minutes")
     args.host = platform.node()

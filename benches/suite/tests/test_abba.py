@@ -26,13 +26,20 @@ import test_release_gate as fixture  # noqa: E402  (the gate's pass fixtures)
 
 READS = ("benches/cases/core.toml", "benches/cases/sparql.toml", "benches/competitors/queries/",
          "benches/datasets.toml", "benches/fast/fast.py", "benches/fast/measurement-sides.toml",
-         "benches/fast/noise-floor/phuoc-yu.toml", "benches/fast/queries/", "benches/fast/release_gate.py",
+         "benches/fast/queries/", "benches/fast/release_gate.py",
          "benches/hosts.toml", "benches/reasoning/prepare-lubm.sh", "benches/reasoning/prepare-owl2bench.sh",
          "benches/reasoning/queries/lubm/", "benches/reasoning/queries/owl2bench/",
          "benches/sparql/prepare.sh", "benches/suite/abba.py", "benches/suite/suitekit/*",
          "benches/suite/tests/test_release_gate.py", "scripts/lib/ns.sh")
 
 A, B = "a" * 40, "b" * 40
+OVERLAY_HEAD = ""  # the commit of this module's private bench overlay (setUpModule)
+
+
+def setUpModule():  # noqa: N802
+    """The job writers stop without the private bench overlay: this module's own."""
+    global OVERLAY_HEAD
+    OVERLAY_HEAD = isolation.writers_overlay()
 # The real reader of a harness's dataset metadata; the tests' fake harnesses (A, B) read as this tree's
 # (Abba's patch), as PR #139's tests patched makers_at().
 HARNESS_TABLES = getattr(abba.rg, "harness_tables", None)
@@ -40,7 +47,7 @@ CHECKS = next(c for c in abba.cases_registry.load() if c["name"] == "lab-olympic
 fixture.REVS.update(a=A, a2=A, b=B)
 SERIES = ("q01-point-lookup", "q06-text-filter")
 FAMILY = f'''name = "t"
-host = "phuoc-yu"
+host = "timed-host"
 blocks = 6
 [sides]
 a = "{A}"
@@ -94,18 +101,20 @@ class Abba(unittest.TestCase):
     def load(self):
         return abba.load_family(self.path, self.repo)
 
-    def round_(self, records_of, name="r1", drop=lambda p: False, manifest=True, host="phuoc-yu", k=1,
+    def round_(self, records_of, name="r1", drop=lambda p: False, manifest=True, host="timed-host", k=1,
                ran_on=None):
         """Round k's results as its job leaves them: the manifest of its check, naming `host`, its
         passes (after round k - 1's), run on `ran_on` (default: that host; None in it: unsaid)."""
         out = Path(self.tmp.name) / name
         (out / "passes").mkdir(parents=True)
+        timing = abba.rg.round_inputs(host)
         for p in fixture.passes(records_of, blocks=6, sides=abba.SIDES):
             later = (k - 1) * 10 ** 9
             for item in [p["report"], *p["report"]["records"]]:
                 item.update(started_ns=item["started_ns"] + later, finished_ns=item["finished_ns"] + later)
             machine = {**p["report"]["machine"], "fleet_host": host if ran_on is None else ran_on(p)}
             p["report"]["machine"] = {k_: v for k_, v in machine.items() if v is not None}
+            p["report"]["timing_inputs"] = timing
             if not drop(p):
                 (out / "passes" / p["path"]).write_text(json.dumps(p["report"]), encoding="utf-8")
         if manifest:
@@ -199,7 +208,7 @@ class Abba(unittest.TestCase):
         exits 1, as a run that wasn't submitted does; a plan the fleet takes still exits 0."""
         catalog = abba.cases_registry.load()
         for code, expected in ((1, 1), (0, 0)):
-            with self.subTest(fleet_check=code), tempfile.TemporaryDirectory(dir=self.repo) as out:
+            with self.subTest(fleet_check=code), tempfile.TemporaryDirectory() as out:
                 args = SimpleNamespace(checkout=self.repo.as_posix(), a=self.commits[0], b=self.commits[-1],
                                        harness=None, cases="lab-olympics", areas="", blocks=3, min_samples=3,
                                        name=None, out=Path(out), host=None, round=1, priority=790, reason="",
@@ -235,14 +244,14 @@ class Abba(unittest.TestCase):
         between steps when a host's window closes; such a round has no verdict, and so has one whose
         passes don't say which fleet host ran them."""
         read = []
-        with patch.object(abba.rg, "read_floor", side_effect=lambda path: read.append(path.stem)):
+        with patch.object(abba.rg, "host_floor", side_effect=lambda host: read.append(host)):
             code, text = self.verdict(self.round_(records(), name="moved", host="shared-a",
-                                                  ran_on=lambda p: "phuoc-yu"))
+                                                  ran_on=lambda p: "timed-host"))
         self.assertEqual(code, abba.NO_VERDICT, text)
-        self.assertIn("passes ran on phuoc-yu, not on shared-a", text)
+        self.assertIn("passes ran on timed-host, not on shared-a", text)
         self.assertNotIn("shared-a", read)  # no floor is read for a round that has no verdict
         code, text = self.verdict(self.round_(records(), name="part-moved",
-                                              ran_on=lambda p: "shared-a" if p["report"]["block"] == 6 else "phuoc-yu"))
+                                              ran_on=lambda p: "shared-a" if p["report"]["block"] == 6 else "timed-host"))
         self.assertEqual(code, abba.NO_VERDICT, text)
         code, text = self.verdict(self.round_(records(), name="unsaid", ran_on=lambda p: None))
         self.assertEqual(code, abba.NO_VERDICT, text)
@@ -356,11 +365,7 @@ systems = []
         blocks = [s for s in timed["steps"] if "block" in s]
         self.assertEqual(len(blocks), 6)
         self.assertEqual(blocks[0][-3:], [f"a={A}", f"a2={A}", f"b={B}"])
-        # A round its manifest says ran elsewhere takes that host's floor, not the family's.
-        read = []
-        with patch.object(abba.rg, "read_floor", side_effect=lambda path: read.append(path.stem)):
-            self.verdict(self.round_(records(), host="shared-a"))
-        self.assertEqual((timed["env"]["GATE_HOST"], read), ("shared-a", ["shared-a"]))
+        self.assertEqual(timed["env"]["GATE_HOST"], "shared-a")
         self.assertIn("pin_reason", timed)
 
     def test_a_job_asks_for_what_making_its_data_takes(self):
@@ -475,6 +480,14 @@ systems = []
                         self.assertNotIn("containers", job)
                         self.assertEqual(job["requires"]["ram_gb"], blocks)
                         self.assertIn("owlrs-bench-assets", job["requires"]["has"])
+
+    def test_the_job_reads_the_private_overlay_on_its_host(self):
+        """The lead's decision of 21 Nov 2026: its host's entry comes from the private overlay, whose
+        hosts.toml and commit the job carries in its environment; no input of the overlay's."""
+        job = next(iter(abba.jobs(self.family, B, self.repo.as_posix()).values()))
+        self.assertEqual((job["env"]["NRESE_BENCH_HOSTS"], job["env"]["NRESE_BENCH_OVERLAY_REV"]),
+                         (isolation.OVERLAY_HOSTS, OVERLAY_HEAD))
+        self.assertNotIn("BENCH_INPUTS", [i["name"] for i in job["inputs"]])
 
     def test_one_job_asks_by_capability_and_builds_where_it_times(self):
         """A job names no host. A build job and a timed job pinned to one host

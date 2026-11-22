@@ -63,7 +63,7 @@ def sparqloscope(root: Path, tier: str, settings: dict) -> Plan:
                 prepare=["bash", PREPARE, "dblp-kg"],
                 note="answers against the reference systems; the paper's are of another release")
     if tier != "sparqloscope-dblp":
-        plan.unavailable = f"no tier {tier}: sparqloscope-dblp (Wikidata truthy waits for Draco)"
+        plan.unavailable = f"no tier {tier}: sparqloscope-dblp (Wikidata truthy waits for a cluster host)"
     return plan
 
 

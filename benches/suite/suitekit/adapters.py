@@ -40,7 +40,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import ns
+from . import hosts, ns
 from .manifest import docker_memory_bytes
 from .runtime import DockerRuntime, Measured, Mount, Runtime, Server, Spec, memory_now, slice_limit_mib
 
@@ -803,7 +803,7 @@ class Virtuoso(Adapter):
         rc, text = self.isql(ctx, "checkpoint;")
         output.append(text)
         ms = (time.monotonic() - started) * 1000
-        (ctx.logs / "load.log").write_text("\n".join(output), encoding="utf-8")
+        hosts.evidence_path(ctx.logs / "load.log").write_text("\n".join(output), encoding="utf-8")
         peak, kind, memory_note = self.stop_memory(ctx)
         return Step(Measured(ms, peak, rc, memory_kind=kind, memory_note=memory_note), note="server start-up excluded")
 
@@ -921,7 +921,7 @@ class Rdf4j(Adapter):
             rc = 0 if status in (200, 204) else 1
             late, why = timed_out(status, text), f"; LOAD {path}: {answer(status, text)}" if rc else ""
         ms = (time.monotonic() - started) * 1000
-        (ctx.logs / "load.log").write_text("\n".join(log), encoding="utf-8")
+        hosts.evidence_path(ctx.logs / "load.log").write_text("\n".join(log), encoding="utf-8")
         peak, kind, memory_note = self.stop_memory(ctx)
         return Step(Measured(ms, peak, rc, late, memory_kind=kind, memory_note=memory_note),
                     note="server start-up excluded; SPARQL LOAD per file" + why)
@@ -1037,7 +1037,7 @@ class Graphdb(Adapter):
                                      "-Dgraphdb.license.file=<set>", env["GDB_JAVA_OPTS"])
         record = {"image": spec.image, "requested_edition": "enterprise" if self.enterprise(ctx) else "free",
                   "memory": spec.memory, "env": env}
-        (ctx.logs / f"graphdb-{phase}-config.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+        hosts.evidence_path(ctx.logs / f"graphdb-{phase}-config.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
 
     def load(self, ctx, store, inputs, regime):
         config = self.configuration(ctx, regime)
@@ -1091,7 +1091,7 @@ class Graphdb(Adapter):
             metadata = {key: info[key] for key in ("productVersion", "productType")}
             if not all(isinstance(v, str) and len(v) < 80 for v in metadata.values()):
                 return "-"
-            (ctx.logs / "graphdb-runtime.json").write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+            hosts.evidence_path(ctx.logs / "graphdb-runtime.json").write_text(json.dumps(metadata) + "\n", encoding="utf-8")
             return metadata["productVersion"]
         except (OSError, ValueError, KeyError, TypeError):
             return "-"
@@ -1164,7 +1164,7 @@ class Anzograph(Adapter):
             if rc == 0 and status != 200:  # the first unsuccessful file decides
                 rc, late, why = 1, timed_out(status, body), f"; LOAD {path}: {answer(status, body)}"
         ms = (time.monotonic() - started) * 1000
-        (ctx.logs / "load.log").write_text("\n".join(output), encoding="utf-8")
+        hosts.evidence_path(ctx.logs / "load.log").write_text("\n".join(output), encoding="utf-8")
         peak, kind, memory_note = memory_now(self.server)  # it serves on: its peak so far
         return Step(Measured(ms, peak, rc, late, memory_kind=kind, memory_note=memory_note),
                     note="server start-up excluded; in memory" + why)

@@ -102,9 +102,14 @@ captured runs again, without running.
 
 ## Hosts
 
-[hosts.toml](hosts.toml) owns the host facts: each host's roles (`build`, `test`,
-`measure`, `cluster`), what it has (Docker, Java, Apptainer), and the verified inputs under
-the preservation root on the hosts that hold it. Only a `build` host compiles Rust and runs
+[hosts.toml](hosts.toml) holds what is true on any host: the verified inputs by their
+variables, the Docker volumes, the caches a job keeps. The hosts themselves are private: each
+host's roles (`build`, `test`, `measure`, `cluster`), what it has (Docker, Java, Apptainer),
+and the verified inputs' paths under the preservation root on the hosts that hold it are in a
+private overlay's `hosts.toml`, which `suitekit/hosts.py` merges over the public one when
+`NRESE_BENCH_PRIVATE` names the overlay's folder. Without it no host is registered: inputs come
+from their variables, no case is refused for what a host lacks, and a run's configuration is
+"-". Only a `build` host compiles Rust and runs
 the gate (`scripts/lib/remote.sh`, `git config nrese.buildHost`); a `measure`-only host runs
 binaries a build host made, with their source revision and SHA-256 recorded. What changes
 timings on a host (toolchain, CPU governor, profiling, page-cache control) is its `config`,
@@ -122,7 +127,7 @@ benches/
 ├── PROTOCOL.md          the rules: fairness, correctness first, repetitions, statistics, records, publishing
 ├── CATALOG.md           the benchmarks per field: what each measures, its cost, core / representative / later
 ├── STATUS.md            generated: coverage matrix, tier tables, gaps, problems, runs
-├── hosts.toml           the hosts, their roles, the verified inputs
+├── hosts.toml           the verified inputs, volumes and caches; the hosts are in the private overlay
 ├── runs/                one record per run (committed)
 ├── baselines/           committed NRESE reference numbers the regression gates compare against
 ├── cases/               every case, a file per group, one schema (cases/README.md)
@@ -246,8 +251,12 @@ each file checked against its pin (`sha256`, or `rdfc_sha256` for a file whose m
 blank nodes afresh) before it is kept, and asks for what its makers need (`docker`); only a file
 no maker here makes still needs the verified bench assets (`has = ["owlrs-bench-assets"]`). Answers come before time: compete captures
 every answer, a timed `suite.py run` must ask for them (`--answers full`).
-`suite/measurement_queue.py` and the kits' `jobs/*.toml` are the queue that came before the fleet; they
-aren't used any more.
+The kits' job files were written for the measurement queue that came before the fleet; they
+aren't used any more, and are in the private overlay (its `jobs/KIT/`). So are our hosts' run
+records from before the reset (`runs/`), their fast baselines (`baselines/fast/`) and the A-A'
+noise floors (`noise-floor/`): with `NRESE_BENCH_PRIVATE` set, the suite reads and writes them
+there. A fleet job reads the overlay's hosts and floors from its environment, put there by the
+machine that wrote it.
 
 ## A run, step by step
 
@@ -261,14 +270,15 @@ run        suite/batch.sh NAME -- ARGS [-- ARGS]  from a worktree of HEAD; write
                                                   logs/         per pair and repetition
 check      suite.py report suite/results/NAME   tables (restricted systems left out)
            suite.py compare BASE NEW            regressions and changed answers against a baseline run
-record     suite.py ledger suite/results/NAME   writes runs/NAME.toml; then fill in purpose, cases, findings
-           suite.py status --write              regenerates STATUS.md
+record     suite.py ledger suite/results/NAME   writes runs/NAME.toml (the overlay's runs/ for private results); then fill in
+                                                purpose, cases, findings
+           suite.py status --write              regenerates STATUS.md (from runs/ here)
 commit     runs/NAME.toml and STATUS.md         never the raw results
 clean      batch.sh: containers, stores, scratch go; datasets stay until the results are concluded
 ```
 
 On a host with preserved inputs, pass them with `--data` (the path from
-[hosts.toml](hosts.toml)) and `--skip-build` with the binaries named in the host's
+the overlay's `hosts.toml`) and `--skip-build` with the binaries named in the host's
 `nrese-bench.env`; `--data DIR` skips a missing input instead of preparing it. Neither
 `batch.sh` nor `scripts/bench-cleanup.sh` may manage preserved inputs or another
 campaign's resources: both clean by name and on low disk.
@@ -281,7 +291,7 @@ campaign's resources: both clean by name and on low disk.
   2. Its data and queries in a kit.
   3. A plan in `suite/suitekit/workloads.py` (then `state = "ready"`), or a kit driver that writes a run record.
 - A fast case: [fast/README.md](fast/README.md#adding-a-case).
-- A host: an entry in `hosts.toml`; its inputs verified against the preservation receipts before first use.
+- A host: an entry in the private overlay's `hosts.toml`; its inputs verified against the preservation receipts before first use.
 - A capability: add it to `CAPABILITIES` in `suite.py` and to the vocabulary at the top of `systems.toml`.
 
 `suite.py --check` validates the registries. The hooks don't run benchmarks: they run in

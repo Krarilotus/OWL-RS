@@ -450,8 +450,8 @@ cases, each 10-300 s, all of them in under an hour on the development machine, r
 performance ([fast/README.md](fast/README.md)). Each case is one bottleneck, on generated
 data with a fixed seed or a pinned file, checked before its time counts, with time and
 peak memory under a memory cap and, where a plan or engine path should handle it, that
-path asserted. Results go to `baselines/fast/` and are compared beyond a confidence
-interval.
+path asserted. Results go to `baselines/fast/` (our hosts' to the private overlay's) and are
+compared beyond a confidence interval.
 
 **Who runs a case**:
 - **NRESE runs every case:** every reasoning profile (rdfs, rdfs-full, rdfs-plus,
