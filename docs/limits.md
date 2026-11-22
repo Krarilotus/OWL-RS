@@ -38,6 +38,8 @@ come with. What is in is on
 - `HAVING` may name a `SELECT` alias, an extension ([why](ops/http-api.md#sparql)). For
   a query that runs the same on other stores, repeat the aggregate:
   `HAVING (COUNT(?x) > 1)`.
+- Integers of any size order and compare by value, but arithmetic (`+`, `-`, `*`, `/`, `SUM`,
+  `AVG`) on an integer beyond signed 64 bits is an overflow error (unbound), never a wrong number.
 - A default graph merged from several graphs keeps a blank node they share as one node,
   where SPARQL's RDF merge keeps them apart ([why](ops/http-api.md#sparql)). No setting
   gives the standard merge. Where it matters, read with `GRAPH ?g { … }` and keep `?g` in
