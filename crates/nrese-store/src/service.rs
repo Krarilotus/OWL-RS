@@ -407,10 +407,21 @@ impl StoreService {
 
     /// Installs `state`'s certificate on the current version under `tx`'s writer slot, with
     /// the certified stack's reading: the open, and a change of the QL setting or the mode,
-    /// whose new certificate keeps the current one's QL schema where its closure is the same.
-    fn certify(&self, tx: &nrese_engine::Transaction<'_>, state: crate::ReasoningState) {
+    /// whose new certificate keeps the current one's QL schema where its closure is the same,
+    /// and its mark of a literal equality ([`Self::with_literal_equality`]), on the state kept
+    /// in memory too: a version made without a certificate (rules other than its own) keeps
+    /// it for the next.
+    fn certify(&self, tx: &nrese_engine::Transaction<'_>, mut state: crate::ReasoningState) {
         let writer = tx.writer().expect("a transaction holds the writer slot");
-        let kept = Certificate::of(tx.base()).and_then(|c| c.ql.clone());
+        let base = Certificate::of(tx.base());
+        if base.is_some_and(|c| c.state.literal_equality) {
+            state.literal_equality = true;
+            let mut kept = self.materialised.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(kept) = kept.as_mut() {
+                kept.literal_equality = true;
+            }
+        }
+        let kept = base.and_then(|c| c.ql.clone());
         let reading = self.note_equality(writer, &state);
         let certificate = self.vouches(&state).then(|| self.certificate(state, kept));
         tx.install(reading, certificate);
@@ -739,24 +750,15 @@ impl StoreService {
     /// `certificate` with its state marked as the rules equating a literal with another term
     /// ([`crate::ReasoningState::literal_equality`]), for the version of a commit that derived
     /// such a fact; the same object where it is marked already or isn't this store's. The
-    /// state kept in memory is marked too, under the writer slot, so a certificate made again
-    /// (a change of the mode or the QL setting, which waits for the slot) keeps the mark; the
-    /// second value says whether it was, for [`Self::unmark_literal_equality`] if the commit
-    /// fails. The marker on disk isn't changed (an open finds the equality again,
-    /// [`Self::literal_equality_at_open`]).
+    /// version's certificate is the mark's one place: a commit that fails publishes none, so
+    /// it leaves nothing to take back, and a certificate made again takes the mark from the
+    /// version's ([`Self::certify`]). The marker on disk isn't changed (an open finds the
+    /// equality again, [`Self::literal_equality_at_open`]).
     pub(crate) fn with_literal_equality(
-        &self,
-        _writer: nrese_engine::WriterHeld<'_>,
         certificate: nrese_engine::Certificate,
-    ) -> (nrese_engine::Certificate, bool) {
-        let mut kept_marked = false;
+    ) -> nrese_engine::Certificate {
         let marked = match certificate.downcast_ref::<Certificate>() {
             Some(held) if !held.state.literal_equality => {
-                let mut kept = self.materialised.lock().unwrap_or_else(|p| p.into_inner());
-                if let Some(kept) = kept.as_mut().filter(|kept| !kept.literal_equality) {
-                    kept.literal_equality = true;
-                    kept_marked = true;
-                }
                 let state = crate::ReasoningState {
                     literal_equality: true,
                     ..held.state.clone()
@@ -771,16 +773,7 @@ impl StoreService {
             }
             _ => None,
         };
-        (marked.unwrap_or(certificate), kept_marked)
-    }
-
-    /// Takes back the mark [`Self::with_literal_equality`] put on the state kept in memory,
-    /// for a commit that failed: no version holds its equality.
-    pub(crate) fn unmark_literal_equality(&self) {
-        let mut kept = self.materialised.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(kept) = kept.as_mut() {
-            kept.literal_equality = false;
-        }
+        marked.unwrap_or(certificate)
     }
 
     /// Whether the rules of `state` equate a literal with another term over the statements
