@@ -271,9 +271,9 @@ class FleetFollow(push.Repo):
         """Spec (22 Nov, the gate's start window): a start time the waiter couldn't read (none, null,
         malformed, or the answer of a status call that failed, however good) is never taken as fitting:
         the fixed window holds, and the job is cancelled when it ends, with no verdict. Here the window is
-        3 s and the job would start after 6 s, inside what a start expected 10 s on (a 1 min estimate,
-        a 120 s limit) would hold open."""
-        fits = pending(expected_start=expected(10), basis="its reservation")
+        3 s and the job would start after 6 s, well inside what a start expected 30 s on (a 1 min
+        estimate, a 120 s limit) would hold open."""
+        fits = pending(expected_start=expected(30), basis="its reservation")
         for name, replies in (
                 ("none", [f"+1 {pending()}"] * 6),
                 ("null", [f"+1 {pending(expected_start=None, basis='not estimated')}"] * 6),
