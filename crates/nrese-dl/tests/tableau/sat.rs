@@ -157,8 +157,26 @@ fn merges_carry_their_dependencies() {
 
 /// Random 3-SAT through nominals, around the hard ratio of clauses to variables, against
 /// brute force: every merge choice and its backtracking.
+/// By default (tier unset or `landing`, with no seed or count), this test checks pinned satisfiable and unsatisfiable cases at every size. With `NRESE_CHECK_TIER=nightly`, `NRESE_FUZZ_SEED` or `NRESE_FUZZ_CASES`, it checks 60 rounds.
 #[test]
 fn random_sat_through_nominals() {
+    const SIZES: [u8; 4] = [4, 5, 6, 7];
+    // Round 0 catches a fault that refutes a satisfiable case by abandoning backtracking.
+    let witnesses = [
+        (0, true),
+        (1, true),
+        (2, false),
+        (3, false),
+        (6, true),
+        (7, true),
+        (13, false),
+        (24, false),
+    ];
+    // Replay the fixed rounds with the tier unset or `landing`, with no seed or count.
+    let pinned = !crate::support::nightly()
+        && std::env::var_os("NRESE_FUZZ_SEED").is_none()
+        && std::env::var_os("NRESE_FUZZ_CASES").is_none();
+    let cases = if pinned { 25 } else { 60 };
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
     let mut next = |n: u64| {
         state ^= state << 13;
@@ -166,8 +184,9 @@ fn random_sat_through_nominals() {
         state ^= state << 17;
         state % n
     };
-    for round in 0..60 {
-        let vars = 4 + (round % 4) as u8;
+    let mut covered = std::collections::BTreeSet::new();
+    for round in 0..cases {
+        let vars = SIZES[round % SIZES.len()];
         let count = (f64::from(vars) * 4.3) as usize + next(5) as usize - 2;
         let clauses: Vec<Vec<i8>> = (0..count)
             .map(|_| {
@@ -179,6 +198,22 @@ fn random_sat_through_nominals() {
                     .collect()
             })
             .collect();
-        check(vars, &clauses, false);
+        if !pinned {
+            check(vars, &clauses, false);
+        } else if let Some(&(_, expected)) = witnesses.iter().find(|&&(i, _)| i == round) {
+            check(vars, &clauses, false);
+            assert_eq!(satisfiable(vars, &clauses), expected, "witness {round}");
+            covered.insert((vars, expected));
+        }
+    }
+    if pinned {
+        for vars in SIZES {
+            for verdict in [false, true] {
+                assert!(
+                    covered.contains(&(vars, verdict)),
+                    "{vars} variables, {verdict}"
+                );
+            }
+        }
     }
 }

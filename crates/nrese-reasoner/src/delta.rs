@@ -54,7 +54,7 @@ use super::eval::{
 };
 use super::ir::Triple;
 use super::ir::{Head, Rule};
-use super::lists::{ListDiagnostic, ListVocabulary, instantiate};
+use super::lists::{ListDiagnostic, ListVocabulary, Predicates, RuleKind, internal};
 use super::violations::{Violations, unlimited};
 
 /// The materialised state: asserted facts after the change, and inferred facts before it.
@@ -213,12 +213,18 @@ pub struct Rules<'a> {
 impl Rules<'_> {
     /// The ground program over `source`; its bodiless facts count as handed out. List
     /// rules carry the list facts they come from as premises.
-    fn program<B: Base + ?Sized>(&self, source: &Overlay<'_, B>) -> GroundProgram {
+    fn program<S: Source + ?Sized>(
+        &self,
+        source: &S,
+        predicates: Predicates,
+        poll: &Poller<'_>,
+    ) -> GroundProgram {
         let mut program = GroundProgram::default();
+        program.list_predicates = predicates;
         program.ground(source, self.schema, self.rules);
-        // The overlays a program is ground over hold in `extra` only the facts a change
-        // deleted (the state before it), never inferred ones.
-        if let Some((rules, premises, diagnostics)) = self.read_lists(source, Some(source.extra)) {
+        if let Some((rules, premises, diagnostics)) =
+            self.read_lists(source, &mut program.list_predicates, poll)
+        {
             program.ground_with_premises(source, self.schema, &rules, &premises);
             program.list_diagnostics = diagnostics;
         }
@@ -226,37 +232,33 @@ impl Rules<'_> {
         program
     }
 
-    /// The list rules (both kinds) instantiated over `source`. Overdeletion compares the
-    /// inference rules alone: the closure's reading, which a reading as written adds nothing
-    /// to ([`Self::read_lists`]).
-    fn list_rules<S: Source + ?Sized>(&self, source: &S) -> Vec<Rule> {
+    /// The list rules instantiated over `source` for overdeletion.
+    fn list_rules<S: Source + ?Sized>(
+        &self,
+        source: &S,
+        mut predicates: Predicates,
+        poll: &Poller<'_>,
+    ) -> Vec<Rule> {
         #[cfg(test)]
         crate::witness::add(crate::witness::Site::ListRules, 1);
-        self.lists
-            .map(|vocabulary| instantiate(vocabulary, &AllFacts(source)).0)
+        self.read_lists(source, &mut predicates, poll)
+            .map(|(rules, _, _)| rules)
             .unwrap_or_default()
     }
 
-    /// The list rules over `source`, with the list facts each comes from, and the lists left
-    /// out ([`super::lists::instantiate_written`]). A list past the cap over `source` is read
-    /// as written as well: over the asserted facts of `source.base` that `source` doesn't
-    /// hide, and `deleted`, asserted before a change where `source` is the state before it.
-    /// Every grounding of list rules reads them here, so all read them alike.
-    fn read_lists<B: Base + ?Sized>(
+    /// The list rules over `source`, their premises, and the lists left out.
+    fn read_lists<S: Source + ?Sized>(
         &self,
-        source: &Overlay<'_, B>,
-        deleted: Option<&Store>,
+        source: &S,
+        predicates: &mut Predicates,
+        poll: &Poller<'_>,
     ) -> Option<ListRules> {
-        let written = Written {
-            base: source.base,
-            hidden: source.hidden,
-            deleted,
-        };
         let vocabulary = self.lists?;
-        Some(super::lists::instantiate_written(
+        Some(super::lists::compile(
             vocabulary,
-            &AllFacts(source),
-            Some(&written),
+            &AllFacts(source, poll),
+            predicates,
+            RuleKind::All,
         ))
     }
 
@@ -292,10 +294,7 @@ pub struct Update {
     /// List axioms the change left uninstantiable (malformed, cyclic, oversized) that
     /// weren't before.
     pub diagnostics: Vec<super::lists::ListDiagnostic>,
-    /// Whether the change reads an axiom's list otherwise: one left out after it that was
-    /// read before, read after it that was left out before, or left out for another reason
-    /// ([`super::lists::ListProblem::kind`]). The rules such a list gives, or gave, aren't
-    /// the ones the program before held, so the delta can't follow them.
+    /// Whether any list goes between having an accepting walk and having none.
     pub lists_read_otherwise: bool,
     pub rounds: usize,
     /// Time per phase: program, overdelete, rederive, insert, consistency.
@@ -328,6 +327,7 @@ struct Overlay<'a, B: Base + ?Sized> {
     base: &'a B,
     hidden: &'a HashSet<Triple>,
     extra: &'a Store,
+    table: Option<&'a Store>,
 }
 
 impl<B: Base + ?Sized> Overlay<'_, B> {
@@ -339,45 +339,6 @@ impl<B: Base + ?Sized> Overlay<'_, B> {
 /// List rules, the list facts each comes from, and the lists left out.
 type ListRules = (Vec<Rule>, Vec<Vec<[u64; 3]>>, Vec<ListDiagnostic>);
 
-/// The asserted facts of a state over `base`, for list instantiation, which is grounding: run
-/// to its end. The base's asserted facts (after the change) it doesn't hide, and `deleted`.
-struct Written<'a, B: Base + ?Sized> {
-    base: &'a B,
-    hidden: &'a HashSet<Triple>,
-    deleted: Option<&'a Store>,
-}
-
-impl<B: Base + ?Sized> Written<'_, B> {
-    fn matching(&self, pattern: [Option<u64>; 3]) -> Vec<Triple> {
-        let poll = Poller::never();
-        let mut out = Vec::new();
-        if let Some(deleted) = self.deleted {
-            (deleted.scan(pattern, Seg::All, &poll, &mut |t| out.push(t))).expect("never stopped");
-        }
-        let scanned = self.base.scan_asserted(pattern, &poll, &mut |t| {
-            if !self.hidden.contains(&t) {
-                out.push(t);
-            }
-        });
-        scanned.expect("never stopped");
-        out.sort_unstable();
-        out.dedup();
-        out
-    }
-}
-
-impl<B: Base + ?Sized> super::lists::Facts for Written<'_, B> {
-    fn objects(&self, subject: u64, predicate: u64) -> Vec<u64> {
-        let found = self.matching([Some(subject), Some(predicate), None]);
-        found.into_iter().map(|t| t[2]).collect()
-    }
-
-    fn pairs(&self, predicate: u64) -> Vec<(u64, u64)> {
-        let found = self.matching([None, Some(predicate), None]);
-        found.into_iter().map(|t| (t[0], t[2])).collect()
-    }
-}
-
 /// Reads count on the base's and the extra store's (each position they visit), and each
 /// base fact's check against the overlay on the extra store's probe.
 impl<B: Base + ?Sized> Visits for Overlay<'_, B> {
@@ -386,6 +347,15 @@ impl<B: Base + ?Sized> Visits for Overlay<'_, B> {
         self.extra.visit(pattern, seg, visit);
         if seg != Seg::Delta && !visit.stopped() {
             let poll = visit.poller();
+            if pattern[1].is_some_and(internal) {
+                if let Some(table) = self.table {
+                    visit.kept(
+                        |fact| self.in_base(fact, poll) == Ok(true),
+                        |inner| table.visit(pattern, Seg::All, inner),
+                    );
+                }
+                return;
+            }
             // The base's scan counts each position it visits on this visit's poller; a check
             // its poller stopped delivers nothing, and the scan ends at its next position.
             // Stopped, the read around this visit answers `Stopped` (the poller is latched).
@@ -417,6 +387,13 @@ impl<B: Base + ?Sized> Visits for Overlay<'_, B> {
     ) -> Result<usize, Stopped> {
         let seg = seg.plain();
         let extra = self.extra.size(pattern, seg, probe)?;
+        if pattern[1].is_some_and(internal) {
+            let held = match self.table.filter(|_| seg != Seg::Delta) {
+                Some(table) => table.size(pattern, Seg::All, probe)?,
+                None => 0,
+            };
+            return Ok(extra.saturating_add(held));
+        }
         Ok(match seg {
             // The base's estimate saturates (`Snapshot::count_in`), so the sum does too.
             Seg::Old | Seg::All => {
@@ -428,18 +405,130 @@ impl<B: Base + ?Sized> Visits for Overlay<'_, B> {
 
     fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, Stopped> {
         Ok(self.extra.holds(fact, probe)?
-            || (!self.hidden.contains(&fact) && self.base.contains(fact, probe.poller())?))
+            || (!self.hidden.contains(&fact)
+                && if internal(fact[1]) {
+                    table_contains(self.table, fact, probe.poller())?
+                } else {
+                    self.base.contains(fact, probe.poller())?
+                }))
     }
 }
 
 /// The ground program of the materialised state `base`: the cache [`update`] takes.
 pub fn program<B: Base + ?Sized>(base: &B, rules: Rules<'_>) -> GroundProgram {
+    program_until(base, rules, NEVER).expect("unbounded grounding")
+}
+
+pub(crate) fn program_until<B: Base + ?Sized>(
+    base: &B,
+    rules: Rules<'_>,
+    stop: Stop<'_>,
+) -> Result<GroundProgram, Stopped> {
     let (hidden, extra) = (HashSet::new(), Store::default());
-    rules.program(&Overlay {
+    let source = Overlay {
         base,
         hidden: &hidden,
         extra: &extra,
-    })
+        table: None,
+    };
+    let stage = Poller::new(stop).ok_or(Stopped)?;
+    let mut program = rules.program(&source, Predicates::default(), &stage);
+    stage.ended()?;
+    program.table = rebuild_table(&program, &source, stop)?;
+    if stop() {
+        return Err(Stopped);
+    }
+    Ok(program)
+}
+
+fn table_contains(table: Option<&Store>, fact: Triple, poll: &Poller<'_>) -> Result<bool, Stopped> {
+    table.map_or(Ok(false), |table| table.contains(fact, poll))
+}
+
+/// Ground rules can read private relations by their reserved predicate. A
+/// variable-predicate read over RDF facts never ranges over them.
+pub(crate) struct TableSource<'a, S: ?Sized> {
+    pub(crate) source: &'a S,
+    pub(crate) table: Option<&'a Store>,
+}
+
+impl<S: Source + ?Sized> Visits for TableSource<'_, S> {
+    fn visit(&self, pattern: [Option<u64>; 3], seg: Seg, visit: &mut Visit<'_, '_>) {
+        if pattern[1].is_some_and(internal) {
+            if let Some(table) = self.table {
+                table.visit(pattern, seg, visit);
+            }
+        } else {
+            let read = self.source.scan(pattern, seg, visit.poller(), &mut |fact| {
+                visit.counted(fact)
+            });
+            debug_assert!(read.is_ok() || visit.stopped());
+        }
+    }
+
+    fn size(
+        &self,
+        pattern: [Option<u64>; 3],
+        seg: Seg,
+        probe: Probe<'_, '_>,
+    ) -> Result<usize, Stopped> {
+        if pattern[1].is_some_and(internal) {
+            self.table
+                .map_or(Ok(0), |table| table.size(pattern, seg, probe))
+        } else {
+            self.source.estimate(pattern, seg, probe.poller())
+        }
+    }
+
+    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, Stopped> {
+        if internal(fact[1]) {
+            table_contains(self.table, fact, probe.poller())
+        } else {
+            self.source.contains(fact, probe.poller())
+        }
+    }
+}
+
+fn rebuild_table<S: Source + ?Sized>(
+    program: &GroundProgram,
+    source: &S,
+    stop: Stop<'_>,
+) -> Result<Option<Arc<Store>>, Stopped> {
+    if program.table_rules.is_empty() {
+        return Ok(None);
+    }
+    let stage = Poller::new(stop).ok_or(Stopped)?;
+    let mut table = Store::default();
+    let mut initial = true;
+    loop {
+        let state = TableSource {
+            source,
+            table: Some(&table),
+        };
+        let mut jobs = Vec::new();
+        if initial {
+            for &rule in &program.table_rules {
+                jobs.extend(Job::full(&state, &program.rules[rule], &stage)?);
+            }
+            initial = false;
+        } else {
+            for (rule, atom) in program.variants(&table, &stage)? {
+                if program.table_rules.binary_search(&rule).is_ok() {
+                    jobs.extend(Job::variant(&state, &program.rules[rule], atom, &stage)?);
+                }
+            }
+        }
+        let candidates = run_jobs(
+            &state,
+            &jobs,
+            &|fact, poll| Ok(!state.contains(fact, poll)?),
+            stop,
+        )?;
+        stage.ended()?;
+        if table.advance(candidates).is_empty() {
+            return Ok(Some(Arc::new(table)));
+        }
+    }
 }
 
 /// Maintains the materialisation of `base` under `rules` for a change of the asserted
@@ -637,15 +726,26 @@ fn update_body<B: Base + ?Sized>(
     let inserted_set: HashSet<Triple> = inserted.iter().copied().collect();
     // The ground program of the old state: `base` without the inserted facts, plus the
     // deleted ones.
-    let computed: Option<GroundProgram> = cache.is_none().then(|| {
-        let extra = Store::new(deleted.to_vec());
-        rules.program(&Overlay {
-            base,
-            hidden: &inserted_set,
-            extra: &extra,
+    let computed: Option<GroundProgram> = cache
+        .is_none()
+        .then(|| {
+            let extra = Store::new(deleted.to_vec());
+            let before = Overlay {
+                base,
+                hidden: &inserted_set,
+                extra: &extra,
+                table: None,
+            };
+            let mut program = rules.program(&before, Predicates::default(), &stage);
+            stage.ended()?;
+            program.table = rebuild_table(&program, &before, stop)?;
+            Ok(program)
         })
-    });
+        .transpose()
+        .map_err(stopped)?;
     let old_program: &GroundProgram = cache.or(computed.as_ref()).expect("one of them");
+    let table = old_program.table.as_deref();
+    let predicates = || old_program.list_predicates.clone();
     // The ground rules that are non-recursive ([`super::recursion`]): a candidate for
     // overdeletion that one of them still derives in one step from what is left keeps
     // that derivation (its premises are below it: if one goes later in the commit, its
@@ -660,6 +760,7 @@ fn update_body<B: Base + ?Sized>(
             base,
             hidden: &inserted_set,
             extra: &Store::new(deleted.to_vec()),
+            table,
         };
         // A partner read a stop cut short ends the update: the keys asked about are the
         // grounded rules', which grow with the schema.
@@ -717,6 +818,7 @@ fn update_body<B: Base + ?Sized>(
                 base,
                 hidden: &inserted_set,
                 extra: &extra,
+                table,
             };
             // Instances through a deleted schema fact, known or not, in full.
             let mut scratch = GroundProgram::default();
@@ -748,9 +850,13 @@ fn update_body<B: Base + ?Sized>(
                     base,
                     hidden: &gone,
                     extra: &empty,
+                    table,
                 };
-                let current: HashSet<RuleKey> =
-                    rules.list_rules(&now).iter().map(rule_key).collect();
+                let current: HashSet<RuleKey> = rules
+                    .list_rules(&now, predicates(), &stage)
+                    .iter()
+                    .map(rule_key)
+                    .collect();
                 // A stop asked during that extraction is seen before the next one.
                 check_stop()?;
                 let old_lists = old_lists.get_or_insert_with(|| {
@@ -760,9 +866,10 @@ fn update_body<B: Base + ?Sized>(
                         base,
                         hidden: &inserted_set,
                         extra: &at_start,
+                        table,
                     };
                     rules
-                        .list_rules(&old)
+                        .list_rules(&old, predicates(), &stage)
                         .into_iter()
                         .filter(|r| r.head != Head::Inconsistent)
                         .collect()
@@ -903,10 +1010,12 @@ fn update_body<B: Base + ?Sized>(
             }
             // Only inferred facts of the old state are overdeleted; asserted ones stay.
             let overdeletable = |f: Triple, poll: &Poller<'_>| -> Result<bool, Stopped> {
-                Ok(base.contains(f, poll)?
-                    && !base.is_asserted(f, poll)?
-                    && !extra.contains(f, poll)?
-                    && !inserted_set.contains(&f))
+                let inferred = if internal(f[1]) {
+                    table_contains(table, f, poll)?
+                } else {
+                    base.contains(f, poll)? && !base.is_asserted(f, poll)?
+                };
+                Ok(inferred && !extra.contains(f, poll)? && !inserted_set.contains(&f))
             };
             let mut candidates =
                 run_jobs_acyclic(&old, &jobs, &overdeletable, stop).map_err(stopped)?;
@@ -922,7 +1031,9 @@ fn update_body<B: Base + ?Sized>(
                     candidates.push(f);
                 }
             }
-            candidates.retain(|&f| !mentions(&region, f));
+            // Only RDF facts are bulk-overdeleted with the equality region.
+            // Table facts still need to follow their deleted premises.
+            candidates.retain(|&f| internal(f[1]) || !mentions(&region, f));
             drop(jobs);
             // Equalities about to be overdeleted (their premises gone) may split classes
             // too: the policy may recompute them, from the start.
@@ -971,6 +1082,7 @@ fn update_body<B: Base + ?Sized>(
                     base,
                     hidden: &gone,
                     extra: &empty,
+                    table,
                 };
                 candidates.sort_unstable();
                 candidates.dedup();
@@ -1052,13 +1164,22 @@ fn update_body<B: Base + ?Sized>(
         .iter()
         .chain(&overdeleted)
         .any(|&f| rules.is_program_fact(f));
+    let mut lists_changed = deleted
+        .iter()
+        .chain(&overdeleted)
+        .any(|&f| rules.is_list_fact(f));
     let settle = |unsettled: &HashSet<Triple>| -> Cow<'_, GroundProgram> {
         if program_changed {
-            Cow::Owned(rules.program(&Overlay {
-                base,
-                hidden: unsettled,
-                extra: &empty,
-            }))
+            Cow::Owned(rules.program(
+                &Overlay {
+                    base,
+                    hidden: unsettled,
+                    extra: &empty,
+                    table,
+                },
+                predicates(),
+                &stage,
+            ))
         } else {
             Cow::Borrowed(old_program)
         }
@@ -1086,6 +1207,7 @@ fn update_body<B: Base + ?Sized>(
                 base,
                 hidden: &unsettled,
                 extra: &empty,
+                table,
             };
             let not_equality: Vec<bool> = program
                 .equality
@@ -1163,11 +1285,12 @@ fn update_body<B: Base + ?Sized>(
         base,
         hidden: &unsettled,
         extra: &empty,
+        table,
     };
     let candidates: Vec<Triple> = overdeleted
         .iter()
         .copied()
-        .filter(|f| !mentions(&region, *f))
+        .filter(|f| internal(f[1]) || !mentions(&region, *f))
         .chain(deleted.iter().copied())
         .collect();
     let settled: &GroundProgram = &program;
@@ -1181,7 +1304,7 @@ fn update_body<B: Base + ?Sized>(
             |poll, fact| -> Result<Option<Triple>, Stopped> {
                 let poll = poll.as_ref().ok_or(Stopped)?;
                 let recloses = recloses.contains(&fact[1]);
-                Ok((!base.is_asserted(fact, poll)?
+                Ok(((internal(fact[1]) || !base.is_asserted(fact, poll)?)
                     && settled.derivable_with(&remaining, fact, !recloses, stop)?)
                 .then_some(fact))
             },
@@ -1211,6 +1334,7 @@ fn update_body<B: Base + ?Sized>(
             base,
             hidden: &hidden,
             extra: &extra,
+            table,
         };
         // Instances through new schema facts, and list rules from new list facts. They
         // are appended, so the new ones are `evaluated..`.
@@ -1227,10 +1351,13 @@ fn update_body<B: Base + ?Sized>(
         if delta_facts.iter().any(|&f| schema.is_schema_fact(f)) {
             program.to_mut().ground_delta(&state, schema, &schema_rules);
         }
-        if delta_facts.iter().any(|&f| rules.is_list_fact(f))
-            && let Some((list_rules, premises, diagnostics)) = rules.read_lists(&state, None)
-        {
+        if rules.lists.is_some() && delta_facts.iter().any(|&f| rules.is_list_fact(f)) {
+            lists_changed = true;
             let program = program.to_mut();
+            let (list_rules, premises, diagnostics) = rules
+                .read_lists(&state, &mut program.list_predicates, &stage)
+                .expect("list vocabulary");
+            stage.ended().map_err(stopped)?;
             program.ground_with_premises(&state, schema, &list_rules, &premises);
             program.list_diagnostics = diagnostics;
         }
@@ -1307,6 +1434,12 @@ fn update_body<B: Base + ?Sized>(
     extra
         .scan([None, None, None], Seg::All, &stage, &mut |f| added.push(f))
         .map_err(stopped)?;
+    let mut internal_added = Vec::new();
+    if !program.table_rules.is_empty() {
+        extra
+            .scan_table(&stage, |fact| internal_added.push(fact))
+            .map_err(stopped)?;
+    }
     added.sort_unstable();
     added.dedup();
     // Two probes per added fact, on the stage's poller; the first that finds it stopped ends
@@ -1331,7 +1464,7 @@ fn update_body<B: Base + ?Sized>(
     result.remove = overdeleted
         .iter()
         .copied()
-        .filter(|f| !kept.contains(f) && !put_back.contains(f))
+        .filter(|f| !internal(f[1]) && !kept.contains(f) && !put_back.contains(f))
         .collect();
     result.remove.sort_unstable();
     result.policy.plan = if region.is_empty() {
@@ -1359,6 +1492,7 @@ fn update_body<B: Base + ?Sized>(
         base,
         hidden: &hidden,
         extra: &fresh,
+        table,
     };
     // When phase 2 borrows the old program, phase 3 only appends instances.
     let first_full = if program_changed {
@@ -1393,6 +1527,7 @@ fn update_body<B: Base + ?Sized>(
             base,
             hidden: &inserted_set,
             extra: deleted_facts.get_or_init(|| Store::new(deleted.to_vec())),
+            table,
         },
         memory,
         operation,
@@ -1423,13 +1558,42 @@ fn update_body<B: Base + ?Sized>(
         .filter(|d| !old_program.list_diagnostics.contains(d))
         .copied()
         .collect();
-    let reading = |p: &GroundProgram| -> HashSet<(u64, u64, u64, &'static str)> {
+    let reading = |p: &GroundProgram| -> HashSet<(u64, u64, u64)> {
         (p.list_diagnostics.iter())
-            .map(|d| (d.subject, d.predicate, d.head, d.problem.kind()))
+            .map(|d| (d.subject, d.predicate, d.head))
             .collect()
     };
     result.lists_read_otherwise =
         matches!(program, Cow::Owned(_)) && reading(&program) != reading(old_program);
+    if lists_changed && (!old_program.table_rules.is_empty() || !program.table_rules.is_empty()) {
+        // Temporary programs grow monotonically through insertion rounds.
+        // Reground where a per-cell rule can need retiring or its table can
+        // change. Enumerated additions already grew the program above.
+        let state = Overlay {
+            base,
+            hidden: &hidden,
+            extra: &extra,
+            table: None,
+        };
+        let mut current = rules.program(&state, program.list_predicates.clone(), &stage);
+        stage.ended().map_err(stopped)?;
+        current.table = rebuild_table(&current, &state, stop).map_err(stopped)?;
+        program = Cow::Owned(current);
+    } else if !internal_added.is_empty() || overdeleted.iter().any(|fact| internal(fact[1])) {
+        if let Some(table) = table {
+            table
+                .scan_table(&stage, |fact| {
+                    if !overdeleted.contains(&fact) || put_back.contains(&fact) {
+                        internal_added.push(fact);
+                    }
+                })
+                .map_err(stopped)?;
+        }
+        check_stop()?;
+        program.to_mut().table = Some(Arc::new(Store::new(internal_added)));
+    } else if matches!(program, Cow::Owned(_)) {
+        program.to_mut().table = old_program.table.clone();
+    }
     result.program = match program {
         Cow::Owned(program) => Some(program),
         Cow::Borrowed(_) => None,
@@ -1445,14 +1609,14 @@ fn old_witness_filter<'a, S: Source>(
     before: impl Fn() -> S + 'a,
     memory: &'a Budget,
     operation: &'a super::eval::OperationStop<'_>,
-) -> impl Fn(&str, &[Option<u64>], &Poller<'_>) -> Result<bool, Stopped> + 'a {
+) -> impl Fn(&Rule, &[Option<u64>], &Poller<'_>) -> Result<bool, Stopped> + 'a {
     let old_witnesses = OnceCell::new();
-    move |name, bindings, poll| {
+    move |rule, bindings, poll| {
         let index = old_witnesses
             .get_or_init(|| WitnessIndex::new(program, memory, operation, poll).ok())
             .as_ref()
             .ok_or(Stopped)?;
-        index.contains(&before(), name, bindings, poll)
+        index.contains(&before(), rule, bindings, poll)
     }
 }
 
@@ -1487,14 +1651,24 @@ fn introduced_violations_body<B: Base + ?Sized>(
     memory: &Arc<Budget>,
 ) -> Result<Violations, Interrupted> {
     let stop: Stop<'_> = &|| operation.fired();
+    let stage = Poller::new(stop).ok_or_else(Interrupted::default)?;
     let inserted_set: HashSet<Triple> = inserted.iter().copied().collect();
     let empty = Store::default();
-    let before = || Overlay {
+    let before = Overlay {
         base,
         hidden: &inserted_set,
         extra: &empty,
+        table: None,
     };
-    let computed = cache.is_none().then(|| rules.program(&before()));
+    let computed = if cache.is_none() {
+        let mut program = rules.program(&before, Predicates::default(), &stage);
+        stage.ended().map_err(|Stopped| Interrupted::default())?;
+        program.table =
+            rebuild_table(&program, &before, stop).map_err(|Stopped| Interrupted::default())?;
+        Some(program)
+    } else {
+        None
+    };
     let old_program: &GroundProgram = cache.or(computed.as_ref()).expect("one of them");
     let settled_consistency = old_program.consistency.len();
     let mut new_facts: Vec<Triple> = inserted.iter().chain(derived).copied().collect();
@@ -1507,9 +1681,9 @@ fn introduced_violations_body<B: Base + ?Sized>(
         base,
         hidden: &hidden,
         extra: &fresh,
+        table: old_program.table.as_deref(),
     };
     let mut program: Cow<'_, GroundProgram> = Cow::Borrowed(old_program);
-    let stage = Poller::new(stop).ok_or_else(Interrupted::default)?;
     let mut delta_facts = Vec::new();
     fresh
         .scan([None, None, None], Seg::Delta, &stage, &mut |f| {
@@ -1524,10 +1698,12 @@ fn introduced_violations_body<B: Base + ?Sized>(
             .to_mut()
             .ground_delta(&state, rules.schema, &rules.schema_rules());
     }
-    if delta_facts.iter().any(|&f| rules.is_list_fact(f))
-        && let Some((list_rules, premises, diagnostics)) = rules.read_lists(&state, None)
-    {
+    if rules.lists.is_some() && delta_facts.iter().any(|&f| rules.is_list_fact(f)) {
         let program = program.to_mut();
+        let (list_rules, premises, diagnostics) = rules
+            .read_lists(&state, &mut program.list_predicates, &stage)
+            .expect("list vocabulary");
+        stage.ended().map_err(|Stopped| Interrupted::default())?;
         program.ground_with_premises(&state, rules.schema, &list_rules, &premises);
         program.list_diagnostics = diagnostics;
     }
@@ -1537,7 +1713,15 @@ fn introduced_violations_body<B: Base + ?Sized>(
         .into_iter()
         .filter(|&(c, _)| c < settled_consistency)
         .collect();
-    let was_present = old_witness_filter(old_program, before, memory, operation);
+    let was_present = old_witness_filter(
+        old_program,
+        || Overlay {
+            table: old_program.table.as_deref(),
+            ..before
+        },
+        memory,
+        operation,
+    );
     let exclude_old = (settled_consistency > 0 && settled_consistency < program.consistency.len())
         .then_some(&was_present as &super::batch::WitnessFilter<'_>);
     let mut found = Violations::new(Arc::clone(memory));
@@ -2216,9 +2400,150 @@ mod budget_tests {
     }
 
     /// Deletes can both enable a list check and change a long list's guard. Report the
-    /// witnesses introduced by the delete, even when the list's program is rebuilt.
+    /// witnesses introduced by the edit, even when the list's program is rebuilt.
+    /// The short case adds the only exit while removing the inferred back edge.
+    /// With an earlier exit, the accepting walk would already trigger Table 5 prp-adp.
     #[test]
     fn list_updates_report_only_introduced_witnesses() {
+        let mismatches = list_update_witnesses(&[
+            ("phase-2 list check", 2, false, (0, 1, 1)),
+            (
+                "changed long-list guard",
+                PAIRWISE_MEMBERS + 1,
+                true,
+                (1, 1, 0),
+            ),
+        ]);
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
+    /// The two-position exit of an accepting cycle already gives a prp-adp clash.
+    /// Removing the back edge or adding a separate plain list with the same pair
+    /// can add a short rule instance without introducing that clash.
+    #[test]
+    fn an_accepting_cycle_does_not_make_a_surviving_clash_new() {
+        let mismatches = list_update_witnesses(&[("old accepting cycle", 2, true, (2, 1, 0))]);
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
+    /// Table 5 prp-adp still has the same two property assertions after adding an
+    /// unused first. Neither the bulk insert report nor the bulk filter checking
+    /// the reverse, precomputed closure may count the pair as introduced.
+    #[test]
+    fn list_form_changes_keep_the_same_pair_in_the_bulk_witness_check() {
+        let mut vocab = LocalVocabulary::default();
+        let schema = Schema::owl(&mut vocab);
+        let lists = ListVocabulary::new(&mut vocab);
+        let [list, head, tail, q, a, b, m0] = ["list", "h", "t", "q", "a", "b", "m0"]
+            .map(|local| vocab.iri(&format!("http://example.org/{local}")));
+        let [first, rest, nil] =
+            ["first", "rest", "nil"].map(|local| vocab.iri(&format!("{}{local}", crate::ir::RDF)));
+        let [kind, members] = ["AllDisjointProperties", "members"]
+            .map(|local| vocab.iri(&format!("{}{local}", crate::ir::OWL)));
+        let mut asserted = vec![
+            [list, schema.rdf_type(), kind],
+            [list, members, head],
+            [head, rest, tail],
+            [tail, first, q],
+            [tail, rest, nil],
+            [a, m0, b],
+            [a, q, b],
+        ];
+        asserted
+            .extend((0..64).map(|i| [head, first, vocab.iri(&format!("http://example.org/m{i}"))]));
+        let extra = [head, first, vocab.iri("http://example.org/m64")];
+        let mut larger = asserted.clone();
+        larger.push(extra);
+        let rules = Rules {
+            rules: &[],
+            lists: Some(&lists),
+            schema: &schema,
+            equality: None,
+        };
+        let small = MemoryBase::new(&asserted, &[]);
+        let large = MemoryBase::new(&larger, &[]);
+        let stop = crate::eval::OperationStop::new(crate::eval::NEVER);
+        let memory = Arc::new(Budget::unlimited());
+        let mut errors = Vec::new();
+        for warm in [true, false] {
+            let cache = warm.then(|| program(&small, rules));
+            let grown =
+                introduced_violations(&large, &[extra], &[], rules, cache.as_ref(), &stop, &memory)
+                    .expect("the bulk insert witness check ran");
+            if !grown.consistent() {
+                errors.push(format!("bulk 64 to 65 warm={warm}: {:?}", grown.to_vec()));
+            }
+
+            // The 65th property can also clash with q on the same subject and
+            // object. The distinct pair is new even though the first pair is old.
+            let new_property_fact = [a, extra[2], b];
+            let mut additional = larger.clone();
+            additional.push(new_property_fact);
+            let new_pair = introduced_violations(
+                &MemoryBase::new(&additional, &[]),
+                &[extra, new_property_fact],
+                &[],
+                rules,
+                cache.as_ref(),
+                &stop,
+                &memory,
+            )
+            .expect("the bulk insert witness check ran");
+            if !new_pair.complete() || new_pair.at_least() != 1 {
+                errors.push(format!(
+                    "distinct new pair warm={warm}: {:?}",
+                    new_pair.to_vec()
+                ));
+            }
+
+            // The public bulk entry point accepts only inserts. For the reverse
+            // edit, run its consistency filter over the precomputed after state.
+            let old = match cache.as_ref() {
+                Some(small_program) => update(&large, &[extra], &[], rules, Some(small_program))
+                    .program
+                    .expect("the growth edit refreshed the ground program"),
+                None => program(&large, rules),
+            };
+            let after = program(&small, rules);
+            let empty = Store::default();
+            let hidden = HashSet::new();
+            let before = || Overlay {
+                base: &large,
+                hidden: &hidden,
+                extra: &empty,
+                table: old.table.as_deref(),
+            };
+            let filter = old_witness_filter(&old, before, &memory, &stop);
+            let state = Overlay {
+                base: &small,
+                hidden: &hidden,
+                extra: &empty,
+                table: after.table.as_deref(),
+            };
+            let mut found = Violations::new(Arc::clone(&memory));
+            check(
+                &state,
+                &after,
+                0..after.consistency.len(),
+                &[],
+                &mut found,
+                crate::eval::NEVER,
+                Some(&filter),
+            )
+            .unwrap();
+            if !found.consistent() {
+                errors.push(format!(
+                    "bulk filter 65 to 64 warm={warm}: {:?}",
+                    found.to_vec()
+                ));
+            }
+        }
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+    }
+
+    type ListWitnessCase<'a> = (&'a str, usize, bool, (usize, usize, usize));
+
+    fn list_update_witnesses(cases: &[ListWitnessCase<'_>]) -> Vec<String> {
         let mut vocab = LocalVocabulary::default();
         let schema = Schema::owl(&mut vocab);
         let lists = ListVocabulary::new(&mut vocab);
@@ -2238,10 +2563,7 @@ mod budget_tests {
         let members = vocab.iri("http://www.w3.org/2002/07/owl#members");
         let deleted = [root, p, marker];
         let mut mismatches = Vec::new();
-        for (scenario, len, witness_counts) in [
-            ("phase-2 list check", 2, (0, 1, 1)),
-            ("changed long-list guard", PAIRWISE_MEMBERS + 1, (1, 1, 0)),
-        ] {
+        for &(scenario, len, exit_before, witness_counts) in cases {
             let nodes: Vec<_> = (0..len)
                 .map(|i| vocab.iri(&format!("http://example.com/cell{i}")))
                 .collect();
@@ -2255,12 +2577,20 @@ mod budget_tests {
                 let branch = vocab.iri(&format!("http://example.com/branch{i}"));
                 asserted.push([branch, e, root]);
             }
+            let mut inserted = Vec::new();
+            let mut member_properties = Vec::new();
             for (i, &node) in nodes.iter().enumerate() {
                 let member = vocab.iri(&format!("http://example.com/member{i}"));
                 asserted.push([node, first, member]);
-                asserted.push([node, rest, nodes.get(i + 1).copied().unwrap_or(nil)]);
+                let edge = [node, rest, nodes.get(i + 1).copied().unwrap_or(nil)];
+                if !exit_before && i + 1 == len {
+                    inserted.push(edge);
+                } else {
+                    asserted.push(edge);
+                }
                 if i < 2 {
                     asserted.push([subject, member, object]);
+                    member_properties.push(member);
                 }
             }
             asserted.sort_unstable();
@@ -2288,12 +2618,54 @@ mod budget_tests {
             mismatches.extend(check_witnesses(
                 scenario,
                 &asserted,
-                &[],
+                &inserted,
                 deleted,
                 compiled,
                 witness_counts,
             ));
+            if len == 2 && exit_before {
+                // The bulk witness entry point only accepts insertions. Keep the cycle and
+                // add the same disjoint pair in the enumerated form as another list axiom.
+                let [plain, a, b] = ["plain", "plain0", "plain1"]
+                    .map(|local| vocab.iri(&format!("http://example.com/{local}")));
+                let extra = [
+                    [plain, schema.rdf_type(), adp],
+                    [plain, members, a],
+                    [a, first, member_properties[0]],
+                    [a, rest, b],
+                    [b, first, member_properties[1]],
+                    [b, rest, nil],
+                ];
+                let before = batch::materialise(&asserted, &rules, Some(&lists), &schema);
+                let mut after = asserted.clone();
+                after.extend(extra);
+                let base = MemoryBase::new(&after, &before.derived);
+                for threads in POOL_WIDTHS {
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()
+                        .unwrap();
+                    let reported = pool.install(|| {
+                        introduced_violations(
+                            &base,
+                            &extra,
+                            &[],
+                            compiled,
+                            None,
+                            &crate::eval::OperationStop::new(crate::eval::NEVER),
+                            &Arc::new(Budget::unlimited()),
+                        )
+                        .expect("never stopped")
+                    });
+                    if !reported.consistent() {
+                        mismatches.push(format!(
+                            "bulk form addition, threads={threads}: {:?}",
+                            reported.to_vec()
+                        ));
+                    }
+                }
+            }
         }
-        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+        mismatches
     }
 }

@@ -1087,12 +1087,11 @@ fn a_store_entering_quarantine_at_a_rebuild_is_told_inconsistent_after_a_read_in
 /// A pending fact through an alias of `owl:hasKey` reaches the list scan of a reader by
 /// support's own pending view, under compact equality: the data of
 /// `tests/it/mutation_pipeline_tests.rs`'s
-/// `a_pending_fact_through_an_alias_of_has_key_leaves_out_a_list_under_compact_equality`,
+/// `a_pending_fact_through_an_alias_of_has_key_keeps_the_transaction_status`,
 /// whose reader is told `not-certified`, so its status no longer shows the scan. `:hk`, its
 /// class's representative with `owl:hasKey`, is written first with reasoning off; the pending
-/// `:K :hk :head` (an RDF4J `ADD`, `:K` already in the store) makes a key of 128 properties,
-/// more than the rules build. Committed, no list is left out; the scanned view is the
-/// reader's own, which holds none of the store's inferences (`:x a :L` among them).
+/// `:K :hk :head` makes a readable key of 128 properties. The scanned view is the
+/// reader's own and holds none of the store's inferences (`:x a :L` among them).
 #[test]
 fn a_readers_pending_view_scans_a_key_through_an_alias_of_has_key() {
     let config = StoreConfig {
@@ -1149,7 +1148,7 @@ fn a_readers_pending_view_scans_a_key_through_an_alias_of_has_key() {
     let committed = store.lists_left_out(&full);
     assert_eq!(
         (committed, pending, seen),
-        (false, true, 0),
+        (false, false, 0),
         "(committed, pending, the inferences the reader's pending view holds)"
     );
 }

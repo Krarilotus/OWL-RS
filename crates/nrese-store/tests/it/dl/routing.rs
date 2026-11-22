@@ -1533,26 +1533,21 @@ fn rl_rules() -> nrese_reasoner::RuleProgram {
         .expect("owl2-dl keeps the OWL 2 RL closure")
 }
 
-/// A list axiom of OWL 2 RL that the rules build (the control rows), or leave out: a
-/// chain past [`nrese_reasoner::lists::MAX_RULE_MEMBERS`] (250), a key past
-/// `MAX_KEY_MEMBERS` (127), an intersection past 256 classes (cls-int1's atoms), a list
-/// with more member sequences than `MAX_VARIANTS`, and one that returns to its head through
-/// `owl:sameAs`. Each with the query its rule (prp-spo2, prp-key, cls-int1; OWL 2 Profiles
-/// §4.3) entails `true`, on both ways a route is taken: a commit (`prepare`) and a read of
-/// data that came past the gates (`afresh`). A control stays on the rules' route and
-/// answers `true`. A row the rules leave out leaves the route, and answers `true`, or
-/// `false` with `complete: false`: an ASK that misses an entailed `true` says it may be
-/// incomplete. (Every query here entails `true`, so no answer is a row the entailment
-/// doesn't hold, which would need `sound: false`.) A malformed list, or one with a cycle as
-/// written, is the reader's fatal `BrokenList`: off the route whatever the record says, so
-/// not here.
+/// Table 5 prp-spo2 and prp-key and Table 6 cls-int1 entail the answers for the legal lists.
+/// These take the rules route on commit and read. The OWL 2 DL structural mapping treats
+/// use of a cell outside its list as a reason to leave that route. The path along the
+/// alternative r properties follows only from treating the cell equality as list structure.
 #[test]
-fn a_list_axiom_the_rules_leave_out_leaves_the_rl_route() {
-    let rows: [(&str, String, &str, bool); 9] = [
+fn a_long_legal_list_keeps_the_rl_route() {
+    let mut alternative = aliased_chain(false);
+    for i in 1..=7 {
+        alternative.push_str(&format!(" :b{} :r{i} :b{i} .", i - 1));
+    }
+    let rows = [
         ("chain 250", chain(250), "ASK { :a0 :p :a250 }", true),
-        ("chain 251", chain(251), "ASK { :a0 :p :a251 }", false),
+        ("chain 251", chain(251), "ASK { :a0 :p :a251 }", true),
         ("key 127", key_of(127), "ASK { :x owl:sameAs :y }", true),
-        ("key 128", key_of(128), "ASK { :x owl:sameAs :y }", false),
+        ("key 128", key_of(128), "ASK { :x owl:sameAs :y }", true),
         (
             "intersection 256",
             intersection(256),
@@ -1563,7 +1558,7 @@ fn a_list_axiom_the_rules_leave_out_leaves_the_rl_route() {
             "intersection 257",
             intersection(257),
             "ASK { :x a :C }",
-            false,
+            true,
         ),
         (
             "variants",
@@ -1577,6 +1572,7 @@ fn a_list_axiom_the_rules_leave_out_leaves_the_rl_route() {
             "ASK { :a0 :p :a7 }",
             false,
         ),
+        ("variants r path", alternative, "ASK { :b0 :p :b7 }", false),
         // No equality, but its list cells are individuals of an assertion (`:alias`), so
         // the reader takes them for structures the rules may read more of (`Unused`
         // `reads_more`), which leave the route as a list left out does.
@@ -1605,6 +1601,8 @@ fn a_list_axiom_the_rules_leave_out_leaves_the_rl_route() {
             let entailed = rows == ["true"];
             let honest = if built {
                 route == "rules" && entailed
+            } else if what == "variants r path" {
+                route != "rules" && !(entailed && status.shared.sound && status.shared.complete)
             } else {
                 route != "rules" && (entailed || !status.shared.complete)
             };
@@ -1850,19 +1848,16 @@ fn tagged_key(n: usize) -> String {
 
 /// prp-key (OWL 2 Profiles §4.3; `HasKey` in the Direct Semantics): the key equates the two
 /// named members of `:K`, so `:x :tag :z` is entailed and no member of `:K` lacks a `:tag`
-/// of `:z`. With 127 key properties the rules build the key and the read stays on the RL
-/// route; with 128 they leave it out, and the read leaves the route, whatever update came
+/// of `:z`. Both key lengths stay on the rules route, whatever update came
 /// last before it: the key's commit; none (a load past the pipeline, then a rebuild); after
 /// that load, an empty one, one that writes a known statement into another graph (no
 /// reasoning delta) or one that only deletes; or an empty one after a reopen. Each update
 /// but the commit meets a pipeline that holds no program of the closure; on `warmed`, one
 /// that holds an older state's ([`WARM_UP`] committed before the load), and two updates
 /// follow it: an empty one, then the warm-up's schema statement written into another graph.
-/// Each read is judged answer first: the entailed answer, or a status that withholds what
-/// the answer gets wrong (`complete: false` for a missing `true`, `sound: false` for a row
-/// the entailment doesn't hold); an exact read answers `true` or is refused.
+/// The ASK and exact ASK both answer true and the negation has no rows.
 #[test]
-fn a_key_the_rules_leave_out_leaves_no_wrong_answer_told_right() {
+fn a_long_key_keeps_the_rules_route_on_every_entry_point() {
     let ask = "ASK { :x :tag :z }";
     let negated = "SELECT ?x { ?x a :K FILTER NOT EXISTS { ?x :tag :z } }";
     let mut wrong = Vec::new();
@@ -1927,14 +1922,7 @@ fn a_key_the_rules_leave_out_leaves_no_wrong_answer_told_right() {
                 read.reasons()
             );
             let entailed = answer == ["true"];
-            let honest = if n <= 127 {
-                route == "rules" && entailed && exact == "true" && rows.is_empty()
-            } else {
-                route != "rules"
-                    && (entailed || !asked.shared.complete)
-                    && (exact == "true" || exact == "refused")
-                    && (rows.is_empty() || !read.shared.sound)
-            };
+            let honest = route == "rules" && entailed && exact == "true" && rows.is_empty();
             if !honest {
                 wrong.push(line);
             }
