@@ -9,14 +9,16 @@
 //! qualified components) work on value nodes: their affected nodes are carried back along
 //! the parent's path the same way.
 //!
-//! Only those focus nodes are validated, against the state before and after, and the
-//! results present after but not before are the change's. Data that was invalid before
-//! stays reported by full validation, not blamed on the change.
+//! The affected focus nodes supply the candidate results. A candidate is new only if no
+//! validation route in the state before produced it, including routes from unaffected
+//! focus nodes. Reverse route searches share a limit of [`MAX_AFFECTED`] pair visits per
+//! call. At the limit, the reporting roots are validated whole in the state before.
 //!
 //! Some shapes can't be bounded this way, and are validated whole: closed shapes (any
 //! predicate counts), SPARQL constraints (a query reads anything), and any shape when a
 //! changed statement is an `rdfs:subClassOf` (class membership of every node may move).
-//! So is a shape whose affected nodes pass [`MAX_AFFECTED`].
+//! So is a shape whose affected nodes pass [`MAX_AFFECTED`]. When an active target can
+//! reach a cycle through active shapes, the difference is taken over both full reports.
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -34,16 +36,22 @@ use crate::path;
 use crate::report::{ValidationReport, decode};
 use crate::validate::{self, RawResult, ResultTerm, Validator};
 
-/// Affected focus nodes per shape beyond which the shape is validated whole: following
-/// that many nodes back costs about what a full validation does.
+mod before_routes;
+#[cfg(test)]
+mod tests;
+
+use before_routes::BeforeRoutes;
+
+/// Affected nodes per shape or reverse route pair visits per call before whole-root
+/// validation: following that many nodes back costs about what a full validation does.
 const MAX_AFFECTED: usize = 100_000;
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const RDFS_SUB_CLASS_OF: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
 
 /// The results that `changed` (the statements inserted and deleted, asserted and inferred)
-/// introduce in `data`: validation of the focus nodes the change can affect, in `after`,
-/// minus the same validation in `before`. Both views must share one dictionary (a
+/// introduce in `data`: results among the affected focus nodes in `after` that no
+/// targeted validation in `before` produced. Both views must share one dictionary (a
 /// transaction and its base snapshot do), and `shapes` must be compiled from it.
 ///
 /// Both validations run on `resources` and stop as [`crate::validate`] does: a stop in
@@ -55,6 +63,28 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
     data: Selection,
     changed: &[EncodedQuad],
     resources: &Resources,
+) -> Result<ValidationReport, QueryEvaluationError> {
+    validate_changes_within(
+        before,
+        after,
+        shapes,
+        data,
+        changed,
+        resources,
+        MAX_AFFECTED,
+    )
+}
+
+/// [`validate_changes`] with `route_limit` pair visits for the reverse route searches of
+/// the call, after which their candidates are compared with whole validations.
+fn validate_changes_within<A: ReadView + Sync, B: ReadView + Sync>(
+    before: &A,
+    after: &B,
+    shapes: &Shapes,
+    data: Selection,
+    changed: &[EncodedQuad],
+    resources: &Resources,
+    route_limit: usize,
 ) -> Result<ValidationReport, QueryEvaluationError> {
     resources.check()?;
     let mut selected = Vec::new();
@@ -68,6 +98,18 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
         );
     }
     let changed = selected;
+    if shapes.has_cycles && !changed.is_empty() {
+        // A cycle can carry a change arbitrarily far. A finding can also be reached from
+        // several targets, so a finding reached by a new route may already be in the report.
+        let (mut results, failures, held) =
+            validate_full_difference(before, Some(shapes), after, shapes, data, resources)?;
+        // Change reports are sets in raw result order.
+        results.sort_unstable();
+        results.dedup();
+        let report = decode(after, shapes, results, failures, resources);
+        drop(held);
+        return report;
+    }
     let graph_before =
         GraphView::new(before, data).with_cancellation(resources.cancellation.as_ref());
     let graph_after =
@@ -94,11 +136,17 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
     let mut introduced: BTreeSet<RawResult> = BTreeSet::new();
     if !changed.is_empty() {
         let walk_budget = resources.memory.part();
+        let mut before_routes = None;
         let rdf_type = graph_after.iri(RDF_TYPE);
         for shape in shapes.targeted() {
             // After a stop in either state the difference means nothing: it is the outcome.
             if validator_after.stopped() || validator_before.stopped() {
                 break;
+            }
+            let after_focus = validator_after.focus_nodes(&shapes.shapes[shape]);
+            resources.check()?;
+            if after_focus.is_empty() {
+                continue;
             }
             let affected = if classes_moved {
                 None
@@ -130,9 +178,7 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
                     .map(|node| (shape, node))
                     .collect()
             };
-            let after_results = validator_after.validate_all(&work(focus(
-                validator_after.focus_nodes(&shapes.shapes[shape]),
-            )));
+            let after_results = validator_after.validate_all(&work(focus(after_focus)));
             resources.check()?;
             if after_results.is_empty() {
                 continue;
@@ -153,16 +199,37 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
             }
             // Results kept are charged to their state's validator; those dropped here are
             // returned to it once freed.
+            let already_checked = |root, focus| {
+                root == shape && affected.as_ref().is_none_or(|nodes| nodes.contains(&focus))
+            };
             let mut dropped = 0;
             for (i, result) in after_results.into_iter().enumerate() {
                 if i % CHECK_EVERY == 0 {
                     resources.check()?;
                 }
+                if validator_before.has_stopped() {
+                    break;
+                }
                 if before.contains(&result) || introduced.contains(&result) {
                     dropped += result.retained_bytes();
-                } else {
-                    introduced.insert(result);
+                    continue;
                 }
+                if before_routes.is_none() {
+                    before_routes = Some(BeforeRoutes::new(
+                        shapes,
+                        &walk_budget,
+                        resources,
+                        route_limit,
+                    )?);
+                }
+                let routes = before_routes
+                    .as_mut()
+                    .expect("the reverse shape references");
+                if routes.contains(&validator_before, &graph_before, &result, already_checked)? {
+                    dropped += result.retained_bytes();
+                    continue;
+                }
+                introduced.insert(result);
             }
             validator_after.release(dropped);
             drop(before);
@@ -211,6 +278,22 @@ pub fn validate_shapes_change<A: ReadView + Sync, B: ReadView + Sync>(
     data: Selection,
     resources: &Resources,
 ) -> Result<ValidationReport, QueryEvaluationError> {
+    let (later, failures, held_after) =
+        validate_full_difference(before, shapes_before, after, shapes_after, data, resources)?;
+    // The raw results are freed as they are decoded, then their charges returned.
+    let report = decode(after, shapes_after, later, failures, resources);
+    drop(held_after);
+    report
+}
+
+fn validate_full_difference<A: ReadView + Sync, B: ReadView + Sync>(
+    before: &A,
+    shapes_before: Option<&Shapes>,
+    after: &B,
+    shapes_after: &Shapes,
+    data: Selection,
+    resources: &Resources,
+) -> Result<validate::Kept, QueryEvaluationError> {
     // Its results are compared only where there were shapes before.
     let compares = shapes_before.is_some();
     let (raw, failures, held_after) =
@@ -232,10 +315,7 @@ pub fn validate_shapes_change<A: ReadView + Sync, B: ReadView + Sync>(
         drop(held_before);
         later = kept?;
     }
-    // The raw results are freed as they are decoded, then their charge returned.
-    let report = decode(after, shapes_after, later, failures, resources);
-    drop(held_after);
-    report
+    Ok((later, failures, held_after))
 }
 
 /// A message in effect, borrowed, as it is compared: a stored one by id, before any a query
@@ -421,7 +501,10 @@ fn predicates(
                 }
                 Constraint::Nested(nested) => {
                     for child in nested.references() {
-                        if child != root && seen.get_or_insert_with(child, || ())?.1 {
+                        if child != root
+                            && !shapes.shapes[child].deactivated
+                            && seen.get_or_insert_with(child, || ())?.1
+                        {
                             pending.push(child)?;
                         }
                     }
@@ -481,8 +564,8 @@ impl AffectedFrame {
     }
 }
 
-/// The nodes whose validation against `shape` (as a focus or value node) `seeds` can
-/// change, in either state; `None` if unbounded.
+/// The nodes whose validation against `root` (as a focus or value node) `seeds` can
+/// change, in either state; `None` if unbounded. Shape references are acyclic here.
 fn affected<A: ReadView, B: ReadView>(
     shapes: &Shapes,
     root: ShapeRef,
@@ -505,9 +588,11 @@ fn affected<A: ReadView, B: ReadView>(
                 if before.cancelled() {
                     return Ok(None);
                 }
-                // A recursive reference contributes no additional affected nodes.
-                if child == current || callers.contains(&child) {
+                if shapes.shapes[child].deactivated {
                     continue;
+                }
+                if child == current || callers.contains(&child) {
+                    return Ok(None);
                 }
                 callers.park(current, frame)?;
                 frame = AffectedFrame {

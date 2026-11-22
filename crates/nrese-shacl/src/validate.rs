@@ -205,6 +205,11 @@ impl TaskResults {
         }
     }
 
+    /// Membership in a comparison-only task sorted by [`Validator::results_at`].
+    pub(crate) fn contains(&self, result: &RawResult) -> bool {
+        self.list.binary_search(result).is_ok()
+    }
+
     /// Drops the results from `start` on, then returns their charge.
     fn truncate(&mut self, start: usize) {
         let dropped: usize = self.list[start..]
@@ -802,6 +807,34 @@ impl<'a, V: ReadView> Validator<'a, V> {
         nodes.sort_unstable();
         nodes.dedup();
         nodes
+    }
+
+    /// A point lookup for the same targets `focus_nodes` enumerates.
+    pub(crate) fn is_focus(&self, shape: &Shape, node: TermId) -> bool {
+        shape.targets.iter().any(|target| match *target {
+            Target::Node(focus) => node == focus,
+            Target::Class(class) => self.is_instance(node, class),
+            Target::SubjectsOf(predicate) => self
+                .graph
+                .scan(Some(node), Some(predicate), None)
+                .next()
+                .is_some(),
+            Target::ObjectsOf(predicate) => self
+                .graph
+                .scan(None, Some(predicate), Some(node))
+                .next()
+                .is_some(),
+        })
+    }
+
+    /// Results at a source shape and focus, sorted for membership checks. In acyclic
+    /// shapes the validation at this pair is independent of its callers.
+    pub(crate) fn results_at(&self, shape: ShapeRef, focus: TermId) -> TaskResults {
+        let mut task = TaskResults::new(&self.results_budget);
+        let mut walk = nesting::Walk::new(&self.results_budget);
+        self.validate_node(shape, focus, &mut task, &mut walk);
+        task.list.sort_unstable();
+        task
     }
 
     /// Whether `node` is a SHACL instance of `class`: typed by it or by a subclass.
