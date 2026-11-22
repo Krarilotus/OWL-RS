@@ -4,6 +4,8 @@
 //! smallest first; `one` is one of them, `core` their intersection, `union` their union;
 //! every proof checks, and a broken one doesn't.
 
+mod support;
+
 use std::collections::BTreeSet;
 
 use nrese_owl::{ProofError, ProofGraph};
@@ -19,6 +21,8 @@ fn rng(seed: u64) -> impl FnMut(u64) -> u64 {
     }
 }
 
+const ARITIES: u64 = 3;
+
 /// Facts `0..facts` (the goal is 0), axioms `0..axioms`, random inferences (cycles too).
 fn graph(
     next: &mut dyn FnMut(u64) -> u64,
@@ -29,8 +33,12 @@ fn graph(
     let mut g = ProofGraph::new(0u32);
     for _ in 0..count {
         let conclusion = next(facts as u64) as u32;
-        let premises: Vec<u32> = (0..next(3)).map(|_| next(facts as u64) as u32).collect();
-        let used: Vec<u32> = (0..next(3)).map(|_| next(axioms as u64) as u32).collect();
+        let premises: Vec<u32> = (0..next(ARITIES))
+            .map(|_| next(facts as u64) as u32)
+            .collect();
+        let used: Vec<u32> = (0..next(ARITIES))
+            .map(|_| next(axioms as u64) as u32)
+            .collect();
         g.add(format!("r{}", next(4)), &premises, &used, conclusion);
     }
     g
@@ -57,20 +65,45 @@ fn brute(g: &ProofGraph<u32, u32>, axioms: u32) -> Vec<Vec<u32>> {
     out
 }
 
+/// By default (tier unset or `landing`, with no seed or count), this test checks pinned graphs with no, one or several justifications and every inference arity. With `NRESE_CHECK_TIER=nightly`, a seed or a count, it checks 3,000 graphs unless `NRESE_FUZZ_CASES` supplies a valid count.
 #[test]
 fn the_enumeration_equals_a_brute_force_mus_enumerator() {
-    let cases = std::env::var("NRESE_FUZZ_CASES")
+    let full = support::nightly();
+    let count = std::env::var("NRESE_FUZZ_CASES")
         .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(3000u64);
+        .and_then(|v| v.parse().ok());
+    // Case 5 catches a fault that stops enumeration after the first justification.
+    let witnesses = [(1, 1), (3, 0), (5, 6)];
+    let pinned = !full
+        && std::env::var_os("NRESE_FUZZ_CASES").is_none()
+        && std::env::var_os("NRESE_FUZZ_SEED").is_none();
+    let cases = if pinned { 6 } else { count.unwrap_or(3_000u64) };
     let mut next = rng(0x2026_1003_0240);
+    let mut arities = BTreeSet::new();
+    let mut checked = 0;
     let (mut entailed, mut total, mut most) = (0, 0usize, 0usize);
     for case in 0..cases {
         let (facts, axioms) = (2 + next(8) as u32, 1 + next(12) as u32);
         let count = 2 + next(40) as usize;
         let g = graph(&mut next, facts, axioms, count);
+        let witness = witnesses.iter().find(|&&(i, _)| i == case);
+        if pinned && witness.is_none() {
+            continue;
+        }
         let expected = brute(&g, axioms);
         let got = g.justifications(usize::MAX, usize::MAX);
+        let mut sorted = got.found.clone();
+        sorted.sort();
+        assert_eq!(sorted, expected, "case {case}: {g:?}");
+        if pinned && let Some(&(_, count)) = witness {
+            assert_eq!(expected.len(), count, "witness {case}");
+            arities.extend(
+                g.inferences()
+                    .iter()
+                    .map(|inference| (inference.premises.len(), inference.axioms.len())),
+            );
+        }
+        checked += 1;
         assert!(got.complete);
         // Smallest first.
         assert!(
@@ -78,9 +111,6 @@ fn the_enumeration_equals_a_brute_force_mus_enumerator() {
             "case {case}: {:?}",
             got.found
         );
-        let mut sorted = got.found.clone();
-        sorted.sort();
-        assert_eq!(sorted, expected, "case {case}: {g:?}");
         total += expected.len();
         most = most.max(expected.len());
         // One, core, union.
@@ -141,9 +171,20 @@ fn the_enumeration_equals_a_brute_force_mus_enumerator() {
         }
     }
     eprintln!(
-        "{cases} graphs, {entailed} entailed, {total} justifications, at most {most} for one goal"
+        "{checked} graphs, {entailed} entailed, {total} justifications, at most {most} for one goal"
     );
-    assert!(entailed > cases / 4);
+    assert!(entailed > checked / 4);
+    if pinned {
+        assert_eq!(checked, witnesses.len());
+        for premises in 0..ARITIES as usize {
+            for axioms in 0..ARITIES as usize {
+                assert!(
+                    arities.contains(&(premises, axioms)),
+                    "{premises} premises, {axioms} axioms"
+                );
+            }
+        }
+    }
 }
 
 #[test]

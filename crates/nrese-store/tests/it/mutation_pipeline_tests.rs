@@ -1562,11 +1562,9 @@ fn long_key(n: usize) -> String {
     data
 }
 
-/// A key's rule has two atoms per property and two more, and a rule holds at most 256:
-/// a key of 127 properties is one rule, one of 128 is reported (`list-too-long`, prp-key)
-/// and not built, never a failed commit (docs/spec/reasoning-semantics.md, "Lists").
+/// Table 5 prp-key equates the instances for both sizes of key.
 #[test]
-fn a_key_past_the_rule_format_is_reported_and_not_built() {
+fn a_key_past_the_rule_format_still_equates_the_instances() {
     for n in [127, 128] {
         let owl = pipeline(ReasoningMode::Owl2Rl);
         owl.apply(
@@ -1582,13 +1580,12 @@ fn a_key_past_the_rule_format_is_reported_and_not_built() {
             .diagnostics
             .iter()
             .any(|d| d.kind == "list-too-long" && d.rules == "prp-key");
-        assert_eq!((equal, reported), (n == 127, n == 128), "{n} properties");
+        assert_eq!((equal, reported), (true, false), "{n} properties");
     }
 }
 
 /// A store holding a key of 128 properties, written with reasoning off, is rebuilt with
-/// reasoning on (as the server's start and `nrese-server load` rebuild it): the rebuild
-/// completes with no violation and the key reported (`list-too-long`, prp-key).
+/// reasoning on. Table 5 prp-key yields the equality and Table 4 eq-rep-s copies the name.
 #[test]
 fn a_store_holding_a_key_past_the_rule_format_is_rebuilt_with_reasoning_on() {
     let dir = tempfile::tempdir().unwrap();
@@ -1620,23 +1617,20 @@ fn a_store_holding_a_key_past_the_rule_format_is_rebuilt_with_reasoning_on() {
     assert!(!store.reasoning_is_current(&program));
     let report = store.rematerialise(&program).expect("rebuilt");
     assert_eq!(report.violations, 0);
-    assert!(
-        report
-            .diagnostics
-            .iter()
-            .any(|d| d.kind == "list-too-long" && d.rules == "prp-key"),
-        "{:?}",
-        report.diagnostics
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let rebuilt = MutationPipeline::new(
+        Arc::new(store),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Rl,
+        ))),
     );
+    assert!(contains(&rebuilt, &format!("<{EX}x> <{EX}name> \"Y\"")));
 }
 
-/// A list axiom the rules leave out (reported, not built) is a missing rule: an answer it
-/// would change isn't `complete` because of it. Under `owl2-rl`, where the QL rewriting can
-/// certify an answer (`ql_rewriting = "on"`), each in a store of its own: a key past 127
-/// properties, an intersection past 256 classes and a chain past 250 properties. Every row is
-/// checked; the wrong ones are listed.
+/// Tables 5 and 6 entail the key, intersection and chain answers past the former limits.
+/// The well-formed axioms also let the QL route certify the answers.
 #[test]
-fn an_unbuilt_key_leaves_no_answer_complete_under_owl2_rl() {
+fn legal_long_lists_give_complete_answers_under_owl2_rl() {
     let rows = [
         (
             "key 128",
@@ -1656,21 +1650,20 @@ fn an_unbuilt_key_leaves_no_answer_complete_under_owl2_rl() {
     ];
     let mut wrong = Vec::new();
     for (row, data, ask) in rows {
-        let pipeline = || ql_pipeline(in_memory_store_config());
-        if std::panic::catch_unwind(|| left_out_status(&pipeline(), &data, &ask)).is_err() {
+        let check = || {
+            let pipeline = ql_pipeline(in_memory_store_config());
+            commit_list_and_check_answer(&pipeline, &data, &ask);
+        };
+        if std::panic::catch_unwind(check).is_err() {
             wrong.push(row);
         }
     }
     assert!(wrong.is_empty(), "{wrong:?}");
 }
 
-/// The aliased key built by a first commit, and a later one that adds any list fact: that
-/// commit grounds the lists again, over a closure that holds equality's copies of the key's
-/// cells (`rdf:first` to each alias: 2^7 member sequences, past 64). The later commit's key
-/// match (`:z` with `:x`'s values) entails `:x :name "Z"`, so the answer is true or not
-/// `complete`, however the list is read: a guard against an answer wrongly `complete`.
+/// Table 5 prp-key classifies the instance added with an unrelated list fact.
 #[test]
-fn a_later_list_fact_over_an_aliased_key_leaves_no_answer_wrongly_complete() {
+fn a_later_list_fact_keeps_the_aliased_key_answer_complete() {
     let pipeline = ql_pipeline(in_memory_store_config());
     let write = |data: &str| {
         let ticket = MutationTicket::new();
@@ -1685,18 +1678,14 @@ fn a_later_list_fact_over_an_aliased_key_leaves_no_answer_wrongly_complete() {
         later.push_str(&format!(" <{EX}z> <{EX}k{i}> <{EX}v{i}> ."));
     }
     write(&later);
-    left_out_answer(pipeline.store(), &format!("<{EX}x> <{EX}name> \"Z\""));
+    complete_list_answer(pipeline.store(), &format!("<{EX}x> <{EX}name> \"Z\""));
 }
 
 /// Aliases (`owl:sameAs`) of a key's 7 properties leave the key built by the commit that
 /// writes it. Spec: OWL 2 Profiles §4.3, `prp-key` makes `:x` the same as `:y`, and
 /// `eq-rep-s` gives `:x` the name of `:y`: `:x :name ?o` answers `"Y"` alone, as the
-/// replicated closure does, by representatives (the default) and by replication alike. It
-/// isn't `complete`: the next program is ground over the closure the commit stored, where
-/// equality's `rdf:first` copies give the key's list 2^7 member sequences, past 64. That
-/// program leaves the key out and reports it (a key gives no check to read as written), and
-/// the mark follows the report, naming the list axiom: a sound mark, less precise than the
-/// closure.
+/// replicated closure does, by representatives (the default) and by replication alike.
+/// The QL status is complete across all 2^7 walks that equality gives the list.
 #[test]
 fn aliases_leave_a_key_built() {
     for representatives in [true, false] {
@@ -1713,44 +1702,53 @@ fn aliases_leave_a_key_built() {
             .expect("the data");
         assert_eq!(
             names_of_x(pipeline.store()),
-            (vec!["Y".to_owned()], Some(false)),
+            (vec!["Y".to_owned()], Some(true)),
             "by representatives: {representatives}"
         );
-        let ask = format!("ASK {{ <{EX}x> <{EX}name> \"Y\" }}");
-        let answer = (pipeline.store())
-            .execute_query(&nrese_store::SparqlQueryRequest::all(ask))
-            .expect("answered");
-        let status = answer.completeness.expect("a status");
-        assert!(
-            (status.reasons.iter()).any(|r| r.text.contains("list axiom")),
-            "by representatives: {representatives}: {status:?}"
-        );
+        complete_list_answer(pipeline.store(), &format!("<{EX}x> <{EX}name> \"Y\""));
     }
 }
 
-/// A store holding a key the rules leave out, opened again with its closure current (so
-/// not rebuilt): its answers aren't `complete` either.
+/// A reopen with current reasoning, without a rebuild, keeps the prp-key answer and marks no
+/// list: the answer is true, and its one reason is the reopen's (whether the rules equated two
+/// literals since the last rebuild isn't recorded, docs/limits.md). The `complete` comes back
+/// after a rebuild.
 #[test]
-fn a_reopened_store_with_an_unbuilt_key_leaves_no_answer_complete() {
+fn a_reopened_store_keeps_its_long_key_answer_and_its_word_comes_back_after_a_rebuild() {
     let dir = tempfile::tempdir().expect("dir");
     let ask = format!("<{EX}x> <{EX}name> \"Y\"");
-    left_out_status(
+    commit_list_and_check_answer(
         &ql_pipeline(nrese_store::StoreConfig::on_disk(dir.path())),
         &long_key(128),
         &ask,
     );
-    left_out_answer(
-        ql_pipeline(nrese_store::StoreConfig::on_disk(dir.path())).store(),
-        &ask,
+    let reopened = ql_pipeline(nrese_store::StoreConfig::on_disk(dir.path()));
+    let store = reopened.store();
+    let answer = store
+        .execute_query(&nrese_store::SparqlQueryRequest::all(format!(
+            "ASK {{ {ask} }}"
+        )))
+        .expect("answered");
+    let json: serde_json::Value = serde_json::from_slice(&answer.payload).expect("json");
+    assert_eq!(json["boolean"], true, "{ask} after the reopen");
+    let reasons: Vec<&str> = (answer.completeness.iter())
+        .flat_map(|c| c.reasons.iter().map(|r| r.text.as_str()))
+        .collect();
+    assert!(
+        !reasons.iter().any(|r| r.contains("list axiom")),
+        "{ask} after the reopen, a list marked: {reasons:?}"
     );
+    assert!(
+        matches!(reasons[..], [only] if only.contains("opened without a rebuild")),
+        "{ask} after the reopen, the reopen's reason alone: {reasons:?}"
+    );
+    let rules = (reopened.reasoner().config().materialised_program()).expect("owl2-rl rules");
+    store.rematerialise(rules).expect("rebuild");
+    complete_list_answer(store, &ask);
 }
 
-/// A read inside a transaction whose pending operations delete a key's `owl:hasKey` fact finds
-/// no list left out in its own data, and its snapshot carries the committed revision's number.
-/// The transaction ends without a commit, so the committed revision is as it was: its key of
-/// 128 properties, past what one rule holds, is left out, and `:x :name "Y"` is entailed (the
-/// key makes `:x` and `:y` one; `:y :name "Y"`). A plain read of it after the transaction is
-/// therefore true or not `complete`, whatever the pending read found.
+/// A pending read that deletes the key shares the committed revision number.
+/// The committed prp-key answer stays true and complete after the transaction.
 #[test]
 fn a_pending_read_leaves_the_committed_revisions_mark() {
     let pipeline = ql_pipeline(in_memory_store_config());
@@ -1784,16 +1782,12 @@ fn a_pending_read_leaves_the_committed_revisions_mark() {
         )
         .expect("the pending read");
     println!("pending read: {pending:?}");
-    left_out_answer(store, &ask);
+    complete_list_answer(store, &ask);
 }
 
-/// A revision read first with nothing left out is recorded clean. A commit on it then adds a
-/// key of 128 properties, past what one rule holds: the commit itself must record the key left
-/// out, as the record would otherwise carry the clean range on to the new revision unscanned.
-/// `:x :name "Y"` is entailed (the key makes `:x` and `:y` one), so a read after the commit is
-/// true or not `complete`.
+/// A clean read of the earlier revision does not affect the new prp-key answer.
 #[test]
-fn a_commit_after_a_clean_read_records_its_key_left_out() {
+fn a_long_key_commit_after_a_clean_read_changes_the_answer() {
     let pipeline = ql_pipeline(in_memory_store_config());
     let write = |data: &str| {
         let ticket = MutationTicket::new();
@@ -1813,15 +1807,14 @@ fn a_commit_after_a_clean_read_records_its_key_left_out() {
         "the first read must be complete, so that it records its revision clean: {clean:?}"
     );
     write(&long_key(128));
-    left_out_answer(pipeline.store(), &ask);
+    complete_list_answer(pipeline.store(), &ask);
 }
 
 /// [`long_key`] of 128 properties, its `owl:hasKey` fact and list in `:secret`. A reader of
-/// the default graph only (inferences by support) reads the revision first; a reader of every
-/// graph then reads it too. Its key is left out, and `:x :name "Y"` entailed, so the second
-/// read is true or not `complete`, whatever the first reader's view found.
+/// the default graph only reads the revision first. The unrestricted read still sees
+/// the complete prp-key answer.
 #[test]
-fn a_restricted_read_leaves_a_hidden_keys_mark() {
+fn a_restricted_read_leaves_the_hidden_key_answer_complete_for_an_admin() {
     let pipeline = ql_pipeline(in_memory_store_config());
     let key = long_key(128);
     let (axiom, rest) = key.split_once(" .").expect("the key's axiom first");
@@ -1834,52 +1827,34 @@ fn a_restricted_read_leaves_a_hidden_keys_mark() {
     .expect("the data");
     let ask = format!("<{EX}x> <{EX}name> \"Y\"");
     restricted_read(pipeline.store(), &ask);
-    left_out_answer(pipeline.store(), &ask);
+    complete_list_answer(pipeline.store(), &ask);
 }
 
-/// The aliased key of [`a_later_list_fact_over_an_aliased_key_leaves_no_answer_wrongly_complete`],
-/// its `owl:sameAs` facts in `:secret`: the later commit grounds the lists again, over a
-/// closure where equality's `rdf:first` copies (derived through `:secret`) give the key's list
-/// more than 64 member sequences, and it reports the list past the cap. A reader of the
-/// default graph only (inferences by support) reads that revision first; a reader of every
-/// graph then reads it too. Spec: OWL 2 Profiles §4.3, `prp-key` makes `:x` the same as `:y`
-/// (the first commit) and as `:z` (the later one), so `:x :name ?o` answers `"Y"` and `"Z"`:
-/// the answer holds `"Y"`, nothing outside the two, and isn't `complete`, since the report
-/// says the key may be left out. Two answers are right: `"Y"` alone, where the later key
-/// match is left out (an incomplete answer, so marked), and `"Y"` and `"Z"`, where it is
-/// made; neither is `complete` while the list is reported. After the restricted read, and on
-/// the control, a store of its own with the same data read by a reader of every graph alone;
-/// by representatives (the default) and by replication alike.
+/// Table 5 prp-key makes `:x` the same as `:y` and then as `:z`, so the
+/// unrestricted reader sees both names, even after a reader without the alias graph.
 #[test]
-fn a_restricted_read_leaves_an_aliased_keys_mark() {
+fn a_restricted_read_leaves_the_unrestricted_aliased_key_answer_complete() {
     let entailed = ["Y".to_owned(), "Z".to_owned()];
-    let sound_and_marked = |(names, complete): (Vec<String>, Option<bool>)| {
-        names.contains(&entailed[0])
-            && names.iter().all(|n| entailed.contains(n))
-            && complete == Some(false)
+    let exact = |(names, complete): (Vec<String>, Option<bool>)| {
+        names == entailed && complete == Some(true)
     };
     for representatives in [true, false] {
         let control = aliased_key_with_hidden_aliases(representatives);
         let case = format!("by representatives: {representatives}");
-        assert!(
-            sound_and_marked(names_of_x(control.store())),
-            "{case}: control"
-        );
+        assert!(exact(names_of_x(control.store())), "{case}: control");
         let pipeline = aliased_key_with_hidden_aliases(representatives);
         restricted_read(pipeline.store(), &format!("<{EX}x> <{EX}name> \"Z\""));
         assert!(
-            sound_and_marked(names_of_x(pipeline.store())),
+            exact(names_of_x(pipeline.store())),
             "{case}: after the restricted read"
         );
     }
 }
 
-/// A transaction inserts a key of 128 properties and reads inside it: its pending operations
-/// aren't reasoned over before the commit, and the key is past what one rule holds, so
-/// `:x :name "Y"` (entailed through the key) isn't answered and the read isn't `complete`.
-/// The committed revision has nothing left out: only the pending read's own scan finds it.
+/// A transaction adds a key of 128 properties. The transaction rule leaves the pending
+/// read sound-only until commit, even though prp-key entails the row over the full data.
 #[test]
-fn a_pending_key_left_out_leaves_the_pending_read_not_complete() {
+fn a_pending_long_key_has_the_transaction_status() {
     let pipeline = ql_pipeline(in_memory_store_config());
     let store = pipeline.store();
     (pipeline.apply(
@@ -1911,13 +1886,7 @@ fn a_pending_key_left_out_leaves_the_pending_read_not_complete() {
         .expect("the pending read");
     let answer = String::from_utf8(answer).expect("utf8");
     println!("pending insert read: {answer} with {pending:?}");
-    let left_out = |c: &nrese_sparql::Completeness| {
-        !c.complete && (c.reasons.iter()).any(|r| r.text.contains("list axiom"))
-    };
-    assert!(
-        pending.as_ref().is_some_and(left_out),
-        "not complete for the key left out: {answer} with {pending:?}"
-    );
+    assert_pending_key(pending.as_ref());
 }
 
 /// Two readers of one revision with views of their own: one reads `:secret`, where the key's
@@ -2001,12 +1970,9 @@ fn a_restricted_pending_read_scans_its_own_view() {
 
 /// Under compact equality, a transaction adds (RDF4J `ADD`, which deletes nothing) one
 /// `owl:sameAs` for each of a committed key's seven properties, and `:z`, which agrees with
-/// `:x` on the key. No list fact is added, but the pending data's equality gives the key's
-/// list 2^7 member sequences, more than the rules build. `:x` and `:z` are the same by the
-/// key, so `:x :name :Z` is entailed: the pending read answers it, or is told the list is left
-/// out (any pending read is not `complete`: its operations aren't reasoned over).
+/// `:x` on the key. The pending read is sound-only because its operations are not reasoned over.
 #[test]
-fn a_pending_equality_change_that_leaves_out_a_list_is_not_complete() {
+fn a_pending_key_equality_change_has_the_transaction_status() {
     let pipeline = ql_pipeline(nrese_store::StoreConfig {
         equality_by_representatives: true,
         equality_compact: true,
@@ -2066,17 +2032,13 @@ fn a_pending_equality_change_that_leaves_out_a_list_is_not_complete() {
         .expect("the pending read");
     let answer = String::from_utf8(answer).expect("utf8");
     println!("pending equality read: {answer} with {status:?}");
-    if !answer.contains("true") {
-        assert!(status.as_ref().is_some_and(list_left_out), "{status:?}");
-    }
+    assert_pending_key(status.as_ref());
 }
 
 /// Under compact equality, `:hk` is the same as `owl:hasKey` and its class's representative
 /// (interned first), and a transaction adds (RDF4J `ADD`) only `:K :hk :head`: no list fact
-/// as written. The read of `owl:hasKey` reads `:hk` and expands it, so the list scan sees a
-/// key of `:head`'s 128 properties, more than the rules build. `:x` and `:z` agree on all of
-/// them, so `:x :name :Z` is entailed: the pending read answers it, or is told the list is
-/// left out (any pending read is not `complete`). A restricted reader of the same data by
+/// as written. Compact equality expands `:hk`, and the list scan can read the 128-property key.
+/// The unrestricted read gets the transaction status. A restricted reader of the same data by
 /// support sees no inferred statement under compact equality and is told `not-certified`,
 /// no regime, no reason; the scan of its own pending view is checked in the crate's own test
 /// (`certificate_lifecycle_tests::a_readers_pending_view_scans_a_key_through_an_alias_of_has_key`).
@@ -2086,19 +2048,27 @@ fn a_pending_equality_change_that_leaves_out_a_list_is_not_complete() {
 /// through the `owl2-rl` pipeline first, `owl:hasKey` would be the older id and `:hk` the
 /// alias, and no read would reach the raw pending fact.
 #[test]
-fn a_pending_fact_through_an_alias_of_has_key_leaves_out_a_list_under_compact_equality() {
-    let (answer, status, scanned) = alias_of_has_key(true);
+fn a_pending_fact_through_an_alias_of_has_key_keeps_the_transaction_status() {
+    let (_, status, scanned) = alias_of_has_key(true);
     assert_eq!(
         scanned.map(|s| s.header()).as_deref(),
         Some("not-certified"),
         "the restricted reader"
     );
-    if !answer.contains("true") {
-        assert!(status.as_ref().is_some_and(list_left_out), "{status:?}");
-    }
+    assert_pending_key(status.as_ref());
 }
 
-/// [`a_pending_fact_through_an_alias_of_has_key_leaves_out_a_list_under_compact_equality`]'s
+fn assert_pending_key(status: Option<&nrese_sparql::Completeness>) {
+    assert!(
+        status.is_some_and(|c| c.sound
+            && !c.complete
+            && !list_left_out(c)
+            && c.reasons.iter().any(|r| r.source == "transaction")),
+        "{status:?}"
+    );
+}
+
+/// [`a_pending_fact_through_an_alias_of_has_key_keeps_the_transaction_status`]'s
 /// data with equality kept as every copy: there reads take the statements as written (no
 /// expansion), and pending statements are not reasoned over, so the scan and the pending skip
 /// see the same raw facts. `:K :hk :head` is no key there: the pending read and the
@@ -2368,7 +2338,7 @@ fn ql_pipeline(config: nrese_store::StoreConfig) -> MutationPipeline {
 }
 
 /// `data` written, then `ASK { ask }` either true or not `complete`.
-fn left_out_status(pipeline: &MutationPipeline, data: &str, ask: &str) {
+fn commit_list_and_check_answer(pipeline: &MutationPipeline, data: &str, ask: &str) {
     pipeline
         .apply(
             insert(data),
@@ -2376,21 +2346,24 @@ fn left_out_status(pipeline: &MutationPipeline, data: &str, ask: &str) {
             &MutationTicket::new(),
         )
         .expect("the data");
-    left_out_answer(pipeline.store(), ask);
+    complete_list_answer(pipeline.store(), ask);
 }
 
-fn left_out_answer(store: &StoreService, ask: &str) {
+fn complete_list_answer(store: &StoreService, ask: &str) {
     let answer = store
         .execute_query(&nrese_store::SparqlQueryRequest::all(format!(
             "ASK {{ {ask} }}"
         )))
         .expect("answered");
-    let payload = String::from_utf8(answer.payload).expect("utf8");
-    let status = answer.completeness.as_ref();
-    println!("plain read: {ask}: {payload} with {status:?}");
+    let json: serde_json::Value = serde_json::from_slice(&answer.payload).expect("json");
+    assert_eq!(json["boolean"], true, "{ask}");
     assert!(
-        payload.contains("true") || status.is_some_and(|c| !c.complete),
-        "{ask}: {payload} with {status:?}"
+        answer
+            .completeness
+            .as_ref()
+            .is_some_and(|c| c.complete && c.sound),
+        "{ask}: {:?}",
+        answer.completeness
     );
 }
 
@@ -2439,16 +2412,11 @@ fn long_intersection(n: usize) -> String {
 
 /// Spec: reasoning-semantics.md, what may be complete, "Operators": where answers may be
 /// missing, `EXISTS` makes them `unsound`. Under `owl2-rl` with the QL rewriting on, a list
-/// axiom past the rules' cap is left out of the closure, so answers may be missing, and a
-/// `FILTER NOT EXISTS` read is `unsound` in its status, its QL report, its plan and the printed
-/// query's status (the status this store gives the same answers). The printer writes the
-/// chain's reads and the intersection's unrelated one, and finds the others `NotExpressible`
-/// (as a run on the line found; any other outcome fails here, so the status can't go
-/// unchecked). With
-/// the blocker the list's rule entails, the one row kept is one the certain answers drop. The
-/// rule is the query's, so the read with an unrelated blocker is `unsound` too.
+/// long list entails its blocker. `FILTER NOT EXISTS` drops that row and keeps the row with
+/// an unrelated blocker. Execution and planning are complete. The printer's supported
+/// forms certify the same answer.
 #[test]
-fn a_negation_over_a_list_left_out_is_unsound() {
+fn a_negation_over_a_long_list_uses_the_entailed_blocker() {
     use nrese_sparql::ql::{PrintForm, Printed};
     let mut wrong = Vec::new();
     // Whether each read prints: with the blocker, with the unrelated one.
@@ -2477,7 +2445,9 @@ fn a_negation_over_a_list_left_out_is_unsound() {
         (pipeline.apply(insert(&data), &nrese_store::Requester::all(), &ticket)).expect("data");
         let store = pipeline.store();
         let unrelated = format!("?x <{EX}unrelated> <{EX}unused>");
-        for (blocked_by, prints) in [blocker, unrelated].into_iter().zip(prints) {
+        for (index, (blocked_by, prints)) in
+            [blocker, unrelated].into_iter().zip(prints).enumerate()
+        {
             let text = format!(
                 "SELECT ?x {{ VALUES ?x {{ <{EX}{subject}> }} FILTER NOT EXISTS {{ {blocked_by} }} }}"
             );
@@ -2503,11 +2473,17 @@ fn a_negation_over_a_list_left_out_is_unsound() {
                 Ok(Printed::NotExpressible(_)) => "not expressible".to_owned(),
                 Err(error) => format!("error: {error}"),
             };
-            let expected = if prints { "unsound" } else { "not expressible" };
-            if labels != [Some("unsound"); 4]
-                || printed != expected
-                || rows != [format!("{EX}{subject}")]
-            {
+            let expected = if prints {
+                "complete"
+            } else {
+                "not expressible"
+            };
+            let expected_rows = if index == 0 {
+                vec![]
+            } else {
+                vec![format!("{EX}{subject}")]
+            };
+            if labels != [Some("complete"); 4] || printed != expected || rows != expected_rows {
                 wrong.push((blocked_by, labels, printed, rows));
             }
         }
@@ -2526,14 +2502,10 @@ fn declared_chain() -> String {
     chain
 }
 
-/// Spec: reasoning-semantics.md, what may be complete, "Operators": where answers may be
-/// missing, `EXISTS`, `MINUS` and `OPTIONAL` make them `unsound`. Over [`declared_chain`],
-/// which the rules leave out, `:a0 :chain :a251` is entailed and missing, so each read keeps a
-/// row the certain answers don't have (`:a0` under `NOT EXISTS` and `MINUS`; `:a0` without
-/// `?y` under `OPTIONAL`, where the certain row binds `?y` to `:a251`). Each is `unsound` in
-/// its status, its QL report, its plan, the plan's QL report, EXPLAIN and EXPLAIN's QL report.
+/// Table 5 entails `:a0 :chain :a251`. NOT EXISTS and MINUS remove the row;
+/// OPTIONAL binds its endpoint. Each surface certifies completeness.
 #[test]
-fn each_operator_over_a_list_left_out_is_unsound_on_every_surface() {
+fn each_operator_over_a_long_chain_is_complete_on_every_surface() {
     let pipeline = ql_pipeline(in_memory_store_config());
     let ticket = MutationTicket::new();
     let all = nrese_store::Requester::all();
@@ -2545,10 +2517,10 @@ fn each_operator_over_a_list_left_out_is_unsound_on_every_surface() {
         format!("<{EX}a251>"),
     );
     let mut wrong = Vec::new();
-    for read in [
-        format!("FILTER NOT EXISTS {{ ?x {chain} {a251} }}"),
-        format!("MINUS {{ ?x {chain} {a251} }}"),
-        format!("OPTIONAL {{ ?x {chain} ?y }}"),
+    for (read, optional) in [
+        (format!("FILTER NOT EXISTS {{ ?x {chain} {a251} }}"), false),
+        (format!("MINUS {{ ?x {chain} {a251} }}"), false),
+        (format!("OPTIONAL {{ ?x {chain} ?y }}"), true),
     ] {
         let text = format!("SELECT ?x ?y {{ VALUES ?x {{ {a0} }} {read} }}");
         let request = nrese_store::SparqlQueryRequest::all(text);
@@ -2574,7 +2546,12 @@ fn each_operator_over_a_list_left_out_is_unsound_on_every_surface() {
                 (value("x"), value("y"))
             })
             .collect();
-        if labels != [Some("unsound"); 6] || rows != [(Some(format!("{EX}a0")), None)] {
+        let expected = if optional {
+            vec![(Some(format!("{EX}a0")), Some(format!("{EX}a251")))]
+        } else {
+            vec![]
+        };
+        if labels != [Some("complete"); 6] || rows != expected {
             wrong.push((read, labels, rows));
         }
     }
@@ -2628,8 +2605,7 @@ fn a_pending_negation_over_a_list_left_out_names_the_operator_once() {
     assert_eq!((status.as_str(), operator), ("unsound", 1), "{status:#?}");
 }
 
-/// An intersection of 256 members is one rule; one of 257 is either one too or reported
-/// and not built, never a panic and never a failed commit, under `owl2-rl` and `owl2-dl`.
+/// Table 6 cls-int1 builds both intersections under OWL 2 RL and OWL 2 DL.
 #[test]
 fn a_long_intersection_is_built_or_reported() {
     let mut wrong = Vec::new();
@@ -2655,8 +2631,7 @@ fn a_long_intersection_is_built_or_reported() {
                 Ok::<_, String>((entailed, reported))
             });
             match run {
-                Ok(Ok((true, _))) => {}
-                Ok(Ok((false, reported))) if n == 257 && reported => {}
+                Ok(Ok((true, false))) => {}
                 Ok(outcome) => wrong.push(format!("{mode}, {n} members: {outcome:?}")),
                 Err(_) => wrong.push(format!("{mode}, {n} members: panicked")),
             }
@@ -2666,8 +2641,7 @@ fn a_long_intersection_is_built_or_reported() {
 }
 
 /// A store holding an intersection of 256 or 257 members, written with reasoning off, is
-/// rebuilt with reasoning on: 256 members are built (`:x` is a `:C`), 257 are built too or
-/// reported and not built, and the rebuild never panics or fails.
+/// rebuilt with reasoning on. Table 6 cls-int1 gives `:x a :C` for both sizes.
 #[test]
 fn a_store_holding_a_long_intersection_is_rebuilt_with_reasoning_on() {
     let mut wrong = Vec::new();
@@ -2692,8 +2666,7 @@ fn a_store_holding_a_long_intersection_is_rebuilt_with_reasoning_on() {
             Ok::<_, String>((entailed, reported))
         });
         match rebuilt {
-            Ok(Ok((true, _))) => {}
-            Ok(Ok((false, reported))) if n == 257 && reported => {}
+            Ok(Ok((true, false))) => {}
             Ok(outcome) => wrong.push(format!("{n} members: {outcome:?}")),
             Err(_) => wrong.push(format!("{n} members: panicked")),
         }

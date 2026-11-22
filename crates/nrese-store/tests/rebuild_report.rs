@@ -141,7 +141,7 @@ _:m2 <{RDF}rest> <{RDF}nil> .
 }
 
 /// OWL 2 RL Table 7: adding the second disjoint type introduces cax-adc.
-/// The expanded list has 81 variants, so the compact split's rebuild finds it.
+/// Recompute finds that clash even with 81 variants of the list.
 #[test]
 fn a_split_that_brings_a_clash_is_refused_and_leaves_the_published_state_as_it_was() {
     let store = store(true);
@@ -164,7 +164,7 @@ fn a_split_that_brings_a_clash_is_refused_and_leaves_the_published_state_as_it_w
     assert_refused_for(result, "cax-adc", "the split and type insert");
     assert_eq!(
         commits.last_reasoning_run().unwrap().work.plan,
-        nrese_reasoner::delta::policy::Plan::Rebuild
+        nrese_reasoner::delta::policy::Plan::Recompute
     );
     assert_eq!(
         state(&store),

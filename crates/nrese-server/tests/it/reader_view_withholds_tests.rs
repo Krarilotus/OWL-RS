@@ -134,14 +134,10 @@ fn chain() -> String {
 /// holds a seven-property chain axiom and a chain it closes. Revision B adds
 /// `ex:pi owl:sameAs ex:ai` (i = 1…7) in `:g2`, which the reader by support can't read; B is
 /// read after the commit and again after a rematerialisation. The reader of every graph
-/// answers `ASK { ex:x0 ex:q ex:x7 }` `true` throughout; the reader by support, as it was
-/// answered before its claim was withheld, `true` in A and `false` in B. In B the support
-/// grounding leaves the chain's list out, so the reader's view isn't vouched for: it is told
-/// exactly `not-certified`, in the header and EXPLAIN's `completeness`, and EXPLAIN's `ql`
-/// is `null`. Each header and EXPLAIN's `completeness` and `ql` are printed (`SEEN …`).
+/// and the reader by support both answer `ASK { ex:x0 ex:q ex:x7 }` `true` throughout.
+/// The hidden aliases do not affect Table 5 prp-spo2 over the reader's own graph.
 #[tokio::test]
-async fn a_reader_by_support_missing_a_chain_its_graphs_close_is_never_told_complete() -> TestResult
-{
+async fn a_reader_by_support_keeps_the_complete_chain_answer_with_hidden_aliases() -> TestResult {
     let app = test_app_with_store_config(
         StoreConfig {
             ql_rewriting: QlRewritingMode::On,
@@ -177,10 +173,10 @@ async fn a_reader_by_support_missing_a_chain_its_graphs_close_is_never_told_comp
     ));
     let mut wrong = Vec::new();
     for (at, whole, reader) in &seen {
-        let in_b = at.starts_with('B');
-        let withheld = (reader.1.as_str(), reader.2.as_str(), reader.3.as_str())
-            == ("not-certified", "null", "not-certified");
-        if !whole.0 || reader.0 == in_b || (in_b && !withheld) {
+        let complete = |(_, header, ql, explained): &(bool, String, String, String)| {
+            header == "complete; regime=owl2-rl" && ql != "null" && explained == "complete"
+        };
+        if !whole.0 || !reader.0 || !complete(whole) || !complete(reader) {
             wrong.push(format!("{at}: every graph {}, reader {reader:?}", whole.0));
         }
     }

@@ -582,24 +582,30 @@ mod tests {
         found as f64 / (queries * k) as f64
     }
 
+    /// By default, this test extends 2,500 vectors to 5,000 for both metrics. With `NRESE_CHECK_TIER=nightly`, it extends 10,000 to 20,000.
     #[test]
     fn hnsw_finds_nearly_all_nearest_neighbours() {
-        let vectors = random_vectors(20_000, 16, 3);
+        let count = if crate::tests::nightly() {
+            20_000
+        } else {
+            5_000
+        };
+        let vectors = random_vectors(count, 16, 3);
         for metric in [Metric::Cosine, Metric::L2] {
             let mut graph = Hnsw::new(metric, HnswParameters::default());
             // In two parts: the second extends the graph.
             let mut first = Vectors::new(16);
-            for position in 0..10_000 {
+            for position in 0..(count / 2) as u32 {
                 first.push(vectors.id(position), vectors.get(position));
             }
             graph.extend(&first);
             graph.extend(&vectors);
-            assert_eq!(graph.len(), vectors.len());
             let all = recall(&vectors, &graph, 10, 64, &|_| true);
             assert!(all >= 0.95, "{metric:?}: recall {all}");
             // A filter that accepts half of the ids.
             let half = recall(&vectors, &graph, 10, 64, &|id| id % 2 == 0);
             assert!(half >= 0.9, "{metric:?}: recall with a filter {half}");
+            assert_eq!(graph.len(), vectors.len());
         }
     }
 
