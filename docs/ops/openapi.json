@@ -6387,6 +6387,16 @@
             },
             "description": "Timed out, or an operator cancelled the query"
           },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The SHACL gate's stored shapes don't compile (`shacl-shapes-unusable`); nothing committed. Repair or clear the shapes graph"
+          },
           "413": {
             "content": {
               "application/problem+json": {
@@ -6624,6 +6634,16 @@
               }
             },
             "description": "Timed out (`budgets.update_timeout`); nothing committed"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The SHACL gate's stored shapes don't compile (`shacl-shapes-unusable`); nothing committed. Repair or clear the shapes graph"
           },
           "413": {
             "content": {
