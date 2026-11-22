@@ -419,6 +419,9 @@ async fn hold(
         if Instant::now() >= deadline {
             return Err(ApiError::timeout(timeout_message));
         }
+        // Where a test stops the hold between its clock check and its charge.
+        #[cfg(test)]
+        tests::step().await;
         match received {
             Err(_elapsed) => return Err(ApiError::timeout(timeout_message)),
             Ok(None) => break,
@@ -610,11 +613,38 @@ impl http_body::Body for Held {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::time::Duration;
 
     use futures_util::StreamExt;
+    use tokio::sync::oneshot;
 
     use super::*;
+
+    thread_local! {
+        /// The step [`armed`] makes the next hold on this thread take, once.
+        static STEP: RefCell<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>> =
+            const { RefCell::new(None) };
+    }
+
+    /// The hold's step between its clock check and its charge of what it received: where a
+    /// test armed one on this thread ([`armed`]), it says it got there and waits to be let on.
+    pub(super) async fn step() {
+        let Some((reached, go)) = STEP.with(|step| step.borrow_mut().take()) else {
+            return;
+        };
+        let _ = reached.send(());
+        let _ = go.await;
+    }
+
+    /// Arms a step for the next hold on this thread (a current-thread runtime's): the hold
+    /// got there, and what lets it on.
+    fn armed() -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached, at_step) = oneshot::channel();
+        let (go, gone) = oneshot::channel();
+        STEP.with(|step| *step.borrow_mut() = Some((reached, gone)));
+        (at_step, go)
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_large_write_goes_out_in_chunks_of_at_most_64_kib() {
@@ -1235,6 +1265,82 @@ mod tests {
             .unwrap();
         let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(problem["detail"], "the query's own (budgets.query_memory)");
+    }
+
+    /// The detail of the refusal `stopped` is mapped to.
+    async fn detail(stopped: ApiError) -> serde_json::Value {
+        let body = axum::body::to_bytes(stopped.into_response().into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["detail"].clone()
+    }
+
+    /// Over HTTP/1.0, a producer (a CONSTRUCT) with one small frame of its answer held whose
+    /// next work needs more than its whole envelope (2 MiB of 1 MiB) keeps its own refusal,
+    /// the query's 413: with nothing held it would be refused too, so holding isn't its cause.
+    #[tokio::test]
+    async fn a_producers_work_past_its_whole_envelope_beside_a_held_frame_keeps_its_own_refusal() {
+        let memory = Envelope::new(Some(1 << 20), None);
+        let (sender, receiver) = mpsc::channel(CHANNEL_CHUNKS);
+        sender
+            .try_send(Frame::data(Bytes::from(vec![b'x'; 1 << 10])))
+            .unwrap();
+        let outcome = Outcome::default();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let held = hold(receiver, &outcome, deadline, memory.clone(), "timeout");
+        let refused = async {
+            // Once the hold holds the frame.
+            while memory.used() < 1 << 10 {
+                tokio::task::yield_now().await;
+            }
+            assert!(memory.part().charge(2 << 20).is_err(), "its work fits");
+            outcome.set(Err(ApiError::payload_too_large(
+                "the query's own (budgets.query_memory)",
+            )));
+            drop(sender);
+        };
+        let (stopped, ()) = tokio::join!(held, refused);
+        let stopped = stopped.err().expect("its work refused, no answer");
+        assert_eq!(memory.used(), 0, "the refused answer still holds memory");
+        assert_eq!(
+            detail(stopped).await,
+            "the query's own (budgets.query_memory)"
+        );
+    }
+
+    /// Over HTTP/1.0, a producer whose work is refused after the hold took its first frame
+    /// from the channel but before the hold charged it keeps its own refusal: at the refusal
+    /// the hold held nothing. Step by step, on the hold's step between its clock check and its
+    /// charge: the frame queued; the hold takes it and stops there; the work is refused and
+    /// the producer ends; the hold goes on.
+    #[tokio::test]
+    async fn a_producers_work_refused_before_its_first_frame_is_charged_keeps_its_own_refusal() {
+        let memory = Envelope::new(Some(1 << 20), None);
+        let (sender, receiver) = mpsc::channel(CHANNEL_CHUNKS);
+        sender
+            .try_send(Frame::data(Bytes::from(vec![b'x'; CHUNK_BYTES])))
+            .unwrap();
+        let outcome = Outcome::default();
+        let (at_step, go) = armed();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let held = hold(receiver, &outcome, deadline, memory.clone(), "timeout");
+        let refused = async {
+            at_step.await.expect("the hold reached its step");
+            assert_eq!(memory.used(), 0, "the frame was charged before the step");
+            assert!(memory.part().charge(2 << 20).is_err(), "its work fits");
+            outcome.set(Err(ApiError::payload_too_large(
+                "the query's own (budgets.query_memory)",
+            )));
+            drop(sender);
+            go.send(()).unwrap();
+        };
+        let (stopped, ()) = tokio::join!(held, refused);
+        let stopped = stopped.err().expect("its work refused, no answer");
+        assert_eq!(memory.used(), 0, "the refused answer still holds memory");
+        assert_eq!(
+            detail(stopped).await,
+            "the query's own (budgets.query_memory)"
+        );
     }
 
     /// Over HTTP/1.0, what a hold that resumes only past its deadline (1 s) answers, on a
