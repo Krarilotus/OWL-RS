@@ -17,6 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tower::util::ServiceExt;
 
+use crate::access_control_tests::{policy_of, token};
 use crate::cut_body_wire_tests::{WHOLE, http1_image, image_server, query};
 use crate::support::held_service::{HANG, HeldEndpoint};
 use crate::support::{minimal_fixture_path, test_app_with_store, test_app_with_store_config};
@@ -146,52 +147,101 @@ async fn answered(app: &axum::Router) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// While others hold the memory all queries share (all but 1 MiB of 8 MiB), an HTTP/1.0
-/// answer that fits it alone but not beside them (2 MiB) is turned away for now: 503 with
-/// `Retry-After: 1`, and what it held goes back. Once the others let go, the same request is
-/// answered whole. Its own envelope (4 GiB) has room throughout.
+/// An HTTP/1.0 query whose result table (256 KiB) finds no room in the memory all queries
+/// share because others hold it (all but 128 KiB of 8 MiB), refused before any of its
+/// answer is held: 503 without `Retry-After`, as every memory refusal is. Once the others
+/// let go, the same request is answered.
 #[tokio::test]
-async fn an_http10_answer_past_the_shared_memory_others_hold_may_be_retried()
+async fn an_http10_query_refused_early_while_others_hold_the_shared_memory_is_not_told_when_to_retry()
 -> Result<(), Box<dyn Error>> {
     let (store, app) = sharing(8 << 20)?;
     let others = store.envelope(None);
-    others.charge((7 << 20) - held(&store))?;
+    others.charge((8 << 20) - (128 << 10) - held(&store))?;
     let before = held(&store);
-    let refused = refusal(&app).await?;
     assert_eq!(
-        refused,
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Some(HeaderValue::from_static("1"))
-        )
+        refusal(&app).await?,
+        (StatusCode::SERVICE_UNAVAILABLE, None)
     );
     released_to(&store, before).await;
     drop(others);
     answered(&app).await
 }
 
-/// An HTTP/1.0 query whose result table (256 KiB) finds no room in the memory all queries
-/// share because others hold it (all but 128 KiB of 8 MiB), refused before any of its
-/// answer is held, is told to retry: 503 with `Retry-After: 1`. Once the others let go, the
-/// same request is answered.
+/// Readers of the access policy: `one` reads `urn:graph:g1` and the default graph only.
+const READERS: &str = r#"
+default = "deny"
+inferred = "hidden"
+
+[[role]]
+name = "one"
+read = ["urn:graph:g1"]
+default_graph = "read"
+"#;
+
+/// What the HTTP/1.0 query told the requester with `roles`: its status, its `Retry-After`,
+/// and its problem's `type`, `title` and `detail` (not its request id).
+async fn told(
+    app: &axum::Router,
+    roles: &[&str],
+) -> Result<(StatusCode, Option<HeaderValue>, serde_json::Value), Box<dyn Error>> {
+    let request = Request::post("/dataset/query")
+        .version(Version::HTTP_10)
+        .header(header::CONTENT_TYPE, "application/sparql-query")
+        .header(header::ACCEPT, "text/csv")
+        .header(header::AUTHORIZATION, format!("Bearer {}", token(roles)))
+        .body(Body::from(query()))?;
+    let response = app.clone().oneshot(request).await?;
+    let status = response.status();
+    let retry = response.headers().get(header::RETRY_AFTER).cloned();
+    let body = to_bytes(response.into_body(), usize::MAX).await?;
+    let problem: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+    eprintln!("{roles:?}: {status}; retry-after {retry:?}; {problem}");
+    let problem = serde_json::json!({
+        "type": problem["type"],
+        "title": problem["title"],
+        "detail": problem["detail"],
+    });
+    Ok((status, retry, problem))
+}
+
+/// An HTTP/1.0 answer held whole past the memory all queries share (others hold all but
+/// 1 MiB of 8 MiB; the answer is 2 MiB) is refused with 503 and no `Retry-After`, to a reader
+/// of every graph and to a reader of some, as every memory refusal is. The reader of some
+/// graphs is told the same whether or not work it can't see holds 256 KiB more of that
+/// memory, and the same as the reader of every graph: nothing it is told depends on hidden
+/// work.
 #[tokio::test]
-async fn an_http10_query_refused_early_while_others_hold_the_shared_memory_may_be_retried()
+async fn an_http10_answer_past_the_shared_memory_is_told_alike_and_not_when_to_retry()
 -> Result<(), Box<dyn Error>> {
-    let (store, app) = sharing(8 << 20)?;
+    let store = StoreService::new(StoreConfig {
+        total_query_memory_bytes: 8 << 20,
+        ..StoreConfig::in_memory()
+    })?;
+    let app = test_app_with_store(
+        store.clone(),
+        policy_of(READERS)?,
+        ReasonerConfig::default(),
+    )?;
     let others = store.envelope(None);
-    others.charge((8 << 20) - (128 << 10) - held(&store))?;
+    others.charge((7 << 20) - held(&store))?;
     let before = held(&store);
-    let refused = refusal(&app).await?;
-    assert_eq!(
-        refused,
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Some(HeaderValue::from_static("1"))
-        )
-    );
+    let reader = ["nrese.read", "one"];
+    let alone = told(&app, &reader).await?;
     released_to(&store, before).await;
-    drop(others);
-    answered(&app).await
+    let hidden = store.envelope(None);
+    hidden.charge(256 << 10)?;
+    let beside_hidden = told(&app, &reader).await?;
+    let every = told(&app, &["nrese.admin"]).await?;
+    for (status, retry, _) in [&alone, &beside_hidden, &every] {
+        assert_eq!(*status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(*retry, None);
+    }
+    assert_eq!(
+        alone.2, beside_hidden.2,
+        "the reader is told of work it can't see"
+    );
+    assert_eq!(alone.2, every.2);
+    Ok(())
 }
 
 /// An HTTP/1.0 query whose own work can't fit the memory all queries share even with nothing
