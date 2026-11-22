@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# The push tier of a pushed commit, or the merge check's Windows part, as a fleet job
-# (scripts/check.sh push, scripts/check.sh windows).
+# The push tier of a pushed commit, the quick check, the merge check's Windows part, or the nightly
+# run, as a fleet job (scripts/check.sh push, quick, windows, nightly).
 #
 #   scripts/lib/fleet-gate.sh MODE LIST TREE LIST_HASH IDENTITY WHERE COMMIT [BASE]
 #
@@ -12,6 +12,10 @@
 # target and lock of its own on the host, so it never waits behind a push gate. Sized by measurement
 # (1 to 5 minutes a changed crate on a warm target): est_min 10, a step deadline of 30 minutes. Never
 # a merge gate: it lands nothing.
+# MODE nightly (LIST empty): the same, for scripts/check.sh nightly: gate-job.sh mode nightly, every
+# test in its full form, in push's worktree, target and lock on the host (one build for both; a push
+# gate there waits for it), of push's fleet kind, placed by the fleet as push's is. Sized by measurement
+# (below). Never a merge gate: it lands nothing.
 # MODE windows (LIST: the suite contracts it runs, none listed for all): a job of kind owlrs.any on
 # any Windows host with what the tier uses there (below, `has`, in the fleet config's names), which
 # runs the commit's own scripts/lib/windows-job.ps1 and through it its scripts/check.sh windows.
@@ -82,6 +86,15 @@ case $mode in
     cores=${NRESE_GATE_CORES:-8} ram=${NRESE_GATE_RAM_GB:-12} est=${NRESE_GATE_EST_MIN:-10} deadline=30
     max_s=${NRESE_GATE_MAX_S:-2400}
     reason="the quick check of a commit before its review (scripts/check.sh quick); it lands nothing" ;;
+  nightly)
+    # Measured (21 Nov 2026, 8 cores, a warm target): 651 s whole, the tests 511 s, and the memory at
+    # 13.2 GB, the cap of a 12 GB ask: 16 GB. est twice the measured run for a cold build, the step
+    # deadline three times est. The start window four hours: an 8-core ask once waited past one. The
+    # whole wait a start window and a step deadline, so a run started late in its window ends by its
+    # own deadline.
+    cores=${NRESE_GATE_CORES:-8} ram=${NRESE_GATE_RAM_GB:-16} est=${NRESE_GATE_EST_MIN:-25} deadline=75
+    start_s=${NRESE_GATE_START_S:-14400} max_s=${NRESE_GATE_MAX_S:-$((start_s + deadline * 60))}
+    reason="the nightly run: every test in its full form (scripts/check.sh nightly); it lands nothing" ;;
   windows)
     # 9 GB: the suite's measured peak is 7.5 GB (five runs on the Windows host). The fleet admits a job
     # there only with 16 GB available and its ask within available less the 6.3 GB headroom, so a
@@ -104,7 +117,7 @@ priority=${NRESE_GATE_PRIORITY:-600}
 # The merge check's jobs (above): either tier's, for a commit that lands (gate-key.sh landing_ref:
 # engine-v2 or a release branch).
 class=""
-if [ "$mode" != quick ] && landing_ref "${NRESE_PUSH_REF:-}"; then
+if { [ "$mode" = push ] || [ "$mode" = windows ]; } && landing_ref "${NRESE_PUSH_REF:-}"; then
   class=merge-gate
 fi
 # A list longer than a step carries well within the fleet's 64 KB request is made on the host from
@@ -179,7 +192,8 @@ gate() {
     echo "source = { git = $(q "$(fleet_repo)"), rev = $(q "$commit") }"
   } > "$job"
   fleet_submit "$job" || no_verdict "the fleet refused the job"
-  fleet_say "submitted (priority $priority, asks $cores cores and $ram GB${1:+, on $1})"
+  fleet_say "submitted (priority $priority, asks $cores cores and $ram GB${1:+, on $1}; a start within $start_s s," \
+    "a verdict within $max_s s${deadline:+, a step deadline of $deadline min})"
   fleet_follow "$start_s" "$max_s" || no_verdict "no result"
   host=$fleet_host
   local results out

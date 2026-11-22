@@ -23,11 +23,14 @@ mod datatype;
 mod graph;
 mod incremental;
 mod model;
+mod nested_walk;
 mod path;
 mod report;
 mod sparql;
 mod validate;
 
+#[doc(hidden)]
+pub use compile::nesting_parameters;
 pub use compile::{ShapeError, compile, compile_until};
 pub use graph::Selection;
 pub use incremental::{validate_changes, validate_shapes_change};

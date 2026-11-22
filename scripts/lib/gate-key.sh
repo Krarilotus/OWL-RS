@@ -6,9 +6,10 @@
 #
 #   <tier>[ w3c-optional] <tree> <file list> rustc-<release>-<commit> flags=<rustflags> tools=<id> fleet
 #
-# - tier: push, quick or windows. A quick check's pass (scripts/check.sh quick) is its own tier's,
+# - tier: push, quick, windows or nightly. A quick check's pass (scripts/check.sh quick) is its own tier's,
 #   keyed as push's and found by its exact key only: it never stands for a push pass, and no pass
-#   covers another's list for it (gate_covering is the push tier's);
+#   covers another's list for it (gate_covering is the push tier's); so is a nightly pass
+#   (scripts/check.sh nightly), with an empty list;
 # - tree: the pushed commit's tree, what was tested, byte for byte; for `windows`, the hash of the
 #   checked commit's inputs (windows_inputs), so a pass carries to a later commit with the same
 #   inputs;
