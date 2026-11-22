@@ -1034,10 +1034,9 @@ mod tests {
             parent = child;
         }
         drop(first);
-        let last = Arc::new(Version {
-            content: parent,
-            ..Version::empty()
-        });
+        let mut last = Version::empty();
+        last.content = parent;
+        let last = Arc::new(last);
         let admitted = CorpusAdmission::for_tests(&last);
         store.find(&admitted, kind(&scope), &request).unwrap();
         store
