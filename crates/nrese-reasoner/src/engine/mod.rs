@@ -278,9 +278,10 @@ impl Program {
     /// subject or predicate, it may need such a statement (`prp-rng` types a literal, and
     /// `cls-maxqc3` reads that type): the rule runs without it, and a match counts where the
     /// conclusion's subject is a literal or left unbound, so the answer errs towards an
-    /// equality (`literal_equality_atoms`). Where a rule concludes a statement with a literal
-    /// subject over the statements held (the first such statement the closure had has only
-    /// held premises: `prp-rng` typing a literal), such statements may fill any atom whose
+    /// equality (`literal_equality_atoms`). Where the program holds a statement with a literal
+    /// subject without premises (an axiom, a bodiless instance: `cls-oo` over a literal), or a
+    /// rule concludes one over the statements held (the first such statement the closure had
+    /// has only held premises: `prp-rng` typing a literal), such statements may fill any atom whose
     /// subject is a variable no atom reads as a predicate (`cls-hv1` giving that literal two
     /// values of a functional property, which `prp-fp` reads): those atoms are left out too.
     /// `Err` once `stop` fires.
@@ -329,13 +330,18 @@ impl Program {
             )
         };
         let concluded = std::cell::OnceCell::new();
+        // Every source of a first statement with a literal subject: a fact the program holds
+        // without premises (an axiom, a bodiless instance: `cls-oo` typing a literal its
+        // `owl:oneOf` lists), or a rule's conclusion over held premises, whose subject is then
+        // a constant or a term a premise reads at its object (a premise's subject is held,
+        // never a literal; one at its predicate needs `eq-rep-p` over an `owl:sameAs` with a
+        // literal, the equality looked for). The transitive closure's subject is a premise's.
         let literal_subjects = || {
             *concluded.get_or_init(|| {
-                ground
-                    .rules
-                    .iter()
-                    .filter(|rule| !rule.body.is_empty())
-                    .any(|rule| {
+                let fact = |triple: &crate::ir::Triple| literal(triple[0]);
+                (self.axioms.iter()).any(fact)
+                    || ground.bodiless.iter().any(fact)
+                    || ground.rules.iter().any(|rule| {
                         let Head::Facts(heads) = &rule.head else {
                             return false;
                         };
