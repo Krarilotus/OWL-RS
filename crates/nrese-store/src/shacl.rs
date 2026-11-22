@@ -139,6 +139,9 @@ pub struct ShaclRefusal {
     pub failures: Vec<String>,
     /// Validation failures left out by the count or memory limit.
     pub failures_omitted: usize,
+    /// The refusal's detail with its counts alone, as a restricted committer's is framed:
+    /// for an answer that lists no result.
+    pub count_detail: String,
     memory: Arc<Budget>,
     encoding_floor: usize,
     // Drop the text and vectors before giving their space back.
@@ -572,6 +575,11 @@ pub(crate) fn refusal(
     if total_failures > 0 {
         detail.push_str(&format!(" and {total_failures} failure(s)"));
     }
+    let count_detail = if restricted {
+        in_readable_graphs(&detail)
+    } else {
+        detail.clone()
+    };
     let mut text = Reservation::new(Arc::clone(&memory));
     let mut results = ChargedVec::new(Arc::clone(&memory));
     let mut live_text_bytes = 0;
@@ -648,6 +656,7 @@ pub(crate) fn refusal(
             failures_omitted: total_failures - failures.len(),
             results,
             failures,
+            count_detail,
             memory,
             encoding_floor,
             text: Mutex::new(text),

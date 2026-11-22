@@ -590,7 +590,8 @@ empty `evidence`. It is `null` when no result is listed. The
 two lists. The write's memory budget can shorten them further, including at `unlimited`.
 Add each list's omitted count to its length to get its total. If encoding the lists would
 exceed the write's memory budget, the response still says `shacl-reject` and gives just the
-counts, with both lists empty.
+counts, with both lists empty: its `detail` gives the counts alone, still framed for a committer
+with limited graph access, and `reasoner_reject` is `null`.
 
 A committer with limited graph access gets a report from validation of its own readable
 assertions. If it cannot read the shapes graph, or those shapes use SHACL-SPARQL, a

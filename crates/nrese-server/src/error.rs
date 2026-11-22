@@ -375,9 +375,8 @@ fn shacl_problem(mut body: ProblemJson<'_>, refusal: &ShaclRefusal) -> Response 
     if let Some(response) = charged_shacl_problem(&body, refusal) {
         return response;
     }
-    if body.reasoner_reject.take().is_some() {
-        body.detail = "the commit was rejected by the SHACL gate".to_owned();
-    }
+    body.reasoner_reject = None;
+    body.detail = refusal.count_detail.clone();
     body.shacl = Some(crate::http::refusal_counts_json(refusal));
     charged_shacl_problem(&body, refusal).unwrap_or_else(|| {
         // If even the count-only response has no room, it is a bounded problem
