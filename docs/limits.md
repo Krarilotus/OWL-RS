@@ -213,6 +213,14 @@ leave something out.
   the read answers `false` and is told `complete`. For one:
   `:x a [ owl:onProperty owl:topObjectProperty ; owl:allValuesFrom :D ] . :y a :Y`, asked
   `:y a :D`. At the defaults it isn't told `complete`.
+- Under `owl2-ql`, a read that lists every partner of a top property, or of a property
+  equivalent to, above, or inverse to one, isn't told `complete`: every individual is a
+  partner, and the rewriting doesn't list them. For one: with
+  `:q owl:equivalentProperty owl:topObjectProperty`, `SELECT ?y { :a :q ?y }`. The same holds
+  for listing the members of a top property's domain or range, `SELECT ?x { ?x a :B }`.
+  Asking whether such a pair exists is answered for a property equivalent to, above, or
+  inverse to a top property, and whether an individual is such a member is answered; asked
+  of the top property itself, it isn't told `complete`.
 - Under `owl2-ql`, and under `owl2-rl` with the rewriting on, a store inconsistent only through
   an existential the rewriting gives isn't found inconsistent: a read every inconsistent store
   entails answers `false` and is told `complete`. For one: `:A ⊑ ∃:p.:B`, `:N ⊑ ¬∃:p.:B`,

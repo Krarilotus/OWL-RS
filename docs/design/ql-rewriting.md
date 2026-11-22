@@ -36,7 +36,11 @@ known through a source read; *ours* = measured or tested here).
 - **On the algebra, before planning.** `nrese-sparql` rewrites each basic graph pattern
   of the query (`native/ql.rs`) before the optimiser's passes run, also under
   `as_written` (it changes the answers, not just the plan). EXPLAIN lists it as the rewrite
-  `ql-tree-witness`, and the plan shows the union it made.
+  `ql-tree-witness`, and the plan shows the union it made. An atom over a property that
+  the TBox makes universal (one equivalent to, above, or inverse to a top property) is
+  dropped instead where the Direct Semantics makes it hold, so the plan shows the query
+  without it. A read that would have to list such a property's pairs, or that reads the top
+  property itself, is told it isn't `complete`.
 - **The schema at the snapshot.** The TBox is read from the snapshot the query reads
   (asserted schema statements, every graph), mapped by
   `nrese-owl`'s reverse RDF mapping, and compiled (`nrese-owl::ql`). It is cached per store
