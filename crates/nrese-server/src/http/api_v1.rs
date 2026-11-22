@@ -963,7 +963,8 @@ fn start_import(
         let store = state.store();
         let loaded = store.bulk_load_with(&request, job.progress());
         match &loaded {
-            Ok(loaded) => job.loaded(loaded.revision),
+            Ok(loaded) if loaded.published => job.loaded(loaded.revision),
+            Ok(loaded) => job.unchanged(loaded.revision),
             Err(nrese_store::StoreError::LoadPublished { revision, .. }) => job.loaded(*revision),
             Err(_) => {}
         }

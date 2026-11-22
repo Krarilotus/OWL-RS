@@ -75,7 +75,8 @@ pub struct JobView {
     /// When it started, in seconds since the Unix epoch, and how long it ran.
     pub started: u64,
     pub elapsed_ms: u64,
-    /// Its report when done.
+    /// Its report when done; a failed import that stopped after its load returned has one
+    /// too, with the `revision` the store serves.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(value_type = Option<Object>))]
     pub report: Option<serde_json::Value>,
@@ -106,6 +107,8 @@ enum Stage {
     Running,
     /// The load returned, published at `revision`.
     Loaded { revision: u64 },
+    /// The load returned having changed nothing; the store serves `revision` as before.
+    Unchanged { revision: u64 },
 }
 
 impl Stage {
@@ -122,13 +125,18 @@ impl Stage {
             Self::Loaded { revision } => format!(
                 "the load was published at revision {revision}, then the import stopped (an internal error); reasoning may not be up to date. Don't {retry} it again."
             ),
+            Self::Unchanged { .. } => format!(
+                "the load changed nothing (its statements were already there), then the import stopped (an internal error). There's no need to {retry} it again; any statements it couldn't read are in the quarantine list."
+            ),
         }
     }
 
-    /// The report of a job stopped here: the revision its load published.
+    /// The report of a job stopped here: the revision the store serves after its load.
     fn report(self) -> Option<serde_json::Value> {
         match self {
-            Self::Loaded { revision } => Some(serde_json::json!({ "revision": revision })),
+            Self::Loaded { revision } | Self::Unchanged { revision } => {
+                Some(serde_json::json!({ "revision": revision }))
+            }
             Self::Queued | Self::Running => None,
         }
     }
@@ -194,6 +202,11 @@ impl Job {
     /// after it.
     pub fn loaded(&mut self, revision: u64) {
         self.stage = Stage::Loaded { revision };
+    }
+
+    /// Its load returned having changed nothing, the store at `revision`: as [`Self::loaded`].
+    pub fn unchanged(&mut self, revision: u64) {
+        self.stage = Stage::Unchanged { revision };
     }
 
     /// Ends the job with the operation's outcome, preserving a genuine failure

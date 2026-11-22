@@ -59,6 +59,9 @@ pub struct BulkLoadRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BulkLoadReport {
     pub revision: u64,
+    /// Whether the load published `revision`; `false`: it changed nothing (its statements
+    /// were there already), and `revision` is the one the store served before.
+    pub published: bool,
     /// Quads parsed, including duplicates.
     pub parsed: u64,
     /// Asserted quads added and removed.
@@ -231,6 +234,7 @@ pub(crate) fn bulk_load(
     }
     Ok(BulkLoadReport {
         revision: summary.revision,
+        published,
         parsed,
         inserted: summary.inserted,
         deleted: summary.deleted,
