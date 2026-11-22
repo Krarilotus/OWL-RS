@@ -39,9 +39,13 @@ fn reach<V: ReadView>(
     from: &[TermId],
     inverse: bool,
 ) -> Vec<TermId> {
+    if graph.cancelled() {
+        return Vec::new();
+    }
     match path {
         Path::Predicate(predicate) => union(
             from.iter()
+                .take_while(|_| !graph.cancelled())
                 .flat_map(|&node| {
                     if inverse {
                         graph.subjects(*predicate, node)
@@ -65,6 +69,7 @@ fn reach<V: ReadView>(
         Path::Alternative(parts) => union(
             parts
                 .iter()
+                .take_while(|_| !graph.cancelled())
                 .flat_map(|part| reach(graph, part, from, inverse))
                 .collect(),
         ),
@@ -90,7 +95,7 @@ fn closure<V: ReadView>(
 ) -> Vec<TermId> {
     let mut reached = union(start);
     let mut frontier = reached.clone();
-    while !frontier.is_empty() {
+    while !frontier.is_empty() && !graph.cancelled() {
         let next = reach(graph, path, &frontier, inverse);
         frontier = next
             .into_iter()
