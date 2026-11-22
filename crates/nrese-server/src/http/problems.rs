@@ -42,12 +42,14 @@ pub(crate) async fn problems(method: Method, response: Response) -> Response {
     let bytes = axum::body::to_bytes(body, limit).await.ok();
     // The server's own document passes as it was written, its request id appended: never
     // decoded and written again, which would hold two more copies of it, uncharged.
-    if let (true, true, Some(bytes)) = (own, documented, &bytes) {
-        if let Some(body) = with_request_id(bytes, id.as_deref()) {
-            parts.headers.remove(header::CONTENT_LENGTH);
-            parts.headers.remove(header::CONTENT_ENCODING);
-            return Response::from_parts(parts, body);
-        }
+    if own
+        && documented
+        && let Some(bytes) = &bytes
+        && let Some(body) = with_request_id(bytes, id.as_deref())
+    {
+        parts.headers.remove(header::CONTENT_LENGTH);
+        parts.headers.remove(header::CONTENT_ENCODING);
+        return Response::from_parts(parts, body);
     }
     let mut document = match (&bytes, documented) {
         (Some(bytes), true) => match serde_json::from_slice::<Value>(bytes) {
