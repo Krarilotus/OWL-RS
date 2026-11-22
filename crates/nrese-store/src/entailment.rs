@@ -27,6 +27,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use nrese_engine::Snapshot;
 use nrese_rdf::vocab::{owl, rdf};
 use nrese_rdf::{GraphName, NamedOrBlankNode, Quad, Term, Triple};
 use nrese_reasoner::RuleProgram;
@@ -112,37 +113,46 @@ impl StoreService {
             }
             _ => {}
         }
-        if self.shown_by_rules(program, &split(conclusion))? {
+        // One revision for the whole answer: the closure's read, every refutation and the DL
+        // check are of it.
+        let at = self.engine().snapshot();
+        if self.shown_by_rules(&at, program, &split(conclusion))? {
             return Ok(Entailment::Entailed);
         }
         // The rules are complete under the Direct Semantics only for OWL 2 RL premises
         // (OWL 2 Profiles §4.3, PR1): under owl2-dl, what they leave unshown the DL engines
         // decide.
         if self.dl().active() {
-            return self.decided_by_dl(conclusion);
+            return self.decided_by_dl(&at, conclusion);
         }
         Ok(Entailment::NotEntailed)
     }
 
-    /// Whether the closure holds every positive statement and the rules refute every
-    /// opposite.
-    fn shown_by_rules(&self, program: &RuleProgram, split: &Split) -> StoreResult<bool> {
-        if !split.positive.is_empty() && !self.ask(&split.positive)? {
+    /// Whether the closure at `at` holds every positive statement and the rules refute every
+    /// opposite over it.
+    fn shown_by_rules(
+        &self,
+        at: &Snapshot,
+        program: &RuleProgram,
+        split: &Split,
+    ) -> StoreResult<bool> {
+        if !split.positive.is_empty() && !self.ask(at, &split.positive)? {
             return Ok(false);
         }
         #[cfg(test)]
         crate::service::hooks::run(&crate::service::hooks::BETWEEN_ENTAILMENT_HALVES);
         for opposite in &split.refutations {
-            if !self.refutes(program, opposite)? {
+            if !self.refutes(at, program, opposite)? {
                 return Ok(false);
             }
         }
         Ok(true)
     }
 
-    /// [`Self::entails_dl`]'s answer as an [`Entailment`]; undecided where it is unknown.
-    fn decided_by_dl(&self, conclusion: &[Triple]) -> StoreResult<Entailment> {
-        let decided = self.entails_dl(conclusion)?;
+    /// [`Self::entails_dl`]'s answer at `at` as an [`Entailment`]; undecided where it is
+    /// unknown.
+    fn decided_by_dl(&self, at: &Snapshot, conclusion: &[Triple]) -> StoreResult<Entailment> {
+        let decided = self.entails_dl_at(at, conclusion)?;
         match (decided.premise, decided.answer) {
             (crate::dl::Verdict::Inconsistent, _) => Ok(Entailment::InconsistentPremise),
             (_, crate::dl::entailment::Entailed::Yes) => Ok(Entailment::Entailed),
@@ -153,8 +163,8 @@ impl StoreService {
         }
     }
 
-    /// Whether the materialised data matches `pattern`, blank nodes read as variables.
-    fn ask(&self, pattern: &[Triple]) -> StoreResult<bool> {
+    /// Whether the materialised data at `at` matches `pattern`, blank nodes read as variables.
+    fn ask(&self, at: &Snapshot, pattern: &[Triple]) -> StoreResult<bool> {
         let patterns: Vec<String> = pattern
             .iter()
             .map(|t| format!("{} .", triple_pattern(t)))
@@ -163,16 +173,22 @@ impl StoreService {
         let query = SparqlParser::new()
             .parse_query(&text)
             .map_err(|error| StoreError::Configuration(format!("{error}: {text}")))?;
-        let snapshot = self.engine().snapshot();
-        match nrese_sparql::evaluate_query(&snapshot, &query, &QueryOptions::default())? {
+        match nrese_sparql::evaluate_query(at, &query, &QueryOptions::default())? {
             QueryResults::Boolean(found) => Ok(found),
             _ => unreachable!("an ASK answers with a boolean"),
         }
     }
 
-    /// Whether adding `opposite` to the data makes it inconsistent under `program`: the
-    /// reasoner maintains the closure over a speculative transaction, which is dropped.
-    fn refutes(&self, program: &RuleProgram, opposite: &[Triple]) -> StoreResult<bool> {
+    /// Whether adding `opposite` to the data at `at` makes it inconsistent under `program`:
+    /// the reasoner maintains the closure over a speculative transaction, which is dropped.
+    /// Undecided where a commit came after `at` (the transaction starts from the latest
+    /// revision): its answer would be another revision's.
+    fn refutes(
+        &self,
+        at: &Snapshot,
+        program: &RuleProgram,
+        opposite: &[Triple],
+    ) -> StoreResult<bool> {
         let memory = self.memory_stop();
         let (stop, room) = (|| memory.exceeded(), || memory.room());
         let operation = nrese_reasoner::eval::OperationStop::new(&stop).within(&room);
@@ -181,6 +197,9 @@ impl StoreService {
         // form, so the rule constants this compiles still enter the dictionary.
         #[allow(clippy::disallowed_methods)]
         let mut tx = self.engine().speculative_shared();
+        if tx.base().revision() != at.revision() {
+            return Err(StoreError::Undecided(CHANGED.to_owned()));
+        }
         for t in opposite {
             let quad = Quad::new(
                 t.subject.clone(),
@@ -209,6 +228,9 @@ impl StoreService {
         Ok(!done.violations.consistent())
     }
 }
+
+/// Why an entailment check that saw a commit after its start gives no answer.
+const CHANGED: &str = "the data changed during the entailment check: ask again";
 
 /// `triple` as a SPARQL triple pattern: see [`term_pattern`].
 fn triple_pattern(triple: &Triple) -> String {
@@ -402,6 +424,15 @@ impl StoreService {
     /// check and the conclusion's tests share it. A conclusion that isn't well-formed OWL 2 DL,
     /// or one left undecided at the deadline, is `unknown`. Reads only; never commits.
     pub fn entails_dl(&self, conclusion: &[Triple]) -> StoreResult<DlEntailment> {
+        self.entails_dl_at(&self.engine().snapshot(), conclusion)
+    }
+
+    /// [`Self::entails_dl`] over the asserted statements at `snapshot`.
+    fn entails_dl_at(
+        &self,
+        snapshot: &Snapshot,
+        conclusion: &[Triple],
+    ) -> StoreResult<DlEntailment> {
         use crate::dl::entailment::{Entailed, entails_ontology};
         use crate::dl::{Verdict, consistency, gate, source};
         use nrese_rdf::{BlankNode, NamedNodeRef, NamedOrBlankNode};
@@ -412,12 +443,11 @@ impl StoreService {
                 "entailment checks run on the primary, not on a read replica".to_owned(),
             ));
         }
-        let snapshot = self.engine().snapshot();
         let memory = self.envelope(None);
         // Undecided where the request's envelope can't take reading the premise (SYN-61).
         let treatments = &self.config().dl.treatments;
         let Ok((premise, read_statements)) =
-            source::read_premise(&snapshot, memory.clone(), treatments)
+            source::read_premise(snapshot, memory.clone(), treatments)
         else {
             let why = source::refused("the premise");
             return Ok(DlEntailment {
@@ -443,7 +473,7 @@ impl StoreService {
         // lifecycle V1); the conclusion's terms are the request's own, in a private
         // vocabulary charged to its envelope, past the premise's ids.
         source::intern_system_vocabulary(self.engine())?;
-        let tx = source::private_over(self.engine(), &snapshot, Arc::new(memory.part()));
+        let tx = source::private_over(self.engine(), snapshot, Arc::new(memory.part()));
         let n = CONCLUSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let blank = |b: &BlankNode| BlankNode::new_unchecked(format!("nresec{n}x{}", b.as_str()));
         let id = |t: Term| -> nrese_engine::EngineResult<u64> {
@@ -553,7 +583,11 @@ mod memory_tests {
                 ..StoreConfig::in_memory()
             })
             .unwrap();
-            let result = store.refutes(&Ruleset::Owl2Rl.into(), std::slice::from_ref(&opposite));
+            let result = store.refutes(
+                &store.engine().snapshot(),
+                &Ruleset::Owl2Rl.into(),
+                std::slice::from_ref(&opposite),
+            );
             let diagnostic = store.equality_report(Ruleset::Owl2Rl);
             if limit == 1 {
                 assert!(matches!(
