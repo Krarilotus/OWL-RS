@@ -2322,6 +2322,44 @@ impl<'a> Unpolled<'a> {
     }
 }
 
+/// List rule templates indexed by the atoms that grounding consumes. Keep the templates
+/// even when they ground to no rules yet: a later schema edge may be their first binding.
+#[derive(Default)]
+pub(crate) struct ListOperands {
+    templates: Vec<(Rule, Vec<Triple>)>,
+    dispatch: Dispatch,
+}
+
+pub(crate) enum ListRuleHeads {
+    All,
+    FactsOnly,
+}
+
+impl ListOperands {
+    /// Grounds the templates that read changed schema atoms, keeping their list premises.
+    /// Overdeletion asks only for rules that derive facts.
+    pub(crate) fn ground_delta<S: Source + ?Sized>(
+        &self,
+        target: &mut GroundProgram,
+        source: &S,
+        schema: &Schema,
+        delta: &super::batch::Store,
+        poll: &Poller<'_>,
+        heads: ListRuleHeads,
+    ) -> Result<(), Stopped> {
+        for (index, _) in self.dispatch.matching(delta, poll)? {
+            if poll.tick() {
+                return Err(Stopped);
+            }
+            let (rule, premises) = &self.templates[index];
+            if matches!(heads, ListRuleHeads::All) || rule.head != Head::Inconsistent {
+                target.ground_one(source, schema, rule, true, premises);
+            }
+        }
+        poll.ended()
+    }
+}
+
 /// A ground program: the rule instances with a body (indexed by [`Dispatch`]), the
 /// transitive predicates (closed by a module instead of joins), the facts of bodiless
 /// instances, and the ground consistency rules.
@@ -2374,6 +2412,7 @@ pub struct GroundProgram {
     /// The list axioms of the program's state that weren't instantiated.
     pub list_diagnostics: Vec<super::lists::ListDiagnostic>,
     pub(crate) list_predicates: super::lists::Predicates,
+    pub(crate) list_operands: Option<std::sync::Arc<ListOperands>>,
     pub(crate) table_rules: Vec<usize>,
     pub(crate) table: Option<std::sync::Arc<super::batch::Store>>,
 }
@@ -2606,9 +2645,37 @@ impl GroundProgram {
         }
     }
 
-    /// Grounds `rules` through the delta of `source` only (rules without schema atoms, list
-    /// rules among them, in full); returns the indices of the new fact rules and
-    /// consistency rules.
+    /// Grounds the current list reading and replaces its schema-operand index.
+    pub(crate) fn ground_lists<S: Source + ?Sized>(
+        &mut self,
+        source: &S,
+        schema: &Schema,
+        rules: Vec<Rule>,
+        premises: Vec<Vec<Triple>>,
+    ) {
+        self.ground_with_premises(source, schema, &rules, &premises);
+        let mut operands = ListOperands::default();
+        for (rule, premises) in rules.into_iter().zip(premises) {
+            let mut reads = rule.body.iter().filter(|atom| schema.is_schema_atom(atom));
+            if let Some(first) = reads.next() {
+                let index = operands.templates.len();
+                // Dispatch only needs the template index. Use the same atom index for
+                // every read so its matching step deduplicates the template.
+                for atom in std::iter::once(first).chain(reads) {
+                    operands
+                        .dispatch
+                        .push_atoms(index, std::slice::from_ref(atom));
+                }
+                operands.templates.push((rule, premises));
+            }
+        }
+        self.list_operands =
+            (!operands.templates.is_empty()).then(|| std::sync::Arc::new(operands));
+    }
+
+    /// Grounds `rules` through the delta of `source` (rules without schema atoms in full).
+    /// Returns the indices of new fact and consistency rules. Incremental list operands
+    /// use `ListOperands::ground_delta` so their list premises stay attached.
     pub fn ground_delta<S: Source + ?Sized>(
         &mut self,
         source: &S,

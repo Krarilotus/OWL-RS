@@ -79,18 +79,7 @@ pub fn draws_on(drawn: u64, cases: u64, covered: bool) -> bool {
     drawn < cases || (!covered && drawn < cases.saturating_mul(10))
 }
 
-pub const RED_SHAPES: &[&str] = &[
-    "redundant",
-    "cycle",
-    "schema-insert",
-    "schema-delete",
-    "equality-member",
-    "long-chain",
-    "equality-schema",
-    "literal-functional",
-    "nil-head",
-    "nil-cell",
-];
+pub const RED_SHAPES: &[&str] = &["equality-schema", "literal-functional"];
 
 pub const SHAPES: &[&str] = &[
     "redundant",
