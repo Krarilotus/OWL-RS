@@ -10,7 +10,7 @@ import ast
 from pathlib import Path
 import unittest
 
-from boundary_exceptions import STARTS, WRITES
+import boundary_exceptions
 
 ROOT = Path(__file__).resolve().parents[3]
 DIRECTORIES = ("benches/suite", "benches/fast", "scripts/verify", "benches/reasoning/datalog",
@@ -26,6 +26,17 @@ def argument(call, index, key):
 
 def spelling(node):
     return ast.unparse(node) if node is not None else ""
+
+
+def respelled(entries):
+    # The exceptions are written as source; each Python version unparses the same expression its own way (an
+    # f-string's inner quotes since 3.12), so the listed destination is spelled by the running Python too.
+    return {(*entry[:-1], spelling(ast.parse(entry[-1], mode="eval").body) if entry[-1] else "")
+            for entry in entries}
+
+
+WRITES = respelled(boundary_exceptions.WRITES)
+STARTS = respelled(boundary_exceptions.STARTS)
 
 
 def destination(call, name):

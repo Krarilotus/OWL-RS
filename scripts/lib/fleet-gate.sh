@@ -61,7 +61,7 @@ fleet_label="fleet gate"
 start_s=${NRESE_GATE_START_S:-180}
 max_s=${NRESE_GATE_MAX_S:-10800}
 # fleet_hosts NAME: a configured [fleet] list, space-separated. An absent list fails.
-fleet_hosts() { uv run --no-project python -I benches/suite/suitekit/hosts.py fleet "$1"; }
+fleet_hosts() { python -I benches/suite/suitekit/hosts.py fleet "$1"; }
 no_verdict() {
   fleet_say "$*: no verdict, so no pass"
   fleet_cancel

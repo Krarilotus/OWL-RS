@@ -30,7 +30,9 @@ root=${NRESE_BUILD_ROOT:-owlrs}
 # The fleet's hosts time benchmarks; a build beside a timed run spoils it (19 Oct 2026: hooks
 # built on the shared host during A-B-B-As). On them, builds and tests go through fleet jobs only:
 # the private overlay's [fleet] builds_by_fleet_only (benches/suite/suitekit/hosts.py fleet).
-fleet_only=$(uv run --no-project python -I benches/suite/suitekit/hosts.py fleet builds_by_fleet_only) || {
+# Python under either name, as scripts/lib/fleet-job.sh: Windows has `python` (its `python3` may be the Store's stub).
+python=$(type -P python || type -P python3)
+fleet_only=$("${python:-python3}" -I benches/suite/suitekit/hosts.py fleet builds_by_fleet_only) || {
   echo "can't read the policy for fleet-only build hosts" >&2
   exit 2
 }
