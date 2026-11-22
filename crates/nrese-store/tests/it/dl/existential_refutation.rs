@@ -112,19 +112,38 @@ fn without_the_range_the_complement_is_not_entailed() {
 /// refutation of `:a a :C` shows only its first half.
 #[test]
 fn a_complement_the_conclusion_also_says_is_empty_is_not_entailed() {
-    let dl = pipeline();
-    insert(&dl, ":a a :B . :B owl:disjointWith :C .").expect("premise");
-    let conclusion =
-        turtle(":a a _:n . _:n a owl:Class ; owl:complementOf :C ; rdfs:subClassOf owl:Nothing .");
-    let by_store = format!("{:?}", dl.store().entails(rules(), &conclusion));
-    let by_dl = dl
-        .store()
-        .entails_dl(&conclusion)
-        .expect("entailment")
-        .answer;
     assert_eq!(
-        (by_store.as_str(), by_dl),
-        ("Ok(NotEntailed)", Entailed::No),
+        checks(
+            ":a a :B . :B owl:disjointWith :C .",
+            ":a a _:n . _:n a owl:Class ; owl:complementOf :C ; rdfs:subClassOf owl:Nothing ."
+        ),
+        ("Ok(NotEntailed)".to_owned(), Entailed::No),
         "entails under owl2-dl, entails_dl"
     );
+}
+
+/// Spec (module docs; *OWL 2 Mapping to RDF Graphs*: `C ⊑ ¬C` names the complement by its
+/// node): `:a` is a `:B`, disjoint with `:C`, so `:a a ¬C` holds, but `:b` is a `:C`, so `C ⊑
+/// ¬C` (`:C` empty) doesn't, nor does the conclusion. Read apart, the refutation of `:a a :C`
+/// and a match of `:C rdfs:subClassOf ?n` (`:E`) would show it.
+#[test]
+fn a_complement_another_axiom_names_is_read_with_it() {
+    assert_eq!(
+        checks(
+            ":a a :B . :B owl:disjointWith :C . :b a :C . :C rdfs:subClassOf :E .",
+            ":a a _:n . _:n a owl:Class ; owl:complementOf :C . :C rdfs:subClassOf _:n ."
+        ),
+        ("Ok(NotEntailed)".to_owned(), Entailed::No),
+        "entails under owl2-dl, entails_dl"
+    );
+}
+
+/// Both checks of `conclusion` by a store under `owl2-dl` with `premise` committed.
+fn checks(premise: &str, conclusion: &str) -> (String, Entailed) {
+    let dl = pipeline();
+    insert(&dl, premise).expect("premise");
+    let conclusion = turtle(conclusion);
+    let by_store = format!("{:?}", dl.store().entails(rules(), &conclusion));
+    let by_dl = dl.store().entails_dl(&conclusion).expect("entailment");
+    (by_store, by_dl.answer)
 }
