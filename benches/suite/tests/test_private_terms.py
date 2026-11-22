@@ -294,6 +294,15 @@ class PrivateTerms(unittest.TestCase):
         self.assertNotIn("under benches", done.stdout)
         self.assertNotIn("path matches", done.stdout)
 
+    def test_a_merges_own_binary_content_is_read(self):
+        # Spec (as above): a file the merge adds is its own, a binary one too (git's combined diff can leave a
+        # binary file's lines out).
+        line = self.branch("line", self.base, {"l.txt": "line\n"})
+        merge = self.merge(line, files={"bin.dat": "\x00\x01zznamezz\n"})
+        done = self.check("push", line, "HEAD", "refs/heads/topic")
+        self.assertEqual(done.returncode, 1, f"SPEC merge-own-binary: a merge's own binary line passed\n{done.stdout}")
+        self.assertIn(f"commit {merge[:9]}: added lines match in a file under .\n", done.stdout)
+
     def test_a_merged_side_branch_nobody_has_is_read_at_its_own_commits(self):
         side = self.branch("side", self.base, {"s.txt": "zznamezz\n"})
         merge = self.merge(side)
