@@ -625,12 +625,10 @@ impl Builder {
                 self.role(b.inverse(), *a, true);
             }
             Axiom::ObjectPropertyDomain(property, class) => {
-                let left = self.basic(Basic::Exists(*property));
-                self.superclass(o, left, *class, true);
+                self.domain(o, *property, *class, o.builtin.top_object);
             }
             Axiom::ObjectPropertyRange(property, class) => {
-                let left = self.basic(Basic::Exists(property.inverse()));
-                self.superclass(o, left, *class, true);
+                self.domain(o, property.inverse(), *class, o.builtin.top_object);
             }
             Axiom::ObjectCharacteristic(Characteristic::Symmetric, property) => {
                 self.role(*property, property.inverse(), true);
@@ -659,14 +657,25 @@ impl Builder {
             }
             Axiom::DataPropertyDomain(property, class) => {
                 self.tbox.data.insert(*property);
-                let left = self.basic(Basic::Exists(ObjProp::Named(*property)));
-                self.superclass(o, left, *class, true);
+                self.domain(o, ObjProp::Named(*property), *class, o.builtin.top_data);
             }
             // Not read: what the closure's profile says of it decides (I24c).
             _ => {
                 self.mark_partial();
             }
         }
+    }
+
+    fn domain(&mut self, o: &Ontology, role: Role, class: ExprId, top: Option<Term>) {
+        // Both domains are nonempty, so the top roles' domains (including the inverse
+        // of the top object role) are owl:Thing. The closure needs a stored edge.
+        let (basic, base) = if top == Some(role.named()) {
+            (Basic::Thing, false)
+        } else {
+            (Basic::Exists(role), true)
+        };
+        let left = self.basic(basic);
+        self.superclass(o, left, class, base);
     }
 
     /// A role inclusion; `base` if the materialisation applies it (`prp-spo1`,
