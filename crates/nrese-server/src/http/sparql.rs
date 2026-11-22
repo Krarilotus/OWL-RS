@@ -296,7 +296,7 @@ pub(crate) fn map_query_error(policy: &PolicyConfig, error: StoreError) -> ApiEr
                 "the query was stopped: it exceeded the policy timeout, or an operator cancelled it",
             )
         }
-        // Other queries hold the memory this one asked for: it may succeed later.
+        // The memory all queries share has no room for this one.
         error if error.is_server_memory_limit() => server_memory_in_use(error),
         // The query needs more memory than the policy allows: the client's to change.
         error if error.is_memory_limit() => ApiError::payload_too_large(format!(
@@ -316,12 +316,17 @@ pub(crate) fn map_query_error(policy: &PolicyConfig, error: StoreError) -> ApiEr
     }
 }
 
-/// The 503 of a read refused for the memory all queries share: it may succeed later, so it
-/// says when to try again (`Retry-After: 1`), as an answer refused for it while held does.
+/// The 503 of a read refused for the memory all queries share, told when to try again
+/// (`Retry-After: 1`) only where that can help: what it held and asked for fits that memory
+/// alone, and other requests held part of it ([`StoreError::may_pass_later`]).
 fn server_memory_in_use(error: StoreError) -> ApiError {
-    ApiError::busy(format!(
-        "{error} (budgets.total_query_memory, NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES)"
-    ))
+    let retry = error.may_pass_later();
+    let detail =
+        format!("{error} (budgets.total_query_memory, NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES)");
+    match retry {
+        true => ApiError::busy(detail),
+        false => ApiError::unavailable(detail),
+    }
 }
 
 /// A store error of a read (query, RDF4J, Graph Store), `otherwise` unless it is a refusal

@@ -281,6 +281,7 @@ impl super::Context<'_> {
                 shared: false,
                 unread: false,
                 rows: None,
+                retry: false,
             };
             return Err(crate::QueryEvaluationError::MemoryLimit(refused).into());
         }

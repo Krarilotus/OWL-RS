@@ -4910,7 +4910,7 @@
                 }
               }
             },
-            "description": "Not ready or unavailable, or `budgets.total_query_memory` taken; try again. A reader of some graphs whose view of the inferred statements has no room, by either budget, is told only that the server's query memory is in use, with no limit"
+            "description": "Not ready or unavailable, or no room in `budgets.total_query_memory` (send it again after `Retry-After`, where that is sent). A reader of some graphs whose view of the inferred statements has no room, by either budget, is told only that the server's query memory is in use, with no limit"
           }
         },
         "tags": [
@@ -5118,7 +5118,7 @@
                 }
               }
             },
-            "description": "Not ready or unavailable, or `budgets.total_query_memory` taken; try again. A reader of some graphs whose view of the inferred statements has no room, by either budget, is told only that the server's query memory is in use, with no limit"
+            "description": "Not ready or unavailable, or no room in `budgets.total_query_memory` (send it again after `Retry-After`, where that is sent). A reader of some graphs whose view of the inferred statements has no room, by either budget, is told only that the server's query memory is in use, with no limit"
           }
         },
         "tags": [
@@ -6266,7 +6266,7 @@
                 }
               }
             },
-            "description": "Not ready or unavailable, or `budgets.total_query_memory` taken; try again. A reader of some graphs whose view of the inferred statements has no room, by either budget, is told only that the server's query memory is in use, with no limit"
+            "description": "Not ready or unavailable, or no room in `budgets.total_query_memory` (send it again after `Retry-After`, where that is sent). A reader of some graphs whose view of the inferred statements has no room, by either budget, is told only that the server's query memory is in use, with no limit"
           }
         },
         "tags": [
@@ -6422,7 +6422,7 @@
                 }
               }
             },
-            "description": "Not ready or unavailable, or `budgets.total_query_memory` taken; try again. A reader of some graphs whose view of the inferred statements has no room, by either budget, is told only that the server's query memory is in use, with no limit"
+            "description": "Not ready or unavailable, or no room in `budgets.total_query_memory` (send it again after `Retry-After`, where that is sent). A reader of some graphs whose view of the inferred statements has no room, by either budget, is told only that the server's query memory is in use, with no limit"
           }
         },
         "tags": [
@@ -6650,7 +6650,7 @@
                 }
               }
             },
-            "description": "Not ready or unavailable, or `budgets.total_query_memory` taken; try again. A reader of some graphs whose view of the inferred statements has no room, by either budget, is told only that the server's query memory is in use, with no limit"
+            "description": "Not ready or unavailable, or no room in `budgets.total_query_memory` (send it again after `Retry-After`, where that is sent). A reader of some graphs whose view of the inferred statements has no room, by either budget, is told only that the server's query memory is in use, with no limit"
           }
         },
         "tags": [

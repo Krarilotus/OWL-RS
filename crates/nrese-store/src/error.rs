@@ -259,6 +259,19 @@ impl StoreError {
             )
     }
 
+    /// A [`Self::is_server_memory_limit`] that may pass when tried again: all the request held
+    /// and asked for fits the server's budget alone, and other requests held part of it
+    /// ([`nrese_exec::BudgetExceeded::retry`]). Never for a refusal told by its class only
+    /// ([`Self::MemoryLimitWithoutAmounts`]): its amounts, and so whether it could fit, are
+    /// hidden.
+    pub fn may_pass_later(&self) -> bool {
+        matches!(
+            self.evaluation(),
+            Some(QueryEvaluationError::MemoryLimit(exceeded))
+                if exceeded.shared && exceeded.retry && !exceeded.unread
+        )
+    }
+
     /// True if the request is at fault (syntax, invalid IRIs or payloads, unsupported query
     /// features) rather than the store. Transports map these to client errors. A cancelled
     /// evaluation is neither: the transport decides what cancelled it.
@@ -377,6 +390,7 @@ mod unread_tests {
             shared: true,
             unread: true,
             rows: None,
+            retry: false,
         });
         assert!(!unread.is_memory_limit());
         assert!(!unread.is_server_memory_limit());

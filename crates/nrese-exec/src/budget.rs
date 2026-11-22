@@ -211,6 +211,21 @@ impl SharedBudget {
         }
     }
 
+    /// Whether a request holding `held` bytes here may hold `need` once others let go: `need`
+    /// fits the limit here and at every level above, and others hold some at one of them.
+    fn may_pass_later(&self, held: usize, need: usize) -> bool {
+        let mut others = false;
+        let mut level = Some(self);
+        while let Some(budget) = level {
+            if !budget.known_limit().is_ok_and(|limit| need <= limit) {
+                return false;
+            }
+            others |= budget.used() > held;
+            level = budget.parent.as_deref();
+        }
+        others
+    }
+
     /// Releases `bytes` here, at most what is charged, and as much above.
     fn release(&self, bytes: usize) {
         #[cfg(test)]
@@ -487,6 +502,10 @@ pub struct BudgetExceeded {
     /// because memory is in use.
     pub unread: bool,
     pub rows: Option<RowsPast>,
+    /// Refused by the server's limit (`shared`) while others held part of it, though all
+    /// this request held and asked for fits it alone: it may pass when tried again, once
+    /// they let go ([`Budget::may_pass_later`]).
+    pub retry: bool,
 }
 
 /// A table past the rows its memory has room for (`rows`: `room + 1` where not counted).
@@ -647,6 +666,13 @@ impl Budget {
                         shared: true,
                         unread: refused.unread,
                         rows: None,
+                        // What this request holds at the server, without these bytes (charged
+                        // here already), and all it would hold with them.
+                        retry: !refused.unread
+                            && shared.may_pass_later(
+                                self.used().saturating_sub(bytes) + self.credit(),
+                                self.used(),
+                            ),
                     })
             }
             Some(Parent::Envelope(envelope)) => envelope.take_as(bytes, record && !self.optional),
@@ -761,6 +787,22 @@ impl Budget {
             shared: false,
             unread: false,
             rows: None,
+            retry: false,
+        }
+    }
+
+    /// Whether a refusal of `requested` bytes more by the memory all requests share may pass
+    /// when tried again ([`BudgetExceeded::retry`]): all this request holds and asks for
+    /// fits that memory's limit at every level, and others hold part of it at one. Never for
+    /// a budget that memory doesn't bound.
+    pub fn may_pass_later(&self, requested: usize) -> bool {
+        match &self.parent {
+            Some(Parent::Envelope(envelope)) => envelope.may_pass_later(requested),
+            Some(Parent::Server(shared)) => shared.may_pass_later(
+                self.used() + self.credit(),
+                self.used().saturating_add(requested),
+            ),
+            None => false,
         }
     }
 
