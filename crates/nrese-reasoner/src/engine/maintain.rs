@@ -224,6 +224,10 @@ pub struct Maintenance {
     /// ([`maintain_with`]'s `uses_rebuilt_report`): the rebuild's own violations, charged to
     /// the same budget. Over a state that had none, they are the change's new ones.
     pub rebuilt_violations: Option<Violations>,
+    /// The change derived, or its rebuild holds, a fact equating a literal with another term
+    /// (an `owl:sameAs` with a literal subject): dropped as no store holds it, so a later
+    /// commit's statements miss its copies. Its absence says nothing of the state before.
+    pub literal_equality: bool,
 }
 
 /// Whether `base` holds an inverse property expression (`_:x owl:inverseOf :p`), OWL 2's
@@ -548,6 +552,9 @@ pub fn maintain_with_report_budget(
         }
     };
     let mut update = update;
+    // A first load's facts no store holds are among them (above).
+    let mut literal_equality =
+        (update.insert.iter()).any(|&fact| super::equates_literal(fact, program.same_as));
     // A change after which an axiom's list is read otherwise (left out where it was read,
     // read where it was left out, or left out for another reason): the delta can't follow
     // the rules it gave or gives, so the change is rebuilt and judged by the rebuild's
@@ -612,6 +619,7 @@ pub fn maintain_with_report_budget(
         if operation.fired() {
             return Err(operation.interrupted());
         }
+        literal_equality |= closure.literal_equality;
         rebuilt_violations = uses_rebuilt_report.then(|| {
             let found = std::mem::take(&mut closure.violations);
             // A change rebuilt for a list read otherwise that
@@ -697,6 +705,7 @@ pub fn maintain_with_report_budget(
         program: update.program,
         work: update.policy,
         rebuilt_violations,
+        literal_equality,
     })
 }
 

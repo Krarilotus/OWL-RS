@@ -16,8 +16,7 @@
 //! representatives). The store's answers must all be certain, and every query that misses
 //! one must say `sound-only` (docs/design/ql-rewriting.md §7).
 //!
-//! `NRESE_QL_CASES` sets the number of cases (default 150 per test), `NRESE_QL_SEED` the
-//! seed.
+//! `NRESE_QL_CASES` overrides the number of cases, and `NRESE_QL_SEED` sets the seed.
 
 use crate::support::Writes;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -98,6 +97,7 @@ struct Tbox {
     /// `sub ⊑ sup`, closed under inverses.
     roles: Vec<(Role, Role)>,
     turtle: Vec<String>,
+    families: u16,
 }
 
 impl Tbox {
@@ -116,7 +116,10 @@ struct Extras {
     inverse_functional: Vec<usize>,
     same: Vec<(usize, usize)>,
     turtle: Vec<String>,
+    families: u8,
 }
+
+const EXTRA_AXIOMS: usize = 5;
 
 /// Extras over the properties, mostly over `generating` ones (the roles of existentials),
 /// where they meet anonymous individuals.
@@ -128,7 +131,9 @@ fn random_extras(rng: &mut Rng, generating: &[usize]) -> Extras {
         } else {
             rng.below(PROPERTIES)
         };
-        match rng.below(5) {
+        let kind = rng.below(EXTRA_AXIOMS);
+        e.families |= 1 << kind;
+        match kind {
             0 | 1 => {
                 e.chains.push((p, p, p));
                 e.turtle.push(format!(":P{p} a owl:TransitiveProperty ."));
@@ -151,6 +156,7 @@ fn random_extras(rng: &mut Rng, generating: &[usize]) -> Extras {
         }
     }
     if rng.chance(40) {
+        e.families |= 1 << EXTRA_AXIOMS;
         let (a, b) = (rng.below(INDIVIDUALS), rng.below(INDIVIDUALS));
         e.same.push((a, b));
         e.turtle.push(format!(":a{a} owl:sameAs :a{b} ."));
@@ -166,6 +172,8 @@ fn restriction(role: Role, filler: Option<usize>) -> String {
     )
 }
 
+const TBOX_FAMILIES: usize = 12;
+
 fn random_tbox(rng: &mut Rng) -> Tbox {
     let mut t = Tbox::default();
     let class = |rng: &mut Rng| rng.below(CLASSES);
@@ -176,11 +184,12 @@ fn random_tbox(rng: &mut Rng) -> Tbox {
     let axioms = 2 + rng.below(6);
     let mut generating = 0;
     for _ in 0..axioms {
-        let kind = rng.below(12);
+        let kind = rng.below(TBOX_FAMILIES);
         // At most three generating axioms keep the chase small.
         if matches!(kind, 1 | 2 | 8 | 9) && generating == 3 {
             continue;
         }
+        t.families |= 1 << kind;
         match kind {
             0 => {
                 let (a, b) = (class(rng), class(rng));
@@ -295,6 +304,21 @@ enum T {
 enum QAtom {
     Class(T, usize),
     Role(T, usize, T),
+}
+
+/// Clause and term constructors among queries whose answers have been checked.
+fn query_families(atoms: &[QAtom]) -> u8 {
+    let term = |t: T| match t {
+        T::Var(_) => 0b0100,
+        T::Ind(_) => 0b1000,
+    };
+    atoms.iter().fold(0, |families, atom| {
+        families
+            | match *atom {
+                QAtom::Class(t, _) => 0b0001 | term(t),
+                QAtom::Role(s, _, o) => 0b0010 | term(s) | term(o),
+            }
+    })
 }
 
 struct Query {
@@ -852,12 +876,49 @@ pub(crate) fn store(
     store
 }
 
-#[test]
-fn rewritten_answers_are_the_certain_answers_of_random_ql_cases() {
-    let cases: usize = std::env::var("NRESE_QL_CASES")
+/// Draw through the last pinned witness, or draw 150 cases in the full form.
+/// A valid `NRESE_QL_CASES` overrides the count in the full form.
+fn cases(witnesses: Option<&[usize]>) -> usize {
+    let default = witnesses.map_or(150, |cases| cases.iter().max().unwrap() + 1);
+    std::env::var("NRESE_QL_CASES")
         .ok()
         .and_then(|n| n.parse().ok())
-        .unwrap_or(150);
+        .unwrap_or(default)
+}
+
+/// Replay the pinned QL cases when the tier is unset or `landing`, with no QL or fuzz seed or count.
+fn pinned() -> bool {
+    !crate::support::nightly()
+        && [
+            "NRESE_QL_CASES",
+            "NRESE_QL_SEED",
+            "NRESE_FUZZ_CASES",
+            "NRESE_FUZZ_SEED",
+        ]
+        .iter()
+        .all(|knob| std::env::var_os(knob).is_none())
+}
+
+// Case 1 catches a fault that drops certain answers. Case 22 catches one that drops EXISTS answers.
+fn ql_witnesses(extra: Option<usize>) -> Option<Vec<usize>> {
+    pinned().then(|| {
+        [
+            0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 15, 17, 19, 20, 22, 24, 26, 29, 31, 33, 41, 46,
+        ]
+        .into_iter()
+        .chain(extra)
+        .collect()
+    })
+}
+
+/// By default (tier unset or `landing`, with no QL or fuzz seed or count), this test compares pinned witnesses across both profiles. With `NRESE_CHECK_TIER=nightly`, a seed or a count, it draws 150 cases unless `NRESE_QL_CASES` supplies a valid count.
+#[test]
+fn rewritten_answers_are_the_certain_answers_of_random_ql_cases() {
+    let witnesses = ql_witnesses(None);
+    let witnesses = witnesses.as_deref();
+    let cases = cases(witnesses);
+    let (mut families, mut forms) = (0, BTreeSet::new());
+    let mut query_shapes = 0;
     let dir = tempfile::tempdir().unwrap();
     let seed = std::env::var("NRESE_QL_SEED")
         .ok()
@@ -888,6 +949,9 @@ fn rewritten_answers_are_the_certain_answers_of_random_ql_cases() {
             }
         }
         let queries: Vec<Query> = (0..4).map(|_| random_query(&mut rng)).collect();
+        if witnesses.is_some_and(|examples| !examples.contains(&case)) {
+            continue;
+        }
         let kinds: HashSet<(Role, Option<usize>)> =
             tbox.generating.iter().map(|&(_, r, f)| (r, f)).collect();
         let max_vars = queries.iter().map(|q| q.vars).max().unwrap_or(1);
@@ -921,17 +985,17 @@ fn rewritten_answers_are_the_certain_answers_of_random_ql_cases() {
             realised += store_report(&with, &query.sparql(false)).map_or(0, |r| r.realised);
             let (rows, completeness) = store_answer(&with, &query.sparql(true));
             let distinct: BTreeSet<Vec<usize>> = rows.into_iter().collect();
-            // Pure QL: nothing the rewriting doesn't follow.
-            assert!(
-                completeness.complete,
-                "case {case}: {completeness:?}\n{turtle}\n{}",
-                query.sparql(true)
-            );
             assert_eq!(
                 distinct,
                 certain,
                 "case {case} ({}):\n{turtle}\n{}",
                 ruleset.name(),
+                query.sparql(true)
+            );
+            // Pure QL: nothing the rewriting doesn't follow.
+            assert!(
+                completeness.complete,
+                "case {case}: {completeness:?}\n{turtle}\n{}",
                 query.sparql(true)
             );
             // Bags: the materialised rows, and each further answer once.
@@ -963,6 +1027,11 @@ fn rewritten_answers_are_the_certain_answers_of_random_ql_cases() {
             }
             gained += added;
             checked += 1;
+            if witnesses.is_some() {
+                forms.insert((case % 2, query.answers.is_empty()));
+                families |= tbox.families;
+                query_shapes |= query_families(&query.atoms);
+            }
         }
     }
     eprintln!(
@@ -972,8 +1041,20 @@ fn rewritten_answers_are_the_certain_answers_of_random_ql_cases() {
         realised > 0,
         "no witness the data had: the check went untested"
     );
-    assert!(checked >= cases * 3, "too many cases skipped: {skipped}");
+    assert!(
+        checked >= witnesses.map_or(cases, <[usize]>::len) * 3,
+        "too many cases skipped: {skipped}"
+    );
     assert!(gained > 0, "no case exercised the rewriting");
+    if witnesses.is_some() {
+        assert_eq!(families.count_ones() as usize, TBOX_FAMILIES);
+        assert_eq!(query_shapes, 0b1111, "class, role, variable and individual");
+        assert_eq!(
+            forms.len(),
+            4,
+            "boolean and projected answers under both profiles: {forms:?}"
+        );
+    }
 }
 
 #[test]
@@ -2569,12 +2650,16 @@ fn inclusions_through_inverse_expressions_are_materialised() {
 /// where it hasn't), by the chase. Pure QL: exactly those, complete. Mixed ontologies: an
 /// answer that isn't the chase's says `unsound`, a missing one says so too (the
 /// negation's pattern may miss what makes an answer wrong).
+/// By default (tier unset or `landing`, with no QL or fuzz seed or count), this test checks pinned pure and mixed cases for EXISTS, NOT EXISTS and MINUS. With `NRESE_CHECK_TIER=nightly`, a seed or a count, it draws 150 cases unless `NRESE_QL_CASES` supplies a valid count.
 #[test]
 fn negation_and_exists_answer_as_the_chase() {
-    let cases: usize = std::env::var("NRESE_QL_CASES")
-        .ok()
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(150);
+    // A family counts when its axiom is present in a judged case.
+    let witnesses = ql_witnesses(Some(95));
+    let witnesses = witnesses.as_deref();
+    let cases = cases(witnesses);
+    let (mut families, mut negations) = (0, BTreeSet::new());
+    let (mut extra_shapes, mut query_shapes) = (0, 0);
+    let mut pairs_checked = BTreeSet::new();
     let dir = tempfile::tempdir().unwrap();
     let seed = std::env::var("NRESE_QL_SEED")
         .ok()
@@ -2610,7 +2695,7 @@ fn negation_and_exists_answer_as_the_chase() {
         }
         // `Q2` shares one variable with `Q1` (its `?v0`), its others its own: existential
         // inside the negation.
-        let pairs: Vec<(Query, Query)> = (0..4)
+        let pairs: Vec<_> = (0..4)
             .map(|_| {
                 if rng.chance(50) {
                     // "Instances of C with (or without) some P-edge (into D)": what an
@@ -2621,12 +2706,14 @@ fn negation_and_exists_answer_as_the_chase() {
                         answers: vec![0],
                     };
                     let p = rng.below(PROPERTIES);
-                    let mut atoms = vec![if rng.chance(50) {
+                    let forward = rng.chance(50);
+                    let mut atoms = vec![if forward {
                         QAtom::Role(T::Var(0), p, T::Var(1))
                     } else {
                         QAtom::Role(T::Var(1), p, T::Var(0))
                     }];
-                    if rng.chance(50) {
+                    let typed = rng.chance(50);
+                    if typed {
                         atoms.push(QAtom::Class(T::Var(1), rng.below(CLASSES)));
                     }
                     let q2 = Query {
@@ -2634,7 +2721,7 @@ fn negation_and_exists_answer_as_the_chase() {
                         vars: 2,
                         answers: Vec::new(),
                     };
-                    return (q1, q2);
+                    return (q1, q2, Some((forward, typed)));
                 }
                 let q1 = random_query(&mut rng);
                 let q2 = random_query(&mut rng);
@@ -2662,14 +2749,17 @@ fn negation_and_exists_answer_as_the_chase() {
                     vars: q1.vars + q2.vars,
                     answers: Vec::new(),
                 };
-                (q1, q2)
+                (q1, q2, None)
             })
             .collect();
+        if witnesses.is_some_and(|examples| !examples.contains(&case)) {
+            continue;
+        }
         let kinds: HashSet<(Role, Option<usize>)> =
             tbox.generating.iter().map(|&(_, r, f)| (r, f)).collect();
         let max_vars = pairs
             .iter()
-            .map(|(a, b)| a.vars.max(b.vars))
+            .map(|(a, b, _)| a.vars.max(b.vars))
             .max()
             .unwrap_or(1);
         let Some(chase) = Chase::run(
@@ -2700,7 +2790,7 @@ fn negation_and_exists_answer_as_the_chase() {
                 chase.answers(q)
             }
         };
-        for (q1, q2) in &pairs {
+        for (q1, q2, shape) in &pairs {
             let outer = Query {
                 atoms: q1.atoms.clone(),
                 vars: q1.vars.max(q2.vars),
@@ -2782,6 +2872,13 @@ fn negation_and_exists_answer_as_the_chase() {
                     decided_by_rewriting += 1;
                 }
                 checked += 1;
+                if witnesses.is_some() && (status.sound || status.complete) {
+                    negations.insert((mixed, name));
+                    families |= tbox.families;
+                    extra_shapes |= extras.families;
+                    query_shapes |= query_families(&outer.atoms) | query_families(&inner.atoms);
+                    pairs_checked.insert(*shape);
+                }
             }
         }
     }
@@ -2790,11 +2887,21 @@ fn negation_and_exists_answer_as_the_chase() {
          over the closure alone, {skipped} cases skipped (chase too large); mixed: {flagged} \
          flagged, {silent_ok} complete"
     );
-    assert!(checked >= cases * 2, "too few checked: {checked}");
+    assert!(
+        checked >= witnesses.map_or(cases, <[usize]>::len) * 2,
+        "too few checked: {checked}"
+    );
     assert!(
         decided_by_rewriting > 0,
         "no query needed the rewriting inside the negation"
     );
+    if witnesses.is_some() {
+        assert_eq!(families.count_ones() as usize, TBOX_FAMILIES);
+        assert_eq!(extra_shapes.count_ones() as usize, EXTRA_AXIOMS + 1);
+        assert_eq!(query_shapes, 0b1111, "class, role, variable and individual");
+        assert_eq!(pairs_checked.len(), 5, "query pairs: {pairs_checked:?}");
+        assert_eq!(negations.len(), 6, "all forms in both modes: {negations:?}");
+    }
 }
 
 /// A reader who may not read every graph gets nothing derived from what it can't see
@@ -3258,6 +3365,124 @@ fn the_same_readers_class_read_stays_complete() {
     let store = annotation_store(Ruleset::Owl2Rl, QlRewritingMode::On, HIDDEN);
     let (status, _) = rewritten_read(&store, "SELECT ?x { ?x a :A }", reader_by_support());
     assert_eq!(status_class(&status), "complete", "status: {status}");
+}
+
+/// Spec (graph scope and completeness): an OWL 2 QL read by support with a restricted
+/// grant can miss a membership. Every published status withholds completeness for that
+/// grant, independent of the hidden declaration. A grant to read every graph keeps it.
+#[test]
+fn ql_completeness_for_a_reader_by_support_depends_on_the_grant() {
+    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    use nrese_store::access::{AccessState, Fallback, Inferred, Principal};
+    use nrese_store::{CancellationToken, MutationPipeline, ReadScope};
+    use std::sync::Arc;
+
+    let prefixes = format!(
+        "PREFIX : <{E}> PREFIX owl: <http://www.w3.org/2002/07/owl#> \
+         PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> "
+    );
+    let mut policy = AccessState::default();
+    policy.settings.enforced = true;
+    policy.settings.inferred = Inferred::Supported;
+    policy.settings.fallback = Fallback::Allow;
+    let all_graphs = ReadScope::of(policy.view(&Principal::default(), "default").read);
+    let token = CancellationToken::new();
+    let mut restricted = Vec::new();
+    let mut wrong = Vec::new();
+    for hidden in [true, false] {
+        let store = Arc::new(StoreService::new(StoreConfig::in_memory()).unwrap());
+        let pipeline = MutationPipeline::new(
+            Arc::clone(&store),
+            Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+                ReasoningMode::Owl2Ql,
+            ))),
+        );
+        let write = |data| {
+            let report = pipeline
+                .execute_update_str(&format!("{prefixes}INSERT DATA {{ {data} }}"))
+                .unwrap();
+            assert!(report.applied, "setup must commit");
+        };
+        write(
+            ":Doc a owl:Class . :alice a owl:NamedIndividual ; :note :bob . :note rdfs:domain :Doc .",
+        );
+        if hidden {
+            write("GRAPH :hidden { :note a owl:AnnotationProperty }");
+        }
+        let ask = format!("{prefixes}ASK {{ :alice a :Doc }}");
+        for (reader, scope, expected) in [
+            ("by support", reader_by_support(), "sound-only"),
+            ("all-graph grant", all_graphs.clone(), "complete"),
+            ("unrestricted", ReadScope::All, "complete"),
+        ] {
+            let request = SparqlQueryRequest::new(&ask, scope);
+            let cold = store.execute_query(&request).unwrap();
+            let hits = store.query_cache_stats().hits;
+            let warm = store.execute_query(&request).unwrap();
+            assert!(store.query_cache_stats().hits > hits, "{reader}: cache hit");
+            for result in [&cold, &warm] {
+                let json: serde_json::Value = serde_json::from_slice(&result.payload).unwrap();
+                assert_eq!(json["boolean"], !hidden, "{reader}: ASK answer");
+            }
+            let prepared = store.prepare_query(&request).unwrap();
+            let plan = store.plan_query(&prepared, &token).unwrap();
+            let explain = store.explain_query(&prepared, &token).unwrap();
+            let statuses = [
+                ("result", cold.completeness),
+                (
+                    "result QL report",
+                    cold.ql.map(|report| report.completeness),
+                ),
+                ("cached result", warm.completeness),
+                (
+                    "cached result QL report",
+                    warm.ql.map(|report| report.completeness),
+                ),
+                ("plan", plan.completeness),
+                ("plan QL report", plan.ql.map(|report| report.completeness)),
+                ("EXPLAIN", explain.completeness),
+                (
+                    "EXPLAIN QL report",
+                    explain.ql.map(|report| report.completeness),
+                ),
+            ];
+            for (route, status) in statuses {
+                let status = status.unwrap_or_else(|| panic!("{reader}, {route}: no status"));
+                if status.as_str() != expected {
+                    wrong.push(format!(
+                        "hidden={hidden}, {reader}, {route}: {} (expected {expected})",
+                        status.as_str()
+                    ));
+                }
+                if reader == "by support" {
+                    restricted.push(status);
+                }
+            }
+        }
+        let negated = SparqlQueryRequest::new(
+            format!("{prefixes}ASK {{ FILTER NOT EXISTS {{ :alice a :Doc }} }}"),
+            reader_by_support(),
+        );
+        let status = store.execute_query(&negated).unwrap().completeness.unwrap();
+        if status.as_str() != "unsound" {
+            wrong.push(format!("hidden={hidden}, negation: {}", status.as_str()));
+        }
+        restricted.push(status);
+    }
+    let (hidden, absent) = restricted.split_at(restricted.len() / 2);
+    if hidden != absent {
+        wrong.push("hidden declaration changed the published status".to_owned());
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    for status in restricted {
+        assert!(
+            status
+                .reasons
+                .iter()
+                .any(|r| r.text.contains("can't read every graph")),
+            "the reason must name the grant: {status:?}"
+        );
+    }
 }
 
 /// Spec: a query without a search answers the same through the store whatever the rewriting

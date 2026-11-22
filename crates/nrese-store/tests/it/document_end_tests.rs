@@ -565,7 +565,21 @@ fn a_load_that_stops_keeps_the_answers_and_the_certificate() {
         ask(&store),
         "the certificate's rewriting answers the existential"
     );
-    let certified = (store.reasoning_state(), store.consistency());
+    // The certificate as the marker records it: an open sets the literal-equality flag, which
+    // the marker doesn't hold.
+    let recorded = |store: &StoreService| {
+        let state = store.reasoning_state();
+        state.map(|s| {
+            (
+                s.ruleset,
+                s.fingerprint,
+                s.violations,
+                s.compact_equality,
+                s.nil_lists,
+            )
+        })
+    };
+    let certified = (recorded(&store), store.consistency());
     let (revision, written) = (store.current_revision(), marker());
     assert!(
         certified.0.is_some() && written.is_some(),
@@ -576,7 +590,7 @@ fn a_load_that_stops_keeps_the_answers_and_the_certificate() {
         let seen = [
             (ask(store), "the answer"),
             (
-                (store.reasoning_state(), store.consistency()) == certified,
+                (recorded(store), store.consistency()) == certified,
                 "the certificate",
             ),
             (store.current_revision() == revision, "the revision"),

@@ -3038,12 +3038,14 @@ mod tests {
     /// Against the definition, over random ontologies spread over three graphs: for every
     /// set R of graphs, the facts with a support set inside R are exactly the closure of
     /// the statements in R (no cap).
+    /// By default, this test keeps the 17-graph boundary and fixed witnesses for every reader at both caps. With `NRESE_CHECK_TIER=nightly` or `NRESE_FUZZ_SEED` set, it draws 150 cases.
     #[test]
     fn support_sets_give_the_closure_of_each_set_of_graphs() {
         super::super::tests::support_sets_against_closures();
     }
 
     /// The update after random changes of where statements are equals a recomputation.
+    /// By default, this test replays fixed additions, removals and moves of facts between graphs. With `NRESE_CHECK_TIER=nightly` or `NRESE_FUZZ_SEED` set, it draws 150 cases.
     #[test]
     fn updates_equal_recomputation() {
         super::super::tests::support_set_updates_against_recomputation();

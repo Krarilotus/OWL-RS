@@ -1152,3 +1152,96 @@ fn a_readers_pending_view_scans_a_key_through_an_alias_of_has_key() {
         "(committed, pending, the inferences the reader's pending view holds)"
     );
 }
+
+/// Two writers and a literal equality's condition (`ReasoningState::literal_equality`). The
+/// first writer's commit derives an equality of two literals and fails; in the gap after
+/// its failure, before its write returns, a second writer commits an equality of its own.
+/// The second writes through a second pipeline over the store.
+/// A certificate made again afterwards (a change of the QL setting, made under the writer
+/// slot) still withholds the word from a read of the second writer's values: what the
+/// failed commit leaves, or takes back, is never the second's.
+#[test]
+fn a_failed_commit_leaves_a_later_writers_literal_equality_withheld() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const XSD: &str = "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> ";
+    fn write(
+        pipeline: &MutationPipeline,
+        data: &str,
+        note: Option<nrese_engine::CommitNote<'_>>,
+    ) -> Result<(), String> {
+        let update = format!("{PREFIXES}{XSD}INSERT DATA {{ {data} }}");
+        let command = MutationCommand::Update(SparqlUpdateRequest::new(update));
+        (pipeline.apply_noted(command, &Requester::all(), &MutationTicket::new(), note))
+            .map(drop)
+            .map_err(|error| format!("{error:?}"))
+    }
+    let store = Arc::new(
+        StoreService::new(StoreConfig {
+            ql_rewriting: crate::QlRewritingMode::On,
+            ..StoreConfig::in_memory()
+        })
+        .expect("store"),
+    );
+    let reasoner = ReasonerService::new(ReasonerConfig::for_mode(ReasoningMode::Owl2Rl));
+    let pipeline = Arc::new(MutationPipeline::new(
+        Arc::clone(&store),
+        Arc::new(reasoner),
+    ));
+    write(&pipeline, ":u :r :w .", None).expect("the first commit");
+    // A second pipeline over the store (one that takes it over, say): a pipeline's own
+    // writers wait for its ground program, which the first holds until its write returns.
+    let second = MutationPipeline::new(
+        Arc::clone(&store),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Rl,
+        ))),
+    );
+    let (second, ran) = (Arc::new(second), Arc::new(AtomicBool::new(false)));
+    let seen = Arc::clone(&ran);
+    hooks::AFTER_FAILED_COMMIT.set(Some(Box::new(move || {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let equated = ":g a owl:FunctionalProperty . \
+                           :t :g \"2\"^^xsd:integer , \"2.0\"^^xsd:decimal .";
+            let _ = done.send(write(&second, equated, None));
+        });
+        let outcome = finished
+            .recv_timeout(WAIT)
+            .expect("the second writer commits");
+        outcome.expect("the second writer's commit");
+        seen.store(true, Ordering::SeqCst);
+    })));
+    let refused: nrese_engine::CommitNote<'_> = Box::new(|_| {
+        Err(nrese_engine::NoteError::Refused(std::io::Error::other(
+            "refused by the test",
+        )))
+    });
+    let first = ":p a owl:FunctionalProperty . \
+                 :s :p \"1\"^^xsd:integer , \"1.0\"^^xsd:decimal .";
+    let failed = write(&pipeline, first, Some(refused));
+    hooks::AFTER_FAILED_COMMIT.set(None);
+    assert!(
+        failed.is_err(),
+        "the setup: the first writer's commit didn't fail"
+    );
+    assert!(
+        ran.load(Ordering::SeqCst),
+        "the setup: no writer ran in the gap"
+    );
+    store.set_ql_rewriting(crate::QlRewritingMode::On);
+    let request = SparqlQueryRequest::all(format!("{PREFIXES}SELECT ?v {{ :t :g ?v }}"));
+    let status = store.execute_query(&request).expect("read").completeness;
+    let reasons: Vec<String> = status
+        .iter()
+        .flat_map(|s| &s.reasons)
+        .map(|r| r.text.clone())
+        .collect();
+    assert!(
+        status.as_ref().is_some_and(|s| s.as_str() != "complete")
+            && reasons
+                .iter()
+                .any(|r| r.contains("an owl:sameAs between literals")),
+        "the second writer's equality is no longer withheld: {} {reasons:?}",
+        header(status.clone())
+    );
+}

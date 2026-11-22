@@ -30,7 +30,7 @@
 use std::sync::OnceLock;
 
 use super::ir::{
-    AnnotationIds, Atom, Guard, ParseError, Rule, RuleSource, Term, Triple, Vocabulary,
+    AnnotationIds, Atom, Guard, OWL, ParseError, Rule, RuleSource, Term, Triple, Vocabulary,
     parse_rules, parse_sources, rule_sources,
 };
 use crate::vocabulary::LocalVocabulary;
@@ -237,6 +237,20 @@ impl Ruleset {
     /// Whether the list-axiom rules apply (OWL 2 RL only).
     pub fn has_list_rules(self) -> bool {
         self == Self::Owl2Rl
+    }
+
+    /// Whether the compiled templates enable the engine's equality handling.
+    pub(crate) fn may_equate_literals(self) -> bool {
+        static CAPABILITIES: OnceLock<[bool; ALL.len()]> = OnceLock::new();
+        CAPABILITIES.get_or_init(|| {
+            ALL.map(|ruleset| {
+                let mut vocabulary = LocalVocabulary::default();
+                let same_as = vocabulary.iri(&format!("{OWL}sameAs"));
+                ruleset.rules(&mut vocabulary).map_or(true, |rules| {
+                    super::representatives::same_as(&rules, same_as).is_some()
+                })
+            })
+        })[self as usize]
     }
 
     /// Compiles the rule templates. For evaluation over facts in a local vocabulary, use

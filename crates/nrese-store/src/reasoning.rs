@@ -177,11 +177,12 @@ impl MaterialisationReport {
 }
 
 /// [`nrese_reasoner::engine::maintain_with`] on a commit, with its report: the violations the
-/// change introduced (charged to `memory`, the request's part), what it did, and the
-/// ground program to reuse. Where maintenance installed a rebuilt closure over a state
-/// assessed consistent (`base_consistent`), the rebuild's own violations judge the change
-/// alone: the delta reads less than the rebuilt state holds. Otherwise the delta's report
-/// stands, as before.
+/// change introduced (charged to `memory`, the request's part), what it did, the ground
+/// program to reuse, and whether it equated a literal with another term
+/// ([`nrese_reasoner::engine::Maintenance::literal_equality`]). Where maintenance
+/// installed a rebuilt closure over a state assessed consistent (`base_consistent`), the
+/// rebuild's own violations judge the change alone: the delta reads less than the rebuilt
+/// state holds. Otherwise the delta's report stands, as before.
 pub(crate) fn apply_delta(
     program: &Program,
     ground: Option<&GroundProgram>,
@@ -190,7 +191,15 @@ pub(crate) fn apply_delta(
     memory: &Arc<nrese_exec::Budget>,
     working_memory: &dyn Fn() -> Arc<nrese_exec::Budget>,
     base_consistent: bool,
-) -> Result<(Violations, MaterialisationReport, Option<GroundProgram>), delta::Interrupted> {
+) -> Result<
+    (
+        Violations,
+        MaterialisationReport,
+        Option<GroundProgram>,
+        bool,
+    ),
+    delta::Interrupted,
+> {
     let started = Instant::now();
     let mut done = nrese_reasoner::engine::maintain_with_report_budget(
         program,
@@ -221,7 +230,7 @@ pub(crate) fn apply_delta(
     .with_diagnostics(&done.diagnostics, &|id| {
         decoded(tx.decode(TermId::from_raw(id)), id)
     });
-    Ok((done.violations, report, done.program))
+    Ok((done.violations, report, done.program, done.literal_equality))
 }
 
 #[cfg(test)]
@@ -322,7 +331,7 @@ mod tests {
             };
             let operation = nrese_reasoner::eval::OperationStop::new(&poll);
             let memory = Arc::new(nrese_exec::Budget::unlimited());
-            let (violations, report, _) = apply_delta(
+            let (violations, report, _, _) = apply_delta(
                 &program,
                 None,
                 &mut tx,

@@ -15,9 +15,11 @@
 //! Rules match over the union of all graphs and inferences go to the default graph
 //! (design §6.2). OWL 2 RL derives some generalised triples, such as a literal typed by a
 //! datatype property's range; RDF can't store a literal subject or a non-IRI predicate, so
-//! those are dropped. Commits therefore don't see them either, which matters only for
-//! rules that turn them back into storable facts (an `owl:inverseOf` on a datatype
-//! property, which OWL 2 doesn't allow).
+//! those are dropped. Commits therefore don't see them either, which matters for rules
+//! that turn them back into storable facts (an `owl:inverseOf` on a datatype property,
+//! which OWL 2 doesn't allow), and for an `owl:sameAs` between two spellings of one value,
+//! whose copies of a later commit's statements are missing: the closure and each commit
+//! report one ([`Closure::literal_equality`], [`Maintenance::literal_equality`]).
 
 mod datatypes;
 mod explain;
@@ -467,6 +469,19 @@ pub(crate) fn storable(fact @ [subject, predicate, _]: Triple) -> bool {
     ) && TermId::from_raw(predicate).kind() == TermKind::Iri
 }
 
+/// Whether `fact` equates a literal with another term: an `owl:sameAs` (`same_as`) between
+/// two different terms whose subject no store holds (a literal: [`storable`]). The rules
+/// derive one where a functional property or an at-most-one restriction holds one value in
+/// two spellings; dropped, it copies nothing into a later commit's statements.
+pub(crate) fn equates_literal([subject, predicate, object]: Triple, same_as: Option<u64>) -> bool {
+    Some(predicate) == same_as
+        && subject != object
+        && !matches!(
+            TermId::from_raw(subject).kind(),
+            TermKind::Iri | TermKind::BlankNode
+        )
+}
+
 pub(crate) fn encode([s, p, o]: Triple) -> EncodedTriple {
     EncodedTriple::new(
         TermId::from_raw(s),
@@ -485,5 +500,56 @@ pub(crate) fn pattern([s, p, o]: [Option<u64>; 3], graph: GraphSelector) -> Quad
         predicate: p.map(TermId::from_raw),
         object: o.map(TermId::from_raw),
         graph,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::{Program, RuleProgram};
+    use crate::program::{EQUALITY_RULES_N3, UserRules};
+    use crate::rulesets::{ALL, Ruleset};
+    use nrese_engine::{Engine, EngineConfig};
+
+    /// The reopen verdict for each built-in program must agree with the gate that
+    /// lets the engine act on an `owl:sameAs` and report literal equality. User
+    /// rules can supply the whole equality module to a program without it.
+    #[test]
+    fn the_reopen_verdict_follows_the_compiled_equality_gate() {
+        let engine = Engine::new(EngineConfig {
+            background_maintenance: false,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let tx = engine.transaction();
+        for ruleset in ALL {
+            let expected = match ruleset {
+                Ruleset::Rdfs | Ruleset::RdfsFull | Ruleset::Owl2Ql => false,
+                Ruleset::RdfsPlus | Ruleset::OwlHorst | Ruleset::Owl2Rl => true,
+            };
+            let program = RuleProgram::builtin(ruleset);
+            let verdict = program.may_equate_literals();
+            assert_eq!(verdict, expected, "{}", ruleset.name());
+            let compiled = Program::compile(&program, &|term| tx.intern(term));
+            assert_eq!(
+                verdict,
+                compiled.same_as.is_some(),
+                "{}: compiled engine gate",
+                ruleset.name()
+            );
+        }
+
+        let user = Arc::new(UserRules::n3("equality.n3", EQUALITY_RULES_N3).unwrap());
+        let ql = RuleProgram::new(Some(Ruleset::Owl2Ql), Some(user)).unwrap();
+        let compiled = Program::compile(&ql, &|term| tx.intern(term));
+        assert!(
+            compiled.same_as.is_some(),
+            "OWL 2 QL with user equality rules"
+        );
+        assert!(
+            ql.may_equate_literals(),
+            "OWL 2 QL with user equality rules"
+        );
     }
 }

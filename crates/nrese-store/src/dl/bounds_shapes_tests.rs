@@ -261,11 +261,12 @@ fn facts(store: &StoreService) -> Option<Vec<[String; 3]>> {
 }
 
 /// Spec (a store's reading after any history equals a fresh read of its statements): off the
-/// rules' route with the upper bound unavailable (its build gave up at its deadline, the build
-/// seam holding it past it), a commit giving a SHACL property its first content, where the
+/// rules' route with the upper bound unavailable (the test seam gives the build an expired
+/// deadline), a commit giving a SHACL property its first content, where the
 /// store already names it ([`NAMED_BEFORE`]), takes the route a fresh read of the revision
 /// takes, and the route, U1's facts and the answers of a store given the same statements in one
 /// commit.
+/// All five cases run by default and with `NRESE_CHECK_TIER=nightly`.
 #[test]
 fn a_later_shacl_content_of_a_named_property_reads_as_a_fresh_store_with_the_bound_unavailable() {
     let timeout = std::time::Duration::from_millis(500);
@@ -291,9 +292,7 @@ fn a_later_shacl_content_of_a_named_property_reads_as_a_fresh_store_with_the_bou
         let data = format!("{PREFIXES} INSERT DATA {{ {OFF_THE_ROUTE} {prior} }}");
         store.update_str_ungated(&data).unwrap();
         // The revision's upper bound gives up: its build begins past its deadline.
-        seam::set(&store.dl().bounds, Point::Build, move || {
-            std::thread::sleep(timeout * 2)
-        });
+        seam::set(&store.dl().bounds, Point::BuildDeadline, || {});
         let unavailable = super::report(&store).unavailable;
         update(&store, &pipeline, &format!("INSERT DATA {{ {content} }}"));
         let (last, fresh_routed) = route(&store);
