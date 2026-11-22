@@ -16,7 +16,8 @@
 //! Some shapes can't be bounded this way, and are validated whole: closed shapes (any
 //! predicate counts), SPARQL constraints (a query reads anything), and any shape when a
 //! changed statement is an `rdfs:subClassOf` (class membership of every node may move).
-//! So is a shape whose affected nodes pass [`MAX_AFFECTED`].
+//! So is a shape whose affected nodes pass [`MAX_AFFECTED`]. When the shape references
+//! contain a cycle, the difference is taken over both full reports.
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -68,6 +69,18 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
         );
     }
     let changed = selected;
+    if shapes.has_cycles && !changed.is_empty() {
+        // A cycle can carry a change arbitrarily far. A finding can also be reached from
+        // several targets, so a finding reached by a new route may already be in the report.
+        let (mut results, failures, held) =
+            validate_full_difference(before, Some(shapes), after, shapes, data, resources)?;
+        // Change reports are sets in raw result order.
+        results.sort_unstable();
+        results.dedup();
+        let report = decode(after, shapes, results, failures, resources);
+        drop(held);
+        return report;
+    }
     let graph_before =
         GraphView::new(before, data).with_cancellation(resources.cancellation.as_ref());
     let graph_after =
@@ -211,6 +224,22 @@ pub fn validate_shapes_change<A: ReadView + Sync, B: ReadView + Sync>(
     data: Selection,
     resources: &Resources,
 ) -> Result<ValidationReport, QueryEvaluationError> {
+    let (later, failures, held_after) =
+        validate_full_difference(before, shapes_before, after, shapes_after, data, resources)?;
+    // The raw results are freed as they are decoded, then their charges returned.
+    let report = decode(after, shapes_after, later, failures, resources);
+    drop(held_after);
+    report
+}
+
+fn validate_full_difference<A: ReadView + Sync, B: ReadView + Sync>(
+    before: &A,
+    shapes_before: Option<&Shapes>,
+    after: &B,
+    shapes_after: &Shapes,
+    data: Selection,
+    resources: &Resources,
+) -> Result<validate::Kept, QueryEvaluationError> {
     // Its results are compared only where there were shapes before.
     let compares = shapes_before.is_some();
     let (raw, failures, held_after) =
@@ -232,10 +261,7 @@ pub fn validate_shapes_change<A: ReadView + Sync, B: ReadView + Sync>(
         drop(held_before);
         later = kept?;
     }
-    // The raw results are freed as they are decoded, then their charge returned.
-    let report = decode(after, shapes_after, later, failures, resources);
-    drop(held_after);
-    report
+    Ok((later, failures, held_after))
 }
 
 /// A result as the same finding in any compilation of the shapes ([`validate_shapes_change`]):
@@ -465,8 +491,8 @@ impl AffectedFrame {
     }
 }
 
-/// The nodes whose validation against `shape` (as a focus or value node) `seeds` can
-/// change, in either state; `None` if unbounded.
+/// The nodes whose validation against `root` (as a focus or value node) `seeds` can
+/// change, in either state; `None` if unbounded. Shape references are acyclic here.
 fn affected<A: ReadView, B: ReadView>(
     shapes: &Shapes,
     root: ShapeRef,
@@ -489,10 +515,7 @@ fn affected<A: ReadView, B: ReadView>(
                 if before.cancelled() {
                     return Ok(None);
                 }
-                // A recursive reference contributes no additional affected nodes.
-                if child == current || callers.contains(&child) {
-                    continue;
-                }
+                debug_assert!(child != current && !callers.contains(&child));
                 callers.park(current, frame)?;
                 frame = AffectedFrame {
                     parent: Some(current),

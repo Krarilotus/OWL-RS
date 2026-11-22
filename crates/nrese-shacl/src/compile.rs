@@ -106,6 +106,7 @@ pub fn compile_until<V: ReadView>(
         shapes: Vec::new(),
         index: HashMap::new(),
         numbering: Vec::new(),
+        has_cycles: false,
         errors: Vec::new(),
         components: Vec::new(),
     };
@@ -141,6 +142,7 @@ pub fn compile_until<V: ReadView>(
                 _ => None,
             },
             entailments,
+            has_cycles: compiler.has_cycles,
         }))
     } else {
         Some(Err(compiler.errors))
@@ -156,10 +158,17 @@ struct Compiler<'a, V: ReadView> {
     shapes: Vec<Shape>,
     index: HashMap<TermId, ShapeRef>,
     // The depth-first number of each interned slot, or None while it is pending.
-    numbering: Vec<Option<ShapeRef>>,
+    numbering: Vec<Option<NumberedShape>>,
+    has_cycles: bool,
     errors: Vec<ShapeError>,
     /// The shapes graph's SPARQL-based constraint components.
     components: Vec<ComponentDef>,
+}
+
+#[derive(Clone, Copy)]
+struct NumberedShape {
+    position: ShapeRef,
+    visiting: bool,
 }
 
 /// Where the depth-first walk stopped in a compiled shape's constraints.
@@ -395,12 +404,18 @@ impl<V: ReadView> Compiler<'_, V> {
             while let Some(frame) = stack.last_mut() {
                 let shape = &mut self.shapes[frame.shape];
                 let Some(reference) = frame.next_reference(shape) else {
+                    self.numbering[frame.shape]
+                        .as_mut()
+                        .expect("the frame's shape is numbered")
+                        .visiting = false;
                     stack.pop();
                     continue;
                 };
                 let child = *reference;
                 if let Some(number) = self.numbering[child] {
-                    *reference = number;
+                    // Only a reference into the active branch closes a cycle.
+                    self.has_cycles |= number.visiting;
+                    *reference = number.position;
                 } else {
                     *reference = next;
                     // A walk cut short leaves slots unvisited: nothing of it is kept.
@@ -420,10 +435,14 @@ impl<V: ReadView> Compiler<'_, V> {
     /// Puts the interned slots into the depth-first order used by their references.
     fn reorder_shapes(&mut self) {
         for shape in self.index.values_mut() {
-            *shape = self.numbering[*shape].expect("every interned shape was visited");
+            *shape = self.numbering[*shape]
+                .expect("every interned shape was visited")
+                .position;
         }
         for shape in 0..self.shapes.len() {
-            while let Some(position) = self.numbering[shape].filter(|&position| position != shape) {
+            while let Some(NumberedShape { position, .. }) =
+                self.numbering[shape].filter(|number| number.position != shape)
+            {
                 self.shapes.swap(shape, position);
                 self.numbering.swap(shape, position);
             }
@@ -432,7 +451,10 @@ impl<V: ReadView> Compiler<'_, V> {
 
     fn fill_shape(&mut self, shape: ShapeRef, next: &mut ShapeRef) -> ShapeFrame {
         // Number the shape before its descendants, including when an edge closes a cycle.
-        self.numbering[shape] = Some(*next);
+        self.numbering[shape] = Some(NumberedShape {
+            position: *next,
+            visiting: true,
+        });
         *next += 1;
         let node = self.shapes[shape].node;
 
