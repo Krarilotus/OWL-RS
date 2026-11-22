@@ -272,6 +272,37 @@ fn a_mode_switch_during_the_check_leaves_it_on_its_route() {
     assert_eq!(format!("{answer:?}"), "Ok(NotEntailed)");
 }
 
+/// Spec (`entails`: one certified closure; a changed certificate refuses): a check with
+/// `owl2-dl` off that has read its mode, while the store switches it on and commits a premise
+/// whose annotation property's domain puts `:x a :C` in the closure, refuses. It never answers
+/// by the rules over a revision `owl2-dl` reads, where `:x a :C` isn't entailed.
+#[test]
+fn a_switch_to_owl2_dl_during_the_check_is_refused() {
+    let (store, pipeline) = dl_store(DlConfig::default(), ":a a :D .");
+    let rules = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl)
+        .materialised_program()
+        .unwrap();
+    store.use_dl(false, false);
+    let switched = Arc::clone(&store);
+    hooks::AFTER_MODE_READ.set(Some(Box::new(move || {
+        switched.use_dl(true, false);
+        update(
+            &pipeline,
+            "INSERT DATA { :note a owl:AnnotationProperty ; rdfs:domain :C . :C a owl:Class . \
+             :x :note \"n\" }",
+        );
+    })));
+    let answer = store.entails(
+        rules,
+        &[Triple::new(iri("x"), nrese_rdf::vocab::rdf::TYPE, iri("C"))],
+    );
+    hooks::AFTER_MODE_READ.set(None);
+    assert!(
+        matches!(answer, Err(crate::StoreError::Configuration(_))),
+        "{answer:?}"
+    );
+}
+
 /// Spec (`entailment` module docs: under `owl2-dl` the DL engines decide the whole
 /// conclusion): a ground conclusion the closure holds is entailed by the DL check.
 #[test]

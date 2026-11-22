@@ -81,6 +81,8 @@ impl StoreService {
             .dl()
             .active()
             .then(|| Deadline::after(self.config().dl.timeout));
+        #[cfg(test)]
+        crate::service::hooks::run(&crate::service::hooks::AFTER_MODE_READ);
         // One certified closure: reads start only on a settled certificate (an
         // even epoch; odd, a change is in progress and the old certificate may still be
         // visible), and an answer stands only if no change began while they took their

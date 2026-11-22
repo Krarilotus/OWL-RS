@@ -2938,6 +2938,8 @@ pub(crate) mod hooks {
         /// A pipeline write has passed its preflight certificate check and is about to take
         /// its transaction.
         pub(crate) static AFTER_PREFLIGHT: Hook = const { RefCell::new(None) };
+        /// An entailment check has read its mode and is about to read the certificate's epoch.
+        pub(crate) static AFTER_MODE_READ: Hook = const { RefCell::new(None) };
         /// An entailment check has found the certificate current and is about to read the
         /// closure.
         pub(crate) static AFTER_CERTIFIED: Hook = const { RefCell::new(None) };
