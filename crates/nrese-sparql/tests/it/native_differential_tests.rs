@@ -5328,6 +5328,216 @@ fn a_sum_and_a_count_of_one_expression_answer_where_the_one_pass_does_not_fit() 
     assert!(failed.is_empty(), "{failed:#?}");
 }
 
+/// The rows of `results` with every typed literal read by value (`"2.0"^^xsd:decimal` and
+/// `"2"^^xsd:integer` both `2`), sorted; an error as its text.
+fn rows_by_value(
+    results: Result<QueryResults<'_>, nrese_sparql::QueryEvaluationError>,
+) -> Result<Vec<String>, String> {
+    let value = |cell: &str| {
+        let number = cell
+            .strip_prefix('"')
+            .and_then(|rest| rest.split_once("\"^^"));
+        match number.and_then(|(lexical, _)| lexical.parse::<f64>().ok()) {
+            Some(number) => number.to_string(),
+            None => cell.to_owned(),
+        }
+    };
+    let mut found: Vec<String> = rows(results.map_err(|error| format!("{error:?}"))?, false)
+        .iter()
+        .map(|row| row.split('\t').map(value).collect::<Vec<_>>().join("\t"))
+        .collect();
+    found.sort();
+    Ok(found)
+}
+
+/// A query whose one pass over all aggregates takes a `COUNT` of an expression beside its
+/// `SUM` or `AVG`, a shape the per-column path counts otherwise, keeping nothing after it.
+/// What that pass remembers of the expression's numbers, `distinct` × 114 bytes, must not
+/// outlive it: a later operator (the cross product with `?k`) would then be refused at a
+/// limit where the per-column path answers. The window is measured on the tree itself: B
+/// is the least limit, to 4 KiB, at which `control` answers (the same query with
+/// `COUNT(e + 0)` for `COUNT(e)`, whose values are the same and which the pass declines, as
+/// the per-column path counts it); the query must give `expected` at B + half the
+/// numbers, inside [B, B + numbers).
+fn answers_where_a_kept_memo_would_not_fit(
+    snapshot: &nrese_engine::Snapshot,
+    query: &str,
+    control: &str,
+    options: impl Fn(Option<usize>) -> QueryOptions,
+    expected: &[String],
+    distinct: usize,
+) {
+    let query = SparqlParser::new().parse_query(query).unwrap();
+    let control = SparqlParser::new().parse_query(control).unwrap();
+    let answer = |query: &nrese_sparql_syntax::Query, limit: Option<usize>| {
+        rows_by_value(evaluate_query(snapshot, query, &options(limit)))
+    };
+    let expected = Ok(expected.to_vec());
+    assert_eq!(answer(&query, None), expected, "unlimited");
+    let (mut low, mut high) = (1_usize << 20, 64_usize << 20);
+    assert_eq!(
+        answer(&control, Some(high)),
+        expected,
+        "control, limit {high}"
+    );
+    while high - low > 4_096 {
+        let middle = low + (high - low) / 2;
+        match answer(&control, Some(middle)) == expected {
+            true => high = middle,
+            false => low = middle,
+        }
+    }
+    let numbers = distinct * 114;
+    let limit = high + numbers / 2;
+    let window = format!("limit {limit}, window [{high}, {})", high + numbers);
+    assert_eq!(answer(&control, Some(limit)), expected, "control, {window}");
+    assert_eq!(answer(&query, Some(limit)), expected, "{window}");
+}
+
+/// The options `limit` under, as written or planned, streamed in morsels of `stream` rows.
+fn capped_options(limit: Option<usize>, as_written: bool, stream: Option<usize>) -> QueryOptions {
+    QueryOptions {
+        as_written,
+        stream_rows: stream,
+        resources: nrese_sparql::Resources {
+            memory: nrese_exec::Envelope::new(limit, None),
+            ..nrese_sparql::Resources::default()
+        },
+        ..QueryOptions::default()
+    }
+}
+
+/// [`answers_where_a_kept_memo_would_not_fit`] for a user's `SUM(?v * 2)` and `COUNT(?v * 2)`
+/// over 4,096 groups of one value g each (2g and 1), crossed with `?k` in 1 to 32, as
+/// written: SPARQL 1.1 §18.5.1 and §18.4's join of compatible mappings, every pair once.
+#[test]
+fn a_sum_and_count_of_one_expression_keep_no_numbers_past_their_pass() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let values: String = (0..4_096).map(|g| format!("({g} {g}) ")).collect();
+    let ks: String = (1..=32).map(|k| format!("{k} ")).collect();
+    let text = |count: &str| {
+        format!(
+            "SELECT ?g ?s ?c ?k WHERE {{ {{ SELECT ?g (SUM(?v * 2) AS ?s) ({count} AS ?c) \
+             WHERE {{ VALUES (?g ?v) {{ {values}}} }} GROUP BY ?g }} VALUES ?k {{ {ks}}} }}"
+        )
+    };
+    let mut expected: Vec<String> = (0..4_096)
+        .flat_map(|g| (1..=32).map(move |k| format!("{g}\t{}\t1\t{k}", 2 * g)))
+        .collect();
+    expected.sort();
+    answers_where_a_kept_memo_would_not_fit(
+        &engine.snapshot(),
+        &text("COUNT(?v * 2)"),
+        &text("COUNT(?v * 2 + 0)"),
+        |limit| capped_options(limit, true, None),
+        &expected,
+        4_096,
+    );
+}
+
+/// [`answers_where_a_kept_memo_would_not_fit`] for eager aggregation (planned) of
+/// `AVG(?price * 2)` beside a user's `COUNT(?price * 2)`: 256 teams of two products of eight
+/// offers each, the 4,096 prices 0 to 4,095 (team t's are 16t to 16t + 15: AVG 32t + 15,
+/// COUNT 16), crossed with `?k` in 1 to 512.
+#[test]
+fn an_eager_average_beside_a_count_of_its_argument_keeps_no_numbers_past_its_pass() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for offer in 0..4_096_i64 {
+        let (product, team) = (offer / 8, offer / 16);
+        let (offer_node, product_node) = (ex(&format!("o{offer}")), ex(&format!("p{product}")));
+        let quads = [
+            (
+                product_node.clone(),
+                "team",
+                Term::from(ex(&format!("t{team}"))),
+            ),
+            (offer_node.clone(), "product", Term::from(product_node)),
+            (offer_node, "price", Term::from(Literal::from(offer))),
+        ];
+        for (s, p, o) in quads {
+            tx.insert(Quad::new(s, ex(p), o, GraphName::DefaultGraph).as_ref());
+        }
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let ks: String = (1..=512).map(|k| format!("{k} ")).collect();
+    let text = |count: &str| {
+        format!(
+            "PREFIX : <{EX}> SELECT ?team ?a ?n ?k WHERE {{ {{ SELECT ?team \
+             (AVG(?price * 2) AS ?a) ({count} AS ?n) WHERE {{ ?product :team ?team . \
+             ?offer :product ?product ; :price ?price }} GROUP BY ?team }} VALUES ?k {{ {ks}}} }}"
+        )
+    };
+    let query = SparqlParser::new()
+        .parse_query(&text("COUNT(?price * 2)"))
+        .unwrap();
+    let explained = explain_query(&snapshot, &query, &QueryOptions::default()).unwrap();
+    assert!(
+        explained.rewrites.contains(&"eager-aggregation"),
+        "{:?}",
+        explained.rewrites
+    );
+    let mut expected: Vec<String> = (0..256)
+        .flat_map(|t| (1..=512).map(move |k| format!("<{EX}t{t}>\t{}\t16\t{k}", 32 * t + 15)))
+        .collect();
+    expected.sort();
+    answers_where_a_kept_memo_would_not_fit(
+        &snapshot,
+        &text("COUNT(?price * 2)"),
+        &text("COUNT(?price * 2 + 0)"),
+        |limit| capped_options(limit, false, None),
+        &expected,
+        4_096,
+    );
+}
+
+/// [`answers_where_a_kept_memo_would_not_fit`] for a streamed `AVG(?v * 2)` (morsels of 256
+/// rows, each grouped to a `SUM` and a `COUNT` of `?v * 2`), with `COUNT(?s)` beside it:
+/// 4,096 subjects, s_i in group i mod 256 with value i (group g's are g + 256j: AVG
+/// 2g + 3,840, COUNT 16), crossed with `?k` in 1 to 512. Over the stream the pass would
+/// remember all 4,096 values.
+#[test]
+fn a_streamed_average_keeps_no_numbers_past_each_morsel() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for i in 0..4_096_i64 {
+        let subject = ex(&format!("s{i}"));
+        let group = Term::from(ex(&format!("g{}", i % 256)));
+        tx.insert(Quad::new(subject.clone(), ex("g"), group, GraphName::DefaultGraph).as_ref());
+        let value = Term::from(Literal::from(i));
+        tx.insert(Quad::new(subject, ex("v"), value, GraphName::DefaultGraph).as_ref());
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let ks: String = (1..=512).map(|k| format!("{k} ")).collect();
+    let text = |count: &str| {
+        format!(
+            "PREFIX : <{EX}> SELECT ?g ?a ?n ?k WHERE {{ {{ SELECT ?g (AVG(?v * 2) AS ?a) \
+             ({count} AS ?n) WHERE {{ ?s :g ?g . ?s :v ?v }} GROUP BY ?g }} VALUES ?k {{ {ks}}} }}"
+        )
+    };
+    let query = SparqlParser::new().parse_query(&text("COUNT(?s)")).unwrap();
+    let explained = explain_query(&snapshot, &query, &QueryOptions::default()).unwrap();
+    assert!(
+        !explained.rewrites.contains(&"eager-aggregation"),
+        "{:?}",
+        explained.rewrites
+    );
+    let mut expected: Vec<String> = (0..256)
+        .flat_map(|g| (1..=512).map(move |k| format!("<{EX}g{g}>\t{}\t16\t{k}", 2 * g + 3_840)))
+        .collect();
+    expected.sort();
+    answers_where_a_kept_memo_would_not_fit(
+        &snapshot,
+        &text("COUNT(?s)"),
+        &text("COUNT(?v * 2 + 0)"),
+        |limit| capped_options(limit, false, Some(256)),
+        &expected,
+        4_096,
+    );
+}
+
 /// Eager aggregation (the early group over B, the join's input without the group's keys)
 /// where it pays, its aggregates reading B's values and the join variable B binds in every
 /// solution. Per team two products with four offers each: t0's prices are all 0, so
