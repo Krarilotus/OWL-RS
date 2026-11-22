@@ -1,10 +1,10 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use nrese_rdf::Quad;
 use nrese_rdf_io::{RdfFormat, RdfParser};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::case::{Case, Step};
 use super::gaps::Gap;
@@ -27,28 +27,81 @@ struct Registered {
     witness: String,
 }
 
-#[derive(Deserialize)]
+/// A saved case: a gap's witness, or a failing draw's fixture with its signature and the
+/// full command that replays it.
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Witness {
     case: String,
     selection: String,
     equality: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     shapes: Option<String>,
     #[serde(default)]
     asserted: String,
     #[serde(default)]
     inferred: String,
     steps: Vec<Edit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replay: Option<String>,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 struct Edit {
     add: String,
     remove: String,
     infer: String,
     retract: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     shapes: Option<String>,
+}
+
+fn cases_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/it/change_differential/cases")
+}
+
+/// The saved case `file`: a path, or a file name under `cases/`.
+pub(super) fn load(file: &str) -> Case {
+    let path = cases_dir().join(file);
+    let text = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read saved case {}: {error}", path.display()));
+    let witness: Witness = toml::from_str(&text).expect("parse saved case");
+    witness.case()
+}
+
+/// `case` as a fixture named `id`, with the signature it shows and its replay command.
+pub(super) fn fixture(id: &str, case: &Case, signature: &str, replay: &str) -> String {
+    let lines = |quads: &[Quad]| {
+        quads
+            .iter()
+            .map(|quad| format!("{quad} .\n"))
+            .collect::<String>()
+    };
+    let witness = Witness {
+        case: id.into(),
+        selection: "any-excluding-shapes".into(),
+        equality: case.equality,
+        shapes: case.shapes.clone(),
+        asserted: lines(&case.asserted),
+        inferred: lines(&case.inferred),
+        steps: case
+            .steps
+            .iter()
+            .map(|step| Edit {
+                add: lines(&step.add),
+                remove: lines(&step.remove),
+                infer: lines(&step.infer),
+                retract: lines(&step.retract),
+                shapes: step.shapes.clone(),
+            })
+            .collect(),
+        signature: Some(signature.into()),
+        replay: Some(replay.into()),
+    };
+    toml::to_string(&witness).expect("fixture TOML")
 }
 
 fn parse(format: RdfFormat, text: &str) -> Vec<Quad> {
@@ -86,7 +139,7 @@ impl Witness {
 pub(super) fn verified_gaps() -> Vec<Gap> {
     let registry: Registry = toml::from_str(include_str!("known-gaps.toml")).expect("gap registry");
     let mut ids = BTreeSet::new();
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/it/change_differential/cases");
+    let dir = cases_dir();
     for record in &registry.gap {
         let gap = &record.entry;
         assert!(ids.insert(&gap.id), "duplicate gap {}", gap.id);
