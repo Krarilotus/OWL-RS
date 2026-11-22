@@ -3904,7 +3904,7 @@ impl Reads {
 }
 
 pub(crate) type WitnessFilter<'a> =
-    dyn Fn(&str, &[Option<u64>], &Poller<'_>) -> Result<bool, Stopped> + 'a;
+    dyn Fn(&Rule, &[Option<u64>], &Poller<'_>) -> Result<bool, Stopped> + 'a;
 
 /// Evaluates consistency instances into `found`: those in `full` over all facts, and the
 /// `(instance, atom)` semi-naive variants in `variants` through the delta; then finishes
@@ -3954,7 +3954,7 @@ pub(crate) fn check<S: Source + ?Sized>(
                 for (slot, word) in witness.iter_mut().zip(words(program, c, bindings)) {
                     *slot = Some(word);
                 }
-                if exclude(&rule.name, &witness[..rule.variables()], &poll)? {
+                if exclude(rule, &witness[..rule.variables()], &poll)? {
                     return Ok(false);
                 }
             }

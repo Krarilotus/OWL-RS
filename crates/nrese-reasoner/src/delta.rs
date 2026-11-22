@@ -1609,14 +1609,14 @@ fn old_witness_filter<'a, S: Source>(
     before: impl Fn() -> S + 'a,
     memory: &'a Budget,
     operation: &'a super::eval::OperationStop<'_>,
-) -> impl Fn(&str, &[Option<u64>], &Poller<'_>) -> Result<bool, Stopped> + 'a {
+) -> impl Fn(&Rule, &[Option<u64>], &Poller<'_>) -> Result<bool, Stopped> + 'a {
     let old_witnesses = OnceCell::new();
-    move |name, bindings, poll| {
+    move |rule, bindings, poll| {
         let index = old_witnesses
             .get_or_init(|| WitnessIndex::new(program, memory, operation, poll).ok())
             .as_ref()
             .ok_or(Stopped)?;
-        index.contains(&before(), name, bindings, poll)
+        index.contains(&before(), rule, bindings, poll)
     }
 }
 
@@ -2472,6 +2472,28 @@ mod budget_tests {
                     .expect("the bulk insert witness check ran");
             if !grown.consistent() {
                 errors.push(format!("bulk 64 to 65 warm={warm}: {:?}", grown.to_vec()));
+            }
+
+            // The 65th property can also clash with q on the same subject and
+            // object. The distinct pair is new even though the first pair is old.
+            let new_property_fact = [a, extra[2], b];
+            let mut additional = larger.clone();
+            additional.push(new_property_fact);
+            let new_pair = introduced_violations(
+                &MemoryBase::new(&additional, &[]),
+                &[extra, new_property_fact],
+                &[],
+                rules,
+                cache.as_ref(),
+                &stop,
+                &memory,
+            )
+            .expect("the bulk insert witness check ran");
+            if !new_pair.complete() || new_pair.at_least() != 1 {
+                errors.push(format!(
+                    "distinct new pair warm={warm}: {:?}",
+                    new_pair.to_vec()
+                ));
             }
 
             // The public bulk entry point accepts only inserts. For the reverse
