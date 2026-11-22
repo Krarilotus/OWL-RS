@@ -674,7 +674,6 @@ fn cycle_keeps_its_exiting_walk() {
 }
 
 #[test]
-#[ignore = "undocumented: a chain over rdfs:subClassOf misses a new subclass edge"]
 fn schema_operand_insert_derives_chain_row() {
     // Spec: Table 5 prp-spo2 uses rdfs:subClassOf just like any other list operand.
     check(
@@ -685,7 +684,6 @@ fn schema_operand_insert_derives_chain_row() {
 }
 
 #[test]
-#[ignore = "undocumented: a chain over rdfs:subClassOf keeps the result of a deleted subclass edge"]
 fn schema_operand_delete_retracts_chain_row() {
     // Spec: Table 5 prp-spo2 cannot derive the chain row once its only first edge is gone.
     check(
