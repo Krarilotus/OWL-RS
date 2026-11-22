@@ -39,6 +39,33 @@ fn a_statement_beside_the_ontology_header_is_part_of_the_conclusion() {
     );
 }
 
+/// Spec (*Direct Semantics* §2.3: an annotation axiom has no meaning; *Mapping* §3): the
+/// domain of an annotation property makes nothing an instance of it, though the RL
+/// closure holds `:x a :C` (`prp-dom` over the annotation).
+#[test]
+fn an_annotation_propertys_domain_entails_no_class_assertion() {
+    assert_eq!(
+        checks(
+            ":note a owl:AnnotationProperty ; rdfs:domain :C . :C a owl:Class . :x :note \"n\" .",
+            ":x a :C ."
+        ),
+        ("Ok(NotEntailed)".to_owned(), Entailed::No),
+        "entails under owl2-dl, entails_dl"
+    );
+}
+
+/// Spec (*Mapping* §3: a statement about the ontology's node is an annotation of the
+/// ontology): beside the header, `:ont :note :b` annotates the premise and asserts nothing;
+/// asked alone it is an assertion of `:note`, which the premise doesn't make.
+#[test]
+fn a_header_annotation_entails_no_assertion() {
+    assert_eq!(
+        checks(":ont a owl:Ontology ; :note :b .", ":ont :note :b ."),
+        ("Ok(NotEntailed)".to_owned(), Entailed::No),
+        "entails under owl2-dl, entails_dl"
+    );
+}
+
 /// Spec (module docs): `text:query` is a data property here like any other, and the
 /// premise gives `:a` no value of it; a full-text match of `:a`'s label isn't one.
 #[test]
