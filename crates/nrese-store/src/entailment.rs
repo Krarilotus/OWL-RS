@@ -91,6 +91,8 @@ impl StoreService {
             #[cfg(test)]
             crate::service::hooks::run(&crate::service::hooks::AFTER_MODE_READ);
             let answer = self.entails_once(&program, conclusion, dl)?;
+            #[cfg(test)]
+            crate::service::hooks::run(&crate::service::hooks::AFTER_ENTAILMENT_READS);
             if self.certificate_epoch() == epoch {
                 return Ok(answer);
             }

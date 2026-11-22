@@ -272,6 +272,35 @@ fn a_mode_switch_during_the_check_leaves_it_on_its_route() {
     assert_eq!(format!("{answer:?}"), "Ok(NotEntailed)");
 }
 
+/// Spec (`entails` under `owl2-dl`: one `dl.timeout` from the call; past it, no answer of
+/// any kind): where the time runs out after the check has its answer and has let its
+/// snapshot go, the answer is undecided; within it, entailed.
+#[test]
+fn an_answer_past_the_time_after_the_reads_is_undecided() {
+    let answers = [false, true].map(|late| {
+        let dl = DlConfig {
+            timeout: Some(Duration::from_millis(300)),
+            ..DlConfig::default()
+        };
+        let (store, _pipeline) = dl_store(dl, EMPTY_C);
+        let rules = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl)
+            .materialised_program()
+            .unwrap();
+        if late {
+            hooks::AFTER_ENTAILMENT_READS.set(Some(Box::new(|| {
+                std::thread::sleep(Duration::from_millis(600));
+            })));
+        }
+        let answer = store.entails(rules, &not_in("a", "C"));
+        hooks::AFTER_ENTAILMENT_READS.set(None);
+        match answer {
+            Err(crate::StoreError::Undecided(_)) => "undecided".to_owned(),
+            other => format!("{other:?}"),
+        }
+    });
+    assert_eq!(answers, ["Ok(Entailed)".to_owned(), "undecided".to_owned()]);
+}
+
 /// Spec (`entails`: one certified closure; a changed certificate refuses): a check with
 /// `owl2-dl` off that has read its mode, while the store switches it on and commits a premise
 /// whose annotation property's domain puts `:x a :C` in the closure, refuses. It never answers
