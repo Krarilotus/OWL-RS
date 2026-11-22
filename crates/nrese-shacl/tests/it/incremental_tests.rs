@@ -88,9 +88,36 @@ fn keys(report: &ValidationReport) -> BTreeSet<String> {
         .collect()
 }
 
+/// Shapes that refer to themselves or to each other, through `sh:property` and `sh:node`: a
+/// change anywhere along such a cycle's paths can change the result of a target several
+/// steps away (validated by the recursion rule: a node already being checked conforms).
+const CYCLIC_SHAPES: &str = r#"
+@prefix ex: <http://example.com/> .
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+ex:S6 a sh:NodeShape ; sh:targetClass ex:C1 ; sh:property ex:P6 .
+ex:P6 sh:path ex:p1 ; sh:class ex:C0 ; sh:property ex:P6 .
+ex:S7 a sh:NodeShape ; sh:targetSubjectsOf ex:p0 ; sh:property ex:P7 .
+ex:P7 sh:path ex:p2 ; sh:node ex:S8 .
+ex:S8 a sh:NodeShape ; sh:property [ sh:path ex:p3 ; sh:class ex:C2 ] ; sh:property ex:P7 .
+ex:S9 a sh:NodeShape ; sh:targetNode ex:n0 , ex:n1 ; sh:node ex:S10 .
+ex:S10 a sh:NodeShape ; sh:property [ sh:path ex:p1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ex:p0 ; sh:node ex:S9 ] .
+"#;
+
 #[test]
 fn incremental_validation_equals_the_difference_of_full_validations() {
-    let mut rng = Rng(fuzz(20_261_002));
+    differences_agree(SHAPES, 20_261_002);
+}
+
+#[test]
+fn incremental_validation_equals_the_difference_under_shapes_that_refer_back() {
+    differences_agree(CYCLIC_SHAPES, 20_261_122);
+}
+
+/// On random data and random changes, under `shapes`, the results `validate_changes`
+/// reports are exactly those full validation finds after the change and not before.
+fn differences_agree(shapes_turtle: &str, seed: u64) {
+    let mut rng = Rng(fuzz(seed));
     let mut checked = 0;
     let covered = |checked: usize| checked > 20;
     // Draw on (up to ten times as many cases) until the run covers what the assertion
@@ -104,7 +131,7 @@ fn incremental_validation_equals_the_difference_of_full_validations() {
         let mut tx = engine.transaction();
         let shapes_graph = ex("shapes");
         let parser = RdfParser::from_format(RdfFormat::Turtle);
-        for quad in parser.for_slice(SHAPES.as_bytes()) {
+        for quad in parser.for_slice(shapes_turtle.as_bytes()) {
             let quad = quad.unwrap();
             let quad = Quad::new(
                 quad.subject,
