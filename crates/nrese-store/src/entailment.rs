@@ -76,19 +76,20 @@ impl StoreService {
         conclusion: &[Triple],
     ) -> StoreResult<Entailment> {
         let program = program.into();
-        // The mode, read once: under owl2-dl, the DL route with one dl.timeout from the call.
-        let dl = self
-            .dl()
-            .active()
-            .then(|| Deadline::after(self.config().dl.timeout));
-        #[cfg(test)]
-        crate::service::hooks::run(&crate::service::hooks::AFTER_MODE_READ);
         // One certified closure: reads start only on a settled certificate (an
         // even epoch; odd, a change is in progress and the old certificate may still be
         // visible), and an answer stands only if no change began while they took their
         // snapshots. An open or changed certificate refuses without waiting or retrying.
+        // The mode is one of those reads: switching it is a change of the certificate.
         let epoch = self.certificate_epoch();
         if epoch.is_multiple_of(2) {
+            // The mode, read once: under owl2-dl, the DL route with one dl.timeout from here.
+            let dl = self
+                .dl()
+                .active()
+                .then(|| Deadline::after(self.config().dl.timeout));
+            #[cfg(test)]
+            crate::service::hooks::run(&crate::service::hooks::AFTER_MODE_READ);
             let answer = self.entails_once(&program, conclusion, dl)?;
             if self.certificate_epoch() == epoch {
                 return Ok(answer);

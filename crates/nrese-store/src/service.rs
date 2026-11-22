@@ -1047,8 +1047,12 @@ impl StoreService {
     /// pipeline running the reasoner's `owl2-dl` mode registers it, and whether user rules
     /// run with it.
     pub fn use_dl(&self, active: bool, user_rules: bool) {
-        // Under the writer slot, as every change of the certificate's QL schema.
+        // Under the writer slot, as every change of the certificate's QL schema; and a change
+        // of the certificate (its epoch odd through it): a check that read the mode before
+        // it sees the epoch move.
         let tx = self.engine.transaction();
+        let _transition =
+            self.certificate_transition(tx.writer().expect("a transaction holds the writer slot"));
         self.dl.set_active(active, user_rules);
         // A state with violations (read at open, or recorded before): whether `owl2-dl`
         // decides them, derived under the mode now set (`ReasoningState::undecided`).
@@ -2938,7 +2942,7 @@ pub(crate) mod hooks {
         /// A pipeline write has passed its preflight certificate check and is about to take
         /// its transaction.
         pub(crate) static AFTER_PREFLIGHT: Hook = const { RefCell::new(None) };
-        /// An entailment check has read its mode and is about to read the certificate's epoch.
+        /// An entailment check has read its mode and is about to read the closure.
         pub(crate) static AFTER_MODE_READ: Hook = const { RefCell::new(None) };
         /// An entailment check has found the certificate current and is about to read the
         /// closure.
