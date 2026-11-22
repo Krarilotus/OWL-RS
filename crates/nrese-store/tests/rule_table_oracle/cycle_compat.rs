@@ -33,20 +33,20 @@ fn rebuild_cycle(mode: &str, setup: &str) -> (Arc<StoreService>, usize) {
     let program = config.materialised_program().unwrap();
     let report = store.rematerialise(program).unwrap();
     assert!(
-        report.diagnostics.iter().any(|d| d.kind == "cyclic-list"),
-        "{mode}: missing cycle diagnostic"
+        report.diagnostics.is_empty(),
+        "{mode}: accepting walk diagnosed: {:?}",
+        report.diagnostics
     );
     (store, report.violations)
 }
 
 #[test]
 fn nil_equal_cell_keeps_its_existing_clash() {
-    // Tables 3, 4 and 6 entail the oneOf clash. The cycle leaves reads incomplete.
+    // Tables 3, 4 and 6 entail the oneOf clash. QL still sees non-DL syntax.
+    assert!(oracle_inconsistent(ONE_OF));
     for &mode in judges::MODES {
         let (store, violations) = rebuild_cycle(mode, ONE_OF);
-        if mode != "compact" {
-            assert!(violations > 0, "{mode}: oneOf clash");
-        }
+        assert!(violations > 0, "{mode}: oneOf clash");
         let (_, status) = judges::ask(&store, &triple(["ex:a", "rdf:type", "ex:C"]));
         assert_eq!(status, "sound-only", "{mode}");
     }
@@ -54,9 +54,11 @@ fn nil_equal_cell_keeps_its_existing_clash() {
 
 #[test]
 fn pairwise_list_keeps_its_clash_before_the_nil_cycle() {
-    // Tables 3 and 4 forbid equating the prefix members. The cycle leaves reads incomplete.
+    // Tables 3 and 4 forbid equating the prefix members and repeating the nil cell.
+    assert!(oracle_inconsistent(ALL_DIFFERENT));
     for &mode in judges::MODES {
-        let (store, _) = rebuild_cycle(mode, ALL_DIFFERENT);
+        let (store, violations) = rebuild_cycle(mode, ALL_DIFFERENT);
+        assert!(violations > 0, "{mode}: repeated member clash");
         let pipeline = judges::pipeline(&store, ReasoningMode::Owl2Rl);
         assert!(
             !judges::apply(&pipeline, &insert("ex:a owl:sameAs ex:b")),
@@ -74,7 +76,6 @@ fn oracle_inconsistent(input: &str) -> bool {
 }
 
 #[test]
-#[ignore = "a list head equated with rdf:nil hides the oneOf clash in compact mode"]
 fn compact_one_of_cell_equated_with_nil_reports_a_clash() {
     // Spec: Tables 3, 4 and 6 entail membership of a subclass of owl:Nothing.
     assert!(oracle_inconsistent(ONE_OF));
@@ -83,7 +84,6 @@ fn compact_one_of_cell_equated_with_nil_reports_a_clash() {
 }
 
 #[test]
-#[ignore = "stopping at the first visit to rdf:nil hides the repeated-member clash"]
 fn pairwise_nil_cycle_refuses_the_first_write() {
     // Spec: Tables 3 and 4 revisit nil and clash on the repeated AllDifferent member.
     assert!(oracle_inconsistent(ALL_DIFFERENT));

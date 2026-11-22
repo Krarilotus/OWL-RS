@@ -13,21 +13,11 @@ use hashbrown::HashMap;
 
 use nrese_owl::ProofGraph;
 
-use super::delta::{Base, Rules};
-use super::eval::{GroundProgram, Poller, Probe, Seg, Stopped, Visit, Visits};
+use super::delta::{Base, Rules, TableSource};
+use super::eval::{
+    GroundProgram, Grounding, NEVER, Poller, Probe, Seg, Stop, Stopped, Visit, Visits,
+};
 use super::ir::Triple;
-
-/// What an explanation's reads count on: nothing stops one, it runs to its end (bounded by
-/// its budget), as the program's enumerations it reads do ([`GroundProgram::unpolled`]).
-/// A read on [`to_its_end`]'s poller, which never stops:
-/// its answer.
-fn known<T>(read: Result<T, Stopped>) -> T {
-    read.expect("an explanation reads to its end")
-}
-
-fn to_its_end() -> Poller<'static> {
-    Poller::never()
-}
 
 /// One step of an [`Explanation`]: a fact, how it holds, and its premises (indexes of
 /// steps).
@@ -58,11 +48,22 @@ pub fn explain<B: Base + ?Sized>(
     fact: Triple,
     budget: usize,
 ) -> Option<Explanation> {
-    if !known(base.contains(fact, &to_its_end())) {
+    explain_until(base, rules, fact, budget, NEVER)
+}
+
+pub(crate) fn explain_until<B: Base + ?Sized>(
+    base: &B,
+    rules: Rules<'_>,
+    fact: Triple,
+    budget: usize,
+    stop: Stop<'_>,
+) -> Option<Explanation> {
+    let poll = Poller::new(stop)?;
+    if !base.contains(fact, &poll).ok()? {
         return None;
     }
-    let program = super::delta::program(base, rules);
-    explain_with(base, &program, fact, budget)
+    let program = super::delta::program_until(base, rules, stop).ok()?;
+    explain_with_until(base, &program, fact, budget, &poll)
 }
 
 /// [`explain`] with the ground program of `base` given.
@@ -72,21 +73,33 @@ pub fn explain_with<B: Base + ?Sized>(
     fact: Triple,
     budget: usize,
 ) -> Option<Explanation> {
-    let source = Whole(base);
-    let poll = to_its_end();
+    explain_with_until(base, program, fact, budget, &Poller::never())
+}
+
+pub(crate) fn explain_with_until<B: Base + ?Sized>(
+    base: &B,
+    program: &GroundProgram,
+    fact: Triple,
+    budget: usize,
+    poll: &Poller<'_>,
+) -> Option<Explanation> {
+    let source = TableSource {
+        source: &Whole(base),
+        table: program.table.as_deref(),
+    };
     // Backwards: the derivations of every inferred fact reachable from `fact`.
     let mut derivations: HashMap<Triple, Vec<(String, Vec<Triple>)>> = HashMap::new();
     let mut queue = vec![fact];
     while let Some(next) = queue.pop() {
-        if derivations.contains_key(&next) || known(base.is_asserted(next, &poll)) {
+        if derivations.contains_key(&next) || base.is_asserted(next, poll).ok()? {
             continue;
         }
         if derivations.len() >= budget {
             break;
         }
         let mut found = program
-            .unpolled()
-            .named_derivations(&source, next, BRANCHES);
+            .named_derivations(&source, next, BRANCHES, poll)
+            .ok()?;
         if program.bodiless.contains(&next) {
             found.insert(
                 0,
@@ -106,7 +119,7 @@ pub fn explain_with<B: Base + ?Sized>(
     let size = |fact: Triple, proved: &HashMap<Triple, Proved>| -> Option<usize> {
         match proved.get(&fact) {
             Some(entry) => Some(entry.size),
-            None => known(base.is_asserted(fact, &poll)).then_some(1),
+            None => base.is_asserted(fact, poll).ok()?.then_some(1),
         }
     };
     let mut pending: Vec<Triple> = derivations.keys().copied().collect();
@@ -114,6 +127,9 @@ pub fn explain_with<B: Base + ?Sized>(
     while !proved.contains_key(&fact) {
         let mut round: Vec<(Triple, Proved)> = Vec::new();
         for &next in &pending {
+            if poll.tick() {
+                return None;
+            }
             let best = derivations[&next]
                 .iter()
                 .filter_map(|(rule, body)| {
@@ -145,7 +161,7 @@ pub fn explain_with<B: Base + ?Sized>(
         pending.retain(|next| !round.iter().any(|(fact, _)| fact == next));
         proved.extend(round);
     }
-    if !proved.contains_key(&fact) && !known(base.is_asserted(fact, &poll)) {
+    if poll.stopped() || (!proved.contains_key(&fact) && !base.is_asserted(fact, poll).ok()?) {
         return None;
     }
     // The proof of `fact`, each fact once.
@@ -172,12 +188,23 @@ pub fn explain_with<B: Base + ?Sized>(
             ..
         }) = proved.get(&fact)
         {
-            let premises: Vec<usize> = body
-                .iter()
-                .map(|&premise| add(premise, proved, steps, index))
-                .collect();
+            let mut public = Vec::new();
+            let mut pending = body.clone();
+            pending.reverse();
+            while let Some(premise) = pending.pop() {
+                if crate::lists::internal(premise[1]) {
+                    if let Some((_, body)) = proved[&premise].derivation.as_ref() {
+                        pending.extend(body.iter().rev().copied());
+                    }
+                } else {
+                    let at = add(premise, proved, steps, index);
+                    if !public.contains(&at) {
+                        public.push(at);
+                    }
+                }
+            }
             steps[at].rule = Some(rule.clone());
-            steps[at].premises = premises;
+            steps[at].premises = public;
         }
         at
     }
@@ -197,17 +224,20 @@ const DERIVATIONS: usize = 256;
 /// Justifications, cores, unions and proofs are computed on it ([`nrese_owl::proof`]).
 /// `None` if `fact` doesn't hold; at most `budget` facts examined, past which the graph
 /// is marked incomplete.
-pub fn proof_graph<B: Base + ?Sized>(
+pub(crate) fn proof_graph<B: Base + ?Sized>(
     base: &B,
     program: &GroundProgram,
     fact: Triple,
     budget: usize,
+    poll: &Poller<'_>,
 ) -> Option<ProofGraph<Triple, Triple>> {
-    let poll = to_its_end();
-    if !known(base.contains(fact, &poll)) {
+    if !base.contains(fact, poll).ok()? {
         return None;
     }
-    let source = Whole(base);
+    let source = TableSource {
+        source: &Whole(base),
+        table: program.table.as_deref(),
+    };
     let mut graph = ProofGraph::new(fact);
     let mut seen: hashbrown::HashSet<Triple> = hashbrown::HashSet::new();
     let mut queue = vec![fact];
@@ -219,22 +249,22 @@ pub fn proof_graph<B: Base + ?Sized>(
             graph.complete = false;
             break;
         }
-        if known(base.is_asserted(next, &poll)) {
+        if base.is_asserted(next, poll).ok()? {
             graph.add("asserted", &[], &[next], next);
         }
         let mut found = program
-            .unpolled()
-            .every_named_derivation(&source, next, DERIVATIONS);
+            .named_derivations_with(&source, next, DERIVATIONS, poll, true)
+            .ok()?;
         if found.len() >= DERIVATIONS {
             graph.complete = false;
         }
         if program.bodiless.contains(&next) {
-            let alternatives = program
-                .unpolled()
-                .premise_alternatives(super::eval::Grounding::Bodiless(next));
-            for premises in alternatives {
-                found.push(("axiom".to_owned(), premises.to_vec()));
-            }
+            program
+                .for_each_alternative(Grounding::Bodiless(next), poll, |premises, _| {
+                    found.push(("axiom".to_owned(), premises.to_vec()));
+                    Ok(std::ops::ControlFlow::<()>::Continue(()))
+                })
+                .ok()?;
         }
         for (rule, body) in found {
             // Facts of the ruleset hold without premises: axioms as well.
@@ -248,15 +278,16 @@ pub fn proof_graph<B: Base + ?Sized>(
 /// Whether `inference` is a valid step over `base`: an asserted fact taken as itself, or
 /// an instance of its rule whose body (and schema facts) is exactly its premises,
 /// re-derived from the rules (the proof checker's check of a step).
-pub fn valid_step<B: Base + ?Sized>(
+pub(crate) fn valid_step<B: Base + ?Sized>(
     base: &B,
     program: &GroundProgram,
     inference: &nrese_owl::Inference<Triple, Triple>,
+    poll: &Poller<'_>,
 ) -> bool {
     if inference.rule == "asserted" {
         return inference.premises.is_empty()
             && inference.axioms == [inference.conclusion]
-            && known(base.is_asserted(inference.conclusion, &to_its_end()));
+            && base.is_asserted(inference.conclusion, poll) == Ok(true);
     }
     let same = |body: &[Triple]| {
         let mut body = body.to_vec();
@@ -267,17 +298,34 @@ pub fn valid_step<B: Base + ?Sized>(
     };
     if inference.rule == "axiom" {
         return program.bodiless.contains(&inference.conclusion)
-            && program
-                .unpolled()
-                .premise_alternatives(super::eval::Grounding::Bodiless(inference.conclusion))
-                .iter()
-                .any(|premises| same(premises));
+            && program.for_each_alternative(
+                Grounding::Bodiless(inference.conclusion),
+                poll,
+                |premises, _| {
+                    Ok(if same(premises) {
+                        std::ops::ControlFlow::Break(())
+                    } else {
+                        std::ops::ControlFlow::Continue(())
+                    })
+                },
+            ) == Ok(Some(()));
     }
     program
-        .unpolled()
-        .every_named_derivation(&Whole(base), inference.conclusion, usize::MAX)
-        .iter()
-        .any(|(rule, body)| *rule == inference.rule && same(body))
+        .named_derivations_with(
+            &TableSource {
+                source: &Whole(base),
+                table: program.table.as_deref(),
+            },
+            inference.conclusion,
+            usize::MAX,
+            poll,
+            true,
+        )
+        .is_ok_and(|bodies| {
+            bodies
+                .iter()
+                .any(|(rule, body)| *rule == inference.rule && same(body))
+        })
 }
 
 /// A fact proved: the size of its proof (steps, shared ones counted per use) and how.

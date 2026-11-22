@@ -35,4 +35,5 @@ mod sparql;
 mod tell;
 
 pub use result_stream::MAX_BUFFERED_OUTPUT_BYTES;
-pub use routes::router;
+pub(crate) use result_stream::answering;
+pub(crate) use routes::router;

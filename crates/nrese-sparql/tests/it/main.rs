@@ -29,6 +29,7 @@ mod resource_tests;
 mod result_cache_admission_tests;
 mod result_cache_own_tests;
 mod result_cache_tests;
+mod support;
 mod text_search_scope_tests;
 mod text_search_tests;
 mod transfer_memory_tests;

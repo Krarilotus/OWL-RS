@@ -771,7 +771,20 @@ impl Quarantine {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
-        let load = format!("{millis}-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        let (millis, sequence) = tests::CLOCK_AND_SEQUENCE
+            .take()
+            .unwrap_or((millis, sequence));
+        let mut load = format!("{millis}-{sequence}");
+        if self.dir.is_some() {
+            // Opening the store inventories all surviving load files. The process-wide
+            // sequence keeps collectors in this process distinct, including active loads.
+            let state = self.state();
+            while state.counted.contains(&load) {
+                load = format!("{millis}-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+            }
+        }
         Collector {
             quarantine: self,
             partial: self
@@ -1574,6 +1587,9 @@ mod tests {
     use super::*;
 
     thread_local! {
+        /// Repeat a candidate load ID across simulated process restarts.
+        pub(super) static CLOCK_AND_SEQUENCE: std::cell::Cell<Option<(u128, u64)>> =
+            const { std::cell::Cell::new(None) };
         /// The quarantine directory's sync after a resolution's append fails.
         pub(super) static FAIL_LOG_DIR_SYNC: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
@@ -1612,6 +1628,73 @@ mod tests {
 
     const P: &str = "<http://example.com/p>";
     const O: &str = "<http://example.com/o>";
+
+    // Spec: docs/design/quarantine.md sections 2 and 3 require distinct load IDs and
+    // persistent resolutions. Repeating the allocator inputs across a restart must
+    // retain the two old discards and list the new statement as open.
+    #[test]
+    fn restart_preserves_resolved_and_new_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("store");
+        let file = dir.path().join("bad.nt");
+        let request = crate::BulkLoadRequest {
+            files: vec![file.clone()],
+            replace: false,
+            graph: crate::GraphTarget::DefaultGraph,
+            invalid: None,
+        };
+        let repeated_inputs = Some((1_800_000_000_000, 0));
+        let open = || crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
+        let all = QuarantineFilter {
+            state: EntryState::All,
+            ..Default::default()
+        };
+
+        fs::write(
+            &file,
+            "<http://example.com/a> <http://example.com/p> .\n\
+             <http://example.com/b> <http://example.com/p> .\n",
+        )
+        .unwrap();
+        let old = {
+            let store = open();
+            CLOCK_AND_SEQUENCE.set(repeated_inputs);
+            let report = store.bulk_load(&request).unwrap();
+            let ids: Vec<_> = report
+                .examples
+                .iter()
+                .map(|record| record.id.clone())
+                .collect();
+            assert_eq!(store.quarantine().discard(&ids, None).unwrap(), 2);
+            report
+        };
+        // The forced clock and sequence took effect, so the second load really meets an id
+        // that is already on disk.
+        assert_eq!(old.load.as_deref(), Some("1800000000000-0"));
+        fs::write(&file, "<http://example.com/c> <http://example.com/p> .\n").unwrap();
+        let new = {
+            let store = open();
+            CLOCK_AND_SEQUENCE.set(repeated_inputs);
+            store.bulk_load(&request).unwrap()
+        };
+
+        let store = open();
+        let quarantine = store.quarantine();
+        let records = quarantine.list(&all).unwrap();
+        let resolved = records
+            .iter()
+            .filter(|record| record.resolution.is_some())
+            .count();
+        assert_eq!(
+            (resolved, records.len() - resolved),
+            (2, 1),
+            "old load {:?}, new load {:?}, records: {records:?}",
+            old.load,
+            new.load,
+        );
+        assert_ne!(old.load, new.load);
+        assert_eq!(quarantine.open_count(), 1);
+    }
 
     /// An on-disk store in `dir` whose quarantine holds two statements from one Turtle load:
     /// one with a blank node, one without. Returns their ids, the blank node's first.

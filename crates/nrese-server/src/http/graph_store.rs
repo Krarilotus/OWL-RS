@@ -12,12 +12,13 @@ use crate::http::mutation;
 use crate::http::rdf_payload::{
     parse_graph_content_format, parse_graph_target, parse_rdf_base_iri,
 };
-use crate::http::result_stream::{Pace, stream_blocking};
+use crate::http::result_stream::{Pace, Reader, read_envelope, stream_blocking};
 use crate::http::sparql::refused_or;
 use crate::state::AppState;
 
 /// A graph (Graph Store Protocol `GET`), streamed as it is read: a whole graph in constant
-/// memory, for as long as the client keeps reading ([`Pace::stalled_after`]).
+/// memory, for as long as the client keeps reading ([`Pace::stalled_after`]); over HTTP/1.0,
+/// to a reader of every graph, held whole (`result_stream`).
 pub async fn get_graph(
     state: AppState,
     authenticated: crate::auth::Authenticated,
@@ -28,11 +29,14 @@ pub async fn get_graph(
     let (media_type, request) = graph_request(&state, &raw_query, &headers, &access)?;
     let store = state.store();
     let scope = access.read_scope();
+    let reader = Reader::of(&scope);
     let cancellation = nrese_store::CancellationToken::new();
     let token = cancellation.clone();
     stream_blocking(
         Pace::stalled_after(state.policy().timeouts.graph_read),
         cancellation,
+        read_envelope(&state),
+        reader,
         media_type,
         "graph read exceeded policy timeout",
         move |out| {

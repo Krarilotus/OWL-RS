@@ -76,7 +76,9 @@ impl StoreSettings {
         nrese_exec::Envelope::new(limit, self.runtime.query_memory())
     }
 
-    /// The envelope of a query request: its memory limit within the catalog's budget.
+    /// The envelope of one run of a query, opened for it: its memory limit within this
+    /// catalog's budget. Runs of one prepared query, at once or one after another, share
+    /// neither a limit nor a refusal ([`crate::service::QueryRun`]).
     pub(crate) fn query_envelope(&self, prepared: &PreparedQuery) -> nrese_exec::Envelope {
         self.envelope(prepared.memory_limit)
     }

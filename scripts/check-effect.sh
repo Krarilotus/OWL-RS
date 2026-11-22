@@ -61,6 +61,18 @@ BEGIN {
     allow["http/result_stream.rs|let watchdog = tokio::spawn(async move {"] = "stream watchdog"
     allow["http/result_stream.rs|let busy = tokio::spawn(async {"] = "stream tests"
     count["http/result_stream.rs|let busy = tokio::spawn(async {"] = 2
+    # The stall timer of an answer held whole: aborted when its body drops, else ends a stall
+    # bound after the last frame taken, letting go of what is left.
+    allow["http/result_stream.rs|let watch = tokio::spawn(async move {"] = "whole answer stall timer"
+    # The whole-answer tests: each answer task ends by its stop, its abort or its 120 s
+    # deadline; each wait for the producer, by its write or the drop of its sender, or by 120 s of
+    # real time.
+    allow["http/result_stream.rs|let answer = tokio::spawn(WHOLE.scope("] = "whole answer stop tests"
+    count["http/result_stream.rs|let answer = tokio::spawn(WHOLE.scope("] = 2
+    allow["http/result_stream.rs|tokio::task::spawn_blocking(move || written.recv())"] = "whole answer stop tests"
+    count["http/result_stream.rs|tokio::task::spawn_blocking(move || written.recv())"] = 2
+    allow["http/result_stream.rs|let ended = tokio::task::spawn_blocking(move || {"] = "whole answer client-gone test"
+    allow["http/result_stream.rs|let answer = tokio::spawn(WHOLE.scope(true, async move {"] = "whole answer deadline test"
 }
 {
     key = $0
@@ -86,7 +98,7 @@ BEGIN {
     allow["http/api_v1.rs|tokio::task::spawn_blocking(move || store.rematerialise(program))"] = "v1.6 rematerialisation"
     allow["http/api_v1.rs|store.bulk_load(&request).map_err(|error| match error {"] = "synchronous import through effect::untracked"
     allow["http/api_v1.rs|let loaded = store.bulk_load_with(&request, job.progress());"] = "v1.6 async import"
-    allow["http/api_v1.rs|Some(program) => Some(store.rematerialise(program).map_err(|e| e.to_string())?),"] = "v1.6 async import reasoning"
+    allow["http/api_v1.rs|.rematerialise(program)"] = "v1.6 async import reasoning"
     allow["http/api_v1.rs|tokio::task::spawn_blocking(move || changing.patch_repository_settings(merge))"] = "v1.6 settings patch"
     allow["http/api_v1.rs|changing.patch_repository_settings(|current| {"] = "v1.6 rules upload"
     allow["http/api_v1.rs|state.patch_repository_settings(|current| {"] = "v1.6 rules removal"

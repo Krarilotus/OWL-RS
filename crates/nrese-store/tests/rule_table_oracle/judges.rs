@@ -86,23 +86,29 @@ pub fn first_and_rebuild(
         insert: asserted.to_vec(),
         ..Write::default()
     };
-    let rl = ReasoningMode::Owl2Rl;
     let accepted = if rebuild {
-        let raw = pipeline(&store, ReasoningMode::Disabled);
-        assert!(apply(&raw, &write), "the unreasoned input must load");
-        let _reader = pipeline(&store, rl);
-        let program = ReasonerConfig::for_mode(rl)
-            .materialised_program()
-            .expect("RL program");
-        store
-            .rematerialise(program)
-            .expect("rebuild judge")
-            .violations
-            == 0
+        load_past_gates(&store, &write)
     } else {
-        apply(&pipeline(&store, rl), &write)
+        apply(&pipeline(&store, ReasoningMode::Owl2Rl), &write)
     };
     (store, accepted)
+}
+
+/// Applies `write` unreasoned, then rebuilds the inferences: whether the rebuild found
+/// the state consistent. The store keeps the state either way.
+pub fn load_past_gates(store: &Arc<StoreService>, write: &Write) -> bool {
+    let rl = ReasoningMode::Owl2Rl;
+    let raw = pipeline(store, ReasoningMode::Disabled);
+    assert!(apply(&raw, write), "the unreasoned input must load");
+    let _reader = pipeline(store, rl);
+    let program = ReasonerConfig::for_mode(rl)
+        .materialised_program()
+        .expect("RL program");
+    store
+        .rematerialise(program)
+        .expect("rebuild judge")
+        .violations
+        == 0
 }
 
 fn compact_iri(iri: &str) -> String {

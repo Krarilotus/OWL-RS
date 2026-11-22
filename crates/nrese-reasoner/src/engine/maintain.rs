@@ -548,18 +548,6 @@ pub fn maintain_with_report_budget(
         }
     };
     let mut update = update;
-    // A list past the cap ([`crate::lists::MAX_VARIANTS`]) in the program after the delta,
-    // whether the state before held it or this change's rounds read it: the rules it gave
-    // while within the cap are in no program made over the state, so the delta derived
-    // nothing from it. Such a change runs its delta, whose checks (the list read as
-    // written) stand, and is then rebuilt: the batch's rounds make the list's rules again
-    // as they reach it.
-    let capped = delta_ran
-        && update.policy.plan != delta::policy::Plan::Rebuild
-        && (update.program.as_ref().or(ground)).is_some_and(|program| {
-            (program.list_diagnostics.iter())
-                .any(|d| d.problem == crate::lists::ListProblem::TooManyVariants)
-        });
     // A change after which an axiom's list is read otherwise (left out where it was read,
     // read where it was left out, or left out for another reason): the delta can't follow
     // the rules it gave or gives, so the change is rebuilt and judged by the rebuild's
@@ -585,11 +573,8 @@ pub fn maintain_with_report_budget(
     let (mut inserted, mut removed) = (0, 0);
     // Over representatives, a change that may split a class is rebuilt (B3a: the
     // translation can't follow it; the representative view for the delta executor is B3b).
-    let mut rebuild = revived
-        || unkept
-        || capped
-        || relisted
-        || update.policy.plan == delta::policy::Plan::Rebuild;
+    let mut rebuild =
+        revived || unkept || relisted || update.policy.plan == delta::policy::Plan::Rebuild;
     if !rebuild && program.stores_representatives() {
         match store_over_representatives(program, &update, &missing_axioms, tx) {
             Some((added, dropped)) => (inserted, removed) = (added, dropped),
@@ -629,16 +614,13 @@ pub fn maintain_with_report_budget(
         }
         rebuilt_violations = uses_rebuilt_report.then(|| {
             let found = std::mem::take(&mut closure.violations);
-            // A change rebuilt for a list past the cap, or for a list read otherwise, that
-            // deletes nothing is refused if either report refuses it. For the cap, the
-            // rebuild reads the list from its asserted cells in its rounds, the delta from
-            // the cells as written over every name. For a list read otherwise, a change that
+            // A change rebuilt for a list read otherwise that
             // only inserts takes no list path away, so what the delta found is still
             // entailed even where the list is now left out. Without a clash of its own, the
             // rebuild's report gives way to the delta's. One that deletes is judged by the
             // rebuild's alone: the delta can't follow what the list's rules derived, and a
             // fact the change took the support of can still clash there.
-            match (capped || relisted) && !deletes && found.consistent() {
+            match relisted && !deletes && found.consistent() {
                 true => std::mem::take(&mut update.violations),
                 false => found,
             }
@@ -677,12 +659,18 @@ pub fn maintain_with_report_budget(
         // The delta cache may still contain heads rewritten for a formerly hidden
         // class. Ground the final prospective state, and publish this cache only if
         // the caller commits. Existing unrelated violations remain tolerated.
-        let after = program.ground_program(&tx.pending_snapshot());
+        let ground_at = |snapshot| {
+            program
+                .ground_program_until(snapshot, &|| operation.fired())
+                .map_err(|_| operation.interrupted())
+        };
+        let pending = tx.pending_snapshot();
+        let after = ground_at(&pending)?;
         if update.policy.plan == delta::policy::Plan::Rebuild {
             // No delta ran: the list axioms the change left unusable, as it reports them.
             let before = match ground {
                 Some(ground) => std::borrow::Cow::Borrowed(ground),
-                None => std::borrow::Cow::Owned(program.ground_program(tx.base())),
+                None => std::borrow::Cow::Owned(ground_at(tx.base())?),
             };
             update.diagnostics = after
                 .list_diagnostics
@@ -697,7 +685,7 @@ pub fn maintain_with_report_budget(
         }
     }
     // The delta ran (its violations and diagnostics stand), and the closure is a rebuild's.
-    if unkept || capped || relisted {
+    if unkept || relisted {
         update.policy.plan = delta::policy::Plan::Rebuild;
     }
     Ok(Maintenance {

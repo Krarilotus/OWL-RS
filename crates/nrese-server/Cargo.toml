@@ -7,7 +7,7 @@ publish.workspace = true
 license.workspace = true
 
 [features]
-# Enables the CLI test hook for integration tests that run the binary.
+# Enables hooks for integration tests that run the server library and binary.
 fault-points = ["nrese-store/fault-points"]
 
 [dependencies]
@@ -61,6 +61,8 @@ libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
 
 [dev-dependencies]
+# Enable the server's own hooks in test builds via the dev-dependency resolver.
+nrese-server = { path = ".", features = ["fault-points"] }
 # The maintenance integration tests panic at a named step of one on-disk engine.
 nrese-engine = { path = "../nrese-engine", features = ["fault-points"] }
 # Simulated failures at the store's quarantine commit.
@@ -69,6 +71,9 @@ nrese-store = { path = "../nrese-store", features = ["fault-points"] }
 nrese-exec = { path = "../nrese-exec", features = ["measure"] }
 # The export's checksum computed independently (tests/it/admin_backup_api_tests.rs).
 sha2 = { workspace = true }
+# Exercise the router over h2c and inspect the peer's stream reset.
+axum = { version = "0.8.8", features = ["http2"] }
+h2 = "0.4"
 tower = { version = "0.5.2", features = ["util"] }
 # A paused clock that tests advance themselves: deadlines decided without real time.
 tokio = { version = "1.48.0", features = ["test-util"] }

@@ -272,6 +272,10 @@ pub async fn image(
     .map_err(|error| ApiError::internal(error.to_string()))?
     .map_err(answered)?;
     let path = dir.path().join(&manifest.file);
+    // Sent with its length, known on disk: over HTTP/1.0 too, a cut image is told apart.
+    let length = std::fs::metadata(&path)
+        .map_err(|error| ApiError::internal(error.to_string()))?
+        .len();
     let manifest_json =
         serde_json::to_string(&manifest).map_err(|error| ApiError::internal(error.to_string()))?;
     // Read in pieces on a thread of its own; the directory goes when the body is sent.
@@ -312,6 +316,7 @@ pub async fn image(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),
     );
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(length));
     headers.insert(
         MANIFEST,
         HeaderValue::from_str(&manifest_json)
@@ -381,9 +386,22 @@ async fn begin(
 /// [`IDLE`].
 async fn piece(response: &mut reqwest::Response) -> anyhow::Result<Option<axum::body::Bytes>> {
     match tokio::time::timeout(IDLE, response.chunk()).await {
-        Ok(piece) => Ok(piece?),
+        Ok(piece) => {
+            let piece = piece?;
+            #[cfg(feature = "fault-points")]
+            if let Some(bytes) = &piece {
+                let _ = TEST_BYTES_READ.try_with(|read| read.send(bytes.len()));
+            }
+            Ok(piece)
+        }
         Err(_) => anyhow::bail!("the primary stopped sending for {} s", IDLE.as_secs()),
     }
+}
+
+#[cfg(feature = "fault-points")]
+tokio::task_local! {
+    /// The number of bytes read in each body chunk, for tests that control the clock.
+    pub static TEST_BYTES_READ: tokio::sync::mpsc::UnboundedSender<usize>;
 }
 
 /// An error answer's text, as far as it comes within [`IDLE`].

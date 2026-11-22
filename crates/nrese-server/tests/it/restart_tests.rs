@@ -168,18 +168,24 @@ async fn a_stop_signal_ends_the_server_cleanly_and_keeps_its_commits() -> Outcom
 }
 
 /// A stop whose store doesn't close in time (a checkpoint of a large store; here a close
-/// held for 30 s, `NRESE_TEST_HOLD_CLOSE_MS`) ends at the stop deadline all the same: with
-/// code 0, within [`STOPPED`], naming the close it gave up on, and a commit acknowledged
-/// before the signal is there after a restart.
-/// Debug builds only, as the hold is.
+/// held for 5 s) ends at the stop deadline all the same: with code 0, naming the close it
+/// gave up on, and keeping the commit acknowledged before the signal across a restart.
+/// Use a 500 ms stop deadline by default and with `NRESE_CHECK_TIER=nightly`.
 #[cfg(all(unix, debug_assertions))]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stop_ends_at_its_deadline_when_the_store_does_not_close_in_time() -> Outcome {
     let dir = tempfile::tempdir()?;
     let config = configured(dir.path(), "off")?;
-    let server = Server::start_with(&config, &[("NRESE_TEST_HOLD_CLOSE_MS", "30000")]).await?;
+    let server = Server::start_with(
+        &config,
+        &[
+            ("NRESE_TEST_HOLD_CLOSE_MS", "5000"),
+            ("NRESE_TEST_STOP_DEADLINE_MS", "500"),
+        ],
+    )
+    .await?;
     server.update("nrese", EMPLOYEE).await?;
-    let (status, output) = server.terminate(STOPPED)?;
+    let (status, output) = server.terminate(std::time::Duration::from_secs(3))?;
     let mut wrong = Vec::new();
     if status.code() != Some(0) {
         wrong.push(format!(

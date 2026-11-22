@@ -1,5 +1,9 @@
 //! Shared helpers for `nrese-store` integration tests.
 
+mod tier;
+
+pub(crate) use tier::nightly;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
