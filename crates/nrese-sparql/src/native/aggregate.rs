@@ -878,9 +878,20 @@ fn one_pass_plan(
                 }
                 // Running keeps the first of equal values, the term `value::order` picks only
                 // where equal values are one term: one datatype ("1"^^xsd:integer sorts before
-                // "1"^^xsd:nonNegativeInteger). Several datatypes take [`mixed_pass`].
-                mixed |= matches!(name, AggregateFunction::Min | AggregateFunction::Max)
-                    && !one_datatype(solutions.table.column(column));
+                // "1"^^xsd:nonNegativeInteger). Several datatypes take [`mixed_pass`], which
+                // reduces order keys: an id without one (a reserved datatype code, which a
+                // replayed log record can carry) declines the pass, and the per-group path
+                // answers, as it does for every id this pass doesn't take.
+                if matches!(name, AggregateFunction::Min | AggregateFunction::Max)
+                    && !one_datatype(solutions.table.column(column))
+                {
+                    let keyed =
+                        |&id: &u64| id == UNDEF || value::order_key(TermId::from_raw(id)).is_some();
+                    if !solutions.table.column(column).iter().all(keyed) {
+                        return None;
+                    }
+                    mixed = true;
+                }
                 plan.push((Some(column), name.clone()));
             }
             _ => return None,
@@ -928,7 +939,10 @@ fn mixed_pass(
                 running[at(group as usize)].unbound = true;
                 continue;
             }
-            let key = value::order_key(TermId::from_raw(id)).expect("the plan's inline integers");
+            // Every bound id here has a key: `one_pass_plan` declines a column with one without.
+            let Some(key) = value::order_key(TermId::from_raw(id)) else {
+                continue;
+            };
             let best = &mut keys[group as usize];
             *best = if max {
                 (*best).max(key)

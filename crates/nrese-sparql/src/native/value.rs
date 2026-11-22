@@ -551,7 +551,7 @@ const INTEGER_RANK: u8 = 2;
 /// and the datatypes derived from it, each a canonical lexical form), and the comparison of
 /// two keys is [`order`] of the two terms; [`order_key_id`] gives the id back; no key is 0
 /// or `u64::MAX`. `None` for other ids (dictionary literals, other types), whose order is
-/// [`order`]'s own.
+/// [`order`]'s own, and for a derived integer's id with a datatype code no datatype has.
 #[inline]
 pub(crate) fn order_key(id: TermId) -> Option<u64> {
     let (offset, code) = id.inline_integer_fields()?;
