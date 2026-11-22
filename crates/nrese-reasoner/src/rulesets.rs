@@ -21,7 +21,7 @@
 //! | `rdfs-full` | every RDFS entailment rule (RDF 1.1 Semantics §9.2) and the finite RDF and RDFS axiomatic triples |
 //! | `rdfs-plus` | `rdfs` with equality, inverse, symmetric, transitive, functional and inverse functional properties, equivalent classes and properties |
 //! | `owl-horst` | `rdfs-plus` with `hasValue`, `someValuesFrom` and `allValuesFrom` (ter Horst's pD*) |
-//! | `owl2-ql` | what OWL 2 QL axioms entail without inventing individuals: hierarchies, domains, ranges, inverses, reflexive properties, `someValuesFrom owl:Thing`, and checks for disjointness, complements and an empty `owl:Thing`; no rule reads what the OWL reader reads as an annotation: an annotation property's assertions, domains, ranges and sub-property links (Direct Semantics §1; `guard_annotation_readings`); user rules on top are left as written |
+//! | `owl2-ql` | what OWL 2 QL axioms entail without inventing individuals: hierarchies, domains, ranges, inverses, reflexive properties, `someValuesFrom owl:Thing`, and checks for disjointness, complements and an empty `owl:Thing`; the built-in rules skip annotation assertions, an annotation property's domain or range, and sub-property axioms with one at either end (Direct Semantics §1; `guard_annotation_readings`); user rules on top are left as written |
 //! | `owl2-rl` | the OWL 2 RL/RDF rules |
 //!
 //! Every ruleset is validated by the tests: it parses, every rule is safe, and the
@@ -30,9 +30,10 @@
 use std::sync::OnceLock;
 
 use super::ir::{
-    AnnotationIds, Atom, Guard, ParseError, Rule, RuleSource, Term, Vocabulary, parse_rules,
-    parse_sources, rule_sources,
+    AnnotationIds, Atom, Guard, ParseError, Rule, RuleSource, Term, Triple, Vocabulary,
+    parse_rules, parse_sources, rule_sources,
 };
+use crate::vocabulary::LocalVocabulary;
 
 /// The named rulesets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,11 +239,42 @@ impl Ruleset {
         self == Self::Owl2Rl
     }
 
+    /// Compiles the rule templates. For evaluation over facts in a local vocabulary, use
+    /// [`Self::rules_for`] to bind any guards that read the asserted annotation properties.
     pub fn rules(self, vocabulary: &mut impl Vocabulary) -> Result<Vec<Rule>, ParseError> {
         let mut rules = parse_rules(self.text(), vocabulary)?;
         rules.extend(parse_sources(self.added_rules(), vocabulary)?);
         if self.parts().contains(&SemanticPart::AnnotationReadings) {
             guard_annotation_readings(&mut rules, vocabulary);
+        }
+        Ok(rules)
+    }
+
+    /// The rules for one evaluation of `asserted`, using that state's annotation properties.
+    /// The triples must use `vocabulary`'s ids.
+    pub fn rules_for(
+        self,
+        vocabulary: &mut LocalVocabulary,
+        asserted: &[Triple],
+    ) -> Result<Vec<Rule>, ParseError> {
+        let mut rules = self.rules(vocabulary)?;
+        if self.parts().contains(&SemanticPart::AnnotationReadings) {
+            use nrese_owl::mapping::AnnotationProperties;
+            let mut properties = AnnotationProperties::new(&mut |iri| Some(vocabulary.iri(iri)));
+            for &fact in asserted {
+                if !properties.declares(fact) {
+                    continue;
+                }
+                let iri = vocabulary
+                    .text(fact[0])
+                    .strip_prefix('<')
+                    .and_then(|s| s.strip_suffix('>'));
+                properties.read(fact, iri.is_some_and(nrese_owl::may_name_annotation));
+            }
+            bind_annotations(
+                &mut rules,
+                &AnnotationIds::new(properties.properties().collect()),
+            );
         }
         Ok(rules)
     }
@@ -278,6 +310,17 @@ impl Ruleset {
             );
         }
         Ok(out)
+    }
+}
+
+/// Gives each annotation guard the set read from this evaluation's asserted state.
+pub(crate) fn bind_annotations(rules: &mut [Rule], set: &AnnotationIds) {
+    for rule in rules {
+        for guard in &mut rule.guards {
+            if let Guard::NotAnnotation(_, ids) = guard {
+                *ids = set.clone();
+            }
+        }
     }
 }
 
@@ -621,6 +664,37 @@ scm-avf2: (?c1 owl:allValuesFrom ?y), (?c1 owl:onProperty ?p1), (?c2 owl:allValu
 
 #[cfg(test)]
 mod tests {
+    /// Spec (OWL 2 Direct Semantics §1): a declared annotation property's domain entails no
+    /// membership. The local evaluation of the same facts without that declaration reads it
+    /// as an object-property domain and derives the membership.
+    #[test]
+    fn a_local_ql_evaluation_reads_the_annotation_declarations_of_its_state() {
+        use super::{LocalVocabulary, Ruleset, Vocabulary};
+        use crate::batch::{Schema, materialise};
+
+        let mut vocabulary = LocalVocabulary::default();
+        let [note, doc, alice, bob] = ["note", "Doc", "alice", "bob"]
+            .map(|name| vocabulary.iri(&format!("http://example.com/{name}")));
+        let domain = vocabulary.iri("http://www.w3.org/2000/01/rdf-schema#domain");
+        let rdf_type = vocabulary.iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+        let annotation = vocabulary.iri("http://www.w3.org/2002/07/owl#AnnotationProperty");
+        let schema = Schema::owl(&mut vocabulary);
+        let asserted = [
+            [note, domain, doc],
+            [alice, note, bob],
+            [note, rdf_type, annotation],
+        ];
+        for (facts, expected) in [(&asserted[..2], true), (&asserted[..], false)] {
+            let rules = Ruleset::Owl2Ql.rules_for(&mut vocabulary, facts).unwrap();
+            let result = materialise(facts, &rules, None, &schema);
+            assert_eq!(
+                result.derived.contains(&[alice, rdf_type, doc]),
+                expected,
+                "the declaration controls the domain inference"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

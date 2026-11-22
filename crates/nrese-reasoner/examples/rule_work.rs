@@ -154,7 +154,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .build_global()?;
     }
     let mut vocabulary = LocalVocabulary::default();
-    let rules = ruleset.rules(&mut vocabulary)?;
     let lists = ruleset
         .has_list_rules()
         .then(|| ListVocabulary::new(&mut vocabulary));
@@ -180,6 +179,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         facts.len(),
         started.elapsed().as_secs_f64()
     );
+    let rules = ruleset.rules_for(&mut vocabulary, &facts)?;
     if equality {
         for run in 0..runs {
             let started = Instant::now();

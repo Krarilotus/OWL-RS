@@ -34,6 +34,8 @@ pub(crate) enum Site {
     Merge,
     /// Old consistency instances inspected in a delete's witness lookup.
     OldWitnessInstance,
+    /// Full materialisations started, including runs that keep only a consistency report.
+    FullMaterialisation,
     /// Length of the counter array.
     Count,
 }

@@ -1,0 +1,44 @@
+description = """A write the SHACL gate refuses names the result's message (docs/ops/http-api.md,
+"Status codes": a commit rejected by the SHACL gate is 400 shacl-reject; config-reference.md,
+shacl.gate; SHACL 1.0 section 5.3.2): with the gate enforcing and a SPARQL constraint whose
+sh:message names the solution's ?name, inserting a person with a one-word name is refused,
+its detail naming the message filled in, and nothing of it is stored."""
+
+[server]
+set = { "shacl.gate" = "enforce" }
+
+[[step]]
+name = "store the shapes: a SPARQL constraint with a message"
+method = "PUT"
+path = "/api/v1/repositories/nrese/shapes"
+headers = { Content-Type = "text/turtle" }
+body = """
+@prefix ex: <http://example.com/verify/> .
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+ex:FullName a sh:NodeShape ; sh:targetClass ex:Person ;
+  sh:sparql [ sh:message "{?name} is not a full name" ;
+    sh:select '''SELECT $this ?name WHERE {
+      $this <http://example.com/verify/name> ?name . FILTER (!CONTAINS(?name, " ")) }''' ] .
+"""
+[step.expect]
+status = [200, 201, 204]
+
+[[step]]
+name = "the gate refuses a person with a one-word name, naming the message"
+method = "POST"
+path = "/dataset/update"
+form = { update = 'INSERT DATA { <http://example.com/verify/bob> a <http://example.com/verify/Person> ; <http://example.com/verify/name> "Bob" }' }
+[step.expect]
+status = 400
+headers = { content-type = { contains = "application/problem+json" } }
+json = { "$.type" = "https://nrese.dev/problems/shacl-reject", "$.detail" = { contains = 'message "Bob is not a full name"' } }
+
+[[step]]
+name = "nothing of the refused write is stored"
+method = "POST"
+path = "/dataset/query"
+form = { query = "ASK { <http://example.com/verify/bob> ?p ?o }" }
+headers = { Accept = "application/sparql-results+json" }
+[step.expect]
+status = 200
+json = { "$.boolean" = false }
