@@ -733,8 +733,9 @@ impl<'a, V: ReadView> Validator<'a, V> {
     }
 
     /// The results of validating each `(shape, focus node)` of `work`, in that order: in
-    /// parallel, a few dozen nodes per task, each task charging its own reservation, taken
-    /// over by the validation's when it ends ([`Validator::adopt`]).
+    /// parallel, a few dozen nodes per task. Each task reuses its walk and charges results
+    /// to its own reservation, taken over by the validation's when it ends
+    /// ([`Validator::adopt`]).
     pub(crate) fn validate_all(&self, work: &[(ShapeRef, TermId)]) -> Vec<RawResult>
     where
         V: Sync,
@@ -743,13 +744,18 @@ impl<'a, V: ReadView> Validator<'a, V> {
         work.par_iter()
             .with_min_len(32)
             .fold(
-                || TaskResults::new(&self.results_budget),
-                |mut task, &(shape, focus)| {
-                    self.validate_node(shape, focus, &mut task);
-                    task
+                || {
+                    (
+                        TaskResults::new(&self.results_budget),
+                        nesting::Walk::new(&self.results_budget),
+                    )
+                },
+                |(mut task, mut walk), &(shape, focus)| {
+                    self.validate_node(shape, focus, &mut task, &mut walk);
+                    (task, walk)
                 },
             )
-            .map(|task| self.adopt(task))
+            .map(|(task, _)| self.adopt(task))
             .flat_map_iter(|list| list)
             .collect()
     }

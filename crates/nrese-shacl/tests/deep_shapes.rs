@@ -10,7 +10,7 @@
 
 use nrese_engine::{Engine, EngineConfig, GraphSelector, Snapshot, TermId};
 use nrese_exec::measure;
-use nrese_rdf::{GraphNameRef, NamedNodeRef, QuadRef};
+use nrese_rdf::{GraphNameRef, NamedNode, NamedNodeRef, QuadRef, Term};
 use nrese_rdf_io::{RdfFormat, RdfParser};
 use nrese_shacl::{Selection, Shapes, compile, nesting_parameters, validate, validate_changes};
 use nrese_sparql::Resources;
@@ -227,6 +227,66 @@ deep_tests! {
     "qualifiedValueShapesDisjoint" => Link::QualifiedSibling;
     a_long_sh_qualified_sibling_chain_compiles, a_long_sh_qualified_sibling_chain_validates,
     a_change_under_a_long_sh_qualified_sibling_chain_validates;
+}
+
+/// Spec: SHACL property constraints check each value node against the property shape.
+/// Under the engine's recursion rule (design §5), a repeated shape on a different
+/// focus node still runs. Joining the target to the chain introduces exactly the
+/// terminal node's MinCount violation, also the only result of full validation.
+#[test]
+fn a_recursive_property_shape_walks_a_long_data_chain() {
+    use std::fmt::Write;
+
+    if !measure::alone() {
+        return;
+    }
+    let engine = Engine::new(EngineConfig::default()).expect("engine");
+    let mut tx = engine.transaction();
+    insert(
+        &mut tx,
+        &format!(
+            "{PREFIXES}ex:P sh:targetNode ex:n0 ; sh:path ex:p ;
+                sh:property ex:P ; sh:minCount 1 ."
+        ),
+        GraphNameRef::from(NamedNodeRef::new_unchecked(SHAPES)),
+    );
+    let mut turtle = PREFIXES.to_owned();
+    for i in 1..LENGTH - 1 {
+        writeln!(turtle, "ex:n{i} ex:p ex:n{} .", i + 1).expect("write Turtle");
+    }
+    insert(&mut tx, &turtle, GraphNameRef::DefaultGraph);
+    drop(turtle);
+    tx.commit().expect("commit");
+    let before = engine.snapshot();
+    let shapes = compiled(&before, "recursive property");
+    let data = Selection::of(GraphSelector::Exact(TermId::DEFAULT_GRAPH));
+    let resources = Resources::default();
+
+    // Change an edge at the target itself so incremental selection reaches the walk.
+    let mut tx = engine.transaction();
+    insert(
+        &mut tx,
+        &format!("{PREFIXES}ex:n0 ex:p ex:n1 ."),
+        GraphNameRef::DefaultGraph,
+    );
+    let changed: Vec<_> = tx.inserted().collect();
+    let after = tx.pending_snapshot();
+    let full = validate(&after, &shapes, data, &resources).expect("full validation");
+    let introduced = validate_changes(&before, &after, &shapes, data, &changed, &resources)
+        .expect("change validation");
+    let terminal = Term::from(NamedNode::new_unchecked(format!(
+        "http://example.com/n{}",
+        LENGTH - 1
+    )));
+    for (entry, report) in [("full", full), ("change", introduced)] {
+        assert_eq!(report.results.len(), 1, "{entry}");
+        assert_eq!(report.results[0].focus_node, terminal, "{entry}");
+        assert_eq!(
+            report.results[0].component.as_str(),
+            "http://www.w3.org/ns/shacl#MinCountConstraintComponent",
+            "{entry}"
+        );
+    }
 }
 
 #[test]

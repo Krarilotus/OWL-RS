@@ -180,27 +180,21 @@ pub(crate) enum Nesting {
 #[derive(Debug)]
 pub(crate) struct NestedConstraint {
     pub(crate) kind: Nesting,
-    /// The single shape of a direct reference, or the primary qualified value shape.
-    /// Unused for a logical list, whose references all live in `others`.
-    first: ShapeRef,
-    /// The logical list members, or the disjoint qualified siblings.
-    others: Vec<ShapeRef>,
+    shapes: Vec<ShapeRef>,
 }
 
 impl NestedConstraint {
     pub(crate) fn single(kind: Nesting, shape: ShapeRef) -> Self {
         Self {
             kind,
-            first: shape,
-            others: Vec::new(),
+            shapes: vec![shape],
         }
     }
 
     pub(crate) fn logical(kind: Logical, members: Vec<ShapeRef>) -> Self {
         Self {
             kind: Nesting::Logical(kind),
-            first: 0,
-            others: members,
+            shapes: members,
         }
     }
 
@@ -208,46 +202,37 @@ impl NestedConstraint {
         shape: ShapeRef,
         min: Option<u64>,
         max: Option<u64>,
-        siblings: Vec<ShapeRef>,
+        mut siblings: Vec<ShapeRef>,
     ) -> Self {
+        siblings.insert(0, shape);
         Self {
             kind: Nesting::Qualified { min, max },
-            first: shape,
-            others: siblings,
+            shapes: siblings,
         }
     }
 
     /// References in validation order: the primary qualified shape before its siblings.
     pub(crate) fn references(&self) -> impl Iterator<Item = ShapeRef> + '_ {
-        self.has_first()
-            .then_some(self.first)
-            .into_iter()
-            .chain(self.others.iter().copied())
+        self.shapes.iter().copied()
     }
 
     /// Random access in the same order, for a suspended validation.
     pub(crate) fn reference(&self, member: usize) -> Option<ShapeRef> {
-        if self.has_first() {
-            if member == 0 {
-                return Some(self.first);
-            }
-            self.others.get(member - 1).copied()
-        } else {
-            self.others.get(member).copied()
-        }
+        self.shapes.get(member).copied()
     }
 
     /// References in creation order: the compiler encounters qualified siblings first.
     pub(crate) fn creation_reference(&mut self, member: usize) -> Option<&mut ShapeRef> {
-        if member == self.others.len() && self.has_first() {
-            Some(&mut self.first)
+        if matches!(self.kind, Nesting::Qualified { .. }) {
+            let (primary, siblings) = self.shapes.split_first_mut()?;
+            if member == siblings.len() {
+                Some(primary)
+            } else {
+                siblings.get_mut(member)
+            }
         } else {
-            self.others.get_mut(member)
+            self.shapes.get_mut(member)
         }
-    }
-
-    fn has_first(&self) -> bool {
-        !matches!(self.kind, Nesting::Logical(_))
     }
 
     /// Whether the conservative applicability check depends on the referenced shapes.

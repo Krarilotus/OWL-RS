@@ -41,7 +41,8 @@ enum ShapeParameter {
 }
 
 const PROPERTY: &str = "property";
-// Keep the shape-valued parameters in constraint evaluation and compilation order.
+// Every shape-valued parameter must go through this table so the deep-chain fixture
+// coverage test sees it. Keep entries in constraint evaluation and compilation order.
 const NESTING_PARAMETERS: &[(&str, ShapeParameter)] = &[
     ("not", ShapeParameter::Single(Nesting::Not)),
     ("and", ShapeParameter::List(Logical::And)),

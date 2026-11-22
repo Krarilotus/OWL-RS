@@ -1100,7 +1100,6 @@ dependencies = [
 name = "nrese-shacl"
 version = "1.5.0"
 dependencies = [
- "hashbrown 0.16.1",
  "nrese-engine",
  "nrese-exec",
  "nrese-rdf",
