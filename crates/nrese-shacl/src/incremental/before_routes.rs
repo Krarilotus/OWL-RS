@@ -1,5 +1,6 @@
 //! Routes by which full validation can report a candidate at its source shape and focus.
-//! At most [`MAX_AFFECTED`] pair visits per change call, with one verdict per candidate
+//! At most [`MAX_AFFECTED`] pair visits per change call (the route limit the call is
+//! given), with one verdict per candidate
 //! pair. After the bound, compare with the full before results of its reporting roots.
 
 use std::collections::BTreeSet;
@@ -46,6 +47,7 @@ impl<'a> BeforeRoutes<'a> {
         shapes: &'a Shapes,
         budget: &'a Budget,
         resources: &'a Resources,
+        route_limit: usize,
     ) -> Result<Self, QueryEvaluationError> {
         let mut parents = ChargedVec::new(budget);
         for (parent, compiled) in shapes.shapes.iter().enumerate() {
@@ -68,7 +70,7 @@ impl<'a> BeforeRoutes<'a> {
             budget,
             resources,
             parents,
-            visits_left: MAX_AFFECTED,
+            visits_left: route_limit,
             memo: Some(ChargedMap::new(budget)),
             whole: BTreeSet::new(),
             whole_seen: ChargedMap::new(budget),

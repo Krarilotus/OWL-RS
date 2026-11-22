@@ -64,6 +64,28 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
     changed: &[EncodedQuad],
     resources: &Resources,
 ) -> Result<ValidationReport, QueryEvaluationError> {
+    validate_changes_within(
+        before,
+        after,
+        shapes,
+        data,
+        changed,
+        resources,
+        MAX_AFFECTED,
+    )
+}
+
+/// [`validate_changes`] with `route_limit` pair visits for the reverse route searches of
+/// the call, after which their candidates are compared with whole validations.
+fn validate_changes_within<A: ReadView + Sync, B: ReadView + Sync>(
+    before: &A,
+    after: &B,
+    shapes: &Shapes,
+    data: Selection,
+    changed: &[EncodedQuad],
+    resources: &Resources,
+    route_limit: usize,
+) -> Result<ValidationReport, QueryEvaluationError> {
     resources.check()?;
     let mut selected = Vec::new();
     for chunk in changed.chunks(CHECK_EVERY) {
@@ -193,7 +215,12 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
                     continue;
                 }
                 if before_routes.is_none() {
-                    before_routes = Some(BeforeRoutes::new(shapes, &walk_budget, resources)?);
+                    before_routes = Some(BeforeRoutes::new(
+                        shapes,
+                        &walk_budget,
+                        resources,
+                        route_limit,
+                    )?);
                 }
                 let routes = before_routes
                     .as_mut()
