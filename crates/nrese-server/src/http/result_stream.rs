@@ -1133,6 +1133,33 @@ mod tests {
         assert_eq!(problem["detail"], "the query's own (budgets.query_memory)");
     }
 
+    /// Over HTTP/1.0, an answer past its deadline is no answer, though the whole of it is
+    /// ready when the hold looks: a hold that resumes only after the deadline, its channel's
+    /// last frame and close both ready, gets 408, not the answer.
+    #[tokio::test]
+    async fn a_held_answer_ready_only_past_its_deadline_is_no_answer() {
+        let (sender, receiver) = mpsc::channel(CHANNEL_CHUNKS);
+        sender
+            .try_send(Frame::data(Bytes::from_static(b"the answer")))
+            .unwrap();
+        drop(sender);
+        let outcome = Outcome::default();
+        outcome.set(Ok(()));
+        let deadline = Instant::now() - Duration::from_millis(1);
+        let held = hold(
+            receiver,
+            &outcome,
+            deadline,
+            Envelope::unlimited(),
+            "timeout",
+        )
+        .await;
+        assert_eq!(
+            held.err().map(|stopped| stopped.into_response().status()),
+            Some(StatusCode::REQUEST_TIMEOUT)
+        );
+    }
+
     /// Over HTTP/1.0, the first frame's stall bound starts when the answer is ready, not when
     /// the hold began: a read that is ready just before its first deadline leaves its client
     /// the whole bound for the first frame, not what is left of the deadline.
