@@ -131,3 +131,26 @@ fn without_the_range_the_complement_is_not_entailed() {
         "entails under owl2-dl, entails_dl"
     );
 }
+
+/// Spec (module docs; *OWL 2 Mapping to RDF Graphs*: the complement's node carries a second
+/// axiom, `¬C ⊑ ⊥`): `:a` is a `:B`, disjoint with `:C`, so `:a a ¬C` is entailed and `¬C`
+/// has an instance; `¬C ⊑ ⊥` is not entailed, so neither is the conclusion. The rules'
+/// refutation of `:a a :C` shows only its first half.
+#[test]
+fn a_complement_the_conclusion_also_says_is_empty_is_not_entailed() {
+    let dl = pipeline();
+    insert(&dl, ":a a :B . :B owl:disjointWith :C .").expect("premise");
+    let conclusion =
+        turtle(":a a _:n . _:n a owl:Class ; owl:complementOf :C ; rdfs:subClassOf owl:Nothing .");
+    let by_store = format!("{:?}", dl.store().entails(rules(), &conclusion));
+    let by_dl = dl
+        .store()
+        .entails_dl(&conclusion)
+        .expect("entailment")
+        .answer;
+    assert_eq!(
+        (by_store.as_str(), by_dl),
+        ("Ok(NotEntailed)", Entailed::No),
+        "entails under owl2-dl, entails_dl"
+    );
+}
