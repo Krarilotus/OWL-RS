@@ -1090,15 +1090,20 @@ impl QuarantineCommitError {
 
 /// `file`, a load's file, and the directory it is named in: its path below the server's
 /// data directory `data_dir`, or (without `data_dir`, or one it isn't below) its path in
-/// its store's. Never a path on the server's file system as a whole.
+/// its store's. Never a path on the server's file system as a whole. Its parts are joined
+/// with `/` on every system, so the answer is one text wherever the server runs.
 fn kept_as(file: &Path, data_dir: Option<&Path>) -> String {
     match data_dir.and_then(|data_dir| file.strip_prefix(data_dir).ok()) {
-        Some(file) => format!("{} in the server's data directory", file.display()),
+        Some(file) => {
+            let parts: Vec<_> = file
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy())
+                .collect();
+            format!("{} in the server's data directory", parts.join("/"))
+        }
         None => format!(
-            "{} in the store's data directory",
-            Path::new(DIR)
-                .join(file.file_name().unwrap_or_default())
-                .display()
+            "{DIR}/{} in the store's data directory",
+            file.file_name().unwrap_or_default().to_string_lossy()
         ),
     }
 }
