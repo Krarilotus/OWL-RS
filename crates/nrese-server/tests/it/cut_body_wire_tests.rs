@@ -3,7 +3,10 @@
 //! stream). HTTP/1.0 can't, so its answer is held whole and sent with its length, its status
 //! chosen at the end.
 //!
-//! The rows name every framing the server can send a streamed answer with. hyper 1.9.0 (the
+//! A known length tells a cut too: the client counts the bytes. Over HTTP/1.1 and HTTP/2 the
+//! server sends one only for a file whose size it knows, the replication image.
+//!
+//! The rows name every framing the server can send an answer with. hyper 1.9.0 (the
 //! version in Cargo.lock) chooses an HTTP/1 response's framing in `src/proto/h1/role.rs`,
 //! `Server::encode_headers`, from three inputs: the request's version, whether the body's
 //! length is known, and whether the request is a `HEAD` (`Server::can_have_body`; also a
@@ -38,7 +41,7 @@ use tokio::time::timeout;
 
 use crate::query_protocol_tests::encode;
 use crate::support::held_service::HANG;
-use crate::support::test_app_with_store;
+use crate::support::{minimal_fixture_path, test_app_with_store};
 
 const CHUNK: usize = 64 * 1024;
 const PREFIX_FRAMES: usize = 2;
@@ -66,9 +69,10 @@ enum Framing {
 
 const HELD: &str = "an HTTP/1.0 answer is held whole, or is a file sent with its size (the \
      replication image), so its length is known (no close-delimited body)";
-const STREAMED: &str = "a streamed answer's length is unknown until it ends";
 
-/// Every combination of (version, length known, `HEAD`) for a streamed answer.
+/// Every combination of (version, length known, `HEAD`) for an answer: a streamed one's length
+/// is unknown until it ends, known only held whole (HTTP/1.0); a file's (the replication
+/// image's) is known on every version.
 const FRAMINGS: &[(Http, bool, bool, Framing)] = &[
     (
         Http::V10,
@@ -96,8 +100,18 @@ const FRAMINGS: &[(Http, bool, bool, Framing)] = &[
         true,
         Framing::Row("http11_head_has_no_body_and_no_framing"),
     ),
-    (Http::V11, true, false, Framing::Never(STREAMED)),
-    (Http::V11, true, true, Framing::Never(STREAMED)),
+    (
+        Http::V11,
+        true,
+        false,
+        Framing::Row("http11_image_has_its_length"),
+    ),
+    (
+        Http::V11,
+        true,
+        true,
+        Framing::Row("http11_image_head_has_its_length_and_no_body"),
+    ),
     (
         Http::V2,
         false,
@@ -110,8 +124,18 @@ const FRAMINGS: &[(Http, bool, bool, Framing)] = &[
         true,
         Framing::Row("http2_head_ends_the_stream_without_data"),
     ),
-    (Http::V2, true, false, Framing::Never(STREAMED)),
-    (Http::V2, true, true, Framing::Never(STREAMED)),
+    (
+        Http::V2,
+        true,
+        false,
+        Framing::Row("http2_image_has_its_length"),
+    ),
+    (
+        Http::V2,
+        true,
+        true,
+        Framing::Row("http2_image_head_has_its_length_and_no_data"),
+    ),
 ];
 
 #[test]
@@ -522,6 +546,149 @@ async fn http2_head_ends_the_stream_without_data() -> Result<(), Box<dyn Error>>
         connection.abort();
         eprintln!("{:?} {:?}; end {end:?}", head.status, head.headers);
         assert!(end.is_none(), "a HEAD answer's stream ends without data");
+        Ok(())
+    })
+    .await?
+}
+
+const IMAGE: &str = "/api/v1/replication/image";
+
+/// A primary on a real port, its store on disk with the minimal fixture: its replication
+/// image ([`IMAGE`]) is a file, sent with its size on every version. The directory lives as
+/// long as the server must.
+pub(crate) async fn image_server()
+-> Result<(SocketAddr, JoinHandle<io::Result<()>>, tempfile::TempDir), Box<dyn Error>> {
+    use nrese_server::replication::{ReplicationConfig, ReplicationMode};
+
+    let dir = tempfile::tempdir()?;
+    let store =
+        StoreService::new(StoreConfig::on_disk(dir.path()).with_ontology(minimal_fixture_path()))?;
+    let state = nrese_server::AppState::new(
+        store,
+        nrese_reasoner::ReasonerService::new(ReasonerConfig::default()),
+        PolicyConfig::default(),
+        nrese_server::ai::AiSuggestionService::disabled(),
+        nrese_server::DeploymentPosture::OpenWorkbench,
+    )
+    .with_replication(ReplicationConfig {
+        mode: ReplicationMode::Primary,
+        ..ReplicationConfig::default()
+    });
+    state.mark_ready();
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let app = nrese_server::build_app(state);
+    let task = tokio::spawn(async move { axum::serve(listener, app).await });
+    Ok((addr, task, dir))
+}
+
+/// The image asked with `method` as HTTP/1 `version`, the connection closed after it: the
+/// response's head (a 200) and all the bytes after it.
+pub(crate) async fn http1_image(
+    addr: SocketAddr,
+    version: &str,
+    method: &str,
+) -> Result<(String, Vec<u8>), Box<dyn Error>> {
+    let mut client = TcpStream::connect(addr).await?;
+    let request =
+        format!("{method} {IMAGE} {version}\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    client.write_all(request.as_bytes()).await?;
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).await?;
+    let end = response
+        .windows(4)
+        .position(|bytes| bytes == b"\r\n\r\n")
+        .expect("a response head");
+    let head = String::from_utf8_lossy(&response[..end]).into_owned();
+    assert_eq!(head.split(' ').nth(1), Some("200"), "{head}");
+    Ok((head, response[end + 4..].to_vec()))
+}
+
+/// The image's length, as its head gives it: a whole number.
+fn image_length(head: &str) -> usize {
+    header(head, "content-length")
+        .and_then(|length| length.parse().ok())
+        .unwrap_or_else(|| panic!("no length: {head:?}"))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http11_image_has_its_length() -> Result<(), Box<dyn Error>> {
+    timeout(HANG, async {
+        let (addr, task, _dir) = image_server().await?;
+        let (head, body) = http1_image(addr, "HTTP/1.1", "GET").await?;
+        task.abort();
+        eprintln!("{head:?}; {} data bytes", body.len());
+        assert_eq!(header(&head, "transfer-encoding"), None, "{head:?}");
+        assert!(!body.is_empty());
+        assert_eq!(image_length(&head), body.len());
+        Ok(())
+    })
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http11_image_head_has_its_length_and_no_body() -> Result<(), Box<dyn Error>> {
+    timeout(HANG, async {
+        let (addr, task, _dir) = image_server().await?;
+        let (head, body) = http1_image(addr, "HTTP/1.1", "HEAD").await?;
+        task.abort();
+        eprintln!("{head:?}; {} data bytes", body.len());
+        assert!(image_length(&head) > 0, "{head:?}");
+        assert!(body.is_empty());
+        Ok(())
+    })
+    .await?
+}
+
+/// The image asked with `method` over HTTP/2: the response's `content-length` and the data
+/// bytes its stream carried to its end.
+async fn http2_image(addr: SocketAddr, method: &str) -> Result<(usize, usize), Box<dyn Error>> {
+    let (mut client, connection) = http2(addr).await?;
+    let request = Request::builder()
+        .method(method)
+        .uri(format!("http://{addr}{IMAGE}"))
+        .body(())?;
+    let (response, _) = client.send_request(request, true)?;
+    let response = response.await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let (head, mut body) = response.into_parts();
+    let mut received = 0;
+    while let Some(data) = body.data().await {
+        let data = data?;
+        received += data.len();
+        body.flow_control().release_capacity(data.len())?;
+    }
+    connection.abort();
+    eprintln!("{method}: {:?}; {received} data bytes", head.headers);
+    let length = head
+        .headers
+        .get("content-length")
+        .and_then(|length| length.to_str().ok()?.parse().ok())
+        .expect("a length");
+    Ok((length, received))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http2_image_has_its_length() -> Result<(), Box<dyn Error>> {
+    timeout(HANG, async {
+        let (addr, task, _dir) = image_server().await?;
+        let (length, received) = http2_image(addr, "GET").await?;
+        task.abort();
+        assert!(received > 0);
+        assert_eq!(length, received);
+        Ok(())
+    })
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http2_image_head_has_its_length_and_no_data() -> Result<(), Box<dyn Error>> {
+    timeout(HANG, async {
+        let (addr, task, _dir) = image_server().await?;
+        let (length, received) = http2_image(addr, "HEAD").await?;
+        task.abort();
+        assert!(length > 0);
+        assert_eq!(received, 0);
         Ok(())
     })
     .await?

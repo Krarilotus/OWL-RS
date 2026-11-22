@@ -17,7 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tower::util::ServiceExt;
 
-use crate::cut_body_wire_tests::{WHOLE, query};
+use crate::cut_body_wire_tests::{WHOLE, http1_image, image_server, query};
 use crate::support::held_service::{HANG, HeldEndpoint};
 use crate::support::{minimal_fixture_path, test_app_with_store, test_app_with_store_config};
 
@@ -256,40 +256,9 @@ async fn an_http10_export_is_sent_whole() -> Result<(), Box<dyn Error>> {
 /// it goes out with its `Content-Length`, as on the wire, all of it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_http10_replication_image_arrives_with_its_length() -> Result<(), Box<dyn Error>> {
-    use nrese_server::replication::{ReplicationConfig, ReplicationMode};
-
-    let dir = tempfile::tempdir()?;
-    let store =
-        StoreService::new(StoreConfig::on_disk(dir.path()).with_ontology(minimal_fixture_path()))?;
-    let state = nrese_server::AppState::new(
-        store,
-        nrese_reasoner::ReasonerService::new(ReasonerConfig::default()),
-        PolicyConfig::default(),
-        nrese_server::ai::AiSuggestionService::disabled(),
-        nrese_server::DeploymentPosture::OpenWorkbench,
-    )
-    .with_replication(ReplicationConfig {
-        mode: ReplicationMode::Primary,
-        ..ReplicationConfig::default()
-    });
-    state.mark_ready();
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let app = nrese_server::build_app(state);
-    let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    let mut client = TcpStream::connect(addr).await?;
-    let request = format!("GET /api/v1/replication/image HTTP/1.0\r\nHost: {addr}\r\n\r\n");
-    client.write_all(request.as_bytes()).await?;
-    let mut response = Vec::new();
-    client.read_to_end(&mut response).await?;
+    let (addr, server, _dir) = image_server().await?;
+    let (head, body) = http1_image(addr, "HTTP/1.0", "GET").await?;
     server.abort();
-    let end = response
-        .windows(4)
-        .position(|bytes| bytes == b"\r\n\r\n")
-        .expect("a response head");
-    let head = String::from_utf8_lossy(&response[..end]).into_owned();
-    let body = &response[end + 4..];
-    assert_eq!(head.split(' ').nth(1), Some("200"), "{head}");
     let length = head.split("\r\n").find_map(|line| {
         let (name, value) = line.split_once(':')?;
         name.eq_ignore_ascii_case("content-length")
