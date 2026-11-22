@@ -293,8 +293,9 @@ const REOPENED: &str = "opened without a rebuild";
 /// its reads of literals are withheld as every reader's are, with the reason that the store
 /// was opened without a rebuild. The value `"Rex"` in `:open`, which nothing could equate,
 /// read by a reader by support of `:open` (and the default graph), under `owl2-ql` and under
-/// `owl2-rl` with the rewriting: `complete` before the reopen, withheld after it for every
-/// reader, and `complete` again after a rebuild.
+/// `owl2-rl` with the rewriting. The reopen reason appears for every reader after reopening,
+/// and goes away after a rebuild. The ordinary status by support is `complete` under `owl2-rl`
+/// and `sound-only` under the `owl2-ql` grant cap.
 #[test]
 fn a_reader_by_support_of_a_store_reopened_without_a_rebuild_is_withheld_too() {
     use nrese_reasoner::rulesets::Ruleset;
@@ -310,6 +311,14 @@ fn a_reader_by_support_of_a_store_reopened_without_a_rebuild_is_withheld_too() {
         ("owl2-ql", Ruleset::Owl2Ql, QlRewritingMode::Auto),
         ("owl2-rl rewriting on", Ruleset::Owl2Rl, QlRewritingMode::On),
     ] {
+        let ordinary = if ruleset == Ruleset::Owl2Ql {
+            "sound-only"
+        } else {
+            "complete"
+        };
+        let settled = |word: &str, reasons: &[String]| {
+            word == ordinary && !reasons.iter().any(|r| r.contains(REOPENED))
+        };
         let dir = tempfile::tempdir().expect("dir");
         let config = || StoreConfig {
             ql_rewriting: ql,
@@ -321,7 +330,7 @@ fn a_reader_by_support_of_a_store_reopened_without_a_rebuild_is_withheld_too() {
             store.rematerialise(ruleset).expect("rebuild");
             store.use_reasoning_rules(Some(ruleset.into()));
             let (_, word, reasons) = read_as(&store, query, reader_of_open(true));
-            if word != "complete" {
+            if !settled(&word, &reasons) {
                 unmet.push(format!(
                     "setup: {regime} before the reopen: {word} {reasons:?}"
                 ));
@@ -344,7 +353,7 @@ fn a_reader_by_support_of_a_store_reopened_without_a_rebuild_is_withheld_too() {
         }
         store.rematerialise(ruleset).expect("rebuild");
         let (_, word, reasons) = read_as(&store, query, reader_of_open(true));
-        if word != "complete" {
+        if !settled(&word, &reasons) {
             unmet.push(format!("{regime} by support rebuilt: {word} {reasons:?}"));
         }
     }

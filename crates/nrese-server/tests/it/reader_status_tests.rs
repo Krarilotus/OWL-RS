@@ -181,9 +181,9 @@ async fn ask(app: &Router, roles: &[&str], route: Route) -> TestResult<Told> {
 /// `complete` says no entailed row is missing, and a regime's status speaks of the closure the
 /// reader reads. So a reader of `:g1` asking for `ex:a ex:q ex:b`, which `:g1` alone entails,
 /// is answered `false` under compact and told `not-certified`, on every route, with no QL
-/// report; never `complete` or a regime's `sound-only`. Under `representatives` its view is its
-/// closure: `true`, with the status a reader of every graph gets (the control). The reader of
-/// every graph is answered `true` either way (the row is entailed).
+/// report; never `complete` or a regime's `sound-only`. Under `representatives` the reader
+/// gets `true` and the ordinary status, subject to the OWL 2 QL grant's `sound-only` cap.
+/// The reader of every graph is answered `true` either way (the row is entailed).
 #[tokio::test]
 async fn a_reader_by_support_is_never_told_complete_for_a_view_without_its_closure() -> TestResult {
     use QlRewritingMode::{Auto, Off, On};
@@ -209,7 +209,7 @@ async fn a_reader_by_support_is_never_told_complete_for_a_view_without_its_closu
             Owl2Ql,
             Auto,
             Route::Query,
-            told(true, "complete", None),
+            told(true, "sound-only", None),
         ),
         (
             "transaction",
