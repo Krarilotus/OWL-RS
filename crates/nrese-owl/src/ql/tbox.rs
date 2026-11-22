@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use super::hazards::Hazard;
 use super::witness::Work;
 use super::{Atom, Cq};
-use crate::mapping::Ontology;
+use crate::mapping::{BuiltinProperties, Ontology};
 use crate::model::{Axiom, Characteristic, ClassExpr, EntityKind, ExprId, ObjProp, Term};
 
 /// A role: a property, or an object property's inverse.
@@ -150,7 +150,7 @@ impl Tbox {
         }
         let unread = std::mem::take(&mut b.unread);
         let partial = std::mem::take(&mut b.partial);
-        let mut tbox = b.finish();
+        let mut tbox = b.finish(ontology.builtin);
         let read = super::hazards::Read {
             unread: &unread,
             partial: &partial,
@@ -795,7 +795,7 @@ impl Builder {
             .push((left, ObjProp::Named(property), None, true));
     }
 
-    fn finish(mut self) -> Tbox {
+    fn finish(mut self, builtin: BuiltinProperties) -> Tbox {
         let data = self.tbox.data.clone();
         let object = |r: &Role| !data.contains(&r.named());
         // Role inclusions hold between the inverses too.
@@ -849,6 +849,25 @@ impl Builder {
             self.tbox.sup.insert(rho, sup);
             self.tbox.base_sup.insert(rho, base_sup);
         }
+        // Every individual has an edge of each top role and each role above it.
+        // A stored edge is still required for the base domain and range rules.
+        let thing = self.basic(Basic::Thing);
+        let mut universal: Vec<u32> = [
+            builtin.top_object.map(ObjProp::Named),
+            builtin.top_object.map(ObjProp::Inverse),
+            builtin.top_data.map(ObjProp::Named),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|top| self.tbox.sup.get(&top))
+        .flatten()
+        .map(|&role| self.tbox.ids[&Basic::Exists(role)])
+        .collect();
+        universal.sort_unstable();
+        universal.dedup();
+        for target in universal {
+            self.include(thing, target, false);
+        }
         // Generating axioms: `B ⊑ ∃ρ`, never applied by the materialisation.
         let mut types: HashMap<TypeKey, usize> = HashMap::new();
         let generating = std::mem::take(&mut self.generating);
@@ -864,7 +883,6 @@ impl Builder {
         }
         let mut keyed: Vec<(TypeKey, usize)> = types.into_iter().collect();
         keyed.sort_by_key(|&(_, ty)| ty);
-        let thing = self.basic(Basic::Thing);
         let reflexive: Vec<u32> = {
             let mut r: Vec<Term> = self.tbox.reflexive.iter().copied().collect();
             r.sort();
