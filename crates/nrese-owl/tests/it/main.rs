@@ -757,6 +757,52 @@ fn the_six_entities_of_the_reserved_vocabulary_declared_annotation_properties_ar
     assert!(kept.is_empty(), "{kept:#?}");
 }
 
+/// Spec (Structural Specification §2.4 gives `owl:Thing`, `owl:Nothing` and the four top and
+/// bottom properties a class's or a property's role only; §5.6.1: no IRI of the reserved
+/// vocabulary is an individual): each of the six where an individual goes (an assertion's
+/// individual or value, an equality, a difference, a nominal, a `hasValue`, a negative
+/// assertion, a `NamedIndividual` declaration) is reported reserved and its axiom left out;
+/// as a class or a property it is read, unreported.
+#[test]
+fn the_six_entities_of_the_reserved_vocabulary_as_individuals_are_left_out() {
+    let reserved = |ontology: &Ontology| {
+        (ontology.diagnostics.iter()).any(|d| matches!(d, Diagnostic::Reserved { .. }))
+    };
+    let places = [
+        "ex:p a owl:ObjectProperty . ex:a ex:p owl:Thing .",
+        "owl:Nothing a ex:C .",
+        "ex:p a owl:ObjectProperty . owl:topObjectProperty ex:p ex:b .",
+        "ex:d a owl:DatatypeProperty . owl:topDataProperty ex:d \"v\" .",
+        "ex:a owl:sameAs owl:bottomObjectProperty .",
+        "ex:a owl:differentFrom owl:bottomDataProperty .",
+        "ex:C owl:equivalentClass [ owl:oneOf ( owl:Thing ) ] .",
+        "ex:p a owl:ObjectProperty . \
+         ex:C owl:equivalentClass [ a owl:Restriction ; owl:onProperty ex:p ; owl:hasValue owl:Nothing ] .",
+        "ex:p a owl:ObjectProperty . [] a owl:NegativePropertyAssertion ; \
+         owl:sourceIndividual ex:a ; owl:assertionProperty ex:p ; owl:targetIndividual owl:Thing .",
+        "owl:Nothing a owl:NamedIndividual .",
+    ];
+    let mut wrong = Vec::new();
+    for data in places {
+        let mut table = Table::default();
+        let ontology = read(&load(&mut table, data), &table);
+        let lines = rendered(&ontology, &table);
+        if !reserved(&ontology) || lines.iter().any(|l| l.contains("www.w3.org")) {
+            wrong.push(format!("{data}: {lines:?} {:?}", ontology.diagnostics));
+        }
+    }
+    let mut table = Table::default();
+    let legal = "ex:C rdfs:subClassOf owl:Thing . owl:Nothing rdfs:subClassOf ex:C . ex:a a owl:Thing . \
+        ex:p a owl:ObjectProperty ; rdfs:subPropertyOf owl:topObjectProperty . \
+        ex:a owl:topObjectProperty ex:b . ex:a owl:bottomDataProperty \"v\" .";
+    let ontology = read(&load(&mut table, legal), &table);
+    if reserved(&ontology) || ontology.axioms.len() < 6 {
+        let lines = rendered(&ontology, &table);
+        wrong.push(format!("legal: {lines:?} {:?}", ontology.diagnostics));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// A disjointness that repeats an operand says that operand is empty (an individual
 /// different from itself: a contradiction), as OWL 2's RDF-Based Semantics reads it; the
 /// operands were deduplicated and the axiom said nothing (WebOnt-disjointWith-010,
