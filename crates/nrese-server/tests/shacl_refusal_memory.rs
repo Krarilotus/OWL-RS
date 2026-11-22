@@ -54,7 +54,6 @@ async fn the_response_keeps_its_encoded_shacl_refusal_charged() {
 /// its detail the counts alone.
 #[tokio::test]
 async fn a_shacl_refusal_still_reports_counts_when_encoding_cannot_fit() {
-    let message = "x".repeat(MESSAGE_BYTES);
     let problem = counts_only(false).await;
     assert_eq!(
         problem["detail"],
@@ -116,7 +115,7 @@ async fn counts_only(restricted: bool) -> Value {
     assert_eq!(problem["shacl"]["failures"], serde_json::json!([]));
     assert_eq!(problem["shacl"]["results_omitted"], 2);
     assert_eq!(problem["shacl"]["failures_omitted"], 0);
-    assert!(problem["reasoner_reject"].is_null());
+    assert_eq!(problem.get("reasoner_reject"), Some(&Value::Null));
     problem
 }
 
