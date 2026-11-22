@@ -60,6 +60,9 @@ struct Split {
     positive: Vec<Triple>,
     /// Sets of statements whose addition must make the data inconsistent.
     refutations: Vec<Vec<Triple>>,
+    /// A negative form's node says more than the form (another axiom about a complement's
+    /// class, say), which its refutation doesn't show.
+    beyond: bool,
 }
 
 impl StoreService {
@@ -116,13 +119,16 @@ impl StoreService {
         // One revision for the whole answer: the closure's read, every refutation and the DL
         // check are of it.
         let at = self.engine().snapshot();
-        if self.shown_by_rules(&at, program, &split(conclusion))? {
-            return Ok(Entailment::Entailed);
-        }
+        let split = split(conclusion);
         // The rules are complete under the Direct Semantics only for OWL 2 RL premises
         // (OWL 2 Profiles §4.3, PR1): under owl2-dl, what they leave unshown the DL engines
-        // decide.
-        if self.dl().active() {
+        // decide, and a conclusion whose negative forms say more than the rules refute goes
+        // to them whole.
+        let dl = self.dl().active();
+        if !(dl && split.beyond) && self.shown_by_rules(&at, program, &split)? {
+            return Ok(Entailment::Entailed);
+        }
+        if dl {
             return self.decided_by_dl(&at, conclusion);
         }
         Ok(Entailment::NotEntailed)
@@ -283,6 +289,14 @@ fn split(conclusion: &[Triple]) -> Split {
         t.predicate.as_ref() == rdf::TYPE
             && matches!(&t.object, Term::NamedNode(n) if n.as_ref() == class)
     };
+    // Whether `node` says more than a form whose node is typed `class` and has `predicates`.
+    let says_more = |node: &NamedOrBlankNode,
+                     class: nrese_rdf::NamedNodeRef<'_>,
+                     predicates: &[nrese_rdf::NamedNodeRef<'_>]| {
+        conclusion.iter().any(|t| {
+            &t.subject == node && !is_type(t, class) && !predicates.contains(&t.predicate.as_ref())
+        })
+    };
     // The statements a negative form or the header consumed, by index.
     let mut used: HashSet<usize> = HashSet::new();
     let mut split = Split::default();
@@ -321,8 +335,14 @@ fn split(conclusion: &[Triple]) -> Split {
                     }
                 }
                 used.extend(about(&t.subject));
+                split.beyond |= says_more(
+                    &t.subject,
+                    owl::ALL_DIFFERENT,
+                    &[owl::MEMBERS, owl::DISTINCT_MEMBERS],
+                );
                 for node in &nodes {
                     used.extend(about(node));
+                    split.beyond |= says_more(node, rdf::LIST, &[rdf::FIRST, rdf::REST]);
                 }
             }
         }
@@ -339,6 +359,7 @@ fn split(conclusion: &[Triple]) -> Split {
                 )]);
                 used.insert(i);
                 used.extend(about(&class));
+                split.beyond |= says_more(&class, owl::CLASS, &[owl::COMPLEMENT_OF]);
             }
         }
         // [] a owl:NegativePropertyAssertion; source, property, target (or value).
@@ -355,6 +376,16 @@ fn split(conclusion: &[Triple]) -> Split {
                     .refutations
                     .push(vec![Triple::new(a.clone(), p.clone(), b.clone())]);
                 used.extend(about(node));
+                split.beyond |= says_more(
+                    node,
+                    owl::NEGATIVE_PROPERTY_ASSERTION,
+                    &[
+                        owl::SOURCE_INDIVIDUAL,
+                        owl::ASSERTION_PROPERTY,
+                        owl::TARGET_INDIVIDUAL,
+                        owl::TARGET_VALUE,
+                    ],
+                );
             }
         }
     }
