@@ -94,6 +94,10 @@ impl StoreService {
             #[cfg(test)]
             crate::service::hooks::run(&crate::service::hooks::AFTER_ENTAILMENT_READS);
             if self.certificate_epoch() == epoch {
+                // Under owl2-dl, an answer stands only within its time, the snapshot let go.
+                if dl.is_some_and(Deadline::passed) {
+                    return Err(out_of_time());
+                }
                 return Ok(answer);
             }
         }
@@ -249,6 +253,11 @@ impl StoreService {
 
 /// Why an entailment check that saw a commit after its start gives no answer.
 const CHANGED: &str = "the data changed during the entailment check: ask again";
+
+/// An entailment check whose deadline passed gives no answer.
+fn out_of_time() -> StoreError {
+    StoreError::Undecided(nrese_dl::limits::Limit::Time.reached("the deadline passed"))
+}
 
 /// `triple` as a SPARQL triple pattern: see [`term_pattern`].
 fn triple_pattern(triple: &Triple) -> String {
