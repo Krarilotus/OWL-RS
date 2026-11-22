@@ -1,4 +1,5 @@
 """A saved run's privacy and the directory that owns its manifest."""
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -124,3 +125,64 @@ class SavedRunBoundaries(unittest.TestCase):
                     self.assertEqual(raw.read_bytes(), source)
                     self.assertEqual([(row["host"], row["status"]) for row in schema.read(results)],
                                      [("sample-host", "wrong"), ("sample-host", "ok")])
+
+    def era_run(self, out):
+        """ERA's real `run` into `out` from this (overlay-free, public) shell, every container stubbed."""
+        spec = importlib.util.spec_from_file_location("era_shacl_run", isolation.ROOT / "benches/breadth/era-shacl/run.py")
+        era = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(era)
+
+        class Runtime:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def pin(self, images):
+                pass
+
+            def run(self, spec, log, timeout_s):
+                log.write_text("Load time: 1.0\nValidation time: 2.0\nData graph size: 5\n", encoding="utf-8")
+                return SimpleNamespace(timed_out=False, ok=True, rc=0, ms=3000.0, peak_mib=10,
+                                       memory_kind="container", memory_note="")
+
+            def cleanup(self):
+                pass
+
+        with patch.object(era.kit, "DockerRuntime", Runtime), patch.object(era.kit, "wait_until_free", lambda: None), \
+                patch.object(era.kit, "retreated_since", lambda started: False), \
+                patch.object(manifest, "container_start_ms", lambda root: None), \
+                patch.object(manifest, "image_ids", lambda images: {}):
+            return era.main(["run", "--results", str(out), "--subsets", "ES", "--shapes", "core",
+                             "--engines", "nrese", "--runs", "1"])
+
+    def test_era_run_never_saves_earlier_rows_under_another_privacy_class(self):
+        # Spec: a reused ERA results directory keeps every invocation whose rows it holds; a run of
+        # another privacy class than those rows, or onto rows of unknown provenance, is refused before
+        # anything changes, so a later `check` still treats the private rows as private.
+        for provenance in (True, False):
+            with self.subTest(saved="private" if provenance else "unknown"):
+                out = self.era_results(f"reused-{provenance}", provenance)
+                public_raw = self.public / f"reused-raw-{provenance}"
+                public_raw.write_bytes(b"public fixture\n")
+                self.link(out / "results.raw.csv", public_raw)
+                watched = (out / "manifest.json", out / "results.csv", public_raw)
+                before = contents(watched)
+                try:
+                    status = self.era_run(out)
+                except Exception as error:  # the old code fails later, at its first container
+                    status = f"raised {error!r}"
+                self.assertEqual(contents(before), before)
+                self.assertEqual(status, 2)
+                runner = isolation.ROOT / "benches/breadth/era-shacl/run.py"
+                done = subprocess.run([sys.executable, "-I", str(runner), "check", str(out)],
+                                      env=self.env, capture_output=True, text=True, timeout=30)
+                self.assertEqual(contents(before), before, done.stderr)
+                self.assertNotEqual(done.returncode, 0)
+
+        # A fresh directory, and the same directory reused by a run of the same (public) class.
+        fresh = self.root / "fresh"
+        self.assertEqual(self.era_run(fresh), 0)
+        self.assertEqual(self.era_run(fresh), 0)
+        invocations = json.loads((fresh / "manifest.json").read_text(encoding="utf-8"))["invocations"]
+        self.assertEqual(len(invocations), 2)
+        self.assertEqual([row["task"] for row in schema.read(fresh / "results.csv")],
+                         ["load", "validate", "load", "validate"])

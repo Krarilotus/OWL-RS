@@ -109,6 +109,13 @@ def parse(log: str) -> dict:
 def steps(args) -> int:
     subsets, shapes, engines = (args.subsets.split(","), args.shapes.split(","), args.engines.split(","))
     out = kit.result_dir(args.results, args.label)
+    # A reused directory keeps its earlier rows, and the manifest below describes only this run:
+    # rows of another privacy class, or of unknown provenance, would then be saved under it.
+    if (out / "results.csv").exists() and (saved_invocations(out) is None
+                                           or private_results(out) != kit.hosts.private_session()):
+        print(f"{out}: its saved rows are not this run's privacy class, or their provenance is unknown; "
+              "give a new --results directory", file=sys.stderr)
+        return 2
     manifest_path = kit.hosts.evidence_path(out / "manifest.json", kit.hosts.private_session(), kit.ROOT)
     (out / "reports").mkdir(parents=True, exist_ok=True)
     (out / "logs").mkdir(exist_ok=True)
@@ -121,7 +128,10 @@ def steps(args) -> int:
                       {"runs": args.runs, "memory": args.memory, "heap": args.heap, "timeout_s": args.timeout_s,
                        "scenario": f"matched: every engine in one container capped at {args.memory} without swap, "
                                    f"all host CPUs; JVM heap {args.heap}"})
-    kit.hosts.evidence_path(manifest_path).write_text(json.dumps({"invocations": [entry]}, indent=1), encoding="utf-8")
+    # The earlier invocations whose rows the reused results.csv keeps stay beside this one.
+    earlier = saved_invocations(out) if (out / "results.csv").exists() else None
+    kit.hosts.evidence_path(manifest_path).write_text(json.dumps({"invocations": [*(earlier or []), entry]}, indent=1),
+                                                      encoding="utf-8")
     date = entry["started"][:16]
     try:
         for rep, (subset, shape, engine) in plan:
@@ -230,14 +240,20 @@ def canonical(path: Path) -> collections.Counter:
     return bag
 
 
-def private_results(out: Path) -> bool:
-    """Saved runs are private unless every invocation records public machine provenance."""
+def saved_invocations(out: Path) -> list | None:
+    """The saved manifest's invocations; None when there's no readable, non-empty list."""
     try:
         data = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return True
+        return None
     invocations = data.get("invocations") if isinstance(data, dict) else None
-    if not isinstance(invocations, list) or not invocations:
+    return invocations if isinstance(invocations, list) and invocations else None
+
+
+def private_results(out: Path) -> bool:
+    """Saved runs are private unless every invocation records public machine provenance."""
+    invocations = saved_invocations(out)
+    if invocations is None:
         return True
     for invocation in invocations:
         machine = invocation.get("machine") if isinstance(invocation, dict) else None
