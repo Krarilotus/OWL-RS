@@ -394,6 +394,7 @@ async fn hold(
         frames: VecDeque::new(),
         left: 0,
         memory: Reservation::new(memory),
+        envelope: envelope.clone(),
         moved: Instant::now(),
         cut: false,
     };
@@ -459,6 +460,8 @@ struct Holding {
     frames: VecDeque<Message>,
     left: u64,
     memory: Reservation<Envelope>,
+    /// The envelope `memory` is charged to.
+    envelope: Envelope,
     /// When the client last took a frame (at first: when the answer was ready).
     moved: Instant,
     /// The client took no frame for the stall bound: the frames and their memory are gone.
@@ -466,12 +469,14 @@ struct Holding {
 }
 
 impl Holding {
-    /// Lets go of what is left: the frames and the memory they hold. An answer all sent
-    /// isn't cut: its end stays clean.
+    /// Lets go of what is left: the frames and the memory they hold, and the credit their
+    /// envelope keeps at the memory all queries share. An answer all sent isn't cut: its end
+    /// stays clean.
     fn cut(&mut self) {
         self.cut = !self.frames.is_empty();
         self.frames.clear();
         self.memory.release(self.memory.bytes());
+        self.envelope.return_credit();
     }
 }
 

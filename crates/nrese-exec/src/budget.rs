@@ -909,8 +909,10 @@ impl Budget {
 
     /// Its credit returned to the server's budget: when it ends, and at a refusal, so that
     /// near the limit a refused request holds nothing it doesn't use (it charges exactly
-    /// from then on).
-    fn return_credit(&self) {
+    /// from then on); and by a holder done with it before it ends (an answer whose client
+    /// stopped reading, kept only until its connection goes). A later charge takes a credit
+    /// anew.
+    pub fn return_credit(&self) {
         if let Some(Parent::Server(shared)) = &self.parent {
             let credit = self.credit.swap(0, Ordering::SeqCst);
             if credit > 0 {
