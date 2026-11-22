@@ -20,6 +20,8 @@ pub(crate) enum Site {
     PartnerRead,
     /// List-rule extractions started for an overdelete pass (`Rules::list_rules`).
     ListRules,
+    /// Starts of one grounding pass over list axioms.
+    ListGrounding,
     /// Morsel tasks started (`run_morsels`).
     MorselTask,
     /// Facts an expanded listing's fold takes (`batch::list`).
@@ -34,10 +36,13 @@ pub(crate) enum Site {
     OldWitnessInstance,
     /// Full materialisations started, including runs that keep only a consistency report.
     FullMaterialisation,
+    /// Length of the counter array.
+    Count,
 }
 
 thread_local! {
-    static COUNTS: [Cell<u64>; 12] = const { [const { Cell::new(0) }; 12] };
+    static COUNTS: [Cell<u64>; Site::Count as usize] =
+        const { [const { Cell::new(0) }; Site::Count as usize] };
 }
 
 /// Counts `n` units at `site` on this thread.

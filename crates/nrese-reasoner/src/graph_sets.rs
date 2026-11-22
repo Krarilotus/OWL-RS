@@ -52,7 +52,7 @@ use super::eval::{
     GroundProgram, Grounding, Job, NEVER, OperationStop, Poller, Probe, Seg, Source, Stop,
     Stopped as ReadStopped, Visit, Visits, derivations, instantiate_head, transitivity,
 };
-use super::ir::{Head, Rule, Triple};
+use super::ir::{Atom, Head, Rule, Term, Triple};
 
 /// Driver facts per parallel task.
 const MORSEL: usize = 4096;
@@ -801,6 +801,11 @@ fn support_sets_run(
 ) -> Result<HashMap<Triple, Annotation>, Stopped> {
     let fired = || run.fired();
     let all = Store::new(facts.to_vec());
+    let table = program.table.as_deref();
+    let all_facts = super::delta::TableSource {
+        source: &all,
+        table,
+    };
     // Each fact's graphs, a store read, on one poller per parallel task (sweep M16). The first
     // read a stop ended ends them all, with the run's cause.
     let initial: Vec<Option<(Triple, Annotation)>> = facts
@@ -890,6 +895,7 @@ fn support_sets_run(
     }
     // What the round doesn't change: the closure's store and the premise maps.
     let fixed = all.bytes().total()
+        + table.map_or(0, |store| store.bytes().total())
         + table_bytes::<Triple, Vec<Triple>>(bodiless_by_premise.capacity())
         + table_bytes::<Triple, Vec<usize>>(rules_by_premise.capacity())
         + bodiless_by_premise
@@ -919,7 +925,7 @@ fn support_sets_run(
         }
         let delta = Store::new(std::mem::take(&mut changed));
         let source = Changed {
-            all: &all,
+            all: &all_facts,
             changed: &delta,
         };
         // Every instance with a premise among the changed facts, with every premise's
@@ -1104,6 +1110,9 @@ fn support_sets_run(
         }
         run.check(held(&sets, annotations))?;
     }
+    if table.is_some() {
+        sets.retain(|fact, _| !super::lists::internal(fact[1]));
+    }
     Ok(sets)
 }
 
@@ -1209,6 +1218,11 @@ pub fn derived_otherwise<S: Source + ?Sized>(
     fact: Triple,
     poll: &Poller<'_>,
 ) -> Result<bool, ReadStopped> {
+    let all = super::delta::TableSource {
+        source,
+        table: program.table.as_deref(),
+    };
+    let source = &all;
     if poll.attempt(1) {
         return Err(ReadStopped);
     }
@@ -1444,6 +1458,33 @@ fn body_rules(program: &GroundProgram) -> Vec<(std::borrow::Cow<'_, Rule>, Groun
         .collect()
 }
 
+/// What the rules of `rules` with a private premise conclude: each conclusion's predicate,
+/// with its object where that is a constant. `None` when one has a variable predicate.
+fn table_conclusions(rules: &[(&Rule, Grounding)]) -> Option<HashSet<(u64, Option<u64>)>> {
+    let private =
+        |Atom(terms): &Atom| matches!(terms[1], Term::Const(p) if super::lists::internal(p));
+    let mut concluded = HashSet::new();
+    for (rule, _) in rules {
+        let Head::Facts(heads) = &rule.head else {
+            continue;
+        };
+        if !rule.body.iter().any(private) {
+            continue;
+        }
+        for Atom([_, predicate, object]) in heads {
+            let Term::Const(predicate) = *predicate else {
+                return None;
+            };
+            let object = match *object {
+                Term::Const(object) => Some(object),
+                Term::Var(_) => None,
+            };
+            concluded.insert((predicate, object));
+        }
+    }
+    Some(concluded)
+}
+
 /// `touched` and every fact of `source` a derivation of which (by `rules`) uses one of
 /// them, transitively. `None` once it reaches a fact of `schema` or passes `limit` facts.
 /// `run` sees `fixed` and what it holds after each round.
@@ -1522,8 +1563,8 @@ pub struct Change<'a, S: ?Sized> {
 /// `program` is the ground program after the change and must have been grounded on the
 /// same schema facts as the one before (the caller compares
 /// [`GroundProgram::schema_premises`]). `Ok(None)` when the change reaches a schema
-/// fact, or affects more than `change.limit` facts: then [`support_sets`] computes them
-/// all. `limits` see the working set's bytes after each round, and stop it.
+/// fact, a private fact or a conclusion of a rule over one, or affects more than
+/// `change.limit` facts: then [`support_sets`] computes them all. `limits` see the working set's bytes after each round, and stop it.
 ///
 /// The affected facts start again from their own graphs, unmarked unless those alone
 /// pass the cap (a mark is a fact of one fixpoint: kept across a change, a mark whose
@@ -1554,10 +1595,15 @@ fn update_support_sets_run<'r, S: Source + Sync + ?Sized>(
     let owned = body_rules(program);
     let rules: Vec<(&Rule, Grounding)> =
         owned.iter().map(|(rule, g)| (rule.as_ref(), *g)).collect();
-    // The affected facts: the touched ones and what follows from them.
+    // The affected facts: the touched ones and what follows from them, through the
+    // private table too.
     let fixed = table_bytes::<Triple, ()>(schema.capacity());
+    let source = super::delta::TableSource {
+        source: change.source,
+        table: program.table.as_deref(),
+    };
     let Some(affected) = forward_cone(
-        change.source,
+        &source,
         &rules,
         &schema,
         change.touched,
@@ -1568,6 +1614,22 @@ fn update_support_sets_run<'r, S: Source + Sync + ?Sized>(
     else {
         return Ok(None);
     };
+    // Private facts' sets are made within a full pass and left out of its result. So the
+    // update serves only where no private fact is affected and no affected fact is the
+    // conclusion of a rule over one: then every derivation it follows is over public
+    // facts, and a private fact's support is unchanged.
+    if program.table.is_some() {
+        let Some(concluded) = table_conclusions(&rules) else {
+            return Ok(None);
+        };
+        if affected.iter().any(|&[_, p, o]| {
+            super::lists::internal(p)
+                || concluded.contains(&(p, None))
+                || concluded.contains(&(p, Some(o)))
+        }) {
+            return Ok(None);
+        }
+    }
     // The sequential stages' poller: the members' probes, their graphs, the schema sets,
     // the merges (store reads, sweep M14); each stage's check comes before its output is
     // used.

@@ -183,9 +183,79 @@ pub struct ListIndex {
     /// Each member's list numbers, sorted.
     lists: std::collections::HashMap<u64, Vec<u32>>,
     count: u32,
+    graphs: Vec<std::sync::Arc<ListPairs>>,
+}
+
+/// Positive-length reachability between accepting cell positions. Members
+/// of one cell can meet only if a rest path returns to that cell.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ListPairs {
+    positions: std::collections::BTreeMap<u64, Vec<usize>>,
+    rows: Vec<Vec<u64>>,
+}
+
+impl ListPairs {
+    pub(crate) fn new(
+        edges: &[Vec<usize>],
+        members: impl Iterator<Item = (u64, usize)>,
+        stop: impl Fn() -> bool,
+    ) -> Option<Self> {
+        let mut positions = std::collections::BTreeMap::<_, Vec<_>>::new();
+        for (member, cell) in members {
+            if stop() {
+                return None;
+            }
+            positions.entry(member).or_default().push(cell);
+        }
+        let mut rows = Vec::with_capacity(edges.len());
+        let mut pending = Vec::new();
+        for rests in edges {
+            if stop() {
+                return None;
+            }
+            let mut row = vec![0; edges.len().div_ceil(64)];
+            pending.extend(rests.iter().copied());
+            while let Some(next) = pending.pop() {
+                if stop() {
+                    return None;
+                }
+                let word = &mut row[next / 64];
+                let bit = 1 << (next % 64);
+                if *word & bit == 0 {
+                    *word |= bit;
+                    pending.extend(edges[next].iter().copied());
+                }
+            }
+            rows.push(row);
+        }
+        Some(Self { positions, rows })
+    }
+
+    fn reaches(&self, from: usize, to: usize) -> bool {
+        self.rows[from][to / 64] & (1 << (to % 64)) != 0
+    }
+
+    fn together(&self, a: u64, b: u64) -> bool {
+        let (Some(a), Some(b)) = (self.positions.get(&a), self.positions.get(&b)) else {
+            return false;
+        };
+        a.iter()
+            .any(|&x| b.iter().any(|&y| self.reaches(x, y) || self.reaches(y, x)))
+    }
+
+    pub(crate) fn repeated(&self) -> impl Iterator<Item = u64> + '_ {
+        self.positions
+            .keys()
+            .copied()
+            .filter(|&member| self.together(member, member))
+    }
 }
 
 impl ListIndex {
+    pub(crate) fn add_graph(&mut self, graph: std::sync::Arc<ListPairs>) {
+        self.graphs.push(graph);
+    }
+
     /// Adds a list of `members`.
     pub fn add(&mut self, members: &[u64]) {
         let list = self.count;
@@ -200,6 +270,10 @@ impl ListIndex {
 
     /// Whether `a` and `b` are members of one list.
     pub fn together(&self, a: u64, b: u64) -> bool {
+        self.share_walk(a, b) || self.graphs.iter().any(|graph| graph.together(a, b))
+    }
+
+    fn share_walk(&self, a: u64, b: u64) -> bool {
         let (Some(x), Some(y)) = (self.lists.get(&a), self.lists.get(&b)) else {
             return false;
         };
@@ -215,7 +289,7 @@ impl ListIndex {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.count == 0
+        self.count == 0 && self.graphs.is_empty()
     }
 }
 
@@ -235,7 +309,7 @@ impl SharedListIndex {
         let mut members: Vec<(&u64, &Vec<u32>)> = index.lists.iter().collect();
         members.sort_unstable();
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        (index.count, members).hash(&mut hasher);
+        (index.count, members, &index.graphs).hash(&mut hasher);
         Self {
             fingerprint: hasher.finish(),
             index: std::sync::Arc::new(index),

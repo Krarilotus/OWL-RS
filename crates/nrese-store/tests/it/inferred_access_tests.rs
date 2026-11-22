@@ -1434,3 +1434,81 @@ fn updated_sets_equal_fresh_ones_across_commits() {
     assert!(statistics.patched >= 10, "{statistics:?}");
     assert!(statistics.computed >= 2, "{statistics:?}");
 }
+
+/// A cyclic chain has a private table (OWL 2 RL Table 5 prp-spo2 over each cell). An
+/// ordinary commit that reaches neither the table nor a chain's conclusion leaves the
+/// chain's support as it was: the warm reader's next read updates the sets, as it does
+/// without a table, and sees what a store forced to compute them sees.
+#[test]
+fn an_ordinary_commit_beside_a_private_table_updates_the_sets() {
+    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    use nrese_store::{MutationCommand, MutationPipeline, MutationTicket, Requester};
+    let pipeline = || {
+        MutationPipeline::new(
+            Arc::new(StoreService::new(in_memory_store_config()).unwrap()),
+            Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+                ReasoningMode::Owl2Rl,
+            ))),
+        )
+    };
+    let (updating, fresh) = (pipeline(), pipeline());
+    let apply = |pipeline: &MutationPipeline, update: &str| {
+        pipeline
+            .apply(
+                MutationCommand::Update(SparqlUpdateRequest::new(format!(
+                    "PREFIX ex: <{EX}> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+                     PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+                     PREFIX owl: <http://www.w3.org/2002/07/owl#> {update}"
+                ))),
+                &Requester::all(),
+                &MutationTicket::new(),
+            )
+            .unwrap();
+    };
+    let commits = [
+        "INSERT DATA { ex:out owl:propertyChainAxiom ex:h .
+                       ex:h rdf:first ex:p . ex:h rdf:rest ex:t .
+                       ex:t rdf:first ex:q . ex:t rdf:rest ex:h . ex:t rdf:rest rdf:nil .
+                       ex:C rdfs:subClassOf ex:D .
+                       GRAPH ex:open { ex:a ex:p ex:b . ex:b ex:q ex:c . ex:e ex:q ex:f }
+                       GRAPH ex:secret { ex:d ex:p ex:e } }",
+        "INSERT DATA { GRAPH ex:open { ex:w0 a ex:C } }",
+    ];
+    let narrow = reader(true);
+    let seen = |pipeline: &MutationPipeline| -> Vec<String> {
+        let mut seen: Vec<String> = select(
+            pipeline.store(),
+            &narrow,
+            "SELECT ?s ?o WHERE { ?s ex:out ?o }",
+        )
+        .lines()
+        .filter(|line| line.contains("example.com"))
+        .map(str::to_owned)
+        .collect();
+        seen.extend(classes(pipeline.store(), &narrow, "w0"));
+        seen
+    };
+    apply(&updating, commits[0]);
+    apply(&fresh, commits[0]);
+    // Warm the reader's sets.
+    let warm = seen(&updating);
+    assert!(warm.iter().any(|line| line.contains("/a")), "{warm:?}");
+    let before = updating.store().support_statistics();
+    apply(&updating, commits[1]);
+    apply(&fresh, commits[1]);
+    fresh
+        .store()
+        .use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
+    let expected = seen(&fresh);
+    assert_eq!(seen(&updating), expected);
+    assert!(expected.contains(&"<D>".to_owned()), "{expected:?}");
+    let after = updating.store().support_statistics();
+    assert_eq!(
+        (
+            after.computed - before.computed,
+            after.updated - before.updated
+        ),
+        (0, 1),
+        "{before:?} -> {after:?}"
+    );
+}

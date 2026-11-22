@@ -76,7 +76,7 @@ pub fn steps(case: &Case) -> Vec<Step> {
                     .cloned(),
             );
             let model = oracle::evaluate(&asserted, Datatypes::Standard);
-            if !model.inconsistent {
+            if !model.inconsistent || write.past_gates {
                 committed = asserted.clone();
                 ordered = candidate.clone();
             }
@@ -259,9 +259,12 @@ fn run<'a>(case: &'a Case, steps: &[Step], focus: Option<&'a Difference>) -> Com
             for (index, ((write, step), expected)) in
                 case.writes.iter().zip(steps).zip(&projected).enumerate()
             {
-                let accepted = judges::apply(&pipeline, write);
+                let accepted = match write.past_gates {
+                    true => judges::load_past_gates(&store, write),
+                    false => judges::apply(&pipeline, write),
+                };
                 let wanted = !step.model.inconsistent;
-                let visible = if accepted {
+                let visible = if accepted || write.past_gates {
                     (step, expected)
                 } else {
                     committed
@@ -288,7 +291,7 @@ fn run<'a>(case: &'a Case, steps: &[Step], focus: Option<&'a Difference>) -> Com
                         );
                     }
                 }
-                if wanted {
+                if wanted || write.past_gates {
                     committed = (step, expected);
                 }
             }
