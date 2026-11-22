@@ -116,6 +116,14 @@ const MEMBERS: [(&str, &str, &str, &str); 8] = [
 const RDF: &str = "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> ";
 
 fn closure(data: &str, ruleset: Ruleset, ql: QlRewritingMode) -> StoreService {
+    let store = loaded(data, ql);
+    store.rematerialise(ruleset).unwrap();
+    store
+}
+
+/// A store with `data` bulk-loaded and nothing reasoned over it, as `print-query --schema`
+/// loads its schema files.
+fn loaded(data: &str, ql: QlRewritingMode) -> StoreService {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("case.ttl");
     let prefixes = PREFIXES.replace("PREFIX", "@prefix").replace("> ", "> . ");
@@ -133,7 +141,6 @@ fn closure(data: &str, ruleset: Ruleset, ql: QlRewritingMode) -> StoreService {
             invalid: Some(nrese_store::InvalidStatements::Strict),
         })
         .unwrap();
-    store.rematerialise(ruleset).unwrap();
     store
 }
 
@@ -627,7 +634,8 @@ fn only_operators_that_can_make_a_row_wrong_label_a_dl_answer_unsound() {
 /// with `dl.consistency = "off"`, whose reasons the run adds whatever path decides. Under
 /// `owl2-rl` with the rewriting also the store's own conditions, whatever the route: rules
 /// that equated two literals (read through a property that holds one), and an import no
-/// loaded ontology answers.
+/// loaded ontology answers; that import printed for too over schema files loaded as
+/// `print-query --schema` loads them, with no rematerialisation and so no certificate.
 #[test]
 fn every_place_gives_a_query_the_answers_status() {
     use nrese_sparql::Completeness;
@@ -790,6 +798,36 @@ fn every_place_gives_a_query_the_answers_status() {
     // What print can't print carries no status: `owl:Thing` is of the schema vocabulary.
     if !matches!(printed, Ok(Printed::NotExpressible(_))) {
         wrong.push(format!("print-query of owl:Thing: {printed:?}"));
+    }
+    // `print-query --schema` prints over the schema files loaded alone, which nothing reasons
+    // over, so no certificate: an import no loaded ontology answers is told there too.
+    let schema = loaded(
+        &format!("{DATA} :o a owl:Ontology ; owl:imports <http://example.com/missing> ."),
+        QlRewritingMode::Auto,
+    );
+    let mut printed = 0;
+    for (query, _) in reads {
+        let text = format!("{PREFIXES}{RDF}{query}");
+        if let Ok(Printed::Query { completeness, .. }) = schema.print_query(&text, PrintForm::Paths)
+        {
+            printed += 1;
+            let reasons: Vec<&str> = completeness
+                .reasons
+                .iter()
+                .map(|r| r.text.as_str())
+                .collect();
+            if completeness.complete
+                || !reasons
+                    .iter()
+                    .any(|r| r.contains("no ontology with that IRI"))
+            {
+                let word = completeness.as_str();
+                wrong.push(format!("print-query --schema: {query}: {word} {reasons:?}"));
+            }
+        }
+    }
+    if printed == 0 {
+        wrong.push("setup: print-query --schema printed no read".to_owned());
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
