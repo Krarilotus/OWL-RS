@@ -1070,6 +1070,42 @@ mod tests {
         );
     }
 
+    /// Over HTTP/1.0, the first frame's stall bound starts when the answer is ready, not when
+    /// the hold began: a read that is ready just before its first deadline leaves its client
+    /// the whole bound for the first frame, not what is left of the deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_answers_first_send_window_starts_when_it_is_ready() {
+        let bound = Duration::from_secs(2);
+        let response = WHOLE
+            .scope(
+                true,
+                stream_blocking(
+                    Pace::stalled_after(bound),
+                    CancellationToken::new(),
+                    Envelope::unlimited,
+                    "text/plain",
+                    "timeout",
+                    move |writer| {
+                        // Ready at four fifths of the first deadline.
+                        std::thread::sleep(bound * 4 / 5);
+                        io::Write::write_all(writer, &vec![b'x'; 2 * CHUNK_BYTES])
+                            .map_err(|error| ApiError::internal(error.to_string()))
+                    },
+                ),
+            )
+            .await
+            .expect("ready before its first deadline");
+        // The client takes its first frame half the bound after the answer is ready: past
+        // the bound from the hold's start, well within it from the answer's readiness.
+        tokio::time::sleep(bound / 2).await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        assert_eq!(
+            body.expect("the first frame is taken within its window")
+                .len(),
+            2 * CHUNK_BYTES
+        );
+    }
+
     /// Over HTTP/1.0, a client that takes part of a held answer and then stops reading,
     /// without leaving, keeps none of it once the stall bound has passed: what was held goes
     /// back, to its envelope and to the memory all queries share (the envelope's credit there
