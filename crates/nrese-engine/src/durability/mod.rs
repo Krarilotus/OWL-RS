@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
 
-use crate::engine::{Stack, Version};
+use crate::engine::{Stack, Version, VersionData, Watch};
 use crate::error::{EngineError, EngineResult};
 use crate::index::compaction::merge_runs;
 use crate::index::{CompactionPolicy, IndexVersion, Layout};
@@ -296,7 +296,7 @@ impl Durable {
                         ),
                     ),
                 };
-                Version {
+                let data = VersionData {
                     content: crate::engine::Content::fresh(),
                     // A recovery: replay below changes this version's asserted stack in place.
                     asserted_content: crate::engine::AssertedIdentity::fresh(),
@@ -316,7 +316,8 @@ impl Durable {
                     certificate: None,
                     canonical: Default::default(),
                     own: Default::default(),
-                }
+                };
+                Version::new(Watch::unwatched(), data)
             }
             None => Version::empty(),
         };

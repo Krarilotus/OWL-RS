@@ -46,11 +46,14 @@ mod speculative_tests;
 pub(crate) mod spill;
 mod statistics;
 mod transaction;
+mod watched;
+#[cfg(test)]
+mod watched_tests;
 mod writer;
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, OnceLock, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -78,6 +81,8 @@ pub use snapshot::{
     SnapshotIdentity, TextScope,
 };
 pub use transaction::{CommitSummary, Transaction};
+pub use watched::WatchedRef;
+pub(crate) use watched::{Version, Watch};
 pub use writer::{CommitNote, CommitPublication, Finished, NoteError, WriterHeld};
 
 /// `slot` (the writer or checkpoint slot, `name`d), taken if free; otherwise waited for off
@@ -235,11 +240,9 @@ impl CommitRecord {
     }
 }
 
-/// One committed state of the dataset. Immutable; shared by snapshots via `Arc`.
-///
-/// Invariant: no quad is visible in both stacks. Transactions enforce it at commit.
+/// The stacks and metadata passed to the version constructor.
 #[derive(Debug)]
-pub(crate) struct Version {
+pub(crate) struct VersionData {
     pub(crate) asserted: IndexVersion,
     pub(crate) inferred: IndexVersion,
     pub(crate) revision: u64,
@@ -267,9 +270,7 @@ pub(crate) struct Version {
     /// What its asserted statements are ([`AssertedIdentity`]): new wherever the asserted
     /// stack is built or changed (a commit with asserted changes, a bulk publication,
     /// recovery and open, a transaction's pending state), kept wherever only the inferred
-    /// stack, the layout or the view changes. No default: each construction chooses, and
-    /// `Engine::build`'s `..version` is the only copy by spread (its version is recovery's
-    /// or the empty one).
+    /// stack, the layout or the view changes. Each construction chooses.
     pub(crate) asserted_content: AssertedIdentity,
     /// What canonical reads of it read, once asked for ([`equality::CanonicalCache`]).
     pub(crate) canonical: equality::CanonicalCache,
@@ -332,7 +333,7 @@ impl Content {
 impl Version {
     /// The empty revision 0.
     pub(crate) fn empty() -> Self {
-        Self {
+        let data = VersionData {
             asserted: IndexVersion::empty(Layout::DefaultGraph),
             inferred: IndexVersion::empty(Layout::DefaultGraph),
             revision: 0,
@@ -346,7 +347,8 @@ impl Version {
             canonical: Default::default(),
             own: Default::default(),
             certificate: None,
-        }
+        };
+        Self::new(Watch::unwatched(), data)
     }
 
     pub(crate) fn stack(&self, stack: Stack) -> &IndexVersion {
@@ -363,14 +365,17 @@ impl Version {
         }
     }
 
-    /// This version with the time `committed_micros` (a bulk publication, stamped as it
-    /// commits).
-    pub(crate) fn with_time(&self, committed_micros: Option<u64>) -> Self {
-        Self {
-            asserted: self.asserted.clone(),
-            inferred: self.inferred.clone(),
+    /// Data for another version of the same statements. Its read-side caches start empty.
+    fn copy_data(&self) -> VersionData {
+        self.data_with_stacks(self.asserted.clone(), self.inferred.clone())
+    }
+
+    fn data_with_stacks(&self, asserted: IndexVersion, inferred: IndexVersion) -> VersionData {
+        VersionData {
+            asserted,
+            inferred,
             revision: self.revision,
-            committed_micros,
+            committed_micros: self.committed_micros,
             dictionary_len: self.dictionary_len,
             equality: Arc::clone(&self.equality),
             reading: self.reading,
@@ -383,22 +388,8 @@ impl Version {
     }
 
     fn with_stack(&self, stack: Stack, index: IndexVersion) -> Self {
-        let mut next = Self {
-            asserted: self.asserted.clone(),
-            inferred: self.inferred.clone(),
-            revision: self.revision,
-            committed_micros: self.committed_micros,
-            dictionary_len: self.dictionary_len,
-            equality: Arc::clone(&self.equality),
-            reading: self.reading,
-            // Only compaction replaces a stack this way: the same statements.
-            content: self.content,
-            asserted_content: self.asserted_content,
-            // A canonical view of the old runs would hold them: made afresh.
-            canonical: Default::default(),
-            own: Default::default(),
-            certificate: self.certificate.clone(),
-        };
+        // Compaction replaces only the layout of the same statements.
+        let mut next = Self::new(Watch::Keep(self), self.copy_data());
         *next.stack_mut(stack) = index;
         next
     }
@@ -569,6 +560,7 @@ struct Shared {
     dictionary: Arc<Dictionary>,
     statistics: Arc<statistics::Statistics>,
     versions: Versions,
+    watched_graph: OnceLock<watched::WatchedGraph>,
     durable: Option<Durable>,
     wants_compaction: AtomicBool,
     wants_checkpoint: AtomicBool,
@@ -637,10 +629,13 @@ impl Shared {
         let current = self.versions.load();
         let at = |c: &Option<Certificate>| c.as_ref().map(|c| Arc::as_ptr(c).cast::<()>());
         if current.reading != reading || at(&current.certificate) != at(&certificate) {
-            self.versions.publish(|current| Version {
-                reading,
-                certificate,
-                ..current.with_time(current.committed_micros)
+            self.versions.publish(|current| {
+                let data = VersionData {
+                    reading,
+                    certificate,
+                    ..current.copy_data()
+                };
+                Version::new(Watch::Keep(current), data)
             });
         }
     }
@@ -717,21 +712,11 @@ impl Shared {
                     Some(runs) => current.stack(stack).with_base(runs, mapped),
                     None => current.stack(stack).clone(),
                 };
-                Version {
-                    asserted: index(Stack::Asserted, &asserted),
-                    inferred: index(Stack::Inferred, &inferred),
-                    revision: current.revision,
-                    committed_micros: current.committed_micros,
-                    dictionary_len: current.dictionary_len,
-                    equality: Arc::clone(&current.equality),
-                    reading: current.reading,
-                    content: current.content,
-                    // A checkpoint mapped: the same statements.
-                    asserted_content: current.asserted_content,
-                    canonical: Default::default(),
-                    own: Default::default(),
-                    certificate: current.certificate.clone(),
-                }
+                let data = current.data_with_stacks(
+                    index(Stack::Asserted, &asserted),
+                    index(Stack::Inferred, &inferred),
+                );
+                Version::new(Watch::Keep(current), data)
             });
         }
         drop(written);
@@ -1087,16 +1072,14 @@ impl Engine {
         config: EngineConfig,
         dictionary: Arc<Dictionary>,
         durable: Option<Durable>,
-        version: Version,
+        mut version: Version,
         clock: u64,
     ) -> EngineResult<Self> {
-        let version = Version {
-            dictionary_len: dictionary.len(),
-            ..version
-        };
+        version.dictionary_len = dictionary.len();
         let shared = Arc::new(Shared {
             dictionary,
             statistics: Arc::new(statistics::Statistics::for_engine()),
+            watched_graph: OnceLock::new(),
             versions: Versions {
                 current: RwLock::new(Arc::new(version)),
                 compaction_slot: Mutex::new(()),
