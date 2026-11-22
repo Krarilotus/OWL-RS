@@ -624,15 +624,16 @@ fn reserved_roles(terms: &dyn Terms, t: Term) -> [bool; 2] {
 /// the repeat's own, `model::Disjoint::axioms`), and leaves them all out where one names any:
 /// left out one by one, the repeat's axiom alone (`ex:a` different from itself) would stay,
 /// a part of a statement read where the rest is not.
+/// `walk` is the reader's, kept across its statements.
 pub(crate) fn reserved_in(
     classes: &Interner<ClassExpr>,
     axioms: &[Axiom],
     terms: &dyn Terms,
+    walk: &mut Walk,
 ) -> Vec<Term> {
-    let mut walk = Walk::new(0);
     let mut found = Vec::new();
     for axiom in axioms {
-        let (names, individuals) = entities_of(classes, axiom, &mut walk);
+        let (names, individuals) = entities_of(classes, axiom, walk);
         let roles =
             (names.iter().map(|&t| (t, false))).chain(individuals.iter().map(|&t| (t, true)));
         for (term, individual) in roles {
@@ -644,11 +645,29 @@ pub(crate) fn reserved_in(
     found
 }
 
+/// Reports each reserved name a nominal or a `hasValue` puts where an individual goes, which
+/// the reader read no axiom of, once: an expression stays interned where the axiom using it is
+/// left out, or the structure around it rejected after it was read (a disjoint union of one
+/// class), and [`Ontology::named_individuals`], which the DL engines realise, leaves out what
+/// is reported so.
+pub(crate) fn report_reserved_in_expressions(ontology: &mut Ontology, terms: &dyn Terms) {
+    let mut met: HashSet<Term> = (ontology.diagnostics.iter())
+        .filter_map(|d| match *d {
+            Diagnostic::Reserved { term } => Some(term),
+            _ => None,
+        })
+        .collect();
+    let found: Vec<Term> = crate::mapping::in_expressions(ontology)
+        .filter(|&t| reserved_roles(terms, t)[1] && met.insert(t))
+        .collect();
+    (ontology.diagnostics).extend(found.into_iter().map(|term| Diagnostic::Reserved { term }));
+}
+
 /// [`entities_of`]'s lists, kept from one axiom to the next so that the walk over every
 /// axiom allocates nothing per axiom: the classes and properties found, the individuals found,
 /// the expressions left to visit, and per expression the round of the axiom that last visited
 /// it.
-struct Walk {
+pub(crate) struct Walk {
     names: Vec<Term>,
     individuals: Vec<Term>,
     stack: Vec<u32>,
@@ -658,7 +677,7 @@ struct Walk {
 
 impl Walk {
     /// A walk over an ontology of `expressions` class expressions.
-    fn new(expressions: usize) -> Self {
+    pub(crate) fn new(expressions: usize) -> Self {
         Self {
             names: Vec::new(),
             individuals: Vec::new(),

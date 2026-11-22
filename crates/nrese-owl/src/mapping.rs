@@ -292,6 +292,7 @@ impl ClassExpressionMarkers {
 /// individuals, and the diagnostics of OWL 2 DL's global restrictions.
 pub(crate) fn complete(ontology: &mut Ontology, terms: &dyn Terms) {
     crate::diagnostics::leave_out_reserved(ontology, terms);
+    crate::diagnostics::report_reserved_in_expressions(ontology, terms);
     ontology.data = data_terms(ontology, terms);
     // Wherever a blank node stands for an individual, it is an anonymous one.
     ontology.anonymous = (ontology.axioms.iter())
@@ -478,6 +479,8 @@ struct Reader<'a> {
     axioms: BTreeMap<Axiom, Vec<Source>>,
     diagnostics: Vec<Diagnostic>,
     reported: HashSet<([Term; 3], &'static str)>,
+    /// The reserved-name walk over a repeated disjointness's axioms, kept across them.
+    walk: crate::diagnostics::Walk,
     annotations: usize,
     noncanonical_cardinality: Option<Term>,
     empty_list: Option<Term>,
@@ -684,6 +687,7 @@ impl<'a> Reader<'a> {
             axioms: BTreeMap::new(),
             diagnostics: Vec::new(),
             reported: HashSet::new(),
+            walk: crate::diagnostics::Walk::new(0),
             annotations: 0,
             noncanonical_cardinality: None,
             empty_list: None,
@@ -1519,7 +1523,8 @@ impl<'a> Reader<'a> {
         let (axioms, repeated) = d.axioms(&mut self.classes, &mut self.ranges);
         if repeated {
             self.report(Diagnostic::RepeatedOperand);
-            let reserved = crate::diagnostics::reserved_in(&self.classes, &axioms, self.terms);
+            let reserved =
+                crate::diagnostics::reserved_in(&self.classes, &axioms, self.terms, &mut self.walk);
             if !reserved.is_empty() {
                 for term in reserved {
                     self.report(Diagnostic::Reserved { term });

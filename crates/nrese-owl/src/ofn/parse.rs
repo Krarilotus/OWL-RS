@@ -46,6 +46,8 @@ pub(super) struct Parser<'t, 'm> {
     full: HashMap<&'t str, (Term, Special)>,
     short: HashMap<&'t str, (Term, Special)>,
     blanks: HashMap<&'t str, Term>,
+    /// The reserved-name walk over a repeated disjointness's axioms, kept across them.
+    walk: crate::diagnostics::Walk,
 }
 
 fn fail<T>(at: usize, what: &'static str) -> R<T> {
@@ -100,6 +102,7 @@ impl<'t, 'm> Parser<'t, 'm> {
             full: HashMap::new(),
             short: HashMap::new(),
             blanks: HashMap::new(),
+            walk: crate::diagnostics::Walk::new(0),
         }
     }
 
@@ -773,7 +776,12 @@ impl<'t, 'm> Parser<'t, 'm> {
         if repeated {
             self.model.diagnostics.push(Diagnostic::RepeatedOperand);
             let terms: &dyn crate::mapping::Terms = &*self.terms;
-            let reserved = crate::diagnostics::reserved_in(&self.model.classes, &axioms, terms);
+            let reserved = crate::diagnostics::reserved_in(
+                &self.model.classes,
+                &axioms,
+                terms,
+                &mut self.walk,
+            );
             if !reserved.is_empty() {
                 for term in reserved {
                     let d = Diagnostic::Reserved { term };
