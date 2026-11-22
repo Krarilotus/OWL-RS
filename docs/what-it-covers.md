@@ -29,6 +29,41 @@ reason, beside its runner.
 | [GeoSPARQL 1.1](https://docs.ogc.org/is/22-047r1/22-047r1.html) | In part: functions and relations over WKT, GeoJSON and simple GML | 194 of the 212 compliance tests, [18 disputed with the reference](../crates/nrese-sparql/tests/geosparql_compliance/disputed.txt) ([runner](../crates/nrese-sparql/tests/geosparql_compliance)) |
 | [RDF4J REST protocol](https://rdf4j.org/documentation/reference/rest-api/) | Served at `/repositories/…`, so RDF4J clients and tools connect | Our own ([protocol](../crates/nrese-server/tests/it/rdf4j_protocol_tests.rs), [clients](../crates/nrese-server/tests/it/client_compat_tests.rs)) |
 
+### Implementation reports
+
+The SPARQL suites and the RDF 1.2 syntax suites also write W3C implementation reports: one
+[EARL](https://www.w3.org/TR/EARL10-Schema/) file in Turtle per suite. To write them, run this from a
+clean clone, with git, a network connection and the Rust toolchain named in `rust-toolchain.toml`:
+
+```sh
+bash scripts/w3c-reports.sh
+```
+
+It fetches the suites at the `w3c/rdf-tests` commit pinned in `scripts/fetch-w3c-tests.sh`, runs the
+two runners, and writes into `w3c-reports/`:
+- `sparql11.ttl` and `sparql12.ttl`, from the [SPARQL runner](../crates/nrese-sparql/tests/w3c_sparql11),
+  with its text reports beside them;
+- `rdf12-n-triples.ttl`, `rdf12-n-quads.ttl`, `rdf12-turtle.ttl`, `rdf12-trig.ttl` and `rdf12-xml.ttl`,
+  from the [RDF syntax runner](../crates/rdf/nrese-rdf-io/tests/w3c_rdf).
+
+It refuses a tree with changes or untracked files, and a `w3c-reports/` that isn't empty. The workflow
+[`w3c-reports.yml`](../.github/workflows/w3c-reports.yml) runs the same script on GitHub's machines
+when it is started at a release tag, and keeps the files with that run for 90 days.
+
+Reading a report:
+- It has one assertion for each test in its suite's manifests: `earl:passed`, `earl:failed` with the
+  reason from the runner's expected-failures list, or `earl:untested` with the reason the runner
+  skips it. The run writes the file; nobody edits it.
+- Its `dc:description` names the commit that ran, the `w3c/rdf-tests` commit and the counts. Two runs
+  of the same commit differ only in `dc:issued`, the time of the run.
+- At this commit, no file has a test failed or untested.
+- No report covers the SPARQL 1.1 Protocol, Graph Store Protocol, Service Description or entailment
+  tests, or RDF 1.2 Semantics: the runners don't read those manifests, so those tests aren't in the
+  files at all. The RDF 1.1 syntax suites run in the checks but write no report: the runner reads their
+  tests under other IRIs than the ones W3C's RDF 1.1 reports use.
+- A report shows the outcome of its suite's tests at that suite commit, and claims nothing beyond
+  them. The 1.2 suites are drafts and can still change.
+
 ## SPARQL
 
 | Capability | Limits and notes |
