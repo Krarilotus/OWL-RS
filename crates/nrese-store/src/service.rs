@@ -3686,18 +3686,17 @@ mod marker_tests {
             .unwrap();
         store.rematerialise(Ruleset::Owl2Rl).unwrap();
         store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
+        // The read's word and its reasons' texts ("none" without a status).
         let word = |store: &StoreService| {
             let read = "SELECT ?o { <http://example.com/a> <http://example.com/p> ?o }";
             let status = store.execute_query_str(read).unwrap().completeness;
-            status.map_or("none".to_owned(), |s| {
-                format!("{} {:?}", s.as_str(), s.reasons)
+            status.map_or(("none".to_owned(), Vec::new()), |s| {
+                let reasons = s.reasons.iter().map(|r| r.text.clone()).collect();
+                (s.as_str().to_owned(), reasons)
             })
         };
-        let rebuilt = word(&store);
-        assert!(
-            rebuilt.starts_with("complete "),
-            "the setup, rebuilt: {rebuilt}"
-        );
+        let (rebuilt, reasons) = word(&store);
+        assert_eq!(rebuilt, "complete", "the setup, rebuilt: {reasons:?}");
         // The trace of an open whose read of the marker failed: no state kept in memory.
         *store.materialised.lock().unwrap() = None;
         let read = store.reasoning_state().expect("the marker is on disk");
@@ -3706,10 +3705,17 @@ mod marker_tests {
             "the state read from the marker: {read:?}"
         );
         store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
-        let certified = word(&store);
+        // Certified, so `sound-only` (the closure alone), not `not-certified` or none.
+        let (certified, reasons) = word(&store);
+        assert_eq!(
+            certified, "sound-only",
+            "under the certificate made from the marker: {reasons:?}"
+        );
         assert!(
-            !certified.starts_with("complete "),
-            "under the certificate made from the marker: {certified}"
+            reasons
+                .iter()
+                .any(|r| r.contains("opened without a rebuild")),
+            "under the certificate made from the marker, the reason: {reasons:?}"
         );
     }
 }
