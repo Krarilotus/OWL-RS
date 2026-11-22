@@ -66,12 +66,27 @@ impl Batch {
                 names.insert(*c);
             }
         }
+        // A key holds for named individuals only (Direct Semantics §2.3.5), and the compiled
+        // program names those of the premise. An individual only the question names is
+        // named too (§2.5): its test goes to the scalar reduction, which adds it.
+        let named = ontology
+            .axioms
+            .iter()
+            .any(|a| matches!(a, Axiom::HasKey(..)))
+            .then(|| ontology.named_individuals());
         let mut classes = Vec::new();
         let mut individuals = Vec::new();
         let mut next = u64::MAX;
         let probes = tests
             .iter()
             .map(|test| {
+                if let (Some(named), Test::Axiom(axiom)) = (&named, test)
+                    && super::individuals(axiom)
+                        .iter()
+                        .any(|t| named.binary_search(t).is_err())
+                {
+                    return None;
+                }
                 let (expr, individual) = assumption(ontology, test)?;
                 while names.contains(&next) {
                     next -= 1;
