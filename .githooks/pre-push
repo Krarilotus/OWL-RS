@@ -29,7 +29,22 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     continue
   fi
   if [[ $remote_sha =~ ^0+$ ]]; then
-    if ! base=$(git merge-base "$local_sha" "refs/remotes/$remote/refactor/engine-v2" 2> /dev/null); then
+    # From refactor/engine-v2 as the remote has it now (a copy not fetched since a rewrite would hide commits it
+    # no longer has), read with no replace ref (one could make engine-v2 seem to descend from an unpublished
+    # commit). A remote that doesn't answer within its bound is never "the same".
+    tracked=$(git rev-parse -q --verify "refs/remotes/$remote/refactor/engine-v2^{commit}")
+    advertised=$(timeout -k 5 30 git ls-remote "$url" refs/heads/refactor/engine-v2 < /dev/null | cut -f1)
+    if [ -z "$advertised" ]; then
+      echo "pre-push: $remote couldn't be asked for its refactor/engine-v2 within 30 s: no base for $remote_ref" >&2
+      code=1
+      continue
+    fi
+    if [ "$tracked" != "$advertised" ]; then
+      echo "pre-push: $remote's refactor/engine-v2 isn't what this checkout last fetched: fetch first" >&2
+      code=1
+      continue
+    fi
+    if ! base=$(GIT_NO_REPLACE_OBJECTS=1 git merge-base "$local_sha" "$advertised" 2> /dev/null); then
       echo "pre-push: $remote_ref is new on $remote, and $local_ref shares no history with" \
         "$remote/refactor/engine-v2 here: no range to gate" >&2
       code=1
