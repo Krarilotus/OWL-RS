@@ -399,6 +399,32 @@ fn a_validation_past_the_writes_memory_fails_the_write_under_any_gate() {
     assert!(!holds(&pipeline, "ex:s0 ex:p ex:o"));
 }
 
+/// Spec: a report that fits the write's envelope can still have
+/// results omitted if their refusal text cannot fit alongside it.
+#[test]
+fn the_refusal_omits_results_that_would_exceed_the_writes_memory() {
+    let pipeline = pipeline_with(StoreConfig {
+        shacl_gate: ShaclGate::Enforce(GateSeverity::Violation),
+        shacl_reject_results: None,
+        total_query_memory_bytes: 256 * 1024,
+        ..StoreConfig::in_memory()
+    });
+    let message = "x".repeat(96 * 1024);
+    load_shapes(
+        &pipeline,
+        &format!(
+            "<http://example.com/RequiresName> <http://www.w3.org/ns/shacl#targetClass> <http://example.com/Person> .
+             <http://example.com/RequiresName> <http://www.w3.org/ns/shacl#path> <http://example.com/name> .
+             <http://example.com/RequiresName> <http://www.w3.org/ns/shacl#minCount> \"1\"^^<http://www.w3.org/2001/XMLSchema#integer> .
+             <http://example.com/RequiresName> <http://www.w3.org/ns/shacl#message> \"{message}\" ."
+        ),
+    );
+    let rejected = refuse(&pipeline, "INSERT DATA { ex:ada a ex:Person }");
+    let refusal = rejected.shacl.as_ref().expect("SHACL refusal report");
+    assert_eq!((refusal.results.len(), refusal.results_omitted), (0, 1));
+    assert!(rejected.explanation.is_none());
+}
+
 /// Loads `ntriples` into the shapes graph without passing the gate (a bulk load doesn't).
 fn load_shapes(pipeline: &MutationPipeline, ntriples: &str) {
     let mut file = tempfile::Builder::new()

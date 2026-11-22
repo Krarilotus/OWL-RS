@@ -1184,7 +1184,7 @@
         },
         "reject_results": {
           "default": 10,
-          "description": "The most results and the most failures listed in a SHACL refusal (0 or unlimited: all).",
+          "description": "The count limit for each list in a SHACL refusal (0 or unlimited: no count limit). The write's memory budget also applies.",
           "minimum": 0,
           "type": [
             "integer",

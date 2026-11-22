@@ -23,12 +23,13 @@ pub(crate) struct Problem {
     detail: String,
     /// For a rejected commit (type `reasoner-reject`, `undecided-reject`, `shacl-reject` or
     /// `commit-reject`): the rule or constraint and any statements shown. For `shacl-reject`,
-    /// the first result's component and focus node, with an empty evidence list.
+    /// the first listed result's component and focus node, with an empty evidence list.
     reasoner_reject: Option<serde_json::Value>,
     /// The request's id, as in the `x-request-id` header and the server's log.
     request_id: Option<String>,
-    /// For `shacl-reject`, the refusing `results` in the validation report's JSON form, the
-    /// validation `failures`, and the counts `results_omitted` and `failures_omitted`.
+    /// For `shacl-reject`, the refusing `results` in the validation report's JSON form, with
+    /// sorted messages, the validation `failures`, and the counts `results_omitted` and
+    /// `failures_omitted` for items left out by the count or memory limit.
     shacl: Option<serde_json::Value>,
 }
 

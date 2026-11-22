@@ -88,9 +88,11 @@ Validate RDF data against SHACL shapes, natively and fast enough to run on every
     `sh:Violation`) or leaves a validation failure.
 - **Refusal:** the write reports only results that meet the gate's threshold and any
   validation failures. The count and first result in its detail use the same selection as
-  the structured report. Results are ordered by decoded terms and failures by their text.
+  the structured report. Results are ordered by decoded terms, their messages are sorted,
+  and failures are ordered by their text.
   Each list has the bound [`shacl.reject_results`](../ops/config-reference.md#shacl.reject_results)
-  and a count of omitted items. A committer with limited graph access sees the results of
+  and a count of items omitted for that bound or the write's memory budget.
+  A committer with limited graph access sees the results of
   validating its own readable assertions against the shapes it may read. If the shapes
   graph is unreadable or the shapes use SHACL-SPARQL, this validation supplies no refusal
   details to the restricted committer. See [HTTP problems](../ops/http-api.md#status-codes).

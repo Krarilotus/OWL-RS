@@ -836,7 +836,7 @@
             "type": "string"
           },
           "reasoner_reject": {
-            "description": "For a rejected commit (type `reasoner-reject`, `undecided-reject`, `shacl-reject` or\n`commit-reject`): the rule or constraint and any statements shown. For `shacl-reject`,\nthe first result's component and focus node, with an empty evidence list."
+            "description": "For a rejected commit (type `reasoner-reject`, `undecided-reject`, `shacl-reject` or\n`commit-reject`): the rule or constraint and any statements shown. For `shacl-reject`,\nthe first listed result's component and focus node, with an empty evidence list."
           },
           "request_id": {
             "description": "The request's id, as in the `x-request-id` header and the server's log.",
@@ -846,7 +846,7 @@
             ]
           },
           "shacl": {
-            "description": "For `shacl-reject`, the refusing `results` in the validation report's JSON form, the\nvalidation `failures`, and the counts `results_omitted` and `failures_omitted`."
+            "description": "For `shacl-reject`, the refusing `results` in the validation report's JSON form, with\nsorted messages, the validation `failures`, and the counts `results_omitted` and\n`failures_omitted` for items left out by the count or memory limit."
           },
           "status": {
             "format": "int32",

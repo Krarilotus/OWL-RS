@@ -298,7 +298,7 @@ Ill-formed shapes are 400, naming the shape and the parameter.
 These are its limits.
 
 - SHACL Core and SHACL-SPARQL; SHACL Advanced Features are not supported, nor is `sh:entailment` (a shapes graph that asks for an entailment regime is reported as a failure). Commits are validated where the SHACL gate is on (`shacl.gate`, off by default: [config-reference.md](config-reference.md#shacl.gate), which says when a commit is refused); bulk loads (`nrese-server load`, the import endpoints) skip the gate ([storage](../spec/02-storage-and-transactions.md#bulk-loads)).
-- An enforcing gate's [refusal](#example-a-commit-refused-by-shacl) lists the results and validation failures that caused it. The result fields use the same JSON form as this endpoint's report.
+- An enforcing gate's [refusal](#example-a-commit-refused-by-shacl) lists the results and validation failures that caused it. The result fields use the same JSON form as this endpoint's report. A refusal sorts each result's `resultMessage` entries.
 - A `POST`'s shapes live in a transaction of its own that is never committed and takes no writer slot, so other writes go on; they count against the request's memory.
 - The shapes graph is an ordinary graph: queries see it, and reasoning reads it like any other.
 
@@ -426,11 +426,13 @@ committer.
 
 - `reasoner-reject` means the data shown is inconsistent.
 - `undecided-reject` means the OWL 2 RL rules found a clash that OWL 2 DL may read as
-  consistent. The detail describes the choices.
+  consistent, which this release doesn't decide. The detail says so and gives the ways out.
 - `shacl-reject` carries the refusing results and validation failures in `shacl`.
 - `commit-reject` means the committer's own graphs show no reason for the refusal.
 
-`reasoner_reject` gives the rule or constraint and any statements shown. For
+The data shown is the whole data for a committer that may read every graph, else the
+graphs it may read. `reasoner_reject` gives the rule or constraint and any statements
+shown. The field keeps its name for every kind, so that clients that read it go on working. For
 `shacl-reject`, it gives the first result's component and focus node with empty evidence.
 See the [SHACL example](#example-a-commit-refused-by-shacl) for the refusal fields.
 
@@ -582,10 +584,12 @@ has status 400 and content type `application/problem+json`.
 
 Only results at or above the gate's severity threshold appear in the refusal or its result
 count. Their order follows the RDF terms, and failure strings are ordered by text.
-`reasoner_reject` gives the first result's constraint component and focus node with empty
-`evidence`. It is `null` when there are only failures. The
+`reasoner_reject` gives the first listed result's constraint component and focus node with
+empty `evidence`. It is `null` when no result is listed. The
 [`shacl.reject_results`](config-reference.md#shacl.reject_results) setting limits each of the
-two lists. Add each list's omitted count to its length to get its total.
+two lists. The write's memory budget can shorten them further, including at `unlimited`.
+Add each list's omitted count to its length to get its total. If encoding the refusal
+exceeds the memory budget, the write answers with the applicable memory error.
 
 A committer with limited graph access gets a report from validation of its own readable
 assertions. If it cannot read the shapes graph, or those shapes use SHACL-SPARQL, a

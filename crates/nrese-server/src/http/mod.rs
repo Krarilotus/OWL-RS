@@ -37,4 +37,4 @@ mod tell;
 pub use result_stream::MAX_BUFFERED_OUTPUT_BYTES;
 pub(crate) use result_stream::answering;
 pub(crate) use routes::router;
-pub(crate) use shacl::refusal_json;
+pub(crate) use shacl::{RefusalJson, refusal_json};

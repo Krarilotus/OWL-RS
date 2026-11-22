@@ -203,11 +203,11 @@ Set by `budgets.result_cache` (`NRESE_QUERY_CACHE_BYTES`; older key `store.query
 | <a id="shacl.shapes_graph"></a>`shacl.shapes_graph` | `NRESE_SHACL_SHAPES_GRAPH` | text: an IRI | `http://rdf4j.org/schema/rdf4j#SHACLShapeGraph` (the graph RDF4J and GraphDB use) | start | The graph whose shapes `GET /dataset/shacl` validates against ([http-api.md](http-api.md#shacl-validation)) and the gate uses |
 | <a id="shacl.gate"></a>`shacl.gate` | `NRESE_SHACL_GATE` | choice: `off`, `report`, `enforce` | `off` | start | SHACL as a commit gate (below) |
 | <a id="shacl.gate_severity"></a>`shacl.gate_severity` | `NRESE_SHACL_GATE_SEVERITY` | choice: `violation`, `warning`, `info` | `violation` | start | The least severity `enforce` rejects |
-| <a id="shacl.reject_results"></a>`shacl.reject_results` | `NRESE_SHACL_REJECT_RESULTS` | limit: count, `0` or `"unlimited"` for all | `10` | start | The most results and the most validation failures listed in a SHACL refusal |
+| <a id="shacl.reject_results"></a>`shacl.reject_results` | `NRESE_SHACL_REJECT_RESULTS` | limit: count, `0` or `"unlimited"` for no count limit | `10` | start | The most results and the most validation failures listed in a SHACL refusal |
 
 Ten results give a client room to mark problems across a form-sized write while keeping the
-error body short for a large batch. Refusals count the results and failures beyond the limit
-so the client can tell when the list is partial.
+error body short for a large batch. Refusals count the results and failures omitted because
+of the count limit or the write's memory budget so the client can tell when the list is partial.
 
 `report` validates every commit against the shapes graph and logs what it introduces; `enforce` also rejects a commit that introduces a result at or above `gate_severity`, or a validation failure, and the commit changes nothing. Only what a commit introduces counts: data that was invalid before doesn't block writes (validation at `/dataset/shacl` reports it), but for a result a new focus node reaches through a nested shape ([limits](../limits.md#shacl)). The check validates the focus nodes the commit can affect, after reasoning; a commit that changes the shapes graph is validated in full. With the gate on, a commit that leaves an uncompilable shapes graph unchanged is refused. A commit that changes the shapes graph must leave shapes that compile, even with the gate off. Repair or replace the shapes graph to restore writes. At the start, the log names each repository's gate and its shapes, and warns while a gate that is on checks nothing.
 

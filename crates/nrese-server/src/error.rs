@@ -1,8 +1,12 @@
 use std::borrow::Cow;
+use std::io;
+use std::sync::Arc;
 
 use axum::Json;
+use axum::body::Bytes;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use nrese_exec::{BudgetExceeded, ChargedVec};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -21,7 +25,7 @@ pub enum ApiError {
         kind: RejectKind,
         detail: String,
         reject: Box<Option<RejectExplanationView>>,
-        shacl: Option<Box<ShaclRefusal>>,
+        shacl: Option<Arc<ShaclRefusal>>,
     },
     #[error("unauthorized: {0}")]
     Unauthorized(String, Option<&'static str>),
@@ -88,7 +92,7 @@ impl ApiError {
             reject: Box::new(reject.explanation.as_ref().map(|explanation| {
                 crate::reject_view::reject_view(explanation, reject.attribution.as_ref())
             })),
-            shacl: reject.shacl.map(Box::new),
+            shacl: reject.shacl,
         }
     }
 
@@ -153,12 +157,27 @@ impl IntoResponse for ApiError {
         if let Self::Internal(detail) = &self {
             tracing::error!(%detail, "request failed on the server side");
         }
-        let rejected = match &self {
-            Self::Rejected { kind, shacl, .. } => {
-                Some((*kind, shacl.as_deref().map(crate::http::refusal_json)))
-            }
-            _ => None,
-        };
+        if let Self::Rejected {
+            kind,
+            detail,
+            reject,
+            shacl,
+        } = self
+        {
+            let (slug, title) = reject_label(kind);
+            let body = ProblemJson {
+                r#type: Cow::Owned(format!("https://nrese.dev/problems/{slug}")),
+                title: Cow::Borrowed(title),
+                status: StatusCode::BAD_REQUEST.as_u16(),
+                detail,
+                reasoner_reject: *reject,
+                shacl: shacl.as_deref().map(crate::http::refusal_json),
+            };
+            return match shacl.as_deref() {
+                Some(refusal) => shacl_problem(&body, refusal),
+                None => problem(StatusCode::BAD_REQUEST, &body),
+            };
+        }
         if let Self::IncompleteAnswer(answer) = self {
             return incomplete_answer(&answer);
         }
@@ -185,8 +204,8 @@ impl IntoResponse for ApiError {
             Self::Unauthorized(_, challenge) => *challenge,
             _ => None,
         };
-        let (status, detail, reasoner_reject) = match self {
-            Self::BadRequest(detail) => (StatusCode::BAD_REQUEST, detail, None),
+        let (status, detail) = match self {
+            Self::BadRequest(detail) => (StatusCode::BAD_REQUEST, detail),
             Self::BadRequestPlainText(detail) => {
                 let mut response = (StatusCode::BAD_REQUEST, detail).into_response();
                 response
@@ -195,45 +214,34 @@ impl IntoResponse for ApiError {
                 response.extensions_mut().insert(Verbatim);
                 return response;
             }
-            Self::Rejected { detail, reject, .. } => (StatusCode::BAD_REQUEST, detail, *reject),
-            Self::Unauthorized(detail, _) => (StatusCode::UNAUTHORIZED, detail, None),
-            Self::Forbidden(detail) => (StatusCode::FORBIDDEN, detail, None),
-            Self::NotFound(detail) => (StatusCode::NOT_FOUND, detail, None),
-            Self::Conflict(detail) => (StatusCode::CONFLICT, detail, None),
-            Self::IncompleteAnswer(_) | Self::Busy(_) | Self::NotImplemented(..) => {
+            Self::Unauthorized(detail, _) => (StatusCode::UNAUTHORIZED, detail),
+            Self::Forbidden(detail) => (StatusCode::FORBIDDEN, detail),
+            Self::NotFound(detail) => (StatusCode::NOT_FOUND, detail),
+            Self::Conflict(detail) => (StatusCode::CONFLICT, detail),
+            Self::Rejected { .. }
+            | Self::IncompleteAnswer(_)
+            | Self::Busy(_)
+            | Self::NotImplemented(..) => {
                 unreachable!("answered above")
             }
-            Self::Gone(detail) => (StatusCode::GONE, detail, None),
-            Self::NotAcceptable(detail) => (StatusCode::NOT_ACCEPTABLE, detail, None),
-            Self::UnsupportedMediaType(detail) => {
-                (StatusCode::UNSUPPORTED_MEDIA_TYPE, detail, None)
-            }
-            Self::PayloadTooLarge(detail) => (StatusCode::PAYLOAD_TOO_LARGE, detail, None),
-            Self::TooManyRequests(detail) => (StatusCode::TOO_MANY_REQUESTS, detail, None),
-            Self::Timeout(detail) => (StatusCode::REQUEST_TIMEOUT, detail, None),
+            Self::Gone(detail) => (StatusCode::GONE, detail),
+            Self::NotAcceptable(detail) => (StatusCode::NOT_ACCEPTABLE, detail),
+            Self::UnsupportedMediaType(detail) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, detail),
+            Self::PayloadTooLarge(detail) => (StatusCode::PAYLOAD_TOO_LARGE, detail),
+            Self::TooManyRequests(detail) => (StatusCode::TOO_MANY_REQUESTS, detail),
+            Self::Timeout(detail) => (StatusCode::REQUEST_TIMEOUT, detail),
             Self::ServiceUnavailable(detail) | Self::RightsChanged(detail) => {
-                (StatusCode::SERVICE_UNAVAILABLE, detail, None)
+                (StatusCode::SERVICE_UNAVAILABLE, detail)
             }
-            Self::Internal(detail) => (StatusCode::INTERNAL_SERVER_ERROR, detail, None),
+            Self::Internal(detail) => (StatusCode::INTERNAL_SERVER_ERROR, detail),
         };
-        let (problem_type, title, shacl) = match rejected {
-            Some((reject, shacl)) => {
-                let (slug, title) = reject_label(reject);
-                (
-                    Cow::Owned(format!("https://nrese.dev/problems/{slug}")),
-                    Cow::Borrowed(title),
-                    shacl,
-                )
-            }
-            None if rights_changed => (
+        let (problem_type, title) = if rights_changed {
+            (
                 Cow::Borrowed("https://nrese.dev/problems/rights-changed"),
                 Cow::Borrowed("Rights Changed"),
-                None,
-            ),
-            None => {
-                let (problem_type, title) = kind(status);
-                (problem_type, title, None)
-            }
+            )
+        } else {
+            kind(status)
         };
         let mut response = problem(
             status,
@@ -242,8 +250,8 @@ impl IntoResponse for ApiError {
                 title,
                 status: status.as_u16(),
                 detail,
-                reasoner_reject,
-                shacl,
+                reasoner_reject: None,
+                shacl: None,
             },
         );
         if let Some(challenge) = challenge {
@@ -350,12 +358,68 @@ pub(crate) fn kind(status: StatusCode) -> (Cow<'static, str>, Cow<'static, str>)
 /// ([`Own`]). `body` writes a JSON object with at least one member and none named
 /// `request_id`: the envelope appends the request's id after its last member, unread.
 pub(crate) fn problem(status: StatusCode, body: &impl Serialize) -> Response {
-    let mut response = (status, Json(body)).into_response();
+    problem_media((status, Json(body)).into_response())
+}
+
+fn problem_media(mut response: Response) -> Response {
     response
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(PROBLEM_JSON));
     response.extensions_mut().insert(Own);
     response
+}
+
+/// The first serialization borrows the refusal's strings, with the store's charge
+/// live. The encoded bytes carry their own charge while they are held by the response.
+fn shacl_problem(body: &ProblemJson<'_>, refusal: &ShaclRefusal) -> Response {
+    let mut encoded = ChargedJson {
+        bytes: ChargedVec::new(Arc::clone(refusal.memory())),
+        refused: None,
+    };
+    if let Err(error) = serde_json::to_writer(&mut encoded, body) {
+        let refused = encoded.refused.take();
+        drop(encoded);
+        let error = match refused {
+            Some(error) if error.unread => ApiError::unavailable(format!(
+                "{error} (budgets.total_query_memory, NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES)"
+            )),
+            Some(error) if error.shared => ApiError::unavailable(
+                "the server's query memory is in use (budgets.total_query_memory, NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES)",
+            ),
+            Some(error) => ApiError::payload_too_large(format!(
+                "{error} (budgets.query_memory, NRESE_MAX_QUERY_MEMORY_BYTES)"
+            )),
+            None => ApiError::internal(error.to_string()),
+        };
+        return error.into_response();
+    }
+    let bytes = Bytes::from_owner(encoded);
+    problem_media((StatusCode::BAD_REQUEST, bytes).into_response())
+}
+
+struct ChargedJson {
+    bytes: ChargedVec<u8>,
+    refused: Option<BudgetExceeded>,
+}
+
+impl AsRef<[u8]> for ChargedJson {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl io::Write for ChargedJson {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if let Err(error) = self.bytes.extend_from_slice(bytes) {
+            self.refused = Some(error);
+            return Err(io::Error::other("problem document memory"));
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Marks a problem document the server wrote itself ([`problem`]): the envelope layer
@@ -367,14 +431,14 @@ pub(crate) struct Own;
 pub(crate) const PROBLEM_JSON: &str = "application/problem+json";
 
 #[derive(Debug, Serialize)]
-struct ProblemJson {
+struct ProblemJson<'a> {
     r#type: Cow<'static, str>,
     title: Cow<'static, str>,
     status: u16,
     detail: String,
     reasoner_reject: Option<RejectExplanationView>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    shacl: Option<serde_json::Value>,
+    shacl: Option<crate::http::RefusalJson<'a>>,
 }
 
 #[cfg(test)]

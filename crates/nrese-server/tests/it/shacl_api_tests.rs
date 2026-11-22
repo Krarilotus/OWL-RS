@@ -26,7 +26,10 @@ const SHAPES: &str = "ex:PersonShape a sh:NodeShape ; sh:targetClass ex:Person ;
 const NAMED_SHAPE: &str = "ex:NameShape a sh:PropertyShape ; sh:targetClass ex:Person ;
     sh:path ex:name ; sh:minCount 1 ; sh:message \"Name fehlt\"@de .";
 
-fn restricted_shacl_app(read_shapes: bool) -> Result<axum::Router, Box<dyn std::error::Error>> {
+fn restricted_shacl_app(
+    read_shapes: bool,
+    reject_results: Option<usize>,
+) -> Result<axum::Router, Box<dyn std::error::Error>> {
     let shapes = if read_shapes {
         format!(", \"{SHAPES_GRAPH}\"")
     } else {
@@ -43,6 +46,7 @@ write = ["http://example.com/open"]"#
     test_app_with_store_config(
         StoreConfig {
             shacl_gate: ShaclGate::Enforce(GateSeverity::Violation),
+            shacl_reject_results: reject_results,
             ..StoreConfig::in_memory()
         },
         policy_of(&policy)?,
@@ -51,9 +55,17 @@ write = ["http://example.com/open"]"#
 }
 
 /// Spec (docs/ops/http-api.md, docs/design/shacl.md): an enforcing gate reports what the
-/// committer's own graphs show. Equal readable data gives the same refusal body.
+/// committer's own graphs show and applies the result bound to that report. Equal
+/// readable data gives the same list and omitted count.
 #[tokio::test]
 async fn a_restricted_shacl_refusal_body_depends_only_on_readable_graphs() -> TestResult {
+    for reject_results in [None, Some(1)] {
+        restricted_refusal_at_bound(reject_results).await?;
+    }
+    Ok(())
+}
+
+async fn restricted_refusal_at_bound(reject_results: Option<usize>) -> TestResult {
     let admin = format!("Bearer {}", token(&["nrese.admin"]));
     let writer = format!("Bearer {}", token(&["writer"]));
     let mut replies = Vec::new();
@@ -64,7 +76,7 @@ async fn a_restricted_shacl_refusal_body_depends_only_on_readable_graphs() -> Te
         "ex:bob ex:name \"Bob\" . ex:secretOne a ex:Candidate ; ex:note \"Name fehlt\"@de",
         "ex:ada ex:name \"Ada\" . ex:secretTwo a ex:Candidate ; ex:note \"A name is required\"",
     ] {
-        let app = restricted_shacl_app(true)?;
+        let app = restricted_shacl_app(true, reject_results)?;
         let update = "/dataset/update";
         let media = ("content-type", "application/sparql-update");
         let auth = ("authorization", admin.as_str());
@@ -113,14 +125,17 @@ async fn a_restricted_shacl_refusal_body_depends_only_on_readable_graphs() -> Te
     assert_eq!(replies[0], replies[1]);
     let (status, body) = &replies[0];
     let problem: serde_json::Value = serde_json::from_str(body)?;
+    let expected = [
+        name_result("ada", &["A name is required", "Name fehlt"]),
+        name_result("bob", &["A name is required", "Name fehlt"]),
+    ];
+    let listed = reject_results.unwrap_or(expected.len());
     assert_eq!(
         problem["shacl"]["results"],
-        serde_json::json!([
-            name_result("ada", &["A name is required", "Name fehlt"]),
-            name_result("bob", &["A name is required", "Name fehlt"]),
-        ]),
+        serde_json::json!(&expected[..listed]),
         "{body}"
     );
+    assert_eq!(problem["shacl"]["results_omitted"], expected.len() - listed);
     assert_eq!(*status, StatusCode::BAD_REQUEST);
     assert_eq!(problem["type"], "https://nrese.dev/problems/shacl-reject");
     assert!(!body.contains("secret"), "{body}");
@@ -137,7 +152,7 @@ async fn a_restricted_shacl_refusal_can_withhold_the_report() -> TestResult {
         (false, NAMED_SHAPE, "ex:bob a ex:Person"),
         (true, SPARQL_SHAPES, "ex:bob a ex:Person ; ex:name \"Bob\""),
     ] {
-        let app = restricted_shacl_app(read_shapes)?;
+        let app = restricted_shacl_app(read_shapes, None)?;
         let setup = send(
             &app,
             Method::PUT,

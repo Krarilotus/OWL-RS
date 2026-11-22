@@ -6,10 +6,13 @@
 //!
 //! [`StoreConfig::shapes_graph`]: crate::StoreConfig::shapes_graph
 
-use std::collections::BinaryHeap;
+use std::cmp::Ordering;
+use std::fmt::{self, Write as _};
+use std::sync::Arc;
 
 use nrese_engine::{EncodedQuad, GraphSelector, ReadModel, Snapshot, TermId, Transaction};
 use nrese_exec::stop::StopSource;
+use nrese_exec::{Budget, ChargedVec, Envelope, Reservation};
 use nrese_rdf::{GraphName, NamedNode, NamedNodeRef, Term};
 use nrese_shacl::{
     PropertyPath, Selection, ShapeError, Shapes, ValidationReport, ValidationResult, compile,
@@ -18,7 +21,9 @@ use nrese_shacl::{
 use nrese_sparql::{CancellationToken, QueryEvaluationError, ReadView, Resources};
 
 use crate::error::{StoreError, StoreResult};
-use crate::mutation::evidence::{Draft, EvidenceView, in_readable_graphs};
+use crate::mutation::evidence::{
+    Draft, EvidenceView, READABLE_REASON_FRAMING_BYTES, in_readable_graphs,
+};
 use crate::mutation::{MutationState, MutationTicket};
 use crate::query::GraphResultFormat;
 use crate::rdf_io::{BlankNodes, each_graph_quad, serialize_triples};
@@ -126,14 +131,24 @@ pub struct ShaclResultText {
 }
 
 /// The results and validation failures shown to the committer of a refused write.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct ShaclRefusal {
     pub results: Vec<ShaclResultText>,
-    /// Refusing results beyond the list's limit.
+    /// Refusing results left out by the count or memory limit.
     pub results_omitted: usize,
     pub failures: Vec<String>,
-    /// Validation failures beyond the list's limit.
+    /// Validation failures left out by the count or memory limit.
     pub failures_omitted: usize,
+    memory: Arc<Budget>,
+    // Drop the text and vectors before giving their space back.
+    _held: (Reservation, Reservation, Reservation),
+}
+
+impl ShaclRefusal {
+    /// The write's budget for preparing and encoding this refusal.
+    pub fn memory(&self) -> &Arc<Budget> {
+        &self.memory
+    }
 }
 
 impl ShaclResultText {
@@ -400,57 +415,107 @@ fn result_key(result: &ValidationResult) -> impl Ord + '_ {
     )
 }
 
-struct OrderedResult<'a>(&'a ValidationResult);
-
-impl<'a> OrderedResult<'a> {
-    fn of(result: &'a mut ValidationResult) -> Self {
-        // Validation can carry message literals in dictionary order.
-        result.messages.sort_unstable();
-        Self(result)
-    }
+fn sort_messages(result: &mut ValidationResult) -> &ValidationResult {
+    // Validation can carry message literals in dictionary order.
+    result.messages.sort_unstable();
+    result
 }
 
-impl Ord for OrderedResult<'_> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        result_key(self.0).cmp(&result_key(other.0))
-    }
+fn compare_results(left: &ValidationResult, right: &ValidationResult) -> Ordering {
+    result_key(left).cmp(&result_key(right))
 }
 
-impl PartialOrd for OrderedResult<'_> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
+/// Orders only the prefix the refusal can list, in the report's already charged storage.
+fn order_prefix<T>(items: &mut [T], bound: usize, mut compare: impl FnMut(&T, &T) -> Ordering) {
+    let listed = bound.min(items.len());
+    if listed < items.len() {
+        items.select_nth_unstable_by(listed, &mut compare);
     }
+    items[..listed].sort_unstable_by(compare);
 }
 
-impl PartialEq for OrderedResult<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-
-impl Eq for OrderedResult<'_> {}
-
-/// Keeps the smallest items in order, counting the rest without storing them.
-fn smallest<T: Ord>(items: impl Iterator<Item = T>, bound: Option<usize>) -> (Vec<T>, usize) {
-    let Some(bound) = bound.filter(|&bound| bound > 0) else {
-        let mut all: Vec<_> = items.collect();
-        all.sort_unstable();
-        return (all, 0);
-    };
-    let mut kept = BinaryHeap::new();
-    let mut total = 0;
-    for item in items {
-        total += 1;
-        if kept.len() < bound {
-            kept.push(item);
-        } else if let Some(mut largest) = kept.peek_mut()
-            && item < *largest
-        {
-            *largest = item;
+/// Size the formatted text without allocating it.
+fn display_len(value: &impl fmt::Display) -> usize {
+    #[derive(Default)]
+    struct Count(usize);
+    impl fmt::Write for Count {
+        fn write_str(&mut self, text: &str) -> fmt::Result {
+            self.0 = self.0.saturating_add(text.len());
+            Ok(())
         }
     }
-    let omitted = total - kept.len();
-    (kept.into_sorted_vec(), omitted)
+    let mut count = Count::default();
+    write!(count, "{value}").expect("counting does not fail");
+    count.0
+}
+
+/// A growing string can hold both its old and new buffers during reallocation.
+fn growing_text_bytes(len: usize) -> usize {
+    len.max(8).saturating_mul(3)
+}
+
+fn term_text_bytes(term: &Term) -> usize {
+    match term {
+        Term::NamedNode(node) => node.as_str().len(),
+        other => growing_text_bytes(display_len(other)),
+    }
+}
+
+fn path_text_bytes(path: &PropertyPath) -> usize {
+    match path {
+        PropertyPath::Predicate(node) => node.as_str().len(),
+        other => growing_text_bytes(display_len(other)),
+    }
+}
+
+fn result_text_bytes(result: &ValidationResult) -> usize {
+    term_text_bytes(&result.focus_node)
+        .saturating_add(result.path.as_ref().map_or(0, path_text_bytes))
+        .saturating_add(result.value.as_ref().map_or(0, term_text_bytes))
+        .saturating_add(term_text_bytes(&result.source_shape))
+        .saturating_add(result.component.as_str().len())
+        .saturating_add(result.severity.as_str().len())
+        .saturating_add(result.messages.iter().fold(0usize, |bytes, message| {
+            bytes
+                .saturating_add(size_of::<String>())
+                .saturating_add(message.value().len())
+        }))
+}
+
+fn first_result_bytes(result: &ValidationResult, detail: &str) -> usize {
+    let focus = display_len(&result.focus_node);
+    let component = display_len(&result.component);
+    let mut description = "focus node , "
+        .len()
+        .saturating_add(focus)
+        .saturating_add(component);
+    let mut message_text = 0usize;
+    for message in &result.messages {
+        let len = display_len(message);
+        description = description.saturating_add(", message ".len().saturating_add(len));
+        message_text = message_text
+            .saturating_add(size_of::<String>())
+            .saturating_add(growing_text_bytes(len));
+    }
+    let full_detail = detail
+        .len()
+        .saturating_add("; first: ".len())
+        .saturating_add(description);
+    // First, the temporary description and its sorted message strings. Then the
+    // detail, framing for a restricted committer, and the two explanation summaries
+    // that can overlap while the server maps the error.
+    let describe = growing_text_bytes(description)
+        .saturating_add(message_text)
+        .saturating_add(detail.len());
+    let append = growing_text_bytes(description).saturating_add(growing_text_bytes(full_detail));
+    let explain = full_detail
+        .saturating_mul(2)
+        .saturating_add(growing_text_bytes(
+            full_detail.saturating_add(READABLE_REASON_FRAMING_BYTES),
+        ))
+        .saturating_add(growing_text_bytes(focus))
+        .saturating_add(component.saturating_mul(2));
+    describe.max(append).max(explain)
 }
 
 /// The common refusal for either the full validation or the committer's own validation.
@@ -458,54 +523,81 @@ pub(crate) fn refusal(
     mut report: ValidationReport,
     rejects: impl Fn(&ValidationResult) -> bool,
     bound: Option<usize>,
+    memory: &Envelope,
     running: impl Fn() -> bool,
 ) -> Option<Draft> {
-    let refusing = report
-        .results
-        .iter_mut()
-        .take_while(|_| running())
-        .filter(|result| rejects(result))
-        .map(OrderedResult::of);
-    let (results, results_omitted) = smallest(refusing, bound);
-    let failures = report.failures.drain(..).take_while(|_| running());
-    let (failures, failures_omitted) = smallest(failures, bound);
-    if !running() || (results.is_empty() && failures.is_empty()) {
+    let memory = Arc::new(memory.optional_part());
+    let bound = bound.filter(|&bound| bound > 0).unwrap_or(usize::MAX);
+    report.results.retain(|result| running() && rejects(result));
+    let total_results = report.results.len();
+    let total_failures = report.failures.len();
+    if !running() || (total_results == 0 && total_failures == 0) {
         return None;
     }
-    let first = results.first().map(|result| result.0);
-    let mut detail = format!(
-        "the commit introduces {} SHACL result(s) the gate rejects",
-        results.len() + results_omitted
-    );
-    if !failures.is_empty() {
-        let total = failures.len() + failures_omitted;
-        detail.push_str(&format!(" and {total} failure(s)"));
+    let mut detail =
+        format!("the commit introduces {total_results} SHACL result(s) the gate rejects");
+    if total_failures > 0 {
+        detail.push_str(&format!(" and {total_failures} failure(s)"));
     }
-    if let Some(first) = first {
-        detail.push_str(&format!("; first: {}", described(first)));
+    let mut text = Reservation::new(Arc::clone(&memory));
+    let mut results = ChargedVec::new(Arc::clone(&memory));
+    let mut explanation = None;
+    for result in report.results.iter_mut().take_while(|_| running()) {
+        sort_messages(result);
     }
-    let explanation = first.map(|result| nrese_reasoner::RejectExplanation {
-        summary: detail.clone(),
-        violated_constraint: result.component.as_str().to_owned(),
-        focus_resource: result.focus_node.to_string(),
-        evidence: Vec::new(),
-    });
-    let results = results
-        .into_iter()
+    order_prefix(&mut report.results, bound, compare_results);
+    for result in report.results.iter().take(bound).take_while(|_| running()) {
+        let first = results.is_empty();
+        let mut bytes = result_text_bytes(result);
+        if first {
+            bytes = bytes.saturating_add(first_result_bytes(result, &detail));
+        }
+        if results.reserve(1).is_err() || text.charge(bytes).is_err() {
+            break;
+        }
+        if first {
+            write!(detail, "; first: {}", described(result)).expect("writing to a string");
+            explanation = Some(nrese_reasoner::RejectExplanation {
+                summary: detail.clone(),
+                violated_constraint: result.component.as_str().to_owned(),
+                focus_resource: result.focus_node.to_string(),
+                evidence: Vec::new(),
+            });
+        }
+        results
+            .push_within(ShaclResultText::of(result))
+            .expect("the result's slot was reserved");
+    }
+    order_prefix(&mut report.failures, bound, Ord::cmp);
+    let mut failures = ChargedVec::new(Arc::clone(&memory));
+    for failure in report
+        .failures
+        .drain(..)
+        .take(bound)
         .take_while(|_| running())
-        .map(|result| ShaclResultText::of(result.0))
-        .collect();
+    {
+        if failures.reserve(1).is_err() || text.charge(failure.capacity()).is_err() {
+            break;
+        }
+        failures
+            .push_within(failure)
+            .expect("the failure's slot was reserved");
+    }
+    let (results, result_slots) = results.into_parts();
+    let (failures, failure_slots) = failures.into_parts();
     running().then_some(Draft {
         kind: crate::RejectKind::ShapesViolated,
         detail,
         explanation,
         attribution: None,
-        shacl: Some(ShaclRefusal {
+        shacl: Some(Arc::new(ShaclRefusal {
+            results_omitted: total_results - results.len(),
+            failures_omitted: total_failures - failures.len(),
             results,
-            results_omitted,
             failures,
-            failures_omitted,
-        }),
+            memory,
+            _held: (text, result_slots, failure_slots),
+        })),
     })
 }
 
@@ -514,10 +606,10 @@ pub(crate) fn reported(mut report: ValidationReport) -> String {
     let first = report
         .results
         .iter_mut()
-        .map(OrderedResult::of)
-        .min()
+        .map(sort_messages)
+        .min_by(|left, right| compare_results(left, right))
         .map_or_else(String::new, |result| {
-            format!("; first: {}", described(result.0))
+            format!("; first: {}", described(result))
         });
     format!(
         "the commit introduces {} SHACL result(s) and {} failure(s){first}",
@@ -576,7 +668,9 @@ pub(crate) fn view_reason(
         resources,
     )
     .ok()??;
-    let mut draft = refusal(report, rejects, bound, || resources.check().is_ok())?;
+    let mut draft = refusal(report, rejects, bound, &resources.memory, || {
+        resources.check().is_ok()
+    })?;
     draft.detail = in_readable_graphs(&draft.detail);
     Some(draft)
 }

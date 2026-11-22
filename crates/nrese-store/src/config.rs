@@ -151,7 +151,8 @@ pub struct StoreConfig {
     /// may introduce against the shapes graph.
     pub shacl_gate: ShaclGate,
     /// How many results and how many validation failures a refusal lists. Ten fits
-    /// form-sized writes and keeps large batch refusals short. None or zero lists all.
+    /// form-sized writes and keeps large batch refusals short. None or zero removes
+    /// the count limit. The write's memory budget still applies.
     pub shacl_reject_results: Option<usize>,
     /// The `owl2-dl` mode's settings (`dl.*`), used when the reasoner runs that mode.
     pub dl: crate::dl::DlConfig,

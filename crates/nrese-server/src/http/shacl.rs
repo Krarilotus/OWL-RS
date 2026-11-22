@@ -7,9 +7,11 @@ use axum::extract::RawQuery;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use nrese_store::{
-    GraphResultFormat, ReadModel, ShaclValidation, ShaclValidationRequest, ShapesSource,
-    ValidatedGraphs,
+    GraphResultFormat, ReadModel, ShaclRefusal, ShaclResultText, ShaclValidation,
+    ShaclValidationRequest, ShapesSource, ValidatedGraphs,
 };
+use serde::ser::SerializeStruct as _;
+use serde::{Serialize, Serializer};
 
 use crate::error::ApiError;
 use crate::http::media::{GRAPHS, Offers, content_format, header_value_str, negotiated};
@@ -152,37 +154,57 @@ pub async fn validate(
 /// property names, and the failures (SPARQL-based constraints that couldn't be
 /// evaluated; `conforms` is then false).
 fn report_json(validation: &ShaclValidation) -> serde_json::Value {
-    let results: Vec<serde_json::Value> =
-        validation.results_text().iter().map(result_json).collect();
+    let results = validation.results_text();
     serde_json::json!({
         "conforms": validation.report.conforms(),
         "revision": validation.revision,
         "shapes": validation.shapes,
-        "results": results,
+        "results": ResultsJson(&results),
         "failures": validation.report.failures,
     })
 }
 
-fn result_json(result: &nrese_store::ShaclResultText) -> serde_json::Value {
-    serde_json::json!({
-        "focusNode": result.focus_node,
-        "resultPath": result.path,
-        "value": result.value,
-        "sourceShape": result.source_shape,
-        "sourceConstraintComponent": result.component,
-        "resultSeverity": result.severity,
-        "resultMessage": result.messages,
-    })
+struct ResultJson<'a>(&'a ShaclResultText);
+
+impl Serialize for ResultJson<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let result = self.0;
+        let mut out = serializer.serialize_struct("ShaclResult", 7)?;
+        out.serialize_field("focusNode", &result.focus_node)?;
+        out.serialize_field("resultPath", &result.path)?;
+        out.serialize_field("value", &result.value)?;
+        out.serialize_field("sourceShape", &result.source_shape)?;
+        out.serialize_field("sourceConstraintComponent", &result.component)?;
+        out.serialize_field("resultSeverity", &result.severity)?;
+        out.serialize_field("resultMessage", &result.messages)?;
+        out.end()
+    }
 }
 
-pub(crate) fn refusal_json(refusal: &nrese_store::ShaclRefusal) -> serde_json::Value {
-    let results: Vec<_> = refusal.results.iter().map(result_json).collect();
-    serde_json::json!({
-        "results": results,
-        "results_omitted": refusal.results_omitted,
-        "failures": refusal.failures,
-        "failures_omitted": refusal.failures_omitted,
-    })
+#[derive(Debug)]
+struct ResultsJson<'a>(&'a [ShaclResultText]);
+
+impl Serialize for ResultsJson<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().map(ResultJson))
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RefusalJson<'a> {
+    results: ResultsJson<'a>,
+    results_omitted: usize,
+    failures: &'a [String],
+    failures_omitted: usize,
+}
+
+pub(crate) fn refusal_json(refusal: &ShaclRefusal) -> RefusalJson<'_> {
+    RefusalJson {
+        results: ResultsJson(&refusal.results),
+        results_omitted: refusal.results_omitted,
+        failures: &refusal.failures,
+        failures_omitted: refusal.failures_omitted,
+    }
 }
 
 #[cfg(test)]

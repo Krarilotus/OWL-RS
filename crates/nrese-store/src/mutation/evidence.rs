@@ -20,6 +20,7 @@ use nrese_rdf::{Quad, Term, TermRef};
 use nrese_reasoner::{RejectEvidence, RejectExplanation};
 use nrese_sparql::{GraphAccess, QueryEvaluationError, ReadView, Resources};
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use super::attribution::RejectAttribution;
 use super::{MutationReject, RejectKind};
@@ -35,11 +36,14 @@ pub(crate) struct Draft {
     pub detail: String,
     pub explanation: Option<RejectExplanation>,
     pub attribution: Option<RejectAttribution>,
-    pub shacl: Option<crate::ShaclRefusal>,
+    pub shacl: Option<Arc<crate::ShaclRefusal>>,
 }
 
 /// Ends every restricted committer's rejection.
 pub(crate) const ONLY_READABLE: &str = "Only statements in graphs you can read are shown.";
+const READABLE_REASON_PREFIX: &str = "the mutation was rejected; in the graphs you can read, ";
+pub(crate) const READABLE_REASON_FRAMING_BYTES: usize =
+    READABLE_REASON_PREFIX.len() + ". ".len() + ONLY_READABLE.len();
 
 /// The one problem told of a shapes graph the committer may not read
 /// ([`EvidenceView::shapes_error`]).
@@ -126,7 +130,11 @@ impl<'v, 'e> EvidenceView<'v, 'e> {
             shacl,
         } = match self.restricted() {
             false => full(),
-            true => view(self),
+            true => {
+                // Return the full report's memory before looking for the view's reason.
+                drop(full);
+                view(self)
+            }
         };
         MutationReject {
             kind,
@@ -178,7 +186,7 @@ pub(crate) fn shown(
 }
 
 pub(crate) fn in_readable_graphs(reason: &str) -> String {
-    format!("the mutation was rejected; in the graphs you can read, {reason}. {ONLY_READABLE}")
+    format!("{READABLE_REASON_PREFIX}{reason}. {ONLY_READABLE}")
 }
 
 /// The likely commit-local trigger sentence of `attribution`, or nothing.
