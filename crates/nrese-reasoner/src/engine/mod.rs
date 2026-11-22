@@ -483,3 +483,38 @@ pub(crate) fn pattern([s, p, o]: [Option<u64>; 3], graph: GraphSelector) -> Quad
         graph,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Program, RuleProgram};
+    use crate::rulesets::{ALL, Ruleset};
+    use nrese_engine::{Engine, EngineConfig};
+
+    /// The reopen verdict for a built-in program must agree with the gate that
+    /// lets the engine act on an `owl:sameAs` and report literal equality.
+    #[test]
+    fn only_the_builtin_rulesets_with_equality_handling_can_equate_literals() {
+        let engine = Engine::new(EngineConfig {
+            background_maintenance: false,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let tx = engine.transaction();
+        for ruleset in ALL {
+            let expected = match ruleset {
+                Ruleset::Rdfs | Ruleset::RdfsFull | Ruleset::Owl2Ql => false,
+                Ruleset::RdfsPlus | Ruleset::OwlHorst | Ruleset::Owl2Rl => true,
+            };
+            let program = RuleProgram::builtin(ruleset);
+            let verdict = program.may_equate_literals();
+            assert_eq!(verdict, expected, "{}", ruleset.name());
+            let compiled = Program::compile(&program, &|term| tx.intern(term));
+            assert_eq!(
+                verdict,
+                compiled.same_as.is_some(),
+                "{}: compiled engine gate",
+                ruleset.name()
+            );
+        }
+    }
+}

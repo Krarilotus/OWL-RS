@@ -282,22 +282,6 @@ mod tests {
         :parent :is :relation .";
 
     #[test]
-    fn only_the_builtin_rulesets_with_equality_handling_can_equate_literals() {
-        for ruleset in crate::rulesets::ALL {
-            let expected = match ruleset {
-                Ruleset::Rdfs | Ruleset::RdfsFull | Ruleset::Owl2Ql => false,
-                Ruleset::RdfsPlus | Ruleset::OwlHorst | Ruleset::Owl2Rl => true,
-            };
-            assert_eq!(
-                RuleProgram::builtin(ruleset).may_equate_literals(),
-                expected,
-                "{}",
-                ruleset.name()
-            );
-        }
-    }
-
-    #[test]
     fn rdfs_with_user_rules_can_equate_when_their_head_can_be_same_as() {
         for (conclusion, expected) in [
             ("?x owl:sameAs ?y", true),
