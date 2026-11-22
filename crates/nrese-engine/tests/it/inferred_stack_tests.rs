@@ -368,6 +368,7 @@ impl Model {
 }
 
 const TERMS: u64 = 3;
+const OPERATIONS: usize = 4;
 
 fn random_quad(rng: &mut Rng) -> EncodedQuad {
     let graph = match rng.below(3) {
@@ -387,7 +388,7 @@ fn random_operation(rng: &mut Rng, tx: &mut Transaction<'_>, model: &mut Model) 
     let quad = random_quad(rng);
     let statement = EncodedTriple::from(quad);
     let inferred_quad = statement.in_default_graph();
-    let operation = rng.below(4) as usize;
+    let operation = rng.below(OPERATIONS as u64) as usize;
     let (got, expected) = match operation {
         0 => (tx.insert_encoded(quad), model.asserted.insert(quad)),
         1 => (tx.remove_encoded(quad), model.asserted.remove(&quad)),
@@ -580,7 +581,7 @@ fn run_random_transactions(
     rng: &mut Rng,
     committed: &mut Model,
     steps: u32,
-) -> BTreeSet<(usize, bool)> {
+) -> BTreeSet<(usize, bool, bool)> {
     let mut witnessed = BTreeSet::new();
     for step in 0..steps {
         let context = format!("step {step}");
@@ -601,7 +602,7 @@ fn run_random_transactions(
         witnessed.extend(
             operations
                 .into_iter()
-                .filter_map(|(kind, changed)| changed.then_some((kind, abort))),
+                .map(|(kind, changed)| (kind, changed, abort)),
         );
     }
     witnessed
@@ -628,7 +629,7 @@ fn both_stacks_match_the_model_with_compaction() {
         ));
     }
     if pinned {
-        assert_eq!(kinds.len(), 8, "witnessed edits: {kinds:?}");
+        assert_eq!(kinds.len(), OPERATIONS * 4, "witnessed edits: {kinds:?}");
     }
 }
 

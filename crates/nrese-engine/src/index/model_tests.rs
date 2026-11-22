@@ -247,17 +247,20 @@ fn random_commits_with_policy_compaction_match_the_model() {
     let cases = seeds();
     for layout in LAYOUTS {
         let mut compacted = false;
+        let (mut inserted, mut deleted) = (false, false);
         // Seed 0 exposes the loss of tombstones during compaction.
         for seed in (0..cases).filter(|seed| !pinned || [0, 9].contains(seed)) {
             let mut rng = Rng(fuzz(seed));
             let mut model = BTreeSet::new();
             let mut version = IndexVersion::empty(layout);
             for step in 0..60 {
-                version = version.with_run(random_commit(layout, &mut rng, &mut model));
-                if let Some(plan) = policy.plan(version.runs()) {
+                let run = random_commit(layout, &mut rng, &mut model);
+                let edits = (run.inserts() > 0, run.deletes() > 0);
+                version = version.with_run(run);
+                let plan = policy.plan(version.runs());
+                if let Some(plan) = &plan {
                     let merged = merge_runs(&version.runs()[plan.window.clone()]);
-                    version = version.with_compacted(plan.window, merged);
-                    compacted = true;
+                    version = version.with_compacted(plan.window.clone(), merged);
                 }
                 let context = format!("{layout:?} seed {seed} step {step}");
                 assert_matches_model(&version, &model, &context);
@@ -268,10 +271,17 @@ fn random_commits_with_policy_compaction_match_the_model() {
                     model.contains(&probe),
                     "{context}"
                 );
+                compacted |= plan.is_some();
+                inserted |= edits.0;
+                deleted |= edits.1;
             }
         }
         if pinned {
             assert!(compacted, "no compaction in {layout:?}");
+            assert!(
+                inserted && deleted,
+                "missing insert or delete in {layout:?}"
+            );
         }
     }
 }
@@ -283,26 +293,38 @@ fn arbitrary_compaction_windows_preserve_contents() {
     let cases = seeds();
     for layout in LAYOUTS {
         let mut windows = BTreeSet::new();
+        let (mut inserted, mut deleted) = (false, false);
         for seed in (100..100 + cases).filter(|seed| !pinned || [100, 103, 109].contains(seed)) {
             let mut rng = Rng(fuzz(seed));
             let mut model = BTreeSet::new();
             let mut version = IndexVersion::empty(layout);
             for step in 0..40 {
-                version = version.with_run(random_commit(layout, &mut rng, &mut model));
+                let run = random_commit(layout, &mut rng, &mut model);
+                let edits = (run.inserts() > 0, run.deletes() > 0);
+                version = version.with_run(run);
                 let runs = version.runs().len() as u64;
-                if runs >= 2 && rng.below(3) == 0 {
+                let window = if runs >= 2 && rng.below(3) == 0 {
                     let start = rng.below(runs - 1) as usize;
                     let end = start + 2 + rng.below(runs - start as u64 - 1) as usize;
                     let merged = merge_runs(&version.runs()[start..end]);
                     version = version.with_compacted(start..end, merged);
-                    windows.insert((start == 0, end as u64 == runs));
-                }
+                    Some((start == 0, end as u64 == runs))
+                } else {
+                    None
+                };
                 let context = format!("{layout:?} seed {seed} step {step}");
                 assert_matches_model(&version, &model, &context);
+                windows.extend(window);
+                inserted |= edits.0;
+                deleted |= edits.1;
             }
         }
         if pinned {
             assert_eq!(windows.len(), 4, "{layout:?}: {windows:?}");
+            assert!(
+                inserted && deleted,
+                "missing insert or delete in {layout:?}"
+            );
         }
     }
 }

@@ -1935,23 +1935,11 @@ fn computed_values_equal_the_reference() {
 /// set evaluation off. Returns the query and whether its results depend on the order of
 /// the rows (`GROUP_CONCAT`, `SAMPLE`).
 pub(crate) fn set_query(rng: &mut Rng) -> (String, bool) {
-    set_query_with(rng, |_, _, _| {})
-}
-
-fn set_query_with(
-    rng: &mut Rng,
-    mut witness: impl FnMut(&'static str, u64, u64),
-) -> (String, bool) {
-    let mut draw = |rng: &mut Rng, family, size| {
-        let index = rng.below(size);
-        witness(family, size, index);
-        index
-    };
     let p = |rng: &mut Rng| format!("<{EX}p{}>", rng.below(4));
     let mut pattern = format!("?a {} ?b .", p(rng));
     for _ in 0..1 + rng.below(3) {
         let (p1, p2) = (p(rng), p(rng));
-        pattern.push_str(&match draw(rng, "pattern", 9) {
+        pattern.push_str(&match rng.below(9) {
             0 | 1 => format!(" OPTIONAL {{ ?a {p1} ?c }}"),
             2 => format!(" OPTIONAL {{ ?a {p1} ?d }}"),
             3 => format!(" OPTIONAL {{ ?a {p1} ?d FILTER(?d != ?b) }}"),
@@ -1964,29 +1952,28 @@ fn set_query_with(
         });
     }
     // A filter that must stay above the OPTIONALs, on variables nothing else may need.
-    match draw(rng, "filter", 6) {
+    match rng.below(6) {
         0 => pattern.push_str(" FILTER(!BOUND(?c) || ?c != ?b)"),
         1 => pattern.push_str(" FILTER(!BOUND(?d) || isLiteral(?d))"),
         _ => {}
     }
-    if draw(rng, "bind", 4) == 0 {
+    if rng.below(4) == 0 {
         pattern.push_str(" BIND(STRLEN(STR(?b)) AS ?len)");
     }
     if rng.below(4) == 0 {
         return (
             format!(
                 "SELECT DISTINCT {} WHERE {{ {pattern} }}",
-                ["?a ?c", "?a ?d ?e", "?b", "?a ?len", "?c ?d", "?a ?h ?g"]
-                    [draw(rng, "projection", 6) as usize]
+                rng.pick(&["?a ?c", "?a ?d ?e", "?b", "?a ?len", "?c ?d", "?a ?h ?g"])
             ),
             false,
         );
     }
-    let keys = ["?a", "?a ?b", "?b", "?a ?c", "?len ?a"][draw(rng, "group keys", 5) as usize];
+    let keys = *rng.pick(&["?a", "?a ?b", "?b", "?a ?c", "?len ?a"]);
     let mut ordered = false;
     let aggregates: Vec<String> = (0..1 + rng.below(3))
         .map(|i| {
-            let aggregate = match draw(rng, "aggregate", 17) {
+            let aggregate = match rng.below(17) {
                 0 | 1 => "COUNT(DISTINCT ?c)",
                 2 | 3 => "COUNT(DISTINCT ?d)",
                 4 => "COUNT(DISTINCT ?e)",
@@ -2019,7 +2006,7 @@ fn set_query_with(
             format!("({aggregate} AS ?x{i})")
         })
         .collect();
-    let having = match draw(rng, "having", 5) {
+    let having = match rng.below(5) {
         0 => " HAVING (COUNT(DISTINCT ?c) > 1)",
         1 => " HAVING (MIN(?c) != MAX(?c) || COUNT(DISTINCT ?d) = 0)",
         _ => "",
@@ -2062,29 +2049,8 @@ fn pinned_cases() -> bool {
 /// `SAMPLE`'s column left out, `GROUP_CONCAT`'s parts sorted (the planner may join in
 /// another order than as written, and SPARQL leaves the order of concatenation open; seed
 /// 2051 of the fuzz campaign). Mutation-checked.
-/// By default, this test checks fixed witnesses for every set-query family. With `NRESE_CHECK_TIER=nightly` or `NRESE_FUZZ_SEED` set, it draws 60 datasets.
 #[test]
 fn duplicate_insensitive_queries_equal_both_evaluations() {
-    let witnesses = [
-        (0, 0),
-        (0, 5),
-        (0, 7),
-        (0, 14),
-        (0, 16),
-        (0, 17),
-        (0, 19),
-        (0, 20),
-        (0, 28),
-        (0, 33),
-        (0, 53),
-        (1, 17),
-        (1, 18),
-        (1, 21),
-        (3, 44),
-    ];
-    let pinned = pinned_cases();
-    let cases = cases(4, 60);
-    let mut families = std::collections::BTreeMap::<_, (u64, std::collections::BTreeSet<_>)>::new();
     let mut rng = Rng::seeded(20_261_003);
     let (mut checked, mut with_solutions) = (0, 0);
     let as_written = QueryOptions {
@@ -2096,9 +2062,7 @@ fn duplicate_insensitive_queries_equal_both_evaluations() {
     };
     let covered = |checked: usize, with_solutions: usize| with_solutions * 4 > checked * 3;
     for dataset_case in 0.. {
-        if (pinned && dataset_case == cases)
-            || (!pinned && !draws_on(dataset_case, cases, covered(checked, with_solutions)))
-        {
+        if !draws_on(dataset_case, 60, covered(checked, with_solutions)) {
             break;
         }
         let engine = Engine::new(EngineConfig::default()).unwrap();
@@ -2109,17 +2073,7 @@ fn duplicate_insensitive_queries_equal_both_evaluations() {
         tx.commit().unwrap();
         let snapshot = engine.snapshot();
         for query_case in 0..60 {
-            let mut choices = Vec::new();
-            let (text, order_dependent) = if pinned {
-                set_query_with(&mut rng, |name, size, index| {
-                    choices.push((name, size, index))
-                })
-            } else {
-                set_query(&mut rng)
-            };
-            if pinned && !witnesses.contains(&(dataset_case, query_case)) {
-                continue;
-            }
+            let (text, order_dependent) = set_query(&mut rng);
             let query = SparqlParser::new()
                 .parse_query(&text)
                 .unwrap_or_else(|e| panic!("{e}: {text}"));
@@ -2165,30 +2119,12 @@ fn duplicate_insensitive_queries_equal_both_evaluations() {
             }
             checked += 1;
             with_solutions += usize::from(!native.is_empty());
-            for (name, size, index) in choices {
-                families
-                    .entry(name)
-                    .or_insert_with(|| (size, Default::default()))
-                    .1
-                    .insert(index);
-            }
         }
     }
     assert!(
         covered(checked, with_solutions),
         "only {with_solutions} of {checked} queries have solutions"
     );
-    if pinned {
-        assert_eq!(checked, witnesses.len());
-        assert_eq!(families.len(), 7);
-        for (name, (size, found)) in families {
-            assert_eq!(
-                found.len() as u64,
-                size,
-                "missing {name} witnesses: {found:?}"
-            );
-        }
-    }
 }
 
 /// Joins on variables that may be unbound (SPARQL compatibility: an unbound variable is

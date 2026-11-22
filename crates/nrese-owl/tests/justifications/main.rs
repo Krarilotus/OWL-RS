@@ -21,16 +21,16 @@ fn rng(seed: u64) -> impl FnMut(u64) -> u64 {
     }
 }
 
+const ARITIES: u64 = 3;
+
 /// Facts `0..facts` (the goal is 0), axioms `0..axioms`, random inferences (cycles too).
 fn graph(
     next: &mut dyn FnMut(u64) -> u64,
     facts: u32,
     axioms: u32,
     count: usize,
-) -> (ProofGraph<u32, u32>, BTreeSet<(usize, usize)>) {
-    const ARITIES: u64 = 3;
+) -> ProofGraph<u32, u32> {
     let mut g = ProofGraph::new(0u32);
-    let mut arities = BTreeSet::new();
     for _ in 0..count {
         let conclusion = next(facts as u64) as u32;
         let premises: Vec<u32> = (0..next(ARITIES))
@@ -39,10 +39,9 @@ fn graph(
         let used: Vec<u32> = (0..next(ARITIES))
             .map(|_| next(axioms as u64) as u32)
             .collect();
-        arities.insert((premises.len(), used.len()));
         g.add(format!("r{}", next(4)), &premises, &used, conclusion);
     }
-    (g, arities)
+    g
 }
 
 /// Every minimal axiom set deriving the goal, by brute force over subsets. Deriving is
@@ -75,7 +74,9 @@ fn the_enumeration_equals_a_brute_force_mus_enumerator() {
         .and_then(|v| v.parse().ok());
     // Case 5 exposed the missing alternatives when enumeration stopped at one.
     let witnesses = [(1, 1), (3, 0), (5, 6)];
-    let pinned = !full && count.is_none() && std::env::var_os("NRESE_FUZZ_SEED").is_none();
+    let pinned = !full
+        && std::env::var_os("NRESE_FUZZ_CASES").is_none()
+        && std::env::var_os("NRESE_FUZZ_SEED").is_none();
     let cases = if pinned { 6 } else { count.unwrap_or(3_000u64) };
     let mut next = rng(0x2026_1003_0240);
     let mut arities = BTreeSet::new();
@@ -84,7 +85,7 @@ fn the_enumeration_equals_a_brute_force_mus_enumerator() {
     for case in 0..cases {
         let (facts, axioms) = (2 + next(8) as u32, 1 + next(12) as u32);
         let count = 2 + next(40) as usize;
-        let (g, families) = graph(&mut next, facts, axioms, count);
+        let g = graph(&mut next, facts, axioms, count);
         let witness = witnesses.iter().find(|&&(i, _)| i == case);
         if pinned && witness.is_none() {
             continue;
@@ -96,7 +97,11 @@ fn the_enumeration_equals_a_brute_force_mus_enumerator() {
         assert_eq!(sorted, expected, "case {case}: {g:?}");
         if pinned && let Some(&(_, count)) = witness {
             assert_eq!(expected.len(), count, "witness {case}");
-            arities.extend(families);
+            arities.extend(
+                g.inferences()
+                    .iter()
+                    .map(|inference| (inference.premises.len(), inference.axioms.len())),
+            );
         }
         checked += 1;
         assert!(got.complete);
@@ -171,8 +176,8 @@ fn the_enumeration_equals_a_brute_force_mus_enumerator() {
     assert!(entailed > checked / 4);
     if pinned {
         assert_eq!(checked, witnesses.len());
-        for premises in 0..3 {
-            for axioms in 0..3 {
+        for premises in 0..ARITIES as usize {
+            for axioms in 0..ARITIES as usize {
                 assert!(
                     arities.contains(&(premises, axioms)),
                     "{premises} premises, {axioms} axioms"

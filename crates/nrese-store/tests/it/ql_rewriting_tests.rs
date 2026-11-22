@@ -16,8 +16,7 @@
 //! representatives). The store's answers must all be certain, and every query that misses
 //! one must say `sound-only` (docs/design/ql-rewriting.md §7).
 //!
-//! `NRESE_QL_CASES` overrides the number of cases, `NRESE_QL_SEED` the
-//! seed.
+//! `NRESE_QL_CASES` overrides the number of cases, and `NRESE_QL_SEED` sets the seed.
 
 use crate::support::Writes;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -117,7 +116,10 @@ struct Extras {
     inverse_functional: Vec<usize>,
     same: Vec<(usize, usize)>,
     turtle: Vec<String>,
+    families: u8,
 }
+
+const EXTRA_AXIOMS: usize = 5;
 
 /// Extras over the properties, mostly over `generating` ones (the roles of existentials),
 /// where they meet anonymous individuals.
@@ -129,7 +131,9 @@ fn random_extras(rng: &mut Rng, generating: &[usize]) -> Extras {
         } else {
             rng.below(PROPERTIES)
         };
-        match rng.below(5) {
+        let kind = rng.below(EXTRA_AXIOMS);
+        e.families |= 1 << kind;
+        match kind {
             0 | 1 => {
                 e.chains.push((p, p, p));
                 e.turtle.push(format!(":P{p} a owl:TransitiveProperty ."));
@@ -152,6 +156,7 @@ fn random_extras(rng: &mut Rng, generating: &[usize]) -> Extras {
         }
     }
     if rng.chance(40) {
+        e.families |= 1 << EXTRA_AXIOMS;
         let (a, b) = (rng.below(INDIVIDUALS), rng.below(INDIVIDUALS));
         e.same.push((a, b));
         e.turtle.push(format!(":a{a} owl:sameAs :a{b} ."));
@@ -299,6 +304,21 @@ enum T {
 enum QAtom {
     Class(T, usize),
     Role(T, usize, T),
+}
+
+/// Clause and term constructors among queries whose answers have been checked.
+fn query_families(atoms: &[QAtom]) -> u8 {
+    let term = |t: T| match t {
+        T::Var(_) => 0b0100,
+        T::Ind(_) => 0b1000,
+    };
+    atoms.iter().fold(0, |families, atom| {
+        families
+            | match *atom {
+                QAtom::Class(t, _) => 0b0001 | term(t),
+                QAtom::Role(s, _, o) => 0b0010 | term(s) | term(o),
+            }
+    })
 }
 
 struct Query {
@@ -892,6 +912,7 @@ fn rewritten_answers_are_the_certain_answers_of_random_ql_cases() {
     let cases = cases();
     let witnesses = ql_witnesses();
     let (mut families, mut forms) = (0, BTreeSet::new());
+    let mut query_shapes = 0;
     let dir = tempfile::tempdir().unwrap();
     let seed = std::env::var("NRESE_QL_SEED")
         .ok()
@@ -1000,9 +1021,12 @@ fn rewritten_answers_are_the_certain_answers_of_random_ql_cases() {
             }
             gained += added;
             checked += 1;
-            forms.insert((case % 2, query.answers.is_empty()));
+            if witnesses.is_some() {
+                forms.insert((case % 2, query.answers.is_empty()));
+                families |= tbox.families;
+                query_shapes |= query_families(&query.atoms);
+            }
         }
-        families |= tbox.families;
     }
     eprintln!(
         "QL differential: {checked} queries checked, {gained} answers only through the rewriting, {realised} witnesses the data had (not folded), {skipped} cases skipped (chase too large)"
@@ -1018,10 +1042,11 @@ fn rewritten_answers_are_the_certain_answers_of_random_ql_cases() {
     assert!(gained > 0, "no case exercised the rewriting");
     if witnesses.is_some() {
         assert_eq!(families.count_ones() as usize, TBOX_FAMILIES);
+        assert_eq!(query_shapes, 0b1111, "class, role, variable and individual");
         assert_eq!(
             forms.len(),
             4,
-            "ASK and SELECT under both profiles: {forms:?}"
+            "boolean and projected answers under both profiles: {forms:?}"
         );
     }
 }
@@ -2412,14 +2437,14 @@ fn rewritten_answers_follow_the_readers_graph_access() {
 /// with reasoning (`owl2-rl`, the rewriting on) does: the same rows, as bags and with
 /// DISTINCT, and the same completeness. On the pure and the mixed random cases; what the
 /// printer can't write exactly it says, and those are counted.
-/// By default, this test checks fixed pure and mixed cases in both printed forms. With `NRESE_CHECK_TIER=nightly` or a seed (`NRESE_QL_SEED`, `NRESE_FUZZ_SEED`) set, it draws 150 cases.
 #[test]
 fn printed_queries_answer_on_a_store_without_reasoning_as_nrese_with_it() {
     use nrese_sparql::ql::{PrintForm, Printed};
 
-    let cases = cases();
-    let witnesses = ql_witnesses();
-    let mut families = 0u16;
+    let cases: usize = std::env::var("NRESE_QL_CASES")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(150);
     let dir = tempfile::tempdir().unwrap();
     let seed = std::env::var("NRESE_QL_SEED")
         .ok()
@@ -2454,9 +2479,6 @@ fn printed_queries_answer_on_a_store_without_reasoning_as_nrese_with_it() {
             })
             .collect();
         let queries: Vec<Query> = (0..4).map(|_| random_query(&mut rng)).collect();
-        if witnesses.is_some_and(|examples| !examples.contains(&case)) {
-            continue;
-        }
         let turtle = format!(
             "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
              @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
@@ -2518,7 +2540,6 @@ fn printed_queries_answer_on_a_store_without_reasoning_as_nrese_with_it() {
                 }
             }
         }
-        families |= tbox.families;
     }
     eprintln!(
         "QL printer: {pure} pure and {mixed_printed} mixed queries printed (both forms, \
@@ -2526,15 +2547,9 @@ fn printed_queries_answer_on_a_store_without_reasoning_as_nrese_with_it() {
          through reasoning; not expressible (queries): {refused:?}"
     );
     // Pure QL prints whole.
-    let pure_cases = witnesses.map_or(cases.div_ceil(2), |xs| {
-        xs.iter().filter(|&&case| case.is_multiple_of(2)).count()
-    });
-    assert_eq!(pure, pure_cases * 4, "{refused:?}");
+    assert_eq!(pure, cases.div_ceil(2) * 4, "{refused:?}");
     assert!(mixed_printed > 0 && sound_only > 0, "{refused:?}");
     assert!(gained > 0, "no printed query needed reasoning");
-    if witnesses.is_some() {
-        assert_eq!(families.count_ones() as usize, TBOX_FAMILIES);
-    }
 }
 
 /// A store holding `turtle` as asserted: no reasoning, no rewriting.
@@ -2635,6 +2650,8 @@ fn negation_and_exists_answer_as_the_chase() {
     let cases = cases();
     let witnesses = ql_witnesses();
     let (mut families, mut negations) = (0, BTreeSet::new());
+    let (mut extra_shapes, mut query_shapes) = (0, 0);
+    let mut pairs_checked = BTreeSet::new();
     let dir = tempfile::tempdir().unwrap();
     let seed = std::env::var("NRESE_QL_SEED")
         .ok()
@@ -2670,7 +2687,7 @@ fn negation_and_exists_answer_as_the_chase() {
         }
         // `Q2` shares one variable with `Q1` (its `?v0`), its others its own: existential
         // inside the negation.
-        let pairs: Vec<(Query, Query)> = (0..4)
+        let pairs: Vec<_> = (0..4)
             .map(|_| {
                 if rng.chance(50) {
                     // "Instances of C with (or without) some P-edge (into D)": what an
@@ -2681,12 +2698,14 @@ fn negation_and_exists_answer_as_the_chase() {
                         answers: vec![0],
                     };
                     let p = rng.below(PROPERTIES);
-                    let mut atoms = vec![if rng.chance(50) {
+                    let forward = rng.chance(50);
+                    let mut atoms = vec![if forward {
                         QAtom::Role(T::Var(0), p, T::Var(1))
                     } else {
                         QAtom::Role(T::Var(1), p, T::Var(0))
                     }];
-                    if rng.chance(50) {
+                    let typed = rng.chance(50);
+                    if typed {
                         atoms.push(QAtom::Class(T::Var(1), rng.below(CLASSES)));
                     }
                     let q2 = Query {
@@ -2694,7 +2713,7 @@ fn negation_and_exists_answer_as_the_chase() {
                         vars: 2,
                         answers: Vec::new(),
                     };
-                    return (q1, q2);
+                    return (q1, q2, Some((forward, typed)));
                 }
                 let q1 = random_query(&mut rng);
                 let q2 = random_query(&mut rng);
@@ -2722,7 +2741,7 @@ fn negation_and_exists_answer_as_the_chase() {
                     vars: q1.vars + q2.vars,
                     answers: Vec::new(),
                 };
-                (q1, q2)
+                (q1, q2, None)
             })
             .collect();
         if witnesses.is_some_and(|examples| !examples.contains(&case)) {
@@ -2732,7 +2751,7 @@ fn negation_and_exists_answer_as_the_chase() {
             tbox.generating.iter().map(|&(_, r, f)| (r, f)).collect();
         let max_vars = pairs
             .iter()
-            .map(|(a, b)| a.vars.max(b.vars))
+            .map(|(a, b, _)| a.vars.max(b.vars))
             .max()
             .unwrap_or(1);
         let Some(chase) = Chase::run(
@@ -2763,7 +2782,7 @@ fn negation_and_exists_answer_as_the_chase() {
                 chase.answers(q)
             }
         };
-        for (q1, q2) in &pairs {
+        for (q1, q2, shape) in &pairs {
             let outer = Query {
                 atoms: q1.atoms.clone(),
                 vars: q1.vars.max(q2.vars),
@@ -2845,10 +2864,15 @@ fn negation_and_exists_answer_as_the_chase() {
                     decided_by_rewriting += 1;
                 }
                 checked += 1;
-                negations.insert((mixed, name));
+                if witnesses.is_some() {
+                    negations.insert((mixed, name));
+                    families |= tbox.families;
+                    extra_shapes |= extras.families;
+                    query_shapes |= query_families(&outer.atoms) | query_families(&inner.atoms);
+                    pairs_checked.insert(*shape);
+                }
             }
         }
-        families |= tbox.families;
     }
     eprintln!(
         "QL negation: {checked} queries checked, {decided_by_rewriting} answered otherwise than \
@@ -2865,6 +2889,9 @@ fn negation_and_exists_answer_as_the_chase() {
     );
     if witnesses.is_some() {
         assert_eq!(families.count_ones() as usize, TBOX_FAMILIES);
+        assert_eq!(extra_shapes.count_ones() as usize, EXTRA_AXIOMS + 1);
+        assert_eq!(query_shapes, 0b1111, "class, role, variable and individual");
+        assert_eq!(pairs_checked.len(), 5, "query pairs: {pairs_checked:?}");
         assert_eq!(negations.len(), 6, "all forms in both modes: {negations:?}");
     }
 }
