@@ -626,14 +626,17 @@ async fn http11_image_has_its_length() -> Result<(), Box<dyn Error>> {
     .await?
 }
 
+/// A `HEAD` of the image gets the length a `GET` of it gets, and no body.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http11_image_head_has_its_length_and_no_body() -> Result<(), Box<dyn Error>> {
     timeout(HANG, async {
         let (addr, task, _dir) = image_server().await?;
         let (head, body) = http1_image(addr, "HTTP/1.1", "HEAD").await?;
+        let (_, image) = http1_image(addr, "HTTP/1.1", "GET").await?;
         task.abort();
         eprintln!("{head:?}; {} data bytes", body.len());
-        assert!(image_length(&head) > 0, "{head:?}");
+        assert!(!image.is_empty());
+        assert_eq!(image_length(&head), image.len(), "{head:?}");
         assert!(body.is_empty());
         Ok(())
     })
@@ -681,13 +684,16 @@ async fn http2_image_has_its_length() -> Result<(), Box<dyn Error>> {
     .await?
 }
 
+/// A `HEAD` of the image gets the length a `GET` of it gets, and no data.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http2_image_head_has_its_length_and_no_data() -> Result<(), Box<dyn Error>> {
     timeout(HANG, async {
         let (addr, task, _dir) = image_server().await?;
         let (length, received) = http2_image(addr, "HEAD").await?;
+        let (_, image) = http2_image(addr, "GET").await?;
         task.abort();
-        assert!(length > 0);
+        assert!(image > 0);
+        assert_eq!(length, image);
         assert_eq!(received, 0);
         Ok(())
     })
