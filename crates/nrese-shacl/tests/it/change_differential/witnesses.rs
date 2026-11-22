@@ -64,12 +64,18 @@ fn cases_dir() -> PathBuf {
 }
 
 /// The saved case `file`: a path, or a file name under `cases/`.
-pub(super) fn load(file: &str) -> Case {
-    let path = cases_dir().join(file);
+pub(super) fn saved_path(file: &str) -> PathBuf {
+    cases_dir().join(file)
+}
+
+/// The saved case `file` and the signature it recorded, if any.
+pub(super) fn load(file: &str) -> (Case, Option<String>) {
+    let path = saved_path(file);
     let text = fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("read saved case {}: {error}", path.display()));
-    let witness: Witness = toml::from_str(&text).expect("parse saved case");
-    witness.case()
+    let mut witness: Witness = toml::from_str(&text).expect("parse saved case");
+    let signature = witness.signature.take();
+    (witness.case(), signature)
 }
 
 /// `case` as a fixture named `id`, with the signature it shows and its replay command.
@@ -114,6 +120,11 @@ fn parse(format: RdfFormat, text: &str) -> Vec<Quad> {
 impl Witness {
     fn case(self) -> Case {
         assert_eq!(self.selection, "any-excluding-shapes");
+        assert!(
+            !self.steps.is_empty(),
+            "{}: a saved case has steps",
+            self.case
+        );
         Case {
             asserted: parse(RdfFormat::NQuads, &self.asserted),
             inferred: parse(RdfFormat::NTriples, &self.inferred),

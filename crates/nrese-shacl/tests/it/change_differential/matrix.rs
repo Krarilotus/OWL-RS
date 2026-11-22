@@ -75,36 +75,50 @@ fn core_key(
 
 // Spec: SHACL Core nested constraints report what a change newly violates,
 // including reversals of conformance through sh:not and shared target routes.
-pub(super) fn run() {
-    let rows = recursion()
+fn rows() -> impl Iterator<Item = Row> {
+    recursion()
         .into_iter()
         .chain(cycle())
         .chain(shared_target())
         .chain(data::rows())
         .chain(shapes::rows())
         .chain(identity::rows())
-        .chain(terminal::rows());
+        .chain(terminal::rows())
+}
+
+pub(super) fn has_row(id: &str) -> bool {
+    rows().any(|row| row.id == id)
+}
+
+pub(super) fn run() {
+    let outer = std::env::var("NRESE_FUZZ_SEED").unwrap_or_else(|_| "0".into());
     let selector = std::env::var("NRESE_SHACL_CASE").ok();
-    if selector
-        .as_ref()
-        .is_some_and(|case| !case.starts_with("row:"))
-    {
-        // A random draw's or saved case's selector.
+    if let Some(case) = selector.as_ref().filter(|case| !case.starts_with("row:")) {
+        // A random draw's or saved case's selector, which must name one.
+        assert!(
+            super::random::selects_a_draw(case),
+            "no case matches NRESE_SHACL_CASE={case}"
+        );
         return;
     }
     let gaps = super::witnesses::verified_gaps();
     let mut allowances: [Allowances<'_>; 3] = Default::default();
     let mut checked = 0;
     let mut ran = BTreeSet::new();
-    for row in rows {
+    for row in rows() {
         let case_id = format!("row:{}", row.id);
         if selector.as_ref().is_some_and(|wanted| wanted != &case_id) {
             continue;
         }
         ran.insert(case_id.clone());
         let mut known = BTreeSet::new();
+        let replay = super::random::replay("matrix", &outer, &case_id);
         for (padding, allowance) in allowances.iter_mut().enumerate() {
-            let context = format!("{case_id}, padding {padding}: {}", row.description);
+            // Every message's first line is the row's replay command.
+            let context = format!(
+                "{replay}\n{case_id}, padding {padding}: {}",
+                row.description
+            );
             let mut case = row.case.clone();
             for i in 0..padding {
                 case.asserted
