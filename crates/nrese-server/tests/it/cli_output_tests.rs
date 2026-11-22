@@ -128,6 +128,23 @@ fn quarantine_failure_without_publication_says_load_again() -> Result<(), Box<dy
     Ok(())
 }
 
+/// The load whose file the store kept in the quarantine of the data directory `data`, the
+/// only file there; a run's `stderr` is shown if there isn't exactly one.
+#[cfg(feature = "fault-points")]
+fn kept_load(data: &std::path::Path, stderr: &str) -> std::io::Result<String> {
+    let kept = std::fs::read_dir(data.join("quarantine"))?
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let loads = kept
+        .iter()
+        .filter_map(|name| name.strip_prefix("load-")?.strip_suffix(".jsonl"))
+        .collect::<Vec<_>>();
+    let [load] = loads[..] else {
+        panic!("{kept:?}\n{stderr}");
+    };
+    Ok(load.to_owned())
+}
+
 /// A load that published nothing, whose quarantine file was placed but couldn't be made
 /// durable or taken back: the error names the load and says when loading it again is safe.
 #[cfg(feature = "fault-points")]
@@ -137,12 +154,14 @@ fn kept_quarantine_without_publication_says_when_to_load_again()
     let dir = tempfile::tempdir()?;
     let file = dir.path().join("invalid.nt");
     std::fs::write(&file, "this is not a statement\n")?;
-    let mut command = nrese(dir.path(), &dir.path().join("data"));
+    let data = dir.path().join("data");
+    let mut command = nrese(dir.path(), &data);
     command
         .env("NRESE_TEST_FAIL_QUARANTINE_REMOVAL", "1")
         .arg("load")
         .arg(&file);
     let output = run(&mut command)?;
+    let load = kept_load(&data, &output.stderr)?;
     let lines = output
         .stderr
         .lines()
@@ -151,11 +170,6 @@ fn kept_quarantine_without_publication_says_when_to_load_again()
     let [line] = lines[..] else {
         panic!("{}", output.stderr);
     };
-    let load = line
-        .split_once("quarantine/load-")
-        .and_then(|(_, rest)| rest.split_once(".jsonl"))
-        .map(|(load, _)| load)
-        .expect(line);
     assert_eq!(
         line,
         format!(
@@ -184,16 +198,7 @@ fn published_load_names_its_kept_quarantine() -> Result<(), Box<dyn std::error::
         .arg("load")
         .arg(&file);
     let output = run(&mut command)?;
-    let kept = std::fs::read_dir(data.join("quarantine"))?
-        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let loads = kept
-        .iter()
-        .filter_map(|name| name.strip_prefix("load-")?.strip_suffix(".jsonl"))
-        .collect::<Vec<_>>();
-    let [load] = loads[..] else {
-        panic!("{kept:?}\n{}", output.stderr);
-    };
+    let load = kept_load(&data, &output.stderr)?;
     let detail = format!(
         "Error: the load completed at published revision 1. Its quarantine record couldn't be kept: the quarantine's directory sync failed (a test's). This load's records are listed under load ID {load}, but a power loss may lose them. Don't load it again."
     );
