@@ -93,6 +93,30 @@ fn the_conclusion_is_tested_in_what_the_premise_check_left() {
     );
 }
 
+/// Spec (`entailment` module docs: what the DL engines can't decide is undecided): where the
+/// DL check runs out of time after the premise's check, a complement only it shows is
+/// undecided, never denied.
+#[test]
+fn a_dl_check_out_of_time_leaves_the_answer_undecided() {
+    let dl = DlConfig {
+        timeout: Some(Duration::from_millis(300)),
+        ..DlConfig::default()
+    };
+    let (store, _pipeline) = dl_store(dl, EMPTY_C);
+    let rules = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl)
+        .materialised_program()
+        .unwrap();
+    hooks::AFTER_DL_PREMISE.set(Some(Box::new(|| {
+        std::thread::sleep(Duration::from_millis(600));
+    })));
+    let answer = store.entails(rules, &not_in("a", "C"));
+    hooks::AFTER_DL_PREMISE.set(None);
+    assert!(
+        matches!(answer, Err(crate::StoreError::Undecided(_))),
+        "{answer:?}"
+    );
+}
+
 /// The store's check of `conclusion` under `owl2-dl` with `dl.timeout` 300 ms over `data`,
 /// its rules' pass taking 600 ms when `late`.
 fn entails_in_300_ms(data: &str, conclusion: &[Triple], late: bool) -> String {
