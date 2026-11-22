@@ -3367,6 +3367,124 @@ fn the_same_readers_class_read_stays_complete() {
     assert_eq!(status_class(&status), "complete", "status: {status}");
 }
 
+/// Spec (graph scope and completeness): an OWL 2 QL read by support with a restricted
+/// grant can miss a membership. Every published status withholds completeness for that
+/// grant, independent of the hidden declaration. A grant to read every graph keeps it.
+#[test]
+fn ql_completeness_for_a_reader_by_support_depends_on_the_grant() {
+    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    use nrese_store::access::{AccessState, Fallback, Inferred, Principal};
+    use nrese_store::{CancellationToken, MutationPipeline, ReadScope};
+    use std::sync::Arc;
+
+    let prefixes = format!(
+        "PREFIX : <{E}> PREFIX owl: <http://www.w3.org/2002/07/owl#> \
+         PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> "
+    );
+    let mut policy = AccessState::default();
+    policy.settings.enforced = true;
+    policy.settings.inferred = Inferred::Supported;
+    policy.settings.fallback = Fallback::Allow;
+    let all_graphs = ReadScope::of(policy.view(&Principal::default(), "default").read);
+    let token = CancellationToken::new();
+    let mut restricted = Vec::new();
+    let mut wrong = Vec::new();
+    for hidden in [true, false] {
+        let store = Arc::new(StoreService::new(StoreConfig::in_memory()).unwrap());
+        let pipeline = MutationPipeline::new(
+            Arc::clone(&store),
+            Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+                ReasoningMode::Owl2Ql,
+            ))),
+        );
+        let write = |data| {
+            let report = pipeline
+                .execute_update_str(&format!("{prefixes}INSERT DATA {{ {data} }}"))
+                .unwrap();
+            assert!(report.applied, "setup must commit");
+        };
+        write(
+            ":Doc a owl:Class . :alice a owl:NamedIndividual ; :note :bob . :note rdfs:domain :Doc .",
+        );
+        if hidden {
+            write("GRAPH :hidden { :note a owl:AnnotationProperty }");
+        }
+        let ask = format!("{prefixes}ASK {{ :alice a :Doc }}");
+        for (reader, scope, expected) in [
+            ("by support", reader_by_support(), "sound-only"),
+            ("all-graph grant", all_graphs.clone(), "complete"),
+            ("unrestricted", ReadScope::All, "complete"),
+        ] {
+            let request = SparqlQueryRequest::new(&ask, scope);
+            let cold = store.execute_query(&request).unwrap();
+            let hits = store.query_cache_stats().hits;
+            let warm = store.execute_query(&request).unwrap();
+            assert!(store.query_cache_stats().hits > hits, "{reader}: cache hit");
+            for result in [&cold, &warm] {
+                let json: serde_json::Value = serde_json::from_slice(&result.payload).unwrap();
+                assert_eq!(json["boolean"], !hidden, "{reader}: ASK answer");
+            }
+            let prepared = store.prepare_query(&request).unwrap();
+            let plan = store.plan_query(&prepared, &token).unwrap();
+            let explain = store.explain_query(&prepared, &token).unwrap();
+            let statuses = [
+                ("result", cold.completeness),
+                (
+                    "result QL report",
+                    cold.ql.map(|report| report.completeness),
+                ),
+                ("cached result", warm.completeness),
+                (
+                    "cached result QL report",
+                    warm.ql.map(|report| report.completeness),
+                ),
+                ("plan", plan.completeness),
+                ("plan QL report", plan.ql.map(|report| report.completeness)),
+                ("EXPLAIN", explain.completeness),
+                (
+                    "EXPLAIN QL report",
+                    explain.ql.map(|report| report.completeness),
+                ),
+            ];
+            for (route, status) in statuses {
+                let status = status.unwrap_or_else(|| panic!("{reader}, {route}: no status"));
+                if status.as_str() != expected {
+                    wrong.push(format!(
+                        "hidden={hidden}, {reader}, {route}: {} (expected {expected})",
+                        status.as_str()
+                    ));
+                }
+                if reader == "by support" {
+                    restricted.push(status);
+                }
+            }
+        }
+        let negated = SparqlQueryRequest::new(
+            format!("{prefixes}ASK {{ FILTER NOT EXISTS {{ :alice a :Doc }} }}"),
+            reader_by_support(),
+        );
+        let status = store.execute_query(&negated).unwrap().completeness.unwrap();
+        if status.as_str() != "unsound" {
+            wrong.push(format!("hidden={hidden}, negation: {}", status.as_str()));
+        }
+        restricted.push(status);
+    }
+    let (hidden, absent) = restricted.split_at(restricted.len() / 2);
+    if hidden != absent {
+        wrong.push("hidden declaration changed the published status".to_owned());
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    for status in restricted {
+        assert!(
+            status
+                .reasons
+                .iter()
+                .any(|r| r.text.contains("can't read every graph")),
+            "the reason must name the grant: {status:?}"
+        );
+    }
+}
+
 /// Spec: a query without a search answers the same through the store whatever the rewriting
 /// has learnt of the data: cold, from the result cache, and fresh. Sixteen arms of a union
 /// each spend one of the questions the rewriting may ask of the data (no `:qK` statement

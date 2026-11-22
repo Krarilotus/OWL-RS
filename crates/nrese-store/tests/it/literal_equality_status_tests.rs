@@ -352,9 +352,9 @@ fn literal_read_over_reopened_subproperty(
     (rebuilt, reopened)
 }
 
-/// A reopened store with a matching program: every reader is told of the unreconstructed
-/// literal-equality state under equality-capable OWL 2 RL. Under QL, the same literal read
-/// may be complete for every reader.
+/// On reopen with matching rules, unrestricted OWL 2 QL reads stay complete and
+/// restricted reads by support keep the grant cap. OWL 2 RL withholds both
+/// reads for possible literal equality until a rebuild.
 #[test]
 fn reopened_literal_reads_by_support_follow_the_matching_program() {
     use nrese_reasoner::rulesets::Ruleset;
@@ -366,37 +366,47 @@ fn reopened_literal_reads_by_support_follow_the_matching_program() {
     );
     let query = "SELECT ?x ?n { GRAPH :open { ?x :p ?n } }";
     let mut unmet = Vec::new();
-    for (regime, ruleset, ql, expected) in [
-        (
-            "owl2-ql",
-            Ruleset::Owl2Ql,
-            QlRewritingMode::Auto,
-            "complete",
-        ),
-        (
-            "owl2-rl rewriting on",
-            Ruleset::Owl2Rl,
-            QlRewritingMode::On,
-            "sound-only",
-        ),
+    for (regime, ruleset, ql) in [
+        ("owl2-ql", Ruleset::Owl2Ql, QlRewritingMode::Auto),
+        ("owl2-rl rewriting on", Ruleset::Owl2Rl, QlRewritingMode::On),
     ] {
         let dir = tempfile::tempdir().expect("dir");
         let config = || StoreConfig {
             ql_rewriting: ql,
             ..StoreConfig::on_disk(dir.path())
         };
-        let rebuilt_answer = {
+        let reads = |store: &StoreService, phase: &str, reopened, unmet: &mut Vec<String>| {
+            [
+                ("unrestricted", ReadScope::All, false),
+                (
+                    "by support",
+                    reader_of_open(true),
+                    ruleset == Ruleset::Owl2Ql,
+                ),
+            ]
+            .map(|(reader, scope, capped)| {
+                let unknown = reopened && ruleset == Ruleset::Owl2Rl;
+                let expected = if capped || unknown {
+                    "sound-only"
+                } else {
+                    "complete"
+                };
+                let (answer, word, reasons) = read_as(store, query, scope);
+                if word != expected
+                    || reasons.iter().any(|r| r.contains(REOPENED)) != unknown
+                    || reasons.iter().any(|r| r.contains("can't read every graph")) != capped
+                {
+                    unmet.push(format!("{regime} {reader} {phase}: {word} {reasons:?}"));
+                }
+                answer
+            })
+        };
+        let rebuilt_answers = {
             let store = StoreService::new(config()).expect("store");
             (store.execute_update(&SparqlUpdateRequest::new(data.clone()))).expect("data");
             store.rematerialise(ruleset).expect("rebuild");
             store.use_reasoning_rules(Some(ruleset.into()));
-            let (answer, word, reasons) = read_as(&store, query, reader_of_open(true));
-            if word != "complete" {
-                unmet.push(format!(
-                    "setup: {regime} before the reopen: {word} {reasons:?}"
-                ));
-            }
-            answer
+            reads(&store, "before reopen", false, &mut unmet)
         };
         let store = StoreService::new(config()).expect("reopen");
         store.use_reasoning_rules(Some(ruleset.into()));
@@ -404,27 +414,14 @@ fn reopened_literal_reads_by_support_follow_the_matching_program() {
             store.last_materialisation().is_none(),
             "{regime}: the reopened store was rematerialised"
         );
-        for (reader, scope) in [
-            ("by support", reader_of_open(true)),
-            ("of every graph", ReadScope::All),
-        ] {
-            let (answer, word, reasons) = read_as(&store, query, scope);
-            if word != expected
-                || reasons.iter().any(|r| r.contains(REOPENED)) != (expected == "sound-only")
-            {
-                unmet.push(format!("{regime} {reader} reopened: {word} {reasons:?}"));
-            }
-            if answer != rebuilt_answer {
-                unmet.push(format!(
-                    "{regime} {reader} reopened: {answer} != {rebuilt_answer}"
-                ));
-            }
+        let reopened_answers = reads(&store, "reopened", true, &mut unmet);
+        if reopened_answers != rebuilt_answers {
+            unmet.push(format!(
+                "{regime} reopened answers: {reopened_answers:?} != {rebuilt_answers:?}"
+            ));
         }
         store.rematerialise(ruleset).expect("rebuild");
-        let (_, word, reasons) = read_as(&store, query, reader_of_open(true));
-        if word != "complete" {
-            unmet.push(format!("{regime} by support rebuilt: {word} {reasons:?}"));
-        }
+        reads(&store, "rebuilt", false, &mut unmet);
     }
     assert!(
         unmet.is_empty(),
