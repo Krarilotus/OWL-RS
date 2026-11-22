@@ -608,7 +608,7 @@ pub(crate) fn inline_integer_datatypes(ids: &[u64]) -> Option<(bool, bool)> {
     let datatype = |raw: u64| {
         let tag = raw >> PAYLOAD_BITS;
         let code = (raw & ((1 << CODE_BITS) - 1)).min(DERIVED_RANK.len() as u64);
-        tag << CODE_BITS | code * u64::from(tag == DERIVED)
+        (tag << CODE_BITS) | (code * u64::from(tag == DERIVED))
     };
     let Some(first) = ids.iter().find(|&&raw| raw != UNDEF) else {
         return Some((false, false));
