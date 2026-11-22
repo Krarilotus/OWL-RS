@@ -75,10 +75,10 @@ pub async fn execute_query_in(
     } else {
         prepared.media_type()
     };
-    let store = state.store();
-    // The envelope of the request's one run, opened by the store that runs it: the run draws
-    // on it, and so does an answer held whole.
-    let memory = store.open_run(&prepared);
+    // The request's one run, opened by the store that runs it: the run draws on its envelope,
+    // and so does an answer held whole.
+    let run = state.store().open_run(&prepared);
+    let memory = run.memory().clone();
     let cancellation = CancellationToken::new();
     let token = cancellation.clone();
     // The completeness goes with the answers, in a header: the store reports it on the
@@ -99,7 +99,6 @@ pub async fn execute_query_in(
         *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(value);
         made
     };
-    let announced = prepared.clone();
     let scoped = request.inference_scope_dataset;
     let mut response = stream_blocking(
         Pace::Total(deadline),
@@ -114,13 +113,13 @@ pub async fn execute_query_in(
         move |out| {
             if explain != Explain::No {
                 let (body, completeness) = if explain == Explain::Plan {
-                    let plan = store
-                        .plan_query(&prepared, &token)
+                    let plan = run
+                        .plan(&token)
                         .map_err(|error| map_query_error(&policy, error))?;
                     (plan_json(&plan), plan.completeness)
                 } else {
-                    let explanation = store
-                        .explain_query(&prepared, &token)
+                    let explanation = run
+                        .explain(&token)
                         .map_err(|error| map_query_error(&policy, error))?;
                     (explanation_json(&explanation), explanation.completeness)
                 };
@@ -131,10 +130,8 @@ pub async fn execute_query_in(
                     .map_err(|error| ApiError::internal(error.to_string()));
             }
             match &pending {
-                None => store.run_query_reporting(&prepared, &token, out, report),
-                Some(pending) => {
-                    store.run_query_pending_reporting(pending, &prepared, &token, out, report)
-                }
+                None => run.run_reporting(&token, out, report),
+                Some(pending) => run.run_pending_reporting(pending, &token, out, report),
             }
             .map_err(|error| map_query_error(&policy, error))
         },
@@ -143,7 +140,7 @@ pub async fn execute_query_in(
     // The run decided the announcement on what its reader reads before its first byte, which
     // `stream_blocking` waits for: the media type is the run's (its place among the headers kept).
     if explain == Explain::No {
-        let announcement = announced.media_type();
+        let announcement = prepared.media_type();
         let parameters = announcement.find(';').map_or("", |i| &announcement[i..]);
         let media_type = HeaderValue::from_str(&format!("{media_type}{parameters}"))
             .map_err(|error| ApiError::internal(error.to_string()))?;

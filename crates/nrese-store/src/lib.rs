@@ -129,7 +129,7 @@ pub use reasoning_state::{ConsistencyStatus, ReasoningState, WhyUndecided};
 pub use running::{RunningQueries, RunningQuery};
 pub use runtime::Runtime;
 pub use scope::{EntryPoint, ReadContext, ReadScope, Requester, WriteScope};
-pub use service::StoreService;
+pub use service::{QueryRun, StoreService};
 pub use sessions::{SESSION_IDLE, Sessions};
 pub use shacl::{
     ShaclResultText, ShaclValidation, ShaclValidationRequest, ShapesSource, ValidatedGraphs,

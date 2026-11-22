@@ -24,6 +24,62 @@ use crate::update::{SparqlUpdateRequest, UpdateExecutionReport};
 /// ([`StoreService::run_query_reporting`]).
 pub type StatusHeader = Option<std::sync::Arc<str>>;
 
+/// One run of a prepared query, opened by the store that runs it ([`StoreService::open_run`]),
+/// with the memory envelope everything of the run draws on: its evaluations, retained results
+/// and DL tasks, and what its transport holds of its output (an answer held whole,
+/// [`Self::memory`]). Each run has an envelope of its own and executes once: two runs of one
+/// prepared query, at once or one after another, share neither a limit nor a refusal, and
+/// nothing else hands a query an envelope.
+pub struct QueryRun {
+    store: StoreService,
+    prepared: PreparedQuery,
+    memory: nrese_exec::Envelope,
+}
+
+impl QueryRun {
+    /// The run's envelope, for what its transport holds of its output.
+    pub fn memory(&self) -> &nrese_exec::Envelope {
+        &self.memory
+    }
+
+    /// [`StoreService::run_query_reporting`], as this run.
+    pub fn run_reporting(
+        self,
+        cancellation: &CancellationToken,
+        out: impl std::io::Write,
+        report: impl FnOnce(Option<nrese_sparql::Completeness>, StatusHeader) -> Option<String>,
+    ) -> StoreResult<()> {
+        self.store
+            .run_reporting(&self.prepared, &self.memory, cancellation, out, report)
+            .map(|_| ())
+    }
+
+    /// [`StoreService::run_query_pending_reporting`], as this run.
+    pub fn run_pending_reporting(
+        self,
+        pending: &crate::StatementsRequest,
+        cancellation: &CancellationToken,
+        out: impl std::io::Write,
+        report: impl FnOnce(Option<nrese_sparql::Completeness>, StatusHeader) -> Option<String>,
+    ) -> StoreResult<()> {
+        let (prepared, memory) = (&self.prepared, &self.memory);
+        self.store
+            .run_pending_reporting(pending, prepared, memory, cancellation, out, report)
+    }
+
+    /// [`StoreService::explain_query`], as this run.
+    pub fn explain(self, cancellation: &CancellationToken) -> StoreResult<crate::Explanation> {
+        self.store
+            .explain_in(&self.prepared, &self.memory, cancellation)
+    }
+
+    /// [`StoreService::plan_query`], as this run.
+    pub fn plan(self, cancellation: &CancellationToken) -> StoreResult<crate::PlannedQuery> {
+        self.store
+            .plan_in(&self.prepared, &self.memory, cancellation)
+    }
+}
+
 /// The dataset and the operations on it. Reads run on an engine snapshot and never wait for
 /// writers. Writes go through [`MutationPipeline`](crate::MutationPipeline), which gates
 /// them (access, reasoning, consistency, SHACL); the store has no public write that
@@ -1092,10 +1148,17 @@ impl StoreService {
         let mut payload = Vec::new();
         let mut completeness = None;
         let cancellation = CancellationToken::new();
-        let (_, ql) = self.run_reporting(&prepared, &cancellation, &mut payload, |status, _| {
-            completeness = status;
-            None
-        })?;
+        let memory = self.settings.query_envelope(&prepared);
+        let (_, ql) = self.run_reporting(
+            &prepared,
+            &memory,
+            &cancellation,
+            &mut payload,
+            |status, _| {
+                completeness = status;
+                None
+            },
+        )?;
         Ok(SerializedQueryResult {
             kind: prepared.kind(),
             media_type: prepared.media_type(),
@@ -1238,7 +1301,8 @@ impl StoreService {
         out: impl std::io::Write,
         report: impl FnOnce(Option<nrese_sparql::Completeness>, StatusHeader) -> Option<String>,
     ) -> StoreResult<()> {
-        self.run_reporting(prepared, cancellation, out, report)
+        let memory = self.settings.query_envelope(prepared);
+        self.run_reporting(prepared, &memory, cancellation, out, report)
             .map(|_| ())
     }
 
@@ -1253,18 +1317,20 @@ impl StoreService {
         out: impl std::io::Write,
     ) -> StoreResult<Option<(nrese_sparql::Completeness, crate::dl::DlDetail)>> {
         let mut status = None;
-        let (detail, _) = self.run_reporting(prepared, cancellation, out, |s, _| {
+        let memory = self.settings.query_envelope(prepared);
+        let (detail, _) = self.run_reporting(prepared, &memory, cancellation, out, |s, _| {
             status = s;
             None
         })?;
         Ok(status.map(|s| (s, detail.unwrap_or_default())))
     }
 
-    /// Every query run but a transaction's pending one: its refusal as its reader may be
-    /// told it ([`for_its_reader`]; the answers are the reader's own).
+    /// Every query run but a transaction's pending one, in its envelope `memory`: its refusal
+    /// as its reader may be told it ([`for_its_reader`]; the answers are the reader's own).
     fn run_reporting(
         &self,
         prepared: &PreparedQuery,
+        memory: &nrese_exec::Envelope,
         cancellation: &CancellationToken,
         out: impl std::io::Write,
         report: impl FnOnce(Option<nrese_sparql::Completeness>, StatusHeader) -> Option<String>,
@@ -1272,7 +1338,7 @@ impl StoreService {
         Option<crate::dl::DlDetail>,
         Option<nrese_sparql::ql::QlReport>,
     )> {
-        let run = self.run_reporting_whole(prepared, cancellation, out, report);
+        let run = self.run_reporting_whole(prepared, memory, cancellation, out, report);
         let run = run.map_err(|error| refusal_for_its_reader(prepared, error));
         for_its_reader(prepared, crate::EntryPoint::Run, run, |_| {})
     }
@@ -1280,6 +1346,7 @@ impl StoreService {
     fn run_reporting_whole(
         &self,
         prepared: &PreparedQuery,
+        memory: &nrese_exec::Envelope,
         cancellation: &CancellationToken,
         out: impl std::io::Write,
         report: impl FnOnce(Option<nrese_sparql::Completeness>, StatusHeader) -> Option<String>,
@@ -1290,9 +1357,9 @@ impl StoreService {
         let _running = self
             .running
             .register(prepared.text(), prepared.origin(), cancellation);
-        // The request's one envelope: every evaluation, retained result and DL task of
-        // the request draws from it.
-        let memory = self.settings.query_envelope(prepared);
+        // The run's one envelope: every evaluation, retained result and DL task of the run
+        // draws from it.
+        let memory = memory.clone();
         // One snapshot the route, the answers and their status are all of (T3, N5).
         let snapshot = self.query_view(prepared, &memory, cancellation)?;
         prepared.announce_on(&snapshot);
@@ -1545,12 +1612,15 @@ impl StoreService {
         self.settings.envelope(limit)
     }
 
-    /// Opens the memory envelope of `prepared`'s next run on this store, its memory limit
-    /// within the catalog's budget, and returns it, so that what a transport holds for that
-    /// run (an answer held whole) draws on the run's own envelope. That run alone takes it:
-    /// every other run, and a run on another catalog's store, opens its own.
-    pub fn open_run(&self, prepared: &PreparedQuery) -> nrese_exec::Envelope {
-        self.settings.open_run(prepared)
+    /// Opens one run of `prepared` on this store, with an envelope of its own: its memory
+    /// limit within this catalog's budget, which the run draws on and so does what its
+    /// transport holds of its output ([`QueryRun::memory`]).
+    pub fn open_run(&self, prepared: &PreparedQuery) -> QueryRun {
+        QueryRun {
+            store: self.clone(),
+            prepared: prepared.clone(),
+            memory: self.settings.query_envelope(prepared),
+        }
     }
 
     /// Runs a prepared query on the latest snapshot to completion and reports how it ran:
@@ -1561,10 +1631,21 @@ impl StoreService {
         prepared: &PreparedQuery,
         cancellation: &CancellationToken,
     ) -> StoreResult<crate::Explanation> {
+        let memory = self.settings.query_envelope(prepared);
+        self.explain_in(prepared, &memory, cancellation)
+    }
+
+    /// [`Self::explain_query`] in the envelope `memory`.
+    fn explain_in(
+        &self,
+        prepared: &PreparedQuery,
+        memory: &nrese_exec::Envelope,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<crate::Explanation> {
         for_its_reader(
             prepared,
             crate::EntryPoint::Explain,
-            self.explain_whole(prepared, cancellation),
+            self.explain_whole(prepared, memory, cancellation),
             |explanation| {
                 explanation.steps.clear();
                 explanation.rewrites.clear();
@@ -1582,12 +1663,13 @@ impl StoreService {
     fn explain_whole(
         &self,
         prepared: &PreparedQuery,
+        memory: &nrese_exec::Envelope,
         cancellation: &CancellationToken,
     ) -> StoreResult<crate::Explanation> {
         let _running = self
             .running
             .register(prepared.text(), prepared.origin(), cancellation);
-        let memory = self.settings.query_envelope(prepared);
+        let memory = memory.clone();
         let snapshot = self.query_view(prepared, &memory, cancellation)?;
         #[cfg(test)]
         hooks::run(&hooks::AFTER_DECIDED);
@@ -1630,10 +1712,21 @@ impl StoreService {
         prepared: &PreparedQuery,
         cancellation: &CancellationToken,
     ) -> StoreResult<crate::PlannedQuery> {
+        let memory = self.settings.query_envelope(prepared);
+        self.plan_in(prepared, &memory, cancellation)
+    }
+
+    /// [`Self::plan_query`] in the envelope `memory`.
+    fn plan_in(
+        &self,
+        prepared: &PreparedQuery,
+        memory: &nrese_exec::Envelope,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<crate::PlannedQuery> {
         for_its_reader(
             prepared,
             crate::EntryPoint::Plan,
-            self.plan_whole(prepared, cancellation),
+            self.plan_whole(prepared, memory, cancellation),
             |planned| {
                 planned.steps.clear();
                 planned.rewrites.clear();
@@ -1650,9 +1743,10 @@ impl StoreService {
     fn plan_whole(
         &self,
         prepared: &PreparedQuery,
+        memory: &nrese_exec::Envelope,
         cancellation: &CancellationToken,
     ) -> StoreResult<crate::PlannedQuery> {
-        let memory = self.settings.query_envelope(prepared);
+        let memory = memory.clone();
         let snapshot = self.query_view(prepared, &memory, cancellation)?;
         #[cfg(test)]
         hooks::run(&hooks::AFTER_DECIDED);
@@ -1876,8 +1970,24 @@ impl StoreService {
         out: impl std::io::Write,
         report: impl FnOnce(Option<nrese_sparql::Completeness>, StatusHeader) -> Option<String>,
     ) -> StoreResult<()> {
+        let memory = self.settings.query_envelope(prepared);
+        self.run_pending_reporting(pending, prepared, &memory, cancellation, out, report)
+    }
+
+    /// [`Self::run_query_pending_reporting`] in the envelope `memory`.
+    fn run_pending_reporting(
+        &self,
+        pending: &crate::StatementsRequest,
+        prepared: &PreparedQuery,
+        memory: &nrese_exec::Envelope,
+        cancellation: &CancellationToken,
+        out: impl std::io::Write,
+        report: impl FnOnce(Option<nrese_sparql::Completeness>, StatusHeader) -> Option<String>,
+    ) -> StoreResult<()> {
         if pending.ops.is_empty() {
-            return self.run_query_reporting(prepared, cancellation, out, report);
+            return self
+                .run_reporting(prepared, memory, cancellation, out, report)
+                .map(|_| ());
         }
         if prepared.inference_scope.is_some() {
             return Err(nrese_sparql::QueryEvaluationError::Argument(
@@ -1890,7 +2000,7 @@ impl StoreService {
             .register(prepared.text(), prepared.origin(), cancellation);
         let scope = crate::ReadScope::of(prepared.access().cloned());
         let deletes = !pending.ops.iter().all(adds_only);
-        let memory = self.settings.query_envelope(prepared);
+        let memory = memory.clone();
         // Announced on the committed view, as outside a transaction: what the transaction
         // asserts itself isn't (a refused view is told as the run's refusal is).
         let latest = &self.engine.snapshot();
