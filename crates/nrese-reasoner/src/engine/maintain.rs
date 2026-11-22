@@ -294,6 +294,28 @@ pub fn maintain_with(
     memory: &Arc<Budget>,
     uses_rebuilt_report: bool,
 ) -> Result<Maintenance, delta::Interrupted> {
+    maintain_with_report_budget(
+        program,
+        ground,
+        tx,
+        operation,
+        memory,
+        &|| Arc::clone(memory),
+        uses_rebuilt_report,
+    )
+}
+
+/// [`maintain_with`] with a separate budget for the working witnesses of a redeclaration
+/// judged by its introduced clashes. Only the resulting report is charged to `memory`.
+pub fn maintain_with_report_budget(
+    program: &Program,
+    ground: Option<&GroundProgram>,
+    tx: &mut Transaction<'_>,
+    operation: &OperationStop<'_>,
+    memory: &Arc<Budget>,
+    working_memory: &dyn Fn() -> Arc<Budget>,
+    uses_rebuilt_report: bool,
+) -> Result<Maintenance, delta::Interrupted> {
     // Axioms that need an inferred copy published by this commit.
     let mut missing_axioms: Vec<Triple> = Vec::new();
     // Unnamed classes left out: as the commit leaves them; one it makes consumable
@@ -305,18 +327,6 @@ pub fn maintain_with(
         (program.schema.clone().hiding(after), revived)
     } else {
         (program.schema.clone(), false)
-    };
-    // Revived memberships must participate in the delta executor's introduced-only
-    // consistency checks. Keep the batch result for installation below: no second run.
-    let mut rebuilt = if revived {
-        Some(super::materialise_with(
-            program,
-            &tx.pending_snapshot(),
-            operation,
-            memory,
-        )?)
-    } else {
-        None
     };
     // A first load (no asserted fact before, nothing deleted): its closure is the whole
     // closure, so it is materialised once, by the batch executor, and its violations are
@@ -342,16 +352,6 @@ pub fn maintain_with(
         && tx.deleted().next().is_none()
         && tx.inserted().next().is_some()
         && program.axioms_conclude_only_storable(tx.base(), operation, memory)?;
-    let mut unstorable: Vec<Triple> = Vec::new();
-    if first_load {
-        rebuilt = Some(super::materialise::materialise_with_unstorable(
-            program,
-            &tx.pending_snapshot(),
-            operation,
-            memory,
-            &mut unstorable,
-        )?);
-    }
     // A change that changes the asserted annotation-property set changes what the rules
     // read throughout the closure, so it is rebuilt. A first load already has a rebuild;
     // its introduced-only check uses the pending rules and grounds that agree with them.
@@ -369,6 +369,29 @@ pub fn maintain_with(
         None
     };
     let redeclared = !first_load && changed_annotations.is_some();
+    let comparison_memory = (redeclared && !uses_rebuilt_report).then(working_memory);
+    let rebuild_memory = comparison_memory.as_ref().unwrap_or(memory);
+    // Revived memberships participate in the delta executor's introduced-only checks.
+    // Keep the full result for installation below, so it is computed once.
+    let mut unstorable = Vec::new();
+    let mut rebuilt = if first_load {
+        Some(super::materialise::materialise_with_unstorable(
+            program,
+            &tx.pending_snapshot(),
+            operation,
+            rebuild_memory,
+            &mut unstorable,
+        )?)
+    } else if revived {
+        Some(super::materialise_with(
+            program,
+            &tx.pending_snapshot(),
+            operation,
+            rebuild_memory,
+        )?)
+    } else {
+        None
+    };
     let delta_annotations = if redeclared {
         None
     } else {
@@ -596,7 +619,9 @@ pub fn maintain_with(
     if rebuild {
         let mut closure = match rebuilt.take() {
             Some(closure) => closure,
-            None => super::materialise_with(program, &tx.pending_snapshot(), operation, memory)?,
+            None => {
+                super::materialise_with(program, &tx.pending_snapshot(), operation, rebuild_memory)?
+            }
         };
         // An interruption drops the transaction, these changes with it.
         if operation.fired() {
@@ -618,26 +643,36 @@ pub fn maintain_with(
                 false => found,
             }
         });
-        if redeclared && !uses_rebuilt_report && !closure.violations.consistent() {
+        let (added, dropped) = {
+            let pending = tx.pending_snapshot();
+            install_closure(&pending, &mut closure.inferred, |fact, add| match add {
+                true => tx.insert_inferred(fact),
+                false => tx.remove_inferred(fact),
+            })
+        };
+        (inserted, removed) = (inserted + added, removed + dropped);
+        drop(closure.inferred);
+
+        if let Some(working) = comparison_memory
+            .as_ref()
+            .filter(|_| !closure.violations.consistent())
+        {
             // Both runs check the entire closure, including facts the inferred stack cannot
-            // store. The old run needs its report only. An old witness stays tolerated.
+            // store. The old run needs its report only and shares the process workspace.
             let before =
-                super::materialise::violations_with(program, tx.base(), operation, memory)?;
+                super::materialise::violations_with(program, tx.base(), operation, working)?;
             let stop = || operation.fired();
             let poll = Poller::new(&stop).ok_or_else(|| operation.interrupted())?;
             closure
                 .violations
                 .remove_previous(&before, &poll)
                 .map_err(|Stopped| operation.interrupted())?;
-            update.violations = std::mem::take(&mut closure.violations);
+            drop(before);
+            update.violations = closure
+                .violations
+                .charged_to(memory, &poll)
+                .map_err(|Stopped| operation.interrupted())?;
         }
-        let pending = tx.pending_snapshot();
-        let (added, dropped) =
-            install_closure(&pending, &mut closure.inferred, |fact, add| match add {
-                true => tx.insert_inferred(fact),
-                false => tx.remove_inferred(fact),
-            });
-        (inserted, removed) = (inserted + added, removed + dropped);
         update.rounds += closure.rounds;
         // The delta cache may still contain heads rewritten for a formerly hidden
         // class. Ground the final prospective state, and publish this cache only if

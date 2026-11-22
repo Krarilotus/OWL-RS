@@ -43,7 +43,8 @@ pub use explain::{
     JustifiedStatement, explain_fact, explain_violation, justify_fact,
 };
 pub use maintain::{
-    EngineBase, Maintenance, install_closure, maintain, maintain_with, maintain_within,
+    EngineBase, Maintenance, install_closure, maintain, maintain_with, maintain_with_report_budget,
+    maintain_within,
 };
 pub use materialise::{
     Closure, equality_report_until, equality_report_with, materialise, materialise_until,
@@ -143,11 +144,6 @@ impl Program {
         let mut id = |iri: &str| lookup(NamedNodeRef::new_unchecked(iri).into()).map(TermId::raw);
         let declaring = AnnotationProperties::new(&mut id);
         quads.any(|quad| declaring.declares(triple(quad)))
-    }
-
-    /// Whether a rule reads the data's annotation properties ([`Guard::NotAnnotation`]).
-    pub fn reads_annotations(&self) -> bool {
-        self.annotations.is_some()
     }
 
     /// Whether the asserted statements change the annotation properties read by this program.

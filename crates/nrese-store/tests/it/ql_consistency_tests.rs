@@ -537,6 +537,30 @@ fn a_user_rule_on_owl2_ql_reads_an_annotation_property_as_written() {
 const UNDECLARED_DOMAIN: &str = ":note rdfs:domain :Doc . :alice :note :x .";
 const DECLARATION: &str = ":note a owl:AnnotationProperty .";
 
+/// Spec (OWL 2 Direct Semantics §1): an annotation domain entails no membership in either
+/// closure compared by the equality diagnostic. The undeclared domain entails a membership.
+#[test]
+fn the_ql_equality_diagnostic_counts_closures_with_their_annotation_set() {
+    let ruleset = nrese_reasoner::rulesets::Ruleset::Owl2Ql;
+    for (case, declaration) in [("undeclared", ""), ("annotation", DECLARATION)] {
+        let store = store(QlRewritingMode::Auto);
+        crate::support::load_past_the_pipeline(
+            &store,
+            &format!("{PREFIXES}{UNDECLARED_DOMAIN} {declaration}"),
+        );
+        let report = store.equality_report(ruleset);
+        // Two assertions and one membership, or three assertions alone.
+        assert!(
+            report.contains("replicated closure 3 facts "),
+            "{case}: {report}"
+        );
+        assert!(
+            report.contains("representatives 3 facts "),
+            "{case}: {report}"
+        );
+    }
+}
+
 /// Whether `ASK { question }` holds with `pending` (an update) pending in a client transaction.
 fn ask_pending(store: &StoreService, pending: &str, question: &str) -> bool {
     let request = SparqlQueryRequest::all(format!("{PREFIXES}ASK {{ {question} }}"));
@@ -912,6 +936,40 @@ fn a_redeclaring_commit_in_quarantine_checks_inverse_property_clashes() {
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec: a harmless redeclaration in quarantine has an empty introduced-only report. Its
+/// commit fits the request budget even when the tolerated witnesses would fill two reports.
+#[test]
+fn a_harmless_declaration_spends_no_request_budget_on_old_clashes() {
+    use std::fmt::Write as _;
+
+    let store = Arc::new(
+        StoreService::new(StoreConfig {
+            total_query_memory_bytes: 192 << 10,
+            ..crate::support::in_memory_store_config()
+        })
+        .unwrap(),
+    );
+    let mode = ReasoningMode::Owl2Ql;
+    let writer = pipeline(&store, mode);
+    let mut data = format!("{PREFIXES}:p a owl:IrreflexiveProperty .\n");
+    let clashes = 5_000;
+    for i in 0..clashes {
+        writeln!(data, ":x{i} :p :x{i} .").unwrap();
+    }
+    crate::support::load_past_the_pipeline(&store, &data);
+    let before = store.rematerialise(program(mode)).unwrap();
+    assert!(store.is_quarantined());
+    assert_eq!(
+        (before.violations, before.violations_at_least),
+        (clashes, false)
+    );
+    let applied = commit(&writer, DECLARATION);
+    assert_eq!(
+        applied, "applied",
+        "a declaration introducing no clash must be applied"
+    );
 }
 
 /// Spec (`entailment` module docs: a negative statement is decided by refutation, its opposite

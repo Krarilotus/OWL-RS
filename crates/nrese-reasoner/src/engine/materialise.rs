@@ -302,10 +302,11 @@ pub fn equality_report_with(
         .into_iter()
         .flat_map(|(p, pairs)| pairs.into_iter().map(move |(o, s)| [s, p, o]))
         .collect();
+    let rules = program.rules_for(snapshot);
     let started = Instant::now();
     let closure = crate::representatives::materialise_until(
         &input,
-        &program.rules,
+        &rules,
         program.lists.as_ref(),
         &program.schema,
         stop,
@@ -315,7 +316,7 @@ pub fn equality_report_with(
     let started = Instant::now();
     let replicated = batch::materialise_owned_with(
         input,
-        &program.rules,
+        &rules,
         program.lists.as_ref(),
         &program.schema,
         operation,

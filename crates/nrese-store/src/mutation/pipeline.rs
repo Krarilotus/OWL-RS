@@ -278,6 +278,7 @@ impl MutationPipeline {
             // The violations' list draws on the request's envelope: past it, the list stops
             // and the commit is still rejected (the change is inconsistent either way).
             let report_memory = Arc::new(envelope.part());
+            let working_memory = || self.store.operation_memory();
             // A rebuild's own report judges only over a state assessed consistent.
             let base_consistent = matches!(
                 self.store.consistency(),
@@ -289,6 +290,7 @@ impl MutationPipeline {
                 &mut tx,
                 &operation,
                 &report_memory,
+                &working_memory,
                 base_consistent,
             )
             .map_err(|interrupted| {
