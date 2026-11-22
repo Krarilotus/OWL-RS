@@ -253,15 +253,18 @@ class QuickTier(unittest.TestCase):
         # Spec (design §1), worked by hand for a change to alpha (beta depends on it, has the listed
         # explorer target; alpha has probes): fmt, message strings; clippy on alpha, every target;
         # alpha's unit tests; its it binary's probes:: module; nrese-server's generated views; one
-        # seed of alpha's random tests; beta's explorer target; the crate scan, which alpha's source
-        # reaches (push's selection, contracts.py). Not beta's tests, the W3C data, Miri, the other suite
-        # contracts (none reads it).
+        # seed of alpha's random tests; beta's explorer target; the lock files and the test-only features,
+        # though no Cargo file changed, and alpha compiled on its own, as push has them (the checklist's one
+        # command, 22 Nov 2026: push's steps that run no test); the crate scan, which alpha's source
+        # reaches (push's selection, contracts.py). Not beta's tests or beta alone, the W3C data, Miri,
+        # the other suite contracts (none reads it).
+        alone = "guarded check --locked -p alpha --lib --bins --tests"
         fallback = ["guarded clippy --locked -p alpha --all-targets",
                     "guarded test --locked --no-fail-fast -p alpha --lib",
                     "guarded test --locked --no-fail-fast -p alpha --test it -- probes::",
                     "guarded test --locked --no-fail-fast -p nrese-server --test it -- generated_views",
                     "guarded seed=SEED test --locked -q -p alpha --lib -- random",
-                    "guarded test --locked -q -p beta --lib -- explore::"]
+                    "guarded test --locked -q -p beta --lib -- explore::", alone]
         nextest = ["guarded clippy --locked -p alpha --all-targets",
                    "guarded nextest run --locked --no-fail-fast --no-tests=pass -p alpha --lib",
                    "guarded nextest run --locked --no-fail-fast --no-tests=pass -p alpha -E (binary_id(alpha::it)) "
@@ -269,9 +272,9 @@ class QuickTier(unittest.TestCase):
                    "guarded nextest run --locked --no-fail-fast --no-tests=fail -p nrese-server "
                    "-E (binary_id(nrese-server::it)) & test(generated_views)",
                    "guarded seed=SEED nextest run --locked --no-fail-fast -p alpha -E (binary_id(alpha) & test(random))",
-                   "guarded nextest run --locked --no-fail-fast -p beta -E (binary_id(beta) & test(explore::))"]
+                   "guarded nextest run --locked --no-fail-fast -p beta -E (binary_id(beta) & test(explore::))", alone]
         steps = {"fmt", "message strings", "clippy", "unit tests", "probes", "generated views", "seeds", "explorer",
-                 "crate scan"}
+                 "locks", "features", "crates alone", "crate scan"}
         for has, want in (("", fallback), ("1", nextest)):
             with self.subTest(nextest=bool(has)):
                 code, got, calls, out = self.tier("quick", ALPHA, HAS_NEXTEST=has)
