@@ -177,6 +177,27 @@ impl Evaluator {
             .insert(alias.to_owned(), term);
     }
 
+    /// How many aliases the map has room for.
+    #[cfg(test)]
+    pub(crate) fn alias_room(&self) -> usize {
+        self.aliases
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .capacity()
+    }
+
+    /// Lets `forgotten` go ([`Self::register_alias`]), with the map's room for them.
+    pub(crate) fn forget_aliases(&self, forgotten: &[String]) {
+        let mut aliases = self
+            .aliases
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for alias in forgotten {
+            aliases.remove(alias);
+        }
+        aliases.shrink_to_fit();
+    }
+
     /// The compiled `pattern` with `flags`, cached per query; `None` if it doesn't compile.
     /// A clone shares the compiled program, so matching runs outside the lock.
     fn regex(&self, pattern: &str, flags: &str) -> Option<Regex> {

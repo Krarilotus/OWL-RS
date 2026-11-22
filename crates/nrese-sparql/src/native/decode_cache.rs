@@ -29,6 +29,8 @@ pub(super) struct DecodeCache {
     /// `None` once a charge was refused: nothing is kept any more.
     kept: Option<Kept>,
     entries: usize,
+    /// Entries from earlier fills still count toward a save point's insertion mark.
+    retired: usize,
 }
 
 /// What a cache keeps, and its charge.
@@ -61,6 +63,23 @@ impl DecodeCache {
         Self {
             kept: Some(Kept::new(budget, workers)),
             entries,
+            retired: 0,
+        }
+    }
+
+    pub(super) fn mark(&self) -> usize {
+        self.retired + self.kept.as_ref().map_or(0, |kept| kept.terms.len())
+    }
+
+    /// Drop speculative entries as a unit if any were added. A cache that yielded
+    /// or was disabled during the attempt keeps that decision.
+    pub(super) fn discard_since(&mut self, mark: usize) {
+        if self.mark() != mark
+            && let Some(kept) = &self.kept
+            && !kept.terms.is_empty()
+        {
+            self.retired += kept.terms.len();
+            self.kept = Some(Kept::new(&kept.budget, kept.workers));
         }
     }
 
@@ -76,7 +95,8 @@ impl DecodeCache {
         let Some(kept) = &mut self.kept else {
             return;
         };
-        if kept.terms.len() >= self.entries {
+        let entries = kept.terms.len();
+        if entries >= self.entries {
             return;
         }
         let text = term.as_ref().map_or(0, Term::heap_bytes);
@@ -93,12 +113,14 @@ impl DecodeCache {
             if held > 0 {
                 let (budget, workers) = (Arc::clone(&kept.budget), kept.workers);
                 // The old terms and their charge go before anything new is charged.
+                self.retired += entries;
                 self.kept = None;
                 self.kept = Some(Kept::new(&budget, workers));
             }
             return;
         }
         if kept.text.take(text).is_err() {
+            self.retired += entries;
             self.kept = None;
             return;
         }
@@ -106,7 +128,10 @@ impl DecodeCache {
             // Kept already: the text it was charged for is the one kept.
             Ok((_, false)) => kept.text.give_back(text),
             Ok((_, true)) => {}
-            Err(_) => self.kept = None,
+            Err(_) => {
+                self.retired += entries;
+                self.kept = None;
+            }
         }
     }
 
@@ -114,6 +139,13 @@ impl DecodeCache {
     #[cfg(test)]
     pub(super) fn keeps(&self) -> bool {
         self.kept.is_some()
+    }
+
+    #[cfg(test)]
+    pub(super) fn bytes_for_test(&self) -> usize {
+        self.kept
+            .as_ref()
+            .map_or(0, |kept| kept.terms.charged() + kept.text.bytes())
     }
 }
 
