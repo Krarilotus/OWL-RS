@@ -100,6 +100,8 @@ impl StoreService {
                 }
                 return Ok(answer);
             }
+            // The certificate changed during the reads: the closure may be certified already.
+            return Err(StoreError::Undecided(CHANGED.to_owned()));
         }
         Err(StoreError::Configuration(format!(
             "the inferred statements aren't {}'s closure: rematerialise first",
