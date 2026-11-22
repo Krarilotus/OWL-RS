@@ -1710,8 +1710,9 @@ fn aliases_leave_a_key_built() {
 }
 
 /// A reopen with current reasoning, without a rebuild, keeps the prp-key answer and marks no
-/// list: the answer is true, and its one reason is the reopen's (whether the rules equated two
-/// literals since the last rebuild isn't recorded, docs/limits.md). The `complete` comes back
+/// list: the answer is true, sound and not `complete`, and its one reason is the reopen's
+/// (whether the rules equated two literals since the last rebuild isn't recorded,
+/// docs/limits.md). The `complete` comes back
 /// after a rebuild.
 #[test]
 fn a_reopened_store_keeps_its_long_key_answer_and_its_word_comes_back_after_a_rebuild() {
@@ -1741,6 +1742,14 @@ fn a_reopened_store_keeps_its_long_key_answer_and_its_word_comes_back_after_a_re
     assert!(
         matches!(reasons[..], [only] if only.contains("opened without a rebuild")),
         "{ask} after the reopen, the reopen's reason alone: {reasons:?}"
+    );
+    assert!(
+        answer
+            .completeness
+            .as_ref()
+            .is_some_and(|c| c.sound && !c.complete),
+        "{ask} after the reopen: {:?}",
+        answer.completeness
     );
     let rules = (reopened.reasoner().config().materialised_program()).expect("owl2-rl rules");
     store.rematerialise(rules).expect("rebuild");
