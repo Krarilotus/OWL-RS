@@ -95,13 +95,14 @@ fn a_complement_only_an_existentials_successor_refutes_is_entailed() {
 }
 
 /// Spec (`entailment` module docs: what the DL engines can't decide is undecided): with no
-/// time for the DL check, a complement only it shows is undecided, never denied; one the
-/// rules show (`cax-dw` on `:x a :A`, `:A` disjoint with `:B`) is entailed as before.
+/// time for the DL check (the shortest timeout the store takes), a complement only it shows
+/// is undecided, never denied; one the rules show (`cax-dw` on `:x a :A`, `:A` disjoint with
+/// `:B`) is entailed as before.
 #[test]
 fn a_dl_check_out_of_time_leaves_the_answer_undecided() {
     let dl = super::pipeline_with(nrese_store::DlConfig {
         consistency: nrese_store::DlConsistency::Off,
-        timeout: Some(std::time::Duration::ZERO),
+        timeout: Some(std::time::Duration::from_nanos(1)),
         ..nrese_store::DlConfig::default()
     });
     let premise = EMPTY_C[0].1.replace("{some}", SOME_A);
