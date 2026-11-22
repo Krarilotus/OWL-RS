@@ -5,6 +5,7 @@
 mod functional;
 mod list_cells;
 mod order;
+mod premise;
 mod ql_status;
 mod typing;
 
