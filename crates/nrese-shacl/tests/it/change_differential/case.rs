@@ -1,5 +1,5 @@
 use nrese_engine::{EncodedTriple, Engine, EngineConfig, GraphSelector, Snapshot, Transaction};
-use nrese_rdf::{NamedNode, NamedNodeRef, Quad};
+use nrese_rdf::{GraphName, NamedNode, NamedNodeRef, Quad};
 use nrese_rdf_io::{RdfFormat, RdfParser};
 use nrese_shacl::{
     Selection, Shapes, ValidationReport, compile, validate, validate_changes,
@@ -58,6 +58,18 @@ impl Step {
             remove: quads(turtle),
             ..Self::default()
         }
+    }
+
+    /// An edit of asserted quads in the shapes graph only, its shapes left as they were: a
+    /// change the shapes change entry point must find nothing in.
+    pub fn edits_only_the_shapes_graph(&self) -> bool {
+        let in_shapes = |quad: &Quad| quad.graph_name == GraphName::NamedNode(ex("shapes"));
+        let quads = || self.add.iter().chain(&self.remove);
+        self.shapes.is_none()
+            && self.infer.is_empty()
+            && self.retract.is_empty()
+            && quads().next().is_some()
+            && quads().all(in_shapes)
     }
 }
 
@@ -196,7 +208,7 @@ impl Case {
                     validate_changes(before, after, shapes_before, data, &changed, resources)
                 })?,
             });
-            if step.shapes.is_some() {
+            if step.shapes.is_some() || step.edits_only_the_shapes_graph() {
                 let shapes_after = compile_shapes(&after)?;
                 let full_after = reference(&after, &shapes_after)?;
                 evaluations.push(Evaluation {

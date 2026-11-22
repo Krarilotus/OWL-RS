@@ -101,20 +101,25 @@ pub(super) fn replay(test: &str, outer: &str, case: &str) -> String {
 pub(super) fn run() {
     let outer = std::env::var("NRESE_FUZZ_SEED").unwrap_or_else(|_| "0".into());
     let selector = std::env::var("NRESE_SHACL_CASE").ok();
-    let draws: Vec<(String, Case, Option<String>)> = match selector.as_deref() {
-        None => (0..DRAWS)
-            .map(|index| (index.to_string(), draw::case(index), None))
-            .collect(),
+    type Draw = (String, Case, Option<String>);
+    let draws: Box<dyn Iterator<Item = Draw>> = match selector.as_deref() {
+        // Drawn on (up to ten times as many) until a draw introduces a result, so that the
+        // batch never compares nothing new whatever the seed (as `incremental_tests` do).
+        None => Box::new((0..DRAWS * 10).map(|index| (index.to_string(), draw::case(index), None))),
         Some(row) if row.starts_with("row:") => return matrix::run(),
         Some(saved) if saved.starts_with("saved:") => {
             let (case, recorded) = witnesses::load(&saved["saved:".len()..]);
-            vec![(saved.into(), case, recorded)]
+            Box::new(std::iter::once((saved.into(), case, recorded)))
         }
         Some(index) => {
             let index = (index.parse::<u64>().ok())
-                .filter(|index| *index < DRAWS)
+                .filter(|index| *index < DRAWS * 10)
                 .unwrap_or_else(|| panic!("no case matches NRESE_SHACL_CASE={index}"));
-            vec![(index.to_string(), draw::case(index), None)]
+            Box::new(std::iter::once((
+                index.to_string(),
+                draw::case(index),
+                None,
+            )))
         }
     };
     // A saved case is compared exactly; only a verified entry at its own selector accepts a
@@ -128,11 +133,18 @@ pub(super) fn run() {
         Vec::new()
     };
     let (mut equality, mut shapes_edits, mut inferred_edits, mut introducing) = (0, 0, 0, 0);
+    let (mut count, mut controls) = (0, 0);
     let mut failures = Vec::new();
-    for (selector, case, recorded) in &draws {
+    for draw in draws {
+        if selector.is_none() && count >= DRAWS && introducing > 0 {
+            break;
+        }
+        count += 1;
+        let (selector, case, recorded) = (&draw.0, &draw.1, &draw.2);
         equality += usize::from(case.equality);
         for step in &case.steps {
             shapes_edits += usize::from(step.shapes.is_some());
+            controls += usize::from(step.edits_only_the_shapes_graph());
             inferred_edits += usize::from(!step.infer.is_empty() || !step.retract.is_empty());
         }
         let verdict = check(case, selector, &gaps);
@@ -188,15 +200,15 @@ pub(super) fn run() {
         }
     }
     println!(
-        "{} draws: {equality} with equality, {shapes_edits} shapes edits, {inferred_edits} \
-         inferred edits, {introducing} evaluations introducing results",
-        draws.len()
+        "{count} draws: {equality} with equality, {shapes_edits} shapes edits, {controls} \
+         edits only of the shapes graph, {inferred_edits} inferred edits, {introducing} \
+         evaluations introducing results"
     );
     if let Some(first) = failures.first() {
-        panic!(
-            "{first}\n{} of {} draws deviate",
-            failures.len(),
-            draws.len()
-        );
+        panic!("{first}\n{} of {count} draws deviate", failures.len());
     }
+    assert!(
+        selector.is_some() || introducing > 0,
+        "no draw of {count} introduced a result: the batch compared nothing new"
+    );
 }
