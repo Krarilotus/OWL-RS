@@ -517,6 +517,11 @@ class PushGate(Repo):
         self.git(self.repo, "commit", "-q", "-m", "many")
         tip = self.git(self.repo, "rev-parse", "HEAD")
         self.fleet("pending")
+        # The pusher's own order for diffs, the rename's new name first, where git's order has it near the
+        # end: the list is in git's order still, as the host makes it (review r2 of pkg/contracts-by-reads,
+        # 22 Nov 2026).
+        (self.root / "pusher-order").write_text("many/a.txt\n")
+        self.git(self.repo, "config", "diff.orderFile", "../pusher-order")
         self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", ZERO))
         request = (self.fake / "job-0.toml").read_text()
         self.assertLess(len(request.encode()), 64 * 1024, "SPEC long-range: the request is over the fleet's limit")

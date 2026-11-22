@@ -543,7 +543,7 @@ changed_files() {
     gate_files diff --no-renames --name-only HEAD
   else
     [ -n "${push_base:-}" ] && [ -n "${push_commit:-}" ] || return 2
-    gate_files diff --no-renames --name-only "$push_base" "$push_commit"
+    gate_files diff --no-renames -O/dev/null --name-only "$push_base" "$push_commit"  # git's order, as the host's
     return
   fi
   gate_files ls-files --others --exclude-standard

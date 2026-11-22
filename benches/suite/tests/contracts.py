@@ -120,8 +120,9 @@ def main(argv: list[str]) -> int:
     lines = sys.stdin.buffer.read().decode("utf-8", "surrogateescape").split("\n")
     changed = [line.strip("\r") for line in lines if line.strip("\r")]
     picked = select(contracts, changed)
-    if picked is not None:
-        print("\n".join(picked) if picked else "none")
+    if picked is not None:  # UTF-8 too: the names go into the fleet's request (TOML), whatever the code page
+        sys.stdout.buffer.write((("\n".join(picked) if picked else "none") + "\n").encode("utf-8"))
+        sys.stdout.flush()
     return 0
 
 

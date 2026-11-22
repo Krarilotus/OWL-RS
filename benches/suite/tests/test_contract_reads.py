@@ -142,8 +142,13 @@ class Command(unittest.TestCase):
         (self.repo / TESTS / "test_über.py").write_text("import os\n", newline="\n")
         self.git("add", "-A")
         self.git("commit", "-qm", "a contract named outside ASCII")
-        picked = self.select("a.txt", commit=self.git("rev-parse", "HEAD"))
-        self.assertEqual(picked, ["test_a", "test_c", "test_über"], "SPEC commit: every contract of the commit")
+        # Its output as bytes: UTF-8 whatever the console's code page, as the fleet's request (TOML) carries it.
+        at = self.git("rev-parse", "HEAD")
+        done = subprocess.run([sys.executable, f"{TESTS}/contracts.py", "select", "--commit", at], cwd=self.repo,
+                              input=b"a.txt\n", capture_output=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.replace(b"\r\n", b"\n"), "test_a\ntest_c\ntest_über\n".encode("utf-8"),
+                         "SPEC commit: every contract of the commit, in UTF-8")
 
     def test_a_usage_error_prints_nothing_to_run(self):
         done = subprocess.run([sys.executable, f"{TESTS}/contracts.py", "pick"], cwd=self.repo, capture_output=True,
