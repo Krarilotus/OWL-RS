@@ -584,34 +584,6 @@ impl Running {
             self.max = Some((value, id));
         }
     }
-
-    /// [`Self::add`] in a column of several datatypes: of equal values of two datatypes (two
-    /// terms), the extremes `value::order` puts first and last. One decode a row; the same
-    /// id is the same term, so only an equal value of another id compares datatypes.
-    fn add_mixed(&mut self, id: u64) {
-        if id == UNDEF {
-            self.unbound = true;
-            return;
-        }
-        self.count += 1;
-        let Some(value) = TermId::from_raw(id).as_inline_integer() else {
-            return;
-        };
-        match self.sum.checked_add(value) {
-            Some(sum) => self.sum = sum,
-            None => self.overflow = true,
-        }
-        if self.min.is_none_or(|(m, mid)| {
-            value < m || (value == m && id != mid && inline_order(&id, &mid).is_lt())
-        }) {
-            self.min = Some((value, id));
-        }
-        if self.max.is_none_or(|(m, mid)| {
-            value > m || (value == m && id != mid && inline_order(&id, &mid).is_gt())
-        }) {
-            self.max = Some((value, id));
-        }
-    }
 }
 
 /// `value::order` of two inline integers: by value, then (one value
@@ -917,9 +889,11 @@ fn one_pass_plan(
     Some((plan, mixed))
 }
 
-/// [`aggregate_in_one_pass`]'s pass over the rows where a MIN or MAX column holds several
-/// datatypes, with [`Running::add_mixed`]. Out of line and cold, so the ordinary pass keeps
-/// its code; its state is per group, like that pass's, never per row.
+/// [`aggregate_in_one_pass`]'s pass where a MIN or MAX column holds several datatypes, one
+/// aggregate at a time. A MIN or MAX keeps one [`value::order_key`] per group, the extreme
+/// in [`value::order`], and recovers its id once per group; the others take
+/// [`Running::add`]. Out of line and cold, so the ordinary pass keeps its code; its state is
+/// per group, like that pass's, never per row.
 #[cold]
 #[inline(never)]
 fn mixed_pass(
@@ -929,12 +903,47 @@ fn mixed_pass(
     running: &mut [Running],
     rows: &mut [u64],
 ) {
-    for (row, &group) in group_of.iter().enumerate() {
-        let group = group as usize;
-        rows[group] += 1;
-        for (a, (column, _)) in plan.iter().enumerate() {
-            if let Some(column) = column {
-                running[group * plan.len() + a].add_mixed(solutions.table.get(row, *column));
+    for &group in group_of {
+        rows[group as usize] += 1;
+    }
+    for (a, (column, name)) in plan.iter().enumerate() {
+        let Some(column) = column else { continue };
+        let ids = solutions.table.column(*column);
+        let at = |group: usize| group * plan.len() + a;
+        let max = match name {
+            AggregateFunction::Min => false,
+            AggregateFunction::Max => true,
+            _ => {
+                for (&group, &id) in group_of.iter().zip(ids) {
+                    running[at(group as usize)].add(id);
+                }
+                continue;
+            }
+        };
+        // No key is 0 or `u64::MAX`: a group still at `none` has no value.
+        let none = if max { 0 } else { u64::MAX };
+        let mut keys = vec![none; rows.len()];
+        for (&group, &id) in group_of.iter().zip(ids) {
+            if id == UNDEF {
+                running[at(group as usize)].unbound = true;
+                continue;
+            }
+            let key = value::order_key(TermId::from_raw(id)).expect("the plan's inline integers");
+            let best = &mut keys[group as usize];
+            *best = if max {
+                (*best).max(key)
+            } else {
+                (*best).min(key)
+            };
+        }
+        for (group, key) in keys.into_iter().enumerate().filter(|&(_, key)| key != none) {
+            let id = value::order_key_id(key);
+            let extreme = id.as_inline_integer().map(|value| (value, id.raw()));
+            let running = &mut running[at(group)];
+            if max {
+                running.max = extreme
+            } else {
+                running.min = extreme
             }
         }
     }

@@ -211,6 +211,38 @@ pub(crate) fn decode_derived(payload: u64) -> (i64, usize) {
     (value, (payload & ((1 << DERIVED_CODE_BITS) - 1)) as usize)
 }
 
+/// A derived integer's value offset on the plain integers' scale, less its own.
+const DERIVED_OFFSET: u64 = DERIVED_MIN.wrapping_sub(INT_MIN) as u64;
+
+/// [`TermId::inline_integer_fields`].
+#[inline]
+pub(crate) fn integer_fields(id: TermId) -> Option<(u64, Option<u8>)> {
+    match id.kind() {
+        TermKind::Integer => Some((id.payload(), None)),
+        TermKind::DerivedInteger => {
+            let code = (id.payload() & ((1 << DERIVED_CODE_BITS) - 1)) as u8;
+            ((code as usize) < DERIVED.len()).then(|| {
+                (
+                    (id.payload() >> DERIVED_CODE_BITS) + DERIVED_OFFSET,
+                    Some(code),
+                )
+            })
+        }
+        _ => None,
+    }
+}
+
+/// [`TermId::from_inline_integer_fields`].
+pub(crate) fn from_integer_fields(offset: u64, code: Option<u8>) -> TermId {
+    match code {
+        None => TermId::new(TermKind::Integer, offset),
+        Some(code) => TermId::new(
+            TermKind::DerivedInteger,
+            (offset - DERIVED_OFFSET) << DERIVED_CODE_BITS | code as u64,
+        ),
+    }
+}
+
 /// The derived-integer ids with a value in `low..=high` (clamped to the inline range).
 pub(crate) fn derived_range(low: i64, high: i64) -> Option<(TermId, TermId)> {
     let (low, high) = (low.max(DERIVED_MIN), high.min(DERIVED_MAX));

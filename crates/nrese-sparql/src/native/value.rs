@@ -6,6 +6,7 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::str::FromStr;
 
+use nrese_engine::TermId;
 use nrese_rdf::vocab::{rdf, xsd};
 use nrese_rdf::{Literal, Term};
 use nrese_xsd::owl::Datatype;
@@ -540,6 +541,34 @@ pub fn order(a: Option<&Term>, b: Option<&Term>) -> Ordering {
     }
 }
 
+/// [`order`] of equal inline integers is by datatype IRI: each datatype's rank among the
+/// 13 IRIs, by the engine's derived datatype code; `xsd:integer` is [`INTEGER_RANK`].
+const DERIVED_RANK: [u8; 12] = [6, 4, 3, 1, 8, 0, 5, 11, 10, 12, 9, 7];
+const INTEGER_RANK: u8 = 2;
+
+/// An order key of `id`: its value's offset (`TermId::inline_integer_fields`) above, its
+/// datatype's rank in the low 4 bits. It takes the ids of inline integers (`xsd:integer`
+/// and the datatypes derived from it, each a canonical lexical form), and the comparison of
+/// two keys is [`order`] of the two terms; [`order_key_id`] gives the id back; no key is 0
+/// or `u64::MAX`. `None` for other ids (dictionary literals, other types), whose order is
+/// [`order`]'s own.
+#[inline]
+pub(crate) fn order_key(id: TermId) -> Option<u64> {
+    let (offset, code) = id.inline_integer_fields()?;
+    let rank = code.map_or(INTEGER_RANK, |code| DERIVED_RANK[code as usize]);
+    Some(offset << 4 | rank as u64)
+}
+
+/// The id of an [`order_key`].
+pub(crate) fn order_key_id(key: u64) -> TermId {
+    let rank = (key & 15) as u8;
+    let code = DERIVED_RANK
+        .iter()
+        .position(|&r| r == rank)
+        .map(|code| code as u8);
+    TermId::from_inline_integer_fields(key >> 4, code)
+}
+
 /// [`order`] of two literals, given their values.
 fn order_literals(xv: &Value, x: &Literal, yv: &Value, y: &Literal) -> Ordering {
     kind(xv)
@@ -986,6 +1015,80 @@ mod tests {
             shuffled.swap(round % n, (round * 13) % n);
             let mut sorted = shuffled.clone();
             sorted.sort_by(|a, b| order(*a, *b));
+        }
+    }
+
+    /// [`order_key`] against [`order`] on every pair of canonical inline integers: each of the
+    /// 13 datatypes at the bounds of its value space and of the inline ranges, and at values
+    /// all of them share. The keys compare as [`order`] compares the terms, and give their
+    /// ids back. Swapping two ranks in `DERIVED_RANK` (`xsd:int`'s and `xsd:byte`'s) fails it.
+    #[test]
+    fn order_key_is_term_order_on_inline_integers() {
+        use nrese_engine::{Engine, EngineConfig, TermKind};
+        let (plain, derived) = (1i128 << 59, 1i128 << 55);
+        let types: [(&str, i128, i128); 13] = [
+            ("integer", i128::MIN, i128::MAX),
+            ("nonPositiveInteger", i128::MIN, 0),
+            ("negativeInteger", i128::MIN, -1),
+            ("long", i64::MIN.into(), i64::MAX.into()),
+            ("int", i32::MIN.into(), i32::MAX.into()),
+            ("short", i16::MIN.into(), i16::MAX.into()),
+            ("byte", i8::MIN.into(), i8::MAX.into()),
+            ("nonNegativeInteger", 0, i128::MAX),
+            ("unsignedLong", 0, u64::MAX.into()),
+            ("unsignedInt", 0, u32::MAX.into()),
+            ("unsignedShort", 0, u16::MAX.into()),
+            ("unsignedByte", 0, u8::MAX.into()),
+            ("positiveInteger", 1, i128::MAX),
+        ];
+        let mut values: Vec<i128> = vec![-2, -1, 0, 1, 2];
+        for bound in [
+            plain,
+            derived,
+            1 << 31,
+            1 << 32,
+            1 << 15,
+            1 << 16,
+            1 << 7,
+            1 << 8,
+        ] {
+            values.extend([-bound - 1, -bound, -bound + 1, bound - 2, bound - 1, bound]);
+        }
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let snapshot = engine.snapshot();
+        let mut terms = Vec::new();
+        for (datatype, low, high) in types {
+            let inline = if datatype == "integer" {
+                plain
+            } else {
+                derived
+            };
+            for &value in values.iter().filter(|v| (low..=high).contains(*v)) {
+                let term = typed(&value.to_string(), datatype);
+                let id = snapshot
+                    .lookup(term.as_ref())
+                    .filter(|id| matches!(id.kind(), TermKind::Integer | TermKind::DerivedInteger));
+                assert_eq!(
+                    id.is_some(),
+                    (-inline..inline).contains(&value),
+                    "inline {term}"
+                );
+                terms.extend(id.map(|id| (term, id)));
+            }
+        }
+        assert!(terms.len() > 150, "{} terms", terms.len());
+        for (term, id) in &terms {
+            let key = order_key(*id).unwrap();
+            assert!(key != 0 && key != u64::MAX, "{term}");
+            assert_eq!(order_key_id(key), *id, "round trip of {term}");
+            for (other, other_id) in &terms {
+                let ours = key.cmp(&order_key(*other_id).unwrap());
+                assert_eq!(
+                    ours,
+                    order(Some(term), Some(other)),
+                    "{term} against {other}"
+                );
+            }
         }
     }
 }
