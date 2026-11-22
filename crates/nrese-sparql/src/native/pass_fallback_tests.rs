@@ -741,6 +741,47 @@ fn a_direct_attempt_refused_at_its_join_holds_nothing_once_restored() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// Spec: the streamed retry of a GROUP BY refused at its join leaves the same charge as
+/// adaptive streaming alone. Both routes meet the streamed join's row limit at 2.2 MB.
+/// Sample the raw budget with the contexts and their caches still live.
+#[test]
+fn a_retry_at_the_join_limit_holds_what_adaptive_streaming_holds() {
+    let snapshot = joined();
+    let text = "SELECT ?y (AVG(?x * 2) AS ?a) \
+                WHERE { ?s <urn:p0> ?x . ?s <urn:p1> ?y } GROUP BY ?y";
+    let Query::Select { pattern, .. } = SparqlParser::new().parse_query(text).unwrap() else {
+        panic!("a SELECT")
+    };
+    let (inner, keys, aggregates) = group_in(&pattern);
+    let plan = stream::Plan::of(inner, aggregates, false).expect("streamable group");
+    let options = QueryOptions {
+        as_written: false,
+        ..options(Some(2_200_000))
+    };
+    let run = |retry| {
+        let ctx = Context::new(&snapshot, &options, None, None);
+        let result = if retry {
+            ctx.group(inner, keys, aggregates, None)
+        } else {
+            ctx.group_streamed(&plan, keys, aggregates)
+        };
+        (ctx.budget.used(), result)
+    };
+    let (retry_used, retry) = run(true);
+    let (alone_used, alone) = run(false);
+    assert_eq!(
+        retry_used, alone_used,
+        "the refused retry leaves only the adaptive route's charge"
+    );
+    for result in [retry, alone] {
+        assert!(
+            matches!(result.map_err(QueryEvaluationError::from),
+                Err(QueryEvaluationError::MemoryLimit(refused)) if refused.rows.is_some()),
+            "the adaptive join reaches its row limit"
+        );
+    }
+}
+
 /// Spec: the ledger of the table charges made since a save point ([`Context::save`]) gives
 /// back only what it recorded. A table charged before a point and consumed while the point
 /// is open (as where an attempt returns without closing its point) breaks that: the query
