@@ -517,8 +517,8 @@ if [ "$mode" = push ] && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
     || git merge-base "$push_commit" refs/remotes/origin/refactor/engine-v2 2> /dev/null)}
   [ -n "$push_base" ] || { echo "no base for the push range: no upstream, and no origin/refactor/engine-v2" >&2; exit 2; }
   # What this push publishes, checked here on every push before the fleet's tier, whose remembered pass
-  # knows neither the overlay nor the messages (private_terms): the hook names the branch and the remote.
-  private_terms push "$push_base" "$push_commit" "${NRESE_PUSH_REF:-}" "${NRESE_PUSH_REMOTE_NAME:-origin}" || exit $?
+  # knows neither the overlay nor the messages (private_terms): the range's commits and the branch.
+  private_terms push "$push_base" "$push_commit" "${NRESE_PUSH_REF:-}" || exit $?
   # A measurement commit (refs/measure/*, benches/PROTOCOL.md §5) is a commit on an old side's tree,
   # which this tier isn't for: its one check is the measurement rule against the declared sides, the
   # side on a branch of the remote the push goes to (NRESE_PUSH_REMOTE, from the hook).
@@ -651,6 +651,8 @@ case "$mode" in
     # windows_inputs; process review 20 Oct 2026, §3A).
     mapfile -t files < <(changed_files commit)
     step "private terms" private_terms commit
+    # A refusal ends the tier: a later step's output (rustfmt's diff) could show the line it refused.
+    [ "${results[-1]%% *}" = 0 ] || exit "${results[-1]%% *}"
     step fmt cargo fmt --all --check
     step "message strings" message_strings
     if printf '%s\n' "${files[@]}" | grep -qE '(^|/)Cargo\.(toml|lock)$'; then

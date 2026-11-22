@@ -152,16 +152,17 @@ class CommitTier(unittest.TestCase):
 
     def test_a_private_host_name_refuses_the_commit(self):
         # The private-terms rule (scripts/check.sh private_terms; its own contract test_private_terms.py), read
-        # by the commit tier: with an overlay, a staged host name refuses the commit; with none it says so.
+        # by the commit tier: with an overlay, a staged host name refuses the commit, and no later step runs (its
+        # output could show the line); with none it says so.
         self.write("notes.txt", "runs on zznamezz\n")
         overlay = self.root / "overlay"
         overlay.mkdir()
         (overlay / "hosts.toml").write_text('[host.zzkeyzz]\nhostname = "zznamezz"\n', newline="\n")
         self.env["NRESE_BENCH_PRIVATE"] = overlay.as_posix()
         done = self.hook()
-        self.assertRegex(done.stdout, r"(?m)^=== private terms: exit 1", f"SPEC commit-tier-private-terms: the "
-                                                                          f"step refuses:\n{done.stdout}{done.stderr}")
-        self.assertNotEqual(done.returncode, 0)
+        self.assertNotEqual(done.returncode, 0, f"SPEC commit-tier-private-terms: refused:\n{done.stdout}{done.stderr}")
+        self.assertRegex(done.stdout, r"(?m)^=== private terms: exit 1")
+        self.assertNotIn("=== fmt", done.stdout, "SPEC commit-tier-private-terms: nothing runs after a refusal")
         self.assertNotIn("zznamezz", done.stdout + done.stderr)
         del self.env["NRESE_BENCH_PRIVATE"]
         done = self.hook()

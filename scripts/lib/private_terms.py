@@ -2,19 +2,20 @@
 push publishes), each called by scripts/check.sh private_terms, the one rule both read.
 
 The terms come only from the private overlay NRESE_BENCH_PRIVATE names (benches/hosts.toml's header):
-- derived from its hosts.toml's [host.NAME] tables, each field by its verdict in HOST_FIELDS; a string in a field
+- derived from its hosts.toml's [host.NAME] tables, each field by its verdict in HOST_FIELDS; a value in a field
   not listed there is derived whole, so a new field is checked before anyone has looked at it;
-- and the patterns of the optional publish-deny.txt beside it (one regular expression per line, matched ignoring
-  case), which may stay git-ignored there, so a private name need be committed nowhere.
-A derived term matches as a whole word, ignoring case. One shorter than SHORTEST can't be matched safely that
-way: it is counted and named by its field, never matched alone (a pattern in the list can cover it).
+- and the patterns of the optional publish-deny.txt beside it (one Python regular expression per line, matched
+  ignoring case), which may stay git-ignored there, so a private name need be committed nowhere.
+A derived term matches as a whole word. One shorter than SHORTEST can't be matched safely that way: it is counted
+and named by its field, never matched alone (a pattern in the list can cover it). Every term is matched line by
+line, each pattern on its own: a pattern's ^ and $ are a line's ends.
 
 It prints where a term was found, never the term or the line. Exit 0: none found; 1: found; 2: could not check
 (an overlay that is set and can't be read, a list that can't be used, a failed git read: never "clean").
 
     python scripts/lib/private_terms.py commit
-    python scripts/lib/private_terms.py push BASE HEAD [REF [REMOTE]]
-        the commits in HEAD that neither BASE ("-" for none) nor REMOTE's branches (origin's) already hold
+    python scripts/lib/private_terms.py push BASE HEAD [REF]
+        the commits in HEAD that BASE doesn't hold (the hook's BASE: the remote's own head for a branch it has)
 """
 from __future__ import annotations
 
@@ -46,14 +47,33 @@ HOST_FIELDS = {
     "queue.chunk_min": NOT, "queue.max_job_min": NOT, "queue.timing": NOT, "queue.windows": NOT,
     "queue.weekend_windows": NOT,
 }
-HOME = re.compile(r"(?:/home/|/Users/|[A-Za-z]:[/\\]Users[/\\])([^/\\\s'\"]+)")
-# Literal pathspecs whatever the caller's environment sets; a conflicting mode makes git fail (could not check).
-GIT_ENV = {**os.environ, "GIT_LITERAL_PATHSPECS": "1"}
+UNKNOWN = "a field the check doesn't know"  # its name may itself be private: never printed
+HOME = re.compile(r"(?:/home/|/Users/|[A-Za-z]:[/\\](?i:users)[/\\])([^/\\\s'\"]+)")
+# What Python reads otherwise than an extended regular expression (a push-deny list's dialect): refused, not
+# silently matched as something else.
+FOREIGN = ("[[:", r"\<", r"\>")
+# Literal pathspecs whatever the caller's environment sets (a conflicting mode makes git fail: could not check),
+# and the objects as stored: no replace ref or graft stands in for what a push sends (suitekit/checkout.py's
+# STORED_OBJECTS).
+GIT_ENV = {**os.environ, "GIT_LITERAL_PATHSPECS": "1", "GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": os.devnull}
 DIFF = ("--no-color", "--no-ext-diff", "--no-textconv", "--text", "--no-renames")
 
 
 class Unreadable(Exception):
     pass
+
+
+class Terms:
+    """The overlay's patterns, each matched on its own against each line (Git's records end at LF only)."""
+
+    def __init__(self, patterns: list[re.Pattern]):
+        self.patterns = patterns
+
+    def matches(self, value: str) -> list[re.Match]:
+        return [m for line in value.split("\n") for p in self.patterns for m in p.finditer(line)]
+
+    def search(self, value: str) -> bool:
+        return any(p.search(line) for line in value.split("\n") for p in self.patterns)
 
 
 def git(*args: str) -> bytes:
@@ -80,23 +100,31 @@ def derive(hosts: dict) -> tuple[set[str], list[str]]:
             (terms.add(term.lower()) if len(term) >= SHORTEST else short.append(field))
 
     def walk(value, field: str):
+        verdict = HOST_FIELDS.get(field, WHOLE)
+        label = field if field in HOST_FIELDS else UNKNOWN
         if isinstance(value, dict):
             for key, item in value.items():
                 walk(item, f"{field}.{key}" if field else key)
         elif isinstance(value, list):
             for item in value:
                 walk(item, field)
-        elif isinstance(value, str):
-            verdict = HOST_FIELDS.get(field, WHOLE)
-            if verdict == WHOLE:
-                add(value, field)
-            elif verdict == SSH:
-                user, _, machine = value.rpartition("@")
-                add(user, field + " (user)")
-                add(machine.split(":")[0], field + " (host)")
-            elif verdict == HOMES:
-                for found in HOME.finditer(value):
-                    add(found.group(1), field)
+        elif verdict == NOT or isinstance(value, bool):  # a flag names nothing
+            return
+        elif verdict == WHOLE:  # a number, a date or a text: as it is written
+            add(str(value), label)
+        elif not isinstance(value, str):
+            raise Unreadable(f"the overlay's {label}: not text")
+        elif verdict == SSH:
+            user, _, machine = value.rpartition("@")
+            add(user, field + " (user)")
+            if machine.startswith("["):  # [an IPv6 address]:port
+                machine = machine[1:].partition("]")[0]
+            elif machine.count(":") == 1:  # host:port
+                machine = machine.partition(":")[0]
+            add(machine, field + " (host)")
+        else:
+            for found in HOME.finditer(value):
+                add(found.group(1), label)
 
     for key, entry in hosts.items():
         add(key, "the host's key")
@@ -104,8 +132,8 @@ def derive(hosts: dict) -> tuple[set[str], list[str]]:
     return terms, short
 
 
-def matcher(folder: str) -> tuple[re.Pattern, str]:
-    """One pattern for every term of the overlay, and what it holds, by count."""
+def matcher(folder: str) -> tuple[Terms, str]:
+    """Every term of the overlay, and what it holds, by count."""
     try:
         overlay = Path(folder)
         hosts = tomllib.loads((overlay / "hosts.toml").read_text(encoding="utf-8")).get("host", {})
@@ -114,10 +142,10 @@ def matcher(folder: str) -> tuple[re.Pattern, str]:
     if not isinstance(hosts, dict):
         raise Unreadable("the overlay's [host] table")
     terms, short = derive(hosts)
-    parts = [rf"(?<![a-z0-9]){re.escape(t)}(?![a-z0-9])" for t in sorted(terms, key=len, reverse=True)]
+    words = "|".join(rf"(?<![a-z0-9]){re.escape(t)}(?![a-z0-9])" for t in sorted(terms, key=len, reverse=True))
+    patterns = [re.compile(words, re.IGNORECASE)] if words else []
     listed = overlay / LIST
-    patterns = 0
-    if listed.exists():
+    if listed.exists() or listed.is_symlink():  # a link to nothing is a list that can't be read, not no list
         try:
             lines = listed.read_text(encoding="utf-8").splitlines()
         except (OSError, ValueError) as error:
@@ -125,41 +153,43 @@ def matcher(folder: str) -> tuple[re.Pattern, str]:
         for number, line in enumerate(lines, 1):
             if not line.strip():
                 continue
+            if any(mark in line for mark in FOREIGN):
+                raise Unreadable(f"line {number} of the overlay's {LIST}, which Python would read otherwise")
             try:
-                re.compile(line, re.IGNORECASE)
+                patterns.append(re.compile(line, re.IGNORECASE))
             except re.error as error:
                 raise Unreadable(f"line {number} of the overlay's {LIST}, which is no pattern") from error
-            parts.append(f"(?:{line})")
-            patterns += 1
-    held = f"{len(terms)} derived terms, {patterns} patterns from {LIST}"
+    held = f"{len(terms)} derived terms, {len(patterns) - bool(words)} patterns from {LIST}"
     if short:
         by_field = ", ".join(sorted(set(short)))
         held += (f"; {len(short)} derived terms too short to match as a word, not checked alone (fields: "
                  f"{by_field}): give each a pattern in {LIST}")
-    return re.compile("|".join(parts) or r"(?!)", re.IGNORECASE), held
+    return Terms(patterns), held
 
 
-def where(path: str, terms: re.Pattern) -> str:
-    """A changed path's directory, unless the directory's own name holds a term."""
-    directory = path.rpartition("/")[0] or "."
-    return "a directory whose name matches (not shown)" if terms.search(directory) else directory
+def where(path: str, terms: Terms) -> str:
+    """A changed path's directory, unless a match reaches into it."""
+    directory = path.rpartition("/")[0]
+    if not directory:
+        return "."
+    hidden = terms.search(directory) or any(m.start() < len(directory) for m in terms.matches(path))
+    return "a directory whose name matches (not shown)" if hidden else directory
 
 
 def added(patch: str) -> str:
-    """A patch's added lines (one marker column per parent in a merge's combined diff). Only a hunk's lines are
-    content: a file's headers come before its first hunk header."""
-    lines, columns, in_hunk = [], 1, False
-    for line in patch.splitlines():
+    """A patch's added lines. Only a hunk's lines are content: a file's headers come before its first hunk."""
+    lines, in_hunk = [], False
+    for line in patch.split("\n"):
         if line.startswith("diff "):
             in_hunk = False
         elif line.startswith("@@"):
-            in_hunk, columns = True, len(line) - len(line.lstrip("@")) - 1
-        elif in_hunk and "+" in line[:columns] and set(line[:columns]) <= {"+", " "}:
-            lines.append(line[columns:])
+            in_hunk = True
+        elif in_hunk and line.startswith("+"):
+            lines.append(line[1:])
     return "\n".join(lines)
 
 
-def scan(label: str, paths: list[str], patch: str, per_file, terms: re.Pattern) -> list[str]:
+def scan(label: str, paths: list[str], patch: str, per_file, terms: Terms) -> list[str]:
     found = []
     for path in paths:
         if terms.search(path):
@@ -171,31 +201,31 @@ def scan(label: str, paths: list[str], patch: str, per_file, terms: re.Pattern) 
     return found
 
 
-def staged(terms: re.Pattern) -> tuple[list[str], int]:
+def staged(terms: Terms) -> tuple[list[str], int]:
     paths = [p for p in text(git("diff", "--cached", "--name-only", "-z", "--no-renames", "--diff-filter=d"))
              .split("\0") if p]
     patch = text(git("diff", "--cached", *DIFF))
     return scan("", paths, patch, lambda p: text(git("diff", "--cached", *DIFF, "--", p)), terms), 0
 
 
-def pushed(terms: re.Pattern, base: str, head: str, ref: str, remote: str) -> tuple[list[str], int]:
+def pushed(terms: Terms, base: str, head: str, ref: str) -> tuple[list[str], int]:
     found = []
     if ref and terms.search(ref.removeprefix("refs/heads/")):
         found.append("the branch name matches")
-    not_in = ([] if base == "-" else [f"^{base}"]) + ["--not", f"--remotes={remote}"]
-    commits = [line.split() for line in text(git("rev-list", "--reverse", "--parents", head, *not_in, "--"))
+    commits = [line.split() for line in text(git("rev-list", "--reverse", "--parents", head, f"^{base}", "--"))
                .splitlines()]
     for commit, *parents in commits:
         short = commit[:9]
         if terms.search(text(git("show", "-s", "--format=%B", commit))):
             found.append(f"commit {short}: message matches")
-        shape = ("--cc",) if len(parents) > 1 else ()
-        paths = [p for p in text(git("diff-tree", "-r", "-z", "--name-only", "--no-commit-id", "--root",
-                                     "--no-renames", "--diff-filter=d", *shape, commit)).split("\0") if p]
-        patch = text(git("diff-tree", "-p", "--no-commit-id", "--root", *DIFF, *shape, commit))
+        # What the commit brings to its branch: against its first parent, so a merge's lines from its other
+        # parents are read too.
+        trees = (parents[0], commit) if parents else ("--root", commit)
+        paths = [p for p in text(git("diff-tree", "-r", "-z", "--name-only", "--no-commit-id", "--no-renames",
+                                     "--diff-filter=d", *trees)).split("\0") if p]
+        patch = text(git("diff-tree", "-r", "-p", "--no-commit-id", *DIFF, *trees))
         found += scan(f"commit {short}: ", paths, patch,
-                      lambda p: text(git("diff-tree", "-p", "--no-commit-id", "--root", *DIFF, *shape, commit,
-                                         "--", p)), terms)
+                      lambda p: text(git("diff-tree", "-r", "-p", "--no-commit-id", *DIFF, *trees, "--", p)), terms)
     return found, len(commits)
 
 
@@ -208,10 +238,10 @@ def main(argv: list[str]) -> int:
         terms, held = matcher(folder)
         if argv[:1] == ["commit"]:
             found, commits = staged(terms)
-        elif argv[:1] == ["push"] and len(argv) >= 3:
-            found, commits = pushed(terms, argv[1], argv[2], (argv[3:] or [""])[0], (argv[4:] or ["origin"])[0])
+        elif argv[:1] == ["push"] and len(argv) in (3, 4):
+            found, commits = pushed(terms, argv[1], argv[2], (argv[3:] or [""])[0])
         else:
-            print("usage: private_terms.py commit | push BASE HEAD [REF [REMOTE]]", file=sys.stderr)
+            print("usage: private_terms.py commit | push BASE HEAD [REF]", file=sys.stderr)
             return 2
     except Unreadable as error:
         print(f"private terms: could not check: {error}: refused")

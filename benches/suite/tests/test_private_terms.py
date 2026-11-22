@@ -23,18 +23,24 @@ ssh = "zzuserzz@zzsshzz:22"
 assets = true
 has = ["docker"]
 roles = ["test"]
-queue = { dir = "/home/zzhomezz/q", chunk_min = 30 }
+queue = { dir = "/home/zzhomezz/q", repo = 'c:\\users\\zzwinzz\\repo', chunk_min = 30 }
 config = [{ since = "2026-01-01", toolchain = "rustc 1.98.1", note = "kept in /home/zznotezz/x" }]
 zzfield = "zzunknownzz"
+zznumberfield = 424242
+zzshortfield = "ab"
 
 [host.q]
 hostname = "zzotherzz"
+ssh = "zzuser6zz@[fd00::5eed]:22"
 """
 # Each derived term, by the field it comes from.
 DERIVED = {"the host's key": "zzkeyzz", "hostname": "zznamezz", "ssh user": "zzuserzz", "ssh host": "zzsshzz",
-           "a path's home directory": "zzhomezz", "a note's home directory": "zznotezz",
-           "a field the check doesn't know": "zzunknownzz", "another host's hostname": "zzotherzz"}
-TERMS = (*DERIVED.values(), "zzlisted")
+           "a path's home directory": "zzhomezz", "a Windows home in lower case": "zzwinzz",
+           "a note's home directory": "zznotezz", "a field the check doesn't know": "zzunknownzz",
+           "a number in a field the check doesn't know": "424242", "another host's hostname": "zzotherzz",
+           "an ssh user beside an IPv6 host": "zzuser6zz", "an IPv6 ssh host": "fd00::5eed"}
+# Never printed: the terms, the list's, and the names of the fields the check doesn't know.
+TERMS = (*DERIVED.values(), "zzlisted", "zzdirzz", "zzlinezz", "zzfield", "zznumberfield", "zzshortfield")
 
 
 class PrivateTerms(unittest.TestCase):
@@ -54,7 +60,6 @@ class PrivateTerms(unittest.TestCase):
         self.git("init", "-q", "-b", "main", str(self.repo), where=self.root)
         self.write("a.txt", "base\n")
         self.base = self.commit("base")
-        self.git("update-ref", "refs/remotes/origin/main", self.base)
 
     def git(self, *args, where=None):
         return subprocess.run(["git", "-C", str(where or self.repo), *args], check=True, capture_output=True,
@@ -95,11 +100,18 @@ class PrivateTerms(unittest.TestCase):
             "no such folder": lambda: shutil.rmtree(self.overlay),
             "hosts.toml unparsable": lambda: (self.overlay / "hosts.toml").write_text("[host\n"),
             "a list line that is no pattern": lambda: (self.overlay / "publish-deny.txt").write_text("zz(\n"),
+            "a list line Python reads otherwise": lambda: (self.overlay / "publish-deny.txt").write_text("[[:alpha:]]\n"),
+            "a list that links to nothing": lambda: os.symlink(self.root / "gone", self.overlay / "publish-deny.txt"),
+            "an identifying field that isn't text": lambda: (self.overlay / "hosts.toml").write_text(
+                "[host.zzkeyzz]\nssh = 42\n"),
         }
         for name, spoil in cases.items():
             with self.subTest(name):
                 self.setUp()
-                spoil()
+                try:
+                    spoil()
+                except OSError as error:  # Windows without the right to make a link
+                    self.skipTest(f"{name}: {error}")
                 done = self.staged("b.txt", "ordinary\n")
                 self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
                 self.assertIn("could not check", done.stdout)
@@ -131,15 +143,24 @@ class PrivateTerms(unittest.TestCase):
     def test_a_term_too_short_is_counted_by_field(self):
         done = self.staged("b.txt", "a q in a line\n")
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
-        self.assertIn("8 derived terms, 0 patterns from publish-deny.txt; 1 derived terms too short to match as a "
-                      "word, not checked alone (fields: the host's key)", done.stdout)
+        self.assertIn("12 derived terms, 0 patterns from publish-deny.txt; 2 derived terms too short to match as a "
+                      "word, not checked alone (fields: a field the check doesn't know, the host's key)", done.stdout)
 
-    # Spec (03:11 3.): the overlay's optional list adds patterns, matched ignoring case; blank lines are none.
+    # Spec (03:11 3.): the overlay's optional list adds patterns, matched ignoring case and each line on its own
+    # (^ and $ are a line's ends); blank lines are none. A match that reaches into a directory withholds it.
     def test_the_overlays_list_adds_patterns(self):
-        (self.overlay / "publish-deny.txt").write_text("\nzzlisted[0-9]+\n\n", newline="\n")
+        (self.overlay / "publish-deny.txt").write_text("\nzzlisted[0-9]+\n\n^zzdirzz/\n^zzlinezz$\n", newline="\n")
         done = self.staged("b.txt", "ZZLISTED42\n")
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
-        self.assertIn("1 patterns from publish-deny.txt", done.stdout)
+        self.assertIn("3 patterns from publish-deny.txt", done.stdout)
+        self.git("reset", "-q", "--hard", self.base)
+        done = self.staged("c.txt", "before\nzzlinezz\nafter\n")
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("added lines match in a file under .\n", done.stdout)
+        self.git("reset", "-q", "--hard", self.base)
+        done = self.staged("zzdirzz/plan.txt", "ordinary\n")
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("path matches: a file under a directory whose name matches (not shown)", done.stdout)
 
     # Spec ((c), the push guard's rows of 22 Nov): the location never shows a term: a directory whose name holds
     # one is withheld; a directory named like an option, a name outside ASCII, an inherited pathspec mode and a
@@ -155,6 +176,7 @@ class PrivateTerms(unittest.TestCase):
                                            "added lines match in a file under .\n"),
             "a path a runtime would rewrite": ("docs=/plan.txt", "zznamezz\n", None,
                                                "added lines match in a file under docs=\n"),
+            "a form feed before the term": ("b.txt", "x\fzznamezz\n", None, "added lines match in a file under .\n"),
         }
         for name, (rel, text, extra, expected) in cases.items():
             with self.subTest(name):
@@ -173,24 +195,26 @@ class PrivateTerms(unittest.TestCase):
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
 
     # Spec (the page, 3.): at push, each published commit's message and lines and the branch name are read; a
-    # term added and removed again is still published in history; commits the remote holds are not this push's.
+    # term added and removed again is still published in history. Commits the remote's branch holds (the hook's
+    # BASE) are not this push's; a local remote-tracking ref, which may be stale, excuses nothing.
     def test_a_push_reads_what_it_publishes(self):
         self.write("b.txt", "zznamezz\n")
         added = self.commit("add")
         self.write("b.txt", "ordinary\n")
         self.commit("remove")
+        self.git("update-ref", "refs/remotes/origin/other", "HEAD")
         done = self.check("push", self.base, "HEAD", "refs/heads/topic")
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
         self.assertIn(f"commit {added[:9]}: added lines match in a file under .\n", done.stdout)
         self.assertIn("; 2 commits", done.stdout)
 
-        self.git("update-ref", "refs/remotes/origin/topic", "HEAD")  # now the remote holds them
+        remote = self.git("rev-parse", "HEAD")  # now the remote's branch is here
         clean = self.commit_message("ordinary message")
-        done = self.check("push", self.base, "HEAD", "refs/heads/topic")
+        done = self.check("push", remote, "HEAD", "refs/heads/topic")
         self.assertEqual((done.returncode, "; 1 commits" in done.stdout), (0, True), done.stdout)
 
         flagged = self.commit_message("about zzsshzz")
-        done = self.check("push", self.base, "HEAD", "refs/heads/zzkeyzz-work")
+        done = self.check("push", remote, "HEAD", "refs/heads/zzkeyzz-work")
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
         self.assertIn(f"commit {flagged[:9]}: message matches", done.stdout)
         self.assertNotIn(clean[:9], done.stdout)
