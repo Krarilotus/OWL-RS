@@ -1245,3 +1245,202 @@ fn a_failed_commit_leaves_a_later_writers_literal_equality_withheld() {
         header(status.clone())
     );
 }
+
+/// A commit on a store in quarantine whose rules equate two literals (two spellings of one
+/// value under a functional property), under OWL 2 RL with the QL rewriting on. The
+/// quarantine's invalidation takes the kept state and its marker before the commit publishes,
+/// so the mark the equality calls for rests on the version's certificate alone. A read of the
+/// equated values is `sound-only`, naming the equality:
+/// - after a repair commit's publication, before its revalidation;
+/// - after its revalidation, which takes the store out of quarantine;
+/// - after a certificate made again (`use_reasoning_rules`) under OWL 2 RL. Under other rules
+///   first, the read is `not-certified`: the certificate was made again, and none vouches.
+///
+/// A repair commit of an equality that fails after staging (its log write refused) publishes
+/// nothing, and a certificate made again afterwards finds no reasoning state to make one
+/// from. A read of the property isn't `complete`, and its answer is the data's: the stored
+/// value alone, without the failed commit's.
+#[test]
+fn a_commit_in_quarantine_that_equates_two_literals_is_never_told_complete() {
+    const INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
+    const DECIMAL: &str = "http://www.w3.org/2001/XMLSchema#decimal";
+    const EQUALITY: &str = "an owl:sameAs between literals";
+    type Answer = (Vec<(String, String)>, Option<nrese_sparql::Completeness>);
+    /// A store in `dir` holding `data` and `:a a owl:Nothing`, reasoned under OWL 2 RL with the
+    /// QL rewriting on: inconsistent, so in quarantine.
+    fn quarantined(dir: &Path, data: &str) -> Arc<StoreService> {
+        let config = StoreConfig {
+            ql_rewriting: crate::QlRewritingMode::On,
+            ..StoreConfig::on_disk(dir)
+        };
+        let store = StoreService::new(config).expect("store");
+        load(&store, &format!("{data} :a a owl:Nothing ."));
+        store.rematerialise(Ruleset::Owl2Rl).expect("reasoned");
+        Arc::new(store)
+    }
+    /// The values of `?v` in `select` (over [`PREFIXES`]), as (lexical form, datatype), sorted,
+    /// and the answer's status.
+    fn answer(store: &StoreService, select: &str) -> Answer {
+        let request = SparqlQueryRequest::all(format!("{PREFIXES}{select}"));
+        let answer = store.execute_query(&request).expect("answered");
+        let json: serde_json::Value = serde_json::from_slice(&answer.payload).expect("json");
+        let text = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_owned();
+        let mut values: Vec<_> = (json["results"]["bindings"].as_array().into_iter().flatten())
+            .map(|b| (text(&b["v"]["value"]), text(&b["v"]["datatype"])))
+            .collect();
+        values.sort();
+        (values, answer.completeness)
+    }
+    /// The status's word and its reasons, for the cell's line.
+    fn said(status: &Option<nrese_sparql::Completeness>) -> String {
+        let reasons: Vec<&str> = (status.iter())
+            .flat_map(|s| s.reasons.iter().map(|r| r.text.as_str()))
+            .collect();
+        format!(
+            "{} {reasons:?}",
+            status.as_ref().map_or("none", |s| s.as_str())
+        )
+    }
+    /// `sound-only`, naming the equality.
+    fn withheld(status: &Option<nrese_sparql::Completeness>) -> bool {
+        status.as_ref().is_some_and(|s| {
+            s.as_str() == "sound-only" && s.reasons.iter().any(|r| r.text.contains(EQUALITY))
+        })
+    }
+    let mut cells = Cells::default();
+    let dir = tempfile::tempdir().expect("dir");
+    let equated =
+        format!(":g a owl:FunctionalProperty . :t :g \"2\"^^<{INTEGER}> , \"2.0\"^^<{DECIMAL}> .");
+    let read = "SELECT ?v { :t :g ?v }";
+
+    // The repair commit that succeeds.
+    let store = quarantined(&dir.path().join("committed"), "");
+    let rl = pipeline(&store, ReasoningMode::Owl2Rl);
+    let before = store.is_quarantined();
+    let seen = Arc::new(Mutex::new(None));
+    let (reader, kept) = (Arc::clone(&store), Arc::clone(&seen));
+    hooks::BEFORE_REVALIDATION.set(Some(Box::new(move || {
+        *kept.lock().unwrap() = Some((reader.is_quarantined(), answer(&reader, read)));
+    })));
+    let repaired = rl.apply(
+        MutationCommand::Update(SparqlUpdateRequest::new(format!(
+            "{PREFIXES}DELETE DATA {{ :a a owl:Nothing }} ; INSERT DATA {{ {equated} }}"
+        ))),
+        &Requester::all(),
+        &MutationTicket::new(),
+    );
+    hooks::BEFORE_REVALIDATION.set(None);
+    let seen = seen.lock().unwrap().take();
+    match (before, repaired, seen) {
+        (false, _, _) => cells.unmet("a repair commit", "the store wasn't in quarantine"),
+        (true, Err(error), _) => {
+            cells.unmet("a repair commit", &format!("the commit failed: {error}"))
+        }
+        (true, Ok(_), None) => cells.unmet(
+            "a repair commit",
+            "the commit didn't reach its revalidation",
+        ),
+        (true, Ok(_), Some((quarantined, (values, status)))) => {
+            if !quarantined {
+                cells.unmet(
+                    "a repair commit before its revalidation",
+                    "the store wasn't in quarantine",
+                );
+            }
+            let name = "a repair commit before its revalidation";
+            println!("{name}: values {values:?}");
+            cells.check(name, &said(&status), |_| withheld(&status), "withheld");
+            let name = "a repair commit after its revalidation";
+            let left = !store.is_quarantined();
+            cells.check(
+                &format!("{name} | out of quarantine"),
+                &left.to_string(),
+                |_| left,
+                "true",
+            );
+            let (values, status) = answer(&store, read);
+            println!("{name}: values {values:?}");
+            cells.check(name, &said(&status), |_| withheld(&status), "withheld");
+            store.use_reasoning_rules(Some(Ruleset::Rdfs.into()));
+            let (_, status) = answer(&store, read);
+            let name = "a repair commit and a certificate made again under rdfs";
+            let none = status
+                .as_ref()
+                .is_some_and(|s| s.as_str() == "not-certified" && s.reasons.is_empty());
+            cells.check(name, &said(&status), |_| none, "not-certified, no reasons");
+            store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
+            let (values, status) = answer(&store, read);
+            let name = "a repair commit and a certificate made again under owl2-rl";
+            println!("{name}: values {values:?}");
+            cells.check(name, &said(&status), |_| withheld(&status), "withheld");
+        }
+    }
+
+    // The repair commit that fails after staging: its log write is refused.
+    let store = quarantined(
+        &dir.path().join("failed"),
+        &format!(":s :p \"1\"^^<{INTEGER}> ."),
+    );
+    let rl = pipeline(&store, ReasoningMode::Owl2Rl);
+    let before = store.is_quarantined();
+    let refused: nrese_engine::CommitNote<'_> = Box::new(|_| {
+        Err(nrese_engine::NoteError::Refused(std::io::Error::other(
+            "refused by the test",
+        )))
+    });
+    let failed = rl.apply_noted(
+        MutationCommand::Update(SparqlUpdateRequest::new(format!(
+            "{PREFIXES}DELETE DATA {{ :a a owl:Nothing }} ; \
+             INSERT DATA {{ :p a owl:FunctionalProperty . :s :p \"1.0\"^^<{DECIMAL}> }}"
+        ))),
+        &Requester::all(),
+        &MutationTicket::new(),
+        Some(refused),
+    );
+    let by_the_note = |error: &crate::MutationError| {
+        matches!(
+            error,
+            crate::MutationError::Store {
+                source: crate::StoreError::Engine(nrese_engine::EngineError::CommitNoteRefused(_)),
+                ..
+            }
+        )
+    };
+    match (before, failed) {
+        (false, _) => cells.unmet("a failed commit", "the store wasn't in quarantine"),
+        (true, Ok(_)) => cells.unmet("a failed commit", "the commit didn't fail"),
+        (true, Err(error)) if !by_the_note(&error) => cells.unmet(
+            "a failed commit",
+            &format!("the commit failed otherwise: {error:?}"),
+        ),
+        (true, Err(_)) => {
+            store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
+            let name = "a failed commit and a certificate made again";
+            let state = store.reasoning_state();
+            cells.check(
+                &format!("{name} | the reasoning state"),
+                &format!("{state:?}"),
+                |_| state.is_none(),
+                "None",
+            );
+            let (values, status) = answer(&store, "SELECT ?v { :s :p ?v }");
+            println!("{name}: in quarantine {}", store.is_quarantined());
+            let complete =
+                |s: &Option<nrese_sparql::Completeness>| s.as_ref().is_some_and(|s| s.complete);
+            cells.check(
+                &format!("{name} | the status"),
+                &said(&status),
+                |_| status.is_some() && !complete(&status),
+                "not complete",
+            );
+            let stored = vec![("1".to_owned(), INTEGER.to_owned())];
+            cells.check(
+                &format!("{name} | the answer"),
+                &format!("{values:?}"),
+                |_| values == stored,
+                &format!("{stored:?}"),
+            );
+        }
+    }
+    cells.finish();
+}

@@ -164,6 +164,7 @@ impl Aggregator<'_> {
         let table = &solutions.table;
         let mut numbers = self.numbers.borrow_mut();
         let mut total = Some(Numeric::Integer(Integer::from(0)));
+        let mut count = 0u64;
         let mut error = false;
         for &row in rows {
             let number =
@@ -179,12 +180,15 @@ impl Aggregator<'_> {
                         }
                     });
             match number {
-                Number::Value(number) => total = total.and_then(|total| total.add(number)),
+                Number::Value(number) => {
+                    count += 1;
+                    total = total.and_then(|total| total.add(number));
+                }
                 Number::Error => error = true,
                 Number::Other => return None,
             }
         }
-        Some(finish_total(total, error, rows.len() as u64, average))
+        Some(finish_total(total, error, count, average))
     }
 
     pub(super) fn binding<'s>(
@@ -225,6 +229,9 @@ impl Aggregator<'_> {
             | AggregateFunction::Min
             | AggregateFunction::Max => {
                 if ids.contains(&UNDEF) {
+                    if *name == AggregateFunction::Avg && ids.iter().all(|&id| id == UNDEF) {
+                        return Some(integer_agg(0));
+                    }
                     return Some(Agg::Id(UNDEF));
                 }
                 let values: Option<Vec<i64>> = ids
@@ -442,8 +449,13 @@ impl Aggregator<'_> {
                     return result;
                 }
                 let evaluated = self.evaluated(solutions, rows, expr, *distinct);
+                // SPARQL 1.1 §18.5.1.4: Avg(M) = "0"^^xsd:integer whenever Count(M) = 0,
+                // including when every row evaluated to an error.
+                if *name == AggregateFunction::Avg && evaluated.iter().all(Option::is_none) {
+                    return Agg::Term(integer(0));
+                }
                 // COUNT skips errors and SAMPLE takes the first value, but one error makes
-                // SUM, AVG, MIN and MAX unbound.
+                // SUM, AVG (with Count > 0), MIN and MAX unbound.
                 let fails_on_error =
                     !matches!(name, AggregateFunction::Count | AggregateFunction::Sample);
                 if fails_on_error && evaluated.iter().any(Option::is_none) {
@@ -503,18 +515,18 @@ impl Aggregator<'_> {
     }
 }
 
-/// SUM (or AVG with `average`) of `count` values adding up to `total`, as `sum` and
-/// `average` give it: unbound after an error or an overflow, AVG of none 0, of integers
-/// and decimals a decimal.
+/// SUM (or AVG with `average`) of `count` non-error values adding up to `total`, as `sum`
+/// and `average` give it: AVG of zero non-error values is `"0"^^xsd:integer` (§18.5.1.4),
+/// otherwise unbound after an error or an overflow, and of integers and decimals a decimal.
 pub(super) fn finish_total(total: Option<Numeric>, error: bool, count: u64, average: bool) -> Agg {
+    if average && count == 0 {
+        return Agg::Term(integer(0));
+    }
     let Some(total) = total.filter(|_| !error) else {
         return Agg::Id(UNDEF);
     };
     if !average {
         return Agg::Term(total.term());
-    }
-    if count == 0 {
-        return Agg::Term(integer(0));
     }
     let mean = match total {
         Numeric::Integer(_) | Numeric::Decimal(_) => total
@@ -605,14 +617,23 @@ pub(super) fn aggregate_in_one_pass(
         return Ok(None);
     };
     reserve(pass_bytes(groups, plan.len()))?;
+    // A column's running state is the same whatever reads it: each aggregate takes the
+    // first one's that reads its column (eager AVG's partial `SUM(?v)` and `COUNT(?v)`).
+    let first: Vec<usize> = (0..plan.len())
+        .map(|a| {
+            plan.iter()
+                .position(|(column, _)| *column == plan[a].0)
+                .unwrap_or(a)
+        })
+        .collect();
     let mut running = vec![Running::default(); groups * plan.len()];
     let mut rows = vec![0u64; groups];
     for (row, &group) in group_of.iter().enumerate() {
         let group = group as usize;
         rows[group] += 1;
         for (a, (column, _)) in plan.iter().enumerate() {
-            if let Some(column) = column {
-                running[group * plan.len() + a].add(solutions.table.get(row, *column));
+            if let Some(column) = column.filter(|_| first[a] == a) {
+                running[group * plan.len() + a].add(solutions.table.get(row, column));
             }
         }
     }
@@ -622,18 +643,18 @@ pub(super) fn aggregate_in_one_pass(
                 plan.iter()
                     .enumerate()
                     .map(|(a, (column, name))| {
-                        let r = running[group * plan.len() + a];
+                        let r = running[group * plan.len() + first[a]];
                         if column.is_none() {
                             return integer_agg(rows[group] as i64);
                         }
                         match name {
                             AggregateFunction::Count => integer_agg(r.count as i64),
+                            AggregateFunction::Avg if r.count == 0 => Agg::Term(integer(0)),
                             _ if r.unbound => Agg::Id(UNDEF),
                             AggregateFunction::Min => Agg::Id(r.min.map_or(UNDEF, |m| m.1)),
                             AggregateFunction::Max => Agg::Id(r.max.map_or(UNDEF, |m| m.1)),
                             _ if r.overflow => Agg::Id(UNDEF),
                             AggregateFunction::Sum => integer_agg(r.sum),
-                            _ if r.count == 0 => Agg::Term(integer(0)),
                             _ => match Decimal::from(r.sum)
                                 .checked_div(Decimal::from(r.count as i64))
                             {

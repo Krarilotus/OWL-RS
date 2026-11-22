@@ -2,6 +2,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use nrese_engine::{Engine, EngineConfig, EngineError, ReadModel, Snapshot, TermId};
+use nrese_exec::stop::StopSource;
 use nrese_sparql::CancellationToken;
 
 use crate::backup::{DatasetBackupArtifact, DatasetBackupFormat, DatasetExport, export_dataset};
@@ -141,6 +142,8 @@ pub struct StoreService {
     /// ([`Self::unavailable`]): its state is neither the one before a failed change nor the
     /// one after it. Set once.
     unavailable: std::sync::Arc<std::sync::OnceLock<String>>,
+    /// Why the published shapes count is still pending, if a refresh was deferred.
+    pub(crate) shapes_deferred: std::sync::Arc<crate::shacl::ShapesDeferred>,
     /// Where the next bulk load panics ([`Self::panic_next_bulk_load`]).
     #[cfg(feature = "fault-points")]
     load_panic: std::sync::Arc<std::sync::Mutex<Option<LoadPanic>>>,
@@ -351,6 +354,9 @@ impl StoreService {
                 Engine::open(&config.data_dir, engine_config)?
             }
         };
+        engine.watch_graph(nrese_rdf::NamedNode::new_unchecked(
+            config.shapes_graph.clone(),
+        ))?;
         // The canonical views versions keep (canonical equality answers) draw on the
         // memory the queries do.
         engine.set_canonical_view_budget(std::sync::Arc::new(
@@ -433,6 +439,7 @@ impl StoreService {
             ql_mode: std::sync::Arc::new(std::sync::RwLock::new(ql_mode)),
             outside_profile: std::sync::Arc::new(std::sync::RwLock::new(outside_profile)),
             last_materialisation: std::sync::Arc::default(),
+            shapes_deferred: Default::default(),
             #[cfg(feature = "fault-points")]
             load_panic: std::sync::Arc::default(),
         };
@@ -466,6 +473,7 @@ impl StoreService {
             service.certify(&tx, state);
         }
         drop(tx);
+        service.refresh_kept_shapes(&service.engine.snapshot(), &StopSource::none());
         service.pin_configured_queries()?;
         Ok(service)
     }
@@ -2406,7 +2414,7 @@ impl StoreService {
         &self,
         frames: &[u8],
         expected: &nrese_engine::LogExpectation,
-        stop: &nrese_exec::stop::StopSource,
+        stop: &StopSource,
     ) -> StoreResult<nrese_engine::Applied> {
         // A marker left from a start as a primary would vouch, after a restart, for the
         // records applied here (nothing reasons on a replica to write one again).
@@ -2415,11 +2423,15 @@ impl StoreService {
         }
         let before = self.current_revision();
         let applied = self.engine.apply_log(frames, expected, stop);
+        #[cfg(test)]
+        hooks::run(&hooks::AFTER_WRITE_PUBLICATION);
+        let view = self.engine.snapshot();
         // Whatever was published, a whole answer or the records before a stop or a
         // failure, the support sets start afresh.
-        if self.current_revision() != before {
+        if view.revision() != before {
             self.supports().forget();
         }
+        self.refresh_kept_shapes(&view, stop);
         applied.map_err(crate::StoreError::Engine)
     }
 
@@ -2484,6 +2496,9 @@ impl StoreService {
         let context = self.update_context(self.envelope(None), &cancellation);
         let report = command.apply(&mut tx, requester, &context)?;
         let summary = tx.commit()?;
+        #[cfg(test)]
+        hooks::run(&hooks::AFTER_WRITE_PUBLICATION);
+        self.refresh_kept_shapes(&self.engine.snapshot(), &StopSource::none());
         Ok(report.committed(summary.revision))
     }
 
@@ -2548,6 +2563,10 @@ impl StoreService {
             &self.quarantine,
             &invalidate,
         );
+        #[cfg(test)]
+        hooks::run(&hooks::AFTER_WRITE_PUBLICATION);
+        // A quarantine error can follow a publication. Count the shapes that are served.
+        self.refresh_kept_shapes(&self.engine.snapshot(), &progress.stop());
         #[cfg(feature = "fault-points")]
         if loaded.is_ok() {
             self.load_panic_point(LoadPanic::BeforeReturn);
@@ -3201,6 +3220,8 @@ pub(crate) mod hooks {
         pub(crate) static BEFORE_PUBLICATION: Hook = const { RefCell::new(None) };
         /// A rematerialisation has published its inferences and is about to certify them.
         pub(crate) static AFTER_PUBLICATION: Hook = const { RefCell::new(None) };
+        /// A write has published and is about to return or refresh its shapes count.
+        pub(crate) static AFTER_WRITE_PUBLICATION: Hook = const { RefCell::new(None) };
         /// A change of the QL rewriting setting has read the certificate and is about to
         /// install the rewriting it calls for.
         pub(crate) static AFTER_QL_READ: Hook = const { RefCell::new(None) };
@@ -3662,7 +3683,8 @@ mod certificate_tests {
     }
 
     /// Spec: a certificate changed during reads refuses even when
-    /// the replacement is certified, instead of retrying to an answer.
+    /// the replacement is certified, instead of retrying to an answer; the refusal says to ask
+    /// again (undecided), as the closure may be certified already.
     #[test]
     fn an_entailment_refuses_a_certificate_changed_during_its_reads() {
         let dir = tempfile::tempdir().unwrap();
@@ -3683,8 +3705,8 @@ mod certificate_tests {
         )];
         assert!(matches!(
             store.entails(rdfs(), &conclusion),
-            Err(crate::StoreError::Configuration(message))
-                if message == "the inferred statements aren't rdfs's closure: rematerialise first"
+            Err(crate::StoreError::Undecided(message))
+                if message == "the data changed during the entailment check: ask again"
         ));
         assert_eq!(
             store.entails(rdfs(), &conclusion).unwrap(),

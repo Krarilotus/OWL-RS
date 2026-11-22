@@ -211,6 +211,25 @@ pub enum ShaclGate {
     Enforce(GateSeverity),
 }
 
+impl ShaclGate {
+    /// The policy as `shacl.gate` names it: `off`, `report` or `enforce`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Report => "report",
+            Self::Enforce(_) => "enforce",
+        }
+    }
+
+    /// Under `enforce`, the least severity it rejects for.
+    pub fn severity(self) -> Option<GateSeverity> {
+        match self {
+            Self::Enforce(severity) => Some(severity),
+            Self::Off | Self::Report => None,
+        }
+    }
+}
+
 /// The least severity the enforcing gate rejects for. A shape's own severity IRI counts
 /// as a violation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -218,6 +237,17 @@ pub enum GateSeverity {
     Info,
     Warning,
     Violation,
+}
+
+impl GateSeverity {
+    /// The severity as `shacl.gate_severity` names it: `info`, `warning` or `violation`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Violation => "violation",
+        }
+    }
 }
 
 /// SPARQL 1.1 Federated Query: the endpoints `SERVICE` may call, and how long and how much

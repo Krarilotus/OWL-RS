@@ -75,6 +75,9 @@ impl StoreService {
         program: impl Into<RuleProgram>,
         conclusion: &[Triple],
     ) -> StoreResult<Entailment> {
+        // Under owl2-dl, one dl.timeout from the call, the caller's conversion of its program
+        // included.
+        let from_the_call = Deadline::after(self.config().dl.timeout);
         let program = program.into();
         // One certified closure: reads start only on a settled certificate (an
         // even epoch; odd, a change is in progress and the old certificate may still be
@@ -83,14 +86,14 @@ impl StoreService {
         // The mode is one of those reads: switching it is a change of the certificate.
         let epoch = self.certificate_epoch();
         if epoch.is_multiple_of(2) {
-            // The mode, read once: under owl2-dl, the DL route with one dl.timeout from here.
-            let dl = self
-                .dl()
-                .active()
-                .then(|| Deadline::after(self.config().dl.timeout));
+            // The mode, read once: under owl2-dl, the DL route with the call's deadline.
+            let dl = self.dl().active().then_some(from_the_call);
             #[cfg(test)]
             crate::service::hooks::run(&crate::service::hooks::AFTER_MODE_READ);
             let answer = self.entails_once(&program, conclusion, dl)?;
+            // Let go before the checks below, so freeing the caller's program (its user rules,
+            // perhaps large) takes none of the time an answer is judged by.
+            drop(program);
             #[cfg(test)]
             crate::service::hooks::run(&crate::service::hooks::AFTER_ENTAILMENT_READS);
             if self.certificate_epoch() == epoch {
@@ -100,6 +103,8 @@ impl StoreService {
                 }
                 return Ok(answer);
             }
+            // The certificate changed during the reads: the closure may be certified already.
+            return Err(StoreError::Undecided(CHANGED.to_owned()));
         }
         Err(StoreError::Configuration(format!(
             "the inferred statements aren't {}'s closure: rematerialise first",
