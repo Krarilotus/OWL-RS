@@ -3,6 +3,8 @@
 
 use std::cell::Cell;
 use std::collections::HashSet;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::rc::Rc;
 use std::thread::LocalKey;
 
 use nrese_rdf::{GraphName, NamedNode, Quad};
@@ -42,69 +44,190 @@ pub(super) fn contents(engine: &Engine) -> HashSet<Quad> {
         .collect()
 }
 
-/// One row of [`a_failed_bulk_load_never_costs_a_later_acknowledged_commit`]: what went
-/// wrong, if anything.
-fn bulk_load_row(point: &'static LocalKey<Cell<bool>>, mode: BulkMode) -> Vec<String> {
+/// How a bulk publication is made to fail at a durable step.
+#[derive(Clone, Copy)]
+enum Fault {
+    /// A test fault point returns an error there.
+    Error(&'static LocalKey<Cell<bool>>),
+    /// A panic at the first directory sync once the checkpoint of revision 2 is in place (the
+    /// one after its rename), before its version is installed.
+    PanicPlaced,
+}
+
+/// What publishes revision 2 of a store at revision 1 by a checkpoint, before it installs
+/// the version the checkpoint holds.
+#[derive(Clone, Copy, Debug)]
+enum Publication {
+    /// A bulk load: an append builds its version in memory (`publish`), a replacement
+    /// streams it into the checkpoint (`publish_streamed`).
+    Load(BulkMode),
+    /// A replacement past its memory budget: its spilled chunks merged into the checkpoint.
+    Spilled,
+    /// The inferred stack replaced (`publish`).
+    Rematerialisation,
+}
+
+fn example(name: &str) -> NamedNode {
+    NamedNode::new_unchecked(format!("http://example.com/{name}"))
+}
+
+/// What the rematerialisation infers: not asserted by `quad(1)`, whose terms it uses.
+fn inferred() -> Quad {
+    Quad::new(
+        example("s1"),
+        example("q"),
+        example("o1"),
+        GraphName::DefaultGraph,
+    )
+}
+
+impl Publication {
+    fn config(self) -> EngineConfig {
+        match self {
+            Self::Spilled => EngineConfig {
+                durability: DurabilityConfig {
+                    // Chunks of 4 quads.
+                    bulk_load_memory: Some(384),
+                    ..config().durability
+                },
+                ..config()
+            },
+            _ => config(),
+        }
+    }
+
+    /// A statement only the publication brings.
+    fn marker(self) -> Quad {
+        match self {
+            Self::Rematerialisation => inferred(),
+            _ => quad(10),
+        }
+    }
+
+    fn run(self, engine: &Engine) -> EngineResult<CommitSummary> {
+        match self {
+            Self::Load(mode) => {
+                let load = engine.bulk_load(mode);
+                load.add(&[quad(10), quad(11)]);
+                load.finish()
+            }
+            Self::Spilled => {
+                let load = engine.bulk_load(BulkMode::Replace);
+                load.add(&(10..18).map(quad).collect::<Vec<_>>());
+                load.finish()
+            }
+            Self::Rematerialisation => {
+                let rematerialisation = engine.rematerialisation();
+                let id = |node: &NamedNode| {
+                    rematerialisation.intern(nrese_rdf::TermRef::NamedNode(node.as_ref()))
+                };
+                let triple = crate::EncodedTriple {
+                    subject: id(&example("s1")),
+                    predicate: id(&example("q")),
+                    object: id(&example("o1")),
+                };
+                rematerialisation.finish(vec![triple])
+            }
+        }
+    }
+}
+
+/// One row of [`a_failed_bulk_publication_never_costs_a_later_acknowledged_commit`]: what
+/// went wrong, if anything.
+fn publication_row(injected: Fault, publication: Publication) -> Vec<String> {
     let mut wrong = Vec::new();
     let dir = tempfile::tempdir().unwrap();
-    let engine = Engine::open(dir.path(), config()).unwrap();
-    let mut tx = engine.transaction();
-    tx.insert(quad(1).as_ref());
-    tx.commit().unwrap();
+    let engine = Engine::open(dir.path(), publication.config()).unwrap();
+    commit(&engine, 1).unwrap();
 
-    let load = engine.bulk_load(mode);
-    load.add(&[quad(10), quad(11)]);
-    point.set(true);
-    let loaded = load.finish();
-    point.set(false);
-    let mut tx = engine.transaction();
-    tx.insert(quad(2).as_ref());
-    let later = tx.commit();
+    let fired = Rc::new(Cell::new(false));
+    match injected {
+        Fault::Error(point) => point.set(true),
+        Fault::PanicPlaced => {
+            let (seen, root) = (Rc::clone(&fired), dir.path().to_path_buf());
+            fault::ON_DIR_SYNC.set(Some(Box::new(move |_: &std::path::Path| {
+                if !seen.get() && super::checkpoint::placed(&root, 2).unwrap_or(false) {
+                    seen.set(true);
+                    panic!("a test's panic once the checkpoint is in place");
+                }
+            })));
+        }
+    }
+    let published = catch_unwind(AssertUnwindSafe(|| publication.run(&engine)));
+    match injected {
+        Fault::Error(point) => point.set(false),
+        Fault::PanicPlaced => fault::ON_DIR_SYNC.set(None),
+    }
+    if matches!(injected, Fault::PanicPlaced) && !fired.get() {
+        return vec!["the panic's point was never reached".into()];
+    }
+    let published = match published {
+        Ok(result) => result.map_err(|error| error.to_string()),
+        Err(_) => Err("a panic".into()),
+    };
+    let later = commit(&engine, 2);
     drop(engine);
 
-    let engine = Engine::open(dir.path(), config()).unwrap();
+    let engine = Engine::open(dir.path(), publication.config()).unwrap();
     let held = contents(&engine);
     if later.is_ok() && !held.contains(&quad(2)) {
         wrong.push(format!(
-            "the acknowledged commit is lost (load: {:?})",
-            loaded.as_ref().err()
+            "the acknowledged commit is lost (publication: {:?})",
+            published.as_ref().err()
         ));
     }
-    match (&loaded, &later) {
-        (Ok(_), _) if !held.contains(&quad(10)) => wrong.push("the load is lost".into()),
+    let marker = publication.marker();
+    match (&published, &later) {
+        (Ok(_), _) if !held.contains(&marker) => wrong.push("the publication is lost".into()),
         // Reported failed while the engine went on taking commits: it must not be there.
-        (Err(error), Ok(_)) if held.contains(&quad(10)) => wrong.push(format!(
-            "a load that failed ({error}) is there after a restart"
+        (Err(error), Ok(_)) if held.contains(&marker) => wrong.push(format!(
+            "a publication that failed ({error}) is there after a restart"
         )),
         _ => {}
     }
     wrong
 }
 
-/// A store at revision 1 with its record in the log; a bulk load fails at a durable step (an
-/// append builds its version in memory, a replacement streams it into the checkpoint); then
-/// a transaction commits. After a restart, the transaction is there if it was acknowledged;
-/// the load is there if it succeeded, and absent if it failed while the engine went on
-/// taking commits (a failure whose outcome is unknown takes no more: then either is right).
-/// Before the fix, the load's checkpoint of revision 2 was in place when it failed, the
-/// transaction was acknowledged as revision 2 too, and the restart skipped it as covered by
-/// that checkpoint. Each row is judged on its own. The mapping rows are guards, right on
-/// the base too: a built load is then served from memory, and a streamed one removed its
-/// checkpoint (the base fails only if that removal fails as well).
+/// Spec: a commit is acknowledged only once it is durable (this module's commit protocol), so
+/// an acknowledged write survives a reopen. After any exit (a returned error or a panic)
+/// between a durable change and the install of the in-memory state that names it, no later
+/// write is acknowledged until the store is reopened, or memory agrees with what is durable.
+///
+/// A store at revision 1 with its record in the log; a bulk publication of revision 2 fails at
+/// a durable step; then a transaction commits. After a restart, the transaction is there if it
+/// was acknowledged (checked first); the publication is there if it succeeded, and absent if
+/// it failed while the engine went on taking commits (a failure whose outcome is unknown takes
+/// no more: then either is right). Before the fix of the error rows, the checkpoint of
+/// revision 2 was in place when the load failed, the transaction was acknowledged as revision
+/// 2 too, and the restart skipped it as covered by that checkpoint; the panic rows did the
+/// same until the log was poisoned on any exit, not only a returned error. Each row is judged
+/// on its own. The mapping rows are guards, right on the base too: a built version is then
+/// served from memory, and a streamed one poisons the log.
 #[test]
-fn a_failed_bulk_load_never_costs_a_later_acknowledged_commit() {
-    let points: [(&'static LocalKey<Cell<bool>>, &str); 3] = [
-        (&fault::FAIL_ROTATE, "rotation"),
-        (&fault::FAIL_DIR_SYNC, "directory sync"),
-        (&fault::FAIL_MAP, "mapping (guard)"),
+fn a_failed_bulk_publication_never_costs_a_later_acknowledged_commit() {
+    let points: [(Fault, &str); 4] = [
+        (Fault::Error(&fault::FAIL_ROTATE), "rotation"),
+        (Fault::Error(&fault::FAIL_DIR_SYNC), "directory sync"),
+        (Fault::PanicPlaced, "panic once the checkpoint is in place"),
+        (Fault::Error(&fault::FAIL_MAP), "mapping (guard)"),
+    ];
+    let publications = [
+        Publication::Load(BulkMode::Append),
+        Publication::Load(BulkMode::Replace),
+        Publication::Spilled,
+        Publication::Rematerialisation,
     ];
     let mut failures = Vec::new();
-    for (point, step) in points {
-        for mode in [BulkMode::Append, BulkMode::Replace] {
-            let wrong = bulk_load_row(point, mode);
+    for (injected, step) in points {
+        for publication in publications {
+            let wrong = publication_row(injected, publication);
             let verdict = if wrong.is_empty() { "ok" } else { "FAILED" };
-            eprintln!("row {step}, {mode:?}: {verdict}");
-            failures.extend(wrong.into_iter().map(|w| format!("{step}, {mode:?}: {w}")));
+            eprintln!("row {step}, {publication:?}: {verdict}");
+            failures.extend(
+                wrong
+                    .into_iter()
+                    .map(|w| format!("{step}, {publication:?}: {w}")),
+            );
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
