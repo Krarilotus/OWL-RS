@@ -260,28 +260,48 @@ fn a_reopened_store_withholds_the_word_after_a_literal_equality() {
     );
 }
 
-/// The equality of [`QUALIFIED`] rests on statements about literals, which the store never
-/// held: a reopened store, which finds it again over what it holds, finds it all the same.
+/// A literal typed by a range (Table 5 prp-rng) into a class under two `owl:hasValue`
+/// restrictions on one functional property (Table 6 cax-sco, cls-hv1): the literal gets both
+/// values, and prp-fp equates them. Every statement the equality rests on has the literal
+/// for its subject.
+const CHAINED: &str = ":r rdfs:range :H . :H rdfs:subClassOf \
+     [ a owl:Restriction ; owl:onProperty :f ; owl:hasValue \"1\"^^xsd:integer ] , \
+     [ a owl:Restriction ; owl:onProperty :f ; owl:hasValue \"1.0\"^^xsd:decimal ] . \
+     :f a owl:DatatypeProperty , owl:FunctionalProperty . :s :r \"x\" .";
+
+/// The equalities of [`QUALIFIED`] and [`CHAINED`] rest on statements about literals, which
+/// the store never held: a reopened store, which finds an equality again over what it holds,
+/// finds them all the same.
 #[test]
 fn a_reopened_store_finds_an_equality_through_a_literal_typed_by_a_range() {
     let mut unmet = Vec::new();
+    let cases = [
+        (
+            "qualified",
+            format!("{QUALIFIED} :s :p {INTEGER} , {DECIMAL} ."),
+        ),
+        ("chained", CHAINED.to_owned()),
+    ];
     for mode in MODES {
-        let dir = tempfile::tempdir().expect("dir");
-        {
-            let before = open("owl2-rl", config(mode, Some(dir.path())));
-            insert(
-                &before,
-                &format!("{QUALIFIED} :s :p {INTEGER} , {DECIMAL} ."),
+        for (name, data) in &cases {
+            let dir = tempfile::tempdir().expect("dir");
+            {
+                let before = open("owl2-rl", config(mode, Some(dir.path())));
+                insert(&before, data);
+                insert(&before, &format!(":t :q {INTEGER} ."));
+                told_otherwise(before.store(), &format!("{mode} {name} before"), &mut unmet);
+            }
+            let after = open("owl2-rl", config(mode, Some(dir.path())));
+            assert!(
+                after.store().last_materialisation().is_none(),
+                "{mode}: the reopened store was rematerialised"
             );
-            insert(&before, &format!(":t :q {INTEGER} ."));
-            told_otherwise(before.store(), &format!("{mode} before"), &mut unmet);
+            told_otherwise(
+                after.store(),
+                &format!("{mode} {name} reopened"),
+                &mut unmet,
+            );
         }
-        let after = open("owl2-rl", config(mode, Some(dir.path())));
-        assert!(
-            after.store().last_materialisation().is_none(),
-            "{mode}: the reopened store was rematerialised"
-        );
-        told_otherwise(after.store(), &format!("{mode} reopened"), &mut unmet);
     }
     assert!(
         unmet.is_empty(),
