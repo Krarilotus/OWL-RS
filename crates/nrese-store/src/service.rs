@@ -389,13 +389,7 @@ impl StoreService {
         if service.engine.snapshot().revision() != before {
             service.invalidate_held(writer)?;
         }
-        if let Some(mut state) = service.reasoning_state() {
-            // The marker doesn't record whether the rules equated two literals, and no reading
-            // of the stored statements can tell (a closure stored over representatives keeps
-            // one of equal values): until a rebuild finds none, they count as equated, for
-            // every reader.
-            state.literal_equality = true;
-            state.literal_equality_unknown = true;
+        if let Some(state) = service.reasoning_state() {
             // The reading isn't on disk: the certified stack's is installed before the store
             // is anyone's, with its certificate. Without one the stack is read as stored.
             service.certify(&tx, state.clone());
@@ -635,7 +629,16 @@ impl StoreService {
         }
         let path = self.marker_path()?;
         let text = std::fs::read_to_string(path).ok()?;
-        crate::ReasoningState::from_text(&text)
+        // Read from disk, the state is one opened without a rebuild, the open's own or a later
+        // read's. The marker doesn't record whether the rules equated two literals, and no
+        // reading of the stored statements can tell (a closure stored over representatives
+        // keeps one of equal values): until a rebuild finds none, they count as equated, for
+        // every reader.
+        crate::ReasoningState::from_text(&text).map(|state| crate::ReasoningState {
+            literal_equality: true,
+            literal_equality_unknown: true,
+            ..state
+        })
     }
 
     /// Whether the data is consistent under the recorded reasoning (see
