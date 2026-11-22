@@ -342,14 +342,23 @@ pub(crate) fn kind(status: StatusCode) -> (Cow<'static, str>, Cow<'static, str>)
     }
 }
 
-/// A problem document as the answer, with its media type.
+/// A problem document as the answer, with its media type, marked as the server's own
+/// ([`Own`]). `body` writes a JSON object with at least one member and none named
+/// `request_id`: the envelope appends the request's id after its last member, unread.
 pub(crate) fn problem(status: StatusCode, body: &impl Serialize) -> Response {
     let mut response = (status, Json(body)).into_response();
     response
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(PROBLEM_JSON));
+    response.extensions_mut().insert(Own);
     response
 }
+
+/// Marks a problem document the server wrote itself ([`problem`]): the envelope layer
+/// (`http::problems`) reads it whole, at any size, where it reads other bodies only up to
+/// the framework's short messages, and passes it as written, as [`problem`] states.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Own;
 
 pub(crate) const PROBLEM_JSON: &str = "application/problem+json";
 

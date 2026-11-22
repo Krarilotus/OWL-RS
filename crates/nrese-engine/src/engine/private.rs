@@ -19,7 +19,7 @@ use nrese_rdf::{Quad, QuadRef, Term, TermRef};
 use parking_lot::Mutex;
 
 use super::transaction::{Pending, SnapshotChanges};
-use super::{Inner, ReadModel, Snapshot, Version};
+use super::{Inner, ReadModel, Snapshot, Version, VersionData, Watch};
 use crate::error::{EngineError, EngineResult};
 use crate::quad::{EncodedQuad, EncodedTriple, QuadPattern};
 use crate::term::TermId;
@@ -434,7 +434,7 @@ fn own_version(
     inferred: crate::index::IndexVersion,
     end: u64,
 ) -> Version {
-    Version {
+    let data = VersionData {
         content: super::Content::fresh(),
         asserted_content: super::AssertedIdentity::fresh(),
         asserted,
@@ -447,7 +447,8 @@ fn own_version(
         certificate: seen.certificate.clone(),
         canonical: Default::default(),
         own: Default::default(),
-    }
+    };
+    Version::new(Watch::unwatched(), data)
 }
 
 #[cfg(test)]

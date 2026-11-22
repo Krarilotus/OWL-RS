@@ -862,6 +862,12 @@ case "$mode" in
         mapfile -t explored <<< "$found"
         step explorer run_targets "explorer tests" scripts/lib/explorer-targets.txt "" "${explored[@]}"
       fi
+      # Push's checks that build no test, on every crate change as push has them: the lock files, the
+      # test-only features, and each changed crate compiled on its own (push's dependents are built by
+      # its test step, which quick doesn't run).
+      step locks bash scripts/check-locks.sh
+      step features bash scripts/check-features.sh
+      step "crates alone" crates_alone "${changed[@]}"
     fi
     guards "${files[@]}"
     mapfile -t reached < <(printf '%s\n' "${files[@]}" | reached_contracts)

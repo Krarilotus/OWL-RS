@@ -268,6 +268,8 @@ fn no_public_method_commits_outside_the_pipeline() {
         // ... and the U1 a cold read keeps, before any commit (dictionary lifecycle V1, item 5).
         "nrese-store/src/dl/source_tests.rs",
         "nrese-store/src/query_executor_tests.rs",
+        // Shapes written without the gate, to follow the shapes count through each writer.
+        "nrese-store/src/shacl_gate_state_tests.rs",
         // An access state from before ids, as an upgraded store holds it (SYN-64).
         "nrese-store/src/access/tests/identity.rs",
     ];

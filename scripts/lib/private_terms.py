@@ -16,7 +16,9 @@ It prints where a term was found, never the term or the line. Exit 0: none found
 
     python scripts/lib/private_terms.py commit
     python scripts/lib/private_terms.py push BASE HEAD [REF]
-        the commits in HEAD that BASE doesn't hold (the hook's BASE: the remote's own head for a branch it has)
+        the commits in HEAD that BASE doesn't hold (the hook's BASE: the remote's own head for a branch it has):
+        each commit's message, and what it adds to its parent; a merge's, what none of its parents holds
+        (merged), so a merge of the published line brings nothing of the line's into the push
 """
 from __future__ import annotations
 
@@ -245,7 +247,28 @@ def added(patch: str) -> str:
     return "\n".join(lines)
 
 
-def scan(label: str, paths: list[str], patch: str, per_file, terms: Terms) -> list[str]:
+def numbered(patch: str) -> dict[int, str]:
+    """One file's patch's added lines by their line numbers in the new file (of a type change, both its halves: only
+    the new one adds). Only a hunk's lines are content: a file's headers come before its first hunk. A blank context
+    line may come without its space (diff.suppressBlankEmpty)."""
+    lines, at, in_hunk = {}, 0, False
+    for line in patch.split("\n"):
+        if line.startswith("diff "):
+            in_hunk = False
+        elif line.startswith("@@"):
+            in_hunk = True
+            at = int(re.match(r"@@ -\d+(?:,\d+)? \+(\d+)", line).group(1))
+        elif in_hunk and line.startswith("+"):
+            lines[at] = line[1:]
+            at += 1
+        elif in_hunk and (line.startswith(" ") or not line):
+            at += 1
+    return lines
+
+
+def scan(label: str, paths: list[str], everything: str, of, terms: Terms, fresh: set[str] | None = None) -> list[str]:
+    """What matches of what a commit publishes: PATHS, the changed files (of those, FRESH the ones whose names it
+    publishes: all if None), and EVERYTHING, the lines it adds (OF: one path's, to locate them)."""
     directories = [path.rpartition("/")[0] for path in paths]
     hit = terms.hits(paths + directories)  # one read for every path and directory
 
@@ -256,10 +279,11 @@ def scan(label: str, paths: list[str], patch: str, per_file, terms: Terms) -> li
         hidden = i in hit or len(paths) + i in hit
         return "a directory whose name matches (not shown)" if hidden else directories[i]
 
-    found = [f"{label}path matches: a file under {where(i)}" for i in range(len(paths)) if i in hit]
-    if terms.search(added(patch)):
+    found = [f"{label}path matches: a file under {where(i)}" for i in range(len(paths))
+             if i in hit and (fresh is None or paths[i] in fresh)]
+    if terms.search(everything):
         located = [f"{label}added lines match in a file under {where(i)}"
-                   for i, path in enumerate(paths) if terms.search(added(per_file(path)))]
+                   for i, path in enumerate(paths) if terms.search(of(path))]
         found += located or [f"{label}added lines match in a file that could not be located"]
     return found
 
@@ -268,7 +292,7 @@ def staged(terms: Terms) -> tuple[list[str], int]:
     paths = [p for p in text(git("diff", "--cached", "--name-only", "-z", "--no-renames", "--diff-filter=d"))
              .split("\0") if p]
     patch = text(git("diff", "--cached", *DIFF))
-    return scan("", paths, patch, lambda p: text(git("diff", "--cached", *DIFF, "--", p)), terms), 0
+    return scan("", paths, added(patch), lambda p: added(text(git("diff", "--cached", *DIFF, "--", p))), terms), 0
 
 
 def pushed(terms: Terms, base: str, head: str, ref: str) -> tuple[list[str], int]:
@@ -281,15 +305,48 @@ def pushed(terms: Terms, base: str, head: str, ref: str) -> tuple[list[str], int
         short = commit[:9]
         if terms.search(text(git("show", "-s", "--format=%B", commit))):
             found.append(f"commit {short}: message matches")
-        # What the commit brings to its branch: against its first parent, so a merge's lines from its other
-        # parents are read too.
+        if len(parents) > 1:
+            found += merged(f"commit {short}: ", commit, parents, terms)
+            continue
+        # What the commit brings to its branch: against its parent (or all of it, a root).
         trees = (parents[0], commit) if parents else ("--root", commit)
         paths = [p for p in text(git("diff-tree", "-r", "-z", "--name-only", "--no-commit-id", "--no-renames",
                                      "--diff-filter=d", *trees)).split("\0") if p]
         patch = text(git("diff-tree", "-r", "-p", "--no-commit-id", *DIFF, *trees))
-        found += scan(f"commit {short}: ", paths, patch,
-                      lambda p: text(git("diff-tree", "-r", "-p", "--no-commit-id", *DIFF, *trees, "--", p)), terms)
+        found += scan(f"commit {short}: ", paths, added(patch),
+                      lambda p: added(text(git("diff-tree", "-r", "-p", "--no-commit-id", *DIFF, *trees, "--", p))),
+                      terms)
     return found, len(commits)
+
+
+def merged(label: str, commit: str, parents: list[str], terms: Terms) -> list[str]:
+    """What a merge publishes itself: the lines it adds against every one of its PARENTS (each the same line of the
+    merge's file, by its number there, in an ordinary diff against each parent) and the paths new to every parent.
+    A line or path it takes from a parent is that parent's, so it is published already when the push's base holds
+    the parent, and read at the commit that brought it when that commit is in the range (every commit the base
+    doesn't hold is: rev-list's own rule). Ordinary diffs, not git's combined diff, which can leave a binary file's
+    lines out and loses hunks past a word's bits of parents."""
+    changed = []  # per parent: {path: status}
+    for parent in parents:
+        entries = git("diff-tree", "-r", "-z", "--name-status", "--no-commit-id", "--no-renames", parent,
+                      commit).decode("utf-8", "surrogateescape").split("\0")  # every byte kept
+        changed.append(dict(zip(entries[1::2], entries[0::2])))  # status, then path; the last field is empty
+    # Only a file changed against every parent can hold a line new to all of them; a file the merge deleted holds none.
+    paths = [p for p, status in changed[0].items() if status != "D" and all(p in c for c in changed[1:])]
+    try:  # a path is read by its name: one that isn't UTF-8 can't be named back to git
+        "".join(paths).encode("utf-8")
+    except UnicodeEncodeError:
+        raise Unreadable("a merged path that isn't UTF-8") from None
+    fresh = {p for p in paths if all(c[p] == "A" for c in changed)}
+    own = {}
+    for path in paths:
+        common = None
+        for parent in parents:
+            lines = numbered(text(git("diff-tree", "-r", "-p", "--no-commit-id", *DIFF, parent, commit, "--", path)))
+            common = lines if common is None else {n: line for n, line in common.items() if n in lines}
+        if common:
+            own[path] = "\n".join(common[n] for n in sorted(common))
+    return scan(label, paths, "\n".join(own.values()), lambda p: own.get(p, ""), terms, fresh)
 
 
 def main(argv: list[str]) -> int:

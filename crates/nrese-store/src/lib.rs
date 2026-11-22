@@ -132,7 +132,8 @@ pub use scope::{EntryPoint, ReadContext, ReadScope, Requester, WriteScope};
 pub use service::{QueryRun, StoreService};
 pub use sessions::{SESSION_IDLE, Sessions};
 pub use shacl::{
-    ShaclResultText, ShaclValidation, ShaclValidationRequest, ShapesSource, ValidatedGraphs,
+    ShaclGateState, ShaclResultText, ShaclValidation, ShaclValidationRequest, ShapesSource,
+    ValidatedGraphs,
 };
 pub use statements::{RdfPayload, StatementOp, StatementOps, StatementPattern, StatementsRequest};
 pub use stats::StoreStats;
