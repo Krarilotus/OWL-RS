@@ -19,6 +19,21 @@ cd "$(git rev-parse --show-toplevel)" || exit 2
 . scripts/lib/gate-key.sh 2> /dev/null
 remote=${1:-origin}
 url=${2:-$remote}
+# refactor/engine-v2's commit as the repository at URL has it now. Nothing (and false) when that can't be told:
+# a URL Git would rewrite to another for the read, no answer within 30 s, a failed read, or not exactly one row
+# of that full name. Its output goes to a file and its errors nowhere, so a transport helper it leaves behind holds
+# no pipe this waits on; only Git's own exit counts.
+engine_v2_at() {
+  local listed answered
+  [ "$(git ls-remote --get-url "$1" 2> /dev/null)" = "$1" ] || return 1
+  listed=$(mktemp) || return 1
+  timeout -k 5 30 git ls-remote "$1" refs/heads/refactor/engine-v2 < /dev/null > "$listed" 2> /dev/null &&
+    awk -F '\t' '$2 == "refs/heads/refactor/engine-v2" && $1 ~ /^[0-9a-f]+$/ { n++; sha = $1 }
+                 END { if (n != 1) exit 1; print sha }' "$listed"
+  answered=$?
+  rm -f "$listed"
+  return $answered
+}
 code=0 gated=0
 while read -r local_ref local_sha remote_ref remote_sha; do
   [[ $local_sha =~ ^0+$ ]] && continue  # a deletion
@@ -33,9 +48,9 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     # no longer has), read with no replace ref (one could make engine-v2 seem to descend from an unpublished
     # commit). A remote that doesn't answer within its bound is never "the same".
     tracked=$(git rev-parse -q --verify "refs/remotes/$remote/refactor/engine-v2^{commit}")
-    advertised=$(timeout -k 5 30 git ls-remote "$url" refs/heads/refactor/engine-v2 < /dev/null | cut -f1)
-    if [ -z "$advertised" ]; then
-      echo "pre-push: $remote couldn't be asked for its refactor/engine-v2 within 30 s: no base for $remote_ref" >&2
+    if ! advertised=$(engine_v2_at "$url"); then
+      echo "pre-push: $remote couldn't be asked for its refactor/engine-v2 (one answer from this URL within" \
+        "30 s): no base for $remote_ref" >&2
       code=1
       continue
     fi
