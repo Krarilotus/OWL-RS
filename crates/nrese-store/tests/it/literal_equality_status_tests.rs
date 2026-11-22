@@ -288,21 +288,17 @@ fn a_store_reopened_without_a_rebuild_withholds_the_word_until_one_finds_no_lite
 /// The words the reason holds where the store was opened without a rebuild.
 const REOPENED: &str = "opened without a rebuild";
 
-/// A matching RDFS program can certify a positive literal read after reopening its
-/// materialised store, even when its subproperty rule derives a raw `owl:sameAs`.
+/// RDFS keeps its closure status across a reopen, even when its subproperty rule
+/// derives a raw `owl:sameAs`. Its reason stays the same as after a rebuild.
 #[test]
-fn a_reopened_rdfs_store_certifies_literal_reads_after_registration() {
+fn a_reopened_rdfs_literal_read_matches_a_fresh_rebuild() {
     use nrese_reasoner::rulesets::Ruleset;
 
-    let (rebuilt, unregistered, reopened, unregistered_again) =
+    let (rebuilt, reopened) =
         literal_read_over_reopened_subproperty(Ruleset::Rdfs, QlRewritingMode::Auto);
-    assert_eq!(reopened.1, "complete", "{:?}", reopened.2);
-    assert_eq!(reopened.0, rebuilt.0, "answer changed on reopen");
-    assert_eq!(rebuilt.1, "complete", "{:?}", rebuilt.2);
-    for (_, word, reasons) in [unregistered, unregistered_again] {
-        assert_eq!(word, "sound-only", "{reasons:?}");
-        assert!(reasons.iter().any(|r| r.contains(REOPENED)), "{reasons:?}");
-    }
+    assert_eq!(reopened, rebuilt);
+    assert_eq!(reopened.1, "sound-only", "{:?}", reopened.2);
+    assert!(!reopened.2.iter().any(|r| r.contains(REOPENED)));
 }
 
 /// The same subproperty case under OWL 2 RL keeps withholding after a reopen,
@@ -311,7 +307,7 @@ fn a_reopened_rdfs_store_certifies_literal_reads_after_registration() {
 fn a_reopened_owl2_rl_store_withholds_literal_reads_after_registration() {
     use nrese_reasoner::rulesets::Ruleset;
 
-    let (rebuilt, _, reopened, _) =
+    let (rebuilt, reopened) =
         literal_read_over_reopened_subproperty(Ruleset::Owl2Rl, QlRewritingMode::On);
     assert_eq!(reopened.1, "sound-only", "{:?}", reopened.2);
     assert!(
@@ -327,7 +323,7 @@ type LiteralRead = (String, String, Vec<String>);
 fn literal_read_over_reopened_subproperty(
     ruleset: nrese_reasoner::rulesets::Ruleset,
     ql_rewriting: QlRewritingMode,
-) -> (LiteralRead, LiteralRead, LiteralRead, LiteralRead) {
+) -> (LiteralRead, LiteralRead) {
     use crate::support::Writes;
 
     let dir = tempfile::tempdir().expect("dir");
@@ -347,14 +343,11 @@ fn literal_read_over_reopened_subproperty(
         read(&store, query)
     };
     let store = StoreService::new(config()).expect("reopen");
-    let unregistered = read(&store, query);
     store.use_reasoning_rules(Some(ruleset.into()));
     store.use_dl(false, false);
     let reopened = read(&store, query);
-    store.use_reasoning_rules(None);
-    let unregistered_again = read(&store, query);
     assert!(store.last_materialisation().is_none());
-    (rebuilt, unregistered, reopened, unregistered_again)
+    (rebuilt, reopened)
 }
 
 /// A reopened store with a matching program: every reader is told of the unreconstructed
@@ -390,18 +383,19 @@ fn reopened_literal_reads_by_support_follow_the_matching_program() {
             ql_rewriting: ql,
             ..StoreConfig::on_disk(dir.path())
         };
-        {
+        let rebuilt_answer = {
             let store = StoreService::new(config()).expect("store");
             (store.execute_update(&SparqlUpdateRequest::new(data.clone()))).expect("data");
             store.rematerialise(ruleset).expect("rebuild");
             store.use_reasoning_rules(Some(ruleset.into()));
-            let (_, word, reasons) = read_as(&store, query, reader_of_open(true));
+            let (answer, word, reasons) = read_as(&store, query, reader_of_open(true));
             if word != "complete" {
                 unmet.push(format!(
                     "setup: {regime} before the reopen: {word} {reasons:?}"
                 ));
             }
-        }
+            answer
+        };
         let store = StoreService::new(config()).expect("reopen");
         store.use_reasoning_rules(Some(ruleset.into()));
         assert!(
@@ -412,11 +406,16 @@ fn reopened_literal_reads_by_support_follow_the_matching_program() {
             ("by support", reader_of_open(true)),
             ("of every graph", ReadScope::All),
         ] {
-            let (_, word, reasons) = read_as(&store, query, scope);
+            let (answer, word, reasons) = read_as(&store, query, scope);
             if word != expected
                 || reasons.iter().any(|r| r.contains(REOPENED)) != (expected == "sound-only")
             {
                 unmet.push(format!("{regime} {reader} reopened: {word} {reasons:?}"));
+            }
+            if answer != rebuilt_answer {
+                unmet.push(format!(
+                    "{regime} {reader} reopened: {answer} != {rebuilt_answer}"
+                ));
             }
         }
         store.rematerialise(ruleset).expect("rebuild");

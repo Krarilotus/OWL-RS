@@ -3608,6 +3608,35 @@ mod marker_tests {
     // rename, fails through metadata's fault (`metadata::tests::FAIL_DIR_SYNC`).
     use crate::metadata::tests::FAIL_DIR_SYNC as FAIL_MARKER_SYNC;
 
+    /// The marker alone cannot rule out an equality. The registered RDFS program
+    /// can, once the store checks that its fingerprint matches the closure.
+    #[test]
+    fn an_rdfs_marker_needs_its_own_program_to_clear_reopen_uncertainty() {
+        use nrese_reasoner::{RuleProgram, rulesets::Ruleset};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = || StoreConfig::on_disk(dir.path());
+        let program = RuleProgram::builtin(Ruleset::Rdfs);
+        {
+            let store = StoreService::new(config()).unwrap();
+            store.rematerialise(&program).unwrap();
+        }
+        let store = StoreService::new(config()).unwrap();
+        let flags = || {
+            super::Certificate::of(&store.engine().snapshot())
+                .map(|c| (c.state.literal_equality, c.state.literal_equality_unknown))
+        };
+        let unknown = flags();
+        store.use_reasoning_rules(Some(program.clone().with_named_keys(true)));
+        let mismatch = flags();
+        store.use_reasoning_rules(Some(program));
+        assert_eq!(flags(), Some((false, false)));
+        assert_eq!(unknown, Some((true, true)));
+        assert_eq!(mismatch, None);
+        store.use_reasoning_rules(None);
+        assert_eq!(flags(), Some((true, true)));
+    }
+
     /// A reasoning marker whose publication failed after its rename is still cleared by the
     /// next clear of the inferences. A rematerialisation under RDFS
     /// of `a a C . C subClassOf D` publishes its inferences, renames its marker into place, and
