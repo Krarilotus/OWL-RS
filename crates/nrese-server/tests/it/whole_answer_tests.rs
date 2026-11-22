@@ -130,6 +130,34 @@ async fn an_http10_answer_past_the_shared_memory_is_turned_away_for_now()
     Ok(())
 }
 
+/// An HTTP/1.0 query that the memory all queries share refuses before any of its answer is
+/// held (the shared total, 64 KiB, has no room for its own work) is turned away for now as
+/// well: 503 with `Retry-After: 1`, as when it is refused for its answer.
+#[tokio::test]
+async fn an_http10_query_refused_by_the_shared_memory_before_its_answer_may_be_retried()
+-> Result<(), Box<dyn Error>> {
+    let store = StoreService::new(StoreConfig {
+        total_query_memory_bytes: 64 << 10,
+        ..StoreConfig::in_memory()
+    })?;
+    let app = test_app_with_store(
+        store.clone(),
+        PolicyConfig::default(),
+        ReasonerConfig::default(),
+    )?;
+    let before = held(&store);
+    let response = app.oneshot(query_request(Version::HTTP_10)?).await?;
+    let status = response.status();
+    let retry = response.headers().get(header::RETRY_AFTER).cloned();
+    let problem: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await?)?;
+    eprintln!("{status}; retry-after {retry:?}; {problem}");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(retry, Some(HeaderValue::from_static("1")));
+    released_to(&store, before).await;
+    Ok(())
+}
+
 /// A client that leaves while its HTTP/1.0 answer is being made stops the request: hyper
 /// drops it once the connection reads the client's end, which cancels the query and
 /// releases its envelope. Pins, for HTTP/1.0, what the hold's own exit relies on.
