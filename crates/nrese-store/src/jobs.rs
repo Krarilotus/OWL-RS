@@ -244,9 +244,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("bad.nt");
         std::fs::write(&file, "<http://example.com/a> <http://example.com/p> .\n").unwrap();
-        let store =
-            crate::StoreService::new(crate::StoreConfig::on_disk(&dir.path().join("store")))
-                .unwrap();
+        let store = crate::StoreService::new(crate::StoreConfig::on_disk(dir.path().join("store")))
+            .unwrap();
         let request = crate::BulkLoadRequest {
             files: vec![file],
             replace: false,
