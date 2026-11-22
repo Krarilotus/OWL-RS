@@ -1033,7 +1033,8 @@ mod tests {
     /// keeps writing well within the stall bound (streamed, that would have started a 200 the
     /// stall bound then keeps going, to its end). The clock moves only as the test moves it
     /// (a blocking producer holds it still otherwise): a chunk each quarter of the bound, for
-    /// three bounds, the producer open throughout.
+    /// three bounds, the producer open throughout; each quarter only once the response task
+    /// has taken that chunk (its envelope charged for it) or has answered.
     #[tokio::test(start_paused = true)]
     async fn a_held_reads_first_deadline_bounds_all_of_it() {
         let memory = Envelope::new(Some(1 << 30), None);
@@ -1067,9 +1068,14 @@ mod tests {
             let status = answer.err().map(|stopped| stopped.into_response().status());
             (status, Instant::now())
         }));
-        for _ in 0..12 {
+        for taken in 1..=12 {
             if go.send(()).is_err() || written.recv().await.is_none() {
                 break;
+            }
+            // The order is the test's, not the runtime's: the response task has taken this
+            // chunk, or has answered, before the clock moves.
+            while memory.used() < taken * CHUNK_BYTES && !answer.is_finished() {
+                tokio::task::yield_now().await;
             }
             tokio::time::advance(Duration::from_millis(250)).await;
         }
@@ -1400,6 +1406,35 @@ mod tests {
             timeout,
             "a 413"
         );
+    }
+
+    /// Over HTTP/1.0, a frame that passed the hold's clock check but whose charge is refused
+    /// only once its deadline (1 s) has passed (it waited on the budget meanwhile) is too late
+    /// to be answered for: 408, not the 413 of a frame past its envelope (1 KiB). On a clock
+    /// the test moves, on the hold's step between its clock check and its charge.
+    #[tokio::test(start_paused = true)]
+    async fn a_frame_refused_past_its_deadline_is_a_timeout() {
+        let memory = Envelope::new(Some(1 << 10), None);
+        let (sender, receiver) = mpsc::channel(CHANNEL_CHUNKS);
+        sender
+            .try_send(Frame::data(Bytes::from(vec![b'x'; CHUNK_BYTES])))
+            .unwrap();
+        let outcome = Outcome::default();
+        let (at_step, go) = armed();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let held = hold(receiver, &outcome, deadline, memory.clone(), "timeout");
+        let late = async {
+            at_step.await.expect("the hold reached its step");
+            tokio::time::advance(Duration::from_secs(2)).await;
+            go.send(()).unwrap();
+        };
+        let (stopped, ()) = tokio::join!(held, late);
+        let status = stopped
+            .err()
+            .map(|stopped| stopped.into_response().status());
+        assert_eq!(status, Some(StatusCode::REQUEST_TIMEOUT));
+        assert_eq!(memory.used(), 0);
+        drop(sender);
     }
 
     /// Over HTTP/1.0, a held answer's frame isn't taken past the stall bound, though the timer
