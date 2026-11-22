@@ -507,8 +507,7 @@ fn a_refused_message_holds_less_than_its_language_tag() {
 /// after's dictionary (its frontier), charged by its bound before: the frontier code both
 /// `validate_changes` and `validate_shapes_change` use. The state after is a transaction's
 /// pending state, as every caller passes it: its lookup is the shared dictionary's, on a
-/// compressed base (assumed: the checkpoint maps it so, and a failed mapping would only be
-/// logged). The message is 1 MiB, the same before and after the change, and neither state
+/// compressed, mapped base (asserted). The message is 1 MiB, the same before and after the change, and neither state
 /// stores it. What the validation holds beyond its charge stays under 64 KiB (a few KiB
 /// measured).
 ///
@@ -524,26 +523,14 @@ fn a_message_looked_up_through_the_frontier_is_charged_for_its_lookup() {
     if !measure::alone() {
         return;
     }
-    /// The test's own data directory, removed when the test ends, also by a panic.
-    struct Dir(std::path::PathBuf);
-    impl Drop for Dir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-    let dir = Dir(std::env::temp_dir().join(format!(
-        "nrese-shacl-frontier-measure-{}",
-        std::process::id()
-    )));
-    // A directory left by a killed run of the same process id is not this test's store.
-    let _ = std::fs::remove_dir_all(&dir.0);
-    std::fs::create_dir_all(&dir.0).expect("the test's directory");
+    // The test's own data directory, removed when the test ends, also by a panic.
+    let dir = tempfile::tempdir().expect("the test's directory");
     nrese_engine::set_vocabulary_encoding(nrese_engine::VocabularyEncoding::Fsst);
     let config = EngineConfig {
         background_maintenance: false,
         ..EngineConfig::default()
     };
-    let engine = Engine::open(&dir.0, config).expect("engine");
+    let engine = Engine::open(dir.path(), config).expect("engine");
     let shapes = format!(
         "@prefix ex: <http://example.com/> . @prefix sh: <http://www.w3.org/ns/shacl#> .
          ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:sparql [ sh:message \"{}{{?x}}\" ;
@@ -571,9 +558,13 @@ fn a_message_looked_up_through_the_frontier_is_charged_for_its_lookup() {
         GraphNameRef::DefaultGraph,
     );
     tx.commit().expect("commit");
-    // The dictionary's base, compressed from here on if its mapping succeeds (a failure is
-    // only logged).
+    // The dictionary's base, compressed and mapped from here on: a failed mapping is only
+    // logged and would leave the dictionary on the heap, a path this test doesn't measure.
     engine.checkpoint().expect("checkpoint");
+    assert!(
+        engine.stats().dictionary.mapped_bytes > 0,
+        "the dictionary is served from the mapped checkpoint"
+    );
     let before = engine.snapshot();
     let graph = before
         .lookup(NamedNodeRef::new_unchecked(SHAPES).into())

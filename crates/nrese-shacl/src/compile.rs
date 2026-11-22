@@ -647,8 +647,10 @@ impl<V: ReadView> Compiler<'_, V> {
     }
 
     /// A SPARQL check's `sh:message`s, each with its template if it has blocks to fill in.
+    /// Once the compile is cancelled the rest are left out: nothing of it is kept.
     fn messages(&self, ids: Vec<TermId>) -> Vec<Message> {
         ids.into_iter()
+            .take_while(|_| !self.graph.cancelled())
             .map(|id| Message {
                 id,
                 template: self
