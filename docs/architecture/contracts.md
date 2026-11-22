@@ -106,7 +106,10 @@ one index → inner → order → derived bookkeeping, never two locks of one le
 compaction holders run serial work. Vector filters use `SearchInput` after index locks are released (`crates/nrese-engine/src/term/vectors.rs:480`).
 A commit's note (`Transaction::note_commit`, `crates/nrese-engine/src/engine/writer.rs`) runs with the writer slot, the WAL and, where the
 commit converts the stack, the compaction slot held: it takes no lock and calls nothing in the engine, and its journal's sync holds back
-compaction, checkpoints and the served log for its length (quarantine readmissions only). State that changes only between commits takes a
+compaction, checkpoints and the served log for its length (quarantine readmissions only).
+The publication report (`Transaction::note_publication`) runs after the current-version lock is released, under the writer slot, with the
+WAL on durable commits and the compaction slot on layout conversions. A no-op reports the unchanged revision under the writer slot alone.
+State that changes only between commits takes a
 `WriterHeld` proof (the store's reasoning certificate: `StoreService::invalidate_held`, `record_reasoning` under `Rematerialisation::finish_held`).
 
 A write publishes only with the rights it was evaluated with (`RightsCheck::hold`, `crates/nrese-store/src/access/control.rs`): the pipeline holds the access

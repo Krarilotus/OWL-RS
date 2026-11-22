@@ -609,8 +609,9 @@ fn owl2_rl_parses_and_every_rule_is_safe() {
     let mut vocabulary = LocalVocabulary::default();
     let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
     // Tables 4 (6 rules), 5 (16), 6 (13), 7 (4) and 9 (18); list rules come from `lists`.
-    // Plus the reflexive eq-diff1 (x differentFrom x), eq-ref's consistency part.
-    assert_eq!(rules.len(), 58);
+    // Plus the reflexive eq-diff1 (x differentFrom x), eq-ref's consistency part, and the
+    // empty-owl:Thing check beyond the tables (cls-thing-empty).
+    assert_eq!(rules.len(), 59);
     assert!(rules.iter().any(|r| r.name == "cls-maxqc4"));
     Ruleset::Rdfs.rules(&mut vocabulary).unwrap();
 }

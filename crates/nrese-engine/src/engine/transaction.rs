@@ -63,6 +63,7 @@ pub struct Transaction<'e> {
     after: OnceLock<super::AssertedIdentity>,
     /// The commit's note in a journal of the caller's ([`Self::note_commit`]).
     note: Option<super::CommitNote<'e>>,
+    publication: Option<super::CommitPublication<'e>>,
     /// The reading the commit installs with its stack ([`Self::read_equality_as`]); `None`
     /// keeps the base's.
     reading: Option<Option<TermId>>,
@@ -78,6 +79,7 @@ impl<'e> Transaction<'e> {
             _slot: slot,
             after: OnceLock::new(),
             note: None,
+            publication: None,
             reading: None,
             vouched: None,
         }
@@ -139,6 +141,17 @@ impl<'e> Transaction<'e> {
     pub fn note_commit(&mut self, note: super::CommitNote<'e>) {
         debug_assert!(self.note.is_none(), "one note per commit");
         self.note = Some(note);
+    }
+
+    /// Records the visible revision under the writer slot, after the version lock is released.
+    /// As with the note, the WAL and conversion's compaction slot may still be held. A no-op
+    /// records the unchanged revision under the writer slot alone. One report per commit.
+    pub fn note_publication(&mut self, publication: super::CommitPublication<'e>) {
+        debug_assert!(
+            self.publication.is_none(),
+            "one publication report per commit"
+        );
+        self.publication = Some(publication);
     }
 
     /// The asserted identity the commit will publish
@@ -492,6 +505,16 @@ impl<'e> Transaction<'e> {
         self.pending.quads_for_pattern_in(model, pattern)
     }
 
+    /// Asserted quads matching `pattern`, stopping before matching further candidates.
+    pub fn asserted_quads_for_pattern_until<'a, F: Fn() -> bool + Copy + 'a>(
+        &'a self,
+        pattern: &QuadPattern,
+        stop: F,
+    ) -> impl Iterator<Item = EncodedQuad> + use<'a, 'e, F> {
+        self.pending
+            .quads_for_pattern_until(ReadModel::Asserted, pattern, stop)
+    }
+
     /// True if the named graph `graph` contains at least one quad, including pending changes.
     pub fn contains_named_graph(&self, graph: TermId) -> bool {
         self.pending.contains_named_graph(graph)
@@ -698,6 +721,7 @@ impl<'e> Transaction<'e> {
             pending,
             after,
             note,
+            publication,
             vouched,
             ..
         } = self;
@@ -723,7 +747,11 @@ impl<'e> Transaction<'e> {
         };
         if asserted.is_empty() && inferred.is_empty() {
             // Nothing published: the note isn't called ([`Self::note_commit`]).
-            return Ok(checked(summary(base.revision(), base.asserted_identity())));
+            let summary = checked(summary(base.revision(), base.asserted_identity()));
+            if let Some(publication) = publication {
+                publication(summary.revision);
+            }
+            return Ok(summary);
         }
         let mut summary = summary(base.revision() + 1, base.asserted_identity());
         let shared = &engine.shared;
@@ -758,6 +786,7 @@ impl<'e> Transaction<'e> {
             reading,
             vouched,
             note,
+            publication,
         )? {
             summary.asserted = new;
         }
@@ -792,6 +821,7 @@ impl Inner {
         reading: Option<TermId>,
         certificate: Option<super::Certificate>,
         note: Option<super::CommitNote<'_>>,
+        publication: Option<super::CommitPublication<'_>>,
     ) -> EngineResult<Option<super::AssertedIdentity>> {
         // New where the record changes asserted statements; kept for an inferred-only one.
         // Chosen once, for the durable and the in-memory path alike.
@@ -884,6 +914,9 @@ impl Inner {
                 shared
                     .versions
                     .publish(|current| publish(current, committed));
+                if let Some(publication) = publication {
+                    publication(revision);
+                }
                 wal.bytes_since_checkpoint()
             }
             None => {
@@ -910,6 +943,9 @@ impl Inner {
                 shared
                     .versions
                     .publish(|current| publish(current, committed));
+                if let Some(publication) = publication {
+                    publication(revision);
+                }
                 0
             }
         };
@@ -934,6 +970,10 @@ impl Inner {
         }
         // After the commit's own compaction slot (a conversion's): compacting takes it.
         drop(_compaction);
+        #[cfg(test)]
+        if let Some(tail) = crate::durability::fault::COMMIT_TAIL.take() {
+            tail()?;
+        }
         self.after_commit(wal_bytes);
         Ok(asserted_identity)
     }
