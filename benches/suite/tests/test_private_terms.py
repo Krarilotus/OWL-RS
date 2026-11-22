@@ -324,6 +324,32 @@ class PrivateTerms(unittest.TestCase):
         self.assertEqual(done.returncode, 1, f"SPEC merge-octopus: an octopus merge's own line passed\n{done.stdout}")
         self.assertIn(f"commit {evil[:9]}: added lines match in a file under .\n", done.stdout)
 
+    def test_a_merges_own_line_is_read_whatever_blank_lines_look_like(self):
+        # Spec (as above; git-config's diff.suppressBlankEmpty prints a blank context line without its space): a
+        # merge's own line after a blank line, taken from one parent and new to the other, is read.
+        self.git("config", "diff.suppressBlankEmpty", "true")
+        start = self.branch("start", self.base, {"f.txt": "x\ny\n"})
+        self.git("merge", "-q", "--ff-only", start)
+        line = self.branch("line", start, {"f.txt": "x\n\ny\n"})
+        merge = self.merge(line, files={"f.txt": "x\n\ny\nabout zzsshzz\n"})
+        done = self.check("push", line, "HEAD", "refs/heads/topic")
+        self.assertEqual(done.returncode, 1, f"SPEC merge-own-blank: a merge's own line passed\n{done.stdout}")
+        self.assertIn(f"commit {merge[:9]}: added lines match in a file under .\n", done.stdout)
+
+    def test_a_merged_path_that_isnt_utf8_is_refused(self):
+        # Spec (the master, 22 Nov 03:08 (b): what can't be read is refused, exit 2): a merge's own file whose name
+        # isn't UTF-8 can't be named back to git, so it is refused, never passed unread.
+        def plumbing(*args, data):
+            return subprocess.run(["git", "-C", str(self.repo), *args], input=data, check=True, capture_output=True,
+                                  env=self.env).stdout
+        line = self.branch("line", self.base, {"l.txt": "line\n"})
+        self.git("merge", "-q", "--no-ff", "--no-commit", line)
+        blob = plumbing("hash-object", "-w", "--stdin", data=b"about zzsshzz\n").strip()
+        plumbing("update-index", "--index-info", data=b"100644 " + blob + b"\t\xff.txt\n")
+        self.git("commit", "-q", "-m", "merge")
+        done = self.check("push", line, "HEAD", "refs/heads/topic")
+        self.assertEqual(done.returncode, 2, f"SPEC merge-path-bytes: a path git can't be given back passed\n{done.stdout}")
+
 
 def module():
     """The check as a module of its own, fresh: STOP starts empty."""

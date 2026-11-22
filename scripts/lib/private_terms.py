@@ -249,7 +249,8 @@ def added(patch: str) -> str:
 
 def numbered(patch: str) -> dict[int, str]:
     """One file's patch's added lines by their line numbers in the new file (of a type change, both its halves: only
-    the new one adds). Only a hunk's lines are content: a file's headers come before its first hunk."""
+    the new one adds). Only a hunk's lines are content: a file's headers come before its first hunk. A blank context
+    line may come without its space (diff.suppressBlankEmpty)."""
     lines, at, in_hunk = {}, 0, False
     for line in patch.split("\n"):
         if line.startswith("diff "):
@@ -260,7 +261,7 @@ def numbered(patch: str) -> dict[int, str]:
         elif in_hunk and line.startswith("+"):
             lines[at] = line[1:]
             at += 1
-        elif in_hunk and line.startswith(" "):
+        elif in_hunk and (line.startswith(" ") or not line):
             at += 1
     return lines
 
@@ -327,8 +328,11 @@ def merged(label: str, commit: str, parents: list[str], terms: Terms) -> list[st
     lines out and loses hunks past a word's bits of parents."""
     changed = []  # per parent: {path: status}
     for parent in parents:
-        entries = text(git("diff-tree", "-r", "-z", "--name-status", "--no-commit-id", "--no-renames", parent,
-                           commit)).split("\0")
+        listed = git("diff-tree", "-r", "-z", "--name-status", "--no-commit-id", "--no-renames", parent, commit)
+        try:  # a path is read by its name: one that isn't UTF-8 can't be named back to git
+            entries = listed.decode("utf-8").split("\0")
+        except UnicodeDecodeError:
+            raise Unreadable("a merged path that isn't UTF-8") from None
         changed.append(dict(zip(entries[1::2], entries[0::2])))  # status, then path; the last field is empty
     # Only a file changed against every parent can hold a line new to all of them; a file the merge deleted holds none.
     paths = [p for p, status in changed[0].items() if status != "D" and all(p in c for c in changed[1:])]
