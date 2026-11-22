@@ -337,10 +337,11 @@ fn an_answer_past_the_time_after_the_reads_is_undecided() {
     assert_eq!(answers, ["Ok(Entailed)".to_owned(), "undecided".to_owned()]);
 }
 
-/// Spec (`entails`: one certified closure; a changed certificate refuses): a check with
-/// `owl2-dl` off that has read its mode, while the store switches it on and commits a premise
-/// whose annotation property's domain puts `:x a :C` in the closure, refuses. It never answers
-/// by the rules over a revision `owl2-dl` reads, where `:x a :C` isn't entailed.
+/// Spec (`entails`: one certified closure; a certificate changed during the check refuses,
+/// asking again): a check with `owl2-dl` off that has read its mode, while the store switches
+/// it on and commits a premise whose annotation property's domain puts `:x a :C` in the
+/// closure, refuses as undecided. It never answers by the rules over a revision `owl2-dl`
+/// reads, where `:x a :C` isn't entailed.
 #[test]
 fn a_switch_to_owl2_dl_during_the_check_is_refused() {
     let (store, pipeline) = dl_store(DlConfig::default(), ":a a :D .");
@@ -363,7 +364,7 @@ fn a_switch_to_owl2_dl_during_the_check_is_refused() {
     );
     hooks::AFTER_MODE_READ.set(None);
     assert!(
-        matches!(answer, Err(crate::StoreError::Configuration(_))),
+        matches!(&answer, Err(crate::StoreError::Undecided(why)) if why.ends_with("ask again")),
         "{answer:?}"
     );
 }
