@@ -954,10 +954,15 @@ const LITERAL_EQUALITY_UNTOLD: &str = "the rules may equate two literals as one 
                                        a reader of some graphs isn't told whether they do";
 
 /// Whether the graphs a reader by support reads (`access`) may give its view an equality of two
-/// literals, read from them alone: an inference it sees has its support there, so an equality
-/// it misses copies of rests on an axiom there that equates (a functional or inverse-functional
-/// property, a cardinality, a key) or on an `owl:sameAs` with a literal. Rules other than a
-/// built-in ruleset's (`state`) may conclude one from anything.
+/// literals, read from its view alone (`snapshot`: what its graphs assert, and the inferences
+/// they support). An inference it sees has its support there, so an equality it misses copies
+/// of rests on premises there. The rules that conclude `owl:sameAs` read either one of these
+/// (a functional or inverse-functional property, a maximum cardinality, qualified or not, a
+/// key; an exact cardinality counted too) or an `owl:sameAs` (eq-sym, eq-trans: one with a
+/// literal), or conclude a property a schema term names (eq-rep-p, prp-spo1, prp-eqp, prp-inv,
+/// prp-symp, prp-trp, prp-spo2, cls-hv1), which is `owl:sameAs` only where a statement names it
+/// as a subject or an object. Each is read in the view, declarations the rules derive included.
+/// Rules other than a built-in ruleset's (`state`) may conclude one from anything.
 fn may_equate_literals(
     snapshot: &Snapshot,
     access: &nrese_sparql::GraphAccess,
@@ -969,12 +974,14 @@ fn may_equate_literals(
     }
     let id = |iri: &str| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into());
     let owl = |name: &str| id(&format!("{OWL}{name}"));
-    let held = |p: Option<TermId>, o: Option<TermId>| {
-        p.is_some_and(|p| {
-            (snapshot.quads_for_pattern_in(ReadModel::Asserted, &any_graph(None, Some(p), o)))
-                .any(|q| access.allows_id(snapshot, q.graph))
-        })
+    // A statement of its view: asserted in a graph it reads, or inferred where it sees them.
+    let held = |pattern: QuadPattern| {
+        (snapshot.quads_for_pattern_in(ReadModel::Asserted, &pattern))
+            .any(|q| access.allows_id(snapshot, q.graph))
+            || (access.inferred && snapshot.exists_in(ReadModel::Inferred, &pattern))
     };
+    let stated =
+        |p: Option<TermId>, o: Option<TermId>| p.is_some_and(|p| held(any_graph(None, Some(p), o)));
     let ty = id(RDF_TYPE);
     let typed = ["FunctionalProperty", "InverseFunctionalProperty"];
     let axioms = [
@@ -984,9 +991,14 @@ fn may_equate_literals(
         "qualifiedCardinality",
         "hasKey",
     ];
-    (typed.iter()).any(|class| owl(class).is_some_and(|class| held(ty, Some(class))))
-        || axioms.iter().any(|p| held(owl(p), None))
-        || owl("sameAs").is_some_and(|same| holds_literals(snapshot, Some(same), Some(access)))
+    let same = owl("sameAs");
+    (typed.iter()).any(|class| owl(class).is_some_and(|class| stated(ty, Some(class))))
+        || axioms.iter().any(|p| stated(owl(p), None))
+        || same.is_some_and(|same| {
+            holds_literals(snapshot, Some(same), Some(access))
+                || held(any_graph(Some(same), None, None))
+                || held(any_graph(None, None, Some(same)))
+        })
 }
 
 /// The conditions of the store under which a read that rests on reasoning isn't told
