@@ -178,6 +178,84 @@ fn a_rules_answer_past_the_time_is_undecided() {
     );
 }
 
+/// Spec (`entails` under `owl2-dl`: one `dl.timeout` from the call; past it, no answer of
+/// any kind): data inconsistent under the rules entails everything, but that found after
+/// the time is up is no answer; within it, `InconsistentPremise`.
+#[test]
+fn an_inconsistent_premise_found_past_the_time_is_undecided() {
+    let answers = [false, true].map(|late| {
+        let dl = DlConfig {
+            timeout: Some(Duration::from_millis(300)),
+            ..DlConfig::default()
+        };
+        let (store, _pipeline) = dl_store(dl, ":a a :D .");
+        // Past the gates, which would refuse it: `:x` in two disjoint classes.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("data.ttl");
+        let prefixes = PREFIXES.replace("PREFIX", "@prefix").replace("> ", "> . ");
+        std::fs::write(
+            &file,
+            format!("{prefixes}\n:x a :A , :B . :A owl:disjointWith :B ."),
+        )
+        .unwrap();
+        store
+            .bulk_load(&crate::BulkLoadRequest {
+                files: vec![file],
+                replace: false,
+                graph: crate::GraphTarget::DefaultGraph,
+                invalid: Some(crate::InvalidStatements::Strict),
+            })
+            .unwrap();
+        let rules = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl)
+            .materialised_program()
+            .unwrap();
+        store.rematerialise(rules.clone()).unwrap();
+        if late {
+            hooks::AFTER_CERTIFIED.set(Some(Box::new(|| {
+                std::thread::sleep(Duration::from_millis(600));
+            })));
+        }
+        let answer = store.entails(
+            rules,
+            &[Triple::new(iri("x"), nrese_rdf::vocab::rdf::TYPE, iri("C"))],
+        );
+        hooks::AFTER_CERTIFIED.set(None);
+        match answer {
+            Err(crate::StoreError::Undecided(_)) => "undecided".to_owned(),
+            other => format!("{other:?}"),
+        }
+    });
+    assert_eq!(
+        answers,
+        ["Ok(InconsistentPremise)".to_owned(), "undecided".to_owned()]
+    );
+}
+
+/// Spec (`entails_dl`: decided within one `dl.timeout` from the call; past it, unknown):
+/// the empty conclusion is entailed, but not past the time.
+#[test]
+fn the_empty_conclusion_past_the_time_is_unknown() {
+    let answers = [false, true].map(|late| {
+        let dl = DlConfig {
+            timeout: Some(Duration::from_millis(300)),
+            ..DlConfig::default()
+        };
+        let (store, _pipeline) = dl_store(dl, EMPTY_C);
+        if late {
+            hooks::AFTER_DL_PREMISE.set(Some(Box::new(|| {
+                std::thread::sleep(Duration::from_millis(600));
+            })));
+        }
+        let answer = store.entails_dl(&[]).unwrap().answer;
+        hooks::AFTER_DL_PREMISE.set(None);
+        match answer {
+            Entailed::Unknown(_) => "unknown".to_owned(),
+            other => format!("{other:?}"),
+        }
+    });
+    assert_eq!(answers, ["Yes".to_owned(), "unknown".to_owned()]);
+}
+
 /// Spec (`entailment` module docs: under `owl2-dl` the rules decide plain ground
 /// assertions): a ground conclusion the rules show is entailed with no DL check.
 #[test]
