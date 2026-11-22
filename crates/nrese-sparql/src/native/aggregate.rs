@@ -869,28 +869,15 @@ fn one_pass_plan(
                     return None;
                 }
                 let column = solutions.column(variable)?;
-                if numeric
-                    && !solutions.table.column(column).iter().all(|&id| {
+                let ids = solutions.table.column(column);
+                if matches!(name, AggregateFunction::Min | AggregateFunction::Max) {
+                    mixed |= min_max_column(ids)?;
+                } else if numeric
+                    && !ids.iter().all(|&id| {
                         id == UNDEF || TermId::from_raw(id).as_inline_integer().is_some()
                     })
                 {
                     return None;
-                }
-                // Running keeps the first of equal values, the term `value::order` picks only
-                // where equal values are one term: one datatype ("1"^^xsd:integer sorts before
-                // "1"^^xsd:nonNegativeInteger). Several datatypes take [`mixed_pass`], which
-                // reduces order keys: an id without one (a reserved datatype code, which a
-                // replayed log record can carry) declines the pass, and the per-group path
-                // answers, as it does for every id this pass doesn't take.
-                if matches!(name, AggregateFunction::Min | AggregateFunction::Max)
-                    && !one_datatype(solutions.table.column(column))
-                {
-                    let keyed =
-                        |&id: &u64| id == UNDEF || value::order_key(TermId::from_raw(id)).is_some();
-                    if !solutions.table.column(column).iter().all(keyed) {
-                        return None;
-                    }
-                    mixed = true;
                 }
                 plan.push((Some(column), name.clone()));
             }
@@ -963,20 +950,26 @@ fn mixed_pass(
     }
 }
 
-/// Whether the inline integers `ids` (unbound ones aside) are of one datatype.
-fn one_datatype(ids: &[u64]) -> bool {
-    let mut bound = ids
-        .iter()
-        .filter(|&&id| id != UNDEF)
-        .map(|&id| TermId::from_raw(id));
-    let Some(first) = bound.next() else {
-        return true;
-    };
-    if first.kind() == TermKind::Integer {
-        return bound.all(|id| id.kind() == TermKind::Integer);
+/// A MIN or MAX column's admission to [`aggregate_in_one_pass`], in one pass over `ids`:
+/// `None` unless every bound id is an inline integer; then whether they hold several
+/// datatypes. Running keeps the first of equal values, the term `value::order` picks only
+/// where equal values are one term: one datatype ("1"^^xsd:integer sorts before
+/// "1"^^xsd:nonNegativeInteger). Several datatypes take [`mixed_pass`], which reduces order
+/// keys: an id without one (a reserved datatype code, which a replayed log record can carry)
+/// declines the pass there, and the per-group path answers, as it does for every id this
+/// pass doesn't take.
+fn min_max_column(ids: &[u64]) -> Option<bool> {
+    let (mut first, mut several, mut keyless) = (None, false, false);
+    for &id in ids.iter().filter(|&&id| id != UNDEF) {
+        let id = TermId::from_raw(id);
+        if !matches!(id.kind(), TermKind::Integer | TermKind::DerivedInteger) {
+            return None;
+        }
+        let rank = value::inline_integer_rank(id);
+        keyless |= rank.is_none();
+        several |= *first.get_or_insert(rank) != rank;
     }
-    let datatype = value::inline_integer_rank(first);
-    bound.all(|id| value::inline_integer_rank(id) == datatype)
+    (!(several && keyless)).then_some(several)
 }
 
 /// GROUP_CONCAT (SPARQL 1.1 §18.5.1.7): string literals only (anything else makes the
