@@ -76,19 +76,45 @@ impl StoreSettings {
         nrese_exec::Envelope::new(limit, self.runtime.query_memory())
     }
 
-    /// The envelope of a query request: the one opened when the store prepared it
-    /// ([`PreparedQuery::memory`]), else its memory limit within the catalog's budget.
+    /// The envelope of one run of a query: its memory limit within this catalog's budget,
+    /// opened for this run. Runs of one prepared query, at once or one after another, share
+    /// neither a limit nor a refusal. The one exception is the envelope [`Self::open_run`]
+    /// opened for the next run on this catalog's store: the run takes it, so that what its
+    /// transport holds for it is charged to the run's own envelope.
     pub(crate) fn query_envelope(&self, prepared: &PreparedQuery) -> nrese_exec::Envelope {
-        prepared
-            .memory
-            .clone()
-            .unwrap_or_else(|| self.envelope(prepared.memory_limit))
+        let opened = prepared
+            .next_run
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        match opened {
+            Some((catalog, envelope))
+                if std::ptr::eq(catalog.as_ptr(), std::sync::Arc::as_ptr(&self.runtime)) =>
+            {
+                envelope
+            }
+            _ => self.envelope(prepared.memory_limit),
+        }
+    }
+
+    /// Opens the envelope of `prepared`'s next run on this catalog's store
+    /// ([`Self::query_envelope`]).
+    pub(crate) fn open_run(&self, prepared: &PreparedQuery) -> nrese_exec::Envelope {
+        let envelope = self.envelope(prepared.memory_limit);
+        *prepared.next_run.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some((std::sync::Arc::downgrade(&self.runtime), envelope.clone()));
+        envelope
     }
 
     pub(crate) fn search_scope(&self) -> nrese_sparql::SearchScope {
         *self.search_scope.read().unwrap_or_else(|p| p.into_inner())
     }
 }
+
+/// The envelope opened for a prepared query's next run, and the catalog whose store opened it.
+type NextRun = std::sync::Arc<
+    std::sync::Mutex<Option<(std::sync::Weak<crate::Runtime>, nrese_exec::Envelope)>>,
+>;
 
 /// A parsed query with its protocol dataset and output format. Preparing is cheap and
 /// reports syntax errors before any result is produced, so a transport can still choose
@@ -103,9 +129,10 @@ pub struct PreparedQuery {
     pub(crate) inference_scope: Option<std::sync::Arc<nrese_sparql::GraphAccess>>,
     read_model: ReadModel,
     memory_limit: Option<usize>,
-    /// The envelope its runs draw from, opened by the store that prepared it
-    /// ([`Self::memory`]).
-    pub(crate) memory: Option<nrese_exec::Envelope>,
+    /// The envelope opened for its next run, with the catalog that opened it
+    /// ([`StoreSettings::open_run`]); taken by that run. Shared by its clones, so that one
+    /// run alone takes it.
+    next_run: NextRun,
     as_written: bool,
     solutions_format: SolutionsResultFormat,
     graph_format: GraphResultFormat,
@@ -198,7 +225,7 @@ impl PreparedQuery {
                 _ => request.read_model.or(model).unwrap_or_default(),
             },
             memory_limit: request.memory_limit,
-            memory: None,
+            next_run: NextRun::default(),
             as_written: request.as_written,
             solutions_format: request.solutions_format,
             graph_format: request.graph_format,
@@ -212,15 +239,6 @@ impl PreparedQuery {
             on_evaluation: None,
             reads: crate::dl::query::Reads::new(request.scope.access().cloned()),
         })
-    }
-
-    /// The envelope its runs draw on, opened by the store that prepared it
-    /// ([`StoreService::prepare_query`](crate::StoreService::prepare_query)): its memory
-    /// limit within the store's budget. What its transport holds for the request (an answer
-    /// held whole) is charged to it too, so that both share the request's limit. `None`
-    /// for a query parsed without a store ([`Self::parse`]).
-    pub fn memory(&self) -> Option<&nrese_exec::Envelope> {
-        self.memory.as_ref()
     }
 
     /// Calls `entered` whenever the store hands this query to the executor, past the
