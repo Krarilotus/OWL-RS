@@ -229,6 +229,43 @@ impl Jobs {
 mod tests {
     use super::*;
 
+    // Spec: docs/ops/http-api.md says an import that could not keep its quarantine
+    // and published nothing ends failed with retry advice, even if cancelled late.
+    #[cfg(feature = "fault-points")]
+    #[test]
+    fn late_cancel_preserves_import_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("bad.nt");
+        std::fs::write(&file, "<http://example.com/a> <http://example.com/p> .\n").unwrap();
+        let store =
+            crate::StoreService::new(crate::StoreConfig::on_disk(&dir.path().join("store")))
+                .unwrap();
+        let request = crate::BulkLoadRequest {
+            files: vec![file],
+            replace: false,
+            graph: crate::GraphTarget::DefaultGraph,
+            invalid: None,
+        };
+        let jobs = Arc::new(Jobs::default());
+        let job = jobs.start("import", "nrese", "an uploaded document");
+        let id = job.id();
+        store.quarantine().fail_next_commit();
+        let error = store.bulk_load_with(&request, job.progress()).unwrap_err();
+        let crate::StoreError::LoadQuarantineNotRecorded(error) = error else {
+            panic!("expected an unpublished quarantine error, got {error}");
+        };
+        let message = error.unpublished_message("send", None);
+        jobs.cancel(id);
+        job.finish(Err(message));
+
+        let view = serde_json::to_value(jobs.get(id).unwrap()).unwrap();
+        assert_eq!(view["state"], "failed", "GET job body: {view}");
+        assert_eq!(
+            view["error"],
+            "the load published nothing. The quarantine record couldn't be kept: simulated failure. It's safe to send it again once the cause is resolved."
+        );
+    }
+
     #[test]
     fn jobs_report_their_progress_and_outcome() {
         let jobs = Arc::new(Jobs::default());
