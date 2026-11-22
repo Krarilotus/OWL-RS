@@ -8,6 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+READS = ("benches/fast/fast.py", "benches/hosts.toml", "benches/suite/suitekit/*", "rust-toolchain.toml")
+
 spec = importlib.util.spec_from_file_location(
     "fast_timeout_contract", Path(__file__).resolve().parents[2] / "fast" / "fast.py")
 fast = importlib.util.module_from_spec(spec)

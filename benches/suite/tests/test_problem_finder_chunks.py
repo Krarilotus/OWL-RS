@@ -20,6 +20,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+READS = ("benches/seed-sweeps.toml", "benches/suite/suitekit/__init__.py", "benches/suite/suitekit/lock.py",
+         "benches/suite/suitekit/ns.py", "benches/suite/suitekit/runtime.py", "scripts/capped-chunk.py",
+         "scripts/seed-sweep.py")
+
 ROOT = Path(__file__).resolve().parents[3]
 
 

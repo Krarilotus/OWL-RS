@@ -18,6 +18,10 @@ sys.path.insert(0, str(ROOT / "benches/suite"))
 from suitekit import adapters, runtime  # noqa: E402
 from suitekit.runtime import Mount  # noqa: E402
 
+READS = ("benches/suite/suitekit/__init__.py", "benches/suite/suitekit/adapters.py",
+         "benches/suite/suitekit/lock.py", "benches/suite/suitekit/manifest.py",
+         "benches/suite/suitekit/ns.py", "benches/suite/suitekit/runtime.py")
+
 
 class Scopes(unittest.TestCase):
     def test_host_binaries_use_the_contenders_cap(self):

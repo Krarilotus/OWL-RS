@@ -16,6 +16,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from suitekit import runtime  # noqa: E402
 
+READS = ("benches/suite/suitekit/__init__.py", "benches/suite/suitekit/lock.py",
+         "benches/suite/suitekit/ns.py", "benches/suite/suitekit/runtime.py")
+
 
 @unittest.skipUnless(sys.platform == "linux" and os.environ.get("NRESE_TEST_NATIVE_CLEANUP") == "1",
                      "requires an explicitly enabled Linux Fleet lifecycle check")

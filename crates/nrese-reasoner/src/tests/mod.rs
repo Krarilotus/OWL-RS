@@ -4007,3 +4007,248 @@ fn a_list_whose_merged_cells_are_past_the_cap_is_checked_as_asserted() {
         );
     }
 }
+
+/// Spec (cost, the `owl2-ql` row of reasoning-semantics.md: no rule reads an annotation,
+/// at no cost where none is read): over a sub-property chain with no annotation property,
+/// `owl2-ql`'s rules, guarded against annotation readings, derive the same closure with the
+/// same work as the same rules without the guard: the same `prp-spo1` bindings (its instances
+/// a closed family, reading none of their own output) and the same pairs read by the
+/// transitive module (`scm-spo` handed to it).
+#[test]
+fn owl2_qls_annotation_guard_keeps_the_hierarchy_fast_paths() {
+    use super::ir::Guard;
+    let mut vocabulary = LocalVocabulary::default();
+    let mut text = String::new();
+    for i in 1..8 {
+        text.push_str(&format!("ex:p{i} rdfs:subPropertyOf ex:p{}\n", i + 1));
+        text.push_str(&format!("ex:p{i} rdf:type owl:ObjectProperty\n"));
+    }
+    for i in 0..20 {
+        text.push_str(&format!("ex:x{i} ex:p1 ex:y{i}\n"));
+        text.push_str(&format!("ex:u{i} ex:p4 ex:v{i}\n"));
+    }
+    let input = load(&mut vocabulary, &text);
+    let guarded = Ruleset::Owl2Ql.rules_for(&mut vocabulary, &input).unwrap();
+    let mut unguarded = guarded.clone();
+    for rule in &mut unguarded {
+        rule.guards
+            .retain(|g| !matches!(g, Guard::NotAnnotation(..)));
+    }
+    assert_ne!(
+        guarded, unguarded,
+        "owl2-ql's rules carry the annotation guard"
+    );
+    let schema = Schema::owl(&mut vocabulary);
+    let run = |rules: &[super::ir::Rule]| batch::materialise(&input, rules, None, &schema);
+    let (with, without) = (run(&guarded), run(&unguarded));
+    let work = |r: &batch::Materialisation| {
+        (
+            r.counters.bindings_by_rule.get("prp-spo1").copied(),
+            r.counters.closure_pairs.iter().sum::<u64>(),
+            r.transitive,
+        )
+    };
+    assert_eq!(with.derived, without.derived, "the same closure");
+    let what = "(prp-spo1 bindings, transitive pairs read, predicates closed transitively)";
+    assert_eq!(work(&with), work(&without), "{what}");
+}
+
+const QL_ANNOTATION_HIERARCHY: &str = "
+    ex:a rdf:type owl:AnnotationProperty
+    ex:p rdfs:subPropertyOf ex:a
+    ex:a rdfs:subPropertyOf ex:q
+    ex:p rdfs:subPropertyOf ex:b
+    ex:b rdfs:subPropertyOf ex:c
+    ex:q rdfs:subPropertyOf ex:r
+    ex:x ex:p ex:y";
+
+/// The hierarchy shortcut closes the logical chain and ignores annotation edges,
+/// whether the annotation would be the middle or an endpoint of a derivation.
+#[test]
+fn owl2_ql_hierarchy_fast_path_skips_annotation_edges() {
+    let mut v = LocalVocabulary::default();
+    let input = load(&mut v, QL_ANNOTATION_HIERARCHY);
+    let rules = Ruleset::Owl2Ql.rules_for(&mut v, &input).unwrap();
+    let schema = Schema::owl(&mut v);
+    let result = batch::materialise(&input, &rules, None, &schema);
+    assert_eq!(
+        result.transitive, 2,
+        "both hierarchies use the transitive module"
+    );
+    let derived = result.derived.into_iter().collect();
+    assert!(has(&mut v, &derived, "ex:p rdfs:subPropertyOf ex:c"));
+    assert!(has(&mut v, &derived, "ex:x ex:c ex:y"));
+    for forbidden in [
+        "ex:p rdfs:subPropertyOf ex:q",
+        "ex:a rdfs:subPropertyOf ex:r",
+        "ex:x ex:r ex:y",
+    ] {
+        assert!(!has(&mut v, &derived, forbidden), "{forbidden}");
+    }
+}
+
+/// A commit's new and already present hierarchy pairs obey the same annotation guard.
+#[test]
+fn owl2_ql_hierarchy_update_skips_annotation_edges() {
+    use super::delta::{self, MemoryBase};
+    let mut v = LocalVocabulary::default();
+    let input = load(&mut v, QL_ANNOTATION_HIERARCHY);
+    let inserted = load(
+        &mut v,
+        "ex:s rdfs:subPropertyOf ex:p\nex:r rdfs:subPropertyOf ex:t\nex:c rdfs:subPropertyOf ex:a",
+    );
+    let rules = Ruleset::Owl2Ql.rules_for(&mut v, &input).unwrap();
+    let schema = Schema::owl(&mut v);
+    let closure = batch::materialise(&input, &rules, None, &schema);
+    let update = delta::update(
+        &MemoryBase::new(&input, &closure.derived),
+        &inserted,
+        &[],
+        delta::Rules {
+            rules: &rules,
+            lists: None,
+            schema: &schema,
+            equality: None,
+        },
+        None,
+    );
+    let derived = update.insert.into_iter().collect();
+    assert!(has(&mut v, &derived, "ex:s rdfs:subPropertyOf ex:c"));
+    for forbidden in [
+        "ex:s rdfs:subPropertyOf ex:a",
+        "ex:a rdfs:subPropertyOf ex:t",
+        "ex:b rdfs:subPropertyOf ex:a",
+    ] {
+        assert!(!has(&mut v, &derived, forbidden), "{forbidden}");
+    }
+}
+
+/// Proof search must skip the annotation path, even when its endpoints also have an
+/// asserted edge between them.
+#[test]
+fn owl2_ql_hierarchy_proofs_skip_annotation_edges() {
+    use super::eval::{GroundProgram, Poller};
+    let mut v = LocalVocabulary::default();
+    let mut input = load(&mut v, QL_ANNOTATION_HIERARCHY);
+    let blocked = load(&mut v, "ex:p rdfs:subPropertyOf ex:q")[0];
+    let control = load(&mut v, "ex:p rdfs:subPropertyOf ex:c")[0];
+    input.push(blocked);
+    let rules = Ruleset::Owl2Ql.rules_for(&mut v, &input).unwrap();
+    let schema = Schema::owl(&mut v);
+    let source = batch::Store::new(input);
+    let mut program = GroundProgram::default();
+    program.ground(&source, &schema, &rules);
+    let bodies = |fact| {
+        program
+            .derivation_bodies(&source, fact, usize::MAX, &Poller::never())
+            .unwrap()
+    };
+    assert!(
+        bodies(blocked).is_empty(),
+        "annotation path supplied a proof"
+    );
+    assert!(!bodies(control).is_empty());
+}
+
+/// Over equality classes the guard can use a non-annotation member, even when
+/// the representative is an annotation. An all-annotation class still blocks a path.
+#[test]
+fn owl2_ql_hierarchy_fast_path_reads_equality_classes() {
+    let mut v = LocalVocabulary::default();
+    let input = load(
+        &mut v,
+        "
+        ex:a rdf:type owl:AnnotationProperty
+        ex:d rdf:type owl:AnnotationProperty
+        ex:e rdf:type owl:AnnotationProperty
+        ex:a owl:sameAs ex:b
+        ex:d owl:sameAs ex:e
+        ex:p rdfs:subPropertyOf ex:a
+        ex:b rdfs:subPropertyOf ex:q
+        ex:p rdfs:subPropertyOf ex:d
+        ex:e rdfs:subPropertyOf ex:r",
+    );
+    let rules = owl2_ql_with_equality(&mut v, &input);
+    let schema = Schema::owl(&mut v);
+    let closure = super::representatives::materialise(&input, &rules, None, &schema);
+    let derived = closure.facts.into_iter().collect();
+    assert!(has(&mut v, &derived, "ex:p rdfs:subPropertyOf ex:q"));
+    assert!(!has(&mut v, &derived, "ex:p rdfs:subPropertyOf ex:r"));
+}
+
+fn owl2_ql_with_equality(v: &mut LocalVocabulary, input: &[Triple]) -> Vec<super::ir::Rule> {
+    let mut rules = Ruleset::Owl2Ql.rules_for(v, input).unwrap();
+    rules.extend(
+        Ruleset::Owl2Rl
+            .rules(v)
+            .unwrap()
+            .into_iter()
+            .filter(|rule| rule.name.starts_with("eq-")),
+    );
+    rules
+}
+
+/// Guarded hierarchy closure over representatives, expanded back to every copy, agrees
+/// with evaluating the original rules directly. In every seed a mixed class whose
+/// representative is an annotation must link the chain. An all-annotation class may not.
+#[test]
+fn owl2_ql_hierarchy_over_representatives_matches_every_copy() {
+    use std::fmt::Write as _;
+
+    let mut next = rng(0x79cc_5162_a91d_74fe);
+    let roles = 3 + next(4);
+    let widths: Vec<_> = (0..roles).map(|_| 2 + next(2)).collect();
+    let property = |role, member| format!("ex:p{role}-{member}");
+    // Intern the annotation first so its non-annotation aliases cannot represent it.
+    let mut text = String::from(
+        "ex:p1-0 rdf:type owl:AnnotationProperty\n\
+         ex:blocked rdf:type owl:AnnotationProperty\n\
+         ex:blockedAlias rdf:type owl:AnnotationProperty\n\
+         ex:blocked owl:sameAs ex:blockedAlias\n",
+    );
+    for (role, &width) in widths.iter().enumerate() {
+        if role != 1 && next(3) != 0 {
+            let annotation = property(role, next(width));
+            writeln!(text, "{annotation} rdf:type owl:AnnotationProperty").unwrap();
+        }
+        for member in 1..width {
+            let parent = next(member);
+            let mut aliases = [property(role, parent), property(role, member)];
+            if next(2) == 0 {
+                aliases.swap(0, 1);
+            }
+            let [left, right] = aliases;
+            writeln!(text, "{left} owl:sameAs {right}").unwrap();
+        }
+    }
+    for role in 0..roles - 1 {
+        let s = property(role, next(widths[role]));
+        let o = property(role + 1, next(widths[role + 1]));
+        writeln!(text, "{s} rdfs:subPropertyOf {o}").unwrap();
+    }
+    let first = property(0, next(widths[0]));
+    let last = property(roles - 1, next(widths[roles - 1]));
+    writeln!(text, "{first} rdfs:subPropertyOf ex:blocked").unwrap();
+    writeln!(text, "ex:blockedAlias rdfs:subPropertyOf {last}").unwrap();
+    writeln!(text, "ex:x {first} ex:y").unwrap();
+
+    let mut v = LocalVocabulary::default();
+    let input = load(&mut v, &text);
+    let rules = owl2_ql_with_equality(&mut v, &input);
+    let mut expected: HashSet<_> = input.iter().copied().collect();
+    expected.extend(materialise(&input, &rules, None).derived);
+    let schema = Schema::owl(&mut v);
+    let closure = super::representatives::materialise(&input, &rules, None, &schema);
+    let expanded: HashSet<_> = closure
+        .facts
+        .iter()
+        .flat_map(|&fact| closure.classes.expand(fact))
+        .collect();
+    assert!(
+        expanded == expected,
+        "guarded hierarchy differs from the every-copy closure\n\
+         missing {:?}\nextra {:?}\n{text}",
+        expected.difference(&expanded).take(8).collect::<Vec<_>>(),
+        expanded.difference(&expected).take(8).collect::<Vec<_>>()
+    );
+}

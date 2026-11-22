@@ -873,8 +873,11 @@ fn update_body<B: Base + ?Sized>(
             // support.
             let mut component: Vec<Triple> = Vec::new();
             for &p in &scratch.transitive {
+                let filter = scratch.transitive_filter(p);
                 old.scan([None, Some(p), None], Seg::All, &stage, &mut |t| {
-                    component.push(t)
+                    if filter.is_none_or(|f| f.keeps(t[0], t[2], &stage)) {
+                        component.push(t);
+                    }
                 })
                 .map_err(stopped)?;
             }
@@ -966,11 +969,13 @@ fn update_body<B: Base + ?Sized>(
             // per endpoint and each probe per fact it visits counts on the stage's poller
             // (sweep M06, M07).
             for &p in &old_program.transitive {
+                let filter = old_program.transitive_filter(p);
+                let eligible = |[s, _, o]: Triple| filter.is_none_or(|f| f.keeps(s, o, &stage));
                 let (mut sources, mut targets) = (Vec::new(), Vec::new());
                 extra
                     .scan([None, Some(p), None], Seg::Delta, &stage, &mut |t| {
                         // The region's equalities are all overdeleted already.
-                        if Some(p) != same_as || !mentions(&region, t) {
+                        if (Some(p) != same_as || !mentions(&region, t)) && eligible(t) {
                             sources.push(t[0]);
                             targets.push(t[2]);
                         }
@@ -983,14 +988,18 @@ fn update_body<B: Base + ?Sized>(
                 let mut before: HashSet<u64> = sources.iter().copied().collect();
                 for &a in &sources {
                     old.scan([None, Some(p), Some(a)], Seg::All, &stage, &mut |t| {
-                        before.insert(t[0]);
+                        if eligible(t) {
+                            before.insert(t[0]);
+                        }
                     })
                     .map_err(stopped)?;
                 }
                 let mut after: HashSet<u64> = targets.iter().copied().collect();
                 for &b in &targets {
                     old.scan([Some(b), Some(p), None], Seg::All, &stage, &mut |t| {
-                        after.insert(t[2]);
+                        if eligible(t) {
+                            after.insert(t[2]);
+                        }
                     })
                     .map_err(stopped)?;
                 }
@@ -1009,14 +1018,14 @@ fn update_body<B: Base + ?Sized>(
                             {
                                 return;
                             }
-                            if t[1] == p {
+                            if t[1] == p && eligible(t) {
                                 edges.push((t[0], t[2]));
                             }
                             // A fact's images grow with the grounded rules that match it: a
                             // stopped probe ends them, and the scan at its next
                             // position.
                             for image in old_program.one_step_images(t) {
-                                if image[1] != p {
+                                if image[1] != p || !eligible(image) {
                                     continue;
                                 }
                                 match extra.contains(image, &stage) {
@@ -1430,11 +1439,15 @@ fn update_body<B: Base + ?Sized>(
         // next round skips them; edges from other rules are closed then.
         let mut produced: Vec<Triple> = Vec::new();
         for &p in &program.transitive {
+            let filter = program.transitive_filter(p);
+            let eligible = |[s, _, o]: Triple| filter.is_none_or(|f| f.keeps(s, o, &stage));
             if !transitive_before.contains(&p) || reclose.remove(&p) {
                 let mut all = Vec::new();
                 state
                     .scan([None, Some(p), None], Seg::All, &stage, &mut |t| {
-                        all.push((t[0], t[2]))
+                        if eligible(t) {
+                            all.push((t[0], t[2]));
+                        }
                     })
                     .map_err(stopped)?;
                 let closure: Vec<Triple> = nrese_exec::graph::transitive_closure_until(&all, stop)
@@ -1448,12 +1461,12 @@ fn update_body<B: Base + ?Sized>(
             let mut edges = Vec::new();
             state
                 .scan([None, Some(p), None], Seg::Delta, &stage, &mut |t| {
-                    if !module_output.contains(&t) {
+                    if !module_output.contains(&t) && eligible(t) {
                         edges.push((t[0], t[2]));
                     }
                 })
                 .map_err(stopped)?;
-            produced.extend(close_edges(&state, p, &edges, &stage).map_err(stopped)?);
+            produced.extend(close_edges(&state, p, &edges, eligible, &stage).map_err(stopped)?);
         }
         // The closures' reads count on the stage's poller: a round's candidates are only
         // added from reads that weren't stopped.
@@ -2006,6 +2019,7 @@ fn close_edges<S: Source + ?Sized>(
     state: &S,
     p: u64,
     edges: &[(u64, u64)],
+    eligible: impl Fn(Triple) -> bool,
     poll: &Poller<'_>,
 ) -> Result<Vec<Triple>, Stopped> {
     use hashbrown::HashMap;
@@ -2016,12 +2030,16 @@ fn close_edges<S: Source + ?Sized>(
     for &(a, b) in edges {
         let mut before = vec![a];
         state.scan([None, Some(p), Some(a)], Seg::All, poll, &mut |t| {
-            before.push(t[0])
+            if eligible(t) {
+                before.push(t[0]);
+            }
         })?;
         before.extend(predecessors.get(&a).into_iter().flatten().copied());
         let mut after = vec![b];
         state.scan([Some(b), Some(p), None], Seg::All, poll, &mut |t| {
-            after.push(t[2])
+            if eligible(t) {
+                after.push(t[2]);
+            }
         })?;
         after.extend(successors.get(&b).into_iter().flatten().copied());
         before.sort_unstable();

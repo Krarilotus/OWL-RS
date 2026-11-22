@@ -15,6 +15,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+READS = ("benches/datasets.toml", "benches/fast/release_gate.py", "benches/suite/suitekit/*",
+         "scripts/release-gate.sh")
+
 ROOT = Path(__file__).resolve().parents[3]
 PASSED = "# Release verdict\n\n**PASSED.**\n"
 

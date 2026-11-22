@@ -18,6 +18,8 @@ import unittest
 
 import isolation  # the suite's git environment policy (inherit())
 
+READS = ("scripts/check.sh",)
+
 ROOT = Path(__file__).resolve().parents[3]
 BASH = shutil.which("bash")
 # A caller's gate, slot, fleet or cargo variables would make the tier behave as its caller's does.

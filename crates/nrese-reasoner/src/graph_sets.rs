@@ -50,7 +50,7 @@ use self::found::Found;
 use super::batch::Store;
 use super::eval::{
     GroundProgram, Grounding, Job, NEVER, OperationStop, Poller, Probe, Seg, Source, Stop,
-    Stopped as ReadStopped, Visit, Visits, derivations, instantiate_head, transitivity,
+    Stopped as ReadStopped, Visit, Visits, derivations, instantiate_head,
 };
 use super::ir::{Atom, Head, Rule, Term, Triple};
 
@@ -865,7 +865,7 @@ fn support_sets_run(
     let transitive: Vec<Rule> = program
         .transitive
         .iter()
-        .map(|&p| transitivity(p))
+        .map(|&p| program.transitive_rule(p))
         .collect();
     let rules: Vec<(&Rule, Grounding)> = program
         .rules
@@ -1289,7 +1289,7 @@ pub fn derived_otherwise<S: Source + ?Sized>(
     if poll.attempt(1) {
         return Err(ReadStopped);
     }
-    Ok(grounded(Grounding::Transitive(p), poll)? && derives(&transitivity(p), poll)?)
+    Ok(grounded(Grounding::Transitive(p), poll)? && derives(&program.transitive_rule(p), poll)?)
 }
 
 /// Whether the asserted `fact` of the closure `source` is in the least closure of the
@@ -1450,7 +1450,7 @@ fn body_rules(program: &GroundProgram) -> Vec<(std::borrow::Cow<'_, Rule>, Groun
         .map(|(r, rule)| (std::borrow::Cow::Borrowed(rule), Grounding::Rule(r)))
         .chain(program.transitive.iter().map(|&p| {
             (
-                std::borrow::Cow::Owned(transitivity(p)),
+                std::borrow::Cow::Owned(program.transitive_rule(p)),
                 Grounding::Transitive(p),
             )
         }))

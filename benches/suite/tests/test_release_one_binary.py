@@ -16,6 +16,9 @@ import unittest
 import test_release_gate as fixtures
 from suitekit import manifest
 
+READS = ("benches/datasets.toml", "benches/fast/fast.py", "benches/fast/release_gate.py", "benches/hosts.toml",
+         "benches/suite/suitekit/*", "benches/suite/tests/test_release_gate.py")
+
 gate_module = fixtures.gate_module
 
 

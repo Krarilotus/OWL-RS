@@ -26,6 +26,10 @@ from suitekit.summary import summarise  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "fast"))
 import compete  # noqa: E402
 
+READS = ("benches/cases/core.toml", "benches/cases/sparql.toml", "benches/fast/compete.py",
+         "benches/fast/fast.py", "benches/fast/release_gate.py", "benches/hosts.toml",
+         "benches/suite/adjudications.tsv", "benches/suite/suitekit/*")
+
 FIELDS = list(Result.__dataclass_fields__)
 
 

@@ -22,6 +22,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from suitekit import answers, hosts  # noqa: E402
 
+READS = ("benches/hosts.toml", "benches/oracle/compare.py", "benches/sparql/same_answers.py",
+         "benches/suite/fixtures/answer-levels.json", "benches/suite/suitekit/*")
+
 XSD = "http://www.w3.org/2001/XMLSchema#"
 
 
