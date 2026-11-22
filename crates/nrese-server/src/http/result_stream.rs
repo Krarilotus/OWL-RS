@@ -1067,12 +1067,15 @@ mod tests {
 
     /// Over HTTP/1.0, a client that takes part of a held answer and then stops reading,
     /// without leaving, keeps none of it once the stall bound has passed: what was held goes
-    /// back, and the body ends with an error, short of its length, never cleanly.
+    /// back, to its envelope and to the memory all queries share (the envelope's credit there
+    /// too), and the body ends with an error, short of its length, never cleanly.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_held_answer_whose_client_stops_reading_releases_its_memory_at_the_stall_bound() {
         use http_body_util::BodyExt;
 
-        let memory = Envelope::new(Some(1 << 30), None);
+        // 1 GiB shared: the envelope keeps a credit there (16 KiB).
+        let shared = nrese_exec::SharedBudget::new(1 << 30);
+        let memory = Envelope::new(Some(1 << 30), Some(Arc::clone(&shared)));
         let held = memory.clone();
         let stall = Duration::from_millis(500);
         let response = WHOLE
@@ -1101,11 +1104,12 @@ mod tests {
         assert_eq!(memory.used(), 2 * CHUNK_BYTES);
         // The client stops reading. Real time, far past the bound: a guard against a hang.
         let stopped = std::time::Instant::now();
-        while memory.used() != 0 {
+        while memory.used() != 0 || shared.used() != 0 {
             assert!(
                 stopped.elapsed() < 20 * stall,
-                "{} bytes still held for a client that stopped reading",
-                memory.used()
+                "{} bytes still held, {} of the shared memory, for a client that stopped reading",
+                memory.used(),
+                shared.used()
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
