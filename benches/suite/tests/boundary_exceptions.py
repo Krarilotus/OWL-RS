@@ -38,6 +38,8 @@ WRITES = {
     ("benches/fast/prepare-support-stress.py", "main", "write_text", "answers_path"),
     # The attempt descriptor was opened exclusively at its checked destination above.
     ("benches/fast/release_gate.py", "attempt_record", "fdopen", "fd"),
+    # A local W3C check marks the log directory it owns; the gate refuses that directory, so it is never evidence.
+    ("benches/fast/release_gate.py", "main", "write_text", "args.logs / LOCAL_MARK"),
     # Generated datasets and archived queries in staged input directories.
     ("benches/fast/release_gate.py", "make_dataset", "replace", "target"),
     ("benches/fast/release_gate.py", "extract_query_set", "extractall", "aside"),
