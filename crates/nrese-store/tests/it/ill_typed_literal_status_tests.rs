@@ -176,6 +176,15 @@ fn a_store_reopened_without_a_rebuild_still_withholds() {
                 "{ruleset}: the reopened store was rematerialised"
             );
             let case = format!("{ruleset} {literal}");
+            // Under `owl2-dl` the consistency is the first need, under `owl2-ql` the read.
+            let first = (ruleset == "owl2-dl").then(|| after.store().consistency());
+            let want = match ill_typed {
+                true => ConsistencyStatus::Unknown,
+                false => ConsistencyStatus::Consistent,
+            };
+            if first.as_ref().is_some_and(|first| *first != want) {
+                unmet.push(format!("{case}: asked first, {first:?}"));
+            }
             unmet.extend(match ill_typed {
                 true => not_withheld(after.store(), &case, Some("\"abc\"")),
                 false => not_complete(after.store(), &case),
@@ -283,8 +292,8 @@ fn a_mode_registered_after_the_open_withholds_at_once() {
 }
 
 /// Under `owl2-dl`, the DL route's own verdict (what the server's readiness reports as the DL
-/// consistency) isn't `consistent` either while the store holds the literal; with it deleted,
-/// it is again.
+/// consistency) is `unknown` while the store holds the literal, for that literal, not for any
+/// other reason; with it deleted, it is `consistent` again.
 #[test]
 fn the_dl_verdict_is_not_consistent_while_an_ill_typed_literal_is_held() {
     let pipeline = open("owl2-dl", None);
@@ -294,12 +303,18 @@ fn the_dl_verdict_is_not_consistent_while_an_ill_typed_literal_is_held() {
             .dl()
             .status()
             .expect("a status after a commit");
-        status.consistency.verdict.as_str().to_owned()
+        let verdict = &status.consistency.verdict;
+        let why = verdict.reason().unwrap_or("none");
+        format!("{} {why}", verdict.as_str())
     };
     update(&pipeline, "INSERT DATA { :a :d \"abc\"^^xsd:integer }");
-    assert_ne!(verdict(), "consistent", "held");
+    let held = verdict();
+    assert!(
+        held.starts_with("unknown ") && held.contains("hold an ill-typed literal"),
+        "held: {held}"
+    );
     update(&pipeline, "DELETE DATA { :a :d \"abc\"^^xsd:integer }");
-    assert_eq!(verdict(), "consistent", "deleted");
+    assert_eq!(verdict(), "consistent none", "deleted");
 }
 
 /// A store in quarantine that holds an ill-typed literal still revalidates on every commit,
