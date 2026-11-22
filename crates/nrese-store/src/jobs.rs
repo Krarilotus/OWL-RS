@@ -256,6 +256,64 @@ impl Jobs {
 mod tests {
     use super::*;
 
+    fn started(jobs: &Arc<Jobs>) -> Job {
+        jobs.start("import", "nrese", "an uploaded document")
+    }
+
+    // Spec: docs/ops/http-api.md says an import job ends `done`, `failed` or `cancelled`. A
+    // job whose owner panics after a panic poisoned the registry's lock -> it ends `failed`,
+    // and is read, listed and not cancelled as such.
+    #[test]
+    fn a_job_ends_and_is_read_after_a_panic_poisoned_the_registry() {
+        let jobs = Arc::new(Jobs::default());
+        let job = started(&jobs);
+        let id = job.id();
+        let poisoner = Arc::clone(&jobs);
+        std::thread::spawn(move || {
+            let _held = poisoner.inner.lock();
+            panic!("a panic under the jobs lock");
+        })
+        .join()
+        .unwrap_err();
+        assert!(jobs.inner.is_poisoned());
+        std::thread::spawn(move || {
+            let _owned = job;
+            panic!("its owner panics");
+        })
+        .join()
+        .unwrap_err();
+
+        let view = jobs.get(id).expect("the job is kept");
+        assert_eq!(view.state, JobState::Failed, "{view:?}");
+        let listed = jobs.list();
+        assert_eq!(
+            listed.first().map(|job| (job.id, job.state.clone())),
+            Some((id, JobState::Failed))
+        );
+        assert!(!jobs.cancel(id), "an ended job isn't cancelled");
+    }
+
+    // Spec: docs/ops/http-api.md says a failed job's error is its load's message. A load that
+    // returned an unsettled commit -> `failed` with the engine's own words for it.
+    #[test]
+    fn a_returned_unsettled_commit_keeps_its_own_words() {
+        let jobs = Arc::new(Jobs::default());
+        let job = started(&jobs);
+        let id = job.id();
+        let error =
+            crate::StoreError::Engine(nrese_engine::EngineError::CommitUnsettled { revision: 7 });
+        job.finish(Err(JobFailure::of_load(error, "send", None)));
+
+        let view = jobs.get(id).unwrap();
+        assert_eq!(view.state, JobState::Failed, "{view:?}");
+        assert_eq!(
+            view.error.as_deref(),
+            Some(
+                "storage engine error: revision 7 may be committed but isn't served; the engine takes no more writes: reopen it to recover what is on disk"
+            )
+        );
+    }
+
     // Spec: docs/ops/http-api.md says an import that could not keep its quarantine
     // and published nothing ends failed with retry advice, even if cancelled late.
     #[cfg(feature = "fault-points")]

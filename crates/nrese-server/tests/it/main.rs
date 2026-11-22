@@ -21,6 +21,7 @@ mod generated_views_tests;
 mod graph_store_api_tests;
 mod http_api_tests;
 mod http_fuzz_tests;
+mod import_job_end_tests;
 mod lifecycle_tests;
 mod list_limit_tests;
 mod maintenance_tests;

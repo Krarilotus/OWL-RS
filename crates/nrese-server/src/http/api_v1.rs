@@ -958,6 +958,10 @@ fn start_import(
         job.phase("loading");
         let store = state.store();
         let loaded = store.bulk_load_with(&request, job.progress());
+        #[cfg(feature = "fault-points")]
+        if loaded.is_ok() {
+            store.load_panic_point(nrese_store::LoadPanic::AfterReturn);
+        }
         // How the caller sends the data again: an upload, or the import directory's files.
         let retry = if remove.is_some() { "send" } else { "load" };
         drop(remove);
@@ -1471,3 +1475,6 @@ pub async fn rules_delete(
     .map_err(|error| ApiError::internal(error.to_string()))??;
     Ok(StatusCode::NO_CONTENT)
 }
+
+#[cfg(test)]
+mod import_job_tests;
