@@ -46,7 +46,7 @@ use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Version, header};
 use axum::response::{IntoResponse, Response};
 use http_body::{Frame, SizeHint};
-use nrese_exec::{BudgetExceeded, Envelope, Reservation};
+use nrese_exec::{BudgetExceeded, Envelope};
 use nrese_store::CancellationToken;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -389,31 +389,25 @@ async fn hold(
     timeout_message: &'static str,
 ) -> Result<Holding, ApiError> {
     let bound = memory.limit();
-    let envelope = memory.clone();
     let mut held = Holding {
         frames: VecDeque::new(),
         left: 0,
-        memory: Reservation::new(memory),
-        envelope: envelope.clone(),
+        charged: 0,
+        envelope: memory,
         moved: Instant::now(),
         cut: false,
     };
-    // Whether the hold held part of the answer when it first saw the envelope refused: the
-    // count then, not after the channel's last frames, which may have been queued before.
-    let mut held_at_refusal = None;
     loop {
         match tokio::time::timeout_at(deadline, receiver.recv()).await {
             Err(_elapsed) => return Err(ApiError::timeout(timeout_message)),
             Ok(None) => break,
             Ok(Some(frame)) => {
-                if held_at_refusal.is_none() && envelope.refused() {
-                    held_at_refusal = Some(held.memory.bytes() > 0);
-                }
                 if let Some(data) = frame.data_ref() {
                     let bytes = data.len();
-                    held.memory
-                        .charge(bytes)
+                    held.envelope
+                        .charge_beside(bytes)
                         .map_err(|refused| too_large(refused, bound))?;
+                    held.charged += bytes;
                     held.left += bytes as u64;
                 }
                 held.frames.push_back(frame);
@@ -421,13 +415,16 @@ async fn hold(
         }
     }
     if let Err(stopped) = outcome.take() {
-        // The producer's own work (a query's) draws on the same envelope: refused while the
-        // hold held part of the answer, it was refused for holding it, as a refusal of the
-        // hold's own charge would be. Refused by the memory all queries share, its 503 is
-        // the producer's: whether it may be retried was decided at the refusal.
-        // Unseen while frames came, the refusal came after the last of them was held.
-        let refused = envelope.refused();
-        let beside = refused && held_at_refusal.unwrap_or(held.memory.bytes() > 0);
+        // The producer's own work (a query's) draws on the same envelope: refused by its
+        // limit while the hold held part of the answer, it was refused for holding it, as a
+        // refusal of the hold's own charge would be. What was held counts as it was at the
+        // refusal itself, recorded with it, not as frames queued before it and taken since
+        // leave it. Refused by the memory all queries share, its 503 is the producer's:
+        // whether it may be retried was decided at the refusal.
+        let beside = held
+            .envelope
+            .held_at_refusal()
+            .is_some_and(|bytes| bytes > 0);
         return Err(match stopped {
             ApiError::PayloadTooLarge(_) if beside => too_large_for_http10(bound),
             stopped => stopped,
@@ -473,8 +470,9 @@ fn too_large_for_http10(bound: usize) -> ApiError {
 struct Holding {
     frames: VecDeque<Message>,
     left: u64,
-    memory: Reservation<Envelope>,
-    /// The envelope `memory` is charged to.
+    /// The bytes of `frames` charged to `envelope` beside the producer's work
+    /// ([`Envelope::charge_beside`]), released as they go out.
+    charged: usize,
     envelope: Envelope,
     /// When the client last took a frame (at first: when the answer was ready).
     moved: Instant,
@@ -489,8 +487,16 @@ impl Holding {
     fn cut(&mut self) {
         self.cut = !self.frames.is_empty();
         self.frames.clear();
-        self.memory.release(self.memory.bytes());
+        self.envelope
+            .release_beside(std::mem::take(&mut self.charged));
         self.envelope.return_credit();
+    }
+}
+
+/// An answer dropped before it is sent (refused, or its request gone) lets go of its memory.
+impl Drop for Holding {
+    fn drop(&mut self) {
+        self.envelope.release_beside(self.charged);
     }
 }
 
@@ -560,7 +566,8 @@ impl http_body::Body for Held {
         if let Some(data) = frame.as_ref().and_then(Frame::data_ref) {
             let bytes = data.len();
             holding.left -= bytes as u64;
-            holding.memory.release(bytes);
+            holding.charged -= bytes;
+            holding.envelope.release_beside(bytes);
         }
         holding.moved = Instant::now();
         Poll::Ready(frame.map(Ok))
