@@ -4,7 +4,7 @@
 //! types, and from there through every shape-valued parameter. An ill-formed shape is an
 //! error naming the shape and the parameter: nothing is validated with half a shape.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
 
 use nrese_engine::{GraphSelector, TermId, TermKind};
@@ -70,8 +70,7 @@ pub fn compile_until<V: ReadView>(
         shapes: Vec::new(),
         index: HashMap::new(),
         numbering: Vec::new(),
-        reference_count: 0,
-        pending_errors: VecDeque::new(),
+        errors: Vec::new(),
         components: Vec::new(),
     };
     compiler.components = compiler.discover_components();
@@ -89,7 +88,7 @@ pub fn compile_until<V: ReadView>(
     for class in ["NodeShape", "PropertyShape"] {
         roots.extend(compiler.instances(&format!("{SH}{class}")));
     }
-    let errors = compiler.compile_shapes(roots)?;
+    compiler.compile_shapes(roots)?;
     // Any triple with `sh:entailment` in the shapes graph, whatever its subject (SHACL §1.5).
     let entailments = compiler
         .sh("entailment")
@@ -97,7 +96,7 @@ pub fn compile_until<V: ReadView>(
         .unwrap_or_default();
     if compiler.graph.cancelled() {
         None
-    } else if errors.is_empty() {
+    } else if compiler.errors.is_empty() {
         Some(Ok(Shapes {
             shapes: compiler.shapes,
             index: compiler.index,
@@ -108,7 +107,7 @@ pub fn compile_until<V: ReadView>(
             entailments,
         }))
     } else {
-        Some(Err(errors))
+        Some(Err(compiler.errors))
     }
 }
 
@@ -122,9 +121,7 @@ struct Compiler<'a, V: ReadView> {
     index: HashMap<TermId, ShapeRef>,
     // The depth-first number of each interned slot, or None while it is pending.
     numbering: Vec<Option<ShapeRef>>,
-    // Each error remembers how many references preceded it in the shape being filled.
-    reference_count: usize,
-    pending_errors: VecDeque<(usize, ShapeError)>,
+    errors: Vec<ShapeError>,
     /// The shapes graph's SPARQL-based constraint components.
     components: Vec<ComponentDef>,
 }
@@ -134,8 +131,6 @@ struct ShapeFrame {
     shape: ShapeRef,
     constraint: usize,
     member: usize,
-    references_seen: usize,
-    errors: VecDeque<(usize, ShapeError)>,
 }
 
 impl ShapeFrame {
@@ -160,7 +155,6 @@ impl ShapeFrame {
             };
             if let Some(reference) = reference {
                 self.member += 1;
-                self.references_seen += 1;
                 return Some(reference);
             }
             self.constraint += 1;
@@ -204,11 +198,10 @@ impl<V: ReadView> Compiler<'_, V> {
     }
 
     fn error(&mut self, shape: TermId, message: impl Into<String>) {
-        let error = ShapeError {
+        self.errors.push(ShapeError {
             shape: self.text(shape),
             message: message.into(),
-        };
-        self.pending_errors.push_back((self.reference_count, error));
+        });
     }
 
     /// The single value of `local`, if any; more than one is an error.
@@ -329,7 +322,7 @@ impl<V: ReadView> Compiler<'_, V> {
         match self.list(head) {
             Ok(members) => members
                 .into_iter()
-                .map(|member| self.reference(member))
+                .map(|member| self.shape(member))
                 .collect(),
             Err(problem) => {
                 self.error(node, format!("sh:{local} {problem}"));
@@ -360,19 +353,9 @@ impl<V: ReadView> Compiler<'_, V> {
         shape
     }
 
-    fn reference(&mut self, node: TermId) -> ShapeRef {
-        self.reference_count += 1;
-        self.shape(node)
-    }
-
-    /// The shapes' errors, or `None` if cancelled.
-    fn compile_shapes(&mut self, roots: BTreeSet<TermId>) -> Option<Vec<ShapeError>> {
-        // Component discovery's errors precede the walk.
-        let mut errors: Vec<_> = self
-            .pending_errors
-            .drain(..)
-            .map(|(_, error)| error)
-            .collect();
+    /// Fills every shape reachable from `roots`, or `None` if cancelled. A shape's own errors
+    /// come before those of the shapes it refers to.
+    fn compile_shapes(&mut self, roots: BTreeSet<TermId>) -> Option<()> {
         // References start as interned slots. Visit them one at a time so a child can
         // reach a pending sibling before the parent does, then replace each with its number.
         let mut stack = Vec::new();
@@ -387,17 +370,8 @@ impl<V: ReadView> Compiler<'_, V> {
             }
             stack.push(self.fill_shape(root, &mut next));
             while let Some(frame) = stack.last_mut() {
-                // Resume the parent's diagnostics at the same point as its references.
-                let references_seen = frame.references_seen;
-                while let Some((_, error)) = frame
-                    .errors
-                    .pop_front_if(|(after, _)| *after == references_seen)
-                {
-                    errors.push(error);
-                }
                 let shape = &mut self.shapes[frame.shape];
                 let Some(reference) = frame.next_reference(shape) else {
-                    debug_assert!(frame.errors.is_empty());
                     stack.pop();
                     continue;
                 };
@@ -414,10 +388,10 @@ impl<V: ReadView> Compiler<'_, V> {
                 }
             }
         }
-        if errors.is_empty() {
+        if self.errors.is_empty() {
             self.reorder_shapes();
         }
-        Some(errors)
+        Some(())
     }
 
     /// Puts the interned slots into the depth-first order used by their references.
@@ -437,7 +411,6 @@ impl<V: ReadView> Compiler<'_, V> {
         // Number the shape before its descendants, including when an edge closes a cycle.
         self.numbering[shape] = Some(*next);
         *next += 1;
-        self.reference_count = 0;
         let node = self.shapes[shape].node;
 
         let path = self.one(node, "path").and_then(|path| {
@@ -471,8 +444,6 @@ impl<V: ReadView> Compiler<'_, V> {
             shape,
             constraint: 0,
             member: 0,
-            references_seen: 0,
-            errors: std::mem::take(&mut self.pending_errors),
         }
     }
 
@@ -639,7 +610,7 @@ impl<V: ReadView> Compiler<'_, V> {
 
         // Logic.
         for shape in self.values(node, "not") {
-            out.push(Constraint::Not(self.reference(shape)));
+            out.push(Constraint::Not(self.shape(shape)));
         }
         for (local, logical) in [
             ("and", Logical::And),
@@ -654,10 +625,10 @@ impl<V: ReadView> Compiler<'_, V> {
 
         // Shapes.
         for shape in self.values(node, "node") {
-            out.push(Constraint::Node(self.reference(shape)));
+            out.push(Constraint::Node(self.shape(shape)));
         }
         for shape in self.values(node, "property") {
-            out.push(Constraint::Property(self.reference(shape)));
+            out.push(Constraint::Property(self.shape(shape)));
         }
         self.qualified(node, &mut out);
 
@@ -725,10 +696,10 @@ impl<V: ReadView> Compiler<'_, V> {
             let siblings = siblings
                 .iter()
                 .filter(|&&sibling| sibling != shape)
-                .map(|&sibling| self.reference(sibling))
+                .map(|&sibling| self.shape(sibling))
                 .collect();
             out.push(Constraint::Qualified {
-                shape: self.reference(shape),
+                shape: self.shape(shape),
                 min,
                 max,
                 siblings,
