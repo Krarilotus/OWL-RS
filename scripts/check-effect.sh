@@ -86,7 +86,7 @@ BEGIN {
     allow["http/api_v1.rs|tokio::task::spawn_blocking(move || store.rematerialise(program))"] = "v1.6 rematerialisation"
     allow["http/api_v1.rs|store.bulk_load(&request).map_err(|error| match error {"] = "synchronous import through effect::untracked"
     allow["http/api_v1.rs|let loaded = store.bulk_load_with(&request, job.progress());"] = "v1.6 async import"
-    allow["http/api_v1.rs|Some(program) => Some(store.rematerialise(program).map_err(|e| e.to_string())?),"] = "v1.6 async import reasoning"
+    allow["http/api_v1.rs|.rematerialise(program)"] = "v1.6 async import reasoning"
     allow["http/api_v1.rs|tokio::task::spawn_blocking(move || changing.patch_repository_settings(merge))"] = "v1.6 settings patch"
     allow["http/api_v1.rs|changing.patch_repository_settings(|current| {"] = "v1.6 rules upload"
     allow["http/api_v1.rs|state.patch_repository_settings(|current| {"] = "v1.6 rules removal"
