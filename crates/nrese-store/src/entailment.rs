@@ -20,13 +20,15 @@
 //! premises and the forms above). A conclusion outside them may be entailed although the
 //! answer is no, except under `owl2-dl`: there what the rules leave unshown is decided by
 //! the DL engines ([`StoreService::entails_dl`]), and is an [`StoreError::Undecided`] error
-//! where they can't decide it.
+//! where they can't decide it. There the whole check, the rules' pass included, has one
+//! `dl.timeout` from the call; past it, the answer is undecided.
 //! Refutation uses the store's process-memory watch; interruption is an error, never
 //! a negative entailment answer or an assumed-unreachable panic.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use nrese_dl::limits::Deadline;
 use nrese_engine::Snapshot;
 use nrese_rdf::vocab::{owl, rdf};
 use nrese_rdf::{GraphName, NamedOrBlankNode, Quad, Term, Triple};
@@ -75,13 +77,18 @@ impl StoreService {
         conclusion: &[Triple],
     ) -> StoreResult<Entailment> {
         let program = program.into();
+        // Under owl2-dl, one dl.timeout from the call: the rules' pass and the DL check spend it.
+        let deadline = match self.dl().active() {
+            true => Deadline::after(self.config().dl.timeout),
+            false => Deadline::NONE,
+        };
         // One certified closure: reads start only on a settled certificate (an
         // even epoch; odd, a change is in progress and the old certificate may still be
         // visible), and an answer stands only if no change began while they took their
         // snapshots. An open or changed certificate refuses without waiting or retrying.
         let epoch = self.certificate_epoch();
         if epoch.is_multiple_of(2) {
-            let answer = self.entails_once(&program, conclusion)?;
+            let answer = self.entails_once(&program, conclusion, deadline)?;
             if self.certificate_epoch() == epoch {
                 return Ok(answer);
             }
@@ -93,10 +100,12 @@ impl StoreService {
     }
 
     /// One try of [`Self::entails`]; it stands only if the certificate didn't change meanwhile.
+    /// Past `deadline`, no answer.
     fn entails_once(
         &self,
         program: &RuleProgram,
         conclusion: &[Triple],
+        deadline: Deadline,
     ) -> StoreResult<Entailment> {
         if !self.reasoning_is_current(program.clone()) {
             return Err(StoreError::Configuration(format!(
@@ -125,22 +134,28 @@ impl StoreService {
         // decide, and a conclusion whose negative forms say more than the rules refute goes
         // to them whole.
         let dl = self.dl().active();
-        if !(dl && split.beyond) && self.shown_by_rules(&at, program, &split)? {
+        let shown = !(dl && split.beyond) && self.shown_by_rules(&at, program, &split, deadline)?;
+        // A rules' answer found late is none either: the deadline bounds the whole answer.
+        if deadline.passed() {
+            return Err(out_of_time());
+        }
+        if shown {
             return Ok(Entailment::Entailed);
         }
         if dl {
-            return self.decided_by_dl(&at, conclusion);
+            return self.decided_by_dl(&at, conclusion, deadline);
         }
         Ok(Entailment::NotEntailed)
     }
 
     /// Whether the closure at `at` holds every positive statement and the rules refute every
-    /// opposite over it.
+    /// opposite over it, before `deadline`.
     fn shown_by_rules(
         &self,
         at: &Snapshot,
         program: &RuleProgram,
         split: &Split,
+        deadline: Deadline,
     ) -> StoreResult<bool> {
         if !split.positive.is_empty() && !self.ask(at, &split.positive)? {
             return Ok(false);
@@ -148,17 +163,22 @@ impl StoreService {
         #[cfg(test)]
         crate::service::hooks::run(&crate::service::hooks::BETWEEN_ENTAILMENT_HALVES);
         for opposite in &split.refutations {
-            if !self.refutes(at, program, opposite)? {
+            if !self.refutes(at, program, opposite, deadline)? {
                 return Ok(false);
             }
         }
         Ok(true)
     }
 
-    /// [`Self::entails_dl`]'s answer at `at` as an [`Entailment`]; undecided where it is
-    /// unknown.
-    fn decided_by_dl(&self, at: &Snapshot, conclusion: &[Triple]) -> StoreResult<Entailment> {
-        let decided = self.entails_dl_at(at, conclusion)?;
+    /// [`Self::entails_dl`]'s answer at `at` before `deadline`, as an [`Entailment`];
+    /// undecided where it is unknown.
+    fn decided_by_dl(
+        &self,
+        at: &Snapshot,
+        conclusion: &[Triple],
+        deadline: Deadline,
+    ) -> StoreResult<Entailment> {
+        let decided = self.entails_dl_at(at, conclusion, deadline)?;
         match (decided.premise, decided.answer) {
             (crate::dl::Verdict::Inconsistent, _) => Ok(Entailment::InconsistentPremise),
             (_, crate::dl::entailment::Entailed::Yes) => Ok(Entailment::Entailed),
@@ -188,15 +208,20 @@ impl StoreService {
     /// Whether adding `opposite` to the data at `at` makes it inconsistent under `program`:
     /// the reasoner maintains the closure over a speculative transaction, which is dropped.
     /// Undecided where a commit came after `at` (the transaction starts from the latest
-    /// revision): its answer would be another revision's.
+    /// revision): its answer would be another revision's; and where `deadline` passes.
     fn refutes(
         &self,
         at: &Snapshot,
         program: &RuleProgram,
         opposite: &[Triple],
+        deadline: Deadline,
     ) -> StoreResult<bool> {
+        if deadline.passed() {
+            return Err(out_of_time());
+        }
         let memory = self.memory_stop();
-        let (stop, room) = (|| memory.exceeded(), || memory.room());
+        let stop = || memory.exceeded() || deadline.passed();
+        let room = || memory.room();
         let operation = nrese_reasoner::eval::OperationStop::new(&stop).within(&room);
         let config = self.config();
         // Until V1b (the reasoner's maintenance over either transaction kind): the old shared
@@ -227,8 +252,11 @@ impl StoreService {
         .map_err(|interrupted| {
             memory
                 .error(interrupted)
-                .unwrap_or(StoreError::ProcessMemoryLimit {
-                    limit: nrese_exec::memory::process_limit().unwrap_or(0),
+                .unwrap_or_else(|| match deadline.passed() {
+                    true => out_of_time(),
+                    false => StoreError::ProcessMemoryLimit {
+                        limit: nrese_exec::memory::process_limit().unwrap_or(0),
+                    },
                 })
         })?;
         Ok(!done.violations.consistent())
@@ -237,6 +265,11 @@ impl StoreService {
 
 /// Why an entailment check that saw a commit after its start gives no answer.
 const CHANGED: &str = "the data changed during the entailment check: ask again";
+
+/// An entailment check whose deadline passed gives no answer.
+fn out_of_time() -> StoreError {
+    StoreError::Undecided(nrese_dl::limits::Limit::Time.reached("the deadline passed"))
+}
 
 /// `triple` as a SPARQL triple pattern: see [`term_pattern`].
 fn triple_pattern(triple: &Triple) -> String {
@@ -455,19 +488,20 @@ impl StoreService {
     /// check and the conclusion's tests share it. A conclusion that isn't well-formed OWL 2 DL,
     /// or one left undecided at the deadline, is `unknown`. Reads only; never commits.
     pub fn entails_dl(&self, conclusion: &[Triple]) -> StoreResult<DlEntailment> {
-        self.entails_dl_at(&self.engine().snapshot(), conclusion)
+        let deadline = Deadline::after(self.config().dl.timeout);
+        self.entails_dl_at(&self.engine().snapshot(), conclusion, deadline)
     }
 
-    /// [`Self::entails_dl`] over the asserted statements at `snapshot`.
+    /// [`Self::entails_dl`] over the asserted statements at `snapshot`, before `deadline`.
     fn entails_dl_at(
         &self,
         snapshot: &Snapshot,
         conclusion: &[Triple],
+        deadline: Deadline,
     ) -> StoreResult<DlEntailment> {
         use crate::dl::entailment::{Entailed, entails_ontology_within};
         use crate::dl::{Verdict, consistency, gate, source};
         use nrese_rdf::{BlankNode, NamedNodeRef, NamedOrBlankNode};
-        let deadline = nrese_dl::limits::Deadline::after(self.config().dl.timeout);
         if self.dl().replica() {
             // Reading a conclusion interns its terms, which a replica must not.
             return Err(StoreError::Configuration(
@@ -618,6 +652,7 @@ mod memory_tests {
                 &store.engine().snapshot(),
                 &Ruleset::Owl2Rl.into(),
                 std::slice::from_ref(&opposite),
+                Deadline::NONE,
             );
             let diagnostic = store.equality_report(Ruleset::Owl2Rl);
             if limit == 1 {

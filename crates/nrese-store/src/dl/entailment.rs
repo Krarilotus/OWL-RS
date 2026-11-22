@@ -319,6 +319,8 @@ fn copy(
 /// Whether `premise` (consistent) entails `axiom`, an axiom over `premise`'s interners.
 /// `fresh` are individuals the premise doesn't name (three or more).
 pub fn entails(premise: &Ontology, axiom: &Axiom, fresh: &[u64], budget: &Budget) -> Entailed {
+    // One time for all the tests, from the call; each spends what is left.
+    let deadline = Deadline::after(budget.timeout);
     let (mut o, _scratch) = match copy(premise, budget) {
         Ok(copy) => copy,
         Err(unknown) => return unknown,
@@ -344,7 +346,7 @@ pub fn entails(premise: &Ontology, axiom: &Axiom, fresh: &[u64], budget: &Budget
             o.axioms.push(a);
             o.sources.push(Vec::new());
         }
-        let found = match consistency::check(&o, budget).verdict {
+        let found = match consistency::check(&o, &budget.remaining(deadline)).verdict {
             Verdict::Inconsistent => Entailed::Yes,
             Verdict::Consistent => Entailed::No,
             Verdict::Unknown(why) => Entailed::Unknown(why),
