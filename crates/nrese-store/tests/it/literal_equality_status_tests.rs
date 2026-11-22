@@ -338,7 +338,8 @@ fn a_reopened_store_finds_an_equality_through_a_literal_typed_by_a_range() {
 /// The controls of a reopen: two spellings with nothing to equate them, directly or through
 /// two sub-properties ([`SUBPROPERTIES`], no axiom that equates: told `complete`), and
 /// [`QUALIFIED`] over two IRIs (an equality, of no literal): reopened, each read is told what
-/// it was told before.
+/// it was told before. Under compact equality, which keeps one of equal values, an axiom that
+/// equates is enough after a reopen: [`QUALIFIED`]'s reads are withheld for it then.
 #[test]
 fn a_reopened_store_with_no_literal_equality_keeps_the_word() {
     let words = |store: &StoreService| READS.map(|query| read(store, query).1);
@@ -366,6 +367,10 @@ fn a_reopened_store_with_no_literal_equality_keeps_the_word() {
                     after.store().last_materialisation().is_none(),
                     "{case}: the reopened store was rematerialised"
                 );
+                if mode == "compact" && name == "IRIs equated" {
+                    told_otherwise(after.store(), &format!("{case} reopened"), &mut unmet);
+                    continue;
+                }
                 let now = words(after.store());
                 if now != was {
                     unmet.push(format!("{case}: {was:?} before the reopen, {now:?} after"));

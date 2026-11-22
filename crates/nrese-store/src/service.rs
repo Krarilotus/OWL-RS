@@ -794,7 +794,10 @@ impl StoreService {
     /// of a store opened without a rematerialisation, whose marker keeps no such record
     /// ([`crate::ReasoningState::literal_equality`]): asked of the ruleset the marker names.
     /// A ruleset it can't name (user rules) or a check the process's memory stops is taken
-    /// to equate one: the word is withheld, never given wrongly.
+    /// to equate one: the word is withheld, never given wrongly. So is a store that keeps one
+    /// representative of equal values (`reasoner.equality = "compact"`) wherever its rules can
+    /// conclude an `owl:sameAs` at all: its statements don't show the values a rule read
+    /// (two values of a functional property, one through each sub-property, kept as one).
     fn literal_equality_at_open(
         &self,
         snapshot: &nrese_engine::Snapshot,
@@ -810,6 +813,9 @@ impl StoreService {
         let program = program
             .by_representatives(self.config.equality_by_representatives)
             .storing_representatives(self.config.equality_compact);
+        if self.config.equality_compact && program.concludes_equality(snapshot) {
+            return true;
+        }
         let memory = self.memory_stop();
         let stop = || memory.exceeded();
         program

@@ -392,6 +392,44 @@ impl Program {
         Ok(false)
     }
 
+    /// Whether the rules can conclude an `owl:sameAs` at all over `snapshot`'s schema, whatever
+    /// its data: a rule instance concludes one from premises none of which is an `owl:sameAs`
+    /// (a functional or inverse-functional property, an at-most-one restriction, a key, a
+    /// property a schema term makes `owl:sameAs`; the equality rules only spread one), or a
+    /// fact the program holds without premises is an `owl:sameAs` with a literal. For a store
+    /// whose closure keeps one representative of equal values (`storing_representatives`),
+    /// whose statements can't show what a premise held ([`Self::derives_literal_equality`]
+    /// counts them): its premises are counted as present.
+    pub fn concludes_equality(&self, snapshot: &Snapshot) -> bool {
+        use crate::ir::{Head, Term};
+        let Some(same_as) = self.same_as else {
+            return false;
+        };
+        let ground = self.ground_program(snapshot);
+        let literal = |id: u64| {
+            !matches!(
+                TermId::from_raw(id).kind(),
+                TermKind::Iri | TermKind::BlankNode
+            )
+        };
+        let fact = |t: &Triple| t[1] == same_as && (literal(t[0]) || literal(t[2]));
+        // A head whose predicate is `owl:sameAs`, or a variable that may be.
+        let may_be = |p: Term| p == Term::Const(same_as) || matches!(p, Term::Var(_));
+        (self.axioms.iter()).any(fact)
+            || ground.bodiless.iter().any(fact)
+            || ground.rules.iter().any(|rule| {
+                let Head::Facts(heads) = &rule.head else {
+                    return false;
+                };
+                rule.body
+                    .iter()
+                    .all(|atom| atom.0[1] != Term::Const(same_as))
+                    && heads
+                        .iter()
+                        .any(|head| may_be(head.0[1]) && head.0[0] != head.0[2])
+            })
+    }
+
     /// The schema for a run over `snapshot`: with the unnamed classes to leave out, when
     /// the program does.
     fn schema_for(&self, snapshot: &Snapshot) -> Schema {
