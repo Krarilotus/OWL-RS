@@ -717,7 +717,8 @@ pub async fn rematerialise(
 ) -> Result<Response, ApiError> {
     guard::enforce_admin_write(&state, &authenticated).await?;
     let report = rematerialised(&state)
-        .await?
+        .await
+        .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("reasoning is off: nothing to materialise"))?;
     Ok(Json(ReasoningRun::from(&report)).into_response())
 }
@@ -725,16 +726,16 @@ pub async fn rematerialise(
 /// The repository's inferences recomputed, if it reasons.
 async fn rematerialised(
     state: &AppState,
-) -> Result<Option<nrese_store::MaterialisationReport>, ApiError> {
+) -> Result<Option<nrese_store::MaterialisationReport>, String> {
     let Some(program) = state.pipeline().reasoner().config().materialised_program() else {
         return Ok(None);
     };
     let store = state.store();
     tokio::task::spawn_blocking(move || store.rematerialise(program))
         .await
-        .map_err(|error| ApiError::internal(error.to_string()))?
+        .map_err(|error| error.to_string())?
         .map(Some)
-        .map_err(|error| ApiError::internal(error.to_string()))
+        .map_err(|error| error.to_string())
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -848,26 +849,25 @@ pub async fn import(
         nrese_store::GraphResultFormat::JsonLd => "jsonld",
         nrese_store::GraphResultFormat::BinaryRdf => "brf",
     };
-    // The loader reads files: the body is one, for the load's duration.
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let file = std::env::temp_dir().join(format!(
-        "nrese-import-{}-{}.{extension}",
-        std::process::id(),
-        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
+    let invalid = invalid_statements(&pairs)?;
+    // Carry the temporary path with the load so unwinding or dropping the task removes it.
+    let file = tokio::task::spawn_blocking(move || {
+        let mut file = tempfile::Builder::new()
+            .prefix("nrese-import-")
+            .suffix(&format!(".{extension}"))
+            .tempfile()?;
+        std::io::Write::write_all(file.as_file_mut(), &body)?;
+        Ok::<_, std::io::Error>(file.into_temp_path())
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?
+    .map_err(|error| ApiError::internal(error.to_string()))?;
     let request = nrese_store::BulkLoadRequest {
-        files: vec![file.clone()],
+        files: vec![file.to_path_buf()],
         replace: flag("replace"),
         graph,
-        invalid: invalid_statements(&pairs)?,
+        invalid,
     };
-    {
-        let (file, body) = (file.clone(), body.clone());
-        tokio::task::spawn_blocking(move || std::fs::write(&file, &body))
-            .await
-            .map_err(|error| ApiError::internal(error.to_string()))?
-            .map_err(|error| ApiError::internal(error.to_string()))?;
-    }
     if flag("async") {
         let job = start_import(
             &state,
@@ -878,18 +878,25 @@ pub async fn import(
         return Ok(job.into_response());
     }
     let store = state.store();
-    let loaded = tokio::task::spawn_blocking(move || {
-        let report = store.bulk_load(&request);
-        let _ = std::fs::remove_file(&file);
-        report
+    let loaded = super::effect::untracked(move || {
+        let _file = file;
+        store.bulk_load(&request).map_err(|error| match error {
+            nrese_store::StoreError::LoadPublished { .. } => ApiError::internal(error.to_string()),
+            // Keep the released answer when only the quarantine record could have changed.
+            nrese_store::StoreError::LoadQuarantineNotRecorded(_) => {
+                ApiError::bad_request(error.to_string())
+            }
+            error if error.is_request_error() => ApiError::bad_request(error.to_string()),
+            _ => super::effect::unknown(),
+        })
     })
-    .await
-    .map_err(|error| ApiError::internal(error.to_string()))?
-    .map_err(|error| match error {
-        nrese_store::StoreError::LoadPublished { .. } => ApiError::internal(error.to_string()),
-        _ => ApiError::bad_request(error.to_string()),
+    .await?;
+    let reasoning = rematerialised(&state).await.map_err(|reason| {
+        ApiError::internal(format!(
+            "the load completed at published revision {}. Reasoning failed: {reason}. Don't send it again.",
+            loaded.revision
+        ))
     })?;
-    let reasoning = rematerialised(&state).await?;
     Ok(Json(import_report(&loaded, reasoning.as_ref())).into_response())
 }
 
@@ -934,7 +941,7 @@ fn start_import(
     state: &AppState,
     request: nrese_store::BulkLoadRequest,
     description: String,
-    remove: Option<std::path::PathBuf>,
+    remove: Option<tempfile::TempPath>,
 ) -> (
     StatusCode,
     [(axum::http::HeaderName, String); 1],
@@ -949,9 +956,7 @@ fn start_import(
         job.phase("loading");
         let store = state.store();
         let loaded = store.bulk_load_with(&request, job.progress());
-        if let Some(file) = remove {
-            let _ = std::fs::remove_file(file);
-        }
+        drop(remove);
         if let Err(nrese_store::StoreError::LoadPublished { revision, reason }) = &loaded {
             let warning = format!("the quarantine record couldn't be kept: {reason}");
             let report = serde_json::json!({ "revision": revision, "warning": warning });

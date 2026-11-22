@@ -55,6 +55,18 @@ pub struct Test {
     pub needs_service: bool,
     /// The endpoints such a test calls and their data (`qt:serviceData`).
     pub service_data: Vec<(NamedNode, Vec<GraphFile>)>,
+    /// What the test assumes of an implementation (`mf:requires`), for the report.
+    pub requires: Vec<String>,
+}
+
+/// Every entry of a manifest tree: the tests this runner runs, and the others with why not.
+#[derive(Default)]
+pub struct Entries {
+    pub tests: Vec<Test>,
+    /// `(entry, reason)`: entries this runner doesn't run.
+    pub untested: Vec<(String, String)>,
+    /// The `mf:entries` members read, counted apart from the two lists.
+    pub count: usize,
 }
 
 pub struct Suite {
@@ -67,6 +79,11 @@ impl Suite {
     /// `base` its official location.
     pub fn new(root: PathBuf, base: &'static str) -> Self {
         Self { root, base }
+    }
+
+    /// The suite's local directory.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     pub fn local_path(&self, iri: NamedNodeRef<'_>) -> Option<PathBuf> {
@@ -82,18 +99,16 @@ impl Suite {
         std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))
     }
 
-    /// All tests of a top-level manifest (e.g. `manifest-sparql11-query.ttl`), following
-    /// `mf:include`.
-    pub fn tests(&self, manifest: &str) -> Result<Vec<Test>, String> {
-        let mut tests = Vec::new();
+    /// All entries of a top-level manifest (e.g. `manifest-sparql11-query.ttl`), following
+    /// `mf:include`, into `entries`.
+    pub fn tests(&self, manifest: &str, entries: &mut Entries) -> Result<(), String> {
         self.collect(
             &NamedNode::new_unchecked(format!("{}{manifest}", self.base)),
-            &mut tests,
-        )?;
-        Ok(tests)
+            entries,
+        )
     }
 
-    fn collect(&self, manifest: &NamedNode, tests: &mut Vec<Test>) -> Result<(), String> {
+    fn collect(&self, manifest: &NamedNode, entries: &mut Entries) -> Result<(), String> {
         let graph = self.parse_graph(manifest.as_ref())?;
         // The manifest resource is the file in SPARQL 1.1 and a resource of its own in
         // SPARQL 1.2 (`trs:manifest`): follow whatever includes and lists entries.
@@ -106,14 +121,16 @@ impl Suite {
         for head in heads("include") {
             for include in list(&graph, Some(head.as_ref())) {
                 if let Term::NamedNode(include) = include {
-                    self.collect(&include, tests)?;
+                    self.collect(&include, entries)?;
                 }
             }
         }
         for head in heads("entries") {
             for entry in list(&graph, Some(head.as_ref())) {
-                if let Some(test) = read_test(&graph, &entry) {
-                    tests.push(test);
+                entries.count += 1;
+                match read_test(&graph, &entry) {
+                    Ok(test) => entries.tests.push(test),
+                    Err(reason) => entries.untested.push((entry.to_string(), reason)),
                 }
             }
         }
@@ -208,12 +225,11 @@ fn list(graph: &Graph, head: Option<TermRef<'_>>) -> Vec<Term> {
     members
 }
 
-fn read_test(graph: &Graph, entry: &Term) -> Option<Test> {
-    let subject = as_subject(entry.as_ref())?;
-    let kind = match named(object(graph, subject, &iri(RDF, "type")))?
-        .as_str()
-        .strip_prefix(MF)?
-    {
+/// The test of `entry`, or why this runner doesn't run it.
+fn read_test(graph: &Graph, entry: &Term) -> Result<Test, String> {
+    let subject = as_subject(entry.as_ref()).ok_or("the entry is not a resource")?;
+    let kind_iri = named(object(graph, subject, &iri(RDF, "type"))).ok_or("no test type")?;
+    let kind = match kind_iri.as_str().strip_prefix(MF).unwrap_or_default() {
         "QueryEvaluationTest" => Kind::QueryEvaluation,
         "UpdateEvaluationTest" => Kind::UpdateEvaluation,
         "PositiveSyntaxTest11" | "PositiveSyntaxTest" => Kind::PositiveSyntax,
@@ -221,13 +237,18 @@ fn read_test(graph: &Graph, entry: &Term) -> Option<Test> {
         "PositiveUpdateSyntaxTest11" | "PositiveUpdateSyntaxTest" => Kind::PositiveUpdateSyntax,
         "NegativeUpdateSyntaxTest11" | "NegativeUpdateSyntaxTest" => Kind::NegativeUpdateSyntax,
         "CSVResultFormatTest" => Kind::CsvResultFormat,
-        _ => return None, // protocol, service description, graph store: HTTP-level suites
+        // Protocol, service description, graph store: HTTP-level suites.
+        _ => {
+            return Err(format!(
+                "the test type {kind_iri} is not run by this runner"
+            ));
+        }
     };
     let approval = named(object(graph, subject, &iri(DAWGT, "approval")));
-    if approval
-        .is_some_and(|a| a.as_str().ends_with("Withdrawn") || a.as_str().ends_with("Rejected"))
+    if let Some(approval) =
+        approval.filter(|a| a.as_str().ends_with("Withdrawn") || a.as_str().ends_with("Rejected"))
     {
-        return None;
+        return Err(format!("not run: {approval}"));
     }
     let action = object(graph, subject, &mf("action"));
     let result = object(graph, subject, &mf("result"));
@@ -240,14 +261,18 @@ fn read_test(graph: &Graph, entry: &Term) -> Option<Test> {
         expected_data: Vec::new(),
         needs_service: false,
         service_data: Vec::new(),
+        requires: objects(graph, subject, &mf("requires"))
+            .map(|term| term.to_string())
+            .collect(),
     };
+    let unreadable = || "its action can't be read".to_owned();
     match kind {
         Kind::PositiveSyntax
         | Kind::NegativeSyntax
         | Kind::PositiveUpdateSyntax
         | Kind::NegativeUpdateSyntax => test.action = named(action),
         Kind::QueryEvaluation | Kind::CsvResultFormat => {
-            let action = as_subject(action?)?;
+            let action = action.and_then(as_subject).ok_or_else(unreadable)?;
             test.action = named(object(graph, action, &iri(QT, "query")));
             test.data.extend(
                 named(object(graph, action, &iri(QT, "data")))
@@ -286,7 +311,7 @@ fn read_test(graph: &Graph, entry: &Term) -> Option<Test> {
             test.result = named(result);
         }
         Kind::UpdateEvaluation => {
-            let action = as_subject(action?)?;
+            let action = action.and_then(as_subject).ok_or_else(unreadable)?;
             test.action = named(object(graph, action, &iri(UT, "request")));
             test.data = update_graphs(graph, action);
             if let Some(result) = result.and_then(as_subject) {
@@ -294,7 +319,7 @@ fn read_test(graph: &Graph, entry: &Term) -> Option<Test> {
             }
         }
     }
-    Some(test)
+    Ok(test)
 }
 
 /// `ut:data` (default graph) and `ut:graphData [ ut:graph <file>; rdfs:label "iri" ]`.
