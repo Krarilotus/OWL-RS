@@ -137,9 +137,28 @@ impl Batch {
     }
 
     /// Decides `tests[index]` of [`Self::new`] over its premise `ontology` before `deadline`:
-    /// by the compiled probe, or by the scalar reduction where the test has no probe form or
-    /// the probe can't express it, in what is left of `deadline` when it starts.
+    /// by the compiled probe, which stops at it, or by the scalar reduction where the test
+    /// has no probe form or the probe can't express it, in what is left of it when it
+    /// starts. A verdict found past it is none.
     pub(crate) fn check(
+        &self,
+        index: usize,
+        test: &Test,
+        ontology: &Ontology,
+        fresh: &[u64],
+        budget: &Budget,
+        deadline: Deadline,
+    ) -> Entailed {
+        match self.decide(index, test, ontology, fresh, budget, deadline) {
+            Entailed::Yes | Entailed::No if deadline.passed() => {
+                Entailed::Unknown(Limit::Time.reached("the deadline passed"))
+            }
+            answer => answer,
+        }
+    }
+
+    /// [`Self::check`] before its check of the deadline.
+    fn decide(
         &self,
         index: usize,
         test: &Test,
@@ -171,6 +190,8 @@ impl Batch {
         }
         let config = tableau::Config {
             timeout: budget.timeout,
+            // The probe stops at the caller's deadline, however late it starts.
+            deadline: deadline.instant(),
             max_memory: budget.memory_bytes,
             memory: budget.memory.clone(),
             max_nodes: budget.max_nodes,
