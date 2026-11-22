@@ -2959,6 +2959,9 @@ pub(crate) mod hooks {
         /// A pipeline write has passed its preflight certificate check and is about to take
         /// its transaction.
         pub(crate) static AFTER_PREFLIGHT: Hook = const { RefCell::new(None) };
+        /// A pipeline write's commit has failed, its writer slot released, and the write is
+        /// about to return its error.
+        pub(crate) static AFTER_FAILED_COMMIT: Hook = const { RefCell::new(None) };
         /// An entailment check has found the certificate current and is about to read the
         /// closure.
         pub(crate) static AFTER_CERTIFIED: Hook = const { RefCell::new(None) };

@@ -486,11 +486,15 @@ impl MutationPipeline {
                 }
                 tx.vouch(certificate);
             }
-            let summary = match ql {
+            let committed = match ql {
                 Some(ql) => ql.commit(tx),
                 None => tx.commit(),
+            };
+            #[cfg(test)]
+            if committed.is_err() {
+                crate::service::hooks::run(&crate::service::hooks::AFTER_FAILED_COMMIT);
             }
-            .map_err(|error| {
+            let summary = committed.map_err(|error| {
                 if kept_marked {
                     self.store.unmark_literal_equality();
                 }
