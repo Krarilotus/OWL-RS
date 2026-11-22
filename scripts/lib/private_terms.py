@@ -63,15 +63,28 @@ class Unreadable(Exception):
     pass
 
 
+# A stop by SIGTERM unwinds as an exit (128 + 15, a refusal to check.sh) through the cleanup; while a pattern file
+# exists it waits until close() has removed it, so no stop leaves one behind (grep starts only then too).
+STOP = {"files": 0, "asked": False}
+
+
+def stop(*_):
+    if STOP["files"]:
+        STOP["asked"] = True
+    else:
+        sys.exit(128 + signal.SIGTERM)
+
+
 class Terms:
     """The overlay's terms, matched against each line (Git's records end at LF only): the derived words here, the
     list's patterns by grep, from a file of its own that close() removes."""
 
     def __init__(self, words: re.Pattern | None, patterns: list[str]):
-        self.words, self.listed = words, None
+        self.words, self.listed, self.held = words, None, bool(patterns)
         if patterns:
-            handle, self.listed = tempfile.mkstemp(prefix="nrese-private-terms-", suffix=".txt")
+            STOP["files"] += 1  # before the file exists: a stop from here on waits for close()
             try:
+                handle, self.listed = tempfile.mkstemp(prefix="nrese-private-terms-", suffix=".txt")
                 with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as out:
                     out.write("\n".join(patterns) + "\n")
                 grep(self.listed, [""])  # a pattern grep can't use refuses here, before anything is read
@@ -80,8 +93,18 @@ class Terms:
                 raise
 
     def close(self):
-        if self.listed:
-            os.remove(self.listed)
+        if not self.held:
+            return
+        self.held = False
+        try:
+            if self.listed:
+                os.remove(self.listed)
+        except OSError:
+            raise Unreadable("removing its own pattern file") from None  # never the path: it names the user
+        finally:
+            STOP["files"] -= 1
+            if STOP["asked"] and not STOP["files"]:
+                sys.exit(128 + signal.SIGTERM)
 
     def hits(self, values: list[str]) -> set[int]:
         """The indexes of the values a term matches, line by line."""
@@ -104,10 +127,15 @@ def grep(patterns: str, lines: list[str]) -> list[int]:
         raise Unreadable(f"grep with the overlay's {LIST}") from error
     if done.returncode not in (0, 1):  # 1 is no match; an error or a signal is never "no match"
         raise Unreadable(f"grep with the overlay's {LIST}")
+    # 0 is a match, so records, each ending at LF (a matched line may hold a CR) and numbered within the input;
+    # 1 is none, so none. Anything else is no answer, and never the line itself in a message.
+    records = done.stdout.split(b"\n")
+    if records.pop() or (done.returncode == 0) != bool(records):
+        raise Unreadable(f"grep's output with the overlay's {LIST}")
     found = []
-    for line in done.stdout.split(b"\n")[:-1]:  # grep ends its records at LF; a matched line may hold a CR
-        number = re.match(rb"([0-9]+):", line)
-        if not number:  # never the line itself in a message
+    for line in records:
+        number = re.match(rb"([1-9][0-9]*):", line)
+        if not number or int(number.group(1)) > len(lines):
             raise Unreadable(f"grep's output with the overlay's {LIST}")
         found.append(int(number.group(1)) - 1)
     return found
@@ -286,6 +314,5 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    # A stop by SIGTERM unwinds as an exit, through the cleanup that removes the pattern file.
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(128 + signal.SIGTERM))
+    signal.signal(signal.SIGTERM, stop)
     sys.exit(main(sys.argv[1:]))

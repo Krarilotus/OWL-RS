@@ -4,6 +4,7 @@ output says where, never what. Every term here is a made-up one in a fake overla
 
 Run: python benches/suite/tests/isolation.py discover -s benches/suite/tests -p test_private_terms.py
 """
+import importlib.util
 import os
 from pathlib import Path
 import shutil
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import isolation
 
@@ -245,6 +247,65 @@ class PrivateTerms(unittest.TestCase):
     def commit_message(self, message):
         self.write("c.txt", message + "\n")
         return self.commit(message)
+
+
+def module():
+    """The check as a module of its own, fresh: STOP starts empty."""
+    spec = importlib.util.spec_from_file_location("private_terms_under_test", SCRIPT)
+    loaded = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(loaded)
+    return loaded
+
+
+class TheCheckOwnEnds(unittest.TestCase):
+    """How the check reads grep's answer, and how it ends with its pattern file (review r6, 22 Nov 2026)."""
+
+    # Spec (GNU grep's manual, Exit Status: 0 a line selected, 1 none; -n prints NUMBER: before each selected
+    # line, numbered from 1): an answer that isn't one of those -> a refusal, never "none found".
+    def test_greps_answer_counts_only_as_grep_gives_it(self):
+        terms = module()
+        lies = {"a match with nothing printed": (0, b""), "a record not ended": (0, b"1:zz"),
+                "line 0": (0, b"0:zz\n"), "a line past the input": (0, b"3:zz\n"),
+                "no match yet printed": (1, b"1:zz\n")}
+
+        def answering(code, out):
+            return mock.patch.object(terms.subprocess, "run",
+                                     return_value=subprocess.CompletedProcess([], code, out, b""))
+        for name, (code, out) in lies.items():
+            with self.subTest(name), answering(code, out):
+                with self.assertRaises(terms.Unreadable, msg="SPEC grep-answer: taken as an answer"):
+                    terms.grep("list", ["one", "two"])
+        with answering(0, b"2:two\n"):
+            self.assertEqual(terms.grep("list", ["one", "two"]), [1], "the one well-formed answer")
+
+    # Spec (the master, 22 Nov 05:24: the signal path is where fail-opens sat): a stop while the pattern file
+    # exists ends the check only once the file is removed, with the stop's exit (143, a refusal to check.sh).
+    def test_a_stop_never_leaves_the_pattern_file(self):
+        terms = module()
+        held = terms.Terms(None, ["zzlisted"])
+        path = Path(held.listed)
+        self.addCleanup(lambda: path.unlink(missing_ok=True))
+        try:
+            terms.stop()
+            ended = False
+        except SystemExit:
+            ended = True
+        self.assertEqual((ended, path.exists()), (False, True), "SPEC stop: it ended with its pattern file there")
+        with self.assertRaises(SystemExit) as ended:
+            held.close()
+        self.assertEqual((ended.exception.code, path.exists()), (143, False), "SPEC stop")
+
+    # Spec (as above; never-printed): a pattern file that can't be removed -> a refusal whose message names no
+    # path (the temp folder's names the user).
+    def test_a_pattern_file_that_cant_be_removed_is_a_refusal_naming_no_path(self):
+        terms = module()
+        held = terms.Terms(None, ["zzlisted"])
+        path = held.listed
+        self.addCleanup(lambda: Path(path).unlink(missing_ok=True))
+        with mock.patch.object(terms.os, "remove", side_effect=PermissionError(13, "denied", path)):
+            with self.assertRaises(terms.Unreadable, msg="SPEC cleanup: a failed removal passed") as refused:
+                held.close()
+        self.assertNotIn(path, str(refused.exception), "SPEC never-printed: the path")
 
 
 if __name__ == "__main__":
