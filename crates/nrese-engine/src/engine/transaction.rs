@@ -747,6 +747,7 @@ impl<'e> Transaction<'e> {
         };
         if asserted.is_empty() && inferred.is_empty() {
             // Nothing published: the note isn't called ([`Self::note_commit`]).
+            engine.shared.acknowledge_unchanged()?;
             let summary = checked(summary(base.revision(), base.asserted_identity()));
             if let Some(publication) = publication {
                 publication(summary.revision);

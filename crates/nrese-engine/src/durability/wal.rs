@@ -417,7 +417,9 @@ impl Wal {
     /// unknown poisons it: the active segment's sync (its records may not be on disk), or a
     /// new segment possibly in place under its name (records appended to the old one after
     /// it would sit behind a later-named segment, which replication and release read as
-    /// covering them).
+    /// covering them). The log is poisoned from the active segment's sync until the new
+    /// segment is active, so that a panic there leaves it poisoned too, as `append` does
+    /// around a note.
     pub(crate) fn rotate(&mut self, next_revision: u64) -> EngineResult<()> {
         if self.poisoned {
             return Err(EngineError::WalPoisoned);
@@ -427,27 +429,29 @@ impl Wal {
         }
         #[cfg(test)]
         super::fault::check(&super::fault::FAIL_ROTATE, "rotation")?;
-        if let Err(error) = self.active.sync_all() {
-            self.poisoned = true;
-            return Err(error.into());
-        }
+        self.poisoned = true;
+        self.active.sync_all()?;
         match create_segment(&self.dir, next_revision, self.magic) {
             Ok(file) => {
                 self.active = file;
                 self.active_first_revision = next_revision;
                 self.active_bytes = SEGMENT_MAGIC.len() as u64;
+                self.poisoned = false;
                 Ok(())
             }
             Err(error) => {
-                if !matches!(
+                self.poisoned = !matches!(
                     segment_path(&self.dir, next_revision).try_exists(),
                     Ok(false)
-                ) {
-                    self.poisoned = true;
-                }
+                );
                 Err(error)
             }
         }
+    }
+
+    /// Whether the log takes no more writes ([`Self::poison`]).
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned
     }
 
     /// Takes no more appends, rotations or bulk publications until the engine is reopened:

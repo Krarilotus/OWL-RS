@@ -409,6 +409,7 @@ impl<'e> BulkLoad<'e> {
             }
         };
         if summary.inserted + summary.deleted + summary.inferred_deleted == 0 {
+            shared.acknowledge_unchanged()?;
             return Ok(CommitSummary {
                 revision: current.revision,
                 ..summary
@@ -949,6 +950,7 @@ impl<'e> Rematerialisation<'e> {
             asserted: base.asserted_identity(),
         };
         if inserted + deleted == 0 {
+            shared.acknowledge_unchanged()?;
             shared.install(reading, certificate);
             let summary = CommitSummary {
                 revision: base.revision(),
