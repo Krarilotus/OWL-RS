@@ -6796,6 +6796,18 @@ impl<'a> Context<'a> {
         reserve(aggregate::pass_bytes(groups, plans.len()))?;
         let width = plans.len();
         let table = &solutions.table;
+        fn missing_numbers(
+            column: &[u64],
+            mut known: impl FnMut(u64) -> bool,
+        ) -> nrese_exec::IdMap<usize> {
+            let mut missing = nrese_exec::IdMap::default();
+            for (row, &id) in column.iter().enumerate() {
+                if !known(id) {
+                    missing.entry(id).or_insert(row);
+                }
+            }
+            missing
+        }
         // Every id's number, found once per query: the chunks of a cross product
         // ([`Self::group_crossed`]) share their values.
         for plan in &plans {
@@ -6805,24 +6817,20 @@ impl<'a> Context<'a> {
             // The expression and the variable it reads here: with another one bound, the
             // same id may give another value.
             let key = ((*expr).clone(), solutions.vars[*column].clone());
-            let mut missing: nrese_exec::IdMap<usize> = nrese_exec::IdMap::default();
-            {
+            let missing = {
                 let (numbers, since) = (self.numbers.borrow(), self.since.borrow());
                 let mut known = remembered(&numbers, &since, &key);
-                let first = known.next();
-                let rest = known
-                    .next()
-                    .map(|second| std::iter::once(second).chain(known));
-                for (row, &id) in table.column(*column).iter().enumerate() {
-                    if !first.is_some_and(|known| known.contains_key(&id))
-                        && !rest
-                            .as_ref()
-                            .is_some_and(|known| known.clone().any(|map| map.contains_key(&id)))
-                    {
-                        missing.entry(id).or_insert(row);
+                let column = table.column(*column);
+                // Choose the lookup once. Only a mixed chunk searches layers per row.
+                match (known.next(), known.next()) {
+                    (None, _) => missing_numbers(column, |_| false),
+                    (Some(map), None) => missing_numbers(column, |id| map.contains_key(&id)),
+                    (Some(first), Some(second)) => {
+                        let maps = [first, second].into_iter().chain(known);
+                        missing_numbers(column, |id| maps.clone().any(|map| map.contains_key(&id)))
                     }
                 }
-            }
+            };
             if missing.is_empty() {
                 continue;
             }
