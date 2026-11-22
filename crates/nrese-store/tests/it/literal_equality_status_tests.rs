@@ -385,6 +385,74 @@ fn a_reopened_store_with_no_literal_equality_keeps_the_word() {
     );
 }
 
+/// `owl:FunctionalProperty` named through an equality (Table 4 eq-rep-o): `:p` is functional
+/// only through `:F`.
+const ALIASED: &str = ":F owl:sameAs owl:FunctionalProperty . :p a :F .";
+
+/// A library store reopened from disk without a rebuild: its marker doesn't record whether the
+/// rules equated two literals, so its reads of literals are withheld, whatever its data hold,
+/// until a rebuild (a rematerialisation) finds no such equality. The pair on a functional
+/// property; that property made functional through an equality ([`ALIASED`], `owl2-rl`); the
+/// pair written under compact equality and reopened with it off (rebuilt at the first write);
+/// and two spellings with nothing to equate them. Rebuilt, only the last is told `complete`.
+#[test]
+fn a_store_reopened_without_a_rebuild_withholds_the_word_until_one_finds_no_literal_equality() {
+    let words = |store: &StoreService| READS.map(|query| read(store, query).1);
+    let pair = format!(":s :p {INTEGER} , {DECIMAL} .");
+    // Name, axiom, the mode it is reopened in (else its own), whether the rules equate the pair.
+    let cases = [
+        ("functional", SOURCES[0], None, true),
+        ("aliased", ALIASED, None, true),
+        (
+            "compact reopened expanded",
+            SOURCES[0],
+            Some("representatives"),
+            true,
+        ),
+        ("no equality", "", None, false),
+    ];
+    let mut unmet = Vec::new();
+    for ruleset in RULESETS {
+        for mode in MODES {
+            for (name, axiom, reopened, equated) in cases {
+                if (name == "aliased" && ruleset != "owl2-rl")
+                    || (reopened.is_some() && mode != "compact")
+                {
+                    continue;
+                }
+                let case = format!("{ruleset} {mode} {name}");
+                let dir = tempfile::tempdir().expect("dir");
+                {
+                    let before = open(ruleset, config(mode, Some(dir.path())));
+                    insert(&before, &format!("{axiom} {pair}"));
+                }
+                let after = open(ruleset, config(reopened.unwrap_or(mode), Some(dir.path())));
+                insert(&after, &format!(":t :q {INTEGER} ."));
+                let store = after.store();
+                // A compact stack opened with compact equality off is another form of the
+                // stack: its first write rebuilds it, and that rebuild says.
+                assert!(
+                    reopened.is_some() || store.last_materialisation().is_none(),
+                    "{case}: the reopened store was rematerialised"
+                );
+                told_otherwise(store, &format!("{case} reopened"), &mut unmet);
+                let rules = after.reasoner().config().materialised_program();
+                store.rematerialise(rules.expect("rules")).expect("rebuild");
+                if equated {
+                    told_otherwise(store, &format!("{case} rebuilt"), &mut unmet);
+                } else if words(store) != ["complete", "complete"] {
+                    unmet.push(format!("{case} rebuilt: {:?}", words(store)));
+                }
+            }
+        }
+    }
+    assert!(
+        unmet.is_empty(),
+        "a store reopened without a rebuild is told otherwise:\n{}",
+        unmet.join("\n")
+    );
+}
+
 /// The condition stays while the store holds the pair's derivation, a delete of its premise
 /// included (the commit can't tell which later value lacks a copy); a rebuild that finds no
 /// literal equality clears it, and one that finds it again keeps it.
