@@ -377,6 +377,18 @@ w3c_data() {
   fi
 }
 
+# A private bench host's names (the overlay NRESE_BENCH_PRIVATE names, benches/hosts.toml's header) are
+# refused where they would be published: by the commit tier for the staged change, and on the pusher's machine
+# for the commits a push publishes, before the fleet's tier, whose remembered pass knows neither the overlay
+# nor the messages (scripts/lib/private_terms.py). With no overlay there is nothing to check and nothing is read.
+private_terms() {
+  if [ -z "${NRESE_BENCH_PRIVATE:-}" ]; then
+    echo "private terms: no overlay configured (NRESE_BENCH_PRIVATE), nothing to check"
+    return 0
+  fi
+  python scripts/lib/private_terms.py "$@"
+}
+
 # The steps for files outside the Rust workspace: the guards, then what tests them.
 side_steps() {
   local files=("$@")
@@ -504,6 +516,9 @@ if [ "$mode" = push ] && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
   push_base=${NRESE_PUSH_BASE:-$(git rev-parse -q --verify '@{upstream}' 2> /dev/null \
     || git merge-base "$push_commit" refs/remotes/origin/refactor/engine-v2 2> /dev/null)}
   [ -n "$push_base" ] || { echo "no base for the push range: no upstream, and no origin/refactor/engine-v2" >&2; exit 2; }
+  # What this push publishes, checked here on every push before the fleet's tier, whose remembered pass
+  # knows neither the overlay nor the messages (private_terms): the hook names the branch and the remote.
+  private_terms push "$push_base" "$push_commit" "${NRESE_PUSH_REF:-}" "${NRESE_PUSH_REMOTE_NAME:-origin}" || exit $?
   # A measurement commit (refs/measure/*, benches/PROTOCOL.md §5) is a commit on an old side's tree,
   # which this tier isn't for: its one check is the measurement rule against the declared sides, the
   # side on a branch of the remote the push goes to (NRESE_PUSH_REMOTE, from the hook).
@@ -635,6 +650,7 @@ case "$mode" in
     # tree, the merge check's Windows part for its Windows inputs (scripts/lib/gate-key.sh
     # windows_inputs; process review 20 Oct 2026, §3A).
     mapfile -t files < <(changed_files commit)
+    step "private terms" private_terms commit
     step fmt cargo fmt --all --check
     step "message strings" message_strings
     if printf '%s\n' "${files[@]}" | grep -qE '(^|/)Cargo\.(toml|lock)$'; then
