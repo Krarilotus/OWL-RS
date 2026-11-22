@@ -314,9 +314,47 @@ pub(crate) fn plan_status(
     let decided = decided(store, snapshot, prepared, cancellation)?;
     let completeness = match decided.as_ref() {
         Ok(at) => plan_status_built(store, prepared, &analysis, at).completeness,
-        Err(why) => Status::sound_only(*why).completeness,
+        Err(why) => fallback(prepared, why).completeness,
     };
     Ok(composed(store, prepared, snapshot, &decided, completeness))
+}
+
+/// The status when the DL bounds view isn't used ([`PART`], [`LATER`], [`DEADLINE`]): `why`,
+/// its cause without "answers over the RL closure" unless the read surely reads the closure
+/// ([`reads_store_closure`]); for a reader of every graph that can't read it
+/// ([`may_read_store_closure`]), also that its dataset leaves the closure out. A reader of
+/// some graphs keeps [`PART`] alone: it never reads the bounds, and under `owl2-dl` it is
+/// told `not-certified` whatever the reason (`status_for_its_reader` in `service.rs`), so no
+/// reason here reaches it.
+fn fallback(prepared: &PreparedQuery, why: &str) -> Status {
+    let mut status = match why.strip_suffix(OVER_THE_CLOSURE) {
+        Some(cause) if !reads_store_closure(prepared) => {
+            Status::sound_only(format!("{cause}{NOT_CHECKED}"))
+        }
+        _ => Status::sound_only(why),
+    };
+    if let Some(reason) = prepared.dataset_omission_reason()
+        && prepared.access().is_none()
+        && !may_read_store_closure(prepared)
+    {
+        status.add(reason.to_owned());
+    }
+    status
+}
+
+/// Whether `prepared` surely reads the store's default graph, where the closure's inferred
+/// statements are: its dataset keeps it, or its query names it by `GRAPH`
+/// ([`reads_store_default_by_graph`]).
+pub(crate) fn reads_store_closure(prepared: &PreparedQuery) -> bool {
+    prepared.dataset_omission_reason().is_none()
+        || reads_store_default_by_graph(prepared.query(), false)
+}
+
+/// Whether `prepared` may read the store's default graph: as [`reads_store_closure`], or by
+/// a variable graph (`GRAPH ?g`), which may be bound to its name.
+fn may_read_store_closure(prepared: &PreparedQuery) -> bool {
+    prepared.dataset_omission_reason().is_none()
+        || reads_store_default_by_graph(prepared.query(), true)
 }
 
 /// The bounds' view of `snapshot` its answers and their status are decided on, or
@@ -328,14 +366,30 @@ type Decided = Result<(Snapshot, Arc<View>), &'static str>;
 const PART: &str = "the reader sees part of the data: answers are checked against the bounds \
                     only for readers of every graph";
 
+/// The end of [`LATER`] and [`DEADLINE`]: what a read without the bounds' view answers over,
+/// where it surely reads the closure ([`fallback`]).
+macro_rules! over_the_closure {
+    () => {
+        ": answers over the RL closure, not checked against the bounds"
+    };
+}
+const OVER_THE_CLOSURE: &str = over_the_closure!();
+
+/// [`OVER_THE_CLOSURE`] for a read that may leave the closure out.
+const NOT_CHECKED: &str = ": not checked against the bounds";
+
 /// An older revision whose bounds a later commit replaced reads its RL closure.
-const LATER: &str = "a later commit's bounds replaced this revision's while it was read: \
-                     answers over the RL closure, not checked against the bounds";
+const LATER: &str = concat!(
+    "a later commit's bounds replaced this revision's while it was read",
+    over_the_closure!()
+);
 
 /// A read whose request's time was up before the view of its revision was built reads its RL
 /// closure: the build, another read's or none begun, isn't waited for.
-const DEADLINE: &str = "the request's time was up before the bounds' view of this revision was \
-                        built: answers over the RL closure, not checked against the bounds";
+const DEADLINE: &str = concat!(
+    "the request's time was up before the bounds' view of this revision was built",
+    over_the_closure!()
+);
 
 /// A read whose wait ended with the build of its revision's view failed (a panic, an early
 /// return) reads its RL closure.
@@ -1300,9 +1354,7 @@ fn plan_status_built(
     (snapshot, view): &(Snapshot, Arc<View>),
 ) -> Status {
     if prepared.has_dataset() {
-        return Status::sound_only(
-            "the query reads part of the data: not checked against the bounds",
-        );
+        return Status::sound_only(prepared.dl_dataset_reason());
     }
     // What the run adds whatever path decides ([`decide_answers`]); a consistency the run
     // would check is not known yet.
@@ -1369,7 +1421,7 @@ pub(crate) fn answer(
     let read = (cancellation, deadline_of(store, prepared));
     let mut outcome = match decided.as_ref() {
         Ok(at) => decide_answers(store, prepared, &analysis, at, read, memory, mode)?,
-        Err(why) => Status::sound_only(*why).stream(Read::At(snapshot.clone())),
+        Err(why) => fallback(prepared, why).stream(Read::At(snapshot.clone())),
     };
     #[cfg(test)]
     crate::service::hooks::run(&crate::service::hooks::AFTER_DECIDED);
@@ -1450,11 +1502,9 @@ fn decide_answers(
     let settings = store.query_settings();
     if prepared.has_dataset() {
         // Over the decided snapshot, every graph's for this reader: the status's.
-        return Ok(Status::sound_only(
-            "the query names its dataset: answers are over those graphs, not checked \
-             against the bounds",
-        )
-        .stream(Read::At(snapshot.clone())));
+        return Ok(
+            Status::sound_only(prepared.dl_dataset_reason()).stream(Read::At(snapshot.clone()))
+        );
     }
     let mut status = Status::complete();
     // A version no certificate vouches for is told `not-certified` whatever its consistency

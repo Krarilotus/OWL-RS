@@ -1,0 +1,39 @@
+# The W3C implementation reports (EARL) of a release, from a run on GitHub's machines:
+# scripts/w3c-reports.sh at the dispatched ref, the report files kept as the run's artifact.
+# Dispatched at a release tag only, as a step of the release:
+#   gh workflow run w3c-reports.yml --ref v1.5.1
+# No cache (the reports come from a cold build) and no secret.
+name: W3C reports
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reports:
+    name: W3C implementation reports
+    runs-on: ubuntu-latest
+    steps:
+      - name: a release tag only
+        shell: bash
+        run: |
+          if [[ ! "$GITHUB_REF" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-pre\.[0-9]+)?$ ]]; then
+            echo "W3C reports are written at a release tag (v1.5.1, v1.5.1-pre.1), not at $GITHUB_REF" >&2
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+      - name: toolchain version from rust-toolchain.toml
+        run: echo "RUST_TOOLCHAIN=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: reports
+        run: bash scripts/w3c-reports.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: w3c-reports-${{ github.ref_name }}
+          path: w3c-reports/
+          if-no-files-found: error
+          retention-days: 90

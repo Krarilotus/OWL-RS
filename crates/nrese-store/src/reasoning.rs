@@ -189,6 +189,7 @@ pub(crate) fn apply_delta(
     tx: &mut Transaction<'_>,
     operation: &nrese_reasoner::eval::OperationStop<'_>,
     memory: &Arc<nrese_exec::Budget>,
+    working_memory: &dyn Fn() -> Arc<nrese_exec::Budget>,
     base_consistent: bool,
 ) -> Result<
     (
@@ -200,12 +201,13 @@ pub(crate) fn apply_delta(
     delta::Interrupted,
 > {
     let started = Instant::now();
-    let mut done = nrese_reasoner::engine::maintain_with(
+    let mut done = nrese_reasoner::engine::maintain_with_report_budget(
         program,
         ground,
         tx,
         operation,
         memory,
+        working_memory,
         base_consistent,
     )?;
     if let Some(rebuilt) = done.rebuilt_violations.take() {
@@ -329,8 +331,16 @@ mod tests {
             };
             let operation = nrese_reasoner::eval::OperationStop::new(&poll);
             let memory = Arc::new(nrese_exec::Budget::unlimited());
-            let (violations, report, _, _) =
-                apply_delta(&program, None, &mut tx, &operation, &memory, true).unwrap();
+            let (violations, report, _, _) = apply_delta(
+                &program,
+                None,
+                &mut tx,
+                &operation,
+                &memory,
+                &|| Arc::clone(&memory),
+                true,
+            )
+            .unwrap();
             assert!(violations.consistent());
             let pending = tx.pending_snapshot();
             let stored: HashSet<EncodedTriple> = pending

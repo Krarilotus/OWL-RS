@@ -30,13 +30,14 @@ mod materialise;
 use nrese_engine::{
     EncodedQuad, EncodedTriple, GraphSelector, QuadPattern, ReadModel, Snapshot, TermId, TermKind,
 };
+use nrese_owl::mapping::AnnotationProperties;
 use nrese_rdf::{LiteralRef, NamedNodeRef, TermRef};
 
 use crate::RuleProgram;
 use crate::batch::Schema;
 use crate::delta;
 use crate::eval::GroundProgram;
-use crate::ir::{Rule, Triple, Vocabulary};
+use crate::ir::{AnnotationIds, Guard, Rule, Triple, Vocabulary};
 use crate::lists::ListVocabulary;
 use crate::unnamed::UnnamedVocabulary;
 
@@ -44,7 +45,10 @@ pub use explain::{
     InferenceStep, JUSTIFICATIONS_AT_MOST, JustificationAnswer, JustificationMode,
     JustifiedStatement, explain_fact, explain_violation, justify_fact,
 };
-pub use maintain::{EngineBase, Maintenance, maintain, maintain_with, maintain_within};
+pub use maintain::{
+    EngineBase, Maintenance, install_closure, maintain, maintain_with, maintain_with_report_budget,
+    maintain_within,
+};
 pub use materialise::{
     Closure, equality_report_until, equality_report_with, materialise, materialise_until,
     materialise_with, materialise_within,
@@ -84,6 +88,9 @@ pub struct Program {
     /// Whether the axioms' own closure concludes only facts a store can hold, once a first
     /// load asked ([`Self::axioms_conclude_only_storable`]).
     axioms_storable: std::sync::OnceLock<bool>,
+    /// Where a rule reads the data's annotation properties ([`Guard::NotAnnotation`]): the
+    /// built-in ones and the declaring statements, by the OWL reader's rule.
+    annotations: Option<AnnotationProperties>,
 }
 
 impl std::fmt::Debug for Program {
@@ -131,7 +138,70 @@ impl Program {
         at.equality_classes().is_some() || quads.any(|quad| lists.is_list_fact(triple(quad)))
     }
 
-    /// The rules as the delta executor takes them.
+    /// Whether one of `quads` (by `lookup`'s ids) has the shape of either annotation
+    /// declaration. A change with one may change the set ([`Self::annotation_set_changed`]).
+    pub fn touches_a_declaration(
+        lookup: &dyn Fn(TermRef<'_>) -> Option<TermId>,
+        mut quads: impl Iterator<Item = EncodedQuad>,
+    ) -> bool {
+        let mut id = |iri: &str| lookup(NamedNodeRef::new_unchecked(iri).into()).map(TermId::raw);
+        let declaring = AnnotationProperties::new(&mut id);
+        quads.any(|quad| declaring.declares(triple(quad)))
+    }
+
+    /// Whether the asserted statements change the annotation properties read by this program.
+    pub fn annotation_set_changed(&self, base: &Snapshot, pending: &Snapshot) -> bool {
+        self.changed_annotation_ids(self.annotation_ids(base).as_ref(), pending)
+            .is_some()
+    }
+
+    /// The pending annotation properties when they differ from the base's.
+    fn changed_annotation_ids(
+        &self,
+        base: Option<&AnnotationIds>,
+        pending: &Snapshot,
+    ) -> Option<AnnotationIds> {
+        self.annotation_ids(pending)
+            .filter(|after| Some(after) != base)
+    }
+
+    /// The rules for a run over `snapshot`: where a rule reads the annotation properties,
+    /// with [`Self::annotation_ids`], fixed for the run.
+    fn rules_for(&self, snapshot: &Snapshot) -> std::borrow::Cow<'_, [Rule]> {
+        self.rules_with(self.annotation_ids(snapshot).as_ref())
+    }
+
+    /// Where a rule reads the annotation properties, those of `snapshot`'s asserted
+    /// statements, read as the OWL reader reads them (an IRI it may name one, declared in any
+    /// graph, and the built-in ones); `None` where none does.
+    fn annotation_ids(&self, snapshot: &Snapshot) -> Option<AnnotationIds> {
+        let annotations = self.annotations.as_ref()?;
+        let mut read = annotations.clone();
+        let named = |s: TermId| match snapshot.decode(s) {
+            Some(nrese_rdf::Term::NamedNode(n)) => nrese_owl::may_name_annotation(n.as_str()),
+            _ => false,
+        };
+        for [p, o] in annotations.declaring() {
+            let declared = pattern([None, Some(p), Some(o)], GraphSelector::Any);
+            for quad in snapshot.quads_for_pattern_in(ReadModel::Asserted, &declared) {
+                read.read(triple(quad), named(quad.subject));
+            }
+        }
+        Some(AnnotationIds::new(read.properties().collect()))
+    }
+
+    /// The rules, where a rule reads the annotation properties, with `set`.
+    fn rules_with(&self, set: Option<&AnnotationIds>) -> std::borrow::Cow<'_, [Rule]> {
+        let Some(set) = set else {
+            return std::borrow::Cow::Borrowed(&self.rules);
+        };
+        let mut rules = self.rules.clone();
+        crate::rulesets::bind_annotations(&mut rules, set);
+        std::borrow::Cow::Owned(rules)
+    }
+
+    /// The rules as the delta executor takes them; a rule that reads the annotation
+    /// properties with none: a run over a state takes them from [`Self::rules_for`].
     pub fn rules(&self) -> delta::Rules<'_> {
         delta::Rules {
             rules: &self.rules,
@@ -178,6 +248,12 @@ impl Program {
             .axiom_triples(&mut constants)
             .expect("the built-in axioms parse (tested), user facts are checked at startup");
         axioms.sort_unstable();
+        let reads =
+            |rule: &Rule| (rule.guards.iter()).any(|g| matches!(g, Guard::NotAnnotation(..)));
+        let annotations = rules
+            .iter()
+            .any(reads)
+            .then(|| AnnotationProperties::new(&mut |iri| Some(constants.iri(iri))));
         if let Some(refused) = constants.refused {
             return Err(refused);
         }
@@ -196,6 +272,7 @@ impl Program {
             axioms,
             plan: None,
             axioms_storable: std::sync::OnceLock::new(),
+            annotations,
         })
     }
 
@@ -256,6 +333,7 @@ impl Program {
     /// builds it.
     pub fn ground_program(&self, snapshot: &Snapshot) -> GroundProgram {
         let schema = self.schema_for(snapshot);
+        let rules = self.rules_for(snapshot);
         let base = explain::SnapshotBase {
             snapshot,
             axioms: &self.axioms,
@@ -263,6 +341,7 @@ impl Program {
         delta::program(
             &base,
             delta::Rules {
+                rules: &rules,
                 schema: &schema,
                 ..self.rules()
             },
