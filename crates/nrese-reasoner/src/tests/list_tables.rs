@@ -43,8 +43,12 @@ fn dense_conjunctive_list_search_stays_within_counted_work() {
             work: Cell::new(0),
             limit: 16 * input.len(),
         };
-        let (_, diagnostics) = crate::lists::instantiate(&voc, &facts);
+        let (rules, diagnostics) = crate::lists::instantiate(&voc, &facts);
         assert!(diagnostics.is_empty(), "{axiom}: {diagnostics:?}");
+        assert!(
+            rules.iter().any(uses_private_list_relation),
+            "{axiom} must use the cell form after reaching the work bound"
+        );
         assert!(
             facts.work.get() <= facts.limit,
             "{axiom} exhausted the search allowance"
@@ -52,11 +56,18 @@ fn dense_conjunctive_list_search_stays_within_counted_work() {
     }
 }
 
+fn uses_private_list_relation(rule: &crate::ir::Rule) -> bool {
+    use crate::ir::{Atom, Head, Term};
+    let private =
+        |Atom(terms): &Atom| matches!(terms[1], Term::Const(p) if crate::lists::internal(p));
+    rule.body.iter().any(private)
+        || matches!(&rule.head, Head::Facts(heads) if heads.iter().any(private))
+}
+
 /// How many rules of the property chain `ex:out` read or conclude a private relation (the
 /// per-cell form). Its list starts at `head`; `cells` cells `ex:c0`… with two firsts each
 /// end it, after the cells of `before`.
 fn per_cell_rules(head: &str, before: &str, cells: usize) -> usize {
-    use crate::ir::{Atom, Head, Term};
     let mut text = format!("ex:out owl:propertyChainAxiom {head}\n{before}");
     for i in 0..cells {
         let rest = if i + 1 == cells {
@@ -73,14 +84,9 @@ fn per_cell_rules(head: &str, before: &str, cells: usize) -> usize {
     let voc = ListVocabulary::new(&mut vocabulary);
     let (rules, diagnostics) = crate::lists::instantiate(&voc, &SliceFacts(&input));
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
-    let private =
-        |Atom(terms): &Atom| matches!(terms[1], Term::Const(p) if crate::lists::internal(p));
     rules
         .iter()
-        .filter(|rule| {
-            rule.body.iter().any(private)
-                || matches!(&rule.head, Head::Facts(heads) if heads.iter().any(private))
-        })
+        .filter(|rule| uses_private_list_relation(rule))
         .count()
 }
 

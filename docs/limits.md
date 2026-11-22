@@ -140,6 +140,8 @@ leave something out.
   The walk search has a deterministic work bound and uses the cell form when it
   reaches that bound. Operations with an existing reasoner stop also use it while
   compiling and evaluating lists.
+  An adversarially branched head can reach this bound and use the cell form while giving
+  the same answers.
   With QL rewriting on, a list outside OWL 2 DL's RDF syntax can still make a read
   `sound-only` through the structural reader's `BrokenList` hazard.
   Literals aren't
