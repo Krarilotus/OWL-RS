@@ -6823,6 +6823,7 @@ impl<'a> Context<'a> {
         if totals == 0 {
             return Ok(None);
         }
+        let twinned = !counted.is_empty();
         for (a, expr) in counted {
             let twin = plans
                 .iter()
@@ -7051,6 +7052,24 @@ impl<'a> Context<'a> {
         let Some(states) = states else {
             return Ok(None);
         };
+        drop(layers);
+        drop((numbers, since));
+        // A pass with a `COUNT` of an expression, which the per-column path counts keeping
+        // nothing after it, keeps nothing either: the numbers it found go when it ends, then
+        // their charge (the fields drop in order); the ones found before it stay.
+        if twinned {
+            let mut since = self.since.borrow_mut();
+            let found = since
+                .last_mut()
+                .expect("a numeric pass runs in a save point");
+            drop(std::mem::replace(
+                found,
+                Remembered {
+                    numbers: HashMap::new(),
+                    held: Reservation::new(Arc::clone(&self.budget)),
+                },
+            ));
+        }
         Ok(Some(
             (0..groups)
                 .map(|group| {
