@@ -502,3 +502,54 @@ pub(crate) fn pattern([s, p, o]: [Option<u64>; 3], graph: GraphSelector) -> Quad
         graph,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::{Program, RuleProgram};
+    use crate::program::{EQUALITY_RULES_N3, UserRules};
+    use crate::rulesets::{ALL, Ruleset};
+    use nrese_engine::{Engine, EngineConfig};
+
+    /// The reopen verdict for each built-in program must agree with the gate that
+    /// lets the engine act on an `owl:sameAs` and report literal equality. User
+    /// rules can supply the whole equality module to a program without it.
+    #[test]
+    fn the_reopen_verdict_follows_the_compiled_equality_gate() {
+        let engine = Engine::new(EngineConfig {
+            background_maintenance: false,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let tx = engine.transaction();
+        for ruleset in ALL {
+            let expected = match ruleset {
+                Ruleset::Rdfs | Ruleset::RdfsFull | Ruleset::Owl2Ql => false,
+                Ruleset::RdfsPlus | Ruleset::OwlHorst | Ruleset::Owl2Rl => true,
+            };
+            let program = RuleProgram::builtin(ruleset);
+            let verdict = program.may_equate_literals();
+            assert_eq!(verdict, expected, "{}", ruleset.name());
+            let compiled = Program::compile(&program, &|term| tx.intern(term));
+            assert_eq!(
+                verdict,
+                compiled.same_as.is_some(),
+                "{}: compiled engine gate",
+                ruleset.name()
+            );
+        }
+
+        let user = Arc::new(UserRules::n3("equality.n3", EQUALITY_RULES_N3).unwrap());
+        let ql = RuleProgram::new(Some(Ruleset::Owl2Ql), Some(user)).unwrap();
+        let compiled = Program::compile(&ql, &|term| tx.intern(term));
+        assert!(
+            compiled.same_as.is_some(),
+            "OWL 2 QL with user equality rules"
+        );
+        assert!(
+            ql.may_equate_literals(),
+            "OWL 2 QL with user equality rules"
+        );
+    }
+}

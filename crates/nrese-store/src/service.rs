@@ -445,15 +445,10 @@ impl StoreService {
         if service.engine.snapshot().revision() != before {
             service.invalidate_held(writer)?;
         }
-        if let Some(state) = service.reasoning_state() {
+        if let Some(state) = service.recorded_reasoning_state() {
             // The reading isn't on disk: the certified stack's is installed before the store
             // is anyone's, with its certificate. Without one the stack is read as stored.
-            service.certify(&tx, state.clone());
-            // Kept in memory too: reads ask for it per query ([`Self::status_without_dl`]).
-            *service
-                .materialised
-                .lock()
-                .unwrap_or_else(|p| p.into_inner()) = Some(state);
+            service.certify(&tx, state);
         }
         drop(tx);
         service.pin_configured_queries()?;
@@ -469,12 +464,26 @@ impl StoreService {
     fn certify(&self, tx: &nrese_engine::Transaction<'_>, mut state: crate::ReasoningState) {
         let writer = tx.writer().expect("a transaction holds the writer slot");
         let base = Certificate::of(tx.base());
-        if base.is_some_and(|c| c.state.literal_equality) {
+        if base.is_some_and(|c| c.state.literal_equality && !c.state.literal_equality_unknown) {
             state.literal_equality = true;
-            let mut kept = self.materialised.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(kept) = kept.as_mut() {
-                kept.literal_equality = true;
-            }
+        }
+        // Keep the observed mark and the marker's uncertainty independent. A later
+        // certificate can reconsider the uncertainty under the rules registered then.
+        self.materialised
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_or_insert_with(|| state.clone())
+            .literal_equality |= state.literal_equality;
+        if state.literal_equality_unknown {
+            let cannot_equate = self.supports.rules().is_some_and(|program| {
+                // Defence in depth: vouches also checks the fingerprint under
+                // this writer slot before the certificate is published.
+                state.made_by(&program, self.config.hide_unnamed_classes)
+                    && !program.may_equate_literals()
+                    && state.ruleset == program.name()
+            });
+            state.literal_equality_unknown = !cannot_equate;
+            state.literal_equality |= state.literal_equality_unknown;
         }
         let kept = base.and_then(|c| c.ql.clone());
         let reading = self.note_equality(writer, &state);
@@ -631,7 +640,7 @@ impl StoreService {
     pub fn set_ql_rewriting(&self, mode: crate::QlRewritingMode) {
         let tx = self.engine.transaction();
         *self.ql_mode.write().unwrap_or_else(|p| p.into_inner()) = mode;
-        if let Some(state) = self.reasoning_state() {
+        if let Some(state) = self.recorded_reasoning_state() {
             #[cfg(test)]
             hooks::run(&hooks::AFTER_QL_READ);
             self.certify(&tx, state);
@@ -680,6 +689,15 @@ impl StoreService {
     /// [`Self::rematerialise`] and kept by reasoner-v2 commits since; `None` if unknown
     /// (never materialised, or a write that didn't maintain the inferences).
     pub fn reasoning_state(&self) -> Option<crate::ReasoningState> {
+        self.recorded_reasoning_state().map(|mut state| {
+            state.literal_equality |= state.literal_equality_unknown;
+            state
+        })
+    }
+
+    /// The observed literal-equality mark and the uncertainty of a marker read are
+    /// kept separately until certification.
+    fn recorded_reasoning_state(&self) -> Option<crate::ReasoningState> {
         if let Some(state) = &*self.materialised.lock().unwrap_or_else(|p| p.into_inner()) {
             return Some(state.clone());
         }
@@ -688,10 +706,9 @@ impl StoreService {
         // Read from disk, the state is one opened without a rebuild, the open's own or a later
         // read's. The marker doesn't record whether the rules equated two literals, and no
         // reading of the stored statements can tell (a closure stored over representatives
-        // keeps one of equal values): until a rebuild finds none, they count as equated, for
-        // every reader.
+        // keeps one of equal values). Certification can narrow this only when the
+        // registered rules made the closure and cannot equate literals.
         crate::ReasoningState::from_text(&text).map(|state| crate::ReasoningState {
-            literal_equality: true,
             literal_equality_unknown: true,
             ..state
         })
@@ -816,8 +833,7 @@ impl StoreService {
     /// such a fact; the same object where it is marked already or isn't this store's. The
     /// state kept in memory is marked too ([`Self::mark_literal_equality`]), for a version
     /// with no certificate; a certificate made again takes the mark from either
-    /// ([`Self::certify`]). The marker on disk isn't changed: an open without a rebuild counts
-    /// the equality as made.
+    /// ([`Self::certify`]). The marker on disk doesn't record literal equality.
     pub(crate) fn with_literal_equality(
         certificate: nrese_engine::Certificate,
     ) -> nrese_engine::Certificate {
@@ -1167,7 +1183,7 @@ impl StoreService {
     pub fn use_reasoning_rules(&self, rules: Option<nrese_reasoner::RuleProgram>) {
         let tx = self.engine.transaction();
         self.supports.use_rules(rules);
-        if let Some(state) = self.reasoning_state() {
+        if let Some(state) = self.recorded_reasoning_state() {
             self.certify(&tx, state);
         }
     }
@@ -1185,7 +1201,7 @@ impl StoreService {
         self.dl.set_active(active, user_rules);
         // A state with violations (read at open, or recorded before): whether `owl2-dl`
         // decides them, derived under the mode now set (`ReasoningState::undecided`).
-        if let Some(mut state) = self.reasoning_state().filter(|s| s.violations > 0) {
+        if let Some(mut state) = self.recorded_reasoning_state().filter(|s| s.violations > 0) {
             let treatments = &self.config.dl.treatments;
             state.undecided = active
                 .then(|| self.dl.undecided(&self.engine.snapshot(), treatments))
@@ -1196,7 +1212,7 @@ impl StoreService {
         // answers through existentials, see `ql_for`); off, the rewriting the closure and the
         // setting call for, whatever came first (a change from `owl2-dl` to `owl2-rl` sets
         // its QL rewriting before its write path, which switches the bounds off, exists).
-        if let Some(state) = self.reasoning_state() {
+        if let Some(state) = self.recorded_reasoning_state() {
             self.certify(&tx, state);
         }
     }
@@ -3747,6 +3763,38 @@ mod marker_tests {
     // The reasoning marker is written as the store's metadata: its directory sync, after the
     // rename, fails through metadata's fault (`metadata::tests::FAIL_DIR_SYNC`).
     use crate::metadata::tests::FAIL_DIR_SYNC as FAIL_MARKER_SYNC;
+
+    /// The marker alone cannot rule out an equality. The registered RDFS program
+    /// can, once the store checks that its fingerprint matches the closure.
+    #[test]
+    fn an_rdfs_marker_needs_its_own_program_to_clear_reopen_uncertainty() {
+        use nrese_reasoner::{RuleProgram, rulesets::Ruleset};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = || StoreConfig::on_disk(dir.path());
+        let program = RuleProgram::builtin(Ruleset::Rdfs);
+        {
+            let store = StoreService::new(config()).unwrap();
+            store.rematerialise(&program).unwrap();
+        }
+        let store = StoreService::new(config()).unwrap();
+        let flags = || {
+            super::Certificate::of(&store.engine().snapshot())
+                .map(|c| (c.state.literal_equality, c.state.literal_equality_unknown))
+        };
+        let unknown = flags();
+        store.use_reasoning_rules(Some(program.clone().with_named_keys(true)));
+        let mismatch = flags();
+        store.use_reasoning_rules(Some(program));
+        assert_eq!(flags(), Some((false, false)));
+        assert_eq!(unknown, Some((true, true)));
+        assert_eq!(
+            mismatch, None,
+            "vouches rejects a certificate for a different fingerprint"
+        );
+        store.use_reasoning_rules(None);
+        assert_eq!(flags(), Some((true, true)));
+    }
 
     /// A reasoning marker whose publication failed after its rename is still cleared by the
     /// next clear of the inferences. A rematerialisation under RDFS
