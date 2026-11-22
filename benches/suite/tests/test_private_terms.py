@@ -43,7 +43,7 @@ DERIVED = {"the host's key": "zzkeyzz", "hostname": "zznamezz", "ssh user": "zzu
            "an ssh user beside an IPv6 host": "zzuser6zz", "an IPv6 ssh host": "fd00::5eed",
            "a line of a value over several lines": "zzlinetwozz"}
 # Never printed: the terms, the list's, and the names of the fields the check doesn't know.
-TERMS = (*DERIVED.values(), "zzlineonezz", "zzlisted", "zzdirzz", "zzlinezz", "zzfield", "zznumberfield",
+TERMS = (*DERIVED.values(), "zzlineonezz", "zzlisted", "zzdirzz", "zzlinezz", "zz42zz", "zzfield", "zznumberfield",
          "zzshortfield", "zzmultifield")
 
 
@@ -104,12 +104,6 @@ class PrivateTerms(unittest.TestCase):
             "no such folder": lambda: shutil.rmtree(self.overlay),
             "hosts.toml unparsable": lambda: (self.overlay / "hosts.toml").write_text("[host\n"),
             "a list line that is no pattern": lambda: (self.overlay / "publish-deny.txt").write_text("zz(\n"),
-            "a list line Python reads otherwise": lambda: (self.overlay / "publish-deny.txt").write_text("[[:alpha:]]\n"),
-            "an equivalence class": lambda: (self.overlay / "publish-deny.txt").write_text("[[=h=]]ostname\n"),
-            "an equivalence class among others": lambda: (self.overlay / "publish-deny.txt").write_text(
-                "[a[=h=]]ostname\n"),
-            "a collating element among others": lambda: (self.overlay / "publish-deny.txt").write_text(
-                "[a[.h.]]ostname\n"),
             "a list that links to nothing": lambda: os.symlink(self.root / "gone", self.overlay / "publish-deny.txt"),
             "an identifying field that isn't text": lambda: (self.overlay / "hosts.toml").write_text(
                 "[host.zzkeyzz]\nssh = 42\n"),
@@ -162,7 +156,7 @@ class PrivateTerms(unittest.TestCase):
     # Spec (03:11 3.): the overlay's optional list adds patterns, matched ignoring case and each line on its own
     # (^ and $ are a line's ends); blank lines are none. A match that reaches into a directory withholds it.
     def test_the_overlays_list_adds_patterns(self):
-        (self.overlay / "publish-deny.txt").write_text("\nzzlisted[0-9]+\n\n(?<=zzdirzz)/\n^zzlinezz$\n", newline="\n")
+        (self.overlay / "publish-deny.txt").write_text("\nzzlisted[0-9]+\n\nzzdirzz/\n^zzlinezz$\n", newline="\n")
         done = self.staged("b.txt", "ZZLISTED42\n")
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
         self.assertIn("3 patterns from publish-deny.txt", done.stdout)
@@ -174,6 +168,20 @@ class PrivateTerms(unittest.TestCase):
         done = self.staged("zzdirzz/plan.txt", "ordinary\n")
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
         self.assertIn("path matches: a file under a directory whose name matches (not shown)", done.stdout)
+
+    # Spec (the master, 22 Nov 03:11 3., and the push guard it would replace, which matches its list by `grep -Eiq -f`):
+    # a list pattern means what an extended regular expression means to grep, constructs Python reads otherwise
+    # included: a backslash in brackets is a backslash, and a POSIX class is a class.
+    def test_the_list_is_read_as_grep_reads_it(self):
+        cases = (("a backslash in brackets", "^[ ]*[\\t]ry:$", "    try:"),
+                 ("a POSIX class", "zz[[:digit:]]+zz", "see zz42zz"))
+        for name, pattern, line in cases:
+            with self.subTest(name):
+                (self.overlay / "publish-deny.txt").write_text(pattern + "\n", newline="\n")
+                self.git("reset", "-q", "--hard", self.base)
+                done = self.staged("b.txt", line + "\n")
+                self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+                self.assertIn("added lines match in a file under .\n", done.stdout)
 
     # Spec ((c), the push guard's rows of 22 Nov): the location never shows a term: a directory whose name holds
     # one is withheld; a directory named like an option, a name outside ASCII, an inherited pathspec mode and a

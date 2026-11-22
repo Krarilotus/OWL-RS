@@ -4,11 +4,12 @@ push publishes), each called by scripts/check.sh private_terms, the one rule bot
 The terms come only from the private overlay NRESE_BENCH_PRIVATE names (benches/hosts.toml's header):
 - derived from its hosts.toml's [host.NAME] tables, each field by its verdict in HOST_FIELDS; a value in a field
   not listed there is derived whole, so a new field is checked before anyone has looked at it;
-- and the patterns of the optional publish-deny.txt beside it (one Python regular expression per line, matched
-  ignoring case), which may stay git-ignored there, so a private name need be committed nowhere.
+- and the patterns of the optional publish-deny.txt beside it (one extended regular expression per line, matched
+  ignoring case by `grep -E -i` itself, the push guard's matcher, so a pattern means here what it means there),
+  which may stay git-ignored there, so a private name need be committed nowhere.
 A derived term matches as a whole word. One shorter than SHORTEST can't be matched safely that way: it is counted
 and named by its field, never matched alone (a pattern in the list can cover it). Every term is matched line by
-line, each pattern on its own: a pattern's ^ and $ are a line's ends.
+line: a pattern's ^ and $ are a line's ends.
 
 It prints where a term was found, never the term or the line. Exit 0: none found; 1: found; 2: could not check
 (an overlay that is set and can't be read, a list that can't be used, a failed git read: never "clean").
@@ -23,6 +24,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import tomllib
 from pathlib import Path
 
@@ -49,10 +51,6 @@ HOST_FIELDS = {
 }
 UNKNOWN = "a field the check doesn't know"  # its name may itself be private: never printed
 HOME = re.compile(r"(?:/home/|/Users/|[A-Za-z]:[/\\](?i:users)[/\\])([^/\\\s'\"]+)")
-# What Python reads otherwise than an extended regular expression (a push-deny list's dialect): refused, not
-# silently matched as something else. A class, equivalence or collating element opens with these anywhere in a
-# bracket expression; a pattern that only means the characters writes them escaped or out of brackets.
-FOREIGN = ("[:", "[=", "[.", r"\<", r"\>")
 # Literal pathspecs whatever the caller's environment sets (a conflicting mode makes git fail: could not check),
 # and the objects as stored: no replace ref or graft stands in for what a push sends (suitekit/checkout.py's
 # STORED_OBJECTS).
@@ -65,13 +63,47 @@ class Unreadable(Exception):
 
 
 class Terms:
-    """The overlay's patterns, each matched on its own against each line (Git's records end at LF only)."""
+    """The overlay's terms, matched against each line (Git's records end at LF only): the derived words here, the
+    list's patterns by grep, from a file of its own that close() removes."""
 
-    def __init__(self, patterns: list[re.Pattern]):
-        self.patterns = patterns
+    def __init__(self, words: re.Pattern | None, patterns: list[str]):
+        self.words, self.listed = words, None
+        if patterns:
+            handle, self.listed = tempfile.mkstemp(prefix="nrese-private-terms-", suffix=".txt")
+            try:
+                with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as out:
+                    out.write("\n".join(patterns) + "\n")
+                grep(self.listed, [""])  # a pattern grep can't use refuses here, before anything is read
+            except BaseException:
+                self.close()
+                raise
+
+    def close(self):
+        if self.listed:
+            os.remove(self.listed)
+
+    def hits(self, values: list[str]) -> set[int]:
+        """The indexes of the values a term matches, line by line."""
+        rows = [(i, line) for i, value in enumerate(values) for line in value.split("\n")]
+        found = {i for i, line in rows if self.words and self.words.search(line)}
+        if self.listed and rows:
+            found |= {rows[n][0] for n in grep(self.listed, [line for _, line in rows])}
+        return found
 
     def search(self, value: str) -> bool:
-        return any(p.search(line) for line in value.split("\n") for p in self.patterns)
+        return bool(self.hits([value]))
+
+
+def grep(patterns: str, lines: list[str]) -> list[int]:
+    """The indexes of the lines one of the file's patterns matches, as `grep -E -i` reads them."""
+    try:
+        done = subprocess.run(["grep", "-a", "-n", "-E", "-i", "-f", patterns],
+                              input=("\n".join(lines) + "\n").encode("utf-8"), capture_output=True, timeout=300)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise Unreadable(f"grep with the overlay's {LIST}") from error
+    if done.returncode > 1:  # 1 is no match; anything above, an error, never "no match"
+        raise Unreadable(f"grep with the overlay's {LIST}")
+    return [int(line.split(b":", 1)[0]) - 1 for line in done.stdout.splitlines()]
 
 
 def git(*args: str) -> bytes:
@@ -143,37 +175,19 @@ def matcher(folder: str) -> tuple[Terms, str]:
         raise Unreadable("the overlay's [host] table")
     terms, short = derive(hosts)
     words = "|".join(rf"(?<![a-z0-9]){re.escape(t)}(?![a-z0-9])" for t in sorted(terms, key=len, reverse=True))
-    patterns = [re.compile(words, re.IGNORECASE)] if words else []
-    listed = overlay / LIST
+    listed, patterns = overlay / LIST, []
     if listed.exists() or listed.is_symlink():  # a link to nothing is a list that can't be read, not no list
         try:
             lines = listed.read_text(encoding="utf-8").splitlines()
         except (OSError, ValueError) as error:
             raise Unreadable(f"the overlay's {LIST}") from error
-        for number, line in enumerate(lines, 1):
-            if not line.strip():
-                continue
-            if any(mark in line for mark in FOREIGN):
-                raise Unreadable(f"line {number} of the overlay's {LIST}, which Python would read otherwise")
-            try:
-                patterns.append(re.compile(line, re.IGNORECASE))
-            except re.error as error:
-                raise Unreadable(f"line {number} of the overlay's {LIST}, which is no pattern") from error
-    held = f"{len(terms)} derived terms, {len(patterns) - bool(words)} patterns from {LIST}"
+        patterns = [line for line in lines if line]  # an empty line is no pattern (to grep, one matching all)
+    held = f"{len(terms)} derived terms, {len(patterns)} patterns from {LIST}"
     if short:
         by_field = ", ".join(sorted(set(short)))
         held += (f"; {len(short)} derived terms too short to match as a word, not checked alone (fields: "
                  f"{by_field}): give each a pattern in {LIST}")
-    return Terms(patterns), held
-
-
-def where(path: str, terms: Terms) -> str:
-    """A changed path's directory, unless the path or the directory matches."""
-    directory = path.rpartition("/")[0]
-    if not directory:
-        return "."
-    hidden = terms.search(path) or terms.search(directory)
-    return "a directory whose name matches (not shown)" if hidden else directory
+    return Terms(re.compile(words, re.IGNORECASE) if words else None, patterns), held
 
 
 def added(patch: str) -> str:
@@ -190,13 +204,20 @@ def added(patch: str) -> str:
 
 
 def scan(label: str, paths: list[str], patch: str, per_file, terms: Terms) -> list[str]:
-    found = []
-    for path in paths:
-        if terms.search(path):
-            found.append(f"{label}path matches: a file under {where(path, terms)}")
+    directories = [path.rpartition("/")[0] for path in paths]
+    hit = terms.hits(paths + directories)  # one read for every path and directory
+
+    def where(i: int) -> str:
+        """A changed path's directory, unless the path or the directory matches."""
+        if not directories[i]:
+            return "."
+        hidden = i in hit or len(paths) + i in hit
+        return "a directory whose name matches (not shown)" if hidden else directories[i]
+
+    found = [f"{label}path matches: a file under {where(i)}" for i in range(len(paths)) if i in hit]
     if terms.search(added(patch)):
-        located = [f"{label}added lines match in a file under {where(path, terms)}"
-                   for path in paths if terms.search(added(per_file(path)))]
+        located = [f"{label}added lines match in a file under {where(i)}"
+                   for i, path in enumerate(paths) if terms.search(added(per_file(path)))]
         found += located or [f"{label}added lines match in a file that could not be located"]
     return found
 
@@ -234,15 +255,16 @@ def main(argv: list[str]) -> int:
     if not folder:
         print(f"private terms: no overlay configured ({PRIVATE}), nothing to check")
         return 0
+    if argv[:1] != ["commit"] and not (argv[:1] == ["push"] and len(argv) in (3, 4)):
+        print("usage: private_terms.py commit | push BASE HEAD [REF]", file=sys.stderr)
+        return 2
     try:
         terms, held = matcher(folder)
-        if argv[:1] == ["commit"]:
-            found, commits = staged(terms)
-        elif argv[:1] == ["push"] and len(argv) in (3, 4):
-            found, commits = pushed(terms, argv[1], argv[2], (argv[3:] or [""])[0])
-        else:
-            print("usage: private_terms.py commit | push BASE HEAD [REF]", file=sys.stderr)
-            return 2
+        try:
+            found, commits = (staged(terms) if argv[0] == "commit"
+                              else pushed(terms, argv[1], argv[2], (argv[3:] or [""])[0]))
+        finally:
+            terms.close()
     except Unreadable as error:
         print(f"private terms: could not check: {error}: refused")
         return 2
