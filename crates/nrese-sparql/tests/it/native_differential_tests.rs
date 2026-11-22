@@ -5241,6 +5241,93 @@ fn an_independent_count_beside_a_sum_is_counted_as_main_counts_it() {
     }
 }
 
+/// A SUM and a COUNT of the same expression (SPARQL 1.1 §18.5.1: each over the group's
+/// values of it), as written, under memory limits that the per-column path fits: SPARQL's
+/// rows, never `MemoryLimit`, wherever the one pass over all aggregates doesn't fit.
+/// 4,096 groups, group g with the one value g:
+/// - `SUM(?v * 2)` and `COUNT(?v * 2)`: 2g and 1. Under 1.5 MiB the pass's states
+///   (4,096 × (2 × 344 + 24) = 2,916,352 bytes) don't fit; under 3,400,000 bytes they do,
+///   but not its remembered numbers (4,096 × 114 = 466,944 bytes) as well.
+/// - `SUM(xsd:double(?v))` and `COUNT` of it, under 4,000,000 bytes: g as a double and 1.
+///   The states and numbers fit, but not the 4,096 new double terms beside them.
+#[test]
+fn a_sum_and_a_count_of_one_expression_answer_where_the_one_pass_does_not_fit() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let snapshot = engine.snapshot();
+    let int = |n: usize| format!("\"{n}\"^^<http://www.w3.org/2001/XMLSchema#integer>");
+    let values: String = (0..4_096).map(|g| format!("({g} {g}) ")).collect();
+    let query = |argument: &str| {
+        let text = format!(
+            "SELECT ?g (SUM({argument}) AS ?t) (COUNT({argument}) AS ?n) \
+             WHERE {{ VALUES (?g ?v) {{ {values}}} }} GROUP BY ?g"
+        );
+        SparqlParser::new().parse_query(&text).unwrap()
+    };
+    let capped = |limit: usize| QueryOptions {
+        as_written: true,
+        resources: nrese_sparql::Resources {
+            memory: nrese_exec::Envelope::new(Some(limit), None),
+            ..nrese_sparql::Resources::default()
+        },
+        ..QueryOptions::default()
+    };
+    let answer = |query: &nrese_sparql_syntax::Query, limit: usize| match evaluate_query(
+        &snapshot,
+        query,
+        &capped(limit),
+    ) {
+        Ok(results) => {
+            let mut found = rows(results, false);
+            found.sort();
+            Ok(found)
+        }
+        Err(error) => Err(format!("{error:?}")),
+    };
+    let mut failed = Vec::new();
+    let doubled = query("?v * 2");
+    let mut expected: Vec<String> = (0..4_096)
+        .map(|g| format!("{}\t{}\t{}", int(g), int(2 * g), int(1)))
+        .collect();
+    expected.sort();
+    for limit in [3 << 19, 3_400_000] {
+        match answer(&doubled, limit) {
+            Ok(found) if found == expected => {}
+            Ok(_) => failed.push(format!("SUM(?v * 2), limit {limit}: not SPARQL's rows")),
+            Err(error) => failed.push(format!("SUM(?v * 2), limit {limit}: {error}")),
+        }
+    }
+    // The double's lexical form is the engine's to choose: each row's sum is read by value.
+    let cast = query("<http://www.w3.org/2001/XMLSchema#double>(?v)");
+    match answer(&cast, 4_000_000) {
+        Ok(found) => {
+            let mut groups = Vec::new();
+            for row in &found {
+                let cells: Vec<&str> = row.split('\t').collect();
+                let sum = cells.get(1).and_then(|cell| {
+                    let (lexical, datatype) = cell.strip_prefix('"')?.split_once("\"^^")?;
+                    let double = datatype == "<http://www.w3.org/2001/XMLSchema#double>";
+                    double.then(|| lexical.parse::<f64>().ok()).flatten()
+                });
+                match (cells.first(), sum, cells.get(2)) {
+                    (Some(g), Some(sum), Some(&count)) if count == int(1) => {
+                        groups.push(((*g).to_owned(), sum))
+                    }
+                    _ => failed.push(format!("SUM(xsd:double(?v)): row {row}")),
+                }
+            }
+            groups.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut wanted: Vec<(String, f64)> = (0..4_096).map(|g| (int(g), g as f64)).collect();
+            wanted.sort_by(|a, b| a.0.cmp(&b.0));
+            if groups != wanted {
+                failed.push("SUM(xsd:double(?v)), limit 4000000: not SPARQL's rows".to_owned());
+            }
+        }
+        Err(error) => failed.push(format!("SUM(xsd:double(?v)), limit 4000000: {error}")),
+    }
+    // Every case's outcome, not only the first one's.
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
 /// Eager aggregation (the early group over B, the join's input without the group's keys)
 /// where it pays, its aggregates reading B's values and the join variable B binds in every
 /// solution. Per team two products with four offers each: t0's prices are all 0, so
