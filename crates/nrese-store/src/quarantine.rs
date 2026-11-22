@@ -776,7 +776,15 @@ impl Quarantine {
         let (millis, sequence) = tests::CLOCK_AND_SEQUENCE
             .take()
             .unwrap_or((millis, sequence));
-        let load = format!("{millis}-{sequence}");
+        let mut load = format!("{millis}-{sequence}");
+        if self.dir.is_some() {
+            // Opening the store inventories all surviving load files. The process-wide
+            // sequence keeps collectors in this process distinct, including active loads.
+            let state = self.state();
+            while state.counted.contains(&load) {
+                load = format!("{millis}-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+            }
+        }
         Collector {
             quarantine: self,
             partial: self
