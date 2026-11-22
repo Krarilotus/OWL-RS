@@ -1224,11 +1224,10 @@ fn placed_segment_row(
             next.map(|summary| summary.revision)
         ));
     }
-    if !held.contains(&quad(1)) || engine.snapshot().revision() != 1 {
+    if held != HashSet::from([quad(1)]) || engine.snapshot().revision() != 1 {
         wrong.push(format!(
-            "the reopen is at revision {}, revision 1's commit there: {}",
-            engine.snapshot().revision(),
-            held.contains(&quad(1))
+            "the reopen is at revision {}, holding {held:?}, not revision 1's commit alone",
+            engine.snapshot().revision()
         ));
     }
     if let Err(error) = commit(&engine, 4) {
@@ -1278,6 +1277,51 @@ fn a_rotation_whose_segment_may_be_placed_takes_no_more_commits() {
             if wrong.is_empty() { "ok" } else { "FAILED" }
         );
         failures.extend(wrong.into_iter().map(|w| format!("{name}: {w}")));
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Spec: as [`a_failed_bulk_publication_never_costs_a_later_acknowledged_commit`], for a replica's
+/// replay: once its log is poisoned, no replay is acknowledged before a reopen, whatever the
+/// batch holds. A durable replica at revision 1 (a primary's commit of `quad(1)` applied), its
+/// log poisoned by a rotation that failed with its new segment in place; then
+/// [`Engine::apply_log`] with an empty batch after revision 1, and with revision 1's batch
+/// again, all of whose records it has. Each is refused with [`EngineError::WalPoisoned`].
+/// Before the fix both were answered `Ok` at revision 1: neither publishes a record, so
+/// neither asked the log.
+#[test]
+fn a_poisoned_replica_acknowledges_no_replay() {
+    let frames = primary_log(2000);
+    let dir = tempfile::tempdir().unwrap();
+    let replica = Engine::open(dir.path(), small_segments()).unwrap();
+    apply_one(&replica, &frames).unwrap();
+    fault::FAIL_SEGMENT_PLACED.set(true);
+    let rotated = commit(&replica, 2);
+    fault::FAIL_SEGMENT_PLACED.set(false);
+    let refused = commit(&replica, 3);
+    assert!(
+        rotated.is_err() && matches!(refused, Err(EngineError::WalPoisoned)),
+        "the setup: the log isn't poisoned ({rotated:?}, then {refused:?})"
+    );
+    let at = |after, records, last| crate::LogExpectation {
+        after,
+        records,
+        last,
+    };
+    let rows: [(&str, &[u8], crate::LogExpectation); 2] = [
+        ("an empty batch", &[], at(1, 0, 1)),
+        ("revision 1's batch again", frames.as_slice(), at(0, 1, 1)),
+    ];
+    let mut failures = Vec::new();
+    for (name, batch, expected) in rows {
+        let answer = replica.apply_log(batch, &expected, &nrese_exec::stop::StopSource::none());
+        let refused = matches!(answer, Err(EngineError::WalPoisoned));
+        eprintln!("row {name}: {}", if refused { "ok" } else { "FAILED" });
+        if !refused {
+            failures.push(format!(
+                "{name}: answered {answer:?}, not refused as poisoned"
+            ));
+        }
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }
