@@ -433,6 +433,8 @@ impl StoreService {
                 premise: checked.verdict,
             });
         }
+        #[cfg(test)]
+        crate::service::hooks::run(&crate::service::hooks::AFTER_DL_PREMISE);
         // The OWL vocabulary and the fresh names are system vocabulary, shared (dictionary
         // lifecycle V1); the conclusion's terms are the request's own, in a private
         // vocabulary charged to its envelope, past the premise's ids.
@@ -563,3 +565,7 @@ mod memory_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "entailment_dl_tests.rs"]
+mod dl_tests;
