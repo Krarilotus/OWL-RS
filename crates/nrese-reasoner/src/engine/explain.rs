@@ -17,6 +17,7 @@ fn describe(rule: &str) -> &'static str {
         "cax-adc" => "an instance of two classes of an owl:AllDisjointClasses axiom",
         "cls-com" => "an instance of a class and of its complement",
         "cls-nothing2" => "an instance of owl:Nothing",
+        "cls-thing-empty" => "owl:Thing is a subclass of owl:Nothing, so nothing can exist",
         "cls-maxc1" | "cls-maxqc1" | "cls-maxqc2" => "a maximum cardinality of 0 is exceeded",
         "prp-irp" => "an irreflexive property relates a resource to itself",
         "prp-asyp" => "an asymmetric property holds in both directions",
@@ -248,8 +249,12 @@ pub fn explain_fact_until(
         snapshot,
         axioms: &program.axioms,
     };
-    let explanation =
-        crate::explain::explain_until(&base, program.rules(), fact, EXPLANATION_BUDGET, stop)?;
+    let rules = program.rules_for(snapshot);
+    let rules = crate::delta::Rules {
+        rules: &rules,
+        ..program.rules()
+    };
+    let explanation = crate::explain::explain_until(&base, rules, fact, EXPLANATION_BUDGET, stop)?;
     let decode = |id: u64| decoded(snapshot.decode(TermId::from_raw(id)), id);
     Some(
         explanation
@@ -364,7 +369,7 @@ pub fn justify_fact_until(
     if !base.contains(fact, &poll).ok()? {
         return None;
     }
-    let ground = crate::delta::program_until(&base, program.rules(), stop).ok()?;
+    let ground = program.ground_program_until(snapshot, stop).ok()?;
     let graph = crate::explain::proof_graph(&base, &ground, fact, EXPLANATION_BUDGET, &poll)?;
     let (sets, complete) = match mode {
         JustificationMode::One => (graph.one().into_iter().collect(), graph.complete),

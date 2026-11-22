@@ -1520,8 +1520,6 @@ fn update_body<B: Base + ?Sized>(
         .into_iter()
         .filter(|&(c, _)| !is_full(c))
         .collect();
-    // An instance with a changed guard can still give the same witness. Test each
-    // candidate against the old state before recording it in the report.
     let deleted_facts = OnceCell::new();
     let was_present = old_witness_filter(
         old_program,
@@ -1534,8 +1532,11 @@ fn update_body<B: Base + ?Sized>(
         memory,
         operation,
     );
-    let exclude_old = (!deleted.is_empty() && !old_program.consistency.is_empty())
-        .then_some(&was_present as &super::batch::WitnessFilter<'_>);
+    // An instance evaluated in full can report an old witness even on an insert,
+    // for example when adding a list member changes its guard.
+    let exclude_old = (!old_program.consistency.is_empty()
+        && (!deleted.is_empty() || first_full < program.consistency.len()))
+    .then_some(&was_present as &super::batch::WitnessFilter<'_>);
     let mut found = Violations::new(Arc::clone(memory));
     check(
         &state,
@@ -1602,6 +1603,7 @@ fn update_body<B: Base + ?Sized>(
 }
 
 /// Probe the before state only when there is a candidate witness to report.
+/// An insert adding consistency instances can be refused if the old-witness index exceeds the memory budget.
 fn old_witness_filter<'a, S: Source>(
     program: &'a GroundProgram,
     before: impl Fn() -> S + 'a,

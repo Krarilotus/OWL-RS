@@ -16,8 +16,9 @@ use super::{ask, insert, pipeline, update};
 /// the ontology off the RL route, to the bounds.
 const OUTSIDE_RL: &str = ":Pet rdfs:subClassOf [ owl:unionOf ( :Dog :Cat ) ] . :tib a :Pet .";
 
-/// The version 9 semantics change the OWL 2 RL fingerprint and require a rebuild at startup.
-const OWL2_RL_FINGERPRINT: &str = "7fdf7c3a5a98052f";
+/// The version 9 semantics and the OWL 2 RL rule text, including `cls-thing-empty`,
+/// determine this fingerprint. An older store rebuilds at startup.
+const OWL2_RL_FINGERPRINT: &str = "e9f63653de270f96";
 
 /// An object key over `z`, `:a` and `:b` sharing it as value, and `more`.
 fn object_key(z: &str, more: &str) -> String {

@@ -976,6 +976,11 @@ fn instance(
                     (a, b) => guards.push(Guard::SameList(a, b, index.clone())),
                 }
             }
+            Guard::NotAnnotation(term, ref set) => match substitute(term, substitution) {
+                Term::Const(v) if set.contains(v) => return None,
+                Term::Const(_) => {}
+                term => guards.push(Guard::NotAnnotation(term, set.clone())),
+            },
             // Kept with the schema variables' values, which stand for their classes: the
             // classes can still grow. An instance without body atoms concludes now, so its
             // guards are decided now.

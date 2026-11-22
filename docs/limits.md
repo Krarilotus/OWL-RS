@@ -607,7 +607,9 @@ leave something out.
   answer is the same, only slower. Earlier versions built them in the first query whatever its budget.
 - A cancel, a deadline or a refusal takes effect at the work's next poll, which bounds work, not time. Under
   nested reads in reasoning, more work runs between two polls ([the bound](architecture/contracts.md#cancellation)).
-  A stop never gives a partial or wrong answer.
+  A stop never gives a wrong answer. A query whose time limit runs out before its output begins gets `408`; one
+  whose limit runs out after the server began sending its output keeps the `200` and the `NRESE-Completeness`
+  header already sent, and its body is cut: on HTTP/1.1 the chunked body never gets its last chunk. Treat a body without its end as no answer, whatever its status and header say.
 - Some phases run to their end after a stop: the executor's selection and sorting (seconds at 10 M rows on a term
   key), one call of a regular expression (seconds for adversarial megabyte literals), and the graph kernel's
   sorts and set-up arrays.
