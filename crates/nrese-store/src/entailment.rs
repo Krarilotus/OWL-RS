@@ -396,12 +396,14 @@ impl StoreService {
     /// Whether the asserted statements (every graph) entail `conclusion` under the OWL 2
     /// Direct Semantics: each logical axiom of the conclusion read as an OWL 2 ontology
     /// (declarations and annotations hold no logical content), decided by the DL engines
-    /// ([`crate::dl::entailment`]) within `dl.timeout` per test. A conclusion that isn't
-    /// well-formed OWL 2 DL is `unknown`. Reads only; never commits.
+    /// ([`crate::dl::entailment`]) within one `dl.timeout` from the call: the premise's
+    /// check and the conclusion's tests share it. A conclusion that isn't well-formed OWL 2 DL,
+    /// or one left undecided at the deadline, is `unknown`. Reads only; never commits.
     pub fn entails_dl(&self, conclusion: &[Triple]) -> StoreResult<DlEntailment> {
         use crate::dl::entailment::{Entailed, entails_ontology};
         use crate::dl::{Verdict, consistency, gate, source};
         use nrese_rdf::{BlankNode, NamedNodeRef, NamedOrBlankNode};
+        let deadline = nrese_dl::limits::Deadline::after(self.config().dl.timeout);
         if self.dl().replica() {
             // Reading a conclusion interns its terms, which a replica must not.
             return Err(StoreError::Configuration(
@@ -422,7 +424,7 @@ impl StoreService {
             });
         };
         let budget = gate::budget(self, None, &memory);
-        let checked = consistency::check(&premise, &budget);
+        let checked = consistency::check(&premise, &budget.remaining(deadline));
         if checked.verdict != Verdict::Consistent {
             let answer = match &checked.verdict {
                 Verdict::Unknown(why) => Entailed::Unknown(format!("the premise: {why}")),
@@ -521,7 +523,7 @@ impl StoreService {
             .collect();
         let fresh = fresh?;
         Ok(DlEntailment {
-            answer: entails_ontology(&premise, &read, &fresh, &budget),
+            answer: entails_ontology(&premise, &read, &fresh, &budget, deadline),
             premise: checked.verdict,
         })
     }

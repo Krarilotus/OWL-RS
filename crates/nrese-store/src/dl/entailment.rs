@@ -353,7 +353,7 @@ pub fn nonempty(premise: &Ontology, class: ExprId, budget: &Budget) -> Entailed 
 }
 
 /// Whether `premise` (consistent) entails every logical axiom of `conclusion` (an
-/// ontology read over the same term ids).
+/// ontology read over the same term ids), each test within what is left of `deadline`.
 ///
 /// A conclusion's anonymous individual says that *some* individual is so (*OWL 2 Direct
 /// Semantics* §2.3.7–2.4). It is held here as a fresh constant: entailed for every value
@@ -364,6 +364,7 @@ pub fn entails_ontology(
     conclusion: &Ontology,
     fresh: &[u64],
     budget: &Budget,
+    deadline: Deadline,
 ) -> Entailed {
     let (mut o, _scratch) = match copy(premise, budget) {
         Ok(copy) => copy,
@@ -381,7 +382,6 @@ pub fn entails_ontology(
             .map(|a| Test::Axiom(import.axiom(a)))
             .collect()
     };
-    let deadline = Deadline::after(budget.timeout);
     let compiled = Batch::new(&mut o, &tests, budget.memory.as_ref());
     let mut answer = Entailed::Yes;
     for (index, test) in tests.iter().enumerate() {
