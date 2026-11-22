@@ -495,7 +495,9 @@ struct Held {
 }
 
 impl Held {
-    fn new(holding: Holding, stall: Duration) -> Self {
+    fn new(mut holding: Holding, stall: Duration) -> Self {
+        // The first frame's window opens now, with the answer ready.
+        holding.moved = Instant::now();
         let holding = Arc::new(Mutex::new(holding));
         // Weak: the body alone keeps what it holds, which goes with it when it is dropped,
         // not later, when the runtime drops the aborted timer.
