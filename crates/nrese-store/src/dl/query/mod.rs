@@ -192,9 +192,9 @@ fn consistency_at(
 
 /// The data's consistency at `snapshot`'s revision where it is known without a check:
 /// recorded by its commit, or proved by U1, or by the rules for this snapshot's revision, unknown
-/// there where it may hold an ill-typed literal ([`gate::ILL_TYPED`]).
+/// there where it holds an ill-typed literal ([`gate::ILL_TYPED`]) or the search for one stopped
+/// ([`UNCHECKED`], never recorded: a later read searches again).
 fn consistency_known(store: &StoreService, snapshot: &Snapshot, view: &View) -> Option<Verdict> {
-    let ill_typed = || super::bounds::may_hold_ill_typed(store, snapshot);
     match store.dl().status() {
         Some(DlStatus {
             revision,
@@ -203,8 +203,11 @@ fn consistency_known(store: &StoreService, snapshot: &Snapshot, view: &View) -> 
         }) if revision == snapshot.revision() => Some(consistency.verdict),
         _ if view.proves_consistency => Some(Verdict::Consistent),
         _ if !(view.rules && super::bounds::rules_prove(snapshot)) => None,
-        _ if ill_typed() => Some(Verdict::Unknown(gate::ILL_TYPED.to_owned())),
-        _ => Some(Verdict::Consistent),
+        _ => Some(match super::bounds::holds_ill_typed(store, snapshot) {
+            Some(false) => Verdict::Consistent,
+            Some(true) => Verdict::Unknown(gate::ILL_TYPED.to_owned()),
+            None => Verdict::Unknown(UNCHECKED.to_owned()),
+        }),
     }
 }
 
@@ -1155,8 +1158,11 @@ fn conditions(
         );
     }
     let ill_typed = certificate.filter(|_| matches!(completeness.regime, Some(Owl2Dl | Owl2Ql)));
-    let memory = store.memory_stop();
-    match ill_typed.map(|c| c.ill_typed(snapshot, &|| memory.exceeded())) {
+    let found = ill_typed.map(|c| {
+        let memory = store.memory_stop();
+        c.ill_typed(snapshot, &|| memory.exceeded())
+    });
+    match found {
         Some(Some(None)) | None => {}
         Some(None) => completeness.incomplete(source, UNCHECKED.to_owned()),
         Some(Some(Some(witness))) => {
@@ -1177,7 +1183,7 @@ fn conditions(
 const ILL_TYPED: &str = "it is ill-typed (its lexical form is outside its datatype's lexical \
                          space), which OWL 2 doesn't admit (Structural Specification §5.7), so \
                          the data's consistency isn't known";
-const UNCHECKED: &str = "the data are not yet checked for an ill-typed literal, which OWL 2 \
+pub(crate) const UNCHECKED: &str = "the data are not yet checked for an ill-typed literal, which OWL 2 \
                          doesn't admit, so their consistency isn't known";
 
 /// Whether a version reading under `owl2-dl` (`dl`) or under the rules `ruleset` keeps the
@@ -1207,8 +1213,8 @@ pub(crate) fn is_ill_typed(id: TermId, decode: &dyn Fn(TermId) -> Option<Term>) 
 
 /// The ill-typed literal ([`is_ill_typed`]) of what the commit `tx` publishes, its base's being
 /// `base`: the base's while `tx` still holds it, else one `tx` inserts, else, where `tx`
-/// deleted the base's, one a scan of what `tx` commits finds ([`ill_typed`], `None` where
-/// `stop` ended it).
+/// deleted the base's, one a scan of what `tx` commits finds ([`ill_typed`]); `None` where
+/// `stop`, asked before each walk and during it ([`polled`]), ended it.
 pub(crate) fn ill_typed_after(
     tx: &nrese_engine::Transaction<'_>,
     base: Option<TermId>,
@@ -1222,27 +1228,45 @@ pub(crate) fn ill_typed_after(
             .next()
             .is_some()
     });
-    let found =
-        kept.or_else(|| (tx.inserted().map(|q| q.object)).find(|&o| is_ill_typed(o, &decode)));
+    let mut stopped = polled(stop);
+    if stopped() {
+        return None;
+    }
+    let mut judged = |o: &TermId| stopped() || is_ill_typed(*o, &decode);
+    let found = kept.or_else(|| (tx.inserted().map(|q| q.object)).find(&mut judged));
     match (found, base) {
+        _ if stopped() => None,
+        (None, Some(_)) if stop() => None,
         (None, Some(_)) => ill_typed(&tx.pending_snapshot(), stop),
         _ => Some(found),
+    }
+}
+
+/// `stop` asked at its first call and then every 4096th, and kept once it says stop: the
+/// poll of a walk, which a refusal ends with nothing kept.
+fn polled(stop: &dyn Fn() -> bool) -> impl FnMut() -> bool + '_ {
+    let (mut calls, mut stopped) = (0u32, false);
+    move || {
+        stopped = stopped || (calls % 4096 == 0 && stop());
+        calls = calls.wrapping_add(1);
+        stopped
     }
 }
 
 /// An ill-typed literal ([`is_ill_typed`]) an asserted statement of `snapshot` holds as its
 /// object, in any graph: one walk of the object-first index over the dictionary's literals,
 /// each judged once (every asserted statement, where the index can't answer by range); `None`
-/// where `stop`, asked every 4096 statements, ended it. One thread.
+/// where `stop`, asked before the walk and during it ([`polled`]), ended it. One thread.
 pub(crate) fn ill_typed(snapshot: &Snapshot, stop: &dyn Fn() -> bool) -> Option<Option<TermId>> {
     use nrese_engine::{TermKind, quad::Permutation};
+    let mut stopped = polled(stop);
+    if stopped() {
+        return None;
+    }
     let decode = |id: TermId| snapshot.decode(id);
-    let (mut last, mut walked, mut stopped) = (None, 0u32, false);
-    let mut judged = |o: &TermId| {
-        walked = walked.wrapping_add(1);
-        stopped = stopped || (walked % 4096 == 0 && stop());
-        stopped || (last.replace(*o) != Some(*o) && is_ill_typed(*o, &decode))
-    };
+    let mut last = None;
+    let mut judged =
+        |o: &TermId| stopped() || (last.replace(*o) != Some(*o) && is_ill_typed(*o, &decode));
     let all = QuadPattern::all();
     let kinds = [
         TermKind::String,
@@ -1259,7 +1283,7 @@ pub(crate) fn ill_typed(snapshot: &Snapshot, stop: &dyn Fn() -> bool) -> Option<
             .map(|q| q.object)
             .find(&mut judged),
     };
-    (!stopped).then_some(found)
+    (!stopped()).then_some(found)
 }
 
 /// The W3C vocabulary documents, whose meaning is built in: an import of one counts as read.

@@ -742,20 +742,29 @@ impl StoreService {
     /// it reasons nothing, and its primary's records don't say ([`crate::StoreConfig::replica`]).
     /// `Unknown` for no clash where the current version holds an ill-typed literal under
     /// `owl2-dl` or `owl2-ql`, which OWL 2 doesn't admit, or the search for one, on this first
-    /// need, stopped ([`Certificate::ill_typed`]).
+    /// need, stopped ([`Certificate::ill_typed`]). Both of one version: the assessment and the
+    /// literal read with no certificate change and no publication between them (the epoch and
+    /// the version the same after as before), else read again once, else `Unknown`.
     pub fn consistency(&self) -> crate::ConsistencyStatus {
-        let ill_typed = || {
-            let (snapshot, memory) = (self.engine.snapshot(), self.memory_stop());
+        use crate::ConsistencyStatus::{Consistent, Unknown};
+        for _ in 0..2 {
+            let (epoch, snapshot) = (self.certificate_epoch(), self.engine.snapshot());
+            #[cfg(test)]
+            hooks::run(&hooks::BETWEEN_CONSISTENCY_READS);
+            let recorded = self.recorded_consistency();
+            let moved = epoch % 2 == 1 || epoch != self.certificate_epoch();
+            if moved || !self.engine.snapshot().same_version(&snapshot) {
+                continue;
+            }
+            let memory = self.memory_stop();
             let found =
                 Certificate::of(&snapshot).map(|c| c.ill_typed(&snapshot, &|| memory.exceeded()));
-            found.is_some_and(|found| found != Some(None))
-        };
-        match self.recorded_consistency() {
-            crate::ConsistencyStatus::Consistent if ill_typed() => {
-                crate::ConsistencyStatus::Unknown
-            }
-            status => status,
+            return match recorded {
+                Consistent if found.is_some_and(|f| f != Some(None)) => Unknown,
+                status => status,
+            };
         }
+        Unknown
     }
 
     /// [`Self::consistency`] as the recorded reasoning alone says it: what a commit's own
@@ -925,10 +934,13 @@ impl StoreService {
         tx: &nrese_engine::Transaction<'_>,
         stop: &dyn Fn() -> bool,
     ) -> nrese_engine::Certificate {
+        let keeps = |c: &Certificate| crate::dl::query::keeps_ill_typed(c.dl, &c.state.ruleset);
+        if !certificate.downcast_ref::<Certificate>().is_some_and(keeps) {
+            return certificate;
+        }
         Self::with_state(certificate, |held, base| {
-            let keeps = crate::dl::query::keeps_ill_typed(held.dl, &held.state.ruleset);
             let found = base.and_then(|base| crate::dl::query::ill_typed_after(tx, base, stop));
-            (keeps && (base.is_none() || found != base)).then(|| (held.state.clone(), found))
+            (base.is_none() || found != base).then(|| (held.state.clone(), found))
         })
     }
 
@@ -3268,6 +3280,8 @@ pub(crate) mod hooks {
         pub(crate) static BEFORE_REVALIDATION: Hook = const { RefCell::new(None) };
         /// A quarantine reading has read the mark and is about to read the assessment.
         pub(crate) static BETWEEN_QUARANTINE_READS: Hook = const { RefCell::new(None) };
+        /// A consistency reading has taken its version and is about to read the assessment.
+        pub(crate) static BETWEEN_CONSISTENCY_READS: Hook = const { RefCell::new(None) };
     }
 
     pub(crate) fn run(hook: &'static LocalKey<Hook>) {

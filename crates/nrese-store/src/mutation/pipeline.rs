@@ -469,6 +469,12 @@ impl MutationPipeline {
                 &evidence::EvidenceView::new(&requester.read, &tx),
                 |view, after| self.view_reason(view, Some(after), &dl_own_budget, &resources),
             )?;
+            // The version's certificate, its ill-typed literal judged under the writer slot alone
+            // (a whole-store scan where the commit deletes it), before the commit and its rights.
+            let certificate = tx.base().certificate().cloned().map(|certificate| {
+                let memory = self.store.memory_stop();
+                StoreService::with_ill_typed(certificate, &tx, &|| memory.exceeded())
+            });
             if !ticket.begin_commit() {
                 return Err(MutationError::Cancelled);
             }
@@ -503,13 +509,11 @@ impl MutationPipeline {
                 let writer = tx.writer().expect("a transaction holds the writer slot");
                 self.store.mark_literal_equality(writer);
             }
-            if let Some(mut certificate) = tx.base().certificate().cloned() {
+            if let Some(mut certificate) = certificate {
                 if literal_equality {
                     certificate = StoreService::with_literal_equality(certificate);
                 }
-                let memory = self.store.memory_stop();
-                let stop = || memory.exceeded();
-                tx.vouch(StoreService::with_ill_typed(certificate, &tx, &stop));
+                tx.vouch(certificate);
             }
             let committed = match ql {
                 Some(ql) => publishing(ticket, report, tx, |tx| ql.commit(tx)),

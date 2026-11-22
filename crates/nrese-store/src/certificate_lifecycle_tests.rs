@@ -1245,3 +1245,101 @@ fn a_failed_commit_leaves_a_later_writers_literal_equality_withheld() {
         header(status.clone())
     );
 }
+
+/// An ill-typed literal (OWL 2 Structural Specification §5.7): [`PREFIXES`] names no `xsd:`.
+const ILL_TYPED: &str = ":a :d \"abc\"^^<http://www.w3.org/2001/XMLSchema#integer> .";
+
+thread_local! {
+    /// How many more memory readings of a [`counted`] store succeed; unset: every one.
+    static READINGS: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// The memory reading of a store given it by [`StoreService::with_capacity`]: readable while
+/// [`READINGS`] is unset, else for that many readings more, then unreadable (the store's
+/// operations stop, failing closed).
+fn counted() -> nrese_exec::memory::Reading {
+    match READINGS.get() {
+        Some(0) => Err(nrese_exec::memory::Unread::Failed),
+        Some(left) => {
+            READINGS.set(Some(left - 1));
+            nrese_exec::memory::capacity()
+        }
+        None => nrese_exec::memory::capacity(),
+    }
+}
+
+/// Under `owl2-ql`, a store far shorter than one poll of the search for an ill-typed literal
+/// (4096 statements), its memory unreadable: the search stops before it starts, so the
+/// consistency is `unknown` and the read isn't `complete`, and nothing is kept. With the memory
+/// readable again, the next need searches, finds none, and `consistent` and the word come back.
+#[test]
+fn an_ill_typed_search_stopped_before_it_starts_keeps_nothing_and_the_next_need_searches() {
+    use crate::ConsistencyStatus::{Consistent, Unknown};
+    let store = StoreService::new(StoreConfig::in_memory())
+        .expect("store")
+        .with_capacity(counted);
+    load(&store, DATA);
+    store.rematerialise(Ruleset::Owl2Ql).expect("reasoned");
+    READINGS.set(Some(0));
+    let stopped = (store.consistency(), status(&store, READ));
+    READINGS.set(None);
+    let again = (store.consistency(), status(&store, READ));
+    assert!(
+        stopped.0 == Unknown && !stopped.1.starts_with("complete"),
+        "stopped: {stopped:?}"
+    );
+    assert!(
+        again.0 == Consistent && again.1.starts_with("complete"),
+        "again: {again:?}"
+    );
+}
+
+/// Under `owl2-dl`, a commit whose search for an ill-typed literal stops (the memory readable
+/// for its reasoning, the first reading after its preflight, and unreadable from its DL gate
+/// on) decides nothing: no verdict is recorded at its revision. With the memory readable
+/// again, the next read searches, finds none, and is `complete` and `consistent`; recorded as
+/// found, the revision would stay withheld.
+#[test]
+fn an_ill_typed_search_stopped_at_a_dl_commit_records_no_verdict_and_the_next_read_searches() {
+    let store = StoreService::new(StoreConfig::in_memory())
+        .expect("store")
+        .with_capacity(counted);
+    let store = Arc::new(store);
+    let dl = pipeline(&store, ReasoningMode::Owl2Dl);
+    commit(&dl, DATA);
+    hooks::AFTER_PREFLIGHT.set(Some(Box::new(|| READINGS.set(Some(1)))));
+    commit(&dl, ":fido a :Dog .");
+    READINGS.set(None);
+    let at = store.current_revision();
+    let recorded = (store.dl().status()).filter(|s| s.revision == at);
+    assert!(
+        recorded.is_none(),
+        "a verdict recorded at the stopped revision: {recorded:?}"
+    );
+    let read = (status(&store, READ), store.consistency());
+    assert!(
+        read.0.starts_with("complete") && read.1 == crate::ConsistencyStatus::Consistent,
+        "after the stop: {read:?}"
+    );
+}
+
+/// `consistency()` of one version: a store holding an ill-typed literal, not yet reasoned (no
+/// certificate, nothing assessed), is reasoned under `owl2-ql` between the reading's version
+/// and its assessment. Read across that, it is `unknown`, as the version reasoned holds the
+/// literal; never the new assessment's `consistent` over the old version's missing certificate.
+#[test]
+fn an_ill_typed_consistency_reading_across_a_rebuild_reads_one_version() {
+    let store = Arc::new(StoreService::new(StoreConfig::in_memory()).expect("store"));
+    commit(&pipeline(&store, ReasoningMode::Disabled), ILL_TYPED);
+    let rebuilder = Arc::clone(&store);
+    hooks::BETWEEN_CONSISTENCY_READS.set(Some(Box::new(move || {
+        rebuilder.rematerialise(Ruleset::Owl2Ql).expect("reasoned");
+    })));
+    let across = store.consistency();
+    hooks::BETWEEN_CONSISTENCY_READS.set(None);
+    assert_eq!(across, crate::ConsistencyStatus::Unknown);
+    assert!(
+        store.reasoning_state().is_some(),
+        "the rebuild didn't run between the reads"
+    );
+}
