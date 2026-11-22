@@ -463,8 +463,8 @@ async fn literal_read(state: &AppState) -> TestResult<(String, Vec<String>)> {
     Ok((word, reasons.unwrap_or_default()))
 }
 
-/// The words of the reason a read of literals is withheld for after a literal equality.
-const LITERAL_EQUALITY: &str = "an owl:sameAs between literals";
+/// The words of the reason a read of literals is withheld for after an open without a rebuild.
+const REOPENED: &str = "opened without a rebuild of its inferences, so its rules may have equated";
 
 /// A store under `owl2-rl` with the QL rewriting, where a read of a literal may be `complete`.
 fn rewriting(dir: &Path) -> TestResult<AppState> {
@@ -499,9 +499,10 @@ async fn a_restarted_server_withholds_reads_of_literals_until_a_rebuild() -> Tes
         "the restart rebuilt the inferences"
     );
     let (word, reasons) = literal_read(&state).await?;
+    assert_eq!(word, "sound-only", "after the restart: {reasons:?}");
     assert!(
-        word != "complete" && reasons.iter().any(|r| r.contains(LITERAL_EQUALITY)),
-        "after the restart: {word} {reasons:?}"
+        reasons.iter().any(|r| r.contains(REOPENED)),
+        "after the restart, the reason: {reasons:?}"
     );
     let program = state.pipeline().reasoner().config().materialised_program();
     state.store().rematerialise(program.ok_or("rules")?)?;

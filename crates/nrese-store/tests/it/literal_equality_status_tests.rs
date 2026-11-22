@@ -285,6 +285,76 @@ fn a_store_reopened_without_a_rebuild_withholds_the_word_until_one_finds_no_lite
     );
 }
 
+/// The words the reason holds where the store was opened without a rebuild.
+const REOPENED: &str = "opened without a rebuild";
+
+/// A reader by support of a store reopened without a rebuild: whether the rules equated two
+/// literals since the last rebuild is the whole store's unknown, which no view can settle, so
+/// its reads of literals are withheld as every reader's are, with the reason that the store
+/// was opened without a rebuild. The value `"Rex"` in `:open`, which nothing could equate,
+/// read by a reader by support of `:open` (and the default graph), under `owl2-ql` and under
+/// `owl2-rl` with the rewriting: `complete` before the reopen, withheld after it for every
+/// reader, and `complete` again after a rebuild.
+#[test]
+fn a_reader_by_support_of_a_store_reopened_without_a_rebuild_is_withheld_too() {
+    use nrese_reasoner::rulesets::Ruleset;
+    use nrese_store::ReadScope;
+
+    use crate::support::Writes;
+    let data = format!(
+        "{PREFIXES}INSERT DATA {{ :p a owl:DatatypeProperty . GRAPH :open {{ :a :p \"Rex\" }} }}"
+    );
+    let query = "SELECT ?x ?n { GRAPH :open { ?x :p ?n } }";
+    let mut unmet = Vec::new();
+    for (regime, ruleset, ql) in [
+        ("owl2-ql", Ruleset::Owl2Ql, QlRewritingMode::Auto),
+        ("owl2-rl rewriting on", Ruleset::Owl2Rl, QlRewritingMode::On),
+    ] {
+        let dir = tempfile::tempdir().expect("dir");
+        let config = || StoreConfig {
+            ql_rewriting: ql,
+            ..StoreConfig::on_disk(dir.path())
+        };
+        {
+            let store = StoreService::new(config()).expect("store");
+            (store.execute_update(&SparqlUpdateRequest::new(data.clone()))).expect("data");
+            store.rematerialise(ruleset).expect("rebuild");
+            store.use_reasoning_rules(Some(ruleset.into()));
+            let (_, word, reasons) = read_as(&store, query, reader_of_open(true));
+            if word != "complete" {
+                unmet.push(format!(
+                    "setup: {regime} before the reopen: {word} {reasons:?}"
+                ));
+            }
+        }
+        let store = StoreService::new(config()).expect("reopen");
+        store.use_reasoning_rules(Some(ruleset.into()));
+        assert!(
+            store.last_materialisation().is_none(),
+            "{regime}: the reopened store was rematerialised"
+        );
+        for (reader, scope) in [
+            ("by support", reader_of_open(true)),
+            ("of every graph", ReadScope::All),
+        ] {
+            let (_, word, reasons) = read_as(&store, query, scope);
+            if word == "complete" || !reasons.iter().any(|r| r.contains(REOPENED)) {
+                unmet.push(format!("{regime} {reader} reopened: {word} {reasons:?}"));
+            }
+        }
+        store.rematerialise(ruleset).expect("rebuild");
+        let (_, word, reasons) = read_as(&store, query, reader_of_open(true));
+        if word != "complete" {
+            unmet.push(format!("{regime} by support rebuilt: {word} {reasons:?}"));
+        }
+    }
+    assert!(
+        unmet.is_empty(),
+        "a reader of a store reopened without a rebuild is told otherwise:\n{}",
+        unmet.join("\n")
+    );
+}
+
 /// The condition stays while the store holds the pair's derivation, a delete of its premise
 /// included (the commit can't tell which later value lacks a copy); a rebuild that finds no
 /// literal equality clears it, and one that finds it again keeps it.
