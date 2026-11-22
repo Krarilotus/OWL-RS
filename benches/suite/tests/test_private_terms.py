@@ -339,16 +339,29 @@ class PrivateTerms(unittest.TestCase):
     def test_a_merged_path_that_isnt_utf8_is_refused(self):
         # Spec (the master, 22 Nov 03:08 (b): what can't be read is refused, exit 2): a merge's own file whose name
         # isn't UTF-8 can't be named back to git, so it is refused, never passed unread.
-        def plumbing(*args, data):
-            return subprocess.run(["git", "-C", str(self.repo), *args], input=data, check=True, capture_output=True,
-                                  env=self.env).stdout
         line = self.branch("line", self.base, {"l.txt": "line\n"})
         self.git("merge", "-q", "--no-ff", "--no-commit", line)
-        blob = plumbing("hash-object", "-w", "--stdin", data=b"about zzsshzz\n").strip()
-        plumbing("update-index", "--index-info", data=b"100644 " + blob + b"\t\xff.txt\n")
+        blob = self.plumbing("hash-object", "-w", "--stdin", data=b"about zzsshzz\n").strip()
+        self.plumbing("update-index", "--index-info", data=b"100644 " + blob + b"\t\xff.txt\n")
         self.git("commit", "-q", "-m", "merge")
         done = self.check("push", line, "HEAD", "refs/heads/topic")
         self.assertEqual(done.returncode, 2, f"SPEC merge-path-bytes: a path git can't be given back passed\n{done.stdout}")
+
+    def test_a_path_that_isnt_utf8_a_merge_takes_from_the_published_line_passes(self):
+        # Spec (as above): a path a merge takes from a parent the base holds is published already, whatever bytes
+        # its name has. Built without a work tree, which can't hold such a name everywhere.
+        blob = self.plumbing("hash-object", "-w", "--stdin", data=b"line\n").strip()
+        tree = self.plumbing("mktree", data=self.plumbing("ls-tree", self.base) + b"100644 blob " + blob +
+                             b"\t\xff.txt\n").strip().decode()
+        line =self.plumbing("commit-tree", tree, "-p", self.base, "-m", "line").strip().decode()
+        merge = self.plumbing("commit-tree", tree, "-p", self.base, "-p", line, "-m", "merge").strip().decode()
+        done = self.check("push", line, merge, "refs/heads/topic")
+        self.assertEqual(done.returncode, 0, f"SPEC merge-path-bytes: a published parent's path was refused\n{done.stdout}")
+
+    def plumbing(self, *args, data=None):
+        """Git with bytes in and out: what a path that isn't UTF-8 needs."""
+        return subprocess.run(["git", "-C", str(self.repo), *args], input=data, check=True, capture_output=True,
+                              env=self.env).stdout
 
 
 def module():

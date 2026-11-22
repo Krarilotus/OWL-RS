@@ -328,14 +328,15 @@ def merged(label: str, commit: str, parents: list[str], terms: Terms) -> list[st
     lines out and loses hunks past a word's bits of parents."""
     changed = []  # per parent: {path: status}
     for parent in parents:
-        listed = git("diff-tree", "-r", "-z", "--name-status", "--no-commit-id", "--no-renames", parent, commit)
-        try:  # a path is read by its name: one that isn't UTF-8 can't be named back to git
-            entries = listed.decode("utf-8").split("\0")
-        except UnicodeDecodeError:
-            raise Unreadable("a merged path that isn't UTF-8") from None
+        entries = git("diff-tree", "-r", "-z", "--name-status", "--no-commit-id", "--no-renames", parent,
+                      commit).decode("utf-8", "surrogateescape").split("\0")  # every byte kept
         changed.append(dict(zip(entries[1::2], entries[0::2])))  # status, then path; the last field is empty
     # Only a file changed against every parent can hold a line new to all of them; a file the merge deleted holds none.
     paths = [p for p, status in changed[0].items() if status != "D" and all(p in c for c in changed[1:])]
+    try:  # a path is read by its name: one that isn't UTF-8 can't be named back to git
+        "".join(paths).encode("utf-8")
+    except UnicodeEncodeError:
+        raise Unreadable("a merged path that isn't UTF-8") from None
     fresh = {p for p in paths if all(c[p] == "A" for c in changed)}
     own = {}
     for path in paths:
