@@ -870,6 +870,10 @@ impl Inner {
         let published_to = &published;
         let publish = move |current: &Version, committed: Option<u64>| {
             debug_assert_eq!(current.revision + 1, revision, "single writer");
+            #[cfg(test)]
+            if crate::durability::fault::PANIC_IN_COMMIT_PUBLISH.replace(false) {
+                panic!("{}", crate::durability::fault::COMMIT_PUBLISH_PANIC);
+            }
             let asserted = converted.as_ref().unwrap_or(&current.asserted);
             let content = super::Content::fresh();
             published_to.set(Some((current.content, content)));
