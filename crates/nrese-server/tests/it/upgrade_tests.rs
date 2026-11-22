@@ -265,6 +265,11 @@ impl Server {
         self.process.finish(limit)
     }
 
+    /// What the server has written so far, its log included.
+    pub(super) fn output(&self) -> String {
+        self.process.output()
+    }
+
     /// `what` failed, with what the server wrote.
     fn failed(&self, what: &str) -> Box<dyn std::error::Error> {
         format!(

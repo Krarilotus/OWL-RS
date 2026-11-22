@@ -88,7 +88,10 @@ fn split(rows: &Rows, keys: &[&str]) -> (Bag, BTreeMap<Key, Bag>) {
 
 // Properties whose witness is an outcome of small chance under SPARQL: a
 // second run must give it too.
-pub const RARE: &[&str] = &["P4", "AVG unbound"];
+pub const RARE: &[&str] = &["P4"];
+
+// AVG's mean where every argument errs (SPARQL 1.1 §18.5.1.4).
+const ZERO: &str = "\"0\"^^<http://www.w3.org/2001/XMLSchema#integer>";
 
 fn number(value: Option<&String>) -> Option<f64> {
     value?.split('"').nth(1)?.parse().ok()
@@ -289,35 +292,21 @@ impl Model {
                 bound_one(found).map_err(|e| ("AVG bound", e))?;
                 same(&without(twin, "avg"), &without(found, "avg"), false)
                     .map_err(|e| ("P5", e))?;
-                for value in found.iter().filter_map(|r| r.get("avg")) {
-                    // The only numeric argument is 1. AVG may be unbound after
-                    // an error, or 0 for empty input, but never another mean.
-                    if !matches!(number(Some(value)), Some(0.0 | 1.0)) {
-                        return Err(("AVG", format!("unexpected mean {value}")));
-                    }
-                }
-                // SPARQL drops erring arguments from the count: a group of n
-                // rows has mean 1 when all are numeric, 0 when all err, and
-                // is unbound otherwise, a chance of 1 - 2 * 2^-n under fair
-                // independent draws. The product below takes 1 - 2^-n per
-                // group (n from ?rows), at least that chance. SPARQL does not
-                // promise independent RAND draws, so the cutoff rests on the
-                // generated shapes: at most 42 groups, so groups of two or
-                // more alone never cross it (0.75^42 > 2^-20); a crossing
-                // needs single-row groups unbound, which SPARQL never leaves
-                // unbound (an engine that leaves an all-erring mean unbound
-                // can cross on chance).
-                if found.iter().all(|r| !r.contains_key("avg")) {
-                    let unbound = |r: &Row| {
-                        let n = number(r.get("rows")).unwrap_or(0.0) as i32;
-                        (1.0 - 0.5f64.powi(n.min(1000))).log2()
-                    };
-                    let log2: f64 = found.iter().map(unbound).sum();
-                    if log2 < -20.0 {
-                        let groups = found.len();
-                        let detail =
-                            format!("all {groups} means unbound: 2^{log2:.1} under SPARQL");
-                        return Err(("AVG unbound", detail));
+                // The only numeric argument is 1, and SPARQL drops erring
+                // arguments from the count (§18.5.1.2, §18.5.1.4): a group's
+                // mean is 1 when all its arguments are numeric, the integer 0
+                // when all err (or it has none), and unbound when they mix. A
+                // group of one row never mixes, so its mean is bound.
+                for row in found {
+                    match row.get("avg") {
+                        Some(value) if value != ZERO && !one(Some(value)) => {
+                            return Err(("AVG", format!("unexpected mean {value}")));
+                        }
+                        None if number(row.get("rows")) == Some(1.0) => {
+                            let detail = format!("a group of one row has no mean: {row:?}");
+                            return Err(("AVG unbound", detail));
+                        }
+                        _ => {}
                     }
                 }
                 Ok(())

@@ -350,7 +350,7 @@ fn covers(pattern: &GraphPattern, variables: &[Variable]) -> bool {
 }
 
 /// The variables bound in every solution of `pattern`.
-pub(super) fn certain(pattern: &GraphPattern) -> Vec<Variable> {
+pub(crate) fn certain(pattern: &GraphPattern) -> Vec<Variable> {
     let mut out = Vec::new();
     let mut add = |variable: &Variable| {
         if !out.contains(variable) {

@@ -371,6 +371,7 @@ impl Engine {
                 None,
                 None,
                 None,
+                None,
             )
             .map(|_| ())
     }
@@ -813,24 +814,14 @@ mod tests {
         let replica = Engine::open(image.path(), durable()).unwrap();
         let logged = (replica.stats().revision, replica.stats().dictionary.terms);
         let high = u64::MAX - 1;
-        replica
-            .inner
-            .shared
-            .versions
-            .publish(|current| super::super::Version {
-                asserted: current.asserted.clone(),
-                inferred: current.inferred.clone(),
+        replica.inner.shared.versions.publish(|current| {
+            let data = super::super::VersionData {
                 revision: high,
-                committed_micros: current.committed_micros,
-                dictionary_len: current.dictionary_len,
-                equality: std::sync::Arc::clone(&current.equality),
-                reading: current.reading,
-                content: current.content,
-                asserted_content: current.asserted_content,
-                canonical: Default::default(),
-                own: Default::default(),
                 certificate: None,
-            });
+                ..current.copy_data()
+            };
+            super::super::Version::new(super::super::Watch::Keep(current), data)
+        });
         let mut records = decoded(&batch.frames);
         records.truncate(2);
         records[0].revision = u64::MAX;
