@@ -95,7 +95,7 @@ fn counts<K: Ord>(values: impl IntoIterator<Item = K>) -> BTreeMap<K, usize> {
     counts
 }
 
-#[derive(Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Observation {
     pub results: BTreeMap<ResultKey, usize>,
     pub failures: BTreeMap<String, usize>,
