@@ -18,7 +18,9 @@
 //!
 //! The answer is sound; it is complete as far as the rules are for the premise (OWL 2 RL
 //! premises and the forms above). A conclusion outside them may be entailed although the
-//! answer is no.
+//! answer is no, except under `owl2-dl`: there what the rules leave unshown is decided by
+//! the DL engines ([`StoreService::entails_dl`]), and is an [`StoreError::Undecided`] error
+//! where they can't decide it.
 //! Refutation uses the store's process-memory watch; interruption is an error, never
 //! a negative entailment answer or an assumed-unreachable panic.
 
@@ -110,16 +112,43 @@ impl StoreService {
             }
             _ => {}
         }
-        let split = split(conclusion);
+        if self.shown_by_rules(program, &split(conclusion))? {
+            return Ok(Entailment::Entailed);
+        }
+        // The rules are complete under the Direct Semantics only for OWL 2 RL premises
+        // (OWL 2 Profiles §4.3, PR1): under owl2-dl, what they leave unshown the DL engines
+        // decide.
+        if self.dl().active() {
+            return self.decided_by_dl(conclusion);
+        }
+        Ok(Entailment::NotEntailed)
+    }
+
+    /// Whether the closure holds every positive statement and the rules refute every
+    /// opposite.
+    fn shown_by_rules(&self, program: &RuleProgram, split: &Split) -> StoreResult<bool> {
         if !split.positive.is_empty() && !self.ask(&split.positive)? {
-            return Ok(Entailment::NotEntailed);
+            return Ok(false);
         }
         for opposite in &split.refutations {
             if !self.refutes(program, opposite)? {
-                return Ok(Entailment::NotEntailed);
+                return Ok(false);
             }
         }
-        Ok(Entailment::Entailed)
+        Ok(true)
+    }
+
+    /// [`Self::entails_dl`]'s answer as an [`Entailment`]; undecided where it is unknown.
+    fn decided_by_dl(&self, conclusion: &[Triple]) -> StoreResult<Entailment> {
+        let decided = self.entails_dl(conclusion)?;
+        match (decided.premise, decided.answer) {
+            (crate::dl::Verdict::Inconsistent, _) => Ok(Entailment::InconsistentPremise),
+            (_, crate::dl::entailment::Entailed::Yes) => Ok(Entailment::Entailed),
+            (_, crate::dl::entailment::Entailed::No) => Ok(Entailment::NotEntailed),
+            (_, crate::dl::entailment::Entailed::Unknown(why)) => {
+                Err(StoreError::Undecided(format!("under OWL 2 DL: {why}")))
+            }
+        }
     }
 
     /// Whether the materialised data matches `pattern`, blank nodes read as variables.
