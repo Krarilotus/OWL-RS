@@ -5,7 +5,7 @@
 
 use nrese_engine::{EncodedQuad, GraphSelector, QuadPattern, ReadModel, TermId};
 use nrese_rdf::{GraphName, NamedNodeRef, Term};
-use nrese_sparql::{QueryDatasetSpecification, QueryOptions, ReadView};
+use nrese_sparql::{CancellationToken, QueryDatasetSpecification, QueryOptions, ReadView};
 
 /// Which statements a validation reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +92,7 @@ impl Selection {
 pub(crate) struct GraphView<'a, V: ReadView> {
     view: &'a V,
     selection: Selection,
+    cancellation: Option<&'a CancellationToken>,
 }
 
 impl<V: ReadView> Clone for GraphView<'_, V> {
@@ -110,7 +111,21 @@ fn sorted_set(mut ids: Vec<TermId>) -> Vec<TermId> {
 
 impl<'a, V: ReadView> GraphView<'a, V> {
     pub(crate) fn new(view: &'a V, selection: Selection) -> Self {
-        Self { view, selection }
+        Self {
+            view,
+            selection,
+            cancellation: None,
+        }
+    }
+
+    pub(crate) fn with_cancellation(mut self, cancellation: Option<&'a CancellationToken>) -> Self {
+        self.cancellation = cancellation;
+        self
+    }
+
+    pub(crate) fn cancelled(&self) -> bool {
+        self.cancellation
+            .is_some_and(CancellationToken::is_cancelled)
     }
 
     fn scan(
@@ -126,8 +141,10 @@ impl<'a, V: ReadView> GraphView<'a, V> {
             graph: self.selection.graphs,
         };
         let excluded = self.selection.excluded;
+        let cancellation = self.cancellation;
         self.view
             .quads_for_pattern_in(self.selection.model, &pattern)
+            .take_while(move |_| !cancellation.is_some_and(CancellationToken::is_cancelled))
             .filter(move |quad| !excluded.contains(&Some(quad.graph)))
     }
 

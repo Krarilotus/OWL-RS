@@ -43,13 +43,13 @@ pub use durability::checkpoint::image_revision;
 pub use durability::{DurabilityConfig, SyncPolicy, WalDamage, place};
 pub use engine::Certificate;
 pub use engine::{
-    Admission, Applied, AssertedIdentity, BulkLoad, BulkMode, CommitNote, CommitSummary, Content,
-    CorpusTuning, Count, CountedSnapshot, DEFAULT_READER_CORPUS_BYTES, Engine, EngineConfig,
-    EngineStats, EqualityClasses, Finished, GroupCounts, HeavyGroups, ImageInfo, InferredMask,
-    InferredSubset, LogBatch, LogExpectation, NoteError, OwnState, PendingView, PendingWrite,
-    PrivateTransaction, ProbeCursor, ReadModel, Rematerialisation, ScanColumns, SearchRefused,
-    Seek, SharedState, Snapshot, SnapshotIdentity, TextCorpusStats, TextScope, Transaction,
-    WriterHeld,
+    Admission, Applied, AssertedIdentity, BulkLoad, BulkMode, CommitNote, CommitPublication,
+    CommitSummary, Content, CorpusTuning, Count, CountedSnapshot, DEFAULT_READER_CORPUS_BYTES,
+    Engine, EngineConfig, EngineStats, EqualityClasses, Finished, GroupCounts, HeavyGroups,
+    ImageInfo, InferredMask, InferredSubset, LogBatch, LogExpectation, NoteError, OwnState,
+    PendingView, PendingWrite, PrivateTransaction, ProbeCursor, ReadModel, Rematerialisation,
+    ScanColumns, SearchRefused, Seek, SharedState, Snapshot, SnapshotIdentity, TextCorpusStats,
+    TextScope, Transaction, WriterHeld,
 };
 pub use error::{EngineError, EngineResult};
 pub use index::cursor::SeekStats;

@@ -219,7 +219,7 @@ pub(crate) fn bulk_load(
                 revision: summary.revision,
                 reason,
             },
-            false => reason.into(),
+            false => StoreError::LoadQuarantineNotRecorded(reason),
         })?
         .unwrap_or_default();
     if quarantined.count > 0 {
