@@ -6,6 +6,8 @@ use nrese_shacl::{Component, PropertyPath, SH};
 use super::case::{Case, Step, ex, quads};
 use super::observe::{Deviation, ResultKey, ResultTerm, compare};
 
+mod data;
+
 struct Row {
     id: String,
     description: &'static str,
@@ -57,12 +59,12 @@ fn core_key(
 
 // Spec: SHACL Core nested constraints report what a change newly violates,
 // including reversals of conformance through sh:not and shared target routes.
-#[test]
-fn matrix() {
+pub(super) fn run() {
     let rows = recursion()
         .into_iter()
         .chain(cycle())
-        .chain(shared_target());
+        .chain(shared_target())
+        .chain(data::rows());
     let selector = std::env::var("NRESE_SHACL_CASE").ok();
     let mut checked = 0;
     for row in rows {
