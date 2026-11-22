@@ -26,7 +26,8 @@ BASH = shutil.which("bash")
 # their caller's does.
 LEAKS = ("NRESE_", "FLEET_", "CARGO_BUILD_", "CARGO_TARGET_DIR")
 # The tier's own scripts, copied into each scratch repository.
-COPIED = (".githooks/pre-commit", "scripts/check.sh", "scripts/check-locks.sh", "scripts/check-names.sh")
+COPIED = (".githooks/pre-commit", "scripts/check.sh", "scripts/check-locks.sh", "scripts/check-names.sh",
+          "scripts/lib/private_terms.py")
 # Stand-ins, each call one line in $FAKE/calls. cargo: fmt fails for a manifest listed in
 # $FAKE/unformatted (`workspace` for the root's), metadata finds a stale lock while $FAKE/stale-lock
 # exists; anything else succeeds, as an installed cargo-nextest answers `nextest --version`.
@@ -148,6 +149,25 @@ class CommitTier(unittest.TestCase):
                                                         f"{done.stdout}{done.stderr}")
                 self.assertRegex(done.stdout, rf"(?m)^=== {re.escape(step)}: exit [1-9]",
                                  f"SPEC commit-tier-keeps: the refusal is {step}'s")
+
+    def test_a_private_host_name_refuses_the_commit(self):
+        # The private-terms rule (scripts/check.sh private_terms; its own contract test_private_terms.py), read
+        # by the commit tier: with an overlay, a staged host name refuses the commit, and no later step runs (its
+        # output could show the line); with none it says so.
+        self.write("notes.txt", "runs on zznamezz\n")
+        overlay = self.root / "overlay"
+        overlay.mkdir()
+        (overlay / "hosts.toml").write_text('[host.zzkeyzz]\nhostname = "zznamezz"\n', newline="\n")
+        self.env["NRESE_BENCH_PRIVATE"] = overlay.as_posix()
+        done = self.hook()
+        self.assertNotEqual(done.returncode, 0, f"SPEC commit-tier-private-terms: refused:\n{done.stdout}{done.stderr}")
+        self.assertRegex(done.stdout, r"(?m)^=== private terms: exit 1")
+        self.assertNotIn("=== fmt", done.stdout, "SPEC commit-tier-private-terms: nothing runs after a refusal")
+        self.assertNotIn("zznamezz", done.stdout + done.stderr)
+        del self.env["NRESE_BENCH_PRIVATE"]
+        done = self.hook()
+        self.assertIn("private terms: no overlay configured (NRESE_BENCH_PRIVATE), nothing to check", done.stdout,
+                      f"SPEC commit-tier-private-terms: no overlay, nothing to check:\n{done.stdout}{done.stderr}")
 
 
 if __name__ == "__main__":
