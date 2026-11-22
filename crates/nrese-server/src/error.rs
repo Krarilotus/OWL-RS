@@ -10,7 +10,7 @@ use thiserror::Error;
 use crate::reject_view::RejectExplanationView;
 use nrese_store::{RejectAttribution, RejectKind};
 
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Error)]
 pub enum ApiError {
     #[error("bad request: {0}")]
     BadRequest(String),
