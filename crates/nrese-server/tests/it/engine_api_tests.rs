@@ -933,7 +933,8 @@ async fn quarantine_commit_failure_async_import_completes_with_warning() {
     let job = finished(&app, started["path"].as_str().expect(&body)).await;
     assert_eq!(job["state"], "done", "{job}");
     assert_eq!(
-        job["report"]["warning"], "the quarantine record couldn't be kept: simulated failure",
+        job["report"]["warning"],
+        "the quarantine record couldn't be kept: simulated failure. Don't send it again.",
         "{job}"
     );
     assert_eq!(job["report"]["revision"], revision, "{job}");
@@ -1227,8 +1228,44 @@ async fn published_import_job_warning_names_the_kept_quarantine() {
     assert_eq!(
         warning,
         format!(
-            "the quarantine record couldn't be kept: the quarantine's directory sync failed (a test's). This load's records are listed under load ID {load}, but a power loss may lose them."
+            "the quarantine record couldn't be kept: the quarantine's directory sync failed (a test's). This load's records are listed under load ID {load}, but a power loss may lose them. Don't send it again."
         )
+    );
+}
+
+/// An import job of the server's import directory that published, whose quarantine record
+/// couldn't be kept: done, its warning saying not to load the files again.
+#[tokio::test]
+async fn published_server_file_import_job_says_not_to_load_again() {
+    let files = tempfile::tempdir().unwrap();
+    std::fs::write(files.path().join("mixed.nt"), MIXED_UPLOAD).unwrap();
+    let state = crate::support::test_state_with_store_config(
+        StoreConfig::in_memory(),
+        PolicyConfig {
+            import_directory: Some(files.path().to_path_buf()),
+            ..PolicyConfig::default()
+        },
+        ReasonerConfig::default(),
+    )
+    .unwrap();
+    state.store().quarantine().fail_next_commit();
+    let app = nrese_server::build_app(state);
+    let (status, body) = send(
+        &app,
+        Method::POST,
+        "/api/v1/repositories/nrese/import/files",
+        Some("application/json"),
+        r#"{"files":["mixed.nt"]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let started: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let job = finished(&app, started["path"].as_str().expect(&body)).await;
+    assert_eq!(job["state"], "done", "{job}");
+    assert_eq!(
+        job["report"]["warning"],
+        "the quarantine record couldn't be kept: simulated failure. Don't load it again.",
+        "{job}"
     );
 }
 
