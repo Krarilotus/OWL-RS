@@ -3,7 +3,7 @@ use thiserror::Error;
 
 use super::attribution::RejectAttribution;
 use super::command::MutationKind;
-use crate::error::StoreError;
+use crate::error::{StoreError, shacl_shapes_message};
 
 /// Why a mutation was not committed. Transport layers map these to protocol responses;
 /// they never need to inspect error strings.
@@ -20,6 +20,10 @@ pub enum MutationError {
     /// A validation gate rejected the resulting dataset state.
     #[error("{}", .0.detail)]
     Rejected(Box<MutationReject>),
+    /// The SHACL gate couldn't compile the stored shapes, so it refused the write. The
+    /// messages are projected for the committer's read access.
+    #[error("{}", shacl_shapes_message(.0))]
+    ShaclShapesUnusable(Vec<String>),
     /// The caller cancelled (for example on timeout) before the commit started.
     #[error("mutation was cancelled before commit")]
     Cancelled,

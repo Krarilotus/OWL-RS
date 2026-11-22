@@ -635,11 +635,14 @@ impl MutationPipeline {
         let report = match crate::shacl::introduced(tx, shapes_graph, resources, ticket) {
             Ok(report) => report,
             Err(error @ StoreError::SparqlEvaluation(_)) => return Err(stopped(error)),
-            // The stored shapes' problems, as the committer may be told them.
             Err(error) => {
                 ticket.claim_error()?;
-                let error = view.shapes_error(shapes_graph, error);
-                return Err(MutationError::Gate(error.to_string()));
+                return Err(match view.shapes_error(shapes_graph, error) {
+                    StoreError::ShaclShapes(problems) => {
+                        MutationError::ShaclShapesUnusable(problems)
+                    }
+                    error => MutationError::Gate(error.to_string()),
+                });
             }
         };
         let Some((report, pending)) = report else {
