@@ -980,18 +980,23 @@ impl StoreService {
     }
 
     /// [`Self::read_snapshot`] for a statement or graph read (RDF4J, the Graph Store): its
-    /// view stops with the read's cancellation, and its working memory is the read's
-    /// ([`Self::read_memory`]).
+    /// view stops with the read's cancellation. Such a read has no envelope of its own, so
+    /// its view's working memory is the queries', as [`Self::read_snapshot`]'s is.
     fn read_snapshot_for(
         &self,
         read: &crate::ReadContext<'_>,
     ) -> StoreResult<nrese_engine::Snapshot> {
-        self.read_snapshot_within(read.scope.access(), &self.read_memory(read), &read.cancel)
+        self.read_snapshot_within(
+            read.scope.access(),
+            &self.settings.envelope(None),
+            &read.cancel,
+        )
     }
 
-    /// The envelope a statement or graph read's working memory is charged to: the one its
-    /// transport holds its answer in, where it holds it ([`crate::ReadContext::within`]);
-    /// else none of its own, so the queries', as [`Self::read_snapshot`]'s is.
+    /// The envelope a statement read's replay of a transaction's pending changes is charged
+    /// to: the one its transport holds its answer in, where it holds it
+    /// ([`crate::ReadContext::within`]: a reader of every graph's, over HTTP/1.0); else none
+    /// of its own, so the queries', as [`Self::read_snapshot`]'s is.
     fn read_memory(&self, read: &crate::ReadContext<'_>) -> nrese_exec::Envelope {
         read.memory
             .clone()

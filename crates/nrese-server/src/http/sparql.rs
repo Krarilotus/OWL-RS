@@ -118,11 +118,17 @@ pub async fn execute_query_in(
                 out.refused(error, |error| map_query_error(&policy, error))
             };
             if explain != Explain::No {
+                // Nothing is held while it runs (its JSON is written after), so its refusal
+                // is the query's own.
                 let (body, completeness) = if explain == Explain::Plan {
-                    let plan = run.plan(&token).map_err(|error| refused(out, error))?;
+                    let plan = run
+                        .plan(&token)
+                        .map_err(|error| map_query_error(&policy, error))?;
                     (plan_json(&plan), plan.completeness)
                 } else {
-                    let explanation = run.explain(&token).map_err(|error| refused(out, error))?;
+                    let explanation = run
+                        .explain(&token)
+                        .map_err(|error| map_query_error(&policy, error))?;
                     (explanation_json(&explanation), explanation.completeness)
                 };
                 if scoped {
@@ -340,9 +346,9 @@ pub(crate) fn refused_or(error: StoreError, otherwise: fn(String) -> ApiError) -
         error @ StoreError::MemoryLimitWithoutAmounts { limit: None, .. } => {
             server_memory_in_use(error)
         }
-        // A read's own memory limit, which a statement or graph read has only where its
-        // answer is held whole (HTTP/1.0: `result_stream`): the client's to change, as a
-        // query's is.
+        // A read's own memory limit, which only a statement read's replay of a transaction
+        // has, where its answer is held whole (HTTP/1.0, a reader of every graph:
+        // `result_stream`): the client's to change, as a query's is.
         error if error.is_memory_limit() && !error.is_server_memory_limit() => {
             ApiError::payload_too_large(format!(
                 "{error} (budgets.query_memory, NRESE_MAX_QUERY_MEMORY_BYTES)"

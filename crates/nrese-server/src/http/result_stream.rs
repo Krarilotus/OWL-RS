@@ -32,9 +32,9 @@
 //!   the first one for all of it, a stall bound's too. Sent, each frame must be taken
 //!   within a stall bound (the read's own, or a query's time) or what is left is let go
 //!   and the body ends short of its length ([`Held`]): a client that stops reading keeps
-//!   no answer charged. A reader of some graphs is told every memory refusal of its answer
-//!   held whole alike, one 503 and one text ([`Reader::Restricted`]), whichever limit refused
-//!   it: what else holds the memory all queries share may be work it can't see.
+//!   no answer charged. Only a reader of every graph's answer is held: a reader of some
+//!   graphs' streams over HTTP/1.0 as over HTTP/1.1, its end the connection's close, so a cut
+//!   answer can look whole to it ([`Reader::Restricted`]).
 
 use std::collections::VecDeque;
 use std::io;
@@ -92,16 +92,16 @@ pub const MAX_BUFFERED_OUTPUT_BYTES: usize = (CHANNEL_CHUNKS + 3) * CHUNK_BYTES;
 
 type Message = Frame<Bytes>;
 
-/// Whose answer it is, which decides what a memory refusal of it held whole tells.
+/// Whose answer it is, which decides whether it may be held whole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reader {
-    /// A reader of every graph: told which limit refused it, its own (413, the query's or
-    /// the HTTP/1.0 answer's) or the memory all queries share (503).
+    /// A reader of every graph: over HTTP/1.0 its answer is held whole, and a memory refusal
+    /// of it tells which limit refused it, its own (413, the query's or the HTTP/1.0
+    /// answer's) or the memory all queries share (503).
     Every,
-    /// A reader of some graphs: told only that memory refused it ([`restricted_refusal`]),
-    /// whichever limit did, its own envelope's, the shared memory's or what its answer held.
-    /// Which limit refuses first depends on what else holds the shared memory, work it may
-    /// not see.
+    /// A reader of some graphs: its answer streams over HTTP/1.0 too. Held whole, which of its
+    /// limits refused it first would depend on what else holds the memory all queries share,
+    /// work it may not see.
     Restricted,
 }
 
@@ -113,16 +113,6 @@ impl Reader {
             false => Self::Restricted,
         }
     }
-}
-
-/// The one refusal a reader of some graphs gets for any memory refusal of its answer held
-/// whole: 503 without `Retry-After`, a text the same at every site and for every limit.
-pub fn restricted_refusal() -> ApiError {
-    ApiError::unavailable(
-        "the server had no memory to hold this answer whole; which limit refused it is not \
-         reported to a reader of some graphs (budgets.query_memory, \
-         budgets.total_query_memory)",
-    )
 }
 
 /// How the producer ended: `None` while it runs (or if it panicked), its result after.
@@ -241,7 +231,6 @@ pub struct ChannelWriter {
     /// The envelope the answer is held whole in (HTTP/1.0), opened before the producer
     /// starts; `None` where the answer streams.
     holding: Option<Envelope>,
-    reader: Reader,
 }
 
 impl ChannelWriter {
@@ -254,17 +243,16 @@ impl ChannelWriter {
 
     /// The store's `error` that stopped what this writer's answer is made of, as its client
     /// is told it: as `otherwise` tells it, unless the answer is held whole and `error` is a
-    /// memory refusal. Then a reader of some graphs gets [`restricted_refusal`]; a reader of
-    /// every graph whose work was refused for what the answer held (the budget's own
-    /// judgement, carried with the refusal: [`nrese_exec::BudgetExceeded::for_held`]) the 413
-    /// of an answer too large for HTTP/1.0. Every producer of an answer that may be held
+    /// memory refusal of its work for what the answer held (the budget's own judgement,
+    /// carried with the refusal: [`nrese_exec::BudgetExceeded::for_held`]). Then it is the
+    /// 413 of an answer too large for HTTP/1.0. Every producer of an answer that may be held
     /// whole maps its store errors through here, and nothing after it maps them again.
     pub fn refused(
         &self,
         error: StoreError,
         otherwise: impl FnOnce(StoreError) -> ApiError,
     ) -> ApiError {
-        refusal_told(self.holding.as_ref(), self.reader, error, otherwise)
+        refusal_told(self.holding.as_ref(), error, otherwise)
     }
 
     /// Sends `message`, waiting for room in the channel as long as the pace allows. The
@@ -332,10 +320,10 @@ impl Drop for CancelOnDrop {
 }
 
 /// Runs `produce` on a blocking thread and streams what it writes as the response body,
-/// within `pace`; or holds it whole (HTTP/1.0), charged to the envelope `memory` opens,
-/// which `produce` is handed as [`ChannelWriter::holding`]. A memory refusal of an answer
-/// held whole is told as `reader` may be told it ([`Reader`]), by the hold and by `produce`
-/// ([`ChannelWriter::refused`]). `produce` must honour `cancellation`.
+/// within `pace`; or, for a reader of every graph over HTTP/1.0, holds it whole, charged to
+/// the envelope `memory` opens, which `produce` is handed as [`ChannelWriter::holding`]. A
+/// reader of some graphs' answer always streams ([`Reader`]). `produce` must honour
+/// `cancellation`.
 pub async fn stream_blocking(
     pace: Pace,
     cancellation: CancellationToken,
@@ -347,7 +335,7 @@ pub async fn stream_blocking(
 ) -> Result<Response, ApiError> {
     // Set for every request of the server's router (`app::screen`), which is reached only
     // through `build_app`; unset only for a handler a test calls without it, which streams.
-    let whole = WHOLE.try_with(|whole| *whole).unwrap_or(false);
+    let whole = reader == Reader::Every && WHOLE.try_with(|whole| *whole).unwrap_or(false);
     // How long an answer held whole waits for its client to take each frame: a stall
     // bound's own, or the time a query was given.
     let stall = match pace {
@@ -366,7 +354,6 @@ pub async fn stream_blocking(
         start: Arc::clone(&start),
         runtime: tokio::runtime::Handle::current(),
         holding: memory.clone(),
-        reader,
     };
     let ended = Arc::clone(&outcome);
     tokio::task::spawn_blocking(move || {
@@ -397,15 +384,7 @@ pub async fn stream_blocking(
     if let Some(memory) = memory {
         // The first deadline bounds all of it: no chunk goes out to start a stall bound. On
         // every exit but the answer's end, `guard` cancels the producer.
-        let held = hold(
-            receiver,
-            &outcome,
-            deadline,
-            memory,
-            reader,
-            timeout_message,
-        )
-        .await?;
+        let held = hold(receiver, &outcome, deadline, memory, timeout_message).await?;
         return Ok(respond(Body::new(Held::new(held, stall)), media_type));
     }
     let first = match tokio::time::timeout_at(deadline, receiver.recv()).await {
@@ -469,13 +448,12 @@ fn respond(body: Body, media_type: &'static str) -> Response {
 
 /// Receives all the producer writes before any of it is sent, charging it to `memory`:
 /// the whole answer, or the status of what stopped it (its deadline, the producer's error, a
-/// refusal of the memory, told as `reader` may be told it).
+/// refusal of the memory).
 async fn hold(
     mut receiver: mpsc::Receiver<Message>,
     outcome: &Outcome,
     deadline: Instant,
     memory: Envelope,
-    reader: Reader,
     timeout_message: &'static str,
 ) -> Result<Holding, ApiError> {
     let bound = memory.limit();
@@ -513,7 +491,7 @@ async fn hold(
                         }
                         outcome
                             .failed()
-                            .unwrap_or_else(|| too_large(refused, bound, reader))
+                            .unwrap_or_else(|| too_large(refused, bound))
                     })?;
                     held.charged += bytes;
                     held.left += bytes as u64;
@@ -531,14 +509,10 @@ async fn hold(
 /// The refusal of an answer held whole past `bound`, its envelope's limit; or, where the
 /// memory all queries share has no room for it, a 503 that names that memory and no amounts:
 /// what it holds is other requests' work too, which its reader may not see. Where the
-/// process's memory couldn't be read, a 503 that says so. To a reader of some graphs, any of
-/// these is [`restricted_refusal`]. No memory refusal is told when to try again (no
-/// `Retry-After`).
-fn too_large(refused: BudgetExceeded, bound: usize, reader: Reader) -> ApiError {
+/// process's memory couldn't be read, a 503 that says so. No memory refusal is told when to
+/// try again (no `Retry-After`).
+fn too_large(refused: BudgetExceeded, bound: usize) -> ApiError {
     const SHARED: &str = "(budgets.total_query_memory, NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES)";
-    if reader == Reader::Restricted {
-        return restricted_refusal();
-    }
     if refused.unread {
         return ApiError::unavailable(format!("{refused} {SHARED}"));
     }
@@ -549,19 +523,14 @@ fn too_large(refused: BudgetExceeded, bound: usize, reader: Reader) -> ApiError 
 }
 
 /// [`ChannelWriter::refused`] of a writer that holds its answer in `holding` (`None`: it
-/// streams) for `reader`.
+/// streams).
 fn refusal_told(
     holding: Option<&Envelope>,
-    reader: Reader,
     error: StoreError,
     otherwise: impl FnOnce(StoreError) -> ApiError,
 ) -> ApiError {
-    let Some(envelope) = holding else {
-        return otherwise(error);
-    };
-    match reader {
-        Reader::Restricted if error.is_memory_refusal() => restricted_refusal(),
-        Reader::Every
+    match holding {
+        Some(envelope)
             if error
                 .memory_refusal()
                 .is_some_and(|refused| refused.for_held) =>
@@ -1203,7 +1172,7 @@ mod tests {
     /// Work of a query's that fits a 1 MiB limit alone, but not beside two chunks held.
     const WORK: usize = (1 << 20) - CHUNK_BYTES;
 
-    /// Over HTTP/1.0, the answer held for `reader` by a producer whose own work (a query's)
+    /// Over HTTP/1.0, the answer held for a reader of every graph by a producer whose own work (a query's)
     /// draws on the same envelope as the hold: it writes `CHUNK_BYTES * 2`, waits until the
     /// hold holds them, charges `work` there, which must be refused, and ends with its
     /// refusal as its writer tells it ([`ChannelWriter::refused`]; `stopped` where the
@@ -1211,7 +1180,6 @@ mod tests {
     /// after it.
     async fn refused_beside_its_held_answer(
         memory: Envelope,
-        reader: Reader,
         work: usize,
         stopped: ApiError,
     ) -> Response {
@@ -1224,7 +1192,7 @@ mod tests {
                     Pace::Total(Instant::now() + Duration::from_secs(120)),
                     CancellationToken::new(),
                     move || held,
-                    reader,
+                    Reader::Every,
                     "text/plain",
                     "timeout",
                     move |writer| {
@@ -1261,7 +1229,6 @@ mod tests {
     async fn a_producers_work_refused_beside_its_held_answer_is_the_answers_refusal() {
         let own = refused_beside_its_held_answer(
             Envelope::new(Some(1 << 20), None),
-            Reader::Every,
             WORK,
             ApiError::payload_too_large("the query's own (budgets.query_memory)"),
         )
@@ -1279,7 +1246,6 @@ mod tests {
 
         let shared = refused_beside_its_held_answer(
             Envelope::new(Some(1 << 30), Some(nrese_exec::SharedBudget::new(1 << 20))),
-            Reader::Every,
             WORK,
             ApiError::unavailable("the query's own (budgets.total_query_memory)"),
         )
@@ -1303,18 +1269,11 @@ mod tests {
         let outcome = Outcome::default();
         outcome.set(Ok(()));
         let deadline = Instant::now() + Duration::from_secs(30);
-        let refused = hold(
-            receiver,
-            &outcome,
-            deadline,
-            memory.clone(),
-            Reader::Every,
-            "timeout",
-        )
-        .await
-        .err()
-        .map(IntoResponse::into_response)
-        .expect("no room in the shared memory, no answer");
+        let refused = hold(receiver, &outcome, deadline, memory.clone(), "timeout")
+            .await
+            .err()
+            .map(IntoResponse::into_response)
+            .expect("no room in the shared memory, no answer");
         assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(refused.headers().get(header::RETRY_AFTER), None);
         assert_eq!(memory.used(), 0, "the refused answer still holds memory");
@@ -1379,18 +1338,11 @@ mod tests {
         outcome.set(Err(told(&memory, refused)));
         drop(sender);
         let deadline = Instant::now() + Duration::from_secs(30);
-        let stopped = hold(
-            receiver,
-            &outcome,
-            deadline,
-            memory.clone(),
-            Reader::Every,
-            "timeout",
-        )
-        .await
-        .err()
-        .map(IntoResponse::into_response)
-        .expect("its work refused, no answer");
+        let stopped = hold(receiver, &outcome, deadline, memory.clone(), "timeout")
+            .await
+            .err()
+            .map(IntoResponse::into_response)
+            .expect("its work refused, no answer");
         assert_eq!(memory.used(), 0, "the refused answer still holds memory");
         let body = axum::body::to_bytes(stopped.into_body(), usize::MAX)
             .await
@@ -1407,12 +1359,7 @@ mod tests {
     /// What a producer that holds its answer in `memory` for a reader of every graph ends
     /// with when its work is `refused` ([`ChannelWriter::refused`]).
     fn told(memory: &Envelope, refused: BudgetExceeded) -> ApiError {
-        refusal_told(
-            Some(memory),
-            Reader::Every,
-            StoreError::from(refused),
-            |_| own(),
-        )
+        refusal_told(Some(memory), StoreError::from(refused), |_| own())
     }
 
     /// The detail of the refusal `stopped` is mapped to.
@@ -1435,14 +1382,7 @@ mod tests {
             .unwrap();
         let outcome = Outcome::default();
         let deadline = Instant::now() + Duration::from_secs(30);
-        let held = hold(
-            receiver,
-            &outcome,
-            deadline,
-            memory.clone(),
-            Reader::Every,
-            "timeout",
-        );
+        let held = hold(receiver, &outcome, deadline, memory.clone(), "timeout");
         let refused = async {
             // Once the hold holds the frame.
             while memory.used() < 1 << 10 {
@@ -1476,14 +1416,7 @@ mod tests {
         let outcome = Outcome::default();
         let (at_step, go) = armed();
         let deadline = Instant::now() + Duration::from_secs(30);
-        let held = hold(
-            receiver,
-            &outcome,
-            deadline,
-            memory.clone(),
-            Reader::Every,
-            "timeout",
-        );
+        let held = hold(receiver, &outcome, deadline, memory.clone(), "timeout");
         let refused = async {
             at_step.await.expect("the hold reached its step");
             assert_eq!(memory.used(), 0, "the frame was charged before the step");
@@ -1516,14 +1449,7 @@ mod tests {
         let outcome = Outcome::default();
         let (at_step, go) = armed();
         let deadline = Instant::now() + Duration::from_secs(30);
-        let held = hold(
-            receiver,
-            &outcome,
-            deadline,
-            memory.clone(),
-            Reader::Every,
-            "timeout",
-        );
+        let held = hold(receiver, &outcome, deadline, memory.clone(), "timeout");
         let ended = async {
             at_step.await.expect("the hold reached its step");
             outcome.set(Err(ApiError::internal("the export failed")));
@@ -1614,14 +1540,10 @@ mod tests {
         (status, problem)
     }
 
-    /// What `reader` is told of the HTTP/1.0 answer `site` makes, held whole in an envelope
-    /// of 1 MiB within 8 MiB all queries share, of which work the reader can't see holds all
+    /// What a reader of every graph is told of the HTTP/1.0 answer `site` makes, held whole
+    /// in an envelope of 1 MiB within 8 MiB all queries share, of which other work holds all
     /// but `room` (`None`: none of it). The envelope is checked to hold nothing after it.
-    async fn told_at(
-        site: Site,
-        reader: Reader,
-        room: Option<usize>,
-    ) -> (StatusCode, serde_json::Value) {
+    async fn told_at(site: Site, room: Option<usize>) -> (StatusCode, serde_json::Value) {
         const SHARED: usize = 8 << 20;
         let shared = nrese_exec::SharedBudget::new(SHARED);
         let hidden = Envelope::new(None, Some(Arc::clone(&shared)));
@@ -1637,7 +1559,7 @@ mod tests {
                     Pace::Total(Instant::now() + Duration::from_secs(120)),
                     CancellationToken::new(),
                     move || held,
-                    reader,
+                    Reader::Every,
                     "text/plain",
                     "timeout",
                     move |writer| site(writer, &charged),
@@ -1649,39 +1571,59 @@ mod tests {
         problem_of(refused.into_response()).await
     }
 
-    /// Each site where a reader of some graphs' HTTP/1.0 answer, held whole, is refused for
+    /// Each site where a reader of every graph's HTTP/1.0 answer, held whole, is refused for
     /// memory, its producer's writer and hold as every route has them: the hold's charge of a
     /// frame, the producer's work before anything is held, and its later reservation beside
-    /// what is held. Alone, its own envelope refuses (1 MiB); beside work it can't see, the
-    /// memory all queries share does (all but 256 KiB held). Every row is told one 503 and one
-    /// text ([`restricted_refusal`]) either way. A reader of every graph is told which limit:
-    /// alone its own 413, beside the hidden work the shared memory's 503.
+    /// what is held. Alone, its own envelope refuses (1 MiB): a 413. Beside other work, the
+    /// memory all queries share does (all but 256 KiB held): a 503.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_restricted_readers_held_answer_is_told_alike_at_every_site() {
-        let one = problem_of(restricted_refusal().into_response()).await;
-        assert_eq!(one.0, StatusCode::SERVICE_UNAVAILABLE);
+    async fn a_full_readers_held_answer_is_told_which_limit_at_every_site() {
         let sites: [(&str, Site); 3] = [
             ("the hold's charge of a frame", frame),
             ("the producer's work before anything is held", evaluation),
             ("a later reservation beside what is held", later),
         ];
         for (name, site) in sites {
-            let alone = told_at(site, Reader::Restricted, None).await;
-            assert_eq!(alone, one, "{name}");
-            let beside = told_at(site, Reader::Restricted, Some(256 << 10)).await;
+            let alone = told_at(site, None).await;
+            assert_eq!(alone.0, StatusCode::PAYLOAD_TOO_LARGE, "{name}: {alone:?}");
+            let beside = told_at(site, Some(256 << 10)).await;
             assert_eq!(
-                beside, alone,
-                "{name}: the reader is told of work it can't see"
-            );
-            let every = told_at(site, Reader::Every, None).await;
-            assert_eq!(every.0, StatusCode::PAYLOAD_TOO_LARGE, "{name}: {every:?}");
-            let every = told_at(site, Reader::Every, Some(256 << 10)).await;
-            assert_eq!(
-                every.0,
+                beside.0,
                 StatusCode::SERVICE_UNAVAILABLE,
-                "{name}: {every:?}"
+                "{name}: {beside:?}"
             );
         }
+    }
+
+    /// Over HTTP/1.0, a reader of some graphs' answer is never held: no envelope is opened
+    /// for it, its producer is handed none, and it streams (no exact length), as over
+    /// HTTP/1.1.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restricted_readers_http10_answer_streams() {
+        let response = WHOLE
+            .scope(
+                true,
+                stream_blocking(
+                    Pace::Total(Instant::now() + Duration::from_secs(120)),
+                    CancellationToken::new(),
+                    || -> Envelope { panic!("an envelope was opened to hold the answer") },
+                    Reader::Restricted,
+                    "text/plain",
+                    "timeout",
+                    |writer| {
+                        assert!(writer.holding().is_none(), "the producer holds its answer");
+                        io::Write::write_all(writer, &vec![b'x'; 2 * CHUNK_BYTES])
+                            .map_err(|error| ApiError::internal(error.to_string()))
+                    },
+                ),
+            )
+            .await
+            .expect("an answer");
+        assert_eq!(http_body::Body::size_hint(response.body()).exact(), None);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.len(), 2 * CHUNK_BYTES);
     }
 
     /// Over HTTP/1.0, a refusal of a producer's work carries the cause the budget judged at
@@ -1738,14 +1680,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel(CHANNEL_CHUNKS);
         let outcome = Outcome::default();
         let deadline = Instant::now() + Duration::from_secs(1);
-        let held = hold(
-            receiver,
-            &outcome,
-            deadline,
-            memory,
-            Reader::Every,
-            "timeout",
-        );
+        let held = hold(receiver, &outcome, deadline, memory, "timeout");
         tokio::time::advance(Duration::from_secs(2)).await;
         if frame > 0 {
             sender
@@ -1808,14 +1743,7 @@ mod tests {
         let outcome = Outcome::default();
         let (at_step, go) = armed();
         let deadline = Instant::now() + Duration::from_secs(1);
-        let held = hold(
-            receiver,
-            &outcome,
-            deadline,
-            memory.clone(),
-            Reader::Every,
-            "timeout",
-        );
+        let held = hold(receiver, &outcome, deadline, memory.clone(), "timeout");
         let late = async {
             at_step.await.expect("the hold reached its step");
             tokio::time::advance(Duration::from_secs(2)).await;
@@ -1844,16 +1772,9 @@ mod tests {
         let outcome = Outcome::default();
         outcome.set(Ok(()));
         let deadline = Instant::now() + Duration::from_secs(30);
-        let holding = hold(
-            receiver,
-            &outcome,
-            deadline,
-            memory.clone(),
-            Reader::Every,
-            "timeout",
-        )
-        .await
-        .unwrap_or_else(|stopped| panic!("{stopped}"));
+        let holding = hold(receiver, &outcome, deadline, memory.clone(), "timeout")
+            .await
+            .unwrap_or_else(|stopped| panic!("{stopped}"));
         let mut body = Held::new(holding, Duration::from_secs(1));
         body.watch.abort();
         tokio::time::advance(Duration::from_secs(2)).await;

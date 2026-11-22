@@ -17,8 +17,8 @@ use crate::http::sparql::refused_or;
 use crate::state::AppState;
 
 /// A graph (Graph Store Protocol `GET`), streamed as it is read: a whole graph in constant
-/// memory, for as long as the client keeps reading ([`Pace::stalled_after`]); over HTTP/1.0
-/// held whole (`result_stream`).
+/// memory, for as long as the client keeps reading ([`Pace::stalled_after`]); over HTTP/1.0,
+/// to a reader of every graph, held whole (`result_stream`).
 pub async fn get_graph(
     state: AppState,
     authenticated: crate::auth::Authenticated,
@@ -40,18 +40,13 @@ pub async fn get_graph(
         media_type,
         "graph read exceeded policy timeout",
         move |out| {
-            // Held whole, the read's view draws on the answer's envelope.
-            let read = nrese_store::ReadContext::new(scope)
-                .cancelled_by(token)
-                .within(out.holding().cloned());
-            match store.write_graph(&read, &request, &mut *out) {
+            let read = nrese_store::ReadContext::new(scope).cancelled_by(token);
+            match store.write_graph(&read, &request, out) {
                 Ok(true) => Ok(()),
                 // Graph Store Protocol §5.2: a graph that doesn't exist is 404, not an empty
                 // document. Nothing is written for it, so the status is still open.
                 Ok(false) => Err(ApiError::not_found("the graph does not exist")),
-                Err(error) => {
-                    Err(out.refused(error, |error| refused_or(error, ApiError::bad_request)))
-                }
+                Err(error) => Err(refused_or(error, ApiError::bad_request)),
             }
         },
     )

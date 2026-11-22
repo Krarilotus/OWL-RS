@@ -273,12 +273,6 @@ impl StoreError {
         }
     }
 
-    /// Refused for memory in any way: by a limit, told with its amounts or without
-    /// ([`Self::is_memory_limit`]), or because the process's memory couldn't be read.
-    pub fn is_memory_refusal(&self) -> bool {
-        self.is_memory_limit() || self.memory_refusal().is_some()
-    }
-
     /// True if the request is at fault (syntax, invalid IRIs or payloads, unsupported query
     /// features) rather than the store. Transports map these to client errors. A cancelled
     /// evaluation is neither: the transport decides what cancelled it.
