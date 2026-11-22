@@ -664,7 +664,7 @@ fn a_sub_property_of_a_built_in_annotation_property_leaves_the_el_answer_complet
 /// Spec (Structural Specification §2.4, §5.6.1: no IRI of the reserved vocabulary is an
 /// individual): a realisation names no reserved name as an individual where the data puts one
 /// in a nominal or a `hasValue` the reader leaves out (`owl:Thing` and `owl:Nothing` included),
-/// and still names the data's own individuals.
+/// with its axiom or with a structure it rejects, and still names the data's own individuals.
 #[test]
 fn a_realisation_names_no_reserved_name_as_an_individual() {
     let mut wrong = Vec::new();
@@ -674,6 +674,8 @@ fn a_realisation_names_no_reserved_name_as_an_individual() {
          :C owl:equivalentClass [ a owl:Restriction ; owl:onProperty :p ; owl:hasValue owl:Nothing ] .",
         ":C owl:equivalentClass [ owl:oneOf ( <http://www.w3.org/1999/02/22-rdf-syntax-ns#nil> ) ] . \
          :a a :C .",
+        // A nominal read before its structure is rejected (a disjoint union of one class).
+        ":C owl:disjointUnionOf ( [ owl:oneOf ( owl:Thing ) ] ) . :a a :C .",
     ] {
         let dl = pipeline();
         insert(&dl, data).expect("committed");

@@ -467,6 +467,35 @@ fn a_disjoint_union_whose_operands_read_as_one_round_trips() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Spec (Structural Specification §2.4, §5.6.1: no IRI of the reserved vocabulary is an
+/// individual): a reserved name in a nominal or a `hasValue` whose axiom isn't read (a disjoint
+/// union of one class, a syntax error) is no named individual, which the DL engines realise;
+/// the data's own individual is.
+#[test]
+fn a_reserved_name_in_a_nominal_not_read_is_no_named_individual() {
+    let mut wrong = Vec::new();
+    for expression in ["ObjectOneOf(owl:Thing)", "ObjectHasValue(:r owl:Nothing)"] {
+        let mut table = Table::default();
+        let (o, _) = read_functional(
+            &format!(
+                "Prefix(:=<http://example.com/>)
+Ontology(
+DisjointUnion(:C {expression})
+ClassAssertion(:C :a)
+)"
+            ),
+            &mut table,
+        );
+        let named: Vec<String> = (o.named_individuals().into_iter())
+            .map(|t| table.name(t))
+            .collect();
+        if named != ["ex:a"] {
+            wrong.push(format!("{expression}: {named:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// An anonymous individual only in a nominal or a `hasValue` (review A-1102) stays
 /// anonymous: not among the named individuals (so no key or rule binds it), and reported,
 /// since OWL 2 DL takes named individuals there (*OWL 2 Structural Specification* §11.2).
