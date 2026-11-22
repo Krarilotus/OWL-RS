@@ -1552,6 +1552,8 @@ struct Context<'a> {
     /// Table charges detached from reservations while an attempt can be retried.
     /// Tables abandoned on an error drop before a restore releases their charge.
     table_charges: Cell<Option<usize>>,
+    /// The table ledger went below zero: the query fails ([`Self::check`]).
+    tables_unbalanced: Cell<bool>,
     cancellation: Option<CancellationToken>,
     budget: Arc<Budget>,
     /// What the context keeps to the query's end, charged to `budget`: its computed terms
@@ -1835,6 +1837,7 @@ impl<'a> Context<'a> {
             numbers: RefCell::default(),
             since: RefCell::default(),
             table_charges: Cell::default(),
+            tables_unbalanced: Cell::default(),
             cancellation: options.resources.cancellation.clone(),
             kept: RefCell::new(Reservation::new(Arc::clone(&budget))),
             budget,
@@ -1952,6 +1955,12 @@ impl<'a> Context<'a> {
     /// Fails a cancelled query, and one a read refused memory to: what it read since may
     /// be incomplete ([`Snapshot::reading_within`]).
     fn check(&self) -> NativeResult<()> {
+        if self.tables_unbalanced.get() {
+            return Err(QueryEvaluationError::Unexpected(
+                "a table's charge was released by a save point it was not made in".to_owned(),
+            )
+            .into());
+        }
         if let Some(refused) = self
             .aliases_refused
             .get()
@@ -2089,8 +2098,19 @@ impl<'a> Context<'a> {
 
     fn take_table_charge(&self, bytes: usize) {
         if let Some(held) = self.table_charges.get() {
-            self.table_charges.set(Some(held - bytes));
+            self.table_charges
+                .set(Some(self.balanced(held.checked_sub(bytes))));
         }
+    }
+
+    /// What a subtraction from the table ledger leaves. Where it would go below zero (a
+    /// table charged before the point consumed inside it), the ledger is broken: it gives
+    /// back nothing more, and the query fails ([`Self::check`]).
+    fn balanced(&self, rest: Option<usize>) -> usize {
+        rest.unwrap_or_else(|| {
+            self.tables_unbalanced.set(true);
+            0
+        })
     }
 
     fn transfer_table_charge(&self, held: Reservation<impl std::ops::Deref<Target = Budget>>) {
@@ -2272,11 +2292,11 @@ impl<'a> Context<'a> {
         // The numbers, then their charge.
         since.truncate(point.depth - 1);
         drop(since);
-        let abandoned = self
-            .table_charges
-            .replace(point.tables)
-            .expect("open point");
-        let abandoned = abandoned - point.tables.unwrap_or(0);
+        let held = self.table_charges.get().expect("open point");
+        // The enclosing point's ledger never counts more than is still held.
+        self.table_charges
+            .set(point.tables.map(|tables| tables.min(held)));
+        let abandoned = self.balanced(held.checked_sub(point.tables.unwrap_or(0)));
         if abandoned != 0 {
             self.budget.release(abandoned);
         }

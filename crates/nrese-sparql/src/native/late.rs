@@ -90,6 +90,9 @@ impl super::Context<'_> {
         if let Some(bytes) = child.table_charges.get() {
             self.returned_table_charge(bytes);
         }
+        if child.tables_unbalanced.get() {
+            self.tables_unbalanced.set(true);
+        }
         let solutions = result?;
         let decodes = child.decodes.load(std::sync::atomic::Ordering::Relaxed);
         self.decodes
@@ -135,6 +138,7 @@ impl super::Context<'_> {
             numbers: RefCell::default(),
             since: RefCell::default(),
             table_charges: Cell::new(self.table_charges.get().map(|_| 0)),
+            tables_unbalanced: Cell::new(false),
             cancellation: self.cancellation.clone(),
             budget: std::sync::Arc::clone(&self.budget),
             kept: RefCell::new(nrese_exec::Reservation::new(std::sync::Arc::clone(
