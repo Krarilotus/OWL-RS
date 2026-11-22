@@ -147,6 +147,10 @@ impl Case {
             .transpose()?;
         let mut evaluations = Vec::new();
         for (index, step) in self.steps.iter().enumerate() {
+            // An error names its step and the validation it came from.
+            let at = |phase: &'static str| {
+                move |error: String| format!("step {}, {phase}: {error}", index + 1)
+            };
             let mut tx = engine.transaction();
             if let Some(turtle) = &step.shapes {
                 for quad in &shapes_rdf {
@@ -179,7 +183,7 @@ impl Case {
                         .map(EncodedTriple::in_default_graph),
                 )
                 .collect::<Vec<_>>();
-            tx.commit().map_err(|error| error.to_string())?;
+            (tx.commit().map_err(|error| error.to_string())).map_err(at("commit"))?;
             let after = read();
             let observer = Observer::new(&before, &after, self.fresh_value);
             let empty = Shapes::default();
@@ -189,8 +193,8 @@ impl Case {
                     .map_err(|error| format!("reference stopped: {error}"))?;
                 observer.observe(&report)
             };
-            let full_before = reference(&before, shapes_before)?;
-            let full_after = reference(&after, shapes_before)?;
+            let full_before = reference(&before, shapes_before).map_err(at("full before"))?;
+            let full_after = reference(&after, shapes_before).map_err(at("full after"))?;
             let observe = |entry, check: &Check<'_>| {
                 let stop = self
                     .stop
@@ -206,11 +210,13 @@ impl Case {
                 after: full_after,
                 actual: observe(EntryPoint::Data, &|before, after, resources| {
                     validate_changes(before, after, shapes_before, data, &changed, resources)
-                })?,
+                })
+                .map_err(at("Data"))?,
             });
             if step.shapes.is_some() || step.edits_only_the_shapes_graph() {
-                let shapes_after = compile_shapes(&after)?;
-                let full_after = reference(&after, &shapes_after)?;
+                let shapes_after = compile_shapes(&after).map_err(at("shapes after"))?;
+                let full_after =
+                    reference(&after, &shapes_after).map_err(at("full after, Shapes"))?;
                 evaluations.push(Evaluation {
                     step: index + 1,
                     entry: EntryPoint::Shapes,
@@ -225,7 +231,8 @@ impl Case {
                             data,
                             resources,
                         )
-                    })?,
+                    })
+                    .map_err(at("Shapes"))?,
                 });
                 shapes = Some(shapes_after);
             }
