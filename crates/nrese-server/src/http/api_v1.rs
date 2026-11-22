@@ -971,12 +971,8 @@ fn start_import(
             return;
         }
         let outcome = loaded
-            .map_err(|error| match error {
-                nrese_store::StoreError::LoadCancelled => JobFailure::Cancelled,
-                nrese_store::StoreError::LoadQuarantineNotRecorded(error) => JobFailure::Failed(
-                    error.unpublished_message(retry, Some(state.repositories().data_dir())),
-                ),
-                error => JobFailure::Failed(error.to_string()),
+            .map_err(|error| {
+                JobFailure::of_load(error, retry, Some(state.repositories().data_dir()))
             })
             .and_then(|loaded| {
                 job.phase("reasoning");

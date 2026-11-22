@@ -1668,6 +1668,9 @@ mod tests {
             assert_eq!(store.quarantine().discard(&ids, None).unwrap(), 2);
             report
         };
+        // The forced clock and sequence took effect, so the second load really meets an id
+        // that is already on disk.
+        assert_eq!(old.load.as_deref(), Some("1800000000000-0"));
         fs::write(&file, "<http://example.com/c> <http://example.com/p> .\n").unwrap();
         let new = {
             let store = open();
