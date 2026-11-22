@@ -428,9 +428,14 @@ async fn hold(
             Ok(Some(frame)) => {
                 if let Some(data) = frame.data_ref() {
                     let bytes = data.len();
-                    held.envelope
-                        .charge_beside(bytes)
-                        .map_err(|refused| too_large(refused, bound))?;
+                    held.envelope.charge_beside(bytes).map_err(|refused| {
+                        // A charge that waited on the budget past the deadline came too late
+                        // to be answered for, whatever refused it.
+                        match Instant::now() >= deadline {
+                            true => ApiError::timeout(timeout_message),
+                            false => too_large(refused, bound),
+                        }
+                    })?;
                     held.charged += bytes;
                     held.left += bytes as u64;
                 }
