@@ -657,6 +657,182 @@ fn a_streamed_retry_releases_abandoned_tables_after_cache_eviction() {
     );
 }
 
+/// 20,000 subjects, each with `p0` its number modulo 100 and `p1` its number modulo 2,000:
+/// their join is 20,000 rows in 2,000 groups of `?y`, both patterns as large, so the join
+/// builds a hash table ([`Context::join`]).
+fn joined() -> Snapshot {
+    let config = EngineConfig {
+        background_maintenance: false,
+        ..EngineConfig::default()
+    };
+    let engine = Engine::new(config).unwrap();
+    let node = |name: &str| nrese_rdf::NamedNode::new_unchecked(format!("urn:{name}"));
+    let mut tx = engine.transaction();
+    for i in 0..20_000u32 {
+        for (p, o) in [("p0", i % 100), ("p1", i % 2_000)] {
+            let o = Literal::new_typed_literal(o.to_string(), xsd::INTEGER);
+            let quad = nrese_rdf::Quad::new(
+                node(&format!("s{i}")),
+                node(p),
+                o,
+                nrese_rdf::GraphName::DefaultGraph,
+            );
+            tx.insert(quad.as_ref());
+        }
+    }
+    tx.commit().unwrap();
+    engine.snapshot()
+}
+
+/// Spec: a GROUP BY whose direct attempt is refused by its join's row limit, on the join's
+/// own error path, holds after its streamed retry ([`Context::group`]) what the same plan
+/// streamed alone holds in a context of its own ([`Context::group_streamed`]): the refused
+/// join's hash table and inputs are let go before the retry. `AVG(?x * 2)` over [`joined`],
+/// from 2.3 MB to 4 MB in steps of 100 kB; at each limit where the direct attempt is refused
+/// past its rows and the streamed route answers, the retry answers its rows and holds its
+/// bytes (the live decoder and the planner's counts aside). At least one limit compares.
+#[test]
+fn a_streamed_retry_after_a_refused_join_holds_what_the_streamed_route_holds() {
+    let snapshot = joined();
+    let text = "SELECT ?y (AVG(?x * 2) AS ?a) \
+                WHERE { ?s <urn:p0> ?x . ?s <urn:p1> ?y } GROUP BY ?y";
+    let Query::Select { pattern, .. } = SparqlParser::new().parse_query(text).unwrap() else {
+        panic!("a SELECT")
+    };
+    let (inner, keys, aggregates) = group_in(&pattern);
+    let plan = stream::Plan::of(inner, aggregates, false).expect("streamable group");
+    let refused = |error: NativeError| match QueryEvaluationError::from(error) {
+        QueryEvaluationError::MemoryLimit(refused) => refused,
+        other => panic!("{other:?}"),
+    };
+    let run = |limit: usize, retry: bool| {
+        let options = QueryOptions {
+            as_written: false,
+            ..options(Some(limit))
+        };
+        let ctx = Context::new(&snapshot, &options, None, None);
+        let result = if retry {
+            ctx.group(inner, keys, aggregates, None)
+        } else {
+            ctx.group_streamed(&plan, keys, aggregates)
+        };
+        let rows = result
+            .map_err(|error| format!("{:?}", refused(error)))
+            .map(|solutions| {
+                let text = |row: usize, c: usize| {
+                    decode(
+                        &ctx.snapshot,
+                        &ctx.computed.borrow(),
+                        solutions.table.get(row, c),
+                    )
+                    .map_or("-".to_owned(), |term| term.to_string())
+                };
+                let mut rows: Vec<String> = (0..solutions.table.len())
+                    .map(|row| format!("{} {}", text(row, 0), text(row, 1)))
+                    .collect();
+                rows.sort();
+                ctx.consumed(solutions);
+                rows
+            });
+        let kept = ctx.kept.borrow().bytes();
+        let planned = ctx.distinct_counts.borrow().charged();
+        let held = release_decoder(&ctx) as i64 - planned as i64;
+        (rows, kept, held)
+    };
+    let direct_refused_past_rows = |limit: usize| {
+        let options = QueryOptions {
+            as_written: false,
+            ..options(Some(limit))
+        };
+        let ctx = Context::new(&snapshot, &options, None, None);
+        match ctx.group_direct(inner, keys, aggregates, None) {
+            Ok(solutions) => {
+                ctx.consumed(solutions);
+                false
+            }
+            Err(error) => refused(error).rows.is_some(),
+        }
+    };
+    let (mut wrong, mut compared) = (Vec::new(), 0);
+    for limit in (23..=40).map(|k| k * 100_000) {
+        let (alone, alone_kept, alone_held) = run(limit, false);
+        if alone.is_err() || !direct_refused_past_rows(limit) {
+            continue;
+        }
+        compared += 1;
+        let (retried, retry_kept, retry_held) = run(limit, true);
+        match retried {
+            Err(refused) => wrong.push(format!(
+                "{limit}: refused ({refused}) where the streamed route answers"
+            )),
+            Ok(rows) if Ok(&rows) != alone.as_ref() => {
+                wrong.push(format!("{limit}: the routes answer differently"));
+            }
+            Ok(_) if (retry_kept, retry_held) != (alone_kept, alone_held) => wrong.push(format!(
+                "{limit}: bytes held after the retry {retry_held} (kept {retry_kept}), the \
+                 streamed route {alone_held} (kept {alone_kept})"
+            )),
+            Ok(_) => {}
+        }
+    }
+    assert!(
+        compared > 0,
+        "no limit refused the direct attempt at its join"
+    );
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Spec: the ledger of the table charges made since a save point ([`Context::save`]) gives
+/// back only what it recorded. A table charged before a point and consumed while the point
+/// is open (as where an attempt returns without closing its point) breaks that: the query
+/// fails with an internal error ([`Context::check`]), and restoring the point releases
+/// nothing beyond the table's own charge. The budget keeps every other live charge, here a
+/// reservation of 65,536 bytes; nested in an outer point too.
+#[test]
+fn a_table_consumed_inside_a_later_point_fails_the_query_and_keeps_live_charges() {
+    let snapshot = snapshot();
+    let options = options(Some(1 << 20));
+    for nested in [false, true] {
+        let ctx = Context::new(&snapshot, &options, None, None);
+        let mut live = Reservation::new(&*ctx.budget);
+        live.charge(65_536).unwrap();
+        let outer = nested.then(|| ctx.save());
+        let rows: Vec<[u64; 1]> = (0..512).map(|i| [i]).collect();
+        let table = ctx
+            .produced(Solutions {
+                vars: vec![Variable::new_unchecked("x")],
+                table: IdTable::from_rows(1, rows.iter().map(|row| &row[..])),
+                ordered: false,
+            })
+            .ok()
+            .unwrap();
+        let bytes = table.table.memory_bytes();
+        let before = ctx.budget.used();
+        let point = ctx.save();
+        ctx.consumed(table);
+        ctx.restore(point);
+        assert_eq!(
+            ctx.budget.used(),
+            before - bytes,
+            "nested {nested}: the budget keeps every live charge"
+        );
+        assert!(
+            matches!(
+                ctx.check().map_err(QueryEvaluationError::from),
+                Err(QueryEvaluationError::Unexpected(_))
+            ),
+            "nested {nested}: the unbalanced ledger fails the query"
+        );
+        if let Some(outer) = outer {
+            ctx.restore(outer);
+        }
+        assert!(
+            ctx.budget.used() >= 65_536,
+            "nested {nested}: the live reservation stays"
+        );
+    }
+}
+
 /// What the context keeps to the query's end, by counter: its charge, its computed terms,
 /// its remembered numbers (since any open save point too), and its live budget and cache.
 fn counters(ctx: &Context<'_>) -> [usize; 5] {
