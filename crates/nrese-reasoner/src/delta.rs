@@ -2541,7 +2541,9 @@ mod budget_tests {
         assert!(errors.is_empty(), "{}", errors.join("\n"));
     }
 
-    fn list_update_witnesses(cases: &[(&str, usize, bool, (usize, usize, usize))]) -> Vec<String> {
+    type ListWitnessCase<'a> = (&'a str, usize, bool, (usize, usize, usize));
+
+    fn list_update_witnesses(cases: &[ListWitnessCase<'_>]) -> Vec<String> {
         let mut vocab = LocalVocabulary::default();
         let schema = Schema::owl(&mut vocab);
         let lists = ListVocabulary::new(&mut vocab);
