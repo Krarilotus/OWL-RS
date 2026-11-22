@@ -783,10 +783,17 @@ pub(crate) fn certify_report(
     if completeness.complete && rl && lists_left_out() {
         completeness.incomplete("rules", LIST.to_owned());
     }
-    let certified = snapshot.and_then(|s| crate::service::Certificate::of(s).map(|c| (s, c)));
-    if let Some((snapshot, certificate)) = certified {
-        let source = if certificate.dl { "dl" } else { "rules" };
-        conditions(completeness, query, source, snapshot, &certificate.state);
+    // With or without a certificate (`print-query --schema` prints over schema files nothing
+    // reasons over): the import is read from the statements; the literal equality, from it.
+    if let Some(snapshot) = snapshot {
+        let certificate = crate::service::Certificate::of(snapshot);
+        let source = if certificate.is_some_and(|c| c.dl) {
+            "dl"
+        } else {
+            "rules"
+        };
+        let state = certificate.map(|c| &c.state);
+        conditions(completeness, query, source, snapshot, state);
     }
     negation_rule(completeness, query, "ql");
 }
@@ -1006,7 +1013,7 @@ pub(crate) fn withhold(
     snapshot: &Snapshot,
     state: &crate::ReasoningState,
 ) {
-    if conditions(completeness, (query, reads), source, snapshot, state) {
+    if conditions(completeness, (query, reads), source, snapshot, Some(state)) {
         negation_rule(completeness, (query, reads), source);
     }
 }
@@ -1018,7 +1025,7 @@ fn conditions(
     (query, reads): (&Query, &Reads),
     source: &'static str,
     snapshot: &Snapshot,
-    state: &crate::ReasoningState,
+    state: Option<&crate::ReasoningState>,
 ) -> bool {
     use nrese_sparql::Regime::{Owl2Dl, Owl2Ql, Owl2Rl};
     if !matches!(completeness.regime, Some(Owl2Dl | Owl2Ql | Owl2Rl)) {
@@ -1031,13 +1038,13 @@ fn conditions(
         None => holds_literals(snapshot, None, access),
     };
     let read = reads.predicates.get_or_init(|| predicates(query));
-    let told = match access {
+    let told = state.and_then(|state| match access {
         None => state.literal_equality.then_some(LITERAL_EQUALITY),
         Some(access) if access.inferred_by_support => {
             (may_equate_literals(snapshot, access, state)).then_some(LITERAL_EQUALITY_UNTOLD)
         }
         Some(_) => None,
-    };
+    });
     if let Some(reason) = told.filter(|_| read.iter().any(literals)) {
         completeness.incomplete(source, reason.to_owned());
     }
