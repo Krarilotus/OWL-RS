@@ -19,6 +19,73 @@ pub(super) fn rows() -> impl Iterator<Item = Row> {
         .chain(targets())
         .chain(inferred())
         .chain(graphs())
+        .chain(equality())
+}
+
+// Spec: expansion of the sameAs class in each committed snapshot changes
+// which values the property shape reads at its explicit target.
+fn equality() -> [Row; 4] {
+    const SUPPORT: &str = "ex:n1 ex:p0 ex:v1 .";
+    const ALIAS: &str = "ex:n1 owl:sameAs ex:n0 .";
+    const UNRELATED: &str = "ex:n2 owl:sameAs ex:n3 .";
+    const MAX: &str = "ex:T sh:targetNode ex:n0 ; sh:property ex:Q .
+        ex:Q sh:path ex:p0 ; sh:maxCount 0 .";
+    let make = |shapes, data, before, infer, retract| {
+        let mut case = Case::new(
+            shapes,
+            data,
+            Step {
+                infer: quads(infer),
+                retract: quads(retract),
+                ..Step::default()
+            },
+        );
+        case.inferred = quads(before);
+        case.equality = true;
+        case
+    };
+    [
+        Row::new(
+            "equality-add-pos",
+            "An inferred alias makes the target read a forbidden value.",
+            make(MAX, SUPPORT, "", ALIAS, ""),
+            [],
+            [core_key(
+                "n0",
+                predicate("p0"),
+                None,
+                "Q",
+                Component::MaxCount,
+            )],
+        ),
+        Row::new(
+            "equality-add-twin",
+            "Equality between unrelated nodes leaves the target conformant.",
+            make(MAX, SUPPORT, "", UNRELATED, ""),
+            [],
+            [],
+        ),
+        Row::new(
+            "equality-remove-pos",
+            "Removing an inferred alias takes away the target's only support.",
+            make(MIN, SUPPORT, ALIAS, "", ALIAS),
+            [],
+            [min_key("n0")],
+        ),
+        Row::new(
+            "equality-remove-twin",
+            "A direct support remains when the alias is removed.",
+            make(
+                MIN,
+                "ex:n1 ex:p0 ex:v1 . ex:n0 ex:p0 ex:v1 .",
+                ALIAS,
+                "",
+                ALIAS,
+            ),
+            [],
+            [],
+        ),
+    ]
 }
 
 fn min_key(focus: &str) -> ResultKey {

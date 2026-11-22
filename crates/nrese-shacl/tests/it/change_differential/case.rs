@@ -1,5 +1,5 @@
 use nrese_engine::{EncodedTriple, Engine, EngineConfig, GraphSelector, Snapshot, Transaction};
-use nrese_rdf::{NamedNode, Quad};
+use nrese_rdf::{NamedNode, NamedNodeRef, Quad};
 use nrese_rdf_io::{RdfFormat, RdfParser};
 use nrese_shacl::{
     Selection, Shapes, ValidationReport, compile, validate, validate_changes,
@@ -67,6 +67,7 @@ pub(super) struct Case {
     pub shapes: Option<String>,
     pub steps: Vec<Step>,
     pub fresh_value: bool,
+    pub equality: bool,
 }
 
 impl Case {
@@ -77,6 +78,7 @@ impl Case {
             shapes: Some(shapes.into()),
             steps: vec![step],
             fresh_value: false,
+            equality: false,
         }
     }
 
@@ -84,6 +86,9 @@ impl Case {
         let engine = Engine::new(EngineConfig::default()).map_err(|error| error.to_string())?;
         let mut shapes_rdf = shape_quads(self.shapes.as_deref().unwrap_or_default());
         let mut tx = engine.transaction();
+        let same_as = self.equality.then(|| {
+            tx.intern(NamedNodeRef::new_unchecked("http://www.w3.org/2002/07/owl#sameAs").into())
+        });
         // Keep the graph's name in the dictionary even for an empty set of shapes.
         tx.insert(Quad::new(ex("shapes"), ex("graph"), ex("shapes"), ex("shapes")).as_ref());
         for quad in self.asserted.iter().chain(&shapes_rdf) {
@@ -93,7 +98,15 @@ impl Case {
             tx.insert_inferred(inferred(&tx, quad));
         }
         tx.commit().map_err(|error| error.to_string())?;
-        let mut before = engine.snapshot();
+        let read = || {
+            let snapshot = engine.snapshot();
+            if let Some(same_as) = same_as {
+                snapshot.with_equality(Some(same_as))
+            } else {
+                snapshot
+            }
+        };
+        let mut before = read();
         let shapes_id = before
             .lookup(ex("shapes").as_ref().into())
             .expect("shapes graph");
@@ -142,7 +155,7 @@ impl Case {
                 )
                 .collect::<Vec<_>>();
             tx.commit().map_err(|error| error.to_string())?;
-            let after = engine.snapshot();
+            let after = read();
             let observer = Observer::new(&before, &after, self.fresh_value);
             let empty = Shapes::default();
             let shapes_before = shapes.as_ref().unwrap_or(&empty);

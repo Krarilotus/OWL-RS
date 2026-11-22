@@ -4,14 +4,17 @@ use nrese_rdf::{NamedNode, Term};
 use nrese_shacl::{Component, PropertyPath, SH};
 
 use super::case::{Case, Step, ex, quads};
+use super::gaps::EntryPoint;
 use super::observe::{Deviation, ResultKey, ResultTerm, compare};
 
 mod data;
+mod shapes;
 
 struct Row {
     id: String,
     description: &'static str,
     case: Case,
+    entry: EntryPoint,
     before: BTreeSet<ResultKey>,
     after: BTreeSet<ResultKey>,
 }
@@ -28,9 +31,15 @@ impl Row {
             id: id.into(),
             description,
             case,
+            entry: EntryPoint::Data,
             before: before.into_iter().collect(),
             after: after.into_iter().collect(),
         }
+    }
+
+    fn for_shapes(mut self) -> Self {
+        self.entry = EntryPoint::Shapes;
+        self
     }
 }
 
@@ -64,7 +73,8 @@ pub(super) fn run() {
         .into_iter()
         .chain(cycle())
         .chain(shared_target())
-        .chain(data::rows());
+        .chain(data::rows())
+        .chain(shapes::rows());
     let selector = std::env::var("NRESE_SHACL_CASE").ok();
     let mut checked = 0;
     for row in rows {
@@ -79,6 +89,7 @@ pub(super) fn run() {
                 case.asserted
                     .extend(quads(&format!("ex:m{i} ex:pad ex:spare .")));
             }
+            let mut pinned = false;
             for outcome in case
                 .run()
                 .unwrap_or_else(|error| panic!("{context}: {error}"))
@@ -86,6 +97,10 @@ pub(super) fn run() {
                 let location = format!("{context}, step {}, {:?}", outcome.step, outcome.entry);
                 let deviation = compare(&outcome.before, &outcome.after, &outcome.actual);
                 assert_eq!(deviation, Deviation::default(), "{location}");
+                if outcome.entry != row.entry {
+                    continue;
+                }
+                pinned = true;
                 assert_eq!(
                     outcome.before.result_set(),
                     row.before,
@@ -109,6 +124,7 @@ pub(super) fn run() {
                     "{location}: actual failures"
                 );
             }
+            assert!(pinned, "{context}: missing {:?} observation", row.entry);
         }
         checked += 1;
     }
