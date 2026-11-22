@@ -750,10 +750,10 @@ impl StoreService {
     /// `certificate` with its state marked as the rules equating a literal with another term
     /// ([`crate::ReasoningState::literal_equality`]), for the version of a commit that derived
     /// such a fact; the same object where it is marked already or isn't this store's. The
-    /// version's certificate is the mark's one place: a commit that fails publishes none, so
-    /// it leaves nothing to take back, and a certificate made again takes the mark from the
-    /// version's ([`Self::certify`]). The marker on disk isn't changed (an open finds the
-    /// equality again, [`Self::literal_equality_at_open`]).
+    /// state kept in memory is marked too ([`Self::mark_literal_equality`]), for a version
+    /// with no certificate; a certificate made again takes the mark from either
+    /// ([`Self::certify`]). The marker on disk isn't changed (an open finds the equality
+    /// again, [`Self::literal_equality_at_open`]).
     pub(crate) fn with_literal_equality(
         certificate: nrese_engine::Certificate,
     ) -> nrese_engine::Certificate {
@@ -774,6 +774,20 @@ impl StoreService {
             _ => None,
         };
         marked.unwrap_or(certificate)
+    }
+
+    /// Marks the state kept in memory as the rules equating a literal with another term, by a
+    /// holder of the writer slot before a maintained commit that derived such a fact: a
+    /// version made while no certificate is in place (rules other than the stack's
+    /// registered, [`Self::use_reasoning_rules`]) has none to carry the mark, and the
+    /// certificate made again reads the kept state ([`Self::certify`]). A commit that then
+    /// fails leaves the mark: the word is withheld until a rematerialisation, never given
+    /// wrongly.
+    pub(crate) fn mark_literal_equality(&self, _writer: nrese_engine::WriterHeld<'_>) {
+        let mut kept = self.materialised.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(kept) = kept.as_mut() {
+            kept.literal_equality = true;
+        }
     }
 
     /// Whether the rules of `state` equate a literal with another term over the statements

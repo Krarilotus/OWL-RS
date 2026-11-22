@@ -474,10 +474,16 @@ impl MutationPipeline {
                 let writer = tx.writer().expect("a transaction holds the writer slot");
                 self.store.invalidate_held(writer).map_err(store_error)?;
             }
+            // A commit that equated a literal with another term: its version and every later
+            // one withhold the word from reads of literals, until a rematerialisation finds no
+            // such equality (`ReasoningState::literal_equality`). The mark goes on the state
+            // kept in memory, certificate or not, and on the version's certificate where it
+            // has one.
+            if literal_equality {
+                let writer = tx.writer().expect("a transaction holds the writer slot");
+                self.store.mark_literal_equality(writer);
+            }
             if let Some(mut certificate) = tx.base().certificate().cloned() {
-                // A commit that equated a literal with another term: its version and every
-                // later one withhold the word from reads of literals, until a
-                // rematerialisation finds no such equality (`ReasoningState::literal_equality`).
                 if literal_equality {
                     certificate = StoreService::with_literal_equality(certificate);
                 }
