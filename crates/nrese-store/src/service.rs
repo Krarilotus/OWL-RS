@@ -85,6 +85,9 @@ pub struct StoreService {
     /// ([`Self::unavailable`]): its state is neither the one before a failed change nor the
     /// one after it. Set once.
     unavailable: std::sync::Arc<std::sync::OnceLock<String>>,
+    /// The stored shapes as last compiled ([`Self::shacl_gate_state`]): at the open, and
+    /// after each write that changes the shapes graph.
+    pub(crate) shapes_kept: std::sync::Arc<std::sync::Mutex<crate::shacl::KeptShapes>>,
 }
 
 /// The file recording what the inferred stack is exact for ([`crate::reasoning_state`]).
@@ -342,6 +345,9 @@ impl StoreService {
             std::sync::Arc::clone(&namespaces),
             std::sync::Arc::clone(&settings.search_scope),
         ));
+        // After the open's own write (the ontology's preload, into the default graph): the
+        // shapes as the store holds them from here.
+        let shapes_kept = crate::shacl::KeptShapes::compiled(&engine.snapshot(), &config);
         let service = Self {
             process_memory,
             capacity: nrese_exec::memory::capacity,
@@ -364,6 +370,7 @@ impl StoreService {
             ql_mode: std::sync::Arc::new(std::sync::RwLock::new(ql_mode)),
             outside_profile: std::sync::Arc::new(std::sync::RwLock::new(outside_profile)),
             last_materialisation: std::sync::Arc::default(),
+            shapes_kept: std::sync::Arc::new(std::sync::Mutex::new(shapes_kept)),
         };
         // Every store a replica server opens is a replica's from its open on, the default and
         // the catalog's others alike: its `owl2-dl` mode interns no term (the default's
@@ -2190,6 +2197,8 @@ impl StoreService {
         // failure, the support sets start afresh.
         if self.current_revision() != before {
             self.supports().forget();
+            // The records don't say which graphs they change.
+            self.compile_kept_shapes();
         }
         applied.map_err(crate::StoreError::Engine)
     }
@@ -2254,7 +2263,11 @@ impl StoreService {
         let cancellation = CancellationToken::new();
         let context = self.update_context(self.envelope(None), &cancellation);
         let report = command.apply(&mut tx, requester, &context)?;
+        let shapes = crate::shacl::changes_shapes(&tx, &self.config.shapes_graph);
         let summary = tx.commit()?;
+        if shapes {
+            self.compile_kept_shapes();
+        }
         Ok(report.committed(summary.revision))
     }
 
@@ -2311,14 +2324,21 @@ impl StoreService {
         let invalid = request.invalid.unwrap_or(self.config.invalid_statements);
         // Cleared under the load's writer slot, before it commits (invariant C).
         let invalidate = |writer: nrese_engine::WriterHeld<'_>| self.invalidate_held(writer);
-        bulk_load(
+        let before = self.current_revision();
+        let loaded = bulk_load(
             &self.engine,
             request,
             progress,
             invalid,
             &self.quarantine,
             &invalidate,
-        )
+        );
+        // Whatever it published (a failure may follow the publication): a load may replace
+        // every graph, and doesn't say which it changed.
+        if self.current_revision() != before {
+            self.compile_kept_shapes();
+        }
+        loaded
     }
 
     /// Builds the query planner's statistics of the store as it is now and saves them

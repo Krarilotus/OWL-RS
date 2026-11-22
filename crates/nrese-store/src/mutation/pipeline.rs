@@ -443,7 +443,7 @@ impl MutationPipeline {
             } else {
                 None
             };
-            crate::shacl::check_shapes(
+            let shapes = crate::shacl::check_shapes(
                 &tx,
                 &self.store.config().shapes_graph,
                 ticket,
@@ -498,6 +498,9 @@ impl MutationPipeline {
                 source: StoreError::Engine(error),
             })?;
             drop(rights);
+            if let Some(shapes) = shapes {
+                self.store.keep_shapes(summary.revision, Ok(shapes));
+            }
             if let Some(touched) = touched {
                 supports.note_commit(before, summary.revision, touched);
             }
@@ -542,7 +545,7 @@ impl MutationPipeline {
         self.store
             .invalidate_held(tx.writer().expect("a transaction holds the writer slot"))
             .map_err(store_error)?;
-        crate::shacl::check_shapes(
+        let shapes = crate::shacl::check_shapes(
             &tx,
             &self.store.config().shapes_graph,
             ticket,
@@ -563,13 +566,17 @@ impl MutationPipeline {
             return Err(MutationError::Cancelled);
         }
         let rights = ticket.hold_rights()?;
-        let (_, report) = publishing(ticket, report, tx, |tx| tx.commit()).map_err(|error| {
-            MutationError::Store {
-                kind,
-                source: StoreError::Engine(error),
-            }
-        })?;
+        let (summary, report) =
+            publishing(ticket, report, tx, |tx| tx.commit()).map_err(|error| {
+                MutationError::Store {
+                    kind,
+                    source: StoreError::Engine(error),
+                }
+            })?;
         drop(rights);
+        if let Some(shapes) = shapes {
+            self.store.keep_shapes(summary.revision, Ok(shapes));
+        }
         Ok(report)
     }
 

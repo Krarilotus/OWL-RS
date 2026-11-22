@@ -599,8 +599,9 @@ leave something out.
   later commits are checked only for what they introduce. Validate with `GET /dataset/shacl`
   after one.
 - With no shapes stored, a gate set to `enforce` accepts every write. An upload of shapes that
-  fails (one that runs past its timeout, say) stores none, so check its status and read the
-  shapes graph back.
+  fails (one that runs past its timeout, say) stores none. The repository's info says which
+  shapes are in force (`GET /dataset/info`, `shacl`: their number and `vacuous`), and the log
+  warns at the start while a gate that is on checks nothing.
 - A commit that changes the shapes is checked against the shapes as they are after it: one
   update that removes the shapes and adds data is checked against none. It needs the right to
   write the shapes graph.
@@ -615,8 +616,10 @@ leave something out.
   shape (a `sh:property` inside a `sh:property`) counts as introduced when a new focus node
   reaches it, though another focus node reached it before. Repair that result first
   (`GET /dataset/shacl` lists it).
-- Shapes that don't compile refuse every write, and a validation stopped by its budget fails
-  the write, with the gate set to `report` as to `enforce`.
+- With the gate set to `report` or `enforce`, a write that leaves an uncompilable shapes graph
+  unchanged is refused (a bulk load can store such shapes; the info's `shacl` then says why
+  they aren't counted). Repair or replace the shapes graph to restore writes. A validation
+  stopped by its budget fails the write in either mode.
 
 ## Memory and stopping
 
