@@ -4,6 +4,11 @@
 #
 #   name version
 cargo-nextest 0.9.146
+# The Windows gate's cargo-nextest (scripts/lib/windows-job.sh), taken only by its archive's sha256:
+# get.nexte.st/<version>/windows-tar, the release's cargo-nextest-<version>-x86_64-pc-windows-msvc.tar.gz
+# (GitHub's digest of that asset), and run only as the cargo-nextest.exe it holds (its sha256).
+#   cargo-nextest-windows version archive-sha256 exe-sha256
+cargo-nextest-windows 0.9.146 809b01f2c94d031ab6cf5f4d4a4f477c8f51b69c96ab3cb2fe4db7ecb222d0d3 124cf1963c7c4c43cfc698e17daf441eb8ab8e160c053d83ebe2d40e82834f4c
 # Miri's toolchain (scripts/miri.sh)
 miri nightly-2026-10-01
 cargo-deny 0.20.2
