@@ -398,11 +398,17 @@ async fn hold(
         moved: Instant::now(),
         cut: false,
     };
+    // Whether the hold held part of the answer when it first saw the envelope refused: the
+    // count then, not after the channel's last frames, which may have been queued before.
+    let mut held_at_refusal = None;
     loop {
         match tokio::time::timeout_at(deadline, receiver.recv()).await {
             Err(_elapsed) => return Err(ApiError::timeout(timeout_message)),
             Ok(None) => break,
             Ok(Some(frame)) => {
+                if held_at_refusal.is_none() && envelope.refused() {
+                    held_at_refusal = Some(held.memory.bytes() > 0);
+                }
                 if let Some(data) = frame.data_ref() {
                     let bytes = data.len();
                     held.memory
@@ -419,8 +425,9 @@ async fn hold(
         // hold held part of the answer, it was refused for holding it, as a refusal of the
         // hold's own charge would be. Refused by the memory all queries share, whenever that
         // was, it may be retried as the hold's own refusal there may.
+        // Unseen while frames came, the refusal came after the last of them was held.
         let refused = envelope.refused();
-        let beside = held.memory.bytes() > 0 && refused;
+        let beside = refused && held_at_refusal.unwrap_or(held.memory.bytes() > 0);
         return Err(match stopped {
             ApiError::PayloadTooLarge(_) if beside => too_large_for_http10(bound),
             ApiError::ServiceUnavailable(detail) if refused => ApiError::busy(detail),
