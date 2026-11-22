@@ -948,11 +948,13 @@ fn one_pass_plan(
 }
 
 /// [`aggregate_in_one_pass`]'s pass where a MIN or MAX column holds several datatypes, one
-/// aggregate at a time. Each such MIN or MAX (`mixed`) keeps one [`value::order_key`] per
-/// group, the extreme in [`value::order`], and recovers its id once per group; every other
-/// aggregate, a MIN or MAX over one datatype included, takes [`Running::add`], as in the
-/// ordinary pass, and shares a column's state as there (`first`). Out of line and cold, so
-/// the ordinary pass keeps its code; its state is per group, like that pass's, never per row.
+/// column at a time. On a column with such a MIN or MAX (`mixed`), one loop over its rows
+/// keeps each group's least and greatest [`value::order_key`], the extremes in
+/// [`value::order`], computing each row's key once, and gives its column's other aggregates
+/// (COUNT, SUM, AVG) their [`Running::add`] in the same loop, into the state they share
+/// (`first`); each MIN or MAX recovers its id once per group. A column without one takes
+/// [`Running::add`] alone, as in the ordinary pass. Out of line and cold, so the ordinary
+/// pass keeps its code; its state is per group, like that pass's, never per row.
 #[cold]
 #[inline(never)]
 fn mixed_pass(
@@ -967,51 +969,68 @@ fn mixed_pass(
     for &group in group_of {
         rows[group as usize] += 1;
     }
-    for (a, (column, name)) in plan.iter().enumerate() {
-        // An aggregate that shares an earlier one's state (`first`) has nothing to add.
-        let Some(column) = column.filter(|_| first[a] == a) else {
+    let len = plan.len();
+    for (a, (column, _)) in plan.iter().enumerate() {
+        // Each column once, at the first aggregate that reads it.
+        let Some(column) = *column else { continue };
+        if plan[..a]
+            .iter()
+            .any(|(earlier, _)| *earlier == Some(column))
+        {
             continue;
-        };
+        }
+        let on_column = |b: &usize| plan[*b].0 == Some(column);
+        // The state the column's unkeyed aggregates share, if it has one.
+        let shared = (0..len)
+            .find(|b| on_column(b) && !mixed[*b])
+            .map(|b| first[b]);
+        let keyed: Vec<usize> = (0..len).filter(|b| on_column(b) && mixed[*b]).collect();
         let ids = solutions.table.column(column);
-        let at = |group: usize| group * plan.len() + a;
-        let max = match name {
-            AggregateFunction::Min | AggregateFunction::Max if mixed[a] => {
-                *name == AggregateFunction::Max
-            }
-            _ => {
+        if keyed.is_empty() {
+            if let Some(s) = shared {
                 for (&group, &id) in group_of.iter().zip(ids) {
-                    running[at(group as usize)].add(id);
+                    running[group as usize * len + s].add(id);
                 }
-                continue;
             }
-        };
-        // No key is 0 or `u64::MAX`: a group still at `none` has no value.
-        let none = if max { 0 } else { u64::MAX };
-        let mut keys = vec![none; rows.len()];
+            continue;
+        }
+        // No key is 0 or `u64::MAX`: a group still at its start has no value.
+        let mut least = vec![u64::MAX; rows.len()];
+        let mut greatest = vec![0u64; rows.len()];
+        let mut unbound = vec![false; rows.len()];
         for (&group, &id) in group_of.iter().zip(ids) {
+            let group = group as usize;
+            if let Some(s) = shared {
+                running[group * len + s].add(id);
+            }
             if id == UNDEF {
-                running[at(group as usize)].unbound = true;
+                unbound[group] = true;
                 continue;
             }
             // Every bound id here has a key: `one_pass_plan` declines a column with one without.
             let Some(key) = value::order_key(TermId::from_raw(id)) else {
                 continue;
             };
-            let best = &mut keys[group as usize];
-            *best = if max {
-                (*best).max(key)
-            } else {
-                (*best).min(key)
-            };
+            least[group] = least[group].min(key);
+            greatest[group] = greatest[group].max(key);
         }
-        for (group, key) in keys.into_iter().enumerate().filter(|&(_, key)| key != none) {
+        let extreme = |key: u64| {
             let id = value::order_key_id(key);
-            let extreme = id.as_inline_integer().map(|value| (value, id.raw()));
-            let running = &mut running[at(group)];
-            if max {
-                running.max = extreme
-            } else {
-                running.min = extreme
+            id.as_inline_integer().map(|value| (value, id.raw()))
+        };
+        for group in 0..rows.len() {
+            for &b in &keyed {
+                let running = &mut running[group * len + b];
+                running.unbound = unbound[group];
+                if plan[b].1 == AggregateFunction::Max {
+                    running.max = Some(greatest[group])
+                        .filter(|&key| key != 0)
+                        .and_then(extreme);
+                } else {
+                    running.min = Some(least[group])
+                        .filter(|&key| key != u64::MAX)
+                        .and_then(extreme);
+                }
             }
         }
     }
