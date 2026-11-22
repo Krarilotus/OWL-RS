@@ -208,8 +208,7 @@ async fn told(
 /// 1 MiB of 8 MiB; the answer is 2 MiB) is refused with 503 and no `Retry-After`, to a reader
 /// of every graph and to a reader of some, as every memory refusal is. The reader of some
 /// graphs is told the same whether or not work it can't see holds 256 KiB more of that
-/// memory, and the same as the reader of every graph: nothing it is told depends on hidden
-/// work.
+/// memory: nothing it is told depends on hidden work.
 #[tokio::test]
 async fn an_http10_answer_past_the_shared_memory_is_told_alike_and_not_when_to_retry()
 -> Result<(), Box<dyn Error>> {
@@ -240,7 +239,211 @@ async fn an_http10_answer_past_the_shared_memory_is_told_alike_and_not_when_to_r
         alone.2, beside_hidden.2,
         "the reader is told of work it can't see"
     );
-    assert_eq!(alone.2, every.2);
+    Ok(())
+}
+
+/// The memory all queries share in the table of a reader of some graphs' refusals.
+const SHARED: usize = 8 << 20;
+
+/// A status and its problem's `type`, `title` and `detail` (not its request id).
+type Told = (StatusCode, serde_json::Value);
+
+/// What `request` is told.
+async fn told_to(app: &axum::Router, request: Request<Body>) -> Result<Told, Box<dyn Error>> {
+    let response = app.clone().oneshot(request).await?;
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await?;
+    eprintln!("{status}: {}", String::from_utf8_lossy(&body));
+    let problem: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+    let problem = serde_json::json!({
+        "type": problem["type"],
+        "title": problem["title"],
+        "detail": problem["detail"],
+    });
+    Ok((status, problem))
+}
+
+/// What `request` is told alone, then while work its reader can't see holds all but `room`
+/// of the memory all queries share.
+async fn alone_and_beside_hidden(
+    store: &StoreService,
+    app: &axum::Router,
+    request: &dyn Fn() -> Result<Request<Body>, axum::http::Error>,
+    room: usize,
+) -> Result<(Told, Told), Box<dyn Error>> {
+    let before = held(store);
+    let alone = told_to(app, request()?).await?;
+    released_to(store, before).await;
+    let hidden = store.envelope(None);
+    hidden.charge(SHARED - room - held(store))?;
+    let beside = told_to(app, request()?).await?;
+    drop(hidden);
+    released_to(store, before).await;
+    Ok((alone, beside))
+}
+
+/// The HTTP/1.0 query (`cut_body_wire_tests::query`: a 256 KiB result table, a 2 MiB answer)
+/// of the requester with `roles`.
+fn query_as<'a>(
+    roles: &'a [&'a str],
+) -> impl Fn() -> Result<Request<Body>, axum::http::Error> + 'a {
+    move || {
+        Request::post("/dataset/query")
+            .version(Version::HTTP_10)
+            .header(header::CONTENT_TYPE, "application/sparql-query")
+            .header(header::ACCEPT, "text/csv")
+            .header(header::AUTHORIZATION, format!("Bearer {}", token(roles)))
+            .body(Body::from(query()))
+    }
+}
+
+/// An HTTP/1.0 `GET` of `uri` by the requester with `roles`.
+fn get_as<'a>(
+    uri: &'a str,
+    roles: &'a [&'a str],
+) -> impl Fn() -> Result<Request<Body>, axum::http::Error> + 'a {
+    move || {
+        Request::get(uri)
+            .version(Version::HTTP_10)
+            .header(header::ACCEPT, "application/n-triples")
+            .header(header::AUTHORIZATION, format!("Bearer {}", token(roles)))
+            .body(Body::empty())
+    }
+}
+
+/// `policy` with a query memory of `bytes` (`budgets.query_memory`).
+fn limited(policy: &str, bytes: usize) -> Result<PolicyConfig, Box<dyn Error>> {
+    let mut policy = policy_of(policy)?;
+    policy.limits.max_query_memory_bytes = bytes;
+    Ok(policy)
+}
+
+/// A store whose queries share [`SHARED`], with the public and the secret graph of
+/// [`SUPPORTED`]'s readers, reasoned over under OWL 2 RL: a public reader's view of what
+/// its graphs support is built over the secret graph's 10,000 statements.
+async fn supported_store() -> Result<StoreService, Box<dyn Error>> {
+    let store = StoreService::new(StoreConfig {
+        total_query_memory_bytes: SHARED,
+        ..StoreConfig::in_memory()
+    })?;
+    let setup = test_app_with_store(
+        store.clone(),
+        policy_of(SUPPORTED)?,
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
+    )?;
+    let secret: String = (0..10_000)
+        .map(|i| format!("<urn:hidden{i}> <urn:p> {i} . "))
+        .collect();
+    let insert = Request::post("/dataset/update")
+        .header(header::CONTENT_TYPE, "application/sparql-update")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", token(&["nrese.admin"])),
+        )
+        .body(Body::from(format!(
+            "INSERT DATA {{ GRAPH <urn:g:public> {{ <urn:visible> <urn:p> <urn:o> . \
+             <urn:p> <http://www.w3.org/2000/01/rdf-schema#subPropertyOf> <urn:q> }} \
+             GRAPH <urn:g:secret> {{ {secret} }} }}"
+        )))?;
+    let (status, body) = answer(&setup, insert).await?;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    Ok(store)
+}
+
+/// Each site where a reader of some graphs' HTTP/1.0 answer, held whole, is refused for
+/// memory, on its real route, alone and while work it can't see holds all but `room` of the
+/// memory all queries share (which then refuses first): one status, 503, and one text at
+/// every site, whichever limit refused it, so nothing it is told depends on hidden work.
+/// The sites:
+/// - a query's evaluation, its 256 KiB result table past its own 128 KiB;
+/// - a query's answer held whole, 2 MiB past its own 1 MiB;
+/// - a graph read's view, built over a secret graph, past its own 64 KiB;
+/// - an RDF4J statements read's view, the same.
+///
+/// A reader of every graph keeps the distinction where it has one (the query's rows): its
+/// own limit's 413, the query's or the HTTP/1.0 answer's, alone; the shared memory's 503
+/// beside the others.
+#[tokio::test]
+async fn a_restricted_readers_held_answer_is_told_one_memory_refusal_at_every_site()
+-> Result<(), Box<dyn Error>> {
+    const ONE: &[&str] = &["nrese.read", "one"];
+    const PUBLIC: &[&str] = &["nrese.read", "public"];
+    const EVERY: &[&str] = &["nrese.admin"];
+    let queries = StoreService::new(StoreConfig {
+        total_query_memory_bytes: SHARED,
+        ..StoreConfig::in_memory()
+    })?;
+    let app = |policy| test_app_with_store(queries.clone(), policy, ReasonerConfig::default());
+    let evaluation = app(limited(READERS, 128 << 10)?)?;
+    let holding = app(limited(READERS, 1 << 20)?)?;
+    let graphs = supported_store().await?;
+    let reasoner = ReasonerConfig::for_mode(ReasoningMode::Owl2Rl);
+    let views = test_app_with_store(graphs.clone(), limited(SUPPORTED, 64 << 10)?, reasoner)?;
+    let queried = query_as(ONE);
+    let graph = get_as("/dataset/data?graph=urn:g:public", PUBLIC);
+    let statements = get_as(
+        "/repositories/nrese/statements?context=%3Curn%3Ag%3Apublic%3E",
+        PUBLIC,
+    );
+    type Ask<'a> = &'a dyn Fn() -> Result<Request<Body>, axum::http::Error>;
+    let rows: [(&str, &StoreService, &axum::Router, Ask<'_>, usize); 4] = [
+        (
+            "a query's evaluation",
+            &queries,
+            &evaluation,
+            &queried,
+            32 << 10,
+        ),
+        (
+            "a query's held answer",
+            &queries,
+            &holding,
+            &queried,
+            512 << 10,
+        ),
+        ("a graph read's view", &graphs, &views, &graph, 32 << 10),
+        (
+            "a statements read's view",
+            &graphs,
+            &views,
+            &statements,
+            32 << 10,
+        ),
+    ];
+    let mut texts = Vec::new();
+    for (site, store, app, request, room) in rows {
+        let (alone, beside) = alone_and_beside_hidden(store, app, request, room).await?;
+        assert_eq!(
+            alone.0,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{site}: {alone:?}"
+        );
+        assert_eq!(
+            alone, beside,
+            "{site}: the reader is told of work it can't see"
+        );
+        texts.push(alone.1);
+    }
+    assert!(
+        texts.windows(2).all(|pair| pair[0] == pair[1]),
+        "the sites tell different texts: {texts:?}"
+    );
+
+    let (alone, beside) =
+        alone_and_beside_hidden(&queries, &evaluation, &query_as(EVERY), 32 << 10).await?;
+    assert_eq!(alone.0, StatusCode::PAYLOAD_TOO_LARGE, "{alone:?}");
+    let own = alone.1["detail"].as_str().unwrap_or_default();
+    assert!(own.contains("budgets.query_memory"), "{own}");
+    assert_eq!(beside.0, StatusCode::SERVICE_UNAVAILABLE, "{beside:?}");
+    let (alone, beside) =
+        alone_and_beside_hidden(&queries, &holding, &query_as(EVERY), 512 << 10).await?;
+    assert_eq!(alone.0, StatusCode::PAYLOAD_TOO_LARGE, "{alone:?}");
+    let own = alone.1["detail"].as_str().unwrap_or_default();
+    assert!(
+        own.starts_with("This answer is larger than the 1 MiB"),
+        "{own}"
+    );
+    assert_eq!(beside.0, StatusCode::SERVICE_UNAVAILABLE, "{beside:?}");
     Ok(())
 }
 

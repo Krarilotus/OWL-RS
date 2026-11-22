@@ -1353,6 +1353,37 @@ mod tests {
         );
     }
 
+    /// Over HTTP/1.0, a producer that ended with its own error while a frame it wrote was
+    /// still unheld keeps that error, though the hold's charge of the frame is refused after
+    /// it (the frame is past the envelope): the answer is what stopped it first. Step by step,
+    /// on the hold's step between its clock check and its charge: the frame queued; the hold
+    /// takes it and stops there; the producer records its error and ends; the hold goes on.
+    #[tokio::test]
+    async fn a_producers_error_recorded_before_a_queued_frames_refusal_is_the_answer() {
+        let memory = Envelope::new(Some(1 << 10), None);
+        let (sender, receiver) = mpsc::channel(CHANNEL_CHUNKS);
+        sender
+            .try_send(Frame::data(Bytes::from(vec![b'x'; CHUNK_BYTES])))
+            .unwrap();
+        let outcome = Outcome::default();
+        let (at_step, go) = armed();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let held = hold(receiver, &outcome, deadline, memory.clone(), "timeout");
+        let ended = async {
+            at_step.await.expect("the hold reached its step");
+            outcome.set(Err(ApiError::internal("the export failed")));
+            drop(sender);
+            go.send(()).unwrap();
+        };
+        let (stopped, ()) = tokio::join!(held, ended);
+        let stopped = stopped
+            .err()
+            .map(IntoResponse::into_response)
+            .expect("the producer failed, no answer");
+        assert_eq!(stopped.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(memory.used(), 0, "the refused answer still holds memory");
+    }
+
     /// Over HTTP/1.0, what a hold that resumes only past its deadline (1 s) answers, on a
     /// clock the test moves: the producer is open through expiry, and only after it are
     /// `frame` bytes queued and, with `end`, its end set (`None`: it stays open).
