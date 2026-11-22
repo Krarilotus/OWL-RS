@@ -929,6 +929,59 @@ fn a_restored_save_point_leaves_the_context_as_it_was() {
     );
 }
 
+/// Spec: a pass whose numbers are partly in the query's memo and partly found since its own
+/// save point, inside an outer one (as a chunk of a cross product finds them,
+/// [`Context::group_crossed`]), answers in one pass: its numbers are kept, and each group's
+/// sum is the one SPARQL gives. First `SUM(?v + 0)` over 0..64 outside any point, its 64
+/// numbers kept in the memo; then over 0..128 in 8 groups (`v % 8`), whose sums are
+/// `16 g + 960`.
+#[test]
+fn a_pass_with_numbers_in_the_memo_and_since_its_point_answers_in_one_pass() {
+    let snapshot = snapshot();
+    let options = options(None);
+    let ctx = Context::new(&snapshot, &options, None, None);
+    let sums = |values: &[(u32, u32)]| {
+        let text = grouped(values, "(SUM(?v + 0) AS ?t)");
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        let Query::Select { pattern, .. } = &query else {
+            panic!("a SELECT")
+        };
+        let (inner, variables, aggregates) = group_in(pattern);
+        let solutions = ctx.eval(inner).ok().expect("no limit");
+        let (groups, positions) = aggregate::groups_of(&solutions, variables).ok().unwrap();
+        let columns = ctx
+            .aggregate_columns(&solutions, &groups.group_of, groups.len(), aggregates)
+            .ok()
+            .expect("no limit");
+        let keys = aggregate::key_columns(&groups, &positions, None);
+        let integer =
+            |id: u64| integer_of(&decode(&ctx.snapshot, &ctx.computed.borrow(), id).unwrap());
+        let mut sums: Vec<(i64, i64)> = (0..groups.len())
+            .map(|g| (integer(keys[0][g]), integer(columns[0][g])))
+            .collect();
+        sums.sort();
+        ctx.consumed(solutions);
+        sums
+    };
+    let first: Vec<_> = (0..64).map(|v| (v % 8, v)).collect();
+    assert_eq!(sums(&first).len(), 8, "eight groups");
+    assert_eq!(
+        counters(&ctx)[2],
+        64,
+        "the first pass's numbers are in the memo"
+    );
+    let outer = ctx.save();
+    let all: Vec<_> = (0..128).map(|v| (v % 8, v)).collect();
+    let expected: Vec<(i64, i64)> = (0..8).map(|g| (g, 16 * g + 960)).collect();
+    assert_eq!(sums(&all), expected, "each group's sum");
+    assert_eq!(
+        counters(&ctx)[2],
+        128,
+        "the pass answered: its 64 new numbers are kept"
+    );
+    ctx.keep(outer);
+}
+
 /// A triple term new to the store: `<urn:s> <urn:p> object`.
 fn triple(object: Term) -> Term {
     nrese_rdf::Triple::new(
