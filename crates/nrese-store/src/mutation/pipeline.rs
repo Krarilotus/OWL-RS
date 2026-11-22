@@ -284,20 +284,21 @@ impl MutationPipeline {
                 self.store.consistency(),
                 crate::ConsistencyStatus::Consistent
             );
-            let (violations, materialisation, changed) = crate::reasoning::apply_delta(
-                program,
-                cached,
-                &mut tx,
-                &operation,
-                &report_memory,
-                &working_memory,
-                base_consistent,
-            )
-            .map_err(|interrupted| {
-                memory
-                    .error(interrupted)
-                    .map_or_else(|| known_error(MutationError::Cancelled), &store_error)
-            })?;
+            let (violations, materialisation, changed, literal_equality) =
+                crate::reasoning::apply_delta(
+                    program,
+                    cached,
+                    &mut tx,
+                    &operation,
+                    &report_memory,
+                    &working_memory,
+                    base_consistent,
+                )
+                .map_err(|interrupted| {
+                    memory
+                        .error(interrupted)
+                        .map_or_else(|| known_error(MutationError::Cancelled), &store_error)
+                })?;
             let inconsistent = !violations.consistent();
             if inconsistent {
                 ticket.claim_error()?;
@@ -493,14 +494,30 @@ impl MutationPipeline {
                 let writer = tx.writer().expect("a transaction holds the writer slot");
                 self.store.invalidate_held(writer).map_err(store_error)?;
             }
-            if let Some(certificate) = tx.base().certificate().cloned() {
+            // A commit that equated a literal with another term: its version and every later
+            // one withhold the word from reads of literals, until a rematerialisation finds no
+            // such equality (`ReasoningState::literal_equality`). The mark goes on the state
+            // kept in memory, certificate or not, and on the version's certificate where it
+            // has one.
+            if literal_equality {
+                let writer = tx.writer().expect("a transaction holds the writer slot");
+                self.store.mark_literal_equality(writer);
+            }
+            if let Some(mut certificate) = tx.base().certificate().cloned() {
+                if literal_equality {
+                    certificate = StoreService::with_literal_equality(certificate);
+                }
                 tx.vouch(certificate);
             }
-            let (summary, report) = match ql {
+            let committed = match ql {
                 Some(ql) => publishing(ticket, report, tx, |tx| ql.commit(tx)),
                 None => publishing(ticket, report, tx, |tx| tx.commit()),
+            };
+            #[cfg(test)]
+            if committed.is_err() {
+                crate::service::hooks::run(&crate::service::hooks::AFTER_FAILED_COMMIT);
             }
-            .map_err(|error| MutationError::Store {
+            let (summary, report) = committed.map_err(|error| MutationError::Store {
                 kind,
                 source: StoreError::Engine(error),
             })?;

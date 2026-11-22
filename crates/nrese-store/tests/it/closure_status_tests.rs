@@ -117,6 +117,14 @@ const MEMBERS: [(&str, &str, &str, &str); 8] = [
 const RDF: &str = "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> ";
 
 fn closure(data: &str, ruleset: Ruleset, ql: QlRewritingMode) -> StoreService {
+    let store = loaded(data, ql);
+    store.rematerialise(ruleset).unwrap();
+    store
+}
+
+/// A store with `data` bulk-loaded and nothing reasoned over it, as `print-query --schema`
+/// loads its schema files.
+fn loaded(data: &str, ql: QlRewritingMode) -> StoreService {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("case.ttl");
     let prefixes = PREFIXES.replace("PREFIX", "@prefix").replace("> ", "> . ");
@@ -134,8 +142,26 @@ fn closure(data: &str, ruleset: Ruleset, ql: QlRewritingMode) -> StoreService {
             invalid: Some(nrese_store::InvalidStatements::Strict),
         })
         .unwrap();
-    store.rematerialise(ruleset).unwrap();
     store
+}
+
+/// [`DATA`] and `more`, committed in one commit through the `owl2-rl` mode with the QL
+/// rewriting on: a store whose commits maintain the closure, which [`closure`]'s rebuild
+/// doesn't.
+fn committed(more: &str) -> nrese_store::MutationPipeline {
+    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    let config = StoreConfig {
+        ql_rewriting: QlRewritingMode::On,
+        ..StoreConfig::in_memory()
+    };
+    let pipeline = nrese_store::MutationPipeline::new(
+        std::sync::Arc::new(StoreService::new(config).unwrap()),
+        std::sync::Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Rl,
+        ))),
+    );
+    insert(&pipeline, &format!("{DATA} {more}")).expect("data");
+    pipeline
 }
 
 /// The rows of `query` and its statuses, as the answer and its plan give them.
@@ -606,7 +632,11 @@ fn only_operators_that_can_make_a_row_wrong_label_a_dl_answer_unsound() {
 /// status and reason kind: a plain read, a denied one (an annotation, the one part of the
 /// reserved vocabulary print prints), that under NOT EXISTS, an ordered slice, and the
 /// `owl:sameAs` entry, on and off the RL route; under OWL 2 DL also with user rules and
-/// with `dl.consistency = "off"`, whose reasons the run adds whatever path decides.
+/// with `dl.consistency = "off"`, whose reasons the run adds whatever path decides. Under
+/// `owl2-rl` with the rewriting also the store's own conditions, whatever the route: rules
+/// that equated two literals (read through a property that holds one), and an import no
+/// loaded ontology answers; that import printed for too over schema files loaded as
+/// `print-query --schema` loads them, with no rematerialisation and so no certificate.
 #[test]
 fn every_place_gives_a_query_the_answers_status() {
     use nrese_sparql::Completeness;
@@ -622,8 +652,17 @@ fn every_place_gives_a_query_the_answers_status() {
         ),
         ("SELECT ?x { ?x a :Animal } ORDER BY ?x LIMIT 1", None),
         ("ASK { :rex owl:sameAs :ann }", None),
+        ("SELECT ?v { :ann :age ?v }", None),
     ];
     let printed_for = closure(DATA, Ruleset::Owl2Rl, QlRewritingMode::On);
+    let equated = committed(
+        ":p a owl:FunctionalProperty . :s :p \"1\"^^xsd:integer , \"1.0\"^^xsd:decimal .",
+    );
+    let unread = closure(
+        &format!("{DATA} :o a owl:Ontology ; owl:imports <http://example.com/missing> ."),
+        Ruleset::Owl2Rl,
+        QlRewritingMode::On,
+    );
     let ql = closure(DATA, Ruleset::Owl2Ql, QlRewritingMode::Auto);
     let rl = closure(DATA, Ruleset::Owl2Rl, QlRewritingMode::Auto);
     let (on, off) = (dl(false), dl(true));
@@ -643,6 +682,18 @@ fn every_place_gives_a_query_the_answers_status() {
     let (unchecked_on, unchecked_off) = (dl_in(unchecked(), false), dl_in(unchecked(), true));
     let stores = [
         ("owl2-rl with the rewriting", &printed_for, true),
+        // Unprinted: a functional property makes no query printable (an equality of
+        // individuals isn't expressible), so print-query has no status here.
+        (
+            "owl2-rl with the rewriting, literals equated",
+            equated.store(),
+            false,
+        ),
+        (
+            "owl2-rl with the rewriting, an import unread",
+            &unread,
+            true,
+        ),
         ("owl2-ql", &ql, false),
         ("owl2-rl", &rl, false),
         ("owl2-dl on the RL route", on.store(), false),
@@ -748,6 +799,36 @@ fn every_place_gives_a_query_the_answers_status() {
     // What print can't print carries no status: `owl:Thing` is of the schema vocabulary.
     if !matches!(printed, Ok(Printed::NotExpressible(_))) {
         wrong.push(format!("print-query of owl:Thing: {printed:?}"));
+    }
+    // `print-query --schema` prints over the schema files loaded alone, which nothing reasons
+    // over, so no certificate: an import no loaded ontology answers is told there too.
+    let schema = loaded(
+        &format!("{DATA} :o a owl:Ontology ; owl:imports <http://example.com/missing> ."),
+        QlRewritingMode::Auto,
+    );
+    let mut printed = 0;
+    for (query, _) in reads {
+        let text = format!("{PREFIXES}{RDF}{query}");
+        if let Ok(Printed::Query { completeness, .. }) = schema.print_query(&text, PrintForm::Paths)
+        {
+            printed += 1;
+            let reasons: Vec<&str> = completeness
+                .reasons
+                .iter()
+                .map(|r| r.text.as_str())
+                .collect();
+            if completeness.complete
+                || !reasons
+                    .iter()
+                    .any(|r| r.contains("no ontology with that IRI"))
+            {
+                let word = completeness.as_str();
+                wrong.push(format!("print-query --schema: {query}: {word} {reasons:?}"));
+            }
+        }
+    }
+    if printed == 0 {
+        wrong.push("setup: print-query --schema printed no read".to_owned());
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
@@ -2462,11 +2543,10 @@ fn no_query_with_a_triple_term_is_complete_under_owl_2() {
 /// A reader of `:open` (and of the default graph, or not), with the inferences their graphs
 /// support, under `owl2-ql` and `owl2-rl` with the rewriting on. A triple term in a graph
 /// the reader can't read takes no part in their answers, so it has no say in their status.
-/// Spec: the status is `complete` (run and planned, rows kept) where no graph they read holds
-/// a triple term: none in the store, one only in a hidden named graph, one only in the
-/// default graph when they can't read it; and not `complete` where one they read does: in
-/// `:open`, in the default graph they read, or inferred where they see it (`rdfs:subPropertyOf`
-/// copies the object, so `:claims` holds the triple term).
+/// Spec: the run and plan name a triple term only where the reader can read it, and keep the
+/// rows. A term can be in `:open`, in the default graph they read, or inferred where they see
+/// it (`rdfs:subPropertyOf` copies the object, so `:claims` holds the triple term). Without a
+/// readable triple term the `owl2-rl` read is `complete`; the `owl2-ql` grant caps it at `sound-only`.
 #[test]
 fn a_readers_status_follows_the_triple_terms_they_may_read() {
     use std::sync::Arc;
@@ -2522,7 +2602,7 @@ fn a_readers_status_follows_the_triple_terms_they_may_read() {
         ("owl2-ql", Ruleset::Owl2Ql, QlRewritingMode::Auto),
         ("owl2-rl rewriting on", Ruleset::Owl2Rl, QlRewritingMode::On),
     ] {
-        for (default_graph, case, data, read, complete) in &cases {
+        for &(default_graph, case, ref data, read, no_visible_term) in &cases {
             let store = StoreService::new(StoreConfig {
                 ql_rewriting: ql,
                 ..StoreConfig::in_memory()
@@ -2536,7 +2616,7 @@ fn a_readers_status_follows_the_triple_terms_they_may_read() {
             store.use_reasoning_rules(Some(ruleset.into()));
             let scope = ReadScope::Graphs(Arc::new(GraphAccess {
                 graphs: vec!["http://example.com/open".to_owned()],
-                default_graph: *default_graph,
+                default_graph,
                 inferred: true,
                 inferred_by_support: true,
                 ..GraphAccess::default()
@@ -2547,17 +2627,26 @@ fn a_readers_status_follows_the_triple_terms_they_may_read() {
             let planned = store
                 .plan_query(&prepared, &CancellationToken::new())
                 .expect("planned");
-            let status = [result.completeness, planned.completeness]
-                .map(|c| c.map_or("none", |c| c.as_str()));
+            let statuses = [result.completeness, planned.completeness];
             let rows = String::from_utf8(result.payload).unwrap();
-            eprintln!("{regime}, {case}: {rows} {status:?}");
+            eprintln!("{regime}, {case}: {rows} {statuses:?}");
             let kept = rows.contains("example.com/a\"") || rows.contains("example.com/b\"");
-            let right = match complete {
-                true => status == ["complete"; 2],
-                false => !status.contains(&"complete"),
+            let expected = if ruleset == Ruleset::Owl2Ql || !no_visible_term {
+                "sound-only"
+            } else {
+                "complete"
             };
+            let right = statuses.iter().all(|status| {
+                status.as_ref().is_some_and(|status| {
+                    let names_triple = status
+                        .reasons
+                        .iter()
+                        .any(|r| r.text.contains("the data read holds a triple term"));
+                    status.as_str() == expected && names_triple != no_visible_term
+                })
+            });
             if !kept || !right {
-                wrong.push(format!("{regime}, {case}: {rows} {status:?}"));
+                wrong.push(format!("{regime}, {case}: {rows} {statuses:?}"));
             }
         }
     }

@@ -431,3 +431,82 @@ async fn a_restore_beside_a_leftover_certificate_refuses_and_says_what_to_do() -
     assert_none(&wrong);
     Ok(())
 }
+
+/// A literal read's status word over HTTP (`NRESE-Completeness`, before its parameters), and
+/// its reasons as the store gives them.
+async fn literal_read(state: &AppState) -> TestResult<(String, Vec<String>)> {
+    const QUERY: &str = "SELECT ?v WHERE { ex:t ex:q ?v }";
+    let response = build_app(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/dataset/query")
+                .method(Method::POST)
+                .header("content-type", "application/sparql-query")
+                .header("accept", "application/sparql-results+json")
+                .body(Body::from(format!("{PREFIXES}{QUERY}")))?,
+        )
+        .await?;
+    let word = (response.headers().get("nrese-completeness"))
+        .map(|value| {
+            value
+                .to_str()
+                .unwrap_or_default()
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .unwrap_or_default();
+    let request = nrese_store::SparqlQueryRequest::all(format!("{PREFIXES}{QUERY}"));
+    let status = state.store().execute_query(&request)?.completeness;
+    let reasons = status.map(|s| s.reasons.iter().map(|r| r.text.clone()).collect());
+    Ok((word, reasons.unwrap_or_default()))
+}
+
+/// The words of the reason a read of literals is withheld for after an open without a rebuild.
+const REOPENED: &str = "opened without a rebuild of its inferences, so its rules may have equated";
+
+/// A store under `owl2-rl` with the QL rewriting, where a read of a literal may be `complete`.
+fn rewriting(dir: &Path) -> TestResult<AppState> {
+    let config = StoreConfig {
+        ql_rewriting: nrese_store::QlRewritingMode::On,
+        ..StoreConfig::on_disk(dir)
+    };
+    state_with(ReasoningMode::Owl2Rl, config)
+}
+
+/// A server restarted over a store its certificate keeps current skips the rebuild ([`start`]):
+/// whether the rules equated two literals since the last rebuild isn't recorded, so its reads
+/// of literals are told `sound-only`, with the reason, until a rebuild (`rematerialise`),
+/// which finds none here and gives `complete` back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restarted_server_withholds_reads_of_literals_until_a_rebuild() -> TestResult<()> {
+    let temp = tempfile::tempdir()?;
+    {
+        let state = rewriting(temp.path())?;
+        start(&state)?;
+        update(&state, "ex:t ex:q 1 .").await?;
+        let (word, reasons) = literal_read(&state).await?;
+        assert_eq!(
+            word, "complete",
+            "the setup, before the restart: {reasons:?}"
+        );
+    }
+    let state = rewriting(temp.path())?;
+    start(&state)?;
+    assert!(
+        state.store().last_materialisation().is_none(),
+        "the restart rebuilt the inferences"
+    );
+    let (word, reasons) = literal_read(&state).await?;
+    assert_eq!(word, "sound-only", "after the restart: {reasons:?}");
+    assert!(
+        reasons.iter().any(|r| r.contains(REOPENED)),
+        "after the restart, the reason: {reasons:?}"
+    );
+    let program = state.pipeline().reasoner().config().materialised_program();
+    state.store().rematerialise(program.ok_or("rules")?)?;
+    let (word, reasons) = literal_read(&state).await?;
+    assert_eq!(word, "complete", "after the rebuild: {reasons:?}");
+    Ok(())
+}
