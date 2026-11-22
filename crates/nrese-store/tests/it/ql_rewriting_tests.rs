@@ -2653,7 +2653,7 @@ fn inclusions_through_inverse_expressions_are_materialised() {
 /// By default (tier unset or `landing`, with no QL or fuzz seed or count), this test checks pinned pure and mixed cases for EXISTS, NOT EXISTS and MINUS. With `NRESE_CHECK_TIER=nightly`, a seed or a count, it draws 150 cases unless `NRESE_QL_CASES` supplies a valid count.
 #[test]
 fn negation_and_exists_answer_as_the_chase() {
-    // Case 95 judges a mixed answer with the first transitive-property slot and a property chain.
+    // A family counts when its axiom is present in a judged case.
     let witnesses = ql_witnesses(Some(95));
     let witnesses = witnesses.as_deref();
     let cases = cases(witnesses);
