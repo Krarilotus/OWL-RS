@@ -1354,28 +1354,59 @@ fn an_ill_typed_consistency_reading_decides_from_one_observation() {
     );
 }
 
-/// A commit's search for its base's ill-typed literal (`dl::query::ill_typed_after`) where the
-/// commit deletes the base's 20 000 occurrences and inserts one more, its stop raised once the
-/// search has begun: the search stops (nothing kept) within its poll, while it passes the
-/// deleted occurrences, before it reaches the one inserted.
+/// A consistency reading inside a registration of rules, after the rules are registered and
+/// before a certificate is made under them: a store holding an ill-typed literal, materialised
+/// under `owl2-rl` (its certificate that program's, which keeps no witness: `consistent`), is
+/// given an `owl2-ql` pipeline. Asked in that gap, it is `unknown`, never the `owl2-rl`
+/// certificate's `consistent` taken with the `owl2-ql` registration.
+#[test]
+fn an_ill_typed_consistency_reading_inside_a_rules_registration_is_unknown() {
+    use crate::ConsistencyStatus::{Consistent, Unknown};
+    let store = Arc::new(StoreService::new(StoreConfig::in_memory()).expect("store"));
+    commit(&pipeline(&store, ReasoningMode::Disabled), ILL_TYPED);
+    store.rematerialise(Ruleset::Owl2Rl).expect("reasoned");
+    assert_eq!(store.consistency(), Consistent);
+    let (reader, seen) = (Arc::clone(&store), Arc::new(Mutex::new(None)));
+    let into = Arc::clone(&seen);
+    hooks::AFTER_RULES_REGISTERED.set(Some(Box::new(move || {
+        *into.lock().unwrap() = Some(reader.consistency());
+    })));
+    let _ql = pipeline(&store, ReasoningMode::Owl2Ql);
+    hooks::AFTER_RULES_REGISTERED.set(None);
+    assert_eq!(*seen.lock().unwrap(), Some(Unknown), "read in the gap");
+}
+
+/// A commit's search for its base's ill-typed literal (`dl::query::ill_typed_after`) where an
+/// earlier commit deleted the base's 20 000 occurrences, its deletions a run of their own (left
+/// uncompacted: the run they were inserted in, with 100 000 other statements, is more than the
+/// compaction's fanout times larger), and the commit inserts one more, its stop raised once
+/// the search has begun: the search stops (nothing kept) within its poll, while it passes the
+/// deleted keys, before it reaches the one inserted.
 #[test]
 fn an_ill_typed_search_past_deleted_occurrences_stops_within_its_poll() {
-    use nrese_engine::{EncodedQuad, QuadPattern, ReadModel};
-    let store = StoreService::new(StoreConfig::in_memory()).expect("store");
+    use nrese_engine::{EncodedQuad, Engine, EngineConfig, QuadPattern, ReadModel};
+    let engine = Engine::new(EngineConfig::default()).expect("engine");
+    let ex = "http://example.org/";
     let integer = "\"abc\"^^<http://www.w3.org/2001/XMLSchema#integer>";
-    load(
-        &store,
-        &(0..20_000)
-            .map(|i| format!(":s{i} :d {integer} .\n"))
-            .collect::<String>(),
-    );
-    let snapshot = store.engine.snapshot();
-    let any = (snapshot.quads_for_pattern_in(ReadModel::Asserted, &QuadPattern::all())).next();
-    let any = any.expect("the data");
-    let mut tx = store.engine.transaction();
+    let held = (0..20_000).map(|i| format!("<{ex}s{i}> <{ex}d> {integer} .\n"));
+    let other = (0..100_000).map(|i| format!("<{ex}f{i}> <{ex}e> <{ex}g> .\n"));
+    let data: String = held.chain(other).collect();
+    let mut tx = engine.transaction();
+    let parser = nrese_rdf_io::RdfParser::from_format(nrese_rdf_io::RdfFormat::Turtle);
+    for quad in parser.for_reader(data.as_bytes()) {
+        tx.insert(quad.expect("a statement").as_ref());
+    }
+    tx.commit().expect("inserted");
+    let snapshot = engine.snapshot();
+    let mut all = snapshot.quads_for_pattern_in(ReadModel::Asserted, &QuadPattern::all());
+    let any = all.find(|q| q.object.kind().is_dictionary_literal());
+    let any = any.expect("the literal");
     let mut held = QuadPattern::all();
     held.object = Some(any.object);
-    tx.remove_matching(&held).expect("deleted");
+    let mut gone = engine.transaction();
+    gone.remove_matching(&held).expect("deleted");
+    gone.commit().expect("deleted");
+    let mut tx = engine.transaction();
     let keep = tx.intern(nrese_rdf::NamedNodeRef::new_unchecked("http://example.org/keep").into());
     tx.insert_encoded(EncodedQuad::new(keep, any.predicate, any.object, any.graph));
     let asked = std::cell::Cell::new(0u32);
