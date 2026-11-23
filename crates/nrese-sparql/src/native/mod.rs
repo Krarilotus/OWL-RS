@@ -47,7 +47,7 @@ pub(crate) use preparation::prepare_ql_query;
 use preparation::{ql_rewriting, semantic_pattern};
 use reads::{Buffer, List, Reads};
 mod pushdown;
-pub(crate) use pushdown::per_solution;
+pub(crate) use pushdown::{certain, per_solution};
 #[cfg(test)]
 mod budget_tests;
 #[cfg(test)]
@@ -6740,10 +6740,11 @@ impl<'a> Context<'a> {
     }
 
     /// Every aggregate of every group in one pass over the rows, where each is `COUNT(*)`,
-    /// `COUNT` of a variable, or `SUM` or `AVG` of an expression of one variable whose
-    /// values are numbers (none DISTINCT): each id's number is found once, and the rows
-    /// are read in order instead of per group. `None` otherwise (and where a value isn't a
-    /// number: the general path decides, durations included). BSBM BI q4: 154 M rows of
+    /// `COUNT` of a variable, `SUM` or `AVG` of an expression of one variable whose values
+    /// are numbers, or `COUNT` of such an expression beside its `SUM` or `AVG` (none
+    /// DISTINCT): each id's number is found once, and the rows are read in order instead of
+    /// per group. `None` otherwise (and where a value isn't a number: the general path
+    /// decides, durations included). BSBM BI q4: 154 M rows of
     /// `AVG(xsd:float(xsd:string(?price)))` at 80 ns a row per group, now a pass.
     /// Once it applies, and before it allocates, it calls `reserve` with what the pass
     /// holds at most ([`aggregate::pass_bytes`]). The numbers it finds are charged before
@@ -6766,9 +6767,17 @@ impl<'a> Context<'a> {
                 expr: &'e Expression,
                 average: bool,
             },
+            /// `COUNT` of a variable or an expression beside a `SUM` or `AVG` of it (that
+            /// plan's index): that one's count, as a bound variable is a value, a term that
+            /// is no number ends the pass, and an error counts in neither.
+            CountOf(usize),
         }
         let mut plans = Vec::with_capacity(aggregates.len());
         let mut totals = 0;
+        // `COUNT` of an expression: only beside a `SUM` or `AVG` of it, whose count it takes
+        // (eager AVG's partial pair). A count of its own would remember numbers of its own:
+        // the per-column path counts it.
+        let mut counted = Vec::new();
         for (_, aggregate) in aggregates {
             plans.push(match aggregate {
                 AggregateExpression::CountSolutions { distinct: false } => Plan::Rows,
@@ -6780,6 +6789,14 @@ impl<'a> Context<'a> {
                     Some(column) => Plan::Bound(column),
                     None => return Ok(None),
                 },
+                AggregateExpression::FunctionCall {
+                    name: AggregateFunction::Count,
+                    expr,
+                    distinct: false,
+                } => {
+                    counted.push((plans.len(), expr));
+                    Plan::Rows // its twin's, below
+                }
                 AggregateExpression::FunctionCall {
                     name: name @ (AggregateFunction::Sum | AggregateFunction::Avg),
                     expr,
@@ -6807,6 +6824,32 @@ impl<'a> Context<'a> {
         // Only worth it where a total is computed; counts alone take the other paths.
         if totals == 0 {
             return Ok(None);
+        }
+        let twinned = !counted.is_empty();
+        for (a, expr) in counted {
+            let twin = plans
+                .iter()
+                .position(|plan| matches!(plan, Plan::Total { expr: e, .. } if *e == expr));
+            match twin {
+                Some(twin) => plans[a] = Plan::CountOf(twin),
+                None => return Ok(None),
+            }
+        }
+        // A test's control: such a pass declines, its aggregates go a column at a time.
+        #[cfg(test)]
+        if twinned && self::pass_fallback_tests::twin_pass_off() {
+            return Ok(None);
+        }
+        for a in 0..plans.len() {
+            let Plan::Bound(column) = plans[a] else {
+                continue;
+            };
+            let twin = plans.iter().position(|plan| {
+                matches!(plan, Plan::Total { column: c, expr: Expression::Variable(_), .. } if *c == column)
+            });
+            if let Some(twin) = twin {
+                plans[a] = Plan::CountOf(twin);
+            }
         }
         #[derive(Clone, Copy)]
         struct State {
@@ -6876,18 +6919,29 @@ impl<'a> Context<'a> {
                 }
             };
             let new: Vec<(u64, Number)> = if missing.len() < 2 * PARALLEL_EXPRESSION_ROWS {
-                let term = |id: u64| self.term(id);
-                let aggregator = Aggregator {
-                    evaluator: &self.evaluator,
-                    term: &term,
-                    memo: RefCell::default(),
-                    numbers: RefCell::default(),
-                    kept: None,
+                let serial = |term: &dyn Fn(u64) -> Option<Term>| -> Vec<(u64, Number)> {
+                    let aggregator = Aggregator {
+                        evaluator: &self.evaluator,
+                        term,
+                        memo: RefCell::default(),
+                        numbers: RefCell::default(),
+                        kept: None,
+                    };
+                    missing
+                        .iter()
+                        .map(|&(id, row)| (id, number(&aggregator, row)))
+                        .collect()
                 };
-                missing
-                    .iter()
-                    .map(|&(id, row)| (id, number(&aggregator, row)))
-                    .collect()
+                if twinned {
+                    // With a `COUNT` of an expression, into a cache of its own, as the
+                    // per-column route decodes: none of its terms stays charged after it.
+                    let computed = self.computed.borrow();
+                    let decoder =
+                        Decoder::new(&self.snapshot, &computed, &self.decodes, &self.budget);
+                    serial(&|id| decoder.term(id))
+                } else {
+                    serial(&|id| self.term(id))
+                }
             } else {
                 let computed = self.computed.borrow();
                 let computed: &[Term] = &computed;
@@ -6955,9 +7009,9 @@ impl<'a> Context<'a> {
                             }
                             Plan::Total { column, .. } => {
                                 let id = table.get(row, *column);
-                                state.count += 1;
                                 match known(a, id) {
                                     Some(Number::Value(number)) => {
+                                        state.count += 1;
                                         state.total =
                                             state.total.and_then(|total| total.add(*number));
                                     }
@@ -6965,6 +7019,7 @@ impl<'a> Context<'a> {
                                     Some(Number::Other) | None => return None,
                                 }
                             }
+                            Plan::CountOf(_) => {}
                         }
                     }
                 }
@@ -7015,6 +7070,24 @@ impl<'a> Context<'a> {
         let Some(states) = states else {
             return Ok(None);
         };
+        drop(layers);
+        drop((numbers, since));
+        // A pass with a `COUNT` of an expression, which the per-column path counts keeping
+        // nothing after it, keeps nothing either: the numbers it found go when it ends, then
+        // their charge (the fields drop in order); the ones found before it stay.
+        if twinned {
+            let mut since = self.since.borrow_mut();
+            let found = since
+                .last_mut()
+                .expect("a numeric pass runs in a save point");
+            drop(std::mem::replace(
+                found,
+                Remembered {
+                    numbers: HashMap::new(),
+                    held: Reservation::new(Arc::clone(&self.budget)),
+                },
+            ));
+        }
         Ok(Some(
             (0..groups)
                 .map(|group| {
@@ -7025,6 +7098,9 @@ impl<'a> Context<'a> {
                             let state = states[group * width + a];
                             match plan {
                                 Plan::Rows | Plan::Bound(_) => integer_agg(state.count as i64),
+                                Plan::CountOf(total) => {
+                                    integer_agg(states[group * width + total].count as i64)
+                                }
                                 Plan::Total { average, .. } => {
                                     finish_total(state.total, state.error, state.count, *average)
                                 }

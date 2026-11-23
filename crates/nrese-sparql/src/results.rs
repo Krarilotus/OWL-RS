@@ -69,6 +69,12 @@ impl From<nrese_engine::SearchRefused> for QueryEvaluationError {
 #[derive(Debug, Clone, Default)]
 pub struct CancellationToken(Arc<AtomicBool>);
 
+impl From<Arc<AtomicBool>> for CancellationToken {
+    fn from(flag: Arc<AtomicBool>) -> Self {
+        Self(flag)
+    }
+}
+
 impl CancellationToken {
     pub fn new() -> Self {
         Self::default()
