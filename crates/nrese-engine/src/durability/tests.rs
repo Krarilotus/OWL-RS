@@ -289,8 +289,16 @@ fn publication_row(injected: Fault, publication: Publication, later: Later) -> V
         ));
     }
     let marker = publication.marker();
+    // Unless the later write, acknowledged, took it away (a rematerialisation inferring nothing
+    // after one that was published).
+    let marker_stays = !after.is_ok()
+        || later
+            .applied(HashSet::from([marker.clone()]))
+            .contains(&marker);
     match (&published, &after) {
-        (Ok(_), _) if !held.contains(&marker) => wrong.push("the publication is lost".into()),
+        (Ok(_), _) if marker_stays && !held.contains(&marker) => {
+            wrong.push("the publication is lost".into())
+        }
         // Reported failed while the engine went on taking writes: it must not be there.
         (Err(error), Ok(_)) if held.contains(&marker) => wrong.push(format!(
             "a publication that failed ({error}) is there after a restart"
