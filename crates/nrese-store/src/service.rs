@@ -1293,7 +1293,12 @@ impl StoreService {
     /// rematerialisation running meanwhile, and must not be called by a holder of the slot.
     pub fn use_reasoning_rules(&self, rules: Option<nrese_reasoner::RuleProgram>) {
         let tx = self.engine.transaction();
+        // One change of the certificate (its epoch odd) from the registration to the
+        // certificate made under it: no reading takes the new rules with the old certificate.
+        let _transition = self.certificate_transition(tx.writer().expect("the writer slot"));
         self.supports.use_rules(rules);
+        #[cfg(test)]
+        hooks::run(&hooks::AFTER_RULES_REGISTERED);
         if let Some(state) = self.recorded_reasoning_state() {
             self.certify(&tx, state);
         }
@@ -3317,8 +3322,11 @@ pub(crate) mod hooks {
         pub(crate) static BEFORE_REVALIDATION: Hook = const { RefCell::new(None) };
         /// A quarantine reading has read the mark and is about to read the assessment.
         pub(crate) static BETWEEN_QUARANTINE_READS: Hook = const { RefCell::new(None) };
-        /// A consistency reading has taken its version and is about to read the assessment.
+        /// A consistency reading has taken its version and assessment and is about to read
+        /// the mode and the rules.
         pub(crate) static BETWEEN_CONSISTENCY_READS: Hook = const { RefCell::new(None) };
+        /// A registration of rules has registered them and is about to certify under them.
+        pub(crate) static AFTER_RULES_REGISTERED: Hook = const { RefCell::new(None) };
     }
 
     pub(crate) fn run(hook: &'static LocalKey<Hook>) {

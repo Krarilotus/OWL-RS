@@ -1312,7 +1312,9 @@ pub(crate) fn ill_typed(snapshot: &Snapshot, stop: &dyn Fn() -> bool) -> Option<
             .map(|q| q.object)
             .find(&mut judged),
     };
-    (!stopped()).then_some(found)
+    // The stop asked again at the end, whatever the poll's count: the range scan can pass
+    // deleted keys within one step uncounted, and a stop it ran past leaves nothing found.
+    (!(stopped() || stop())).then_some(found)
 }
 
 /// The W3C vocabulary documents, whose meaning is built in: an import of one counts as read.
