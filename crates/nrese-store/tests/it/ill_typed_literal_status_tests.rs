@@ -388,3 +388,27 @@ fn an_owl2_dl_pipeline_over_an_owl2_rl_closure_is_not_told_consistent() {
     let _dl = over(&store, "owl2-dl");
     assert_eq!(store.consistency(), ConsistencyStatus::Unknown);
 }
+
+/// A store with a clash under the rules (`:x a owl:Nothing`) holding `"abc"^^xsd:integer`,
+/// materialised under `owl2-rl` (`inconsistent`), then given an `owl2-ql` pipeline without a
+/// rebuild: no certificate vouches for the version, so it is `unknown`, not the earlier
+/// program's `inconsistent`; the quarantine still reads what is recorded.
+#[test]
+fn an_owl2_ql_pipeline_over_an_owl2_rl_closure_with_a_clash_is_unknown() {
+    let store = Arc::new(StoreService::new(StoreConfig::in_memory()).expect("store"));
+    let off = ReasonerConfig::for_mode(ReasoningMode::Disabled);
+    let off = MutationPipeline::new(Arc::clone(&store), Arc::new(ReasonerService::new(off)));
+    update(
+        &off,
+        "INSERT DATA { :x a owl:Nothing . :a :d \"abc\"^^xsd:integer }",
+    );
+    (store.rematerialise(nrese_reasoner::rulesets::Ruleset::Owl2Rl)).expect("reasoned");
+    let inconsistent = ConsistencyStatus::Inconsistent { violations: 1 };
+    assert_eq!(store.consistency(), inconsistent);
+    let _ql = over(&store, "owl2-ql");
+    assert_eq!(store.consistency(), ConsistencyStatus::Unknown);
+    assert!(
+        store.is_quarantined(),
+        "the quarantine no longer reads the record"
+    );
+}

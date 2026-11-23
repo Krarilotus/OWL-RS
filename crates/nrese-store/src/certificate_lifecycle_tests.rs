@@ -1323,25 +1323,68 @@ fn an_ill_typed_search_stopped_at_a_dl_commit_records_no_verdict_and_the_next_re
     );
 }
 
-/// `consistency()` of one version: a store holding an ill-typed literal, not yet reasoned (no
-/// certificate, nothing assessed), is reasoned under `owl2-ql` between the reading's version
-/// and its assessment. Read across that, it is `unknown`, as the version reasoned holds the
-/// literal; never the new assessment's `consistent` over the old version's missing certificate.
+/// `consistency()` decides from one observation. A store holding an ill-typed literal,
+/// materialised under the plain `owl2-rl` program, then taken over by an `owl2-dl` pipeline:
+/// no certificate vouches for its version, so `unknown`. Between the reading's assessment (the
+/// old `consistent`) and its mode, the reasoning is invalidated (a write that doesn't maintain
+/// it) and `owl2-dl` switched off: `unknown` after that too, so `unknown` across it. The old
+/// assessment taken with the new mode would say `consistent`.
 #[test]
-fn an_ill_typed_consistency_reading_across_a_rebuild_reads_one_version() {
+fn an_ill_typed_consistency_reading_decides_from_one_observation() {
+    use crate::ConsistencyStatus::Unknown;
     let store = Arc::new(StoreService::new(StoreConfig::in_memory()).expect("store"));
     commit(&pipeline(&store, ReasoningMode::Disabled), ILL_TYPED);
-    let rebuilder = Arc::clone(&store);
+    store.rematerialise(Ruleset::Owl2Rl).expect("reasoned");
+    let _dl = pipeline(&store, ReasoningMode::Owl2Dl);
+    let before = store.consistency();
+    let changer = Arc::clone(&store);
     hooks::BETWEEN_CONSISTENCY_READS.set(Some(Box::new(move || {
-        rebuilder.rematerialise(Ruleset::Owl2Ql).expect("reasoned");
+        commit(&pipeline(&changer, ReasoningMode::Disabled), ":b :c :e .");
+        changer.use_dl(false, false);
     })));
     let across = store.consistency();
     hooks::BETWEEN_CONSISTENCY_READS.set(None);
-    assert_eq!(across, crate::ConsistencyStatus::Unknown);
     assert!(
-        store.reasoning_state().is_some(),
-        "the rebuild didn't run between the reads"
+        store.reasoning_state().is_none() && !store.dl().active(),
+        "the change didn't run between the reads"
     );
+    assert_eq!(
+        (before, across, store.consistency()),
+        (Unknown, Unknown, Unknown)
+    );
+}
+
+/// A commit's search for its base's ill-typed literal (`dl::query::ill_typed_after`) where the
+/// commit deletes the base's 20 000 occurrences and inserts one more, its stop raised once the
+/// search has begun: the search stops (nothing kept) within its poll, while it passes the
+/// deleted occurrences, before it reaches the one inserted.
+#[test]
+fn an_ill_typed_search_past_deleted_occurrences_stops_within_its_poll() {
+    use nrese_engine::{EncodedQuad, QuadPattern, ReadModel};
+    let store = StoreService::new(StoreConfig::in_memory()).expect("store");
+    let integer = "\"abc\"^^<http://www.w3.org/2001/XMLSchema#integer>";
+    load(
+        &store,
+        &(0..20_000)
+            .map(|i| format!(":s{i} :d {integer} .\n"))
+            .collect::<String>(),
+    );
+    let snapshot = store.engine.snapshot();
+    let any = (snapshot.quads_for_pattern_in(ReadModel::Asserted, &QuadPattern::all())).next();
+    let any = any.expect("the data");
+    let mut tx = store.engine.transaction();
+    let mut held = QuadPattern::all();
+    held.object = Some(any.object);
+    tx.remove_matching(&held).expect("deleted");
+    let keep = tx.intern(nrese_rdf::NamedNodeRef::new_unchecked("http://example.org/keep").into());
+    tx.insert_encoded(EncodedQuad::new(keep, any.predicate, any.object, any.graph));
+    let asked = std::cell::Cell::new(0u32);
+    let stop = || {
+        asked.set(asked.get() + 1);
+        asked.get() > 1
+    };
+    let found = crate::dl::query::ill_typed_after(&tx, Some(any.object), &stop);
+    assert_eq!((found, asked.get()), (None, 2), "found, and the stop asked");
 }
 
 /// A commit on a store in quarantine whose rules equate two literals (two spellings of one
