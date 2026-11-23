@@ -471,10 +471,8 @@ impl MutationPipeline {
             )?;
             // The version's certificate, its ill-typed literal judged under the writer slot alone
             // (a whole-store scan where the commit deletes it), before the commit and its rights.
-            let certificate = tx.base().certificate().cloned().map(|certificate| {
-                let memory = self.store.memory_stop();
-                StoreService::with_ill_typed(certificate, &tx, &|| memory.exceeded())
-            });
+            let certificate = (tx.base().certificate().cloned())
+                .map(|certificate| self.store.with_ill_typed(certificate, &tx));
             if !ticket.begin_commit() {
                 return Err(MutationError::Cancelled);
             }

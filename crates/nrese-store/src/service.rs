@@ -750,9 +750,11 @@ impl StoreService {
     /// it reasons nothing, and its primary's records don't say ([`crate::StoreConfig::replica`]).
     /// `Unknown` for no clash where the current version holds an ill-typed literal under
     /// `owl2-dl` or `owl2-ql`, which OWL 2 doesn't admit, or the search for one, on this first
-    /// need, stopped ([`Certificate::ill_typed`]). Both of one version: the assessment and the
-    /// literal read with no certificate change and no publication between them (the epoch and
-    /// the version the same after as before), else read again once, else `Unknown`.
+    /// need, stopped ([`Certificate::ill_typed`]), or no certificate vouches for that version,
+    /// so its literal is unread (other rules made the closure). Both of one version: the
+    /// assessment and the literal read with no certificate change and no publication between
+    /// them (the epoch and the version the same after as before), else read again once, else
+    /// `Unknown`.
     pub fn consistency(&self) -> crate::ConsistencyStatus {
         use crate::ConsistencyStatus::{Consistent, Unknown};
         for _ in 0..2 {
@@ -764,11 +766,21 @@ impl StoreService {
             if moved || !self.engine.snapshot().same_version(&snapshot) {
                 continue;
             }
-            let memory = self.memory_stop();
-            let found =
-                Certificate::of(&snapshot).map(|c| c.ill_typed(&snapshot, &|| memory.exceeded()));
+            let found = match Certificate::of(&snapshot) {
+                Some(certificate) => {
+                    let memory = self.memory_stop();
+                    certificate.ill_typed(&snapshot, &|| memory.exceeded())
+                }
+                // No certificate vouches for the version: no word in a mode that keeps one.
+                None => {
+                    let rules = self.supports.rules().map(|rules| rules.name());
+                    let rules = rules.or_else(|| self.reasoning_state().map(|s| s.ruleset));
+                    let keeps = |name: &String| crate::dl::query::keeps_ill_typed(false, name);
+                    (!self.dl.active() && !rules.is_some_and(|name| keeps(&name))).then_some(None)
+                }
+            };
             return match recorded {
-                Consistent if found.is_some_and(|f| f != Some(None)) => Unknown,
+                Consistent if found != Some(None) => Unknown,
                 status => status,
             };
         }
@@ -935,19 +947,22 @@ impl StoreService {
 
     /// `certificate` with the ill-typed literal ([`Certificate::ill_typed`]) of what the
     /// maintained commit `tx` publishes, where its base's is found (`dl::query::ill_typed_after`,
-    /// under `stop`); else its own cell, unset. The same object where that is the base's, or the
-    /// certificate isn't this store's or keeps none ([`crate::dl::query::keeps_ill_typed`]).
+    /// under the memory stop); else its own cell, unset. The same object where that is the
+    /// base's, or the certificate isn't this store's or keeps none
+    /// ([`crate::dl::query::keeps_ill_typed`]).
     pub(crate) fn with_ill_typed(
+        &self,
         certificate: nrese_engine::Certificate,
         tx: &nrese_engine::Transaction<'_>,
-        stop: &dyn Fn() -> bool,
     ) -> nrese_engine::Certificate {
         let keeps = |c: &Certificate| crate::dl::query::keeps_ill_typed(c.dl, &c.state.ruleset);
         if !certificate.downcast_ref::<Certificate>().is_some_and(keeps) {
             return certificate;
         }
+        let memory = self.memory_stop();
+        let stop = || memory.exceeded();
         Self::with_state(certificate, |held, base| {
-            let found = base.and_then(|base| crate::dl::query::ill_typed_after(tx, base, stop));
+            let found = base.and_then(|base| crate::dl::query::ill_typed_after(tx, base, &stop));
             (base.is_none() || found != base).then(|| (held.state.clone(), found))
         })
     }

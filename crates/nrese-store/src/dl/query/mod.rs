@@ -1186,11 +1186,12 @@ const ILL_TYPED: &str = "it is ill-typed (its lexical form is outside its dataty
 pub(crate) const UNCHECKED: &str = "the data are not yet checked for an ill-typed literal, which OWL 2 \
                          doesn't admit, so their consistency isn't known";
 
-/// Whether a version reading under `owl2-dl` (`dl`) or under the rules `ruleset` keeps the
-/// witness of an ill-typed literal: under `owl2-dl` and `owl2-ql`, where [`withhold`] reads it,
-/// and nowhere else, so no other mode scans for one.
+/// Whether a version reading under `owl2-dl` (`dl`) or under the rules program named `ruleset`
+/// keeps the witness of an ill-typed literal: under `owl2-dl` and a program on `owl2-ql`, user
+/// rules beside it or not (`owl2-ql+custom:…`, its base the name's first part, as the
+/// reasoner reads it), where [`withhold`] reads it, and nowhere else, so no other mode scans.
 pub(crate) fn keeps_ill_typed(dl: bool, ruleset: &str) -> bool {
-    dl || ruleset == "owl2-ql"
+    dl || ruleset.split('+').next() == Some("owl2-ql")
 }
 
 /// Whether `id` is an ill-typed literal (RDF 1.1 Concepts §3.3): a datatype of the OWL 2
@@ -1221,17 +1222,18 @@ pub(crate) fn ill_typed_after(
     stop: &dyn Fn() -> bool,
 ) -> Option<Option<TermId>> {
     let decode = |id: TermId| tx.decode(id);
-    let kept = base.filter(|&witness| {
-        let mut pattern = QuadPattern::all();
-        pattern.object = Some(witness);
-        tx.quads_for_pattern_in(ReadModel::Asserted, &pattern)
-            .next()
-            .is_some()
-    });
-    let mut stopped = polled(stop);
+    let poll = polled(stop);
+    let stopped = || poll.ask();
     if stopped() {
         return None;
     }
+    let kept = base.filter(|&witness| {
+        let mut pattern = QuadPattern::all();
+        pattern.object = Some(witness);
+        tx.asserted_quads_for_pattern_until(&pattern, stopped)
+            .next()
+            .is_some()
+    });
     let mut judged = |o: &TermId| stopped() || is_ill_typed(*o, &decode);
     let found = kept.or_else(|| (tx.inserted().map(|q| q.object)).find(&mut judged));
     match (found, base) {
@@ -1242,13 +1244,27 @@ pub(crate) fn ill_typed_after(
     }
 }
 
-/// `stop` asked at its first call and then every 4096th, and kept once it says stop: the
-/// poll of a walk, which a refusal ends with nothing kept.
-fn polled(stop: &dyn Fn() -> bool) -> impl FnMut() -> bool + '_ {
-    let (mut calls, mut stopped) = (0u32, false);
-    move || {
-        stopped = stopped || (calls % 4096 == 0 && stop());
-        calls = calls.wrapping_add(1);
+/// `stop` asked at its first [`Polled::ask`] and then every 4096th, and kept once it says
+/// stop: the poll of a walk, which a refusal ends with nothing kept. Asked by shared
+/// reference, so one poll serves a walk and an engine read that takes a stop of its own.
+struct Polled<'a> {
+    stop: &'a dyn Fn() -> bool,
+    calls: std::cell::Cell<u32>,
+    stopped: std::cell::Cell<bool>,
+}
+fn polled(stop: &dyn Fn() -> bool) -> Polled<'_> {
+    let (calls, stopped) = Default::default();
+    Polled {
+        stop,
+        calls,
+        stopped,
+    }
+}
+impl Polled<'_> {
+    fn ask(&self) -> bool {
+        let calls = self.calls.replace(self.calls.get().wrapping_add(1));
+        let stopped = self.stopped.get() || (calls.is_multiple_of(4096) && (self.stop)());
+        self.stopped.set(stopped);
         stopped
     }
 }
@@ -1259,7 +1275,8 @@ fn polled(stop: &dyn Fn() -> bool) -> impl FnMut() -> bool + '_ {
 /// where `stop`, asked before the walk and during it ([`polled`]), ended it. One thread.
 pub(crate) fn ill_typed(snapshot: &Snapshot, stop: &dyn Fn() -> bool) -> Option<Option<TermId>> {
     use nrese_engine::{TermKind, quad::Permutation};
-    let mut stopped = polled(stop);
+    let poll = polled(stop);
+    let stopped = || poll.ask();
     if stopped() {
         return None;
     }
