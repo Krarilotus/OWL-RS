@@ -1984,6 +1984,10 @@ impl StoreService {
     /// ([`crate::sessions`]); `scope` is the reader's, by which the operations were scoped.
     /// What the operations' replay and the reader's view read and build is charged to
     /// `memory`, the reading query's envelope ([`Self::read_snapshot_within`]).
+    /// The operations' declarations are rebuilt under the rules in force when the read
+    /// starts. A reader that `scope` restricts sees one rule generation: if the rules change
+    /// while it reads, the read starts again once, and a second change refuses it with
+    /// `Unavailable::OtherProgram`, though nothing was committed.
     fn with_pending<T>(
         &self,
         pending: &crate::StatementsRequest,
@@ -2083,7 +2087,8 @@ impl StoreService {
     }
 
     /// A pending change that changes the set of annotation properties rebuilds `tx`'s
-    /// inferred stack over its pending state using the rules captured at the read's entry.
+    /// inferred stack over its pending state using `rules`, captured as this attempt of the
+    /// read started.
     /// Other pending changes read the committed inferred stack until commit.
     fn rebuild_pending_declarations(
         &self,
