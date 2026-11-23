@@ -15,7 +15,8 @@
 //! appears under its name only with its magic synced (written under a temporary name, then
 //! renamed): a rotation that fails before the rename leaves the log as it was; one whose
 //! outcome is unknown after it poisons the log. So does any exit between a bulk publication's
-//! checkpoint and the install of its version ([`PendingInstall`]).
+//! checkpoint and the install of its version ([`PendingInstall`]), or between an append's
+//! write and the install of the version that names its record ([`Wal::installed`]).
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
@@ -334,6 +335,12 @@ impl Wal {
     /// Appends one record and makes it durable according to the sync policy, and returns its
     /// commit time. The caller publishes the commit only after this returns `Ok`.
     ///
+    /// From just before the record may reach the disk, the log is poisoned, and it stays so on
+    /// `Ok`: the caller lifts it with [`Self::installed`] once the version that names the record
+    /// is installed. So any exit in between (a panic in the note, the write, the sync, the
+    /// names' settle or the caller's install) leaves no later commit to take the record's
+    /// revision. A refusal that leaves the log as it was returns it unpoisoned.
+    ///
     /// A local commit is stamped here, by `stamp`, once the record's preparation and any
     /// rotation are done and just before it is written and synced: the time is that of the
     /// commit, not of its build. Without `stamp` (a replicated record)
@@ -342,9 +349,9 @@ impl Wal {
     /// A local commit's `note` ([`crate::Transaction::note_commit`]) is called after the
     /// rotation, the stamp and the encoding, the steps whose failure leaves the log as it was,
     /// and before the record is written: so the time logged precedes the note's own I/O, as it
-    /// precedes the record's sync. The log is poisoned while the note runs, so that a note that
-    /// panics, having perhaps written its journal, leaves no later commit to take its revision;
-    /// `Ok` and a refusal clear that, an unknown journal keeps it.
+    /// precedes the record's sync. A note that panics, having perhaps written its journal, so
+    /// leaves no later commit to take its revision; a refusal clears the poison, an unknown
+    /// journal keeps it.
     pub(crate) fn append(
         &mut self,
         record: &CommitRecord,
@@ -373,10 +380,11 @@ impl Wal {
         // Version 4 segments (stores that keep integers in their dictionary) have no times.
         let logged = committed.filter(|_| self.magic == SEGMENT_MAGIC);
         encode_record_at(record, logged, &mut self.buffer)?; // nothing written yet on error
+        // Lifted by the caller's install ([`Self::installed`]), or by a refusal below.
+        self.poisoned = true;
         if let Some(note) = note {
-            self.poisoned = true;
             match note(record.revision) {
-                Ok(()) => self.poisoned = false,
+                Ok(()) => {}
                 Err(crate::engine::NoteError::Refused(error)) => {
                     self.poisoned = false;
                     return Err(EngineError::CommitNoteRefused(error));
@@ -392,18 +400,14 @@ impl Wal {
         // acknowledged: the record's sync commits the journal and flushes the device, and the
         // directories' syncs after it find nothing left to flush (measured on the timing host:
         // in the other order the record's sync paid a second flush).
-        // A failure there leaves the record written, its outcome unknown: it poisons the log.
-        let result = written
+        // A failure there leaves the record written, its outcome unknown: the log stays poisoned.
+        written
             .and_then(|()| self.active.write_all(&self.buffer))
             .and_then(|()| match self.sync {
                 SyncPolicy::EveryCommit => self.active.sync_data(),
                 SyncPolicy::OsBuffered => Ok(()),
             })
-            .and_then(|()| self.pending_names.settle());
-        if let Err(error) = result {
-            self.poisoned = true;
-            return Err(error.into());
-        }
+            .and_then(|()| self.pending_names.settle())?;
         self.active_bytes += self.buffer.len() as u64;
         self.bytes_since_checkpoint += self.buffer.len() as u64;
         Ok(committed)
@@ -460,6 +464,13 @@ impl Wal {
     /// into memory and opens the log unpoisoned.
     pub(crate) fn poison(&mut self) {
         self.poisoned = true;
+    }
+
+    /// The version that names the record just appended is installed: lifts the poison
+    /// [`Self::append`] left on its `Ok`, under the same guard. The log was taking writes
+    /// when that append began, and nothing else wrote to it since.
+    pub(crate) fn installed(&mut self) {
+        self.poisoned = false;
     }
 }
 
