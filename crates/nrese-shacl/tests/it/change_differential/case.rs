@@ -60,16 +60,12 @@ impl Step {
         }
     }
 
-    /// An edit of asserted quads in the shapes graph only, its shapes left as they were: a
-    /// change the shapes change entry point must find nothing in.
-    pub fn edits_only_the_shapes_graph(&self) -> bool {
+    /// Whether the step edits the shapes graph: its shapes, or any asserted quad in it, with
+    /// whatever else the step changes. Such a step goes through the shapes change entry point
+    /// too, as the store sends it.
+    pub fn edits_the_shapes_graph(&self) -> bool {
         let in_shapes = |quad: &Quad| quad.graph_name == GraphName::NamedNode(ex("shapes"));
-        let quads = || self.add.iter().chain(&self.remove);
-        self.shapes.is_none()
-            && self.infer.is_empty()
-            && self.retract.is_empty()
-            && quads().next().is_some()
-            && quads().all(in_shapes)
+        self.shapes.is_some() || self.add.iter().chain(&self.remove).any(in_shapes)
     }
 }
 
@@ -213,7 +209,7 @@ impl Case {
                 })
                 .map_err(at("Data"))?,
             });
-            if step.shapes.is_some() || step.edits_only_the_shapes_graph() {
+            if step.edits_the_shapes_graph() {
                 let shapes_after = compile_shapes(&after).map_err(at("shapes after"))?;
                 let full_after =
                     reference(&after, &shapes_after).map_err(at("full after, Shapes"))?;

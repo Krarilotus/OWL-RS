@@ -153,7 +153,7 @@ pub(super) fn run() {
         equality += usize::from(case.equality);
         for step in &case.steps {
             shapes_edits += usize::from(step.shapes.is_some());
-            controls += usize::from(step.edits_only_the_shapes_graph());
+            controls += usize::from(step.shapes.is_none() && step.edits_the_shapes_graph());
             inferred_edits += usize::from(!step.infer.is_empty() || !step.retract.is_empty());
         }
         let verdict = check(case, selector, &gaps, !saved);
@@ -211,7 +211,7 @@ pub(super) fn run() {
     }
     println!(
         "{count} draws: {equality} with equality, {shapes_edits} shapes edits, {controls} \
-         edits only of the shapes graph, {inferred_edits} inferred edits, {introducing} \
+         ordinary edits of the shapes graph, {inferred_edits} inferred edits, {introducing} \
          evaluations introducing results; left out {left_out:?}"
     );
     if let Some(first) = failures.first() {
