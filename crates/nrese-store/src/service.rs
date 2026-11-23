@@ -748,40 +748,40 @@ impl StoreService {
     /// Whether the data is consistent under the recorded reasoning (see
     /// [`crate::reasoning_state`] for the quarantine this reports). `Unknown` on a replica:
     /// it reasons nothing, and its primary's records don't say ([`crate::StoreConfig::replica`]).
-    /// `Unknown` for no clash where the current version holds an ill-typed literal under
-    /// `owl2-dl` or `owl2-ql`, which OWL 2 doesn't admit, or the search for one, on this first
-    /// need, stopped ([`Certificate::ill_typed`]), or no certificate vouches for that version,
-    /// so its literal is unread (other rules made the closure). Both of one version: the
-    /// assessment and the literal read with no certificate change and no publication between
-    /// them (the epoch and the version the same after as before), else read again once, else
-    /// `Unknown`.
+    /// Under `owl2-dl` or `owl2-ql` (a program on it), `Unknown` where no certificate vouches
+    /// for the current version (other rules made the closure, or the mode came after it), whatever
+    /// is recorded; and for no clash where the version holds an ill-typed literal, which OWL 2
+    /// doesn't admit, or the search for one, on this first need, stopped
+    /// ([`Certificate::ill_typed`]). Decided from one observation: the version with its
+    /// certificate, the recorded assessment, the mode and the rules registered, taken with no
+    /// certificate change, publication or registration between them (the certificate epoch, the
+    /// version and the registration's generation the same after as before); else taken again
+    /// once, else `Unknown`.
     pub fn consistency(&self) -> crate::ConsistencyStatus {
         use crate::ConsistencyStatus::{Consistent, Unknown};
         for _ in 0..2 {
-            let (epoch, snapshot) = (self.certificate_epoch(), self.engine.snapshot());
+            let (epoch, rules) = (self.certificate_epoch(), self.supports.epoch());
+            let snapshot = self.engine.snapshot();
+            let recorded = self.reasoning_state().filter(|_| !self.config.replica);
             #[cfg(test)]
             hooks::run(&hooks::BETWEEN_CONSISTENCY_READS);
-            let recorded = self.recorded_consistency();
-            let moved = epoch % 2 == 1 || epoch != self.certificate_epoch();
-            if moved || !self.engine.snapshot().same_version(&snapshot) {
+            let (dl, registered) = (self.dl.active(), self.supports.rules());
+            let same = epoch % 2 == 0 && epoch == self.certificate_epoch();
+            let same = same && rules == self.supports.epoch();
+            if !(same && self.engine.snapshot().same_version(&snapshot)) {
                 continue;
             }
-            let found = match Certificate::of(&snapshot) {
-                Some(certificate) => {
-                    let memory = self.memory_stop();
-                    certificate.ill_typed(&snapshot, &|| memory.exceeded())
-                }
-                // No certificate vouches for the version: no word in a mode that keeps one.
-                None => {
-                    let rules = self.supports.rules().map(|rules| rules.name());
-                    let rules = rules.or_else(|| self.reasoning_state().map(|s| s.ruleset));
-                    let keeps = |name: &String| crate::dl::query::keeps_ill_typed(false, name);
-                    (!self.dl.active() && !rules.is_some_and(|name| keeps(&name))).then_some(None)
-                }
+            let status = recorded.as_ref().map_or(Unknown, |s| s.consistency());
+            let Some(certificate) = Certificate::of(&snapshot) else {
+                let name = registered.map(|r| r.name()).or(recorded.map(|s| s.ruleset));
+                let keeps = dl || name.is_some_and(|n| crate::dl::query::keeps_ill_typed(dl, &n));
+                return if keeps { Unknown } else { status };
             };
-            return match recorded {
-                Consistent if found != Some(None) => Unknown,
-                status => status,
+            let memory = self.memory_stop();
+            return match certificate.ill_typed(&snapshot, &|| memory.exceeded()) {
+                Some(None) => status,
+                _ if matches!(status, Consistent) => Unknown,
+                _ => status,
             };
         }
         Unknown

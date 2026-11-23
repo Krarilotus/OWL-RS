@@ -1227,12 +1227,16 @@ pub(crate) fn ill_typed_after(
     if stopped() {
         return None;
     }
+    // The base's occurrences through its counted scan, which counts the keys it passes,
+    // deleted ones too (`nrese_engine::visit`); then those `tx` inserts.
     let kept = base.filter(|&witness| {
         let mut pattern = QuadPattern::all();
         pattern.object = Some(witness);
-        tx.asserted_quads_for_pattern_until(&pattern, stopped)
-            .next()
-            .is_some()
+        let (counted, visit) = (tx.base().counted(), |units: u64| !poll.spend(units));
+        let mut stored =
+            (counted.quads(ReadModel::Asserted, &pattern, &visit)).map_while(Result::ok);
+        stored.any(|q| tx.contains_in(ReadModel::Asserted, &q))
+            || (tx.inserted().take_while(|_| !stopped())).any(|q| q.object == witness)
     });
     let mut judged = |o: &TermId| stopped() || is_ill_typed(*o, &decode);
     let found = kept.or_else(|| (tx.inserted().map(|q| q.object)).find(&mut judged));
@@ -1244,28 +1248,36 @@ pub(crate) fn ill_typed_after(
     }
 }
 
-/// `stop` asked at its first [`Polled::ask`] and then every 4096th, and kept once it says
-/// stop: the poll of a walk, which a refusal ends with nothing kept. Asked by shared
-/// reference, so one poll serves a walk and an engine read that takes a stop of its own.
+/// `stop` asked at the first unit of work and then once 4096 more are spent, and kept once it
+/// says stop: the poll of a walk, which a refusal ends with nothing kept. A walk's step spends
+/// one ([`Polled::ask`]); an engine's counted read, what it counts ([`Polled::spend`]). Asked
+/// by shared reference, so one poll serves the walks and the reads of one search.
 struct Polled<'a> {
     stop: &'a dyn Fn() -> bool,
-    calls: std::cell::Cell<u32>,
+    spent: std::cell::Cell<u64>,
+    due: std::cell::Cell<u64>,
     stopped: std::cell::Cell<bool>,
 }
 fn polled(stop: &dyn Fn() -> bool) -> Polled<'_> {
-    let (calls, stopped) = Default::default();
+    let (spent, due, stopped) = Default::default();
     Polled {
         stop,
-        calls,
+        spent,
+        due,
         stopped,
     }
 }
 impl Polled<'_> {
     fn ask(&self) -> bool {
-        let calls = self.calls.replace(self.calls.get().wrapping_add(1));
-        let stopped = self.stopped.get() || (calls.is_multiple_of(4096) && (self.stop)());
-        self.stopped.set(stopped);
-        stopped
+        self.spend(1)
+    }
+    fn spend(&self, units: u64) -> bool {
+        if !self.stopped.get() && self.spent.get() >= self.due.get() {
+            self.stopped.set((self.stop)());
+            self.due.set(self.spent.get() + 4096);
+        }
+        self.spent.set(self.spent.get() + units);
+        self.stopped.get()
     }
 }
 
