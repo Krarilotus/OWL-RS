@@ -2,16 +2,19 @@ use std::fmt::Write as _;
 
 use nrese_rdf::Quad;
 
-use super::case::{Case, Step, quads};
+use super::case::{Case, Evaluation, Step, quads};
+use super::gaps::EntryPoint;
 use crate::incremental_tests::{Rng, fuzz};
 
 const SAME_AS: &str = "http://www.w3.org/2002/07/owl#sameAs";
 /// Restriction for the known gaps `sameas-insert-unchecked` and `sameas-removal-unchecked`,
 /// removed with them: a step changes no `owl:sameAs`; the start state may hold some.
 const STEPS_CHANGE_SAME_AS: bool = false;
-/// Restriction for the known gap `shapes-change-repeats-shared-result`, removed with it: the
-/// shapes a step changes to have no `sh:property`, the only nesting that reports a child's
-/// results, so full validation reports no result twice; the start's shapes may.
+/// Restriction for the known gap `shapes-change-repeats-shared-result`, removed with it: a
+/// drawn case is left out whole, before any comparison, where full validation through the
+/// shapes change entry point reports a new result more than once (one result reached by two
+/// routes). Decided from full validation alone; every nesting still draws from all shapes,
+/// and a result with one reporting route, nested or not, is compared.
 const SHAPES_CHANGES_MAY_REPEAT: bool = false;
 const OBJECTS: [&str; 5] = ["\"a\"", "\"a\"@en", "\"a\"@de", "1", "\"1\"^^xsd:decimal"];
 const TEMPLATES: [&str; 2] = [
@@ -30,7 +33,7 @@ pub(super) fn case(index: u64) -> Case {
     let rng = &mut Rng(seed(index));
     let mut asserted = initial(rng, 14, false);
     let mut inferred = initial(rng, 8, true);
-    let mut case = Case::new(shapes(rng, true), "", Step::default());
+    let mut case = Case::new(shapes(rng), "", Step::default());
     case.asserted = asserted.clone();
     case.inferred = inferred.clone();
     case.steps.clear();
@@ -50,7 +53,7 @@ pub(super) fn case(index: u64) -> Case {
             remove: difference(&old_asserted, &asserted),
             infer: difference(&inferred, &old_inferred),
             retract: difference(&old_inferred, &inferred),
-            shapes: (rng.below(3) == 0).then(|| shapes(rng, SHAPES_CHANGES_MAY_REPEAT)),
+            shapes: (rng.below(3) == 0).then(|| shapes(rng)),
         });
     }
     case.equality = case
@@ -59,6 +62,17 @@ pub(super) fn case(index: u64) -> Case {
         .chain(case.steps.iter().flat_map(|step| &step.infer))
         .any(|quad| quad.predicate.as_str() == SAME_AS);
     case
+}
+
+/// The known gap whose trigger a drawn case's `evaluations` hold, if a restriction leaves it out.
+pub(super) fn left_out(evaluations: &[Evaluation]) -> Option<&'static str> {
+    let repeats = |evaluation: &Evaluation| {
+        let new = |key| !evaluation.before.results.contains_key(key);
+        evaluation.entry == EntryPoint::Shapes
+            && (evaluation.after.results.iter()).any(|(key, count)| *count > 1 && new(key))
+    };
+    (!SHAPES_CHANGES_MAY_REPEAT && evaluations.iter().any(repeats))
+        .then_some("shapes-change-repeats-shared-result")
 }
 
 fn initial(rng: &mut Rng, max: u64, inferred: bool) -> Vec<Quad> {
@@ -139,7 +153,7 @@ fn path(rng: &mut Rng, depth: u8) -> String {
     }
 }
 
-fn shapes(rng: &mut Rng, nested_results: bool) -> String {
+fn shapes(rng: &mut Rng) -> String {
     let names = (0..=rng.below(4))
         .map(|i| {
             if rng.below(2) == 0 {
@@ -159,8 +173,7 @@ fn shapes(rng: &mut Rng, nested_results: bool) -> String {
             _ => format!("sh:targetObjectsOf ex:p{}", rng.below(4)),
         };
         write!(turtle, "{name} {target} ; sh:path {}", path(rng, 2)).unwrap();
-        // Kind 13 is `sh:property`.
-        let mut options = (0..if nested_results { 14 } else { 13 }).collect::<Vec<_>>();
+        let mut options = (0..14).collect::<Vec<_>>();
         for _ in 0..=rng.below(3) {
             let kind = options.swap_remove(rng.below(options.len() as u64) as usize);
             write!(turtle, " ; {}", constraint(rng, &names, kind)).unwrap();

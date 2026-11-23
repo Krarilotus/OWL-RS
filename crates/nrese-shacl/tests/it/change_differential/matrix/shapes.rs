@@ -143,5 +143,35 @@ pub(super) fn rows() -> Vec<Row> {
         )
         .for_shapes(),
     );
+    // One route: the child's own target has nothing to report.
+    let parent = "ex:T sh:targetNode ex:n0 ; sh:path ex:p1 .";
+    let nested = format!(
+        "{parent} ex:T sh:property ex:Q .
+        ex:Q sh:targetNode ex:n2 ; sh:path ex:p0 ; sh:maxCount 2 ."
+    );
+    let one_route = Case::new(
+        parent,
+        "ex:n0 ex:p1 ex:n1 . ex:n1 ex:p0 ex:v1 , ex:v2 , ex:v3 .",
+        Step {
+            shapes: Some(nested),
+            ..Step::default()
+        },
+    );
+    rows.push(
+        Row::new(
+            "shapes-nested-one-route",
+            "A property child a parent gains reports its one result at the parent's value.",
+            one_route,
+            [],
+            [core_key(
+                "n1",
+                predicate("p0"),
+                None,
+                "Q",
+                Component::MaxCount,
+            )],
+        )
+        .for_shapes(),
+    );
     rows
 }

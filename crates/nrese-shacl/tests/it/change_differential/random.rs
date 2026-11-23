@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -15,18 +15,24 @@ pub(super) enum Verdict {
     /// With the number of evaluations whose change introduces a result: draws that never
     /// do test little.
     Pass(usize),
+    /// A drawn case holding the trigger of the known gap a restriction leaves out.
+    LeftOut(&'static str),
     /// The first deviation, stop or error: its step, entry point and delta.
     Fail(String),
 }
 
 /// Runs every step of `case` through both entry points and compares each exactly with full
 /// validation. Only a verified entry of `gaps` at `location`, the case's own selector,
-/// accepts a deviation, and an entry there that accepts none is closed.
-pub(super) fn check(case: &Case, location: &str, gaps: &[Gap]) -> Verdict {
+/// accepts a deviation, and an entry there that accepts none is closed. A `drawn` case
+/// holding a restricted trigger is left out before any comparison.
+pub(super) fn check(case: &Case, location: &str, gaps: &[Gap], drawn: bool) -> Verdict {
     let evaluations = match case.run() {
         Ok(evaluations) => evaluations,
         Err(error) => return Verdict::Fail(format!("error: {error}")),
     };
+    if let Some(gap) = draw::left_out(&evaluations).filter(|_| drawn) {
+        return Verdict::LeftOut(gap);
+    }
     let mut allowance = Allowances::default();
     let mut introducing = 0;
     for evaluation in &evaluations {
@@ -134,9 +140,12 @@ pub(super) fn run() {
     };
     let (mut equality, mut shapes_edits, mut inferred_edits, mut introducing) = (0, 0, 0, 0);
     let (mut count, mut controls) = (0, 0);
+    let mut left_out = BTreeMap::<_, u64>::new();
     let mut failures = Vec::new();
     for draw in draws {
-        if selector.is_none() && count >= DRAWS && introducing > 0 {
+        // Draws left out by a restriction don't count towards the batch.
+        let compared = count - left_out.values().sum::<u64>();
+        if selector.is_none() && compared >= DRAWS && introducing > 0 {
             break;
         }
         count += 1;
@@ -147,7 +156,7 @@ pub(super) fn run() {
             controls += usize::from(step.edits_only_the_shapes_graph());
             inferred_edits += usize::from(!step.infer.is_empty() || !step.retract.is_empty());
         }
-        let verdict = check(case, selector, &gaps);
+        let verdict = check(case, selector, &gaps, !saved);
         // A saved fixture must still show what it recorded.
         if let (Some(recorded), Verdict::Pass(_)) = (recorded, &verdict) {
             let replay = replay("random_changes", &outer, selector);
@@ -158,6 +167,7 @@ pub(super) fn run() {
         }
         match verdict {
             Verdict::Pass(evaluations) => introducing += evaluations,
+            Verdict::LeftOut(gap) => *left_out.entry(gap).or_default() += 1,
             Verdict::Fail(signature) => {
                 let replay = replay("random_changes", &outer, selector);
                 let changed = (recorded.as_ref())
@@ -202,7 +212,7 @@ pub(super) fn run() {
     println!(
         "{count} draws: {equality} with equality, {shapes_edits} shapes edits, {controls} \
          edits only of the shapes graph, {inferred_edits} inferred edits, {introducing} \
-         evaluations introducing results"
+         evaluations introducing results; left out {left_out:?}"
     );
     if let Some(first) = failures.first() {
         panic!("{first}\n{} of {count} draws deviate", failures.len());
