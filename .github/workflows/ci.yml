@@ -6,9 +6,8 @@ name: CI
 #   gh workflow run ci.yml --ref refactor/engine-v2
 # and on merges to main.
 on:
+  # Runs only when started by hand (Actions tab > Run workflow), to save CI minutes.
   workflow_dispatch:
-  push:
-    branches: [main]
 
 concurrency:
   group: ci-${{ github.ref }}
