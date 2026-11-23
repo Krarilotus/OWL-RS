@@ -95,6 +95,8 @@ enum Later {
     UnchangedCommit,
     /// A bulk append of `quad(1)` alone: nothing changes in memory.
     UnchangedLoad,
+    /// A rematerialisation inferring nothing: after a failed one, nothing changes in memory.
+    UnchangedRematerialisation,
 }
 
 impl Later {
@@ -107,15 +109,27 @@ impl Later {
                 load.add(&[quad(1)]);
                 load.finish()
             }
+            Self::UnchangedRematerialisation => engine.rematerialisation().finish(Vec::new()),
         }
     }
 
-    /// The statement it writes.
-    fn witness(self) -> Quad {
+    /// Whether `held` keeps what it wrote, once it was acknowledged.
+    fn kept(self, held: &HashSet<Quad>) -> bool {
         match self {
-            Self::Commit => quad(2),
-            Self::UnchangedCommit | Self::UnchangedLoad => quad(1),
+            Self::Commit => held.contains(&quad(2)),
+            Self::UnchangedCommit | Self::UnchangedLoad => held.contains(&quad(1)),
+            Self::UnchangedRematerialisation => !held.contains(&inferred()),
         }
+    }
+
+    /// What the store holds after it, acknowledged, from `before`.
+    fn applied(self, mut before: HashSet<Quad>) -> HashSet<Quad> {
+        match self {
+            Self::Commit => before.insert(quad(2)),
+            Self::UnchangedCommit | Self::UnchangedLoad => before.insert(quad(1)),
+            Self::UnchangedRematerialisation => before.remove(&inferred()),
+        };
+        before
     }
 }
 
@@ -207,6 +221,18 @@ impl Publication {
             _ => super::checkpoint::placed(root, 2).unwrap_or(false),
         }
     }
+
+    /// What the store holds at revision 2 once the publication is in (revision 1 holds
+    /// `quad(1)`), by hand from what [`Self::run`] writes.
+    fn holds(self) -> HashSet<Quad> {
+        match self {
+            Self::Load(BulkMode::Replace) => HashSet::from([quad(10), quad(11)]),
+            Self::Load(_) => HashSet::from([quad(1), quad(10), quad(11)]),
+            Self::Spilled => (10..18).map(quad).collect(),
+            Self::Rematerialisation => HashSet::from([quad(1), inferred()]),
+            Self::Commit => HashSet::from([quad(1), quad(10)]),
+        }
+    }
 }
 
 /// The records of `revision` in the log of the store at `root` (unreadable: none).
@@ -277,20 +303,46 @@ fn publication_row(injected: Fault, publication: Publication, later: Later) -> V
         Err(error) => return vec![format!("the store doesn't reopen: {error}")],
     };
     let held = contents(&engine);
-    if after.is_ok() && !held.contains(&later.witness()) {
+    if after.is_ok() && !later.kept(&held) {
         wrong.push(format!(
             "the acknowledged write is lost (publication: {:?})",
             published.as_ref().err()
         ));
     }
     let marker = publication.marker();
+    // Unless the later write, acknowledged, took it away (a rematerialisation inferring nothing
+    // after one that was published).
+    let marker_stays = !after.is_ok()
+        || later
+            .applied(HashSet::from([marker.clone()]))
+            .contains(&marker);
     match (&published, &after) {
-        (Ok(_), _) if !held.contains(&marker) => wrong.push("the publication is lost".into()),
+        (Ok(_), _) if marker_stays && !held.contains(&marker) => {
+            wrong.push("the publication is lost".into())
+        }
         // Reported failed while the engine went on taking writes: it must not be there.
         (Err(error), Ok(_)) if held.contains(&marker) => wrong.push(format!(
             "a publication that failed ({error}) is there after a restart"
         )),
         _ => {}
+    }
+    // The whole recovered set: revision 1's, or the publication's where it is in or durable,
+    // with the later write where it was acknowledged. A failure that left nothing durable and
+    // took no later write may have gone either way.
+    let before = HashSet::from([quad(1)]);
+    let acknowledged = |set: HashSet<Quad>| match after.is_ok() {
+        true => later.applied(set),
+        false => set,
+    };
+    let expected = match (published.is_ok() || durable, after.is_ok()) {
+        (true, _) => vec![acknowledged(publication.holds())],
+        (false, true) => vec![acknowledged(before)],
+        (false, false) => vec![before, publication.holds()],
+    };
+    if !expected.contains(&held) {
+        wrong.push(format!(
+            "the reopen holds {held:?}, not one of {expected:?}"
+        ));
     }
     // Failed with revision 2 durable: the log takes no write before a reopen, which recovers
     // the publication at revision 2 and takes the next write at 3.
@@ -330,12 +382,15 @@ fn publication_row(injected: Fault, publication: Publication, later: Later) -> V
 /// absent if it failed while the engine went on taking writes (a failure whose outcome is
 /// unknown takes no more: then either is right). A publication that failed with revision 2
 /// durable (its checkpoint in place, or its record in the log) leaves the log taking no write
-/// before a reopen, which recovers it at revision 2 and takes the next commit at 3. A panic
-/// other than the one injected fails its row.
+/// before a reopen, which recovers it at revision 2 and takes the next commit at 3. The
+/// reopened store holds exactly what was recovered: revision 1's statements or the
+/// publication's, with the acknowledged write. A panic other than the one injected fails its
+/// row.
 ///
-/// The write is a commit of a new statement, or (after a replacement, whose checkpoint lacks
-/// `quad(1)`) one that changes nothing in memory: a transaction or an append of `quad(1)`,
-/// which revision 1 holds. Before the fix of the error rows, the checkpoint of revision 2 was
+/// The write is a commit of a new statement, or one that changes nothing in memory: after a
+/// replacement, whose checkpoint lacks `quad(1)`, a transaction or an append of `quad(1)`,
+/// which revision 1 holds; after a rematerialisation, one that infers nothing. The unchanged
+/// rematerialisation is a guard: the check that refuses it is in place. Before the fix of the error rows, the checkpoint of revision 2 was
 /// in place when the load failed, the transaction was acknowledged as revision 2 too, and the
 /// restart skipped it as covered by that checkpoint; the panic rows did the same until the log
 /// was poisoned on any exit, not only a returned error; the unchanged writes were acknowledged
@@ -373,6 +428,13 @@ fn a_failed_publication_never_costs_a_later_acknowledged_commit() {
         .chain(points.iter().flat_map(|&point| {
             [Later::UnchangedCommit, Later::UnchangedLoad]
                 .map(|later| (point, Publication::Load(BulkMode::Replace), later))
+        }))
+        .chain(points.iter().map(|&point| {
+            (
+                point,
+                Publication::Rematerialisation,
+                Later::UnchangedRematerialisation,
+            )
         }))
         .chain([(in_publish, Publication::Commit, Later::Commit)]);
     let mut failures = Vec::new();
@@ -1364,6 +1426,112 @@ fn a_poisoned_replica_acknowledges_no_replay() {
                 "{name}: answered {answer:?}, not refused as poisoned"
             ));
         }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// What [`an_append_that_panics_as_its_names_settle_takes_no_more_writes`]'s panic says.
+const SETTLE_PANIC: &str = "a test's panic as an appended record's names are settled";
+
+/// The log of a primary's second commit, `quad(2)`, after its first, `quad(1)`: what a
+/// replica at revision 1 made by `commit(_, 1)` is sent ([`Engine::apply_log`]).
+fn second_record() -> Vec<u8> {
+    let dir = tempfile::tempdir().unwrap();
+    let primary = Engine::open(dir.path(), config()).unwrap();
+    commit(&primary, 1).unwrap();
+    commit(&primary, 2).unwrap();
+    primary.log_since(1, usize::MAX).unwrap().frames
+}
+
+/// One row of [`an_append_that_panics_as_its_names_settle_takes_no_more_writes`]: a reopened
+/// store at revision 1, `step` appending revision 2's record (`quad(2)`), which panics at the
+/// first directory sync once that record is in the log; what went wrong, if anything.
+fn settle_panic_row(step: impl FnOnce(&Engine) -> EngineResult<()>) -> Vec<String> {
+    let mut wrong = Vec::new();
+    let (_base, root) = a_closed_store(config());
+    let engine = Engine::open(&root, config()).unwrap();
+    let (fired, at) = (Rc::new(Cell::new(false)), root.clone());
+    let seen = Rc::clone(&fired);
+    fault::ON_DIR_SYNC.set(Some(Box::new(move |_: &std::path::Path| {
+        if !seen.get() && records_of(&at, 2) > 0 {
+            seen.set(true);
+            panic!("{SETTLE_PANIC}");
+        }
+    })));
+    let stepped = catch_unwind(AssertUnwindSafe(|| step(&engine)));
+    fault::ON_DIR_SYNC.set(None);
+    match stepped {
+        Err(payload) if panic_text(payload.as_ref()) != SETTLE_PANIC => {
+            return vec![format!(
+                "an unexpected panic: {}",
+                panic_text(payload.as_ref())
+            )];
+        }
+        _ if !fired.get() => return vec!["the panic's point was never reached".into()],
+        Ok(answer) => wrong.push(format!("the panicking append is answered {answer:?}")),
+        Err(_) => {}
+    }
+    let next = commit(&engine, 3);
+    drop(engine);
+    let engine = match Engine::open(&root, config()) {
+        Ok(engine) => engine,
+        Err(error) => return vec![format!("the store doesn't reopen: {error}")],
+    };
+    let held = contents(&engine);
+    if next.is_ok() && !held.contains(&quad(3)) {
+        wrong.push("the acknowledged write is lost".into());
+    }
+    if !matches!(next, Err(EngineError::WalPoisoned)) {
+        wrong.push(format!(
+            "the next commit is answered {:?}, not refused as poisoned",
+            next.map(|summary| summary.revision)
+        ));
+    }
+    if held != HashSet::from([quad(1), quad(2)]) || engine.snapshot().revision() != 2 {
+        wrong.push(format!(
+            "the reopen is at revision {}, holding {held:?}, not the synced record's",
+            engine.snapshot().revision()
+        ));
+    }
+    wrong
+}
+
+/// Spec: as [`a_failed_publication_never_costs_a_later_acknowledged_commit`], for the
+/// log's own append: a record written and synced but not yet installed is a durable change
+/// whose version memory doesn't hold, so an exit there takes no later write before a reopen.
+/// A reopened store, whose names are synced by its first append after the record (the
+/// deferred sync of 8 Nov), panics in that sync. Rows: a local commit, and a replica's replay
+/// of a valid record. The next commit is refused with [`EngineError::WalPoisoned`]; after the
+/// reopen the synced record is there at revision 2, and no acknowledged write is missing
+/// (checked first). Before the fix the log was poisoned only on a returned error: the next
+/// commit was acknowledged at revision 2 too, and the reopen skipped it as a duplicate.
+#[test]
+fn an_append_that_panics_as_its_names_settle_takes_no_more_writes() {
+    let frames = second_record();
+    let replay = |engine: &Engine| {
+        let expected = crate::LogExpectation {
+            after: 1,
+            records: 1,
+            last: 2,
+        };
+        let stop = nrese_exec::stop::StopSource::none();
+        engine.apply_log(&frames, &expected, &stop).map(drop)
+    };
+    type Step<'a> = &'a dyn Fn(&Engine) -> EngineResult<()>;
+    let rows: [(&str, Step<'_>); 2] = [
+        ("a local commit", &|engine: &Engine| {
+            commit(engine, 2).map(drop)
+        }),
+        ("a replay", &replay),
+    ];
+    let mut failures = Vec::new();
+    for (name, step) in rows {
+        let wrong = settle_panic_row(step);
+        eprintln!(
+            "row {name}: {}",
+            if wrong.is_empty() { "ok" } else { "FAILED" }
+        );
+        failures.extend(wrong.into_iter().map(|w| format!("{name}: {w}")));
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }

@@ -944,10 +944,9 @@ impl Inner {
                     true => Some(&mut stamp),
                     false => None,
                 };
+                // The log stays poisoned from the append's write until the version is
+                // installed: no exit in between leaves a later commit to take this revision.
                 let committed = wal.append(record, stamp, note)?;
-                // The record is durable and memory doesn't hold it yet: a panic before the
-                // install leaves the log poisoned, so that no later commit takes its revision.
-                wal.poison();
                 if !local {
                     shared
                         .clock
