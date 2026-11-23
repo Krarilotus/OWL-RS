@@ -634,7 +634,7 @@
             ]
           },
           "report": {
-            "description": "Its report when done.",
+            "description": "Its report when done. A failed import that stopped unexpectedly after its load\nreturned has one too, with the `revision` the store serves, beside its `error`; one\nwhose step after the load returned an error (its reasoning, say) has the `error` alone.",
             "type": [
               "object",
               "null"
