@@ -353,3 +353,38 @@ fn a_quarantined_store_holding_an_ill_typed_literal_revalidates_on_every_commit(
     );
     assert_eq!(store.consistency(), ConsistencyStatus::Unknown);
 }
+
+/// Under `owl2-ql` with user rules beside it (the program `owl2-ql+custom:beside.n3`), which
+/// derive nothing from the literal: a store holding `"abc"^^xsd:integer` is told neither
+/// `complete` nor `consistent`, as under `owl2-ql` alone.
+#[test]
+fn owl2_ql_with_user_rules_beside_it_is_told_neither_complete_nor_consistent() {
+    let n3 = "{ ?x <http://example.org/p> ?y } => { ?x <http://example.org/q> ?y } .";
+    let rules = nrese_reasoner::UserRules::n3("beside.n3", n3).expect("the rules parse");
+    let config = ReasonerConfig::for_mode(ReasoningMode::Owl2Ql).with_rules(Some(Arc::new(rules)));
+    let store = Arc::new(StoreService::new(StoreConfig::in_memory()).expect("store"));
+    let reasoner = Arc::new(ReasonerService::new(config.expect("rules beside owl2-ql")));
+    let pipeline = MutationPipeline::new(Arc::clone(&store), reasoner);
+    update(&pipeline, "INSERT DATA { :a :d \"abc\"^^xsd:integer }");
+    let ((word, reasons), consistency) = (read(&store), store.consistency());
+    assert!(
+        word != "complete" && consistency == ConsistencyStatus::Unknown,
+        "{word} {reasons:?}, {consistency:?}"
+    );
+}
+
+/// A store holding `"abc"^^xsd:integer`, materialised under the plain `owl2-rl` program (which
+/// keeps no witness: `consistent`), then taken over by an `owl2-dl` pipeline, whose program
+/// didn't make the closure: no certificate vouches for the version, its literal is unread,
+/// and its consistency is `unknown`, never the earlier program's `consistent`.
+#[test]
+fn an_owl2_dl_pipeline_over_an_owl2_rl_closure_is_not_told_consistent() {
+    let store = Arc::new(StoreService::new(StoreConfig::in_memory()).expect("store"));
+    let off = ReasonerConfig::for_mode(ReasoningMode::Disabled);
+    let off = MutationPipeline::new(Arc::clone(&store), Arc::new(ReasonerService::new(off)));
+    update(&off, "INSERT DATA { :a :d \"abc\"^^xsd:integer }");
+    (store.rematerialise(nrese_reasoner::rulesets::Ruleset::Owl2Rl)).expect("reasoned");
+    assert_eq!(store.consistency(), ConsistencyStatus::Consistent);
+    let _dl = over(&store, "owl2-dl");
+    assert_eq!(store.consistency(), ConsistencyStatus::Unknown);
+}
