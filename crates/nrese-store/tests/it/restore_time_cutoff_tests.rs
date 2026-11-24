@@ -136,6 +136,26 @@ fn untimed(v6: &[u8]) -> Vec<u8> {
     out
 }
 
+/// A version 6 segment with its records' commit times (the payload's last 8 bytes) replaced by
+/// `times`, in order, and each frame's checksum made anew.
+fn retimed(v6: &[u8], times: &[u64]) -> Vec<u8> {
+    assert_eq!(&v6[..8], b"NRESEWL6", "setup: a version 6 segment");
+    let mut out = v6.to_vec();
+    let mut times = times.iter();
+    let mut pos = 8;
+    while pos < out.len() {
+        let len = u32::from_le_bytes(out[pos..pos + 4].try_into().unwrap()) as usize;
+        let end = pos + 8 + len;
+        let time = times.next().expect("setup: a time for each record");
+        out[end - 8..end].copy_from_slice(&time.to_le_bytes());
+        let crc = crc32(&out[pos + 8..end]);
+        out[pos + 4..pos + 8].copy_from_slice(&crc.to_le_bytes());
+        pos = end;
+    }
+    assert!(times.next().is_none(), "setup: a record for each time");
+    out
+}
+
 fn ask(store: &StoreService, n: u64, object: &str) -> bool {
     let answer = store
         .execute_query_str(&format!("ASK {{ <{EX}s{n}> <{EX}p> <{EX}{object}> }}"))
@@ -305,6 +325,36 @@ fn an_empty_image_restored_reports_no_commit_time() {
     assert_eq!(at, 0);
     assert_eq!(report.stop, nrese_store::RestoreStop::EndOfLog);
     assert_eq!(report.last_commit_micros, None);
+}
+
+/// Spec: the restore reports the latest commit time among the commits it keeps, as a version's
+/// time bounds every commit in it; a log an earlier binary wrote may step back. The image at 0,
+/// then commits 1 and 2 logged at 2000 and 1000: restored, it reports 2000.
+#[test]
+fn a_stepped_back_log_reports_its_latest_commit_time() {
+    let root = tempdir().unwrap();
+    let (data, backup) = (root.path().join("data"), root.path().join("backup"));
+    let e = engine(&data, false);
+    assert_eq!(image(&e, &backup), 0);
+    commit_plain(&e, 1);
+    commit_plain(&e, 2);
+    drop(e);
+    let live = data.join("wal");
+    let firsts = segments(&live);
+    assert_eq!(firsts.len(), 1, "setup: one live segment");
+    let supplied = root.path().join("supplied");
+    fs::create_dir_all(&supplied).unwrap();
+    let bytes = fs::read(segment(&live, firsts[0])).unwrap();
+    fs::write(
+        segment(&supplied, firsts[0]),
+        retimed(&bytes, &[2000, 1000]),
+    )
+    .unwrap();
+    let target = root.path().join("target");
+    let (_, at, report) =
+        nrese_store::restore_until(&backup, &target, &[supplied], None, None).unwrap();
+    assert_eq!(at, 2);
+    assert_eq!(report.last_commit_micros, Some(2000));
 }
 
 /// Spec: `restore_until` rejects untimed records after the image under a time cutoff.
