@@ -1723,7 +1723,16 @@ fn parts(
             Some(over)
         }
     };
-    let mut triples = ChargedVec::with_capacity(Arc::clone(kept), upper.stack.len()).ok()?;
+    let mut eligible = ChargedVec::new(Arc::clone(kept));
+    for t in upper.facts() {
+        // The stack already holds the representative form of facts that touch a class.
+        if t.into_iter().any(|id| classes.class_of(id).is_some()) || in_view(snapshot, t) {
+            continue;
+        }
+        eligible.push(t).ok()?;
+    }
+    let capacity = upper.stack.len().checked_add(eligible.len())?;
+    let mut triples = ChargedVec::with_capacity(Arc::clone(kept), capacity).ok()?;
     let mut take = |[s, p, o]: Triple| {
         // L's memberships from the taxonomy are certain: no gap.
         if held_by_lower(lower, classes, [s, p, o]) {
@@ -1751,16 +1760,10 @@ fn parts(
         }
         triples.push(encode([s, p, o])).ok()
     };
-    for t in upper.stack.iter() {
+    for t in upper.stack.iter().chain(eligible.iter().copied()) {
         take(t)?;
     }
-    for t in upper.facts() {
-        // The stack already holds the representative form of facts that touch a class.
-        if t.into_iter().any(|id| classes.class_of(id).is_some()) || in_view(snapshot, t) {
-            continue;
-        }
-        take(t)?;
-    }
+    drop(eligible);
     for signature in [
         &mut view.gap_classes,
         &mut view.gap_predicates,
