@@ -500,6 +500,13 @@ pub(crate) fn mark(
         completeness.unsound("dl", reason);
     }
     let snapshot = at.snapshot();
+    if !matches!(at, Revision::Pending { .. })
+        && let Some(text) = store.dl().bounds.anonymous(snapshot.revision())
+    {
+        completeness
+            .reasons
+            .push(nrese_sparql::completeness::Reason { source: "dl", text });
+    }
     let held = |iri: &str| {
         let Some(t) = snapshot.lookup(NamedNodeRef::new_unchecked(iri).into()) else {
             return false;
@@ -517,26 +524,6 @@ pub(crate) fn mark(
         Revision::Pending { .. } => read_ontology,
         _ => ontology_at,
     };
-    // Probe the asserted indexes before reading the ontology for anonymous individuals.
-    use nrese_engine::{TermKind, quad::Permutation};
-    let (low, high) = TermId::kind_range(TermKind::BlankNode);
-    let all = QuadPattern::all();
-    if !matches!(at, Revision::Pending { .. })
-        && [Permutation::Spog, Permutation::Ospg].into_iter().any(|order| {
-            snapshot
-                .scan_range_in(ReadModel::Asserted, &all, order, low, high)
-                .is_some_and(|mut quads| quads.next().is_some())
-        })
-        && let Ok(ontology) = ontology_at(store, snapshot)
-        && let Some(finding) = ontology.value().diagnostics.iter().find(|d| {
-            matches!(d, nrese_owl::Diagnostic::AnonymousIndividual { axioms, .. } if axioms.iter().any(Option::is_some))
-        })
-    {
-        completeness.reasons.push(nrese_sparql::completeness::Reason {
-            source: "dl",
-            text: finding.describe(&consistency::nameless),
-        });
-    }
     if let Some(iri) = named_outside(prepared.query(), held)
         && read(store, snapshot).ok().is_none_or(|o| {
             o.value()
