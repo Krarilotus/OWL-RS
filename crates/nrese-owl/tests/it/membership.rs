@@ -43,6 +43,18 @@ fn datatype_rules_outside_owl2_dl_are_named() {
         ),
         ("built-in declaration", "xsd:integer a rdfs:Datatype .", ""),
         (
+            "RDF 1.1 language-tagged string outside the OWL 2 datatype map",
+            "rdf:langString a rdfs:Datatype . ex:d a owl:DatatypeProperty ;
+             rdfs:range rdf:langString .",
+            "undefined datatype",
+        ),
+        (
+            "OWL 2 plain literal in the datatype map",
+            "rdf:PlainLiteral a rdfs:Datatype . ex:d a owl:DatatypeProperty ;
+             rdfs:range rdf:PlainLiteral .",
+            "",
+        ),
+        (
             "top data superproperty",
             "ex:d a owl:DatatypeProperty ; rdfs:subPropertyOf owl:topDataProperty .",
             "",

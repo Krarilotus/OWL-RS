@@ -24,14 +24,18 @@ fn preloaded(data: &str) -> nrese_store::MutationPipeline {
 
 /// OWL 2 Structural Specification §§11.1–11.2: the bottom object property
 /// is composite, so a functional superproperty lies outside OWL 2 DL.
+/// The same functional property alone is simple and the read stays complete.
 #[test]
 fn a_property_above_the_bottom_property_is_not_simple() {
-    let dl = preloaded(
-        ":q a owl:ObjectProperty, owl:FunctionalProperty .
-         owl:bottomObjectProperty rdfs:subPropertyOf :q .
-         :x a owl:NamedIndividual ; :q :y . :y a owl:NamedIndividual .",
-    );
-    let (_, status) = query(&dl, "SELECT ?x { :x :q ?x }");
+    let functional = ":q a owl:ObjectProperty, owl:FunctionalProperty .
+        :x a owl:NamedIndividual ; :q :y . :y a owl:NamedIndividual .";
+    let select = "SELECT ?x { :x :q ?x }";
+    let (_, control) = query(&preloaded(functional), select);
+    assert!(control.is_complete(), "{control:?}");
+    let dl = preloaded(&format!(
+        "{functional} owl:bottomObjectProperty rdfs:subPropertyOf :q ."
+    ));
+    let (_, status) = query(&dl, select);
     assert!(!status.is_complete(), "{status:?}");
     let verdict = dl
         .store()
@@ -124,6 +128,31 @@ fn anonymous_individuals_outside_owl2_dl_are_reported() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// OWL 2 Structural Specification §11.2 permits a singleton anonymous tree
+/// with one named attachment. Two attachments give a membership report on a
+/// read of a fixed user predicate.
+#[test]
+fn anonymous_tree_attachments_are_reported_on_a_fixed_predicate_read() {
+    let fixture = format!("{FIXED_PREDICATE} :q a owl:ObjectProperty . :z a owl:NamedIndividual .");
+    let (_, control) = query(&preloaded(&format!("{fixture} _:b :q :y .")), FIXED_READ);
+    assert!(control.is_complete(), "{control:?}");
+    assert!(
+        !control.reasons().iter().any(|r| r.contains("anonymous")),
+        "{control:?}"
+    );
+    let (_, status) = query(
+        &preloaded(&format!("{fixture} _:b :q :y, :z .")),
+        FIXED_READ,
+    );
+    assert!(
+        status
+            .reasons()
+            .iter()
+            .any(|r| r.contains("anonymous tree has no root")),
+        "{status:?}"
+    );
+}
+
 /// OWL 2 Mapping to RDF Graphs Table 12: one member cannot form a data
 /// intersection or union. Two members, and a one-literal enumeration, can.
 /// The test uses a fixed predicate because an unbound predicate already
@@ -176,5 +205,22 @@ fn conclusion_can_use_a_datatype_defined_in_the_premise() {
         .expect("entailment");
     assert_eq!(report.answer, Entailed::Yes);
     assert!(report.holds());
+    assert_eq!(report.premise.as_str(), "inconsistent");
+}
+
+/// Mapping to RDF Graphs Table 12 gives no reading to a one-member data
+/// intersection. OWL 2 Conformance §2.2.1 permits an unknown entailment answer.
+/// The premise's inconsistency remains established.
+#[test]
+fn a_singleton_data_intersection_in_the_conclusion_is_unknown() {
+    let dl = unchecked_inconsistent();
+    let report = dl
+        .store()
+        .entails_dl(&turtle(
+            ":d a owl:DatatypeProperty ; rdfs:range [
+         a rdfs:Datatype ; owl:intersectionOf ( xsd:integer ) ] .",
+        ))
+        .expect("entailment");
+    assert!(matches!(report.answer, Entailed::Unknown(_)), "{report:?}");
     assert_eq!(report.premise.as_str(), "inconsistent");
 }
