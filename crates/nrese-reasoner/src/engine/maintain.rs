@@ -920,7 +920,7 @@ mod tests {
     /// cold commit adapter give the same rule instances, premises and list tables.
     #[test]
     fn snapshot_and_cold_commit_ground_the_same_program() {
-        use crate::eval::{GroundProgram, Grounding, Seg, Source};
+        use crate::eval::{GroundProgram, Grounding};
         use crate::ir::{Head, Rule, Term};
         use nrese_rdf_io::{RdfFormat, RdfParser};
         use std::fmt::Write as _;
@@ -1070,7 +1070,7 @@ mod tests {
             g.table
                 .as_ref()
                 .unwrap()
-                .scan([None; 3], Seg::All, &Poller::never(), &mut |mut fact| {
+                .scan_table(&Poller::never(), |mut fact| {
                     fact[1] = predicate(fact[1]);
                     rows.insert(
                         fact.map(|id| super::super::decoded(base.decode(TermId::from_raw(id)), id)),
