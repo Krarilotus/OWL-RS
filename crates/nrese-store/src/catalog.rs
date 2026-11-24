@@ -1457,19 +1457,54 @@ mod tests {
         assert_eq!(mode, "rdfs", "the old reasoning isn't the repository's");
         assert_eq!(got, rdfs, "the old reasoning's answers");
         let restored = std::sync::Arc::clone(&*repository.pipeline.read());
-        // The failed publication cleared the certificate. The restored writer certifies
-        // the old closure before its edit, then uses its own preparation.
-        commit(&restored, SAME_DOG);
+        let before = restored.write_program_metrics();
+        let refused = restored.execute_update_str(SAME_DOG);
+        let after = restored.write_program_metrics();
+        println!(
+            "poisoned WAL, write program before and after the refusal: {before:?} -> {after:?}"
+        );
+        assert_eq!([before, after], [(1, 0, 0); 2]);
+        assert!(
+            matches!(
+                &refused,
+                Err(crate::MutationError::Store {
+                    source: crate::StoreError::Engine(nrese_engine::EngineError::WalPoisoned),
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+        drop((restored, repository, store, catalog));
+
+        let catalog = Catalog::open(
+            compact_store(dir.path()),
+            nrese_reasoner::ReasonerService::new(nrese_reasoner::ReasonerConfig::default()),
+        )
+        .unwrap();
+        let repository = catalog.get(DEFAULT_REPOSITORY).unwrap();
+        let reopened = repository.pipeline.read();
+        assert_eq!(
+            animals(reopened.store()),
+            rdfs,
+            "the reopened store uses the old rules"
+        );
+        commit(&reopened, SAME_DOG);
         let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while restored.write_program_metrics().0 != 2 {
+        loop {
+            let (phase, builds, commit_groundings) = reopened.write_program_metrics();
+            assert_ne!(phase, 3, "the reopened writer's preparation failed");
+            assert!(builds <= 1, "the reopened writer retried preparation");
+            assert_eq!(commit_groundings, 0);
+            if (phase, builds) == (2, 1) {
+                break;
+            }
             assert!(std::time::Instant::now() < until, "restored write program");
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        assert_eq!(restored.write_program_metrics().2, 0);
         assert_eq!(
-            animals(&store),
+            animals(reopened.store()),
             rdfs,
-            "the restored writer uses the old rules"
+            "the reopened writer uses the old rules"
         );
     }
 
