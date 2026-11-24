@@ -2947,6 +2947,7 @@ impl StoreService {
         // Under the writer slot: no commit raises the mark between the reading and the rise.
         let mark = self.unassessed.load(std::sync::atomic::Ordering::Relaxed);
         (self.unassessed).fetch_add(mark % 2, std::sync::atomic::Ordering::Release);
+        self.engine.notify_publication();
         drop(finished);
         if let Some(why) = undecided {
             let text = why.text(violations);

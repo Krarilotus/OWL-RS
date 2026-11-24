@@ -53,7 +53,7 @@ mod writer;
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, mpsc};
+use std::sync::{Arc, OnceLock, Weak, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -409,8 +409,16 @@ enum CompactionOutcome {
     Deferred,
 }
 
+/// Observes a published version after its version and WAL locks have been released.
+/// The writer slot may still be held: a listener cannot take it or wait for a writer.
+pub trait PublicationListener: Send + Sync {
+    /// The revision and equality reading visible when the notification is sent.
+    fn published(self: Arc<Self>, revision: u64, reading: Option<TermId>);
+}
+
 struct Versions {
     current: RwLock<Arc<Version>>,
+    listeners: OnceLock<Mutex<Vec<Weak<dyn PublicationListener>>>>,
     /// Held to replace runs, and only for serial work: anyone may wait for it.
     compaction_slot: Mutex<()>,
     /// A merge runs ([`Self::claim`]); `merged` is notified when it ends.
@@ -422,6 +430,22 @@ struct Versions {
 }
 
 impl Versions {
+    fn notify(&self) {
+        let Some(listeners) = self.listeners.get() else {
+            return;
+        };
+        let live = {
+            let mut listeners = listeners.lock();
+            let live: Vec<_> = listeners.iter().filter_map(Weak::upgrade).collect();
+            listeners.retain(|listener| listener.strong_count() > 0);
+            live
+        };
+        let current = self.load();
+        for listener in live {
+            listener.published(current.revision, current.reading);
+        }
+    }
+
     fn load(&self) -> Arc<Version> {
         self.current.read().clone()
     }
@@ -472,7 +496,7 @@ impl Versions {
             };
             let runs = version.stack(stack).runs();
             let merged = merge_runs(&runs[plan.window.clone()]);
-            let _slot = self.compaction_slot.lock();
+            let slot = self.compaction_slot.lock();
             self.publish(|current| {
                 let index = current.stack(stack);
                 // A commit that turned the stack into the quad layout replaced its runs
@@ -492,6 +516,8 @@ impl Versions {
                     false => current.with_stack(stack, index.clone()),
                 }
             });
+            drop(slot);
+            self.notify();
         }
     }
 
@@ -637,6 +663,7 @@ impl Shared {
                 };
                 Version::new(Watch::Keep(current), data)
             });
+            self.versions.notify();
         }
     }
 
@@ -719,6 +746,7 @@ impl Shared {
                 Version::new(Watch::Keep(current), data)
             });
         }
+        self.versions.notify();
         drop(written);
         if let Err(error) = self.dictionary.rebase(base) {
             tracing::warn!(%error, "checkpoint dictionary not mapped; it stays in memory");
@@ -1082,6 +1110,7 @@ impl Engine {
             watched_graph: OnceLock::new(),
             versions: Versions {
                 current: RwLock::new(Arc::new(version)),
+                listeners: OnceLock::new(),
                 compaction_slot: Mutex::new(()),
                 merging: Mutex::new(false),
                 merged: Condvar::new(),
@@ -1109,6 +1138,22 @@ impl Engine {
                 worker,
             }),
         })
+    }
+
+    /// Subscribes while the caller keeps the listener alive.
+    pub fn listen_publications(&self, listener: &Arc<dyn PublicationListener>) {
+        self.inner
+            .shared
+            .versions
+            .listeners
+            .get_or_init(Mutex::default)
+            .lock()
+            .push(Arc::downgrade(listener));
+    }
+
+    /// Notifies listeners after a store records the reasoning state of the published version.
+    pub fn notify_publication(&self) {
+        self.inner.shared.versions.notify();
     }
 
     /// The latest committed state. Never blocks on writers.
