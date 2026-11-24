@@ -186,9 +186,7 @@ impl Diagnostic {
             Self::NotOwl { triple } => return (triple, "not owl"),
             Self::Unused { node, .. } => (node, "unused"),
             Self::NonSimpleProperty { property, what, .. } => (property, what),
-            Self::IrregularPropertyHierarchy { upper, .. } => {
-                (upper.named(), "irregular property hierarchy")
-            }
+            Self::IrregularPropertyHierarchy { upper, .. } => (upper.named(), "irregular roles"),
             Self::AnonymousIndividual { node } => (node, "anonymous individual"),
             Self::Syntax { line, column, what } => {
                 ((u64::from(line) << 32) | u64::from(column), what)
@@ -491,12 +489,13 @@ pub(crate) fn check_global_restrictions(ontology: &mut Ontology) {
 
 /// The first impossible pair in the least strict order required by §11.2.
 fn impossible_role_order(ontology: &Ontology) -> Option<(ObjProp, ObjProp)> {
+    let top = ontology.builtin.top_object.map(ObjProp::Named);
     let mut pairs = VecDeque::new();
     for axiom in &ontology.axioms {
         let Axiom::SubObjectPropertyOf(chain, upper) = axiom else {
             continue;
         };
-        if chain.len() < 2 || Some(upper.named()) == ontology.builtin.top_object {
+        if chain.len() < 2 || Some(*upper) == top {
             continue;
         }
         let last = chain.len() - 1;
