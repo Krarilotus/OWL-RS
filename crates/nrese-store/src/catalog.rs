@@ -1457,12 +1457,14 @@ mod tests {
         assert_eq!(mode, "rdfs", "the old reasoning isn't the repository's");
         assert_eq!(got, rdfs, "the old reasoning's answers");
         let restored = std::sync::Arc::clone(&*repository.pipeline.read());
+        // The failed publication cleared the certificate. The restored writer certifies
+        // the old closure before its edit, then uses its own preparation.
+        commit(&restored, SAME_DOG);
         let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while restored.write_program_metrics().0 != 2 {
             assert!(std::time::Instant::now() < until, "restored write program");
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        commit(&restored, SAME_DOG);
         assert_eq!(restored.write_program_metrics().2, 0);
         assert_eq!(
             animals(&store),

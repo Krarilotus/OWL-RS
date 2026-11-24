@@ -6,7 +6,7 @@ use nrese_rdf_io::{RdfFormat, RdfParser};
 use nrese_sparql::GraphAccess;
 use std::collections::BTreeSet;
 
-#[path = "../../../nrese-reasoner/src/tests/ontology_generator.rs"]
+#[path = "../../nrese-reasoner/src/tests/ontology_generator.rs"]
 mod generator;
 
 #[path = "prepare_fixed_edits.rs"]

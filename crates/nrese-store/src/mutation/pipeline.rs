@@ -17,7 +17,7 @@ use crate::service::StoreService;
 use crate::update::{SparqlUpdateRequest, UpdateExecutionReport};
 
 #[cfg(test)]
-#[path = "prepare_tests.rs"]
+#[path = "../prepare_tests.rs"]
 mod prepare_tests;
 
 /// The single owner of write semantics: plan → validate → claim → commit.
@@ -209,9 +209,9 @@ impl MutationPipeline {
         // the certificate between the preflight and the slot. Then the slot goes back, the
         // closure is rematerialised, and the transaction is taken again.
         let preparation = &self.preparation;
-        let rules = preparation.rules.as_ref();
+        let rules = preparation.rules.clone();
         let (mut tx, entry) = loop {
-            if let Some(rules) = rules
+            if let Some(rules) = &rules
                 && !self.store.reasoning_is_current(rules)
             {
                 let stop = || ticket.stop_requested() || self.is_retired();
@@ -229,7 +229,9 @@ impl MutationPipeline {
             #[cfg(test)]
             crate::service::hooks::run(&crate::service::hooks::AFTER_PREFLIGHT);
             let tx = self.store.engine().transaction();
-            let Some(rules) = rules else { break (tx, None) };
+            let Some(rules) = &rules else {
+                break (tx, None);
+            };
             let writer = tx.writer().expect("a transaction holds the writer slot");
             if !self.store.reasoning_is_current_held(writer, rules) {
                 continue;
@@ -279,7 +281,7 @@ impl MutationPipeline {
         if let Some(rules) = rules {
             // Reasoner v2: the closure goes into the inferred stack, in this transaction.
             let program = preparation
-                .compiled(&self.store, rules, &tx)
+                .compiled(&self.store, &rules, &tx)
                 .map_err(store_error)?;
             // The commit's stack is read as the program keeps it, installed with it: expanded
             // over representatives from the commit that brings the store's first `owl:sameAs`.
@@ -593,7 +595,7 @@ impl MutationPipeline {
             crate::service::hooks::run(&crate::service::hooks::BEFORE_REVALIDATION);
             // In quarantine the commit checked only its own facts: revalidate everything, so
             // the store leaves quarantine once the data is repaired. The commit itself stands.
-            if quarantined && let Err(error) = self.store.rematerialise(rules) {
+            if quarantined && let Err(error) = self.store.rematerialise(&rules) {
                 tracing::error!(%error, "revalidation after a commit in quarantine failed");
             }
             return Ok(report);
