@@ -46,6 +46,12 @@ pub struct MutationPipeline {
     preparation: Arc<Preparation>,
 }
 
+impl Drop for MutationPipeline {
+    fn drop(&mut self) {
+        self.preparation.close();
+    }
+}
+
 impl MutationPipeline {
     pub fn new(store: Arc<StoreService>, reasoner: Arc<ReasonerService>) -> Self {
         let rules = reasoner.config().materialised_program();

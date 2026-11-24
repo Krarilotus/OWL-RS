@@ -1,6 +1,5 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, OnceLock, Weak, atomic::AtomicU64};
 
 use nrese_engine::engine::PublicationListener;
 use nrese_engine::{Snapshot, TermId, Transaction};
@@ -35,7 +34,8 @@ enum Handoff {
 }
 
 pub(super) struct Preparation {
-    store: Weak<StoreService>,
+    // The pipeline clears this before releasing its last store reference.
+    store: Mutex<Weak<StoreService>>,
     pub(super) rules: Option<RuleProgram>,
     program: OnceLock<Program>,
     pub(super) entry: Mutex<Entry>,
@@ -56,7 +56,7 @@ impl std::fmt::Debug for Preparation {
 impl Preparation {
     pub(super) fn new(store: &Arc<StoreService>, rules: Option<RuleProgram>) -> Self {
         Self {
-            store: Arc::downgrade(store),
+            store: Mutex::new(Arc::downgrade(store)),
             rules,
             program: OnceLock::new(),
             entry: Mutex::default(),
@@ -66,6 +66,15 @@ impl Preparation {
             retired: Mutex::default(),
             tagging: ReentrantMutex::default(),
         }
+    }
+
+    pub(super) fn close(&self) {
+        *self.store.lock() = Weak::new();
+    }
+
+    fn with_store<T>(&self, run: impl FnOnce(&StoreService) -> T) -> Option<T> {
+        let store = self.store.lock();
+        store.upgrade().as_deref().map(run)
     }
 
     pub(super) fn register(self: &Arc<Self>, store: &StoreService) {
@@ -135,18 +144,23 @@ impl Preparation {
         #[cfg(any(test, feature = "fault-points"))]
         super::write_program_hooks::run(super::write_program_hooks::Stage::BeforeClaim);
         let requested = reply.is_some();
-        while let Some(store) = self.store.upgrade().filter(|_| !*self.retired.lock()) {
-            let key = ground_key(&store.engine().snapshot());
+        let rules = self.rules.as_ref().expect("preparation requires rules");
+        while !*self.retired.lock() {
+            let Some((key, current)) = self.with_store(|store| {
+                (
+                    ground_key(&store.engine().snapshot()),
+                    requested || store.reasoning_is_current(rules),
+                )
+            }) else {
+                break;
+            };
             if cached(&self.entry.lock(), key).is_some() {
                 if let Some(reply) = reply {
                     reply.finish(Handoff::Covered);
                 }
                 return;
             }
-            let rules = self.rules.as_ref().expect("preparation requires rules");
-            if !requested
-                && (*self.failed.lock() == Some(key) || !store.reasoning_is_current(rules))
-            {
+            if !current || (!requested && *self.failed.lock() == Some(key)) {
                 return;
             }
             let (build, owner) = match self.builds.claim((), Kind::Opaque, || {
@@ -162,18 +176,12 @@ impl Preparation {
             if let Some(reply) = reply.take() {
                 reply.finish(Handoff::Joined(build.clone()));
             }
-            let completed = owner.map(|owner| {
+            if let Some(owner) = owner {
                 let mut pinned = key;
-                let end = catch_unwind(AssertUnwindSafe(|| {
-                    self.build(&store, rules, &mut pinned, requested)
-                }));
+                let end = catch_unwind(AssertUnwindSafe(|| self.build(&mut pinned, requested)));
                 if matches!(end, Ok(End::Empty) | Err(_)) {
                     *self.failed.lock() = Some(pinned);
                 }
-                (owner, end)
-            });
-            drop(store);
-            if let Some((owner, end)) = completed {
                 match end {
                     Ok(end) => owner.end(end),
                     Err(_) => drop(owner),
@@ -188,39 +196,39 @@ impl Preparation {
         }
     }
 
-    fn build(
-        &self,
-        store: &StoreService,
-        rules: &RuleProgram,
-        pinned: &mut GroundKey,
-        requested: bool,
-    ) -> End<GroundProgram> {
-        let (base, program) = {
+    fn build(&self, pinned: &mut GroundKey, requested: bool) -> End<GroundProgram> {
+        let rules = self.rules.as_ref().expect("preparation requires rules");
+        let pinned_base = self.with_store(|store| {
             let tx = store.engine().transaction();
             if *self.retired.lock()
                 || !store.reasoning_is_current_held(tx.writer().expect("writer"), rules)
             {
-                return End::Later;
+                return Err(End::Later);
             }
             let base = tx.base();
             *pinned = ground_key(base);
             if let Some(program) = cached(&self.entry.lock(), *pinned).cloned() {
-                return End::Kept(program);
+                return Err(End::Kept(program));
             }
             if *self.failed.lock() == Some(*pinned) {
                 if !requested {
-                    return End::Empty;
+                    return Err(End::Empty);
                 }
                 *self.failed.lock() = None;
             }
             let Ok(program) = self.compiled(store, rules, &tx) else {
-                return End::Empty;
+                return Err(End::Empty);
             };
-            (base.clone(), program)
+            Ok((base.clone(), program, store.memory_stop()))
+        });
+        let (base, program, memory) = match pinned_base {
+            Some(Ok(pinned)) => pinned,
+            Some(Err(end)) => return end,
+            None => return End::Later,
         };
         let key = *pinned;
-        let moved = || ground_key(&store.engine().snapshot()) != key;
-        let memory = store.memory_stop();
+        let head = || self.with_store(|store| ground_key(&store.engine().snapshot()));
+        let moved = || head() != Some(key);
         let stop = || {
             #[cfg(any(test, feature = "fault-points"))]
             super::write_program_hooks::run(super::write_program_hooks::Stage::DuringGrounding);

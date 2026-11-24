@@ -96,6 +96,22 @@ fn answer_at(writer: &MutationPipeline, sparql: &str) {
         .unwrap();
 }
 
+/// Spec: closing the last pipeline releases the directory even while a snapshot
+/// is held for background grounding.
+#[test]
+fn closing_a_pipeline_releases_the_directory_during_grounding() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = StoreConfig::on_disk(dir.path());
+    let store = loaded(StoreService::new(config.clone()).unwrap(), SCHEMA);
+    let (entered, release) = pause(Stage::DuringGrounding);
+    let pipeline = MutationPipeline::new(store, rl()).prepare_from_start();
+    entered.recv_timeout(WAIT).unwrap();
+    drop(pipeline);
+    let reopened = StoreService::new(config).expect("the closed pipeline released the directory");
+    release.send(()).unwrap();
+    assert!(reopened.reasoning_state().is_some());
+}
+
 /// Spec: a reopened, prepared writer makes the first edit against the current hidden
 /// closure without grounding the whole program again.
 #[test]
