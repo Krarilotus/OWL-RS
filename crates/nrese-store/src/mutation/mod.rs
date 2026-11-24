@@ -13,6 +13,7 @@ pub(crate) mod command;
 mod error;
 pub(crate) mod evidence;
 mod pipeline;
+mod prepare;
 mod record;
 mod ticket;
 

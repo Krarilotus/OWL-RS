@@ -293,7 +293,7 @@ pub struct Repository {
 impl Repository {
     fn new(pipeline: MutationPipeline, settings: RepositorySettings) -> Self {
         Self {
-            pipeline: PipelineSlot(Arc::new(RwLock::new(Arc::new(pipeline)))),
+            pipeline: PipelineSlot(Arc::new(RwLock::new(pipeline.prepare_from_start()))),
             settings: Arc::new(RwLock::new(settings)),
             lifecycle: Arc::default(),
         }
@@ -846,10 +846,9 @@ impl Catalog {
             // the new ones.
             previous.retire();
             let restore = || {
-                *repository.pipeline.0.write() = Arc::new(MutationPipeline::new(
-                    Arc::clone(&store),
-                    Arc::clone(previous.reasoner()),
-                ));
+                *repository.pipeline.0.write() =
+                    MutationPipeline::new(Arc::clone(&store), Arc::clone(previous.reasoner()))
+                        .prepare_from_start();
             };
             // Back to the old reasoning after the new inferences were published: they are
             // recomputed under it before its write path is published again. If that fails
@@ -883,7 +882,7 @@ impl Catalog {
                 Err((error, false)) => return Err(roll_back(error)),
             }
             effective.apply(&store);
-            Some(Arc::new(MutationPipeline::new(store, Arc::new(reasoner))))
+            Some(MutationPipeline::new(store, Arc::new(reasoner)).prepare_from_start())
         } else {
             persist().map_err(|(error, _)| error)?;
             effective.apply(repository.pipeline.read().store());

@@ -1,13 +1,12 @@
 use std::sync::{Arc, RwLock};
 
-use nrese_engine::{Snapshot, TermId};
 use nrese_reasoner::ReasonerService;
-use nrese_reasoner::eval::GroundProgram;
 
 use super::attribution::attribute_reject_delta;
 use super::command::{MutationCommand, MutationCommitReport};
 use super::error::{MutationError, RejectKind};
 use super::evidence;
+use super::prepare::{Preparation, cached, ground_key};
 use super::record::ReasoningRunRecord;
 use super::ticket::{MutationTicket, publishing};
 use crate::config::{GateSeverity, ShaclGate};
@@ -16,13 +15,6 @@ use crate::error::StoreError;
 use crate::graph_store::{GraphDeleteReport, GraphTarget, GraphWriteReport, GraphWriteRequest};
 use crate::service::StoreService;
 use crate::update::{SparqlUpdateRequest, UpdateExecutionReport};
-
-type GroundKey = (u64, Option<TermId>);
-
-fn ground_key(snapshot: &Snapshot) -> GroundKey {
-    let identity = snapshot.identity();
-    (identity.revision, identity.equality)
-}
 
 /// The single owner of write semantics: plan → validate → claim → commit.
 ///
@@ -47,30 +39,28 @@ pub struct MutationPipeline {
     store: Arc<StoreService>,
     reasoner: Arc<ReasonerService>,
     last_reasoning_run: RwLock<Option<ReasoningRunRecord>>,
-    /// Reasoner v2's ruleset compiled against the dictionary, on first use.
-    program: std::sync::OnceLock<crate::reasoning::Program>,
-    /// Reasoner v2's ground program, keyed by the revision and how it was read.
-    ground: std::sync::Mutex<Option<(GroundKey, Arc<GroundProgram>)>>,
-    /// Set when another pipeline (other rules) took over the store: writes are refused
-    /// from then on, so none applies this pipeline's rules to a stack made for others.
-    retired: std::sync::atomic::AtomicBool,
+    preparation: Arc<Preparation>,
 }
 
 impl MutationPipeline {
     pub fn new(store: Arc<StoreService>, reasoner: Arc<ReasonerService>) -> Self {
-        store.use_reasoning_rules(reasoner.config().materialised_program());
+        let rules = reasoner.config().materialised_program();
+        store.use_reasoning_rules(rules.clone());
         store.use_dl(
             reasoner.config().mode().is_dl(),
             reasoner.config().rules.is_some(),
         );
         Self {
+            preparation: Arc::new(Preparation::new(&store, rules)),
             store,
             reasoner,
             last_reasoning_run: RwLock::new(None),
-            program: std::sync::OnceLock::new(),
-            ground: std::sync::Mutex::new(None),
-            retired: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn prepare_from_start(self) -> Arc<Self> {
+        self.preparation.register(&self.store);
+        Arc::new(self)
     }
 
     pub fn store(&self) -> &Arc<StoreService> {
@@ -92,13 +82,12 @@ impl MutationPipeline {
     /// Retires this pipeline: another one with other rules takes over its store, and this
     /// one's writes are refused ([`MutationError::Retired`]) from now on.
     pub fn retire(&self) {
-        self.retired
-            .store(true, std::sync::atomic::Ordering::Release);
+        *self.preparation.retired.lock() = true;
     }
 
     /// Whether [`Self::retire`] was called.
     pub fn is_retired(&self) -> bool {
-        self.retired.load(std::sync::atomic::Ordering::Acquire)
+        *self.preparation.retired.lock()
     }
 
     /// Applies `command` as the store's owner ([`crate::Requester::all`]: every graph)
@@ -194,9 +183,10 @@ impl MutationPipeline {
         // a write that doesn't maintain the closure (a bulk load, `clear_inferred`) may clear
         // the certificate between the preflight and the slot. Then the slot goes back, the
         // closure is rematerialised, and the transaction is taken again.
-        let rules = self.reasoner.config().materialised_program();
-        let mut tx = loop {
-            if let Some(rules) = &rules
+        let preparation = &self.preparation;
+        let rules = preparation.rules.as_ref();
+        let (mut tx, entry) = loop {
+            if let Some(rules) = rules
                 && !self.store.reasoning_is_current(rules)
             {
                 let stop = || ticket.stop_requested() || self.is_retired();
@@ -214,11 +204,28 @@ impl MutationPipeline {
             #[cfg(test)]
             crate::service::hooks::run(&crate::service::hooks::AFTER_PREFLIGHT);
             let tx = self.store.engine().transaction();
+            let Some(rules) = rules else { break (tx, None) };
             let writer = tx.writer().expect("a transaction holds the writer slot");
-            match &rules {
-                Some(rules) if !self.store.reasoning_is_current_held(writer, rules) => drop(tx),
-                _ => break tx,
+            if !self.store.reasoning_is_current_held(writer, rules) {
+                continue;
             }
+            let entry = preparation.entry.lock();
+            if cached(&entry, ground_key(tx.base())).is_some()
+                || self.store.config().replica
+                || rayon::current_thread_index().is_some()
+            {
+                break (tx, Some(entry));
+            }
+            drop(entry);
+            drop(tx);
+            let joined = preparation.join(&self.store, ticket);
+            if self.is_retired() {
+                return Err(known_error(MutationError::Retired));
+            }
+            if ticket.stop_requested() {
+                return Err(MutationError::Cancelled);
+            }
+            joined.map_err(store_error)?;
         };
         if let Some(note) = note {
             tx.note_commit(note);
@@ -244,38 +251,18 @@ impl MutationPipeline {
             .apply(&mut tx, requester, &context)
             .map_err(store_error)?;
 
-        if let Some(rules) = self.reasoner.config().materialised_program() {
+        if let Some(rules) = rules {
             // Reasoner v2: the closure goes into the inferred stack, in this transaction.
-            // A compilation the process's memory interrupts refuses the commit and caches
-            // nothing: the next commit compiles again. Writers are serialised by the
-            // transaction, and the program is a function of the rules, the configuration and
-            // the dictionary's ids for the rules' constants, which never change once interned;
-            // so a second compilation is the first one's value, and whichever is set stands.
-            let program = match self.program.get() {
-                Some(program) => program,
-                None => {
-                    let config = self.store.config();
-                    let compiled = crate::reasoning::Program::compile(&rules, &|t| tx.intern(t))
-                        .hiding_unnamed_classes(config.hide_unnamed_classes)
-                        .map_err(|interrupted| {
-                            store_error(self.store.interruption_refusal(interrupted))
-                        })?
-                        .by_representatives(config.equality_by_representatives)
-                        .storing_representatives(config.equality_compact);
-                    self.program.get_or_init(|| compiled)
-                }
-            };
+            let program = preparation
+                .compiled(&self.store, rules, &tx)
+                .map_err(store_error)?;
             // The commit's stack is read as the program keeps it, installed with it: expanded
             // over representatives from the commit that brings the store's first `owl:sameAs`.
             let reading = program.stored_equality();
             tx.read_equality_as(reading);
             let base_key = ground_key(tx.base());
-            // Writers are serialised by the transaction, so the cache can't change meanwhile.
-            let mut ground = self.ground.lock().unwrap_or_else(|p| p.into_inner());
-            let cached = ground
-                .as_ref()
-                .filter(|(at, _)| *at == base_key)
-                .map(|(_, program)| program.as_ref());
+            let mut ground = entry.expect("reasoning holds the write program entry");
+            let ground_before = cached(&ground, base_key).map(Arc::as_ref);
             // A cancelled request stops the reasoning; dropping `tx` then discards both
             // the asserted and the inferred changes, and releases the writer.
             // So does the process's memory limit: the commit is refused, not the machine.
@@ -295,7 +282,7 @@ impl MutationPipeline {
             let (violations, materialisation, changed, literal_equality) =
                 crate::reasoning::apply_delta(
                     program,
-                    cached,
+                    ground_before,
                     &mut tx,
                     &operation,
                     &report_memory,
@@ -351,7 +338,7 @@ impl MutationPipeline {
                             &violation,
                             &tx,
                             None,
-                            changed.as_ref().or(cached),
+                            changed.as_ref().or(ground_before),
                             &|| operation.fired(),
                         )
                     })
@@ -520,10 +507,12 @@ impl MutationPipeline {
             if let Some(shapes) = shapes {
                 tx.keep_watched(Arc::new(crate::shacl::ShapesCounted(Ok(shapes))));
             }
+            let tagging = preparation.tagging.lock();
             let committed = match ql {
                 Some(ql) => publishing(ticket, report, tx, |tx| ql.commit(tx)),
                 None => publishing(ticket, report, tx, |tx| tx.commit()),
             };
+            drop(tagging);
             #[cfg(test)]
             if committed.is_err() {
                 crate::service::hooks::run(&crate::service::hooks::AFTER_FAILED_COMMIT);
@@ -568,12 +557,16 @@ impl MutationPipeline {
             } else if let Some((at, _)) = ground.as_mut().filter(|(at, _)| *at == base_key) {
                 *at = next_key;
             }
+            let covered = cached(&ground, ground_key(&self.store.engine().snapshot())).is_some();
             drop(ground);
+            if !covered {
+                self.store.engine().notify_publication();
+            }
             #[cfg(test)]
             crate::service::hooks::run(&crate::service::hooks::BEFORE_REVALIDATION);
             // In quarantine the commit checked only its own facts: revalidate everything, so
             // the store leaves quarantine once the data is repaired. The commit itself stands.
-            if quarantined && let Err(error) = self.store.rematerialise(&rules) {
+            if quarantined && let Err(error) = self.store.rematerialise(rules) {
                 tracing::error!(%error, "revalidation after a commit in quarantine failed");
             }
             return Ok(report);

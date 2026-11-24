@@ -45,6 +45,8 @@ impl<O> Drop for Slot<'_, O> {
 /// The longest single wait underneath `wait_until`: a far deadline becomes several finite
 /// waits, never one the platform reads as untimed (Windows does above about 49.7 days).
 const WAIT_CAP: Duration = Duration::from_secs(3600);
+/// The stop of a build or its handoff is a flag checked between waits.
+pub(crate) const STOP_POLL: Duration = Duration::from_millis(50);
 
 type Fallback<O> = Box<dyn FnOnce() -> O + Send>;
 
@@ -86,6 +88,16 @@ pub struct Terminal<O> {
 }
 
 impl<O: Clone> Terminal<O> {
+    /// Waits for the recorded end, or until the caller gives up.
+    pub fn wait_stopped(&self, stop: &dyn Fn() -> bool) -> Option<O> {
+        while !stop() {
+            if let Some(end) = self.wait_until(Instant::now() + STOP_POLL) {
+                return Some(end);
+            }
+        }
+        self.get()
+    }
+
     /// The recorded end, if there is one.
     pub fn get(&self) -> Option<O> {
         let end = lock(&self.shared.0).end.clone();
