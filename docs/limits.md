@@ -264,11 +264,6 @@ leave something out.
   - After a full rebuild, a key whose list is reached through `owl:sameAs rdf:nil`
     (`:C owl:hasKey :l . :l owl:sameAs rdf:nil`) doesn't make two instances of `:C` the same,
     where a commit, and `owl:hasKey rdf:nil` written directly, do in every setting.
-  - A write of an `owl:sameAs` statement, between two properties or two individuals, can pass a
-    SHACL gate set to `enforce` though it brings a result: the equality is expanded when the data
-    are read, so the gate starts from that statement alone. An insert of the statement that
-    breaks the shape is refused in every setting. After such writes, validate in full
-    (`GET /dataset/shacl`).
 - A store whose ontology uses an inverse property expression (`ObjectInverseOf`, written
   `_:x owl:inverseOf :p`) rebuilds its inferences at every commit that changes its data, so a
   commit's time grows with the store: at 100,000 individuals, a one-fact commit takes about 40
@@ -594,8 +589,6 @@ leave something out.
   store. With LUBM 10's asserted data (1.27 million statements) and one recursive shape, a commit
   of one new node took 87 ms and peaked at 12 MB on 4 cores. Without the recursive shape, it
   took 5 ms and 1.7 MB.
-- Under `reasoner.equality = "compact"`, a write of `owl:sameAs` can pass the gate though it
-  brings a result ([reasoning](#reasoning)).
 - With the gate set to `report` or `enforce`, a write that leaves an uncompilable shapes graph
   unchanged is refused (a bulk load can store such shapes; the info's `shacl` then says why
   they aren't counted). Repair or replace the shapes graph to restore writes. A validation
