@@ -136,6 +136,14 @@ struct Builder {
     current: usize,
 }
 
+/// What [`Builder::superclass`] has still to do: read `left ⊑ expr` (with whether the
+/// materialisation applies it), or record that `left` generates successors over a role in a
+/// filler.
+enum Superclass {
+    Read(u32, ExprId, bool),
+    Generated(u32, Role, Option<u32>),
+}
+
 impl Tbox {
     /// Compiles the QL part of `ontology` for rewriting over data closed under `closure`.
     /// `thing` is the source's id of `owl:Thing`, if it has one.
@@ -715,77 +723,110 @@ impl Builder {
     /// The basic concepts a subclass expression is read as, each with whether the
     /// materialisation applies an inclusion from it (`cax-sco`, `cls-svf2`, `cls-uni`).
     /// `whole` is cleared where some part of it isn't read: no basic concept, or a union's
-    /// branch without one.
+    /// branch without one. A union's branches are read from the left with a stack of its
+    /// own (the nesting depth is no call depth).
     fn lefts(&mut self, o: &Ontology, expr: ExprId, whole: &mut bool) -> Vec<(u32, bool)> {
-        match o.class(expr) {
-            ClassExpr::Class(a) => vec![(self.basic(Basic::Class(*a)), true)],
-            ClassExpr::Thing => vec![(self.basic(Basic::Thing), false)],
-            ClassExpr::Some(property, filler) if matches!(o.class(*filler), ClassExpr::Thing) => {
-                vec![(self.basic(Basic::Exists(*property)), true)]
-            }
-            // `≥ 1 R.⊤` is `∃R`, `≥ 0 R.C` is `⊤`. `≥ n R` for n ≥ 2 is no basic concept, and
-            // `∃R` would say more than the axiom: nothing (the hazards mark it).
-            ClassExpr::Min(1, property, filler) if matches!(o.class(*filler), ClassExpr::Thing) => {
-                vec![(self.basic(Basic::Exists(*property)), false)]
-            }
-            ClassExpr::Min(0, ..) => vec![(self.basic(Basic::Thing), false)],
-            // OWL 2 QL allows a data existential on the left over `rdfs:Literal` only: with
-            // another range, having some value isn't enough.
-            ClassExpr::DataSome(property, range)
-                if matches!(o.range(*range), crate::model::DataRange::Literal) =>
-            {
-                self.tbox.data.insert(*property);
-                vec![(self.basic(Basic::Exists(ObjProp::Named(*property))), false)]
-            }
-            ClassExpr::Or(parts) => {
-                let lists = self.lists;
-                parts
-                    .clone()
-                    .into_iter()
-                    .flat_map(|part| self.lefts(o, part, whole))
-                    .map(|(left, base)| (left, base && lists))
-                    .collect()
-            }
-            _ => {
-                *whole = false;
-                Vec::new()
-            }
+        let mut out = Vec::new();
+        // Each expression with whether it is a union's branch, whose inclusion the
+        // materialisation applies only with the lists read.
+        let mut stack = vec![(expr, false)];
+        while let Some((expr, branch)) = stack.pop() {
+            let (left, base) = match o.class(expr) {
+                ClassExpr::Class(a) => (self.basic(Basic::Class(*a)), true),
+                ClassExpr::Thing => (self.basic(Basic::Thing), false),
+                ClassExpr::Some(property, filler)
+                    if matches!(o.class(*filler), ClassExpr::Thing) =>
+                {
+                    (self.basic(Basic::Exists(*property)), true)
+                }
+                // `≥ 1 R.⊤` is `∃R`, `≥ 0 R.C` is `⊤`. `≥ n R` for n ≥ 2 is no basic concept,
+                // and `∃R` would say more than the axiom: nothing (the hazards mark it).
+                ClassExpr::Min(1, property, filler)
+                    if matches!(o.class(*filler), ClassExpr::Thing) =>
+                {
+                    (self.basic(Basic::Exists(*property)), false)
+                }
+                ClassExpr::Min(0, ..) => (self.basic(Basic::Thing), false),
+                // OWL 2 QL allows a data existential on the left over `rdfs:Literal` only:
+                // with another range, having some value isn't enough.
+                ClassExpr::DataSome(property, range)
+                    if matches!(o.range(*range), crate::model::DataRange::Literal) =>
+                {
+                    self.tbox.data.insert(*property);
+                    (self.basic(Basic::Exists(ObjProp::Named(*property))), false)
+                }
+                ClassExpr::Or(parts) => {
+                    stack.extend(parts.iter().rev().map(|&part| (part, true)));
+                    continue;
+                }
+                _ => {
+                    *whole = false;
+                    continue;
+                }
+            };
+            out.push((left, base && (!branch || self.lists)));
         }
+        out
     }
 
-    /// `left ⊑ expr` for a superclass expression.
+    /// `left ⊑ expr` for a superclass expression. An intersection's parts are read from the
+    /// left, and a filler read as a fresh concept is read as its own superclass expression
+    /// before the existential that generates it is recorded, with a stack of its own (the
+    /// nesting depth is no call depth).
     fn superclass(&mut self, o: &Ontology, left: u32, expr: ExprId, base: bool) {
-        match o.class(expr) {
-            ClassExpr::Class(a) => {
-                let sup = self.basic(Basic::Class(*a));
-                self.include(left, sup, base);
-            }
-            ClassExpr::And(parts) => {
-                let base = base && self.lists;
-                for part in parts.clone() {
-                    self.superclass(o, left, part, base);
+        let mut stack = vec![Superclass::Read(left, expr, base)];
+        while let Some(task) = stack.pop() {
+            let (left, expr, base) = match task {
+                Superclass::Read(left, expr, base) => (left, expr, base),
+                Superclass::Generated(left, role, filler) => {
+                    self.generating.push((left, role, filler, false));
+                    continue;
+                }
+            };
+            match o.class(expr) {
+                ClassExpr::Class(a) => {
+                    let sup = self.basic(Basic::Class(*a));
+                    self.include(left, sup, base);
+                }
+                ClassExpr::And(parts) => {
+                    let base = base && self.lists;
+                    stack.extend(
+                        (parts.iter().rev()).map(|&part| Superclass::Read(left, part, base)),
+                    );
+                }
+                ClassExpr::Some(property, filler) => {
+                    self.generates(o, left, *property, *filler, &mut stack)
+                }
+                ClassExpr::Min(n, property, filler) | ClassExpr::Exact(n, property, filler)
+                    if *n >= 1 =>
+                {
+                    self.generates(o, left, *property, *filler, &mut stack);
+                }
+                ClassExpr::DataSome(property, _) => self.generates_data(left, *property),
+                ClassExpr::DataMin(n, property, _) | ClassExpr::DataExact(n, property, _)
+                    if *n >= 1 =>
+                {
+                    self.generates_data(left, *property);
+                }
+                _ => {
+                    self.unread.insert((expr, true));
+                    self.mark_partial();
                 }
             }
-            ClassExpr::Some(property, filler) => self.generates(o, left, *property, *filler),
-            ClassExpr::Min(n, property, filler) | ClassExpr::Exact(n, property, filler)
-                if *n >= 1 =>
-            {
-                self.generates(o, left, *property, *filler);
-            }
-            ClassExpr::DataSome(property, _) => self.generates_data(left, *property),
-            ClassExpr::DataMin(n, property, _) | ClassExpr::DataExact(n, property, _)
-                if *n >= 1 =>
-            {
-                self.generates_data(left, *property);
-            }
-            _ => {
-                self.unread.insert((expr, true));
-                self.mark_partial();
-            }
         }
     }
 
-    fn generates(&mut self, o: &Ontology, left: u32, role: Role, filler: ExprId) {
+    /// `left` generates `role` successors in `filler`: recorded once a fresh filler is read
+    /// ([`Self::superclass`]'s `stack`).
+    fn generates(
+        &mut self,
+        o: &Ontology,
+        left: u32,
+        role: Role,
+        filler: ExprId,
+        stack: &mut Vec<Superclass>,
+    ) {
+        let mut read = None;
         let filler = match o.class(filler) {
             ClassExpr::Thing => None,
             ClassExpr::Class(a) => Some(self.basic(Basic::Class(*a))),
@@ -794,12 +835,13 @@ impl Builder {
                 None => {
                     let id = self.basic(Basic::Fresh(self.fresh.len() as u32));
                     self.fresh.insert(filler, id);
-                    self.superclass(o, id, filler, false);
+                    read = Some(Superclass::Read(id, filler, false));
                     id
                 }
             }),
         };
-        self.generating.push((left, role, filler, false));
+        stack.push(Superclass::Generated(left, role, filler));
+        stack.extend(read);
     }
 
     fn generates_data(&mut self, left: u32, property: Term) {

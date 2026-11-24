@@ -134,26 +134,34 @@ fn datatype(o: &Ontology, datatype: Term) -> Profiles {
     }
 }
 
-/// Which profiles admit the data range `r`.
+/// Which profiles admit the data range `r`: those admitting every range in it, read with a
+/// stack of its own (the nesting depth is no call depth).
 fn range(o: &Ontology, r: RangeId) -> Profiles {
-    match o.range(r) {
-        DataRange::Literal => Profiles::ALL,
-        DataRange::Datatype(t) => datatype(o, *t),
-        DataRange::And(rs) => rs
-            .iter()
-            .fold(Profiles::ALL, |acc, &r| acc.and(range(o, r))),
-        // EL: one literal only.
-        DataRange::OneOf(xs) => Profiles {
-            el: xs.len() == 1,
-            ql: false,
-            rl: false,
-        },
-        DataRange::Or(_) | DataRange::Not(_) | DataRange::Restriction(..) => Profiles {
-            el: false,
-            ql: false,
-            rl: false,
-        },
+    let mut out = Profiles::ALL;
+    let mut stack = vec![r];
+    while let Some(r) = stack.pop() {
+        let own = match o.range(r) {
+            DataRange::Literal => Profiles::ALL,
+            DataRange::Datatype(t) => datatype(o, *t),
+            DataRange::And(rs) => {
+                stack.extend(rs);
+                Profiles::ALL
+            }
+            // EL: one literal only.
+            DataRange::OneOf(xs) => Profiles {
+                el: xs.len() == 1,
+                ql: false,
+                rl: false,
+            },
+            DataRange::Or(_) | DataRange::Not(_) | DataRange::Restriction(..) => Profiles {
+                el: false,
+                ql: false,
+                rl: false,
+            },
+        };
+        out = out.and(own);
     }
+    out
 }
 
 fn named(p: ObjProp) -> bool {
@@ -172,19 +180,84 @@ fn unwrap(o: &Ontology, mut e: ExprId) -> ExprId {
     e
 }
 
-/// Whether EL admits the class expression `e` (EL has one grammar for every position).
+/// The grammar rules below, decided over nested expressions by [`admits`].
+#[derive(Clone, Copy)]
+enum Rule {
+    El,
+    QlSuper,
+    RlSub,
+    RlSuper,
+    RlEquiv,
+}
+
+/// Whether `rule` admits `e`, with a stack of its own (the nesting depth is no call depth).
+/// Each rule says what an expression needs of itself and of its operands, by rule.
+fn admits(o: &Ontology, e: ExprId, rule: Rule) -> bool {
+    use crate::walk::Holds::{All, Is};
+    let one = std::slice::from_ref;
+    let thing = |f: &ExprId| matches!(o.class(*f), ClassExpr::Thing);
+    crate::walk::holds(e, rule, |e, rule| {
+        let e = unwrap(o, e);
+        match (rule, o.class(e)) {
+            (Rule::El, expr) => match expr {
+                ClassExpr::Class(_) | ClassExpr::Thing | ClassExpr::Nothing => Is(true),
+                ClassExpr::And(es) => All(es, Rule::El),
+                ClassExpr::Some(p, f) if named(*p) => All(one(f), Rule::El),
+                ClassExpr::HasValue(p, _) | ClassExpr::HasSelf(p) => Is(named(*p)),
+                ClassExpr::OneOf(xs) => Is(xs.len() == 1),
+                ClassExpr::DataSome(_, r) => Is(range(o, *r).el),
+                ClassExpr::DataHasValue(..) => Is(true),
+                _ => Is(false),
+            },
+            (Rule::QlSuper, expr) => match expr {
+                ClassExpr::Class(_) | ClassExpr::Thing | ClassExpr::Nothing => Is(true),
+                ClassExpr::And(es) => All(es, Rule::QlSuper),
+                ClassExpr::Not(e) => Is(ql_sub(o, *e)),
+                ClassExpr::Some(_, f) => Is(matches!(
+                    o.class(*f),
+                    ClassExpr::Class(_) | ClassExpr::Thing
+                )),
+                ClassExpr::DataSome(_, r) => Is(range(o, *r).ql),
+                _ => Is(false),
+            },
+            (Rule::RlSub, expr) => match expr {
+                ClassExpr::Class(_) | ClassExpr::Nothing => Is(true),
+                ClassExpr::And(es) | ClassExpr::Or(es) => All(es, Rule::RlSub),
+                ClassExpr::OneOf(_) => Is(true),
+                ClassExpr::Some(_, f) if thing(f) => Is(true),
+                ClassExpr::Some(_, f) => All(one(f), Rule::RlSub),
+                ClassExpr::DataSome(_, r) => Is(range(o, *r).rl),
+                ClassExpr::HasValue(..) | ClassExpr::DataHasValue(..) => Is(true),
+                _ => Is(false),
+            },
+            (Rule::RlSuper, expr) => match expr {
+                ClassExpr::Class(_) | ClassExpr::Nothing => Is(true),
+                ClassExpr::And(es) => All(es, Rule::RlSuper),
+                ClassExpr::Not(e) => All(one(e), Rule::RlSub),
+                ClassExpr::All(_, f) => All(one(f), Rule::RlSuper),
+                ClassExpr::HasValue(..) | ClassExpr::DataHasValue(..) => Is(true),
+                ClassExpr::Max(n, _, _) if *n > 1 => Is(false),
+                ClassExpr::Max(_, _, f) if thing(f) => Is(true),
+                ClassExpr::Max(_, _, f) => All(one(f), Rule::RlSub),
+                ClassExpr::DataAll(_, r) => Is(range(o, *r).rl),
+                ClassExpr::DataMax(n, _, r) => Is(*n <= 1 && range(o, *r).rl),
+                _ => Is(false),
+            },
+            (Rule::RlEquiv, expr) => match expr {
+                ClassExpr::Class(_) | ClassExpr::Nothing => Is(true),
+                ClassExpr::And(es) => All(es, Rule::RlEquiv),
+                ClassExpr::HasValue(..) | ClassExpr::DataHasValue(..) => Is(true),
+                _ => Is(false),
+            },
+        }
+    })
+}
+
+/// Whether EL admits the class expression `e` (EL has one grammar for every position): a
+/// class, intersections of them, `∃R.C` over a named `R`, values, a single nominal, `∃D`
+/// over an EL range.
 fn el(o: &Ontology, e: ExprId) -> bool {
-    let e = unwrap(o, e);
-    match o.class(e) {
-        ClassExpr::Class(_) | ClassExpr::Thing | ClassExpr::Nothing => true,
-        ClassExpr::And(es) => es.iter().all(|&e| el(o, e)),
-        ClassExpr::Some(p, f) => named(*p) && el(o, *f),
-        ClassExpr::HasValue(p, _) | ClassExpr::HasSelf(p) => named(*p),
-        ClassExpr::OneOf(xs) => xs.len() == 1,
-        ClassExpr::DataSome(_, r) => range(o, *r).el,
-        ClassExpr::DataHasValue(..) => true,
-        _ => false,
-    }
+    admits(o, e, Rule::El)
 }
 
 /// QL's `subClassExpression` (§3.2.3): a class, `∃R.⊤`, `∃D.Literal`.
@@ -201,61 +274,25 @@ fn ql_sub(o: &Ontology, e: ExprId) -> bool {
 /// QL's `superClassExpression`: a class, an intersection of them, the complement of a
 /// `subClassExpression`, `∃R.A`, `∃D.range`.
 fn ql_super(o: &Ontology, e: ExprId) -> bool {
-    let e = unwrap(o, e);
-    match o.class(e) {
-        ClassExpr::Class(_) | ClassExpr::Thing | ClassExpr::Nothing => true,
-        ClassExpr::And(es) => es.iter().all(|&e| ql_super(o, e)),
-        ClassExpr::Not(e) => ql_sub(o, *e),
-        ClassExpr::Some(_, f) => matches!(o.class(*f), ClassExpr::Class(_) | ClassExpr::Thing),
-        ClassExpr::DataSome(_, r) => range(o, *r).ql,
-        _ => false,
-    }
+    admits(o, e, Rule::QlSuper)
 }
 
 /// RL's `subClassExpression` (§4.2.3): a class other than `owl:Thing`, intersections and
 /// unions of them, enumerations, `∃R.sub` (or `∃R.⊤`), `∃D.range`, values.
 fn rl_sub(o: &Ontology, e: ExprId) -> bool {
-    let e = unwrap(o, e);
-    match o.class(e) {
-        ClassExpr::Class(_) | ClassExpr::Nothing => true,
-        ClassExpr::And(es) | ClassExpr::Or(es) => es.iter().all(|&e| rl_sub(o, e)),
-        ClassExpr::OneOf(_) => true,
-        ClassExpr::Some(_, f) => matches!(o.class(*f), ClassExpr::Thing) || rl_sub(o, *f),
-        ClassExpr::DataSome(_, r) => range(o, *r).rl,
-        ClassExpr::HasValue(..) | ClassExpr::DataHasValue(..) => true,
-        _ => false,
-    }
+    admits(o, e, Rule::RlSub)
 }
 
 /// RL's `superClassExpression`: a class other than `owl:Thing`, intersections, the
 /// complement of a `subClassExpression`, `∀R.super`, values, `≤ 0/1 R(.sub)`, `∀D.range`,
 /// `≤ 0/1 D(.range)`.
 pub(crate) fn rl_super(o: &Ontology, e: ExprId) -> bool {
-    let e = unwrap(o, e);
-    match o.class(e) {
-        ClassExpr::Class(_) | ClassExpr::Nothing => true,
-        ClassExpr::And(es) => es.iter().all(|&e| rl_super(o, e)),
-        ClassExpr::Not(e) => rl_sub(o, *e),
-        ClassExpr::All(_, f) => rl_super(o, *f),
-        ClassExpr::HasValue(..) | ClassExpr::DataHasValue(..) => true,
-        ClassExpr::Max(n, _, f) => {
-            *n <= 1 && (matches!(o.class(*f), ClassExpr::Thing) || rl_sub(o, *f))
-        }
-        ClassExpr::DataAll(_, r) => range(o, *r).rl,
-        ClassExpr::DataMax(n, _, r) => *n <= 1 && range(o, *r).rl,
-        _ => false,
-    }
+    admits(o, e, Rule::RlSuper)
 }
 
 /// RL's `equivClassExpression`: a class other than `owl:Thing`, intersections, values.
 fn rl_equiv(o: &Ontology, e: ExprId) -> bool {
-    let e = unwrap(o, e);
-    match o.class(e) {
-        ClassExpr::Class(_) | ClassExpr::Nothing => true,
-        ClassExpr::And(es) => es.iter().all(|&e| rl_equiv(o, e)),
-        ClassExpr::HasValue(..) | ClassExpr::DataHasValue(..) => true,
-        _ => false,
-    }
+    admits(o, e, Rule::RlEquiv)
 }
 
 /// The individuals an assertion names.
@@ -504,26 +541,42 @@ fn grammar(o: &Ontology, axiom: &Axiom) -> Profiles {
 /// QL rewriting covers where it runs over that profile's closure: `∃R.C` and `≥ n R.C`
 /// with n ≥ 1, for any filler, and their data forms. Its generators and the TBox's ledger
 /// of unread conclusions seed them (I24b).
+///
+/// Decided with a stack of its own (the nesting depth is no call depth): every expression
+/// reached must be covered.
 fn super_covered(o: &Ontology, e: ExprId, rl: bool) -> bool {
-    let e = unwrap(o, e);
-    let plain = match rl {
-        true => rl_super(o, e),
-        false => ql_super(o, e),
-    };
-    plain
-        || match o.class(e) {
-            ClassExpr::And(es) => es.iter().all(|&e| super_covered(o, e, rl)),
-            ClassExpr::Some(..) | ClassExpr::DataSome(..) => true,
-            ClassExpr::Min(n, ..) | ClassExpr::DataMin(n, ..) => *n >= 1,
-            // `∀R.F` concludes `F` of the successors: what the closure's `cls-avf` gives,
-            // where RL has it.
-            ClassExpr::All(_, f) => rl && super_covered(o, *f, rl),
-            // Nothing else: a form the grammar doesn't admit as written is answered by
-            // neither the TBox nor the rules, which see it as written (`¬¬D`, `¬≥ 2 R`).
-            // What it may conclude decides whether it matters
-            // ([`concluded_terms`], [`concludes_equality`]).
-            _ => false,
+    let mut stack = vec![e];
+    while let Some(e) = stack.pop() {
+        let e = unwrap(o, e);
+        let plain = match rl {
+            true => rl_super(o, e),
+            false => ql_super(o, e),
+        };
+        let covered = plain
+            || match o.class(e) {
+                ClassExpr::And(es) => {
+                    stack.extend(es);
+                    true
+                }
+                ClassExpr::Some(..) | ClassExpr::DataSome(..) => true,
+                ClassExpr::Min(n, ..) | ClassExpr::DataMin(n, ..) => *n >= 1,
+                // `∀R.F` concludes `F` of the successors: what the closure's `cls-avf` gives,
+                // where RL has it.
+                ClassExpr::All(_, f) => {
+                    stack.push(*f);
+                    rl
+                }
+                // Nothing else: a form the grammar doesn't admit as written is answered by
+                // neither the TBox nor the rules, which see it as written (`¬¬D`, `¬≥ 2 R`).
+                // What it may conclude decides whether it matters
+                // ([`concluded_terms`], [`concludes_equality`]).
+                _ => false,
+            };
+        if !covered {
+            return false;
         }
+    }
+    true
 }
 
 /// Whether what a rewriting over the closure of QL (`rl` false) or RL can miss of
@@ -679,14 +732,24 @@ pub(crate) fn positive_terms(o: &Ontology, e: ExprId, positive: bool, out: &mut 
 /// A term to name an axiom's hazard by: a property, else a class or an individual of its
 /// expressions (`C ⊑ {a}` names no property).
 pub(crate) fn label(o: &Ontology, axiom: &Axiom) -> Option<Term> {
+    /// The first class or individual from the left, with a stack of its own (the nesting
+    /// depth is no call depth).
     fn any(o: &Ontology, e: ExprId) -> Option<Term> {
-        match o.class(e) {
-            ClassExpr::Class(c) => Some(*c),
-            ClassExpr::OneOf(xs) => xs.first().copied(),
-            ClassExpr::And(es) | ClassExpr::Or(es) => es.iter().find_map(|&e| any(o, e)),
-            ClassExpr::Not(e) => any(o, *e),
-            _ => None,
+        let mut stack = vec![e];
+        while let Some(e) = stack.pop() {
+            match o.class(e) {
+                ClassExpr::Class(c) => return Some(*c),
+                ClassExpr::OneOf(xs) => {
+                    if let Some(&x) = xs.first() {
+                        return Some(x);
+                    }
+                }
+                ClassExpr::And(es) | ClassExpr::Or(es) => stack.extend(es.iter().rev()),
+                ClassExpr::Not(e) => stack.push(*e),
+                _ => {}
+            }
         }
+        None
     }
     let exprs: Vec<ExprId> = match axiom {
         Axiom::SubClassOf(a, b) => vec![*a, *b],

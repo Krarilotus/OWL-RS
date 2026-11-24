@@ -872,19 +872,20 @@ fn open_axiom(
 /// it: no membership of its classes, no edge of its properties. Conservative: a part that
 /// is negative or bounded above may hold without either.
 fn needs_no_term(o: &Ontology, e: ExprId) -> bool {
-    match o.class(e) {
+    use crate::walk::Holds::{All, Any, Is};
+    crate::walk::holds(e, (), |e, ()| match o.class(e) {
         ClassExpr::Thing
         | ClassExpr::Not(_)
         | ClassExpr::All(..)
         | ClassExpr::Max(..)
         | ClassExpr::DataAll(..)
-        | ClassExpr::DataMax(..) => true,
+        | ClassExpr::DataMax(..) => Is(true),
         ClassExpr::Min(n, ..)
         | ClassExpr::Exact(n, ..)
         | ClassExpr::DataMin(n, ..)
-        | ClassExpr::DataExact(n, ..) => *n == 0,
-        ClassExpr::And(parts) => parts.iter().all(|&p| needs_no_term(o, p)),
-        ClassExpr::Or(parts) => parts.iter().any(|&p| needs_no_term(o, p)),
+        | ClassExpr::DataExact(n, ..) => Is(*n == 0),
+        ClassExpr::And(parts) => All(parts, ()),
+        ClassExpr::Or(parts) => Any(parts, ()),
         ClassExpr::Nothing
         | ClassExpr::Class(_)
         | ClassExpr::OneOf(_)
@@ -892,29 +893,31 @@ fn needs_no_term(o: &Ontology, e: ExprId) -> bool {
         | ClassExpr::HasValue(..)
         | ClassExpr::HasSelf(_)
         | ClassExpr::DataSome(..)
-        | ClassExpr::DataHasValue(..) => false,
-    }
+        | ClassExpr::DataHasValue(..) => Is(false),
+    })
 }
 
 /// Whether the TBox reads left side `e` as `⊤` (`Tbox`'s left sides: `⊤`, `≥ 0 R.C`, and a
 /// union with such a part).
 fn read_as_top(o: &Ontology, e: ExprId) -> bool {
-    match o.class(e) {
-        ClassExpr::Thing | ClassExpr::Min(0, ..) => true,
-        ClassExpr::Or(parts) => parts.iter().any(|&p| read_as_top(o, p)),
-        _ => false,
-    }
+    use crate::walk::Holds::{Any, Is};
+    crate::walk::holds(e, (), |e, ()| match o.class(e) {
+        ClassExpr::Thing | ClassExpr::Min(0, ..) => Is(true),
+        ClassExpr::Or(parts) => Any(parts, ()),
+        _ => Is(false),
+    })
 }
 
 /// Whether the TBox reads right side `e` whole: no hazard in it, and no union, enumeration
 /// or complement outside an existential.
 fn read_on_right(o: &Ontology, e: ExprId) -> bool {
     fn plain(o: &Ontology, e: ExprId) -> bool {
-        match o.class(e) {
-            ClassExpr::Or(_) | ClassExpr::OneOf(_) | ClassExpr::Not(_) => false,
-            ClassExpr::And(parts) => parts.iter().all(|&p| plain(o, p)),
-            _ => true,
-        }
+        use crate::walk::Holds::{All, Is};
+        crate::walk::holds(e, (), |e, ()| match o.class(e) {
+            ClassExpr::Or(_) | ClassExpr::OneOf(_) | ClassExpr::Not(_) => Is(false),
+            ClassExpr::And(parts) => All(parts, ()),
+            _ => Is(true),
+        })
     }
     let mut collect = Collect {
         o,
@@ -925,15 +928,22 @@ fn read_on_right(o: &Ontology, e: ExprId) -> bool {
     collect.found.is_empty() && plain(o, e)
 }
 
-/// An individual of an enumeration in `e` outside an existential, if there is one.
+/// An individual of an enumeration in `e` outside an existential, if there is one: the
+/// first from the left, found with a stack of its own (the nesting depth is no call depth).
 fn enumerated(o: &Ontology, e: ExprId) -> Option<Term> {
-    match o.class(e) {
-        ClassExpr::OneOf(individuals) => individuals.first().copied(),
-        ClassExpr::And(parts) | ClassExpr::Or(parts) => {
-            parts.iter().find_map(|&p| enumerated(o, p))
+    let mut stack = vec![e];
+    while let Some(e) = stack.pop() {
+        match o.class(e) {
+            ClassExpr::OneOf(individuals) => {
+                if let Some(&individual) = individuals.first() {
+                    return Some(individual);
+                }
+            }
+            ClassExpr::And(parts) | ClassExpr::Or(parts) => stack.extend(parts.iter().rev()),
+            _ => {}
         }
-        _ => None,
     }
+    None
 }
 
 /// The roles of the existentials (`∃`, `≥ n`) in an expression ([`generated`]).
