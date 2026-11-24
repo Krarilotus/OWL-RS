@@ -507,7 +507,7 @@ class Nrese(Adapter):
         base = ctx.runtime.url(spec)
         endpoint = self.start(ctx, spec, Endpoint(f"{base}/dataset/query", f"{base}/dataset/update",
                                                 ready=f"{base}/readyz"))
-        if not ctx.dry and regime != "none":
+        if not ctx.dry:
             self.wait_write_program(base, max(ctx.timeout_s, 1800))
         return endpoint
 
@@ -519,18 +519,16 @@ class Nrese(Adapter):
             try:
                 with urllib.request.urlopen(f"{base}/metrics", timeout=min(2.0, left)) as response:
                     metrics = response.read().decode("utf-8", "replace")
-            except OSError as error:
-                if isinstance(error, urllib.error.HTTPError) and error.code == 404 and not present:
+            except urllib.error.HTTPError as error:
+                if error.code == 404 and not present:
                     return
-            else:
-                present |= "nrese_write_program_state" in metrics
-                if not present:
-                    return
-                phase = re.search(r'^nrese_write_program_state\{repository="nrese"\} ([23])$', metrics, re.M)
-                if phase and phase.group(1) == "2":
-                    return
-                if phase:
-                    raise RuntimeError(f"{self.key}: write program preparation failed")
+                raise
+            present |= "nrese_write_program_state" in metrics
+            phase = re.search(r'^nrese_write_program_state\{repository="nrese"\} ([0123])$', metrics, re.M)
+            if not present or (phase and phase[1] in "02"):
+                return
+            if not phase or phase[1] == "3":
+                raise RuntimeError(f"{self.key}: write program preparation failed or has no valid state")
             time.sleep(min(0.3, max(0, deadline - time.monotonic())))
         raise RuntimeError(f"{self.key}: write program preparation did not finish within {timeout_s:g} s")
 

@@ -96,6 +96,28 @@ fn answer_at(writer: &MutationPipeline, sparql: &str) {
         .unwrap();
 }
 
+/// Spec: a primary with rules reports building before its closure is certified.
+/// A replica or a repository without rules reports that preparation is disabled.
+#[test]
+fn only_a_primary_with_rules_reports_building_at_construction() {
+    for (mode, replica, expected) in [
+        (ReasoningMode::Owl2Rl, false, 1),
+        (ReasoningMode::Owl2Rl, true, 0),
+        (ReasoningMode::Disabled, false, 0),
+    ] {
+        let config = StoreConfig {
+            replica,
+            ..StoreConfig::in_memory()
+        };
+        let reasoner = ReasonerService::new(ReasonerConfig::for_mode(mode));
+        let writer = MutationPipeline::new(
+            Arc::new(StoreService::new(config).unwrap()),
+            Arc::new(reasoner),
+        );
+        assert_eq!(writer.write_program_metrics(), (expected, 0, 0));
+    }
+}
+
 /// Spec: closing the last pipeline releases the directory even while a snapshot
 /// is held for background grounding.
 #[test]

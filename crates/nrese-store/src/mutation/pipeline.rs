@@ -89,7 +89,7 @@ impl MutationPipeline {
         let phase = match prep.rules.as_ref() {
             _ if self.store.config().replica || self.is_retired() => 0,
             None => 0,
-            Some(rules) if !self.store.reasoning_is_current(rules) => 0,
+            Some(rules) if !self.store.reasoning_is_current(rules) => 1,
             _ if prep.covers(key) => 2,
             _ if *prep.failed.lock() == Some(key) => 3,
             _ => 1,
