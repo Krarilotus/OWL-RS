@@ -518,7 +518,7 @@ pub(crate) fn mark(
         _ => ontology_at,
     };
     // Probe the asserted indexes before reading the ontology for anonymous individuals.
-    use nrese_engine::{Permutation, TermKind};
+    use nrese_engine::{TermKind, quad::Permutation};
     let (low, high) = TermId::kind_range(TermKind::BlankNode);
     let all = QuadPattern::all();
     if [Permutation::Spog, Permutation::Ospg].into_iter().any(|order| {
