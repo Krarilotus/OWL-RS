@@ -25,6 +25,7 @@ import tempfile
 import time
 from pathlib import Path
 
+from suitekit import hosts
 from suitekit.processes import stop as stop_tree
 
 from . import client
@@ -97,7 +98,7 @@ class Server:
         for attempt in range(1, BIND_ATTEMPTS + 1):
             self.port = port or free_port()
             began = time.monotonic()
-            with open(self.log, "ab") as log:
+            with open(hosts.evidence_path(self.log), "ab") as log:
                 offset = log.tell()  # where this attempt's own log begins
                 log.write(f"=== verify: start attempt {len(self.attempts) + 1}, port {self.port}, "
                           f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n".encode())

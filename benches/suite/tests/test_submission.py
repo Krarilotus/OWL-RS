@@ -38,8 +38,8 @@ class W3CRequired(unittest.TestCase):
             for log in (None, Path(tmp) / "kit.log"):
                 with self.subTest(log=log), patch.object(driver.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run:
                     self.assertEqual(driver.Suite.host_command(suite, ["test-tool"], log,
-                                                              env=driver.kit_env({})), 0)
-                    self.assertEqual(run.call_args.kwargs["env"]["NRESE_W3C_REQUIRED"], "1")
+                                                              environ=driver.kit_env({})), 0)
+                    self.assertEqual(run.call_args.kwargs["env"], {"NRESE_W3C_REQUIRED": "1"})
 
     def test_the_suites_w3c_kits_fetch_their_data_and_require_it(self):
         for name in ("w3c-sparql11", "w3c-shacl", "w3c-owl2-rl", "geosparql"):

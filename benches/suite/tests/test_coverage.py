@@ -344,7 +344,7 @@ class Cells(Base):
 
     def run_command(self, *argv, records=None, root=None):
         out, err = io.StringIO(), io.StringIO()
-        with patch.object(coverage, "load_records", return_value=records if records is not None else self.records()), \
+        with patch.object(coverage, "all_records", return_value=records if records is not None else self.records()), \
                 patch.object(coverage, "runnable", return_value=None), \
                 patch.object(coverage, "RESET_BASE", self.repo.base), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -393,7 +393,7 @@ class Cells(Base):
             return real(owners, workload, tier, system, receipt)
         with patch.object(coverage, "judge", judge):
             out, err = io.StringIO(), io.StringIO()
-            with patch.object(coverage, "load_records", return_value=late), \
+            with patch.object(coverage, "all_records", return_value=late), \
                     patch.object(coverage, "runnable", return_value=None), \
                     contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                 code = coverage.main(["--json"], {"nrese": SYSTEMS["nrese"], "jena": SYSTEMS["jena"]},

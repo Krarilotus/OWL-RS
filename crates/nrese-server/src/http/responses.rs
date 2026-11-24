@@ -40,10 +40,46 @@ pub struct ReadyResponse {
     pub reasoning_semantic_tier: &'static str,
     /// Under `owl2-dl`: the data's consistency under OWL 2 DL, as last checked.
     pub dl: Option<DlReady>,
+    /// The SHACL commit gate and the shapes it checks against, as the store keeps them
+    /// (the repository's info and summary; health checks leave it out).
+    pub shacl: ShaclReady,
     /// Unavailable repositories and stopped maintenance workers. The server stays ready
     /// for stores that can serve.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub degraded: Vec<String>,
+}
+
+/// The SHACL commit gate's state (`shacl.gate`, `shacl.gate_severity`) and the shapes it
+/// checks commits against ([`nrese_store::ShaclGateState`]).
+#[derive(Debug, Serialize)]
+pub struct ShaclReady {
+    /// `off`, `report` or `enforce`.
+    pub gate: &'static str,
+    /// Under `enforce`: the least severity it refuses (`info`, `warning`, `violation`).
+    pub severity: Option<&'static str>,
+    /// The revision the shapes were compiled at.
+    pub revision: u64,
+    /// The shapes in the shapes graph, nested ones included; null where they don't compile.
+    pub shapes: Option<usize>,
+    /// Whether there is no shape and no `sh:entailment` (an enforcing gate then accepts
+    /// every write); null where they don't compile.
+    pub vacuous: Option<bool>,
+    /// Why the shapes weren't counted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_counted: Option<String>,
+}
+
+impl From<nrese_store::ShaclGateState> for ShaclReady {
+    fn from(state: nrese_store::ShaclGateState) -> Self {
+        Self {
+            gate: state.gate.name(),
+            severity: state.gate.severity().map(nrese_store::GateSeverity::name),
+            revision: state.revision,
+            shapes: state.shapes,
+            vacuous: state.vacuous,
+            not_counted: state.not_counted,
+        }
+    }
 }
 
 /// The `owl2-dl` mode's status.
@@ -205,6 +241,7 @@ pub fn build_ready_response(
     let posture = state.runtime_posture();
 
     let consistency = state.store().consistency();
+    let shacl = state.store().shacl_gate_state();
     Ok(ReadyResponse {
         status: build_readiness_response(state).status,
         consistency: consistency.as_str(),
@@ -219,7 +256,7 @@ pub fn build_ready_response(
             }
             _ => None,
         },
-        revision: state.store().current_revision(),
+        revision: shacl.view_revision,
         quad_count: stats.quad_count as u64,
         named_graph_count: stats.named_graph_count,
         ontology_path: state
@@ -251,6 +288,7 @@ pub fn build_ready_response(
                     revision: None,
                 },
             }),
+        shacl: shacl.into(),
         degraded: state.degraded(),
     })
 }

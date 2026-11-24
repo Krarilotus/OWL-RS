@@ -471,6 +471,7 @@ impl Catalog {
                 CatalogError::Store(repair(&file, &error.to_string()))
             })?;
         effective.apply(&store);
+        store.log_shacl_gate_state(DEFAULT_REPOSITORY);
         let default = Repository::new(
             MutationPipeline::new(Arc::new(store), Arc::new(effective.reasoner(&reasoner))),
             default_settings,
@@ -607,6 +608,7 @@ impl Catalog {
                 store.clear_inferred().map_err(|error| error.to_string())?;
             }
         }
+        store.log_shacl_gate_state(id);
         Ok(Repository::new(
             MutationPipeline::new(Arc::new(store), Arc::new(reasoner)),
             settings,

@@ -58,7 +58,7 @@ ROOT = HERE.parents[2]
 sys.path.insert(0, str(ROOT / "benches/suite"))
 sys.path.insert(0, str(HERE.parent))
 
-from suitekit import quiet  # noqa: E402
+from suitekit import hosts, quiet  # noqa: E402
 from suitekit.adapters import Context, Nrese, adapter, images_for  # noqa: E402
 from suitekit.manifest import Manifest  # noqa: E402
 from suitekit.runtime import DockerRuntime, Mount, Spec, memory_fields  # noqa: E402
@@ -83,10 +83,11 @@ def changes_dir(tier: str) -> Path:
 
 
 def bench_data() -> Path:
-    if setting("BENCH_DATA"):
-        return Path(setting("BENCH_DATA"))
-    hosts = tomllib.loads((ROOT / "benches/hosts.toml").read_text(encoding="utf-8"))
-    return Path(hosts["assets"]["root"]) / hosts["inputs"]["data"]["path"]
+    """The suite's datasets: BENCH_DATA, else the verified inputs' copy on a host that holds them."""
+    found = hosts.input_path("data")
+    if found is None:
+        sys.exit("no datasets here: set BENCH_DATA (benches/hosts.toml inputs.data)")
+    return found
 
 
 # --- prepare: the change sets ---------------------------------------------------------------------
@@ -303,12 +304,12 @@ class Run:
         harness = None
         if readers:
             report = self.logs / f"readers-{readers}.json"
-            harness = subprocess.Popen(
+            harness = hosts.launch(subprocess.Popen,
                 [setting("HARNESS"), "query-mix", "--endpoint", endpoint.query,
                  "--queries", str(ROOT / "benches/reasoning/queries/lubm"), "--label", self.key,
                  "--warmup", "0", "--runs", "1", "--clients", str(readers), "--duration-s", str(self.args.duration_s),
                  "--interactive-ms", "1000", "--timeout-s", str(self.args.timeout_s), "--report-json", str(report)],
-                stdout=open(self.logs / f"readers-{readers}.log", "w"), stderr=subprocess.STDOUT)
+                stdout=open(hosts.evidence_path(self.logs / f"readers-{readers}.log"), "w"), stderr=subprocess.STDOUT)
         times, failures, i = [], 0, 0
         deadline = time.monotonic() + self.args.duration_s
         item = f"commit@readers-{readers}"
@@ -352,8 +353,9 @@ class Run:
                                        note=f"no reader report: {e}"))
 
 
+@hosts.run_snapshot
 def cmd_run(args):
-    results = Path(args.results)
+    results = hosts.evidence_path(Path(args.results), hosts.private_session(), ROOT)
     results.mkdir(parents=True, exist_ok=True)
     args.date = datetime.datetime.now().isoformat(timespec="minutes")
     args.stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")

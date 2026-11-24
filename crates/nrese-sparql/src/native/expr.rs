@@ -5,6 +5,7 @@
 //! error or an unbound variable, which SPARQL treats alike in FILTERs. The supported set
 //! grows with coverage (execution-core design, XC5).
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -19,13 +20,14 @@ use sha2::{Sha256, Sha384, Sha512};
 
 use nrese_xsd::{
     Date, DateTime, DayTimeDuration, Decimal, Double, Duration, Float, GDay, GMonth, GMonthDay,
-    GYear, GYearMonth, Integer, Time, TimezoneOffset, YearMonthDuration,
+    GYear, GYearMonth, Time, TimezoneOffset, YearMonthDuration,
 };
 
 use super::calendar;
 use super::numeric::{Numeric, Operator};
 use super::value::{
-    Value, boolean_term, canonical, compare, effective_boolean, equals, is_lang_string,
+    Value, boolean_term, canonical, compare_rel, effective_boolean, equals, is_lang_string,
+    parse_integer,
 };
 
 /// True if the native evaluator implements every node of `expr`.
@@ -50,9 +52,11 @@ pub(crate) fn supported(expr: &Expression) -> bool {
         Expression::Not(a) => supported(a),
         Expression::If(a, b, c) => supported(a) && supported(b) && supported(c),
         Expression::Coalesce(list) => list.iter().all(supported),
+        // Every argument first, whatever the function: an `EXISTS` behind a cast is one the
+        // evaluator can't answer either.
         Expression::FunctionCall(function, args) => {
             args.iter().all(supported)
-                && matches!(
+                && (matches!(
                     function,
                     Function::Str
                         | Function::Lang
@@ -112,7 +116,7 @@ pub(crate) fn supported(expr: &Expression) -> bool {
                 )
                 // Casts, GeoSPARQL; any other IRI is an unknown function: an error.
                 || matches!(function, Function::Custom(_))
-                || (matches!(function, Function::BNode) && args.len() <= 1)
+                || (matches!(function, Function::BNode) && args.len() <= 1))
         }
         _ => false,
     }
@@ -266,19 +270,19 @@ impl Evaluator {
             Expression::SameTerm(a, b) => boolean(self.eval(a, binding)? == self.eval(b, binding)?),
             Expression::Greater(a, b) => {
                 let (x, y) = values(a, b)?;
-                compare(&x, &y).map(|o| boolean_term(o.is_gt()))
+                compare_rel(&x, &y).map(|o| boolean_term(o.is_some_and(Ordering::is_gt)))
             }
             Expression::GreaterOrEqual(a, b) => {
                 let (x, y) = values(a, b)?;
-                compare(&x, &y).map(|o| boolean_term(o.is_ge()))
+                compare_rel(&x, &y).map(|o| boolean_term(o.is_some_and(Ordering::is_ge)))
             }
             Expression::Less(a, b) => {
                 let (x, y) = values(a, b)?;
-                compare(&x, &y).map(|o| boolean_term(o.is_lt()))
+                compare_rel(&x, &y).map(|o| boolean_term(o.is_some_and(Ordering::is_lt)))
             }
             Expression::LessOrEqual(a, b) => {
                 let (x, y) = values(a, b)?;
-                compare(&x, &y).map(|o| boolean_term(o.is_le()))
+                compare_rel(&x, &y).map(|o| boolean_term(o.is_some_and(Ordering::is_le)))
             }
             Expression::In(a, list) => {
                 let needle = Value::of(&self.eval(a, binding)?);
@@ -754,12 +758,7 @@ impl Evaluator {
                 })
                 .flatten()
             }
-            Function::IsNumeric => arg(0).map(|t| {
-                boolean_term(matches!(
-                    Value::of(&t),
-                    Value::Integer(_) | Value::Decimal(_) | Value::Float(_) | Value::Double(_)
-                ))
-            }),
+            Function::IsNumeric => arg(0).map(|t| boolean_term(Value::of(&t).is_numeric())),
         }
     }
 }
@@ -916,6 +915,7 @@ fn cast(name: &str, term: Term) -> Option<Term> {
             Value::Float(v) => Boolean::from(v).into(),
             Value::Double(v) => Boolean::from(v).into(),
             Value::Integer(v) => Boolean::from(v).into(),
+            Value::BigInteger(_) => true,
             Value::Decimal(v) => Boolean::from(v).into(),
             Value::String(s) => s.parse::<Boolean>().ok()?.into(),
             _ => return None,
@@ -927,6 +927,7 @@ fn cast(name: &str, term: Term) -> Option<Term> {
             Value::Float(v) => v.into(),
             Value::Double(v) => v,
             Value::Integer(v) => v.into(),
+            Value::BigInteger(v) => v.to_double(),
             Value::Decimal(v) => v.into(),
             Value::Boolean(b) => Boolean::from(b).into(),
             Value::String(s) => s.parse().ok()?,
@@ -939,6 +940,7 @@ fn cast(name: &str, term: Term) -> Option<Term> {
             Value::Float(v) => v,
             Value::Double(v) => v.into(),
             Value::Integer(v) => v.into(),
+            Value::BigInteger(v) => v.to_float(),
             Value::Decimal(v) => v.into(),
             Value::Boolean(b) => Boolean::from(b).into(),
             Value::String(s) => s.parse().ok()?,
@@ -947,22 +949,32 @@ fn cast(name: &str, term: Term) -> Option<Term> {
         return typed(v.to_string(), xsd::FLOAT);
     }
     if name == xsd::INTEGER.as_str() {
-        let v: Integer = match value {
-            Value::Float(v) => v.try_into().ok()?,
-            Value::Double(v) => v.try_into().ok()?,
-            Value::Integer(v) => v,
-            Value::Decimal(v) => v.try_into().ok()?,
-            Value::Boolean(b) => Boolean::from(b).into(),
-            Value::String(s) => s.parse().ok()?,
-            _ => return None,
+        let v = match value {
+            Value::Float(v) => Value::Integer(v.try_into().ok()?),
+            Value::Double(v) => Value::Integer(v.try_into().ok()?),
+            Value::Decimal(v) => match v.try_into() {
+                Ok(v) => Value::Integer(v),
+                // Beyond i64: the canonical form's whole digits, its truncation toward zero.
+                Err(_) => parse_integer(v.to_string().split('.').next()?, None, None)?,
+            },
+            Value::Boolean(b) => Value::Integer(Boolean::from(b).into()),
+            // A cast collapses the string's whitespace first (XPath F&O §17.1.1); an RDF
+            // literal's lexical form is never trimmed.
+            Value::String(s) => parse_integer(s.trim_matches(['\t', '\n', '\r', ' ']), None, None)?,
+            v => v,
         };
-        return typed(v.to_string(), xsd::INTEGER);
+        return match v {
+            Value::Integer(v) => typed(v.to_string(), xsd::INTEGER),
+            Value::BigInteger(v) => typed(v.to_string(), xsd::INTEGER),
+            _ => None,
+        };
     }
     if name == xsd::DECIMAL.as_str() {
         let v: Decimal = match value {
             Value::Float(v) => v.try_into().ok()?,
             Value::Double(v) => v.try_into().ok()?,
             Value::Integer(v) => v.into(),
+            Value::BigInteger(v) => v.to_decimal()?,
             Value::Decimal(v) => v,
             Value::Boolean(b) => Boolean::from(b).into(),
             Value::String(s) => s.parse().ok()?,

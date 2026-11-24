@@ -2,6 +2,7 @@
 //! result interning remain in the executor; these helpers preserve row order and errors.
 
 use std::cell::{Cell, RefCell};
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -164,6 +165,7 @@ impl Aggregator<'_> {
         let table = &solutions.table;
         let mut numbers = self.numbers.borrow_mut();
         let mut total = Some(Numeric::Integer(Integer::from(0)));
+        let mut count = 0u64;
         let mut error = false;
         for &row in rows {
             let number =
@@ -179,12 +181,15 @@ impl Aggregator<'_> {
                         }
                     });
             match number {
-                Number::Value(number) => total = total.and_then(|total| total.add(number)),
+                Number::Value(number) => {
+                    count += 1;
+                    total = total.and_then(|total| total.add(number));
+                }
                 Number::Error => error = true,
                 Number::Other => return None,
             }
         }
-        Some(finish_total(total, error, rows.len() as u64, average))
+        Some(finish_total(total, error, count, average))
     }
 
     pub(super) fn binding<'s>(
@@ -225,6 +230,9 @@ impl Aggregator<'_> {
             | AggregateFunction::Min
             | AggregateFunction::Max => {
                 if ids.contains(&UNDEF) {
+                    if *name == AggregateFunction::Avg && ids.iter().all(|&id| id == UNDEF) {
+                        return Some(integer_agg(0));
+                    }
                     return Some(Agg::Id(UNDEF));
                 }
                 let values: Option<Vec<i64>> = ids
@@ -242,14 +250,12 @@ impl Aggregator<'_> {
                 } else {
                     values
                 };
-                // By value: xsd:integer and derived ids are of different kinds.
-                let value = |id: &u64| TermId::from_raw(*id).as_inline_integer();
                 Some(match name {
                     AggregateFunction::Min => {
-                        Agg::Id(ids.iter().copied().min_by_key(value).unwrap_or(UNDEF))
+                        Agg::Id(ids.iter().copied().min_by(inline_order).unwrap_or(UNDEF))
                     }
                     AggregateFunction::Max => {
-                        Agg::Id(ids.iter().copied().max_by_key(value).unwrap_or(UNDEF))
+                        Agg::Id(ids.iter().copied().max_by(inline_order).unwrap_or(UNDEF))
                     }
                     _ => {
                         let Some(sum) = values.iter().try_fold(0i64, |acc, &v| acc.checked_add(v))
@@ -442,8 +448,13 @@ impl Aggregator<'_> {
                     return result;
                 }
                 let evaluated = self.evaluated(solutions, rows, expr, *distinct);
+                // SPARQL 1.1 §18.5.1.4: Avg(M) = "0"^^xsd:integer whenever Count(M) = 0,
+                // including when every row evaluated to an error.
+                if *name == AggregateFunction::Avg && evaluated.iter().all(Option::is_none) {
+                    return Agg::Term(integer(0));
+                }
                 // COUNT skips errors and SAMPLE takes the first value, but one error makes
-                // SUM, AVG, MIN and MAX unbound.
+                // SUM, AVG (with Count > 0), MIN and MAX unbound.
                 let fails_on_error =
                     !matches!(name, AggregateFunction::Count | AggregateFunction::Sample);
                 if fails_on_error && evaluated.iter().any(Option::is_none) {
@@ -503,18 +514,18 @@ impl Aggregator<'_> {
     }
 }
 
-/// SUM (or AVG with `average`) of `count` values adding up to `total`, as `sum` and
-/// `average` give it: unbound after an error or an overflow, AVG of none 0, of integers
-/// and decimals a decimal.
+/// SUM (or AVG with `average`) of `count` non-error values adding up to `total`, as `sum`
+/// and `average` give it: AVG of zero non-error values is `"0"^^xsd:integer` (§18.5.1.4),
+/// otherwise unbound after an error or an overflow, and of integers and decimals a decimal.
 pub(super) fn finish_total(total: Option<Numeric>, error: bool, count: u64, average: bool) -> Agg {
+    if average && count == 0 {
+        return Agg::Term(integer(0));
+    }
     let Some(total) = total.filter(|_| !error) else {
         return Agg::Id(UNDEF);
     };
     if !average {
         return Agg::Term(total.term());
-    }
-    if count == 0 {
-        return Agg::Term(integer(0));
     }
     let mean = match total {
         Numeric::Integer(_) | Numeric::Decimal(_) => total
@@ -587,6 +598,15 @@ impl Running {
     }
 }
 
+/// `value::order` of two inline integers: by value, then (one value
+/// of two datatypes, `"1"^^xsd:integer` and `"1"^^xsd:nonNegativeInteger`) by datatype IRI.
+fn inline_order(a: &u64, b: &u64) -> Ordering {
+    let (a, b) = (TermId::from_raw(*a), TermId::from_raw(*b));
+    a.as_inline_integer()
+        .cmp(&b.as_inline_integer())
+        .then_with(|| value::inline_integer_rank(a).cmp(&value::inline_integer_rank(b)))
+}
+
 /// Every aggregate of every group in one pass over the rows, where each is `COUNT(*)`,
 /// or `COUNT`, `SUM`, `AVG`, `MIN` or `MAX` (without DISTINCT) of a variable holding only
 /// inline integers (`COUNT`: any terms): the results [`Aggregator::aggregate_ids`] gives,
@@ -601,18 +621,45 @@ pub(super) fn aggregate_in_one_pass(
     aggregates: &[(Variable, AggregateExpression)],
     reserve: &mut dyn FnMut(usize) -> Result<(), BudgetExceeded>,
 ) -> Result<Option<Vec<Vec<Agg>>>, BudgetExceeded> {
-    let Some(plan) = one_pass_plan(solutions, aggregates) else {
+    let Some((plan, mixed)) = one_pass_plan(solutions, aggregates) else {
         return Ok(None);
     };
     reserve(pass_bytes(groups, plan.len()))?;
+    // A column's running state is the same whatever reads it: each aggregate takes the
+    // first one's that reads its column (eager AVG's partial `SUM(?v)` and `COUNT(?v)`).
+    // A MIN or MAX over several datatypes (`mixed`) keeps its own and shares none:
+    // [`mixed_pass`] writes its extreme from order keys, not from that state.
+    let first: Vec<usize> = (0..plan.len())
+        .map(|a| {
+            if mixed[a] {
+                return a;
+            }
+            plan.iter()
+                .zip(&mixed)
+                .position(|((column, _), &keyed)| !keyed && *column == plan[a].0)
+                .unwrap_or(a)
+        })
+        .collect();
     let mut running = vec![Running::default(); groups * plan.len()];
     let mut rows = vec![0u64; groups];
-    for (row, &group) in group_of.iter().enumerate() {
-        let group = group as usize;
-        rows[group] += 1;
-        for (a, (column, _)) in plan.iter().enumerate() {
-            if let Some(column) = column {
-                running[group * plan.len() + a].add(solutions.table.get(row, *column));
+    if mixed.contains(&true) {
+        mixed_pass(
+            solutions,
+            group_of,
+            &plan,
+            &mixed,
+            &first,
+            &mut running,
+            &mut rows,
+        );
+    } else {
+        for (row, &group) in group_of.iter().enumerate() {
+            let group = group as usize;
+            rows[group] += 1;
+            for (a, (column, _)) in plan.iter().enumerate() {
+                if let Some(column) = column.filter(|_| first[a] == a) {
+                    running[group * plan.len() + a].add(solutions.table.get(row, column));
+                }
             }
         }
     }
@@ -622,18 +669,18 @@ pub(super) fn aggregate_in_one_pass(
                 plan.iter()
                     .enumerate()
                     .map(|(a, (column, name))| {
-                        let r = running[group * plan.len() + a];
+                        let r = running[group * plan.len() + first[a]];
                         if column.is_none() {
                             return integer_agg(rows[group] as i64);
                         }
                         match name {
                             AggregateFunction::Count => integer_agg(r.count as i64),
+                            AggregateFunction::Avg if r.count == 0 => Agg::Term(integer(0)),
                             _ if r.unbound => Agg::Id(UNDEF),
                             AggregateFunction::Min => Agg::Id(r.min.map_or(UNDEF, |m| m.1)),
                             AggregateFunction::Max => Agg::Id(r.max.map_or(UNDEF, |m| m.1)),
                             _ if r.overflow => Agg::Id(UNDEF),
                             AggregateFunction::Sum => integer_agg(r.sum),
-                            _ if r.count == 0 => Agg::Term(integer(0)),
                             _ => match Decimal::from(r.sum)
                                 .checked_div(Decimal::from(r.count as i64))
                             {
@@ -849,15 +896,19 @@ impl Context<'_> {
     }
 }
 
-/// Per aggregate, the column [`aggregate_in_one_pass`] reads (`None`: the rows) and its
-/// function; `None` if one isn't for that pass.
+/// Per aggregate: the column it reads (`None`: the rows) and its function.
+type OnePassPlan = Vec<(Option<usize>, AggregateFunction)>;
+
+/// [`aggregate_in_one_pass`]'s plan, and per aggregate whether it is a MIN or MAX over a
+/// column of several datatypes; `None` if one aggregate isn't for that pass.
 fn one_pass_plan(
     solutions: &Solutions,
     aggregates: &[(Variable, AggregateExpression)],
-) -> Option<Vec<(Option<usize>, AggregateFunction)>> {
-    // Per aggregate: the column it reads (`None`: the rows) and its function.
-    let mut plan: Vec<(Option<usize>, AggregateFunction)> = Vec::new();
+) -> Option<(OnePassPlan, Vec<bool>)> {
+    let mut plan = OnePassPlan::new();
+    let mut mixed = Vec::with_capacity(aggregates.len());
     for (_, aggregate) in aggregates {
+        mixed.push(false);
         match aggregate {
             AggregateExpression::CountSolutions { distinct: false } => {
                 plan.push((None, AggregateFunction::Count));
@@ -878,8 +929,11 @@ fn one_pass_plan(
                     return None;
                 }
                 let column = solutions.column(variable)?;
-                if numeric
-                    && !solutions.table.column(column).iter().all(|&id| {
+                let ids = solutions.table.column(column);
+                if matches!(name, AggregateFunction::Min | AggregateFunction::Max) {
+                    *mixed.last_mut()? = min_max_column(ids)?;
+                } else if numeric
+                    && !ids.iter().all(|&id| {
                         id == UNDEF || TermId::from_raw(id).as_inline_integer().is_some()
                     })
                 {
@@ -890,7 +944,109 @@ fn one_pass_plan(
             _ => return None,
         }
     }
-    Some(plan)
+    Some((plan, mixed))
+}
+
+/// [`aggregate_in_one_pass`]'s pass where a MIN or MAX column holds several datatypes, one
+/// column at a time. On a column with such a MIN or MAX (`mixed`), one loop over its rows
+/// keeps each group's least and greatest [`value::order_key`], the extremes in
+/// [`value::order`], computing each row's key once, and gives its column's other aggregates
+/// (COUNT, SUM, AVG) their [`Running::add`] in the same loop, into the state they share
+/// (`first`); each MIN or MAX recovers its id once per group. A column without one takes
+/// [`Running::add`] alone, as in the ordinary pass. Out of line and cold, so the ordinary
+/// pass keeps its code; its state is per group, like that pass's, never per row.
+#[cold]
+#[inline(never)]
+fn mixed_pass(
+    solutions: &Solutions,
+    group_of: &[u32],
+    plan: &[(Option<usize>, AggregateFunction)],
+    mixed: &[bool],
+    first: &[usize],
+    running: &mut [Running],
+    rows: &mut [u64],
+) {
+    for &group in group_of {
+        rows[group as usize] += 1;
+    }
+    let len = plan.len();
+    for (a, (column, _)) in plan.iter().enumerate() {
+        // Each column once, at the first aggregate that reads it.
+        let Some(column) = *column else { continue };
+        if plan[..a]
+            .iter()
+            .any(|(earlier, _)| *earlier == Some(column))
+        {
+            continue;
+        }
+        let on_column = |b: &usize| plan[*b].0 == Some(column);
+        // The state the column's unkeyed aggregates share, if it has one.
+        let shared = (0..len)
+            .find(|b| on_column(b) && !mixed[*b])
+            .map(|b| first[b]);
+        let keyed: Vec<usize> = (0..len).filter(|b| on_column(b) && mixed[*b]).collect();
+        let ids = solutions.table.column(column);
+        if keyed.is_empty() {
+            if let Some(s) = shared {
+                for (&group, &id) in group_of.iter().zip(ids) {
+                    running[group as usize * len + s].add(id);
+                }
+            }
+            continue;
+        }
+        // No key is 0 or `u64::MAX`: a group still at its start has no value.
+        let mut least = vec![u64::MAX; rows.len()];
+        let mut greatest = vec![0u64; rows.len()];
+        let mut unbound = vec![false; rows.len()];
+        for (&group, &id) in group_of.iter().zip(ids) {
+            let group = group as usize;
+            if let Some(s) = shared {
+                running[group * len + s].add(id);
+            }
+            if id == UNDEF {
+                unbound[group] = true;
+                continue;
+            }
+            // Every bound id here has a key: `one_pass_plan` declines a column with one without.
+            let Some(key) = value::order_key(TermId::from_raw(id)) else {
+                continue;
+            };
+            least[group] = least[group].min(key);
+            greatest[group] = greatest[group].max(key);
+        }
+        let extreme = |key: u64| {
+            let id = value::order_key_id(key);
+            id.as_inline_integer().map(|value| (value, id.raw()))
+        };
+        for group in 0..rows.len() {
+            for &b in &keyed {
+                let running = &mut running[group * len + b];
+                running.unbound = unbound[group];
+                if plan[b].1 == AggregateFunction::Max {
+                    running.max = Some(greatest[group])
+                        .filter(|&key| key != 0)
+                        .and_then(extreme);
+                } else {
+                    running.min = Some(least[group])
+                        .filter(|&key| key != u64::MAX)
+                        .and_then(extreme);
+                }
+            }
+        }
+    }
+}
+
+/// A MIN or MAX column's admission to [`aggregate_in_one_pass`], in one pass over `ids`:
+/// `None` unless every bound id is an inline integer; then whether they hold several
+/// datatypes. Running keeps the first of equal values, the term `value::order` picks only
+/// where equal values are one term: one datatype ("1"^^xsd:integer sorts before
+/// "1"^^xsd:nonNegativeInteger). Several datatypes take [`mixed_pass`], which reduces order
+/// keys: an id without one (a reserved datatype code, which a replayed log record can carry)
+/// declines the pass there, and the per-group path answers, as it does for every id this
+/// pass doesn't take.
+fn min_max_column(ids: &[u64]) -> Option<bool> {
+    let (several, keyless) = value::inline_integer_datatypes(ids)?;
+    (!(several && keyless)).then_some(several)
 }
 
 /// GROUP_CONCAT (SPARQL 1.1 §18.5.1.7): string literals only (anything else makes the

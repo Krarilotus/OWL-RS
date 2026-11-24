@@ -251,6 +251,118 @@ class PrivateTerms(unittest.TestCase):
         self.write("c.txt", message + "\n")
         return self.commit(message)
 
+    def branch(self, name, start, files):
+        """A commit on a new branch NAME from START, writing FILES; the work tree back on main."""
+        self.git("checkout", "-q", "-b", name, start)
+        for rel, content in files.items():
+            self.write(rel, content)
+        tip = self.commit(name)
+        self.git("checkout", "-q", "main")
+        return tip
+
+    def merge(self, *tips, files=None):
+        """A merge of TIPS into main, with FILES written into it before it is committed (an evil merge's own)."""
+        self.git("merge", "-q", "--no-ff", "--no-commit", *tips)
+        for rel, content in (files or {}).items():
+            self.write(rel, content)
+        return self.commit("merge")
+
+    # Spec (the master, 22 Nov 12:06): a push is refused exactly when a line or path it publishes, one the base
+    # doesn't hold already, holds a term. A merge publishes what none of its parents holds; what it takes from a
+    # parent is read at that parent's commits in the range, and is published already when the base holds it.
+    def test_a_merge_of_the_published_line_publishes_none_of_its_lines(self):
+        # The line's term in a file of its own, in a path, and in a file both sides changed (so the merge's
+        # combined diff shows that line, as taken from the line).
+        lines = "".join(f"{n}\n" for n in range(1, 7))
+        start = self.branch("start", self.base, {"m.txt": lines})
+        self.git("merge", "-q", "--ff-only", start)
+        line = self.branch("line", start, {"benches/hosts.txt": "zznamezz\n", "zznamezz-dir/x.txt": "x\n",
+                                           "m.txt": lines + "zznamezz\n"})
+        self.write("m.txt", "0\n" + lines)
+        self.commit("topic work")
+        merge = self.merge(line)
+        self.assertIn("zznamezz", self.git("diff-tree", "-c", "-p", merge), "the row's own premise")
+        done = self.check("push", line, "HEAD", "refs/heads/topic")
+        self.assertEqual(done.returncode, 0,
+                         f"SPEC merge-of-the-base: the line's own lines were read as the push's\n{done.stdout}")
+        self.assertIn("; 2 commits", done.stdout)
+        self.git("reset", "-q", "--hard", f"{merge}^1")
+        evil = self.merge(line, files={"a.txt": "base\nabout zzsshzz\n"})
+        done = self.check("push", line, "HEAD", "refs/heads/topic")
+        self.assertEqual(done.returncode, 1, f"SPEC merge-own-lines: a merge's own line passed\n{done.stdout}")
+        self.assertIn(f"commit {evil[:9]}: added lines match in a file under .\n", done.stdout)
+        self.assertNotIn("under benches", done.stdout)
+        self.assertNotIn("path matches", done.stdout)
+
+    def test_a_merges_own_binary_content_is_read(self):
+        # Spec (as above): a file the merge adds is its own, a binary one too (git's combined diff can leave a
+        # binary file's lines out).
+        line = self.branch("line", self.base, {"l.txt": "line\n"})
+        merge = self.merge(line, files={"bin.dat": "\x00\x01zznamezz\n"})
+        done = self.check("push", line, "HEAD", "refs/heads/topic")
+        self.assertEqual(done.returncode, 1, f"SPEC merge-own-binary: a merge's own binary line passed\n{done.stdout}")
+        self.assertIn(f"commit {merge[:9]}: added lines match in a file under .\n", done.stdout)
+
+    def test_a_merged_side_branch_nobody_has_is_read_at_its_own_commits(self):
+        side = self.branch("side", self.base, {"s.txt": "zznamezz\n"})
+        merge = self.merge(side)
+        done = self.check("push", self.base, "HEAD", "refs/heads/topic")
+        self.assertEqual(done.returncode, 1, f"SPEC merge-side: an unpublished side branch's term passed\n{done.stdout}")
+        self.assertIn(f"commit {side[:9]}: added lines match in a file under .\n", done.stdout)
+        self.assertNotIn(f"commit {merge[:9]}", done.stdout)
+
+    def test_an_octopus_merge_publishes_only_its_own_lines(self):
+        line = self.branch("line", self.base, {"benches/hosts.txt": "zznamezz\n"})
+        one = self.branch("one", self.base, {"one.txt": "one\n"})
+        two = self.branch("two", self.base, {"two.txt": "two\n"})
+        octopus = self.merge(line, one, two)
+        done = self.check("push", line, "HEAD", "refs/heads/topic")
+        self.assertEqual(done.returncode, 0, f"SPEC merge-octopus: a parent's published line was read\n{done.stdout}")
+        self.git("reset", "-q", "--hard", f"{octopus}^1")
+        evil = self.merge(line, one, two, files={"two.txt": "two\nabout zzsshzz\n"})
+        done = self.check("push", line, "HEAD", "refs/heads/topic")
+        self.assertEqual(done.returncode, 1, f"SPEC merge-octopus: an octopus merge's own line passed\n{done.stdout}")
+        self.assertIn(f"commit {evil[:9]}: added lines match in a file under .\n", done.stdout)
+
+    def test_a_merges_own_line_is_read_whatever_blank_lines_look_like(self):
+        # Spec (as above; git-config's diff.suppressBlankEmpty prints a blank context line without its space): a
+        # merge's own line after a blank line, taken from one parent and new to the other, is read.
+        self.git("config", "diff.suppressBlankEmpty", "true")
+        start = self.branch("start", self.base, {"f.txt": "x\ny\n"})
+        self.git("merge", "-q", "--ff-only", start)
+        line = self.branch("line", start, {"f.txt": "x\n\ny\n"})
+        merge = self.merge(line, files={"f.txt": "x\n\ny\nabout zzsshzz\n"})
+        done = self.check("push", line, "HEAD", "refs/heads/topic")
+        self.assertEqual(done.returncode, 1, f"SPEC merge-own-blank: a merge's own line passed\n{done.stdout}")
+        self.assertIn(f"commit {merge[:9]}: added lines match in a file under .\n", done.stdout)
+
+    def test_a_merged_path_that_isnt_utf8_is_refused(self):
+        # Spec (the master, 22 Nov 03:08 (b): what can't be read is refused, exit 2): a merge's own file whose name
+        # isn't UTF-8 can't be named back to git, so it is refused, never passed unread.
+        line = self.branch("line", self.base, {"l.txt": "line\n"})
+        self.git("merge", "-q", "--no-ff", "--no-commit", line)
+        blob = self.plumbing("hash-object", "-w", "--stdin", data=b"about zzsshzz\n").strip()
+        self.plumbing("update-index", "--index-info", data=b"100644 " + blob + b"\t\xff.txt\n")
+        self.git("commit", "-q", "-m", "merge")
+        done = self.check("push", line, "HEAD", "refs/heads/topic")
+        self.assertEqual(done.returncode, 2, f"SPEC merge-path-bytes: a path git can't be given back passed\n{done.stdout}")
+
+    def test_a_path_that_isnt_utf8_a_merge_takes_from_the_published_line_passes(self):
+        # Spec (as above): a path a merge takes from a parent the base holds is published already, whatever bytes
+        # its name has. Built without a work tree, which can't hold such a name everywhere.
+        blob = self.plumbing("hash-object", "-w", "--stdin", data=b"line\n").strip()
+        tree = self.plumbing("mktree", data=self.plumbing("ls-tree", self.base) + b"100644 blob " + blob +
+                             b"\t\xff.txt\n").strip().decode()
+        line =self.plumbing("commit-tree", tree, "-p", self.base, "-m", "line").strip().decode()
+        merge = self.plumbing("commit-tree", tree, "-p", self.base, "-p", line, "-m", "merge").strip().decode()
+        done = self.check("push", line, merge, "refs/heads/topic")
+        self.assertEqual(done.returncode, 0, f"SPEC merge-path-bytes: a published parent's path was refused\n{done.stdout}")
+
+    def plumbing(self, *args, data=None):
+        """Git with bytes in and out: what a path that isn't UTF-8 needs."""
+        return subprocess.run(["git", "-C", str(self.repo), *args], input=data, check=True, capture_output=True,
+                              env=self.env).stdout
+
 
 def module():
     """The check as a module of its own, fresh: STOP starts empty."""

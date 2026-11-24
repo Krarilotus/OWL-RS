@@ -1,0 +1,73 @@
+description = """The SHACL gate's state on the repository's info (docs/ops/http-api.md, `/dataset/info`,
+`shacl`). An enforcing gate with no shapes stored says that it checks nothing: 0 shapes, `vacuous`.
+docs/limits.md says why that matters: with no shapes stored, a gate set to `enforce` accepts every
+write. Once shapes are stored, the info counts them, at the revision they were compiled at. A
+commit that changes only data keeps that revision. A restart on the same data keeps the count. The
+server's log names the gate at each start, with a warning while it checks nothing."""
+
+[server]
+set = { "shacl.gate" = "enforce", "shacl.gate_severity" = "warning" }
+
+[vars]
+shapes_graph = "http://rdf4j.org/schema/rdf4j#SHACLShapeGraph"
+
+[[step]]
+name = "an enforcing gate with no shapes says it checks nothing"
+path = "/dataset/info"
+headers = { Accept = "application/json" }
+[step.expect]
+status = 200
+json = { "$.shacl.gate" = "enforce", "$.shacl.severity" = "warning", "$.shacl.shapes" = 0, "$.shacl.vacuous" = true }
+
+[[step]]
+name = "shapes stored in the shapes graph"
+method = "PUT"
+path = "/dataset/data"
+params = { graph = "${shapes_graph}" }
+headers = { Content-Type = "text/turtle" }
+body = """@prefix ex: <http://example.com/> .
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+ex:PersonShape a sh:NodeShape ; sh:targetClass ex:Person ;
+  sh:property [ sh:path ex:name ; sh:minCount 1 ; sh:message "a person needs a name" ] ."""
+[step.expect]
+status = [201, 204]
+
+[[step]]
+name = "the info counts the shapes"
+path = "/dataset/info"
+headers = { Accept = "application/json" }
+[step.expect]
+status = 200
+json = { "$.shacl.gate" = "enforce", "$.shacl.shapes" = 2, "$.shacl.vacuous" = false }
+[step.capture]
+compiled = { json = "$.shacl.revision" }
+
+[[step]]
+name = "data that passes the gate"
+method = "PUT"
+path = "/dataset/data"
+params = { graph = "http://example.com/people" }
+headers = { Content-Type = "text/turtle" }
+body = """<http://example.com/ada> a <http://example.com/Person> ; <http://example.com/name> "Ada" ."""
+[step.expect]
+status = [201, 204]
+
+[[step]]
+name = "a commit of data only keeps the shapes as compiled"
+path = "/dataset/info"
+headers = { Accept = "application/json" }
+[step.expect]
+status = 200
+json = { "$.shacl.shapes" = 2, "$.shacl.revision" = { matches = "^${compiled}$" } }
+
+[[step]]
+name = "restart on the same data"
+restart = true
+
+[[step]]
+name = "after the restart: the same shapes"
+path = "/dataset/info"
+headers = { Accept = "application/json" }
+[step.expect]
+status = 200
+json = { "$.shacl.shapes" = 2, "$.shacl.vacuous" = false }

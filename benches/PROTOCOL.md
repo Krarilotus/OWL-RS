@@ -264,7 +264,7 @@ the timed host and the big host); a declared hypothesis a round doesn't test cou
   between-file spread; until then the false-block rates of `probes/gate-falseblock.py` (0 of
   2,000 simulated A/A gates with copies, against 0.2 % to 100 % without, by blocks a round) hold
   under that assumption only.
-- *The floor.* `release_gate.py floor` writes `fast/noise-floor/<host>.toml`
+- *The floor.* `release_gate.py floor` writes `noise-floor/<host>.toml` (the private overlay's; `fast/` without one)
   from an A-A' gate on that host (every side one revision; the copies make them different
   instances): per case and dimension, the sd of one block's contrast. Each test takes its units'
   spread as at least that (floor / sqrt(k) for a unit of k blocks), so a loss must be clear

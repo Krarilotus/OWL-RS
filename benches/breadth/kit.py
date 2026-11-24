@@ -23,7 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "benches" / "suite"))
 
-from suitekit import manifest, ns  # noqa: E402
+from suitekit import hosts, manifest, ns  # noqa: E402
 from suitekit.runtime import DockerRuntime, Mount, Spec  # noqa: E402,F401
 from suitekit.schema import Result, Writer  # noqa: E402,F401
 
@@ -43,7 +43,7 @@ BIN = ns.directory(WORK, "bin", ROOT)
 
 def run(command: list[str], **kw) -> subprocess.CompletedProcess:
     print("+", " ".join(command), flush=True)
-    return subprocess.run(command, check=True, **kw)
+    return hosts.launch(subprocess.run, command, check=True, **kw)
 
 
 def rust_image() -> str:
@@ -184,3 +184,9 @@ def stamp(results: Path, argv: list[str], images: list[str], datasets: list[Path
         "datasets": {str(p): p.stat().st_size for p in datasets if p.exists()},
         "binaries": {p.name: sha256(p) for p in sorted(BIN.glob("*")) if p.is_file()},
     }
+
+
+def result_dir(explicit: str | None, label: str) -> Path:
+    private = hosts.private_session()
+    default = hosts.private_home() / "results/breadth" if private else RESULTS
+    return hosts.evidence_path(Path(explicit) if explicit else default / label, private, ROOT)

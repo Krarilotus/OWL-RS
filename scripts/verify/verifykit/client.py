@@ -26,6 +26,8 @@ import time
 import urllib.parse
 from pathlib import Path
 
+from suitekit import hosts
+
 
 class Deadline:
     """What is left of one operation's time, and what the operation is doing (`phase`)."""
@@ -107,7 +109,7 @@ class Body:
 
     def record(self, file: Path, evidence_bytes: int) -> dict:
         saved = self.kept[:evidence_bytes]
-        file.write_bytes(saved)
+        hosts.evidence_path(file).write_bytes(saved)
         return {"bytes": self.size, "sha256": self.digest.hexdigest(), "file": file.name,
                 "saved_bytes": len(saved), "saved_complete": len(saved) == self.size,
                 "beyond_read_limit": self.size > self.read_limit}

@@ -1145,3 +1145,168 @@ fn a_point_kept_inside_another_lets_go_of_numbers_past_the_limit() {
     ctx.keep(inner);
     ctx.keep(outer);
 }
+
+thread_local! {
+    static TWIN_PASS_OFF: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether a test has the one pass decline a `COUNT` of an expression beside its `SUM` or
+/// `AVG` ([`Context::numeric_pass`]), as it did before it took them: those aggregates then
+/// go a column at a time ([`Context::aggregate_column`]).
+pub(super) fn twin_pass_off() -> bool {
+    TWIN_PASS_OFF.get()
+}
+
+/// 16 subjects `g0` to `g15`, each with `p` to all 1,024 strings (`j` in four digits, then
+/// 1,020 `x`), `n` to all 1,024 integers `j`, and `team` `t0` or `t1` (`g % 2`): `?g :p ?v` is
+/// 16,384 rows in 16 groups, enough that the per-column route aggregates in parallel, each
+/// worker decoding into a cache of its own ([`Decoder`]), over few distinct values.
+fn shared_strings() -> Snapshot {
+    let config = EngineConfig {
+        background_maintenance: false,
+        ..EngineConfig::default()
+    };
+    let engine = Engine::new(config).unwrap();
+    let node = |name: String| nrese_rdf::NamedNode::new_unchecked(format!("urn:{name}"));
+    let mut tx = engine.transaction();
+    let mut insert = |s: u32, p: &str, o: Term| {
+        let quad = nrese_rdf::Quad::new(
+            node(format!("g{s}")),
+            node(p.to_owned()),
+            o,
+            nrese_rdf::GraphName::DefaultGraph,
+        );
+        tx.insert(quad.as_ref());
+    };
+    for g in 0..16 {
+        insert(g, "team", node(format!("t{}", g % 2)).into());
+        for j in 0..1_024 {
+            let text = format!("{j:04}{}", "x".repeat(1_020));
+            insert(g, "p", Literal::from(text).into());
+            insert(
+                g,
+                "n",
+                Literal::new_typed_literal(j.to_string(), xsd::INTEGER).into(),
+            );
+        }
+    }
+    tx.commit().unwrap();
+    engine.snapshot()
+}
+
+/// How a test runs a GROUP BY: as written, streamed ([`Context::group_streamed`]), or
+/// rewritten to eager aggregation ([`crate::plan::eager_aggregation`]).
+#[derive(Clone, Copy, Debug)]
+enum Run {
+    AsWritten,
+    Streamed,
+    Eager,
+}
+
+/// Spec: a one pass that takes a `COUNT` of an expression beside its `SUM` or `AVG` (the
+/// shapes it takes that it declined before) and answers leaves the query holding no more
+/// than the per-column route leaves after the same aggregates ([`twin_pass_off`]), with the
+/// same rows. Both are read right after the operator, before any cleanup: the budget's use
+/// with the result still held, the decode cache and every memo as they stand. The pass may
+/// keep its results' terms, as that route does. Over [`shared_strings`]:
+/// - a user's `SUM` and `COUNT` of `STRLEN(?v)` (1,024 strings of 1,024 bytes to decode),
+///   and of `?x * 2` (1,024 numbers to remember), as written;
+/// - a streamed `AVG(STRLEN(?v))`, whose partials are its `SUM` and `COUNT`;
+/// - eager `AVG(STRLEN(?v))` per team, alone and beside a user's `COUNT(STRLEN(?v))`: the
+///   early group by `?g` takes the pass.
+#[test]
+fn a_pass_with_a_count_of_its_expression_leaves_no_more_charged_than_the_per_column_route() {
+    let snapshot = shared_strings();
+    let options = options(None);
+    let grouped = |aggregates: &str, by: &str, pattern: &str| {
+        format!("SELECT ?{by} {aggregates} WHERE {{ {pattern} }} GROUP BY ?{by}")
+    };
+    let (strings, numbers) = ("?g <urn:p> ?v", "?g <urn:n> ?x");
+    let teams = "?g <urn:team> ?t . ?g <urn:p> ?v";
+    let shapes = [
+        (
+            grouped(
+                "(SUM(STRLEN(?v)) AS ?s) (COUNT(STRLEN(?v)) AS ?c)",
+                "g",
+                strings,
+            ),
+            Run::AsWritten,
+        ),
+        (
+            grouped("(SUM(?x * 2) AS ?s) (COUNT(?x * 2) AS ?c)", "g", numbers),
+            Run::AsWritten,
+        ),
+        (
+            grouped("(AVG(STRLEN(?v)) AS ?a)", "g", teams),
+            Run::Streamed,
+        ),
+        (grouped("(AVG(STRLEN(?v)) AS ?a)", "t", teams), Run::Eager),
+        (
+            grouped(
+                "(AVG(STRLEN(?v)) AS ?a) (COUNT(STRLEN(?v)) AS ?c)",
+                "t",
+                teams,
+            ),
+            Run::Eager,
+        ),
+    ];
+    // The shape's rows (sorted) and what the query holds right after it ([`counters`]).
+    let run = |text: &str, how: Run, off: bool| {
+        let query = SparqlParser::new().parse_query(text).unwrap();
+        let Query::Select { pattern, .. } = &query else {
+            panic!("a SELECT")
+        };
+        let ctx = Context::new(&snapshot, &options, None, None);
+        TWIN_PASS_OFF.set(off);
+        let solutions = match how {
+            Run::AsWritten => ctx.eval(pattern),
+            Run::Streamed => {
+                let (inner, keys, aggregates) = group_in(pattern);
+                let plan = stream::Plan::of(inner, aggregates, false).expect("streamable group");
+                ctx.group_streamed(&plan, keys, aggregates)
+            }
+            Run::Eager => {
+                let rewritten = crate::plan::eager_aggregation(pattern);
+                assert!(rewritten != *pattern, "{text}: no eager rewrite");
+                ctx.eval(&rewritten)
+            }
+        };
+        TWIN_PASS_OFF.set(false);
+        let solutions = solutions.ok().expect("no limit");
+        let held = counters(&ctx);
+        let mut rows: Vec<String> = (0..solutions.table.len())
+            .map(|row| {
+                (0..solutions.vars.len())
+                    .map(|c| {
+                        let id = solutions.table.get(row, c);
+                        decode(&ctx.snapshot, &ctx.computed.borrow(), id)
+                            .map_or("-".to_owned(), |term| term.to_string())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect();
+        rows.sort();
+        ctx.consumed(solutions);
+        (rows, held)
+    };
+    let mut wrong = Vec::new();
+    for (text, how) in &shapes {
+        let shape = &text[text.find(" (").unwrap() + 1..text.find(" WHERE").unwrap()];
+        let (rows, pass) = run(text, *how, false);
+        let (per_column_rows, per_column) = run(text, *how, true);
+        assert!(!rows.is_empty(), "{shape}: no rows");
+        if rows != per_column_rows {
+            wrong.push(format!("{shape} ({how:?}): the routes answer differently"));
+        }
+        // [kept bytes, computed terms, remembered numbers, budget used, decoded bytes]
+        if pass[3] > per_column[3] {
+            wrong.push(format!(
+                "{shape} ({how:?}): the pass leaves {} bytes charged, the per-column route {}: \
+                 {pass:?} against {per_column:?}",
+                pass[3], per_column[3]
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

@@ -113,9 +113,10 @@ def frontier(points: list[tuple[float, float]], target: float) -> float | None:
     return max(reached) if reached else None
 
 
+@kit.hosts.run_snapshot
 def export(args) -> int:
+    out = kit.result_dir(args.results, args.label)
     src = checkout()
-    out = Path(args.results) if args.results else kit.RESULTS / args.label
     out.mkdir(parents=True, exist_ok=True)
     table = out / "ann-benchmarks.csv"
     kit.run([python(), "data_export.py", "--output", str(table)], cwd=src)

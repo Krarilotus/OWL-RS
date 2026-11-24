@@ -37,7 +37,7 @@ python benches/fast/fast.py clean [--build] [--data]     this checkout's scratch
 | `queries/` | the cases' SPARQL (LUBM's and OWL2Bench's come from `../reasoning/queries`) |
 | `rules/`, `shapes/` | the user-rules case's N3 and Datalog programs; the SHACL case's shapes |
 | `crates/nrese-store/examples/perf_lab/` | the measuring tool: `generate.rs` (the data), `modes.rs` (commits with readers, clients, canonicalisation, the store's classification), `main.rs` (with `--routes`: each query's rewrites, operators and, under `owl2-dl`, its status and path) |
-| `../baselines/fast/` | NRESE's runs, one compact record each (`<date>-<label>.json`; "What is kept") |
+| `../baselines/fast/` | NRESE's runs, one compact record each (`<date>-<label>.json`; "What is kept"); our hosts' in the private overlay's `baselines/fast/` |
 
 ## A case
 
@@ -182,7 +182,7 @@ Every block times copies of the builds made for it ([PROTOCOL.md §5, "the unit"
 - Catalog cases, through the gate's steps: `release-gate.sh build REV` for each side, then `prepare HARNESS` with `GATE_BASELINES=base GATE_CASES=...`. Then `block N HARNESS 1 - base=REV cand=REV` for N = 1..k (four reports a block), and `report HARNESS cand=REV base=REV`.
 - Directly: `fast.py block --block N --cases C --side base:BINDIR:REV --side cand:BINDIR:REV --seed S --fresh-copies DIR --out PASSES`. This needs the native runtime and prepared data, and a BINDIR laid out like a gate build (`release/examples/perf_lab`, REVISION, SHA256SUMS).
 - A hand-rolled `perf_lab` loop (no catalog case): at each block's start run `cp -a "$BIN" "$W/copy-$k-$side" && sync` for each side, time from the copy, and `rm -rf` it at the block's end. Never time one file in two blocks.
-- The verdict: `release_gate.py report` takes the host's A-A' floor from `noise-floor/HOST.toml` (`release_gate.py floor`), or says the host has none.
+- Each pass saves the host's A-A' floor and the overlay digest. `release_gate.py report` uses those readings, and confirmation requires the same floor and overlay. `jobs` and `confirm` default to the overlay's `jobs/` directory and require output outside the public checkout.
 
 ## What is kept
 
@@ -190,7 +190,8 @@ A run writes two files:
 - **The full report**, outside git: `~/nrese-bench/reports/fast/<date>-<label>.json`
   (`NRESE_BENCH_REPORTS` moves it). It holds
   every sample and each case's raw result, 1-3 MB a run.
-- **The compact record**, committed: `../baselines/fast/<date>-<label>.json`, 0.1-0.3 MB. It
+- **The compact record**, committed: `../baselines/fast/<date>-<label>.json` (the private
+  overlay's `baselines/fast/` when `NRESE_BENCH_PRIVATE` is set), 0.1-0.3 MB. It
   holds the run's commit, machine and configuration. Per case and repetition it holds the
   status, the checks and routes (long values shortened), the work counters, the metric, the
   peaks and the case's time. Each series is kept as 41 order statistics. It names the full

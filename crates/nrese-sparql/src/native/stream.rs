@@ -5,10 +5,15 @@
 //! and the groups, not the join.
 //!
 //! The aggregates must merge: `COUNT` (partial counts summed), `SUM`, `MIN`, `MAX`,
-//! `SAMPLE`, and `AVG` as a sum and a count divided at the end; not `DISTINCT` ones nor
-//! `GROUP_CONCAT`. An error in a group's values leaves its partial unbound, and an unbound
-//! partial makes the merged `SUM`, `AVG`, `MIN` and `MAX` unbound as the sequential
-//! evaluation does. Floating-point sums may round differently: SPARQL fixes no order.
+//! `SAMPLE`, and `AVG` as a `SUM(expr)` and `COUNT(expr)` divided at the end; not
+//! `DISTINCT` ones, not `GROUP_CONCAT`, and not `AVG` over an argument that draws (`RAND`,
+//! `UUID`, `STRUUID`, `BNODE`, in an `EXISTS` too), which splitting into sum and count would
+//! evaluate twice. A morsel's partial may hold only errors: its sum is then unbound and its
+//! count 0. The merged count is the whole group's count of values that aren't errors: where
+//! it is 0 the mean is `"0"^^xsd:integer` (SPARQL 1.1 §18.5.1.4); where an error stands
+//! beside a value the merged sum stays unbound and the count positive, so the merged `SUM`,
+//! `AVG`, `MIN` and `MAX` stay unbound as the sequential evaluation does. Floating-point
+//! sums may round differently: SPARQL fixes no order.
 //!
 //! It runs when the direct evaluation of the group runs out of memory (the attempt's
 //! memory released first), or always with [`crate::QueryOptions::stream_rows`] (tests).
@@ -280,14 +285,21 @@ impl Context<'_> {
                 Final::Copy(target, column) => {
                     self.extend(solutions, target, &Expression::Variable(column.clone()))?
                 }
-                Final::Average { target, sum, count } => self.extend(
-                    solutions,
-                    target,
-                    &Expression::Divide(
-                        Box::new(Expression::Variable(sum.clone())),
-                        Box::new(Expression::Variable(count.clone())),
-                    ),
-                )?,
+                Final::Average { target, sum, count } => {
+                    let zero = Expression::Literal(nrese_rdf::Literal::from(0i64));
+                    let average = Expression::If(
+                        Box::new(Expression::Equal(
+                            Box::new(Expression::Variable(count.clone())),
+                            Box::new(zero.clone()),
+                        )),
+                        Box::new(zero),
+                        Box::new(Expression::Divide(
+                            Box::new(Expression::Variable(sum.clone())),
+                            Box::new(Expression::Variable(count.clone())),
+                        )),
+                    );
+                    self.extend(solutions, target, &average)?
+                }
             };
         }
         let mut wanted = variables.to_vec();

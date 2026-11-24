@@ -31,6 +31,8 @@ import csv
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
+from . import hosts
+
 TASKS = {"load", "reason", "size", "restart", "count", "query", "update", "serve", "conformance", "validate", "index"}
 STATUSES = {"ok", "failed", "timeout", "wrong", "skipped"}
 REGIMES = {"none", "rdfs", "owl-horst", "owl2-rl", "owl2-ql", "custom", "-"}
@@ -88,7 +90,8 @@ class Writer:
     results.csv only, so it can go nowhere they look. A file of other fields is left alone: the
     rows go to results-2.csv, -3, … instead."""
 
-    def __init__(self, path: Path, echo=None):
+    def __init__(self, path: Path, echo=None, *, checkout=hosts.ROOT):
+        self.private, self.checkout = hosts.private_session(), checkout
         n = 1
         while (path.exists() and path.stat().st_size > 0
                and (not (found := header(path)) or FIELDS[:len(found)] != found)):
@@ -96,9 +99,10 @@ class Writer:
             path = path.with_name(f"{path.stem.split('-')[0]}-{n}{path.suffix}")
         self.path = path
         self.echo = echo
+        hosts.evidence_path(path, self.private, self.checkout)
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.exists() or path.stat().st_size == 0:
-            with open(path, "w", newline="", encoding="utf-8") as f:
+            with open(hosts.evidence_path(path, self.private, self.checkout), "w", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerow(FIELDS)
         self.fields = header(path)
 
@@ -113,7 +117,7 @@ class Writer:
                              "results directory (rows written beside the file are read by nobody)")
         if isinstance(row["ms"], float):
             row["ms"] = f"{row['ms']:.2f}"
-        with open(self.path, "a", newline="", encoding="utf-8") as f:
+        with open(hosts.evidence_path(self.path, self.private, self.checkout), "a", newline="", encoding="utf-8") as f:
             csv.DictWriter(f, self.fields, extrasaction="ignore").writerow(row)
         if self.echo:
             shown = [result.system, result.workload, result.tier, f"run {result.run}", result.task]
