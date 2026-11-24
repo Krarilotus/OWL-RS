@@ -23,14 +23,14 @@ pub(super) enum Verdict {
 
 /// Runs every step of `case` through both entry points and compares each exactly with full
 /// validation. Only a verified entry of `gaps` at `location`, the case's own selector,
-/// accepts a deviation, and an entry there that accepts none is closed. A `drawn` case
-/// holding a restricted trigger is left out before any comparison.
-pub(super) fn check(case: &Case, location: &str, gaps: &[Gap], drawn: bool) -> Verdict {
+/// accepts a deviation, and an entry there that accepts none is closed. A case holding
+/// a restricted trigger is left out before any comparison.
+pub(super) fn check(case: &Case, location: &str, gaps: &[Gap]) -> Verdict {
     let evaluations = match case.run() {
         Ok(evaluations) => evaluations,
         Err(error) => return Verdict::Fail(format!("error: {error}")),
     };
-    if let Some(gap) = draw::left_out(&evaluations).filter(|_| drawn) {
+    if let Some(gap) = draw::left_out(&evaluations) {
         return Verdict::LeftOut(gap);
     }
     let mut allowance = Allowances::default();
@@ -107,6 +107,7 @@ pub(super) fn replay(test: &str, outer: &str, case: &str) -> String {
 pub(super) fn run() {
     let outer = std::env::var("NRESE_FUZZ_SEED").unwrap_or_else(|_| "0".into());
     let selector = std::env::var("NRESE_SHACL_CASE").ok();
+    let replaying = selector.is_some();
     type Draw = (String, Case, Option<String>);
     let draws: Box<dyn Iterator<Item = Draw>> = match selector.as_deref() {
         // Drawn on (up to ten times as many) until a draw introduces a result, so that the
@@ -128,8 +129,8 @@ pub(super) fn run() {
             )))
         }
     };
-    // A saved case is compared exactly; only a verified entry at its own selector accepts a
-    // deviation. No entry names a draw.
+    // Only a verified entry at its own selector accepts a deviation in a saved case.
+    // No entry names a draw.
     let saved = selector
         .as_deref()
         .is_some_and(|case| case.starts_with("saved:"));
@@ -145,7 +146,7 @@ pub(super) fn run() {
     for draw in draws {
         // Draws left out by a restriction don't count towards the batch.
         let compared = count - left_out.values().sum::<u64>();
-        if selector.is_none() && compared >= DRAWS && introducing > 0 {
+        if !replaying && compared >= DRAWS && introducing > 0 {
             break;
         }
         count += 1;
@@ -156,7 +157,7 @@ pub(super) fn run() {
             controls += usize::from(step.shapes.is_none() && step.edits_the_shapes_graph());
             inferred_edits += usize::from(!step.infer.is_empty() || !step.retract.is_empty());
         }
-        let verdict = check(case, selector, &gaps, !saved);
+        let verdict = check(case, selector, &gaps);
         // A saved fixture must still show what it recorded.
         if let (Some(recorded), Verdict::Pass(_)) = (recorded, &verdict) {
             let replay = replay("random_changes", &outer, selector);
@@ -167,6 +168,11 @@ pub(super) fn run() {
         }
         match verdict {
             Verdict::Pass(evaluations) => introducing += evaluations,
+            Verdict::LeftOut(gap) if replaying => {
+                let replay = replay("random_changes", &outer, selector);
+                let reason = gap.replace('-', " ");
+                panic!("{replay}\ncase {selector} is left out: {reason}");
+            }
             Verdict::LeftOut(gap) => *left_out.entry(gap).or_default() += 1,
             Verdict::Fail(signature) => {
                 let replay = replay("random_changes", &outer, selector);
@@ -218,7 +224,7 @@ pub(super) fn run() {
         panic!("{first}\n{} of {count} draws deviate", failures.len());
     }
     assert!(
-        selector.is_some() || introducing > 0,
+        replaying || introducing > 0,
         "no draw of {count} introduced a result: the batch compared nothing new"
     );
 }
