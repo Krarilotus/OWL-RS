@@ -110,29 +110,19 @@ fn validate_changes_within<A: ReadView + Sync, B: ReadView + Sync>(
         );
     }
     let changed = selected;
-    // Test both sides: an insertion may enable expansion, and a deletion may end it.
-    let expands_equality = |view: Option<&nrese_engine::Snapshot>| {
-        view.is_some_and(|view| view.equality_classes().is_some())
-    };
+    // A transaction's view reads with its base's equality, so the view after decides.
     let equality_changed = edits_equality
-        && (expands_equality(after.snapshot()) || expands_equality(before.snapshot()));
+        && after
+            .snapshot()
+            .is_some_and(|view| view.equality_classes().is_some());
     if equality_changed || (shapes.has_cycles && !changed.is_empty()) {
         // A cycle can carry a change arbitrarily far. An equality edit can change what
         // reads see far from the edited statement. Either needs the whole reports.
         let (mut results, failures, held) =
             validate_full_difference(before, Some(shapes), after, shapes, data, resources)?;
-        if equality_changed {
-            let order = |a: &RawResult, b: &RawResult| {
-                Key { result: a, shapes }.order(&Key { result: b, shapes })
-            };
-            results.sort_unstable_by(order);
-            results.dedup_by(|a, b| order(a, b).is_eq());
-        }
         // Change reports are sets in raw result order.
         results.sort_unstable();
-        if !equality_changed {
-            results.dedup();
-        }
+        results.dedup();
         let report = decode(after, shapes, results, failures, resources);
         drop(held);
         return report;

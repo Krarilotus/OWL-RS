@@ -589,6 +589,9 @@ leave something out.
   store. With LUBM 10's asserted data (1.27 million statements) and one recursive shape, a commit
   of one new node took 87 ms and peaked at 12 MB on 4 cores. Without the recursive shape, it
   took 5 ms and 1.7 MB.
+- Under `reasoner.equality = "compact"`, the gate validates the whole store for every data commit
+  that changes an `owl:sameAs` statement, inferred ones included (from functional properties or
+  keys, for example). It runs after the commit and, if that finds results, before it too.
 - With the gate set to `report` or `enforce`, a write that leaves an uncompilable shapes graph
   unchanged is refused (a bulk load can store such shapes; the info's `shacl` then says why
   they aren't counted). Repair or replace the shapes graph to restore writes. A validation
