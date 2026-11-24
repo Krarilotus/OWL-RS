@@ -231,6 +231,34 @@ fn reads_only_report_inconsistency_when_the_equal_terms_are_list_operands() {
     assert!(failures.is_empty(), "quarantine read: {failures:#?}");
 }
 
+/// An asserted operand is a change to the list even when equality already
+/// supplies that RDF triple in the inferred stack.
+#[test]
+fn writing_an_already_inferred_operand_can_introduce_a_clash() {
+    for representatives in [true, false] {
+        let dl = dl_pipeline(representatives);
+        insert(&dl, ALIAS_OUTSIDE).expect("the alias is outside the written list");
+        let write = super::update(
+            &dl,
+            &format!(
+                "{RDF}
+                 DELETE {{ ?second rdf:first :a }}
+                 INSERT {{ ?second rdf:first :b }}
+                 WHERE {{
+                     ?axiom a owl:AllDifferent ; owl:members ?head .
+                     ?head rdf:rest ?second .
+                     ?second rdf:first :a ; rdf:rest ?third .
+                     ?third rdf:first :c .
+                 }}"
+            ),
+        );
+        assert!(
+            refused(&write),
+            "representatives={representatives}: {write:?}"
+        );
+    }
+}
+
 #[test]
 fn same_as_members_clash_past_the_walk_limit_after_a_rebuild() {
     use std::fmt::Write;
