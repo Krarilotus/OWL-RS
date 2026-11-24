@@ -22,6 +22,7 @@ mod equality_pending_tests;
 mod equality_rule_names_tests;
 mod explanation_tests;
 mod graph_alias_input_tests;
+mod hidden_union_writes;
 mod image_backup_tests;
 mod implicit_prefix_tests;
 mod inferred_access_tests;
