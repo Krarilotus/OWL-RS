@@ -44,9 +44,8 @@ impl<'a> Membership<'a> {
 
     pub(crate) fn finish(mut self) -> Vec<Diagnostic> {
         if !self.occurs.is_empty() {
-            let builtin: HashSet<_> = crate::vocab::DATA_IRIS
+            let builtin: HashSet<_> = crate::vocab::DL_DATATYPES
                 .iter()
-                .filter(|iri| !crate::mapping::FACETS.contains(iri))
                 .filter_map(|iri| self.terms.iri(iri))
                 .collect();
             for (term, witness) in std::mem::take(&mut self.occurs) {
