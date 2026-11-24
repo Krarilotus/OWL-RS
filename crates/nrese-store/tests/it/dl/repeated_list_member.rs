@@ -146,7 +146,13 @@ fn a_branching_list_can_still_have_a_single_operand_walk() {
         .unwrap();
     }
     let write = super::update(&pipeline(), &format!("{RDF} INSERT DATA {{ {data} }}"));
-    assert!(refused(&write), "the (:a :a) walk clashes: {write:?}");
+    // A branching RDF list is outside the structural mapping. Pin the rule that
+    // found the clash even when the public consistency verdict is Undecided.
+    assert!(
+        matches!(&write, Err(MutationError::Rejected(reject))
+            if reject.explanation.as_ref().is_some_and(|e| e.violated_constraint == "eq-diff2")),
+        "the (:a :a) walk clashes: {write:?}"
+    );
 
     // Extending the repeated walk to (:a :a :b) makes every walk mixed.
     let data = data.replace(
