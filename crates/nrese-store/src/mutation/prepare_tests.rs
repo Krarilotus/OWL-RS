@@ -300,11 +300,20 @@ fn a_failed_key_waits_for_an_explicit_retry() {
 /// free to finish. A write may start its own repository's preparation ahead of startup.
 #[test]
 fn preparation_is_local_and_a_write_can_beat_startup() {
+    let reopen = |dir: &tempfile::TempDir| {
+        let config = StoreConfig::on_disk(dir.path());
+        drop(loaded(StoreService::new(config.clone()).unwrap(), SCHEMA));
+        MutationPipeline::new(Arc::new(StoreService::new(config).unwrap()), rl())
+    };
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let a = reopen(&dir_a);
+    let b = reopen(&dir_b);
     let (held_a, release_a) = pause(Stage::BeforeInstall);
-    let a = pipeline().prepare_from_start();
+    let a = a.prepare_from_start();
     held_a.recv_timeout(WAIT).unwrap();
     let (held_b, release_b) = pause(Stage::BeforeClaim);
-    let b = pipeline().prepare_from_start();
+    let b = b.prepare_from_start();
     held_b.recv_timeout(WAIT).unwrap();
     apply(&b, &MutationTicket::new()).unwrap();
     assert!(ask(&b, "ex:y a ex:B"));
@@ -382,30 +391,39 @@ fn a_waiting_write_joins_the_replacement_and_drops_its_reading() {
 /// result is ready before the next edit arrives.
 #[test]
 fn publication_during_the_write_seam_wakes_the_new_head() {
-    let pipeline = pipeline().prepare_from_start();
-    ready(&pipeline);
-    let (entered, seam) = mpsc::channel();
-    let (release, wait) = mpsc::channel();
-    let writer = pipeline.clone();
-    let commit = thread::spawn(move || {
-        hooks::AFTER_WRITE_PUBLICATION.set(Some(Box::new(move || {
-            entered.send(()).unwrap();
-            wait.recv_timeout(WAIT).unwrap();
-        })));
-        apply(&writer, &MutationTicket::new())
-    });
-    seam.recv_timeout(WAIT).unwrap();
-    pipeline.store().clear_inferred().unwrap();
-    pipeline
-        .store()
-        .rematerialise(rl().config().materialised_program().unwrap())
-        .unwrap();
-    release.send(()).unwrap();
-    commit.join().unwrap().unwrap();
-    ready(&pipeline);
-    answer_at(&pipeline, "INSERT DATA { ex:z a ex:A }");
-    assert!(ask(&pipeline, "ex:z a ex:B"));
-    assert_eq!(pipeline.write_program_metrics().2, 0);
+    for control in [false, true] {
+        let pipeline = pipeline().prepare_from_start();
+        ready(&pipeline);
+        let (entered, seam) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let writer = pipeline.clone();
+        let commit = thread::spawn(move || {
+            hooks::AFTER_WRITE_PUBLICATION.set(Some(Box::new(move || {
+                entered.send(()).unwrap();
+                wait.recv_timeout(WAIT).unwrap();
+            })));
+            apply(&writer, &MutationTicket::new())
+        });
+        seam.recv_timeout(WAIT).unwrap();
+        pipeline.store().clear_inferred().unwrap();
+        pipeline
+            .store()
+            .rematerialise(rl().config().materialised_program().unwrap())
+            .unwrap();
+        release.send(()).unwrap();
+        commit.join().unwrap().unwrap();
+        let writer = if control {
+            let store = Arc::clone(pipeline.store());
+            pipeline.retire();
+            MutationPipeline::new(store, rl()).prepare_from_start()
+        } else {
+            pipeline
+        };
+        ready(&writer);
+        answer_at(&writer, "INSERT DATA { ex:z a ex:A }");
+        assert!(ask(&writer, "ex:z a ex:B"));
+        assert_eq!(writer.write_program_metrics().2, 0);
+    }
 }
 
 /// Spec: restoration of the reading at the same revision prepares that exact key,

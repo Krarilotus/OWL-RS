@@ -922,17 +922,37 @@ mod tests {
     fn snapshot_and_cold_commit_ground_the_same_program() {
         use crate::eval::{GroundProgram, Grounding, Seg, Source};
         use nrese_rdf_io::{RdfFormat, RdfParser};
+        use std::fmt::Write as _;
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
-        let input = b"@prefix ex: <http://example.org/> .
+        let mut input = "@prefix ex: <http://example.org/> .
             @prefix owl: <http://www.w3.org/2002/07/owl#> .
             @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
             ex:p owl:propertyChainAxiom (ex:q ex:r) .
+            ex:wide owl:propertyChainAxiom ex:c0 .
+            ex:ancestor a owl:TransitiveProperty .
             ex:A rdfs:subClassOf ex:B .
             ex:x a ex:A ; ex:q ex:y . ex:y ex:r ex:z .
             ex:B owl:disjointWith ex:C .
-            _:u owl:unionOf (ex:A ex:B) .";
-        for quad in RdfParser::from_format(RdfFormat::Turtle).for_reader(&input[..]) {
+            _:u owl:unionOf (ex:A ex:B) .\n"
+            .to_owned();
+        // Seven binary cells give 128 walks, above the 64-walk enumeration limit.
+        for index in 0..7 {
+            let next = index + 1;
+            let rest = if next == 7 {
+                "rdf:nil".to_owned()
+            } else {
+                format!("ex:c{next}")
+            };
+            writeln!(
+                input,
+                "ex:c{index} rdf:first ex:edge, ex:alternate ; rdf:rest {rest} . \
+                 ex:n{index} ex:edge ex:n{next} ."
+            )
+            .unwrap();
+        }
+        for quad in RdfParser::from_format(RdfFormat::Turtle).for_reader(input.as_bytes()) {
             tx.insert(quad.unwrap().as_ref());
         }
         let rules = crate::rulesets::Ruleset::Owl2Rl.into();
