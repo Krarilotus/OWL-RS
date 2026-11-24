@@ -74,14 +74,28 @@ fn ask(store: &StoreService, pattern: &str) -> (bool, Option<Completeness>) {
     )
 }
 
-/// OWL 2 Direct Semantics §§2.2.3 and 2.3.6: an even number of complements of `:A`
-/// denotes `:A`. An individual asserted to belong to that expression belongs to `:A`.
+/// The membership answer under `owl2-dl` with what its status says and what decided it,
+/// after a later read of an asserted statement shows the store still answers.
+fn dl_membership(dl: &MutationPipeline) -> (Vec<String>, Completeness, Vec<&'static str>) {
+    let asserted = query(dl, &format!("ASK {{ {DECLARED_INDIVIDUAL} }}"));
+    assert_eq!(asserted.0, ["true"]);
+    let (answer, status) = query(dl, &format!("ASK {{ {MEMBERSHIP} }}"));
+    (answer, status.shared, status.paths)
+}
+
+/// OWL 2 Mapping to RDF §2 maps each complement to a triple, at any nesting depth. A deep
+/// chain's write applies, the store still answers, and the membership `:x a :A` is answered
+/// with the answer, status and path of a chain of two: nesting changes neither. The
+/// answer's value under the Direct Semantics is checked elsewhere.
 #[test]
 fn dl_write() {
     at_each_depth("dl_write", |depth| {
-        let dl = pipeline();
-        insert(&dl, &complement_chain(depth)).expect("write applies");
-        assert_eq!(query(&dl, "ASK { :x a :A }").0, ["true"]);
+        let write_and_read = |depth| {
+            let dl = pipeline();
+            insert(&dl, &complement_chain(depth)).expect("write applies");
+            dl_membership(&dl)
+        };
+        assert_eq!(write_and_read(depth), write_and_read(2));
     });
 }
 
@@ -103,25 +117,29 @@ fn ql_write() {
     });
 }
 
-/// OWL 2 Direct Semantics §§2.2.3 and 2.3.6: bulk-loaded assertions retain the same
-/// meaning when the store rebuilds its reasoning. An even complement chain denotes `:A`.
+/// As [`dl_write`], for a bulk load past the pipeline and the store's rebuild of its
+/// reasoning: the deep chain loads, the rebuild succeeds, and the membership is answered as
+/// for a chain of two. The answer's value is checked elsewhere.
 #[test]
 fn dl_bulk_load() {
     at_each_depth("dl_bulk_load", |depth| {
-        let dl = pipeline();
-        crate::support::load_past_the_pipeline(
-            dl.store(),
-            &format!("{PREFIXES}{}", complement_chain(depth)),
-        );
-        dl.store()
-            .rematerialise(
-                dl.reasoner()
-                    .config()
-                    .materialised_program()
-                    .expect("rules"),
-            )
-            .expect("rematerialisation");
-        assert_eq!(query(&dl, "ASK { :x a :A }").0, ["true"]);
+        let load_and_read = |depth| {
+            let dl = pipeline();
+            crate::support::load_past_the_pipeline(
+                dl.store(),
+                &format!("{PREFIXES}{}", complement_chain(depth)),
+            );
+            dl.store()
+                .rematerialise(
+                    dl.reasoner()
+                        .config()
+                        .materialised_program()
+                        .expect("rules"),
+                )
+                .expect("rematerialisation");
+            dl_membership(&dl)
+        };
+        assert_eq!(load_and_read(depth), load_and_read(2));
     });
 }
 
