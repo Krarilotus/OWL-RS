@@ -793,8 +793,10 @@ fn update_body<B: Base + ?Sized>(
     let schema = rules.schema;
     let empty = Store::default();
     let inserted_set: HashSet<Triple> = inserted.iter().copied().collect();
-    // The ground program of the old state: `base` without the inserted facts, plus the
-    // deleted ones.
+    // Reconstruct the old ground program by hiding insertions and restoring deletions.
+    // This also hides newly asserted list facts that were previously inferred. The
+    // written view must hide those assertions. If masking their inferred copies changes
+    // which lists can be read, the change in diagnostics triggers a rebuild.
     let computed: Option<GroundProgram> = cache
         .is_none()
         .then(|| {

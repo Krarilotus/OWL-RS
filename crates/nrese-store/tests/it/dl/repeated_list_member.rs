@@ -299,16 +299,24 @@ fn asserting_an_inferred_operand_beside_the_written_one_agrees_with_a_rebuild() 
              }}"
             ),
         );
-        if write.is_ok() {
-            let program = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl)
-                .materialised_program()
-                .unwrap();
-            dl.store().rematerialise(program).expect("rebuild");
-            assert!(
-                !dl.store().is_quarantined(),
-                "representatives={representatives}: admitted by the write, quarantined by the rebuild"
-            );
-        }
+        // A branching RDF list can have an Undecided DL verdict despite this clash.
+        assert!(
+            matches!(&write, Err(MutationError::Rejected(reject))
+                if reject.explanation.as_ref().is_some_and(|e| e.violated_constraint == "eq-diff2")),
+            "representatives={representatives}: {write:?}"
+        );
+        let data = format!(
+            "{RDF}
+             [] a owl:AllDifferent ; owl:members [
+                 rdf:first :a ; rdf:rest [ rdf:first :a, :b ; rdf:rest ( :c ) ]
+             ] .
+             :a owl:sameAs :b ."
+        );
+        let (status, quarantine) = rebuilt(dl_pipeline(representatives).store(), &data);
+        assert!(
+            quarantine,
+            "representatives={representatives}: the written :a/:b pair must clash: {status:?}"
+        );
     }
 }
 
