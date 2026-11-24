@@ -50,34 +50,90 @@ struct Import<'a> {
     to: &'a mut Ontology,
 }
 
+/// What a class expression [`Import::class`] copies waits for: its operands' copies.
+enum Copying {
+    /// An intersection (`or`: a union): the operands copied so far, and those left.
+    Set {
+        or: bool,
+        rest: std::vec::IntoIter<ExprId>,
+        done: Vec<ExprId>,
+    },
+    Not,
+    Wrap(fn(ObjProp, ExprId) -> ClassExpr, ObjProp),
+    Count(fn(u32, ObjProp, ExprId) -> ClassExpr, u32, ObjProp),
+}
+
 impl Import<'_> {
+    /// `id` copied, with a stack of its own (the nesting depth is no call depth): operands
+    /// in order, each expression interned once its operands are.
     fn class(&mut self, id: ExprId) -> ExprId {
         let sorted = |mut v: Vec<ExprId>| {
             v.sort_unstable();
             v.dedup();
             v
         };
-        let expr = match self.from.class(id).clone() {
-            ClassExpr::And(v) => {
-                ClassExpr::And(sorted(v.into_iter().map(|e| self.class(e)).collect()))
-            }
-            ClassExpr::Or(v) => {
-                ClassExpr::Or(sorted(v.into_iter().map(|e| self.class(e)).collect()))
-            }
-            ClassExpr::Not(e) => ClassExpr::Not(self.class(e)),
-            ClassExpr::Some(p, e) => ClassExpr::Some(p, self.class(e)),
-            ClassExpr::All(p, e) => ClassExpr::All(p, self.class(e)),
-            ClassExpr::Min(n, p, e) => ClassExpr::Min(n, p, self.class(e)),
-            ClassExpr::Max(n, p, e) => ClassExpr::Max(n, p, self.class(e)),
-            ClassExpr::Exact(n, p, e) => ClassExpr::Exact(n, p, self.class(e)),
-            ClassExpr::DataSome(d, r) => ClassExpr::DataSome(d, self.range(r)),
-            ClassExpr::DataAll(d, r) => ClassExpr::DataAll(d, self.range(r)),
-            ClassExpr::DataMin(n, d, r) => ClassExpr::DataMin(n, d, self.range(r)),
-            ClassExpr::DataMax(n, d, r) => ClassExpr::DataMax(n, d, self.range(r)),
-            ClassExpr::DataExact(n, d, r) => ClassExpr::DataExact(n, d, self.range(r)),
-            other => other,
+        // What waits for a nonempty set's first operand, and that operand.
+        let set = |or: bool, v: Vec<ExprId>| {
+            let mut rest = v.into_iter();
+            let first = rest.next().expect("a nonempty set");
+            let done = Vec::with_capacity(rest.len() + 1);
+            (Copying::Set { or, rest, done }, first)
         };
-        ExprId(self.to.classes.intern(expr))
+        let mut waiting: Vec<Copying> = Vec::new();
+        let mut next = id;
+        'copy: loop {
+            let (then, operand) = match self.from.class(next).clone() {
+                ClassExpr::And(v) if !v.is_empty() => set(false, v),
+                ClassExpr::Or(v) if !v.is_empty() => set(true, v),
+                ClassExpr::Not(e) => (Copying::Not, e),
+                ClassExpr::Some(p, e) => (Copying::Wrap(ClassExpr::Some, p), e),
+                ClassExpr::All(p, e) => (Copying::Wrap(ClassExpr::All, p), e),
+                ClassExpr::Min(n, p, e) => (Copying::Count(ClassExpr::Min, n, p), e),
+                ClassExpr::Max(n, p, e) => (Copying::Count(ClassExpr::Max, n, p), e),
+                ClassExpr::Exact(n, p, e) => (Copying::Count(ClassExpr::Exact, n, p), e),
+                leaf => {
+                    let expr = match leaf {
+                        ClassExpr::DataSome(d, r) => ClassExpr::DataSome(d, self.range(r)),
+                        ClassExpr::DataAll(d, r) => ClassExpr::DataAll(d, self.range(r)),
+                        ClassExpr::DataMin(n, d, r) => ClassExpr::DataMin(n, d, self.range(r)),
+                        ClassExpr::DataMax(n, d, r) => ClassExpr::DataMax(n, d, self.range(r)),
+                        ClassExpr::DataExact(n, d, r) => ClassExpr::DataExact(n, d, self.range(r)),
+                        other => other,
+                    };
+                    let mut found = ExprId(self.to.classes.intern(expr));
+                    // Up through what waits, as far as it has every operand.
+                    loop {
+                        let Some(then) = waiting.pop() else {
+                            return found;
+                        };
+                        let expr = match then {
+                            Copying::Set {
+                                or,
+                                mut rest,
+                                mut done,
+                            } => {
+                                done.push(found);
+                                if let Some(operand) = rest.next() {
+                                    waiting.push(Copying::Set { or, rest, done });
+                                    next = operand;
+                                    continue 'copy;
+                                }
+                                match or {
+                                    true => ClassExpr::Or(sorted(done)),
+                                    false => ClassExpr::And(sorted(done)),
+                                }
+                            }
+                            Copying::Not => ClassExpr::Not(found),
+                            Copying::Wrap(make, p) => make(p, found),
+                            Copying::Count(make, n, p) => make(n, p, found),
+                        };
+                        found = ExprId(self.to.classes.intern(expr));
+                    }
+                }
+            };
+            waiting.push(then);
+            next = operand;
+        }
     }
 
     fn range(&mut self, id: RangeId) -> RangeId {

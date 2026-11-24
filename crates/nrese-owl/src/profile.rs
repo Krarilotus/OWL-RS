@@ -274,31 +274,31 @@ fn individuals(axiom: &Axiom) -> Vec<Term> {
     }
 }
 
-/// The properties an expression names, with those of its fillers.
+/// The properties an expression names, with those of its fillers, in the order of a walk
+/// from the left, with a stack of its own (the nesting depth is no call depth).
 fn expr_properties(o: &Ontology, e: ExprId, out: &mut Vec<Term>) {
-    match o.class(e) {
-        ClassExpr::And(es) | ClassExpr::Or(es) => {
-            for &e in es {
-                expr_properties(o, e, out);
+    let mut stack = vec![e];
+    while let Some(e) = stack.pop() {
+        match o.class(e) {
+            ClassExpr::And(es) | ClassExpr::Or(es) => stack.extend(es.iter().rev()),
+            ClassExpr::Not(e) => stack.push(*e),
+            ClassExpr::Some(p, f)
+            | ClassExpr::All(p, f)
+            | ClassExpr::Min(_, p, f)
+            | ClassExpr::Max(_, p, f)
+            | ClassExpr::Exact(_, p, f) => {
+                out.push(p.named());
+                stack.push(*f);
             }
+            ClassExpr::HasValue(p, _) | ClassExpr::HasSelf(p) => out.push(p.named()),
+            ClassExpr::DataSome(d, _)
+            | ClassExpr::DataAll(d, _)
+            | ClassExpr::DataHasValue(d, _)
+            | ClassExpr::DataMin(_, d, _)
+            | ClassExpr::DataMax(_, d, _)
+            | ClassExpr::DataExact(_, d, _) => out.push(*d),
+            _ => {}
         }
-        ClassExpr::Not(e) => expr_properties(o, *e, out),
-        ClassExpr::Some(p, f)
-        | ClassExpr::All(p, f)
-        | ClassExpr::Min(_, p, f)
-        | ClassExpr::Max(_, p, f)
-        | ClassExpr::Exact(_, p, f) => {
-            out.push(p.named());
-            expr_properties(o, *f, out);
-        }
-        ClassExpr::HasValue(p, _) | ClassExpr::HasSelf(p) => out.push(p.named()),
-        ClassExpr::DataSome(d, _)
-        | ClassExpr::DataAll(d, _)
-        | ClassExpr::DataHasValue(d, _)
-        | ClassExpr::DataMin(_, d, _)
-        | ClassExpr::DataMax(_, d, _)
-        | ClassExpr::DataExact(_, d, _) => out.push(*d),
-        _ => {}
     }
 }
 
