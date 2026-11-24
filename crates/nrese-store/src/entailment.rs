@@ -509,7 +509,7 @@ impl StoreService {
         // Undecided where the request's envelope can't take reading the premise (SYN-61).
         let treatments = &self.config().dl.treatments;
         let Ok((premise, read_statements)) =
-            source::read_premise(snapshot, memory.clone(), treatments)
+            source::read_premise(snapshot, memory.clone(), treatments, false)
         else {
             let why = source::refused("the premise");
             return Ok(DlEntailment {

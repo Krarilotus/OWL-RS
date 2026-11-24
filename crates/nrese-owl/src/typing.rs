@@ -13,7 +13,9 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use crate::mapping::Ontology;
+use crate::Diagnostic;
+use crate::mapping::{Ontology, Terms};
+use crate::membership::Membership;
 use crate::model::{Axiom, ClassExpr, DataRange, EntityKind, ExprId, ObjProp, RangeId, Term};
 use crate::rules::Atom;
 
@@ -41,15 +43,30 @@ pub const PAIRS: [[EntityKind; 2]; 4] = [
 
 /// Every name of `ontology` used as two kinds of a pair of [`PAIRS`], by term, then pair.
 pub fn two_kinds(ontology: &Ontology) -> Vec<TwoKinds> {
+    check(ontology, None).0
+}
+
+pub(crate) fn check(
+    ontology: &Ontology,
+    terms: Option<&dyn Terms>,
+) -> (Vec<TwoKinds>, Vec<Diagnostic>) {
     let mut check = Check {
         o: ontology,
         uses: BTreeMap::new(),
         classes: HashSet::new(),
         ranges: HashSet::new(),
+        membership: terms.map(|terms| Membership::new(ontology, terms)),
     };
-    for axiom in &ontology.axioms {
+    for (index, axiom) in ontology.axioms.iter().enumerate() {
+        if let Some(membership) = &mut check.membership {
+            membership.axiom = index;
+        }
         check.axiom(axiom);
     }
+    let findings = check
+        .membership
+        .take()
+        .map_or_else(Vec::new, Membership::finish);
     for rule in &ontology.rules {
         for atom in rule.body.iter().chain(&rule.head) {
             check.atom(atom);
@@ -89,7 +106,7 @@ pub fn two_kinds(ontology: &Ontology) -> Vec<TwoKinds> {
             }
         }
     }
-    out
+    (out, findings)
 }
 
 /// A name's kinds, a bit each ([`bit`]): all, and those something other than an assertion
@@ -118,10 +135,16 @@ struct Check<'o> {
     /// The class expressions and data ranges walked from an axiom ([`Self::expression`]).
     classes: HashSet<ExprId>,
     ranges: HashSet<RangeId>,
+    membership: Option<Membership<'o>>,
 }
 
 impl Check<'_> {
     fn mark(&mut self, term: Term, kind: EntityKind, by_axiom: bool) {
+        if kind == EntityKind::Datatype
+            && let Some(membership) = &mut self.membership
+        {
+            membership.occurs.entry(term).or_insert(membership.axiom);
+        }
         let uses = self.uses.entry(term).or_default();
         uses.any |= bit(kind);
         if by_axiom {
@@ -134,12 +157,18 @@ impl Check<'_> {
     }
 
     fn data(&mut self, p: Term, by_axiom: bool) {
+        if Some(p) == self.o.builtin.top_data
+            && let Some(membership) = &mut self.membership
+        {
+            membership.report(p, "owl:topDataProperty outside the superproperty position");
+        }
         self.mark(p, EntityKind::DataProperty, by_axiom);
     }
 
     #[deny(clippy::wildcard_enum_match_arm)]
     fn axiom(&mut self, axiom: &Axiom) {
         match axiom {
+            Axiom::Declaration(EntityKind::DataProperty, t) => self.data(*t, true),
             Axiom::Declaration(kind, t) => self.mark(*t, *kind, true),
             Axiom::SubClassOf(a, b) => {
                 self.class(*a);
@@ -170,7 +199,7 @@ impl Check<'_> {
             Axiom::ObjectCharacteristic(_, p) => self.object(*p, true),
             Axiom::SubDataPropertyOf(a, b) => {
                 self.data(*a, true);
-                self.data(*b, true);
+                self.mark(*b, EntityKind::DataProperty, true);
             }
             Axiom::EquivalentDataProperties(ps) | Axiom::DisjointDataProperties(ps) => {
                 ps.iter().for_each(|&p| self.data(p, true));
@@ -185,6 +214,9 @@ impl Check<'_> {
             }
             Axiom::FunctionalDataProperty(p) => self.data(*p, true),
             Axiom::DatatypeDefinition(t, r) => {
+                if let Some(membership) = &mut self.membership {
+                    membership.definition(*t, *r);
+                }
                 self.mark(*t, EntityKind::Datatype, true);
                 self.range(*r);
             }

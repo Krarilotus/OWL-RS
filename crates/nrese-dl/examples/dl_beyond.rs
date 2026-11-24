@@ -35,6 +35,7 @@ fn kind(d: &Diagnostic) -> String {
         Diagnostic::NonSimpleProperty { what, .. } => format!("NonSimpleProperty:{what}"),
         Diagnostic::IrregularPropertyHierarchy { .. } => "IrregularPropertyHierarchy".into(),
         Diagnostic::AnonymousIndividual { .. } => "AnonymousIndividual".into(),
+        Diagnostic::GlobalRestriction { .. } => "GlobalRestriction".into(),
         Diagnostic::Syntax { what, .. } => format!("Syntax:{what}"),
         Diagnostic::Rule { .. } => "Rule".into(),
         Diagnostic::RepeatedOperand => "RepeatedOperand".into(),

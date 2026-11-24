@@ -1,4 +1,4 @@
-use nrese_owl::read;
+use nrese_owl::{Axiom, Diagnostic, read};
 
 use super::{Table, load};
 
@@ -66,6 +66,23 @@ fn datatype_rules_outside_owl2_dl_are_named() {
         };
         if !correct {
             wrong.push(format!("{name}: expected {expected:?}, got {fatal:?}"));
+        } else if name == "definition of a built-in" {
+            let axiom = ontology
+                .diagnostics
+                .iter()
+                .find_map(|diagnostic| match *diagnostic {
+                    Diagnostic::GlobalRestriction { term, axiom, what } if what == expected => {
+                        Some((&ontology.axioms[axiom], term))
+                    }
+                    _ => None,
+                });
+            assert!(
+                matches!(
+                    axiom,
+                    Some((Axiom::DatatypeDefinition(datatype, _), term)) if *datatype == term
+                ),
+                "{axiom:?}"
+            );
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");

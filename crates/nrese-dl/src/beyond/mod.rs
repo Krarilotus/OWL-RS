@@ -119,8 +119,12 @@ fn restriction(d: &Diagnostic) -> Option<(&'static str, bool)> {
             true,
         ),
         Diagnostic::AnonymousIndividual { .. } => (
-            "OWL 2 Structural Specification §11.2: a named individual in a nominal or hasValue",
+            "OWL 2 Structural Specification §11.2: restrictions on anonymous individuals",
             true,
+        ),
+        Diagnostic::GlobalRestriction { .. } => (
+            "OWL 2 Structural Specification §11.2: global restrictions",
+            false,
         ),
         // The reader leaves nothing out, and a model checks each axiom; but where an axiom
         // reads the name, the engines read its two kinds as one name, so no model of theirs

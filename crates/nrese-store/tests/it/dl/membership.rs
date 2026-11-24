@@ -42,7 +42,7 @@ fn a_property_above_the_bottom_property_is_not_simple() {
         .verdict;
     let reason = verdict.reason().unwrap_or_default();
     assert!(
-        reason.contains("non-simple") && reason.contains("/q"),
+        reason.contains("a non-simple property in a functional property"),
         "{reason}"
     );
 }
