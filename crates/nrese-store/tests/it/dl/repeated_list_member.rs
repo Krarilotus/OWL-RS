@@ -158,12 +158,22 @@ fn same_as_members_still_clash_after_a_rebuild() {
 /// An alias elsewhere in the ontology introduces no second operand into a list.
 #[test]
 fn an_alias_outside_the_list_does_not_clash_after_a_rebuild() {
-    let (status, quarantine) = rebuilt(
-        pipeline().store(),
-        "[] a owl:AllDifferent ; owl:members ( :a :a :c ) . :a owl:sameAs :b .",
-    );
-    assert_eq!(status, ConsistencyStatus::Consistent);
-    assert!(!quarantine);
+    for representatives in [true, false] {
+        let dl = super::pipeline_of(nrese_store::StoreConfig {
+            equality_by_representatives: representatives,
+            ..in_memory_store_config()
+        });
+        let (status, quarantine) = rebuilt(
+            dl.store(),
+            "[] a owl:AllDifferent ; owl:members ( :a :a :c ) . :a owl:sameAs :b .",
+        );
+        assert_eq!(
+            status,
+            ConsistencyStatus::Consistent,
+            "representatives={representatives}: an alias outside the list adds no operand"
+        );
+        assert!(!quarantine, "representatives={representatives}");
+    }
 }
 
 #[test]
