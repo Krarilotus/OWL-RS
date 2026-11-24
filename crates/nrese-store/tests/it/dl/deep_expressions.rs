@@ -4,9 +4,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
-use nrese_sparql::Completeness;
+use nrese_sparql::{Completeness, GraphAccess};
 use nrese_store::dl::entailment::Entailed;
-use nrese_store::{MutationPipeline, SparqlQueryRequest, StoreService};
+use nrese_store::{
+    MutationCommand, MutationError, MutationPipeline, MutationTicket, ReadScope, Requester,
+    SparqlQueryRequest, SparqlUpdateRequest, StoreService, WriteScope,
+};
 
 use super::entailment::{turtle, unchecked_inconsistent};
 use super::{PREFIXES, insert, pipeline, queries::query};
@@ -356,16 +359,35 @@ fn intersection_subclass_dl_write() {
 }
 
 /// OWL 2 Direct Semantics §2.5: an odd complement chain of `:A` beside `:x a :A` has no
-/// model. Under `owl2-dl` the write is refused as one with a chain of three is, and the
-/// store still answers.
+/// model. Under `owl2-dl`, a committer that may read and write the default graph only is
+/// told the refusal its own graph shows by itself, as for a chain of three, and the store
+/// still answers.
 #[test]
 fn refused_dl_write() {
+    let default_graph_only = || {
+        let access = || {
+            Arc::new(GraphAccess {
+                default_graph: true,
+                ..GraphAccess::default()
+            })
+        };
+        Requester::new(ReadScope::Graphs(access()), WriteScope::Graphs(access()))
+    };
     at_each_depth("refused_dl_write", |depth| {
         let write_and_read = |depth| {
             let dl = pipeline();
             let data = format!("{} :x a :A .", complement_chain(depth + 1));
-            let refused = insert(&dl, &data).is_err();
-            (refused, query(&dl, "ASK { :x a :A }").0)
+            let write = format!("{PREFIXES}INSERT DATA {{ {data} }}");
+            let result = dl.apply(
+                MutationCommand::Update(SparqlUpdateRequest::new(write)),
+                &default_graph_only(),
+                &MutationTicket::new(),
+            );
+            let kind = match result {
+                Err(MutationError::Rejected(reject)) => reject.kind,
+                other => panic!("expected the refusal, got {other:?}"),
+            };
+            (kind, query(&dl, "ASK { :x a :A }").0)
         };
         assert_eq!(write_and_read(depth), write_and_read(2));
     });
