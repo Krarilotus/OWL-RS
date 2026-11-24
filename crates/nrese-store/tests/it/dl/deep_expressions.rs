@@ -24,7 +24,49 @@ fn complement_chain(depth: usize) -> String {
     data
 }
 
+/// `_:b0 = :A ⊓ (:A ⊓ (… ⊓ (:A ⊓ :B)))`, `depth` intersections.
+fn intersection_chain(depth: usize) -> String {
+    let mut data = String::from(":A a owl:Class . :B a owl:Class .");
+    for i in 0..depth {
+        match i + 1 == depth {
+            true => write!(data, " _:b{i} owl:intersectionOf (:A :B) .").unwrap(),
+            false => write!(data, " _:b{i} owl:intersectionOf (:A _:b{}) .", i + 1).unwrap(),
+        }
+    }
+    data
+}
+
+/// `_:r`, a data existential on `:d` whose range is `depth` data complements of
+/// `xsd:integer`.
+fn data_complement_chain(depth: usize) -> String {
+    let mut data = String::from(
+        ":d a owl:DatatypeProperty . \
+         _:r a owl:Restriction ; owl:onProperty :d ; owl:someValuesFrom _:c0 .",
+    );
+    for i in 1..depth {
+        write!(
+            data,
+            " _:c{} a rdfs:Datatype ; owl:datatypeComplementOf _:c{i} .",
+            i - 1
+        )
+        .unwrap();
+    }
+    write!(
+        data,
+        " _:c{} a rdfs:Datatype ; owl:datatypeComplementOf xsd:integer .",
+        depth - 1
+    )
+    .unwrap();
+    data
+}
+
 fn at_each_depth(test: &str, case: impl Fn(usize)) {
+    at_depths(test, &[1_000, 10_000, 100_000], case);
+}
+
+/// Runs `case` at each of `depths` in a child process of its own, so that a stack
+/// overflow is reported per depth.
+fn at_depths(test: &str, depths: &[usize], case: impl Fn(usize)) {
     if let Ok(depth) = std::env::var(CHILD_DEPTH) {
         case(depth.parse().expect("test depth"));
         println!("complement case completed");
@@ -35,7 +77,7 @@ fn at_each_depth(test: &str, case: impl Fn(usize)) {
     let name = format!("{module}::{test}");
     let binary = std::env::current_exe().expect("test binary");
     let mut failed = Vec::new();
-    for depth in [1_000, 10_000, 100_000] {
+    for &depth in depths {
         let start = Instant::now();
         let child = Command::new(&binary)
             .args(["--exact", &name, "--nocapture", "--test-threads=1"])
@@ -182,5 +224,193 @@ fn rl_write_control() {
         let rl = profile_pipeline(ReasoningMode::Owl2Rl);
         insert(&rl, &complement_chain(depth)).expect("write applies");
         assert!(ask(rl.store(), DECLARED_INDIVIDUAL).0);
+    });
+}
+
+/// OWL 2 Mapping to RDF §2 maps each data complement to a triple, at any depth. Under
+/// `owl2-dl`, a write asserting a data existential over a deep chain of them is accepted
+/// or refused as one over a chain of two is, and the store still answers.
+#[test]
+fn data_range_dl_write() {
+    at_each_depth("data_range_dl_write", |depth| {
+        let write_and_read = |depth| {
+            let dl = pipeline();
+            let data = format!(
+                "{} {DECLARED_INDIVIDUAL}, _:r .",
+                data_complement_chain(depth)
+            );
+            let applied = insert(&dl, &data).is_ok();
+            (
+                applied,
+                query(&dl, &format!("ASK {{ {DECLARED_INDIVIDUAL} }}")).0,
+            )
+        };
+        assert_eq!(write_and_read(depth), write_and_read(2));
+    });
+}
+
+/// As [`data_range_dl_write`] under `owl2-ql`: the write applies, and the asserted
+/// declaration is answered with the answer and status of a chain of two.
+#[test]
+fn data_range_ql_write() {
+    at_each_depth("data_range_ql_write", |depth| {
+        let write_and_read = |depth| {
+            let ql = profile_pipeline(ReasoningMode::Owl2Ql);
+            let data = format!(
+                "{} {DECLARED_INDIVIDUAL}, _:r .",
+                data_complement_chain(depth)
+            );
+            insert(&ql, &data).expect("write applies");
+            ask(ql.store(), DECLARED_INDIVIDUAL)
+        };
+        assert_eq!(write_and_read(depth), write_and_read(2));
+    });
+}
+
+/// OWL 2 Direct Semantics §2.5: whether a premise entails a membership of a data
+/// existential over a deep chain of data complements is answered as for a chain of two.
+#[test]
+fn data_range_entailment() {
+    at_each_depth("data_range_entailment", |depth| {
+        let dl = pipeline();
+        insert(
+            &dl,
+            ":d a owl:DatatypeProperty . :x a owl:NamedIndividual .",
+        )
+        .expect("premise");
+        let entails = |depth| {
+            let conclusion = format!("{} :x a _:r .", data_complement_chain(depth));
+            let answer = dl
+                .store()
+                .entails_dl(&turtle(&conclusion))
+                .expect("entailment");
+            (answer.answer, answer.premise.as_str())
+        };
+        assert_eq!(entails(depth), entails(2));
+    });
+}
+
+/// As [`ql_write`], for a complement chain ending in a nominal: the write applies and the
+/// membership is answered with the answer and status of a chain of two.
+#[test]
+fn nominal_complement_ql_write() {
+    at_each_depth("nominal_complement_ql_write", |depth| {
+        let write_and_read = |depth: usize| {
+            let mut data = format!(
+                ":A a owl:Class . :a a owl:NamedIndividual . {DECLARED_INDIVIDUAL}, _:b0 ."
+            );
+            for i in 1..depth {
+                write!(data, " _:b{} owl:complementOf _:b{i} .", i - 1).unwrap();
+            }
+            write!(
+                data,
+                " _:b{} owl:complementOf _:nom . _:nom owl:oneOf (:a) .",
+                depth - 1
+            )
+            .unwrap();
+            let ql = profile_pipeline(ReasoningMode::Owl2Ql);
+            insert(&ql, &data).expect("write applies");
+            assert!(ask(ql.store(), DECLARED_INDIVIDUAL).0);
+            ask(ql.store(), MEMBERSHIP)
+        };
+        assert_eq!(write_and_read(depth), write_and_read(2));
+    });
+}
+
+/// As [`ql_write`], for an intersection chain asserted of `:x`.
+#[test]
+fn intersection_ql_write() {
+    at_each_depth("intersection_ql_write", |depth| {
+        let write_and_read = |depth| {
+            let ql = profile_pipeline(ReasoningMode::Owl2Ql);
+            let data = format!(
+                "{} {DECLARED_INDIVIDUAL}, _:b0 .",
+                intersection_chain(depth)
+            );
+            insert(&ql, &data).expect("write applies");
+            assert!(ask(ql.store(), DECLARED_INDIVIDUAL).0);
+            ask(ql.store(), MEMBERSHIP)
+        };
+        assert_eq!(write_and_read(depth), write_and_read(2));
+    });
+}
+
+/// OWL 2 Profiles §2.2 and §4.2: a subclass of an intersection of named classes is in
+/// EL, QL and RL. Under `owl2-dl`, a deep one applies and the store answers as for a chain
+/// of two. Run at 1,000 only: deeper, the rules' grounding of the chain takes time and
+/// memory growing faster than the chain itself, which is not this case's subject.
+#[test]
+fn intersection_subclass_dl_write() {
+    at_depths("intersection_subclass_dl_write", &[1_000], |depth| {
+        let write_and_read = |depth| {
+            let dl = pipeline();
+            let data = format!(
+                "{} :C a owl:Class ; rdfs:subClassOf _:b0 . {DECLARED_INDIVIDUAL}, :C .",
+                intersection_chain(depth)
+            );
+            insert(&dl, &data).expect("write applies");
+            dl_membership(&dl)
+        };
+        assert_eq!(write_and_read(depth), write_and_read(2));
+    });
+}
+
+/// OWL 2 Direct Semantics §2.5: an odd complement chain of `:A` beside `:x a :A` has no
+/// model. Under `owl2-dl` the write is refused as one with a chain of three is, and the
+/// store still answers.
+#[test]
+fn refused_dl_write() {
+    at_each_depth("refused_dl_write", |depth| {
+        let write_and_read = |depth| {
+            let dl = pipeline();
+            let data = format!("{} :x a :A .", complement_chain(depth + 1));
+            let refused = insert(&dl, &data).is_err();
+            (refused, query(&dl, "ASK { :x a :A }").0)
+        };
+        assert_eq!(write_and_read(depth), write_and_read(2));
+    });
+}
+
+/// OWL 2 Structural Specification §5.3: `owl:topObjectProperty` relates every pair of
+/// individuals. Under `owl2-dl`, an existential on it over a deep complement chain is
+/// written and answered as one over a chain of two.
+#[test]
+fn universal_property_dl_write() {
+    at_each_depth("universal_property_dl_write", |depth| {
+        let write_and_read = |depth| {
+            let dl = pipeline();
+            let data = format!(
+                "{} :y a owl:NamedIndividual, _:u . \
+                 _:u a owl:Restriction ; owl:onProperty owl:topObjectProperty ; \
+                 owl:someValuesFrom _:b0 .",
+                complement_chain(depth)
+            );
+            insert(&dl, &data).expect("write applies");
+            dl_membership(&dl)
+        };
+        assert_eq!(write_and_read(depth), write_and_read(2));
+    });
+}
+
+/// As [`ql_write`], for a subclass axiom whose left side is a deep chain of unions: the
+/// write applies and a membership of its superclass is answered as for a chain of two.
+#[test]
+fn union_subclass_ql_write() {
+    at_each_depth("union_subclass_ql_write", |depth| {
+        let write_and_read = |depth: usize| {
+            let mut data = format!(":A a owl:Class . :B a owl:Class . {DECLARED_INDIVIDUAL}, :A .");
+            for i in 0..depth {
+                match i + 1 == depth {
+                    true => write!(data, " _:u{i} owl:unionOf (:A :C) .").unwrap(),
+                    false => write!(data, " _:u{i} owl:unionOf (:A _:u{}) .", i + 1).unwrap(),
+                }
+            }
+            data.push_str(" _:u0 rdfs:subClassOf :B .");
+            let ql = profile_pipeline(ReasoningMode::Owl2Ql);
+            insert(&ql, &data).expect("write applies");
+            assert!(ask(ql.store(), DECLARED_INDIVIDUAL).0);
+            ask(ql.store(), ":x a :B")
+        };
+        assert_eq!(write_and_read(depth), write_and_read(2));
     });
 }
