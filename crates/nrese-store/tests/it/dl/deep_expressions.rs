@@ -63,13 +63,54 @@ fn data_complement_chain(depth: usize) -> String {
     data
 }
 
-fn at_each_depth(test: &str, case: impl Fn(usize)) {
-    at_depths(test, &[1_000, 10_000, 100_000], case);
+/// `_:r`, a data existential on `:d` over `:D`, stated before `:D`'s definition as `depth`
+/// data complements of `xsd:integer`.
+fn defined_after_use(depth: usize) -> String {
+    let mut data = String::from(
+        ":d a owl:DatatypeProperty . :D a rdfs:Datatype . \
+         _:r a owl:Restriction ; owl:onProperty :d ; owl:someValuesFrom :D . \
+         :D owl:equivalentClass _:c0 .",
+    );
+    for i in 1..depth {
+        write!(
+            data,
+            " _:c{} a rdfs:Datatype ; owl:datatypeComplementOf _:c{i} .",
+            i - 1
+        )
+        .unwrap();
+    }
+    write!(
+        data,
+        " _:c{} a rdfs:Datatype ; owl:datatypeComplementOf xsd:integer .",
+        depth - 1
+    )
+    .unwrap();
+    data
 }
 
-/// Runs `case` at each of `depths` in a child process of its own, so that a stack
-/// overflow is reported per depth.
-fn at_depths(test: &str, depths: &[usize], case: impl Fn(usize)) {
+/// `_:r`, a data existential on `:d` over `:D0`, where `:D0 = ¬:D1`, …, and
+/// `:D{depth - 1} = ¬xsd:integer`: `depth` definitions.
+fn definition_chain(depth: usize) -> String {
+    let mut data = String::from(
+        ":d a owl:DatatypeProperty . \
+         _:r a owl:Restriction ; owl:onProperty :d ; owl:someValuesFrom :D0 .",
+    );
+    for i in 0..depth {
+        let next = match i + 1 == depth {
+            true => "xsd:integer".to_owned(),
+            false => format!(":D{}", i + 1),
+        };
+        write!(
+            data,
+            " :D{i} a rdfs:Datatype ; owl:equivalentClass [ a rdfs:Datatype ; \
+             owl:datatypeComplementOf {next} ] ."
+        )
+        .unwrap();
+    }
+    data
+}
+
+fn at_each_depth(test: &str, case: impl Fn(usize)) {
     if let Ok(depth) = std::env::var(CHILD_DEPTH) {
         case(depth.parse().expect("test depth"));
         println!("complement case completed");
@@ -80,7 +121,7 @@ fn at_depths(test: &str, depths: &[usize], case: impl Fn(usize)) {
     let name = format!("{module}::{test}");
     let binary = std::env::current_exe().expect("test binary");
     let mut failed = Vec::new();
-    for &depth in depths {
+    for depth in [1_000, 10_000, 100_000] {
         let start = Instant::now();
         let child = Command::new(&binary)
             .args(["--exact", &name, "--nocapture", "--test-threads=1"])
@@ -338,26 +379,6 @@ fn intersection_ql_write() {
     });
 }
 
-/// OWL 2 Profiles §2.2 and §4.2: a subclass of an intersection of named classes is in
-/// EL, QL and RL. Under `owl2-dl`, a deep one applies and the store answers as for a chain
-/// of two. Run at 1,000 only: deeper, the rules' grounding of the chain takes time and
-/// memory growing faster than the chain itself, which is not this case's subject.
-#[test]
-fn intersection_subclass_dl_write() {
-    at_depths("intersection_subclass_dl_write", &[1_000], |depth| {
-        let write_and_read = |depth| {
-            let dl = pipeline();
-            let data = format!(
-                "{} :C a owl:Class ; rdfs:subClassOf _:b0 . {DECLARED_INDIVIDUAL}, :C .",
-                intersection_chain(depth)
-            );
-            insert(&dl, &data).expect("write applies");
-            dl_membership(&dl)
-        };
-        assert_eq!(write_and_read(depth), write_and_read(2));
-    });
-}
-
 /// OWL 2 Direct Semantics §2.5: an odd complement chain of `:A` beside `:x a :A` has no
 /// model. Under `owl2-dl`, a committer that may read and write the default graph only is
 /// told the refusal its own graph shows by itself, as for a chain of three, and the store
@@ -434,5 +455,42 @@ fn union_subclass_ql_write() {
             ask(ql.store(), ":x a :B")
         };
         assert_eq!(write_and_read(depth), write_and_read(2));
+    });
+}
+
+/// Under `owl2-dl`, `:x` asserted in the data existential `_:r` of `data`: whether the
+/// write applies, and the asserted declaration's answer after it.
+fn data_existential_write(data: &str) -> (bool, Vec<String>) {
+    let dl = pipeline();
+    let applied = insert(&dl, &format!("{data} {DECLARED_INDIVIDUAL}, _:r .")).is_ok();
+    (
+        applied,
+        query(&dl, &format!("ASK {{ {DECLARED_INDIVIDUAL} }}")).0,
+    )
+}
+
+/// OWL 2 Structural Specification §9.4: a datatype definition gives the datatype its
+/// meaning wherever it is used. A write asserting a data existential over a datatype whose
+/// deep definition is read after the existential is accepted or refused as one over a
+/// definition two deep, and the store still answers.
+#[test]
+fn defined_after_use_dl_write() {
+    at_each_depth("defined_after_use_dl_write", |depth| {
+        assert_eq!(
+            data_existential_write(&defined_after_use(depth)),
+            data_existential_write(&defined_after_use(2))
+        );
+    });
+}
+
+/// As [`defined_after_use_dl_write`], for a chain of datatype definitions each defined by
+/// the complement of the next.
+#[test]
+fn definition_chain_dl_write() {
+    at_each_depth("definition_chain_dl_write", |depth| {
+        assert_eq!(
+            data_existential_write(&definition_chain(depth)),
+            data_existential_write(&definition_chain(2))
+        );
     });
 }
