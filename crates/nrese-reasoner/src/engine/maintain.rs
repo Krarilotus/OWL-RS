@@ -33,16 +33,22 @@ pub struct EngineBase<'a> {
     deletes: HashSet<EncodedQuad>,
     /// The ruleset's axioms (sorted): they count as asserted, so no deletion retracts them.
     axioms: &'a [Triple],
+    axiom_predicates: HashSet<u64>,
 }
 
 impl<'a> EngineBase<'a> {
     pub fn new(tx: &'a Transaction<'_>, axioms: &'a [Triple]) -> Self {
         let inserts: Vec<Triple> = tx.inserted().map(triple).collect();
+        let mut axiom_predicates = HashSet::new();
+        for &[_, predicate, _] in axioms {
+            axiom_predicates.insert(predicate);
+        }
         Self {
             snapshot: tx.base().counted(),
             inserts: MemoryBase::new(&inserts, &[]),
             deletes: tx.deleted().collect(),
             axioms,
+            axiom_predicates,
         }
     }
 
@@ -190,6 +196,9 @@ impl VisitsBase for EngineBase<'_> {
             }
         }
         self.inserts.visit(bound, visit);
+        if bound[1].is_some_and(|predicate| !self.axiom_predicates.contains(&predicate)) {
+            return;
+        }
         let matches = |fact: &Triple| {
             bound
                 .iter()
