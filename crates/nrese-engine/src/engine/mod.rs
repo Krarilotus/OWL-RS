@@ -432,6 +432,10 @@ impl Versions {
     /// compaction slot, so that none is published while it is replaced. A value, never an
     /// `Arc`: no snapshot can have held it, so its own slots ([`OwnState`]) are empty.
     fn install(&self, version: Version) {
+        #[cfg(test)]
+        if crate::durability::fault::PANIC_AT_VERSION_INSTALL.replace(false) {
+            panic!("{}", crate::durability::fault::VERSION_INSTALL_PANIC);
+        }
         let version = Arc::new(version);
         *self.current.write() = version;
     }
@@ -596,6 +600,19 @@ impl Drop for Shared {
 }
 
 impl Shared {
+    /// Whether a write that changes nothing in memory may be acknowledged: not on a poisoned
+    /// log, whose store may hold a revision memory doesn't (a bulk publication's checkpoint in
+    /// place, its version not installed), so that "nothing changed" isn't known until a
+    /// reopen. The writes that return without the log ask it: a transaction or bulk load that
+    /// changes nothing, a rematerialisation whose stored rows don't change, a replica's replay
+    /// (asked once, at its entry).
+    fn acknowledge_unchanged(&self) -> EngineResult<()> {
+        match &self.durable {
+            Some(durable) if durable.wal.lock().is_poisoned() => Err(EngineError::WalPoisoned),
+            _ => Ok(()),
+        }
+    }
+
     /// A stamp for a new commit: never before the store's clock, which takes it.
     fn stamp(&self) -> u64 {
         let stamp = crate::durability::commit_time(Some(self.clock.load(Ordering::Relaxed)));

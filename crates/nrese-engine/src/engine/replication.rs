@@ -195,7 +195,8 @@ impl Engine {
     /// ([`EngineError::Corruption`]) with the engine as it was: the replica starts again
     /// from an image. Then the records are published one by one. `stop` is checked before each:
     /// once it stops, no further record is published ([`Applied::stopped`]). A local
-    /// failure on a record (the log's write) leaves the records before it published.
+    /// failure on a record (the log's write) leaves the records before it published. On a
+    /// poisoned log every answer is refused ([`EngineError::WalPoisoned`]), an empty one too.
     ///
     /// On a Rayon pool thread while the writer slot is held: [`EngineError::SlotBusy`]
     /// (the contract of [`Engine::transaction`]).
@@ -207,6 +208,9 @@ impl Engine {
     ) -> EngineResult<Applied> {
         let _slot = super::admit(&self.inner.writer, "writer")?;
         let shared = &self.inner.shared;
+        // Asked once for every answer: an empty or all-skipped one publishes no record, so no
+        // append asks the log.
+        shared.acknowledge_unchanged()?;
         let records = self.checked_batch(frames, expected)?;
         let keys: Vec<&[u8]> = records
             .iter()

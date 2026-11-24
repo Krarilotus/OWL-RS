@@ -14,7 +14,9 @@
 //! partial frame would turn a recoverable torn tail into mid-log corruption. A new segment
 //! appears under its name only with its magic synced (written under a temporary name, then
 //! renamed): a rotation that fails before the rename leaves the log as it was; one whose
-//! outcome is unknown after it poisons the log.
+//! outcome is unknown after it poisons the log. So does any exit between a bulk publication's
+//! checkpoint and the install of its version ([`PendingInstall`]), or between an append's
+//! write and the install of the version that names its record ([`Wal::installed`]).
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
@@ -333,6 +335,12 @@ impl Wal {
     /// Appends one record and makes it durable according to the sync policy, and returns its
     /// commit time. The caller publishes the commit only after this returns `Ok`.
     ///
+    /// From just before the record may reach the disk, the log is poisoned, and it stays so on
+    /// `Ok`: the caller lifts it with [`Self::installed`] once the version that names the record
+    /// is installed. So any exit in between (a panic in the note, the write, the sync, the
+    /// names' settle or the caller's install) leaves no later commit to take the record's
+    /// revision. A refusal that leaves the log as it was returns it unpoisoned.
+    ///
     /// A local commit is stamped here, by `stamp`, once the record's preparation and any
     /// rotation are done and just before it is written and synced: the time is that of the
     /// commit, not of its build. Without `stamp` (a replicated record)
@@ -341,9 +349,9 @@ impl Wal {
     /// A local commit's `note` ([`crate::Transaction::note_commit`]) is called after the
     /// rotation, the stamp and the encoding, the steps whose failure leaves the log as it was,
     /// and before the record is written: so the time logged precedes the note's own I/O, as it
-    /// precedes the record's sync. The log is poisoned while the note runs, so that a note that
-    /// panics, having perhaps written its journal, leaves no later commit to take its revision;
-    /// `Ok` and a refusal clear that, an unknown journal keeps it.
+    /// precedes the record's sync. A note that panics, having perhaps written its journal, so
+    /// leaves no later commit to take its revision; a refusal clears the poison, an unknown
+    /// journal keeps it.
     pub(crate) fn append(
         &mut self,
         record: &CommitRecord,
@@ -372,10 +380,11 @@ impl Wal {
         // Version 4 segments (stores that keep integers in their dictionary) have no times.
         let logged = committed.filter(|_| self.magic == SEGMENT_MAGIC);
         encode_record_at(record, logged, &mut self.buffer)?; // nothing written yet on error
+        // Lifted by the caller's install ([`Self::installed`]), or by a refusal below.
+        self.poisoned = true;
         if let Some(note) = note {
-            self.poisoned = true;
             match note(record.revision) {
-                Ok(()) => self.poisoned = false,
+                Ok(()) => {}
                 Err(crate::engine::NoteError::Refused(error)) => {
                     self.poisoned = false;
                     return Err(EngineError::CommitNoteRefused(error));
@@ -391,18 +400,14 @@ impl Wal {
         // acknowledged: the record's sync commits the journal and flushes the device, and the
         // directories' syncs after it find nothing left to flush (measured on the timing host:
         // in the other order the record's sync paid a second flush).
-        // A failure there leaves the record written, its outcome unknown: it poisons the log.
-        let result = written
+        // A failure there leaves the record written, its outcome unknown: the log stays poisoned.
+        written
             .and_then(|()| self.active.write_all(&self.buffer))
             .and_then(|()| match self.sync {
                 SyncPolicy::EveryCommit => self.active.sync_data(),
                 SyncPolicy::OsBuffered => Ok(()),
             })
-            .and_then(|()| self.pending_names.settle());
-        if let Err(error) = result {
-            self.poisoned = true;
-            return Err(error.into());
-        }
+            .and_then(|()| self.pending_names.settle())?;
         self.active_bytes += self.buffer.len() as u64;
         self.bytes_since_checkpoint += self.buffer.len() as u64;
         Ok(committed)
@@ -416,7 +421,9 @@ impl Wal {
     /// unknown poisons it: the active segment's sync (its records may not be on disk), or a
     /// new segment possibly in place under its name (records appended to the old one after
     /// it would sit behind a later-named segment, which replication and release read as
-    /// covering them).
+    /// covering them). The log is poisoned from the active segment's sync until the new
+    /// segment is active, so that a panic there leaves it poisoned too, as `append` does
+    /// around a note.
     pub(crate) fn rotate(&mut self, next_revision: u64) -> EngineResult<()> {
         if self.poisoned {
             return Err(EngineError::WalPoisoned);
@@ -426,35 +433,76 @@ impl Wal {
         }
         #[cfg(test)]
         super::fault::check(&super::fault::FAIL_ROTATE, "rotation")?;
-        if let Err(error) = self.active.sync_all() {
-            self.poisoned = true;
-            return Err(error.into());
-        }
+        self.poisoned = true;
+        self.active.sync_all()?;
         match create_segment(&self.dir, next_revision, self.magic) {
             Ok(file) => {
                 self.active = file;
                 self.active_first_revision = next_revision;
                 self.active_bytes = SEGMENT_MAGIC.len() as u64;
+                self.poisoned = false;
                 Ok(())
             }
             Err(error) => {
-                if !matches!(
+                self.poisoned = !matches!(
                     segment_path(&self.dir, next_revision).try_exists(),
                     Ok(false)
-                ) {
-                    self.poisoned = true;
-                }
+                );
                 Err(error)
             }
         }
     }
 
+    /// Whether the log takes no more writes ([`Self::poison`]).
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
     /// Takes no more appends, rotations or bulk publications until the engine is reopened:
     /// a revision may be on disk that the live state doesn't hold ([`crate::engine::bulk`]).
+    /// Each is refused with [`EngineError::WalPoisoned`]. A reopen recovers what is on disk
+    /// into memory and opens the log unpoisoned.
     pub(crate) fn poison(&mut self) {
         self.poisoned = true;
     }
 
+    /// The version that names the record just appended is installed: lifts the poison
+    /// [`Self::append`] left on its `Ok`, under the same guard. The log was taking writes
+    /// when that append began, and nothing else wrote to it since.
+    pub(crate) fn installed(&mut self) {
+        self.poisoned = false;
+    }
+}
+
+/// A durable change whose in-memory state isn't installed yet: armed before the change is
+/// put in place, [`disarm`](Self::disarm)ed once the state that names it is installed (or the
+/// change is proven absent). Dropped armed, by a returned error or a panic unwinding past it,
+/// it poisons the log ([`Wal::poison`]): no later commit is then acknowledged against a
+/// durable state the memory doesn't hold. A panic before the change is in place poisons too:
+/// the fence can't tell, and a reopen settles it.
+///
+/// Its drop takes the log's lock: it is made before any guard of that lock its thread holds,
+/// so an unwinding thread lets that guard go first.
+#[must_use = "dropped, it poisons the log"]
+pub(crate) struct PendingInstall<'a>(&'a parking_lot::Mutex<Wal>);
+
+impl<'a> PendingInstall<'a> {
+    pub(crate) fn arm(wal: &'a parking_lot::Mutex<Wal>) -> Self {
+        Self(wal)
+    }
+
+    pub(crate) fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for PendingInstall<'_> {
+    fn drop(&mut self) {
+        self.0.lock().poison();
+    }
+}
+
+impl Wal {
     /// Called after a checkpoint at `revision`: restarts the byte counter and deletes (or
     /// archives) every segment whose records are all covered by the checkpoint. The active
     /// segment stays.
