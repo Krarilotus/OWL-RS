@@ -214,35 +214,42 @@ impl Check<'_> {
     /// class here is named by an axiom, not by an assertion's own place. Everything within
     /// is: the rules read a restriction or a set operator in an assertion's class as they
     /// read one in an axiom.
+    /// Walked with its own stack, operands in order, so that the nesting depth of an
+    /// expression is no call depth.
     #[deny(clippy::wildcard_enum_match_arm)]
     fn expression(&mut self, id: ExprId, by_axiom: bool) {
-        // Only the walks from an axiom are remembered: one from an assertion marks less.
-        if by_axiom && !self.classes.insert(id) {
-            return;
-        }
-        match self.o.class(id) {
-            ClassExpr::Class(t) => self.mark(*t, EntityKind::Class, by_axiom),
-            ClassExpr::Thing | ClassExpr::Nothing | ClassExpr::OneOf(_) => {}
-            ClassExpr::And(xs) | ClassExpr::Or(xs) => xs.iter().for_each(|&x| self.class(x)),
-            ClassExpr::Not(x) => self.class(*x),
-            ClassExpr::Some(p, x)
-            | ClassExpr::All(p, x)
-            | ClassExpr::Min(_, p, x)
-            | ClassExpr::Max(_, p, x)
-            | ClassExpr::Exact(_, p, x) => {
-                self.object(*p, true);
-                self.class(*x);
+        let mut stack = vec![(id, by_axiom)];
+        while let Some((id, by_axiom)) = stack.pop() {
+            // Only the walks from an axiom are remembered: one from an assertion marks less.
+            if by_axiom && !self.classes.insert(id) {
+                continue;
             }
-            ClassExpr::HasValue(p, _) | ClassExpr::HasSelf(p) => self.object(*p, true),
-            ClassExpr::DataSome(p, r)
-            | ClassExpr::DataAll(p, r)
-            | ClassExpr::DataMin(_, p, r)
-            | ClassExpr::DataMax(_, p, r)
-            | ClassExpr::DataExact(_, p, r) => {
-                self.data(*p, true);
-                self.range(*r);
+            match self.o.class(id) {
+                ClassExpr::Class(t) => self.mark(*t, EntityKind::Class, by_axiom),
+                ClassExpr::Thing | ClassExpr::Nothing | ClassExpr::OneOf(_) => {}
+                ClassExpr::And(xs) | ClassExpr::Or(xs) => {
+                    stack.extend(xs.iter().rev().map(|&x| (x, true)));
+                }
+                ClassExpr::Not(x) => stack.push((*x, true)),
+                ClassExpr::Some(p, x)
+                | ClassExpr::All(p, x)
+                | ClassExpr::Min(_, p, x)
+                | ClassExpr::Max(_, p, x)
+                | ClassExpr::Exact(_, p, x) => {
+                    self.object(*p, true);
+                    stack.push((*x, true));
+                }
+                ClassExpr::HasValue(p, _) | ClassExpr::HasSelf(p) => self.object(*p, true),
+                ClassExpr::DataSome(p, r)
+                | ClassExpr::DataAll(p, r)
+                | ClassExpr::DataMin(_, p, r)
+                | ClassExpr::DataMax(_, p, r)
+                | ClassExpr::DataExact(_, p, r) => {
+                    self.data(*p, true);
+                    self.range(*r);
+                }
+                ClassExpr::DataHasValue(p, _) => self.data(*p, true),
             }
-            ClassExpr::DataHasValue(p, _) => self.data(*p, true),
         }
     }
 
