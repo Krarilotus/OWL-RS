@@ -110,7 +110,6 @@ pub(crate) mod seam {
 /// U1 at a revision.
 struct State {
     revision: u64,
-    anonymous: Option<String>,
     /// Shared only with the commit computing its change ([`prepare`]), which lets go
     /// before [`install`] changes it in place: a read takes what it needs of U1 under the
     /// bounds' state, never keeping it.
@@ -137,6 +136,8 @@ struct State {
 struct Slot {
     current: Option<State>,
     floor: u64,
+    // The report survives a U1 eviction or a commit that did not read the ontology.
+    anonymous: Option<(u64, Option<String>)>,
 }
 
 impl std::ops::Deref for Slot {
@@ -147,6 +148,21 @@ impl std::ops::Deref for Slot {
 }
 
 impl Slot {
+    fn record_anonymous(&mut self, revision: u64, read: Option<Option<String>>) {
+        if self
+            .anonymous
+            .as_ref()
+            .is_some_and(|(at, _)| *at > revision || (*at == revision && read.is_none()))
+        {
+            return;
+        }
+        let note = match read {
+            Some(note) => note.map(|text| format!("{text} as of revision {revision}")),
+            None => self.anonymous.take().and_then(|(_, note)| note),
+        };
+        self.anonymous = Some((revision, note));
+    }
+
     fn get_mut(&mut self) -> Option<&mut State> {
         self.current.as_mut()
     }
@@ -381,9 +397,10 @@ impl Bounds {
 
     pub(super) fn anonymous(&self, revision: u64) -> Option<String> {
         lock(&self.state)
+            .anonymous
             .as_ref()
-            .filter(|s| s.revision == revision)
-            .and_then(|s| s.anonymous.clone())
+            .filter(|(at, _)| *at == revision)
+            .and_then(|(_, note)| note.clone())
     }
 
     /// Whether the commit `tx` keeps the RL route its base is on ([`route_kept`]), by the kinds
@@ -674,7 +691,8 @@ pub(crate) enum Prepared {
 /// consistency.
 pub(crate) struct Preparation {
     base: u64,
-    anonymous: Option<String>,
+    // A full read with no finding replaces an earlier note; no read keeps it.
+    anonymous: Option<Option<String>>,
     pub prepared: Prepared,
     /// U1 after the commit proves the data consistent (or, on the RL route, the RL
     /// rules do: [`Preparation::decided_by`]; only where they assessed the base's own
@@ -686,6 +704,16 @@ pub(crate) struct Preparation {
     /// The ontology the commit leaves, where the preparation had to read it (for the
     /// consistency check, which then needn't read it again).
     pub ontology: Option<Ontology>,
+}
+
+impl Preparation {
+    pub(crate) fn record_gate_anonymous(&mut self) {
+        if self.anonymous.is_none()
+            && let Some(ontology) = &self.ontology
+        {
+            self.anonymous = Some(anonymous_report(ontology));
+        }
+    }
 }
 
 /// Prepares U1 for the commit `tx` (after the RL reasoning applied its changes): the
@@ -815,7 +843,7 @@ pub(crate) fn prepare(
             ontology: None,
         };
     };
-    let anonymous = anonymous_report(&ontology);
+    let anonymous = Some(anonymous_report(&ontology));
     if routed_to_rules(&ontology) && !lists_left_out {
         // The RL gate that ran before has decided the commit's consistency.
         let lookup = |iri: &str| tx.lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into());
@@ -1035,6 +1063,9 @@ fn in_view(view: &Snapshot, [s, p, o]: Triple) -> bool {
 pub(crate) fn install(store: &StoreService, preparation: Preparation, revision: u64) {
     let bounds = &store.dl().bounds;
     let mut state = lock(&bounds.state);
+    if revision != preparation.base {
+        state.record_anonymous(revision, preparation.anonymous);
+    }
     match preparation.prepared {
         // Refused for memory: not kept, so a read of the revision builds it again (SYN-61);
         // the generation it would have replaced is superseded, and goes with its charge.
@@ -1047,7 +1078,6 @@ pub(crate) fn install(store: &StoreService, preparation: Preparation, revision: 
             &mut state,
             State {
                 revision,
-                anonymous: preparation.anonymous,
                 upper: upper.map(Arc::new),
                 last: "rebuilt",
                 compiled: bounds.compiled(),
@@ -1059,7 +1089,6 @@ pub(crate) fn install(store: &StoreService, preparation: Preparation, revision: 
             &mut state,
             State {
                 revision,
-                anonymous: preparation.anonymous,
                 upper: Err(not_compiled()),
                 last: "rules",
                 compiled: bounds.compiled(),
@@ -1085,7 +1114,6 @@ pub(crate) fn install(store: &StoreService, preparation: Preparation, revision: 
                     }
                 }
                 s.revision = revision;
-                s.anonymous = None;
                 s.last = "delta";
             }
             // A query built U1 for the new revision (or a later one) meanwhile: it stands.
@@ -1098,7 +1126,6 @@ pub(crate) fn install(store: &StoreService, preparation: Preparation, revision: 
                 && s.revision == preparation.base
             {
                 s.revision = revision;
-                s.anonymous = None;
                 s.last = "kept";
             }
         }
@@ -1308,6 +1335,8 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> ViewEnd {
             // A U1 a budget refused is not kept: the next read builds it again.
             let refused_upper = upper.as_ref().is_err_and(|g| g.refused);
             keep &= !refused_upper;
+            let mut slot = lock(&bounds.state);
+            slot.record_anonymous(revision, anonymous);
             if !refused_upper {
                 let last = match rules {
                     true => "rules",
@@ -1315,14 +1344,13 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> ViewEnd {
                 };
                 let state = State {
                     revision,
-                    anonymous,
                     upper: upper.map(Arc::new),
                     last,
                     compiled,
                     taxonomy: taxonomy.and_then(Result::ok),
                     kinds,
                 };
-                publish(&mut lock(&bounds.state), state);
+                publish(&mut slot, state);
             }
             parts
         }
@@ -1383,7 +1411,11 @@ fn anonymous_report(ontology: &Ontology) -> Option<String> {
         .map(|d| d.describe(&super::consistency::nameless))
 }
 
-type Rebuilt = (Result<Upper, GaveUp>, Option<Arc<Kinds>>, Option<String>);
+type Rebuilt = (
+    Result<Upper, GaveUp>,
+    Option<Arc<Kinds>>,
+    Option<Option<String>>,
+);
 
 /// U1 compiled and evaluated afresh over `snapshot` (or, with the kinds it was decided on,
 /// the RL route's place).
@@ -1401,7 +1433,7 @@ fn afresh(store: &StoreService, snapshot: &Snapshot) -> Rebuilt {
         Ok(ontology) => ontology,
         Err(_) => return refused("the revision"),
     };
-    let anonymous = anonymous_report(&ontology);
+    let anonymous = Some(anonymous_report(&ontology));
     if routed_to_rules(&ontology) && !store.lists_left_out(snapshot) {
         let lookup =
             |iri: &str| snapshot.lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into());

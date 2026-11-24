@@ -190,7 +190,6 @@ fn a_late_build_of_a_revision_a_read_let_go_publishes_nothing() {
     // The late build of the first revision, at its publication (a read's, afresh).
     let state = State {
         revision: first.revision,
-        anonymous: None,
         upper: Err(not_compiled()),
         last: "read",
         compiled: store.dl().bounds.compiled(),
@@ -440,7 +439,6 @@ fn embedded_low_memory_stops_maintenance_of_an_existing_upper_bound() {
         &mut lock(&store.dl().bounds.state),
         State {
             revision: tx.base().revision(),
-            anonymous: None,
             upper: Ok(Arc::new(upper)),
             last: "read",
             compiled: store.dl().bounds.compiled(),

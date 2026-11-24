@@ -186,6 +186,57 @@ fn an_empty_update_keeps_the_anonymous_report() {
     assert_eq!(report().as_deref(), Some(before.as_str()));
 }
 
+/// The anonymous report identifies the revision whose ontology established it.
+/// A data-only write keeps the earlier evidence. Subsequent schema and blank-node
+/// edits reread the ontology and refresh or clear the report.
+#[test]
+fn an_anonymous_report_names_the_revision_that_was_read() {
+    use nrese_store::{DlConfig, DlConsistency};
+
+    let dl = super::pipeline_with(DlConfig {
+        consistency: DlConsistency::Off,
+        ..DlConfig::default()
+    });
+    let first = insert(
+        &dl,
+        &format!(
+            "{FIXED_PREDICATE} :q a owl:ObjectProperty . :z a owl:NamedIndividual .
+             _:b :q :y, :z .
+             :A a owl:Class ; rdfs:subClassOf [
+                 a owl:Restriction ; owl:onProperty :q ; owl:someValuesFrom :B
+             ] . :B a owl:Class ."
+        ),
+    )
+    .expect("admitted");
+    let report = |revision| {
+        assert_eq!(dl.store().current_revision(), revision);
+        let (answers, status) = query(&dl, FIXED_READ);
+        assert_eq!(answers, ["true"]);
+        status
+            .reasons()
+            .into_iter()
+            .find(|reason| reason.contains("anonymous tree has no root"))
+    };
+    let named = insert(&dl, ":x :p :z .").expect("named assertion");
+    assert!(named > first);
+    assert_eq!(dl.store().dl_bounds().last, "delta");
+    assert!(
+        report(named).is_some_and(|text| text.ends_with(&format!("as of revision {first}"))),
+        "named assertion must keep the report from revision {first}"
+    );
+    let schema = insert(&dl, ":D a owl:Class .").expect("schema edit");
+    assert!(schema > named);
+    assert_eq!(dl.store().dl_bounds().last, "rebuilt");
+    assert!(
+        report(schema).is_some_and(|text| text.ends_with(&format!("as of revision {schema}"))),
+        "schema edit must refresh the report at revision {schema}"
+    );
+    let cleared = super::update(&dl, "DELETE WHERE { ?b :q :z }").expect("remove one attachment");
+    assert!(cleared > schema);
+    assert_eq!(dl.store().dl_bounds().last, "rebuilt");
+    assert_eq!(report(cleared), None);
+}
+
 /// OWL 2 Mapping to RDF Graphs Table 12: one member cannot form a data
 /// intersection or union. Two members, and a one-literal enumeration, can.
 /// The test uses a fixed predicate because an unbound predicate already
