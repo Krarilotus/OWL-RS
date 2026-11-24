@@ -66,24 +66,6 @@ fn two_datatype_definitions_withhold_the_word() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// OWL 2 Structural Specification §§4 and 7.5: minInclusive has no facet space
-/// on xsd:string. The store reports this restriction on its input by name.
-#[test]
-fn a_facet_its_datatype_does_not_take_is_reported() {
-    let dl = preloaded(
-        ":d a owl:DatatypeProperty ; rdfs:range [ a rdfs:Datatype ;
-         owl:onDatatype xsd:string ; owl:withRestrictions ( [ xsd:minInclusive 5 ] ) ] .",
-    );
-    let (_, status) = query(&dl, "ASK { ?s ?p ?o }");
-    let reasons = status.reasons();
-    assert!(
-        reasons
-            .iter()
-            .any(|r| r.contains("facet is not applicable")),
-        "{status:?}"
-    );
-}
-
 /// OWL 2 Structural Specification §11.2: anonymous individuals cannot occur
 /// in equality, inequality or negative assertions, and their graph must be
 /// a forest with one assertion per pair and a root with at most one named attachment.

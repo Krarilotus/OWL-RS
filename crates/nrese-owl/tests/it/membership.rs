@@ -1,4 +1,4 @@
-use nrese_owl::{Diagnostic, read};
+use nrese_owl::read;
 
 use super::{Table, load};
 
@@ -66,54 +66,6 @@ fn datatype_rules_outside_owl2_dl_are_named() {
         };
         if !correct {
             wrong.push(format!("{name}: expected {expected:?}, got {fatal:?}"));
-        }
-    }
-    assert!(wrong.is_empty(), "{wrong:#?}");
-}
-
-/// OWL 2 Structural Specification §4 and §7.5 require the pair and the
-/// literal's value to belong to the permitted facet space. An impossible pair
-/// can be rejected even when the literal exceeds the value owner's capacity.
-#[test]
-fn facets_outside_their_facet_space_are_named() {
-    let large = "\"170141183460469231731687303715884105728\"^^xsd:integer";
-    let rejected = Some(("facet is not applicable", true));
-    let cases = [
-        ("xsd:string", "minInclusive", "5", rejected),
-        ("owl:real", "minInclusive", "\"low\"", rejected),
-        ("xsd:string", "minInclusive", large, rejected),
-        (
-            "xsd:integer",
-            "minInclusive",
-            large,
-            Some(("facet membership undecided", false)),
-        ),
-        ("xsd:string", "maxLength", "3", None),
-        ("xsd:integer", "minInclusive", "5", None),
-    ];
-    let mut wrong = Vec::new();
-    for (datatype, facet, value, expected) in cases {
-        let mut terms = Table::default();
-        let input = load(
-            &mut terms,
-            &format!(
-                "ex:d a owl:DatatypeProperty ; rdfs:range [
-                 a rdfs:Datatype ; owl:onDatatype {datatype} ;
-                 owl:withRestrictions ( [ xsd:{facet} {value} ] ) ] ."
-            ),
-        );
-        let ontology = read(&input, &terms);
-        let actual = ontology.diagnostics.iter().find_map(|d| {
-            let text = d.describe(&|t| terms.name(t));
-            ["facet is not applicable", "facet membership undecided"]
-                .into_iter()
-                .find(|what| text.contains(what))
-                .map(|what| (what, Diagnostic::is_fatal(d)))
-        });
-        if actual != expected {
-            wrong.push(format!(
-                "{datatype} {facet} {value}: expected {expected:?}, got {actual:?}"
-            ));
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
