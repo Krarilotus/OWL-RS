@@ -303,7 +303,7 @@ impl MutationPipeline {
             // whole list diagnostics (the report's are only the new ones). With no program at
             // hand (an update with no reasoning delta, on a pipeline that caches none: a
             // fresh one, a reopened store's), the store's record of the pending version.
-            let lists_left_out = match changed.as_ref().or(cached) {
+            let lists_left_out = match changed.as_ref().or(ground_before) {
                 Some(p) => !p.list_diagnostics.is_empty(),
                 None => self.store.lists_left_out(&tx.pending_snapshot()),
             };
