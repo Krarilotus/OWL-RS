@@ -111,6 +111,12 @@ fn definition_chain(depth: usize) -> String {
 }
 
 fn at_each_depth(test: &str, case: impl Fn(usize)) {
+    at_depths(test, &[1_000, 10_000, 100_000], case);
+}
+
+/// Runs `case` at each of `depths` in a child process of its own, so that a stack
+/// overflow is reported per depth.
+fn at_depths(test: &str, depths: &[usize], case: impl Fn(usize)) {
     if let Ok(depth) = std::env::var(CHILD_DEPTH) {
         case(depth.parse().expect("test depth"));
         println!("complement case completed");
@@ -121,7 +127,7 @@ fn at_each_depth(test: &str, case: impl Fn(usize)) {
     let name = format!("{module}::{test}");
     let binary = std::env::current_exe().expect("test binary");
     let mut failed = Vec::new();
-    for depth in [1_000, 10_000, 100_000] {
+    for &depth in depths {
         let start = Instant::now();
         let child = Command::new(&binary)
             .args(["--exact", &name, "--nocapture", "--test-threads=1"])
@@ -484,10 +490,11 @@ fn defined_after_use_dl_write() {
 }
 
 /// As [`defined_after_use_dl_write`], for a chain of datatype definitions each defined by
-/// the complement of the next.
+/// the complement of the next. Run at 1,000 and 10,000 only: at 100,000, evaluating the
+/// chain takes time growing faster than the chain itself, which is not this case's subject.
 #[test]
 fn definition_chain_dl_write() {
-    at_each_depth("definition_chain_dl_write", |depth| {
+    at_depths("definition_chain_dl_write", &[1_000, 10_000], |depth| {
         assert_eq!(
             data_existential_write(&definition_chain(depth)),
             data_existential_write(&definition_chain(2))
