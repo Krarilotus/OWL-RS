@@ -1,6 +1,8 @@
 use std::sync::{Arc, RwLock};
 
+use nrese_engine::{Snapshot, TermId};
 use nrese_reasoner::ReasonerService;
+use nrese_reasoner::eval::GroundProgram;
 
 use super::attribution::attribute_reject_delta;
 use super::command::{MutationCommand, MutationCommitReport};
@@ -14,6 +16,13 @@ use crate::error::StoreError;
 use crate::graph_store::{GraphDeleteReport, GraphTarget, GraphWriteReport, GraphWriteRequest};
 use crate::service::StoreService;
 use crate::update::{SparqlUpdateRequest, UpdateExecutionReport};
+
+type GroundKey = (u64, Option<TermId>);
+
+fn ground_key(snapshot: &Snapshot) -> GroundKey {
+    let identity = snapshot.identity();
+    (identity.revision, identity.equality)
+}
 
 /// The single owner of write semantics: plan → validate → claim → commit.
 ///
@@ -40,10 +49,8 @@ pub struct MutationPipeline {
     last_reasoning_run: RwLock<Option<ReasoningRunRecord>>,
     /// Reasoner v2's ruleset compiled against the dictionary, on first use.
     program: std::sync::OnceLock<crate::reasoning::Program>,
-    /// Reasoner v2's ground program and the committed revision it describes. Writers
-    /// outside the pipeline (bulk loads, rematerialisation) change the revision, which
-    /// invalidates it.
-    ground: std::sync::Mutex<Option<(u64, nrese_reasoner::eval::GroundProgram)>>,
+    /// Reasoner v2's ground program, keyed by the revision and how it was read.
+    ground: std::sync::Mutex<Option<(GroundKey, Arc<GroundProgram>)>>,
     /// Set when another pipeline (other rules) took over the store: writes are refused
     /// from then on, so none applies this pipeline's rules to a stack made for others.
     retired: std::sync::atomic::AtomicBool,
@@ -260,14 +267,15 @@ impl MutationPipeline {
             };
             // The commit's stack is read as the program keeps it, installed with it: expanded
             // over representatives from the commit that brings the store's first `owl:sameAs`.
-            tx.read_equality_as(program.stored_equality());
-            let revision = tx.base().revision();
+            let reading = program.stored_equality();
+            tx.read_equality_as(reading);
+            let base_key = ground_key(tx.base());
             // Writers are serialised by the transaction, so the cache can't change meanwhile.
             let mut ground = self.ground.lock().unwrap_or_else(|p| p.into_inner());
             let cached = ground
                 .as_ref()
-                .filter(|(at, _)| *at == revision)
-                .map(|(_, program)| program);
+                .filter(|(at, _)| *at == base_key)
+                .map(|(_, program)| program.as_ref());
             // A cancelled request stops the reasoning; dropping `tx` then discards both
             // the asserted and the inferred changes, and releases the writer.
             // So does the process's memory limit: the commit is refused, not the machine.
@@ -546,15 +554,19 @@ impl MutationPipeline {
                     });
                 }
             }
-            // The program now describes the committed state; a kept one only if it described
-            // the commit's base (one of an older state, left out of `cached`, stays stale).
-            match changed {
-                Some(program) => *ground = Some((summary.revision, program)),
-                None => {
-                    if let Some((at, _)) = ground.as_mut().filter(|(at, _)| *at == revision) {
-                        *at = summary.revision;
-                    }
-                }
+            // A no-op keeps its base. A commit that changed the reading cannot keep a program
+            // grounded under the previous reading.
+            let next_key = if summary.revision == base_key.0 {
+                base_key
+            } else {
+                (summary.revision, reading)
+            };
+            if next_key.1 != base_key.1 {
+                *ground = None;
+            } else if let Some(program) = changed {
+                *ground = Some((next_key, Arc::new(program)));
+            } else if let Some((at, _)) = ground.as_mut().filter(|(at, _)| *at == base_key) {
+                *at = next_key;
             }
             drop(ground);
             #[cfg(test)]
