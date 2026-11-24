@@ -46,7 +46,7 @@ impl<O> Drop for Slot<'_, O> {
 /// waits, never one the platform reads as untimed (Windows does above about 49.7 days).
 const WAIT_CAP: Duration = Duration::from_secs(3600);
 /// The stop of a build or its handoff is a flag checked between waits.
-pub(crate) const STOP_POLL: Duration = Duration::from_millis(50);
+pub const STOP_POLL: Duration = Duration::from_millis(50);
 
 type Fallback<O> = Box<dyn FnOnce() -> O + Send>;
 

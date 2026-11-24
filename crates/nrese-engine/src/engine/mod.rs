@@ -1250,6 +1250,12 @@ impl Engine {
         Ok(Transaction::new(&self.inner, Some(slot)))
     }
 
+    /// Opens a writer only if its slot is free, including outside the Rayon pool.
+    pub fn transaction_if_idle(&self) -> Option<Transaction<'_>> {
+        let slot = self.inner.writer.try_lock()?;
+        Some(Transaction::new(&self.inner, Some(slot)))
+    }
+
     /// A private transaction over the latest snapshot ([`Self::speculative_over`]): for
     /// reading what pending changes would make (a client transaction's reads, a validation
     /// preview, an entailment test) while writers go on. Its terms are its own, charged to

@@ -112,6 +112,36 @@ fn closing_a_pipeline_releases_the_directory_during_grounding() {
     assert!(reopened.reasoning_state().is_some());
 }
 
+/// Spec: closing the last pipeline returns while another thread holds the writer
+/// slot and the background preparation is trying to pin a snapshot.
+#[test]
+fn closing_a_pipeline_does_not_wait_for_a_held_writer() {
+    let store = loaded(StoreService::new(StoreConfig::in_memory()).unwrap(), SCHEMA);
+    let pipeline = MutationPipeline::new(store.clone(), rl());
+    let (held, writer_started) = mpsc::channel();
+    let (release, writer_finished) = mpsc::channel();
+    let writer = thread::spawn(move || {
+        let _tx = store.engine().transaction();
+        held.send(()).unwrap();
+        writer_finished.recv_timeout(WAIT).unwrap();
+    });
+    writer_started.recv_timeout(WAIT).unwrap();
+    let (attempted, resume) = pause(Stage::WaitingForWriter);
+    let pipeline = pipeline.prepare_from_start();
+    attempted.recv_timeout(WAIT).unwrap();
+    resume.send(()).unwrap();
+    let (closed, heard) = mpsc::channel();
+    let closer = thread::spawn(move || {
+        drop(pipeline);
+        closed.send(()).unwrap();
+    });
+    let result = heard.recv_timeout(Duration::from_secs(1));
+    release.send(()).unwrap();
+    writer.join().unwrap();
+    closer.join().unwrap();
+    result.expect("the last pipeline must close with the writer slot still held");
+}
+
 /// Spec: a reopened, prepared writer makes the first edit against the current hidden
 /// closure without grounding the whole program again.
 #[test]
@@ -139,6 +169,34 @@ fn restarted_writer_uses_the_prepared_hidden_union_closure() {
     assert_ne!(
         reopened.last_reasoning_run().unwrap().work.plan,
         Plan::Rebuild
+    );
+}
+
+/// Spec: the first ordinary write after a compact-store restart keeps its prepared
+/// program when the repository has no owl:sameAs statements.
+#[test]
+fn compact_restart_without_same_as_reuses_its_write_program() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = StoreConfig {
+        equality_compact: true,
+        ..StoreConfig::on_disk(dir.path())
+    };
+    drop(loaded(StoreService::new(config.clone()).unwrap(), SCHEMA));
+    let store = Arc::new(StoreService::new(config).unwrap());
+    let writer = MutationPipeline::new(store, rl()).prepare_from_start();
+    ready(&writer);
+    until(|| writer.preparation.builds.is_idle());
+    assert_eq!(writer.write_program_metrics(), (2, 1, 0));
+    assert!(!ask(&writer, "?a owl:sameAs ?b"));
+    apply(&writer, &MutationTicket::new()).unwrap();
+    assert!(ask(&writer, "ex:y a ex:B"));
+    let after_write = writer.write_program_metrics();
+    ready(&writer);
+    until(|| writer.preparation.builds.is_idle());
+    assert_eq!(
+        writer.write_program_metrics(),
+        (2, 1, 0),
+        "after write: {after_write:?}"
     );
 }
 

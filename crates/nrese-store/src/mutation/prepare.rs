@@ -4,7 +4,7 @@ use std::sync::{Arc, OnceLock, Weak, atomic::AtomicU64};
 use nrese_engine::engine::PublicationListener;
 use nrese_engine::{Snapshot, TermId, Transaction};
 use nrese_exec::cell::{Build, BuildCell, Claim, End, Ended, Joined, Kind};
-use nrese_exec::terminal::{Guard, terminal};
+use nrese_exec::terminal::{Guard, STOP_POLL, terminal};
 use nrese_reasoner::RuleProgram;
 use nrese_reasoner::eval::{GroundProgram, OperationStop};
 use parking_lot::{Mutex, ReentrantMutex};
@@ -164,9 +164,6 @@ impl Preparation {
                 return;
             }
             let (build, owner) = match self.builds.claim((), Kind::Opaque, || {
-                if !requested && *self.failed.lock() == Some(key) {
-                    return Some(None);
-                }
                 let entry = self.entry.try_lock()?;
                 cached(&entry, key).cloned().map(Some)
             }) {
@@ -178,13 +175,13 @@ impl Preparation {
             }
             if let Some(owner) = owner {
                 let mut pinned = key;
+                // The cell reports abandonment. Retain its key before releasing the claim.
                 let end = catch_unwind(AssertUnwindSafe(|| self.build(&mut pinned, requested)));
                 if matches!(end, Ok(End::Empty) | Err(_)) {
                     *self.failed.lock() = Some(pinned);
                 }
-                match end {
-                    Ok(end) => owner.end(end),
-                    Err(_) => drop(owner),
+                if let Ok(end) = end {
+                    owner.end(end);
                 }
             }
             if requested || matches!(build.join(None, &|| *self.retired.lock()), Joined::Left) {
@@ -198,33 +195,42 @@ impl Preparation {
 
     fn build(&self, pinned: &mut GroundKey, requested: bool) -> End<GroundProgram> {
         let rules = self.rules.as_ref().expect("preparation requires rules");
-        let pinned_base = self.with_store(|store| {
-            let tx = store.engine().transaction();
+        let mut pin = |store: &StoreService| {
+            let tx = store.engine().transaction_if_idle().ok_or(None)?;
             if *self.retired.lock()
                 || !store.reasoning_is_current_held(tx.writer().expect("writer"), rules)
             {
-                return Err(End::Later);
+                return Err(Some(End::Later));
             }
             let base = tx.base();
             *pinned = ground_key(base);
             if let Some(program) = cached(&self.entry.lock(), *pinned).cloned() {
-                return Err(End::Kept(program));
+                return Err(Some(End::Kept(program)));
             }
             if *self.failed.lock() == Some(*pinned) {
                 if !requested {
-                    return Err(End::Empty);
+                    return Err(Some(End::Empty));
                 }
                 *self.failed.lock() = None;
             }
             let Ok(program) = self.compiled(store, rules, &tx) else {
-                return Err(End::Empty);
+                return Err(Some(End::Empty));
             };
             Ok((base.clone(), program, store.memory_stop()))
-        });
-        let (base, program, memory) = match pinned_base {
-            Some(Ok(pinned)) => pinned,
-            Some(Err(end)) => return end,
-            None => return End::Later,
+        };
+        let (base, program, memory) = loop {
+            match self.with_store(&mut pin) {
+                Some(Ok(pinned)) => break pinned,
+                Some(Err(Some(end))) => return end,
+                Some(Err(None)) if !*self.retired.lock() => {
+                    #[cfg(test)]
+                    super::write_program_hooks::run(
+                        super::write_program_hooks::Stage::WaitingForWriter,
+                    );
+                    std::thread::sleep(STOP_POLL);
+                }
+                _ => return End::Later,
+            }
         };
         let key = *pinned;
         let head = || self.with_store(|store| ground_key(&store.engine().snapshot()));

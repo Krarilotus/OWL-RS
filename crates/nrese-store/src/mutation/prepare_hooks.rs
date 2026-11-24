@@ -4,14 +4,15 @@ use std::cell::RefCell;
 
 pub enum Stage {
     BeforeClaim,
+    WaitingForWriter,
     DuringGrounding,
     BeforeInstall,
 }
 
-type Hooks = [Option<Box<dyn FnOnce() + Send>>; 3];
+type Hooks = [Option<Box<dyn FnOnce() + Send>>; 4];
 
 thread_local! {
-    static HOOKS: RefCell<Hooks> = const { RefCell::new([None, None, None]) };
+    static HOOKS: RefCell<Hooks> = const { RefCell::new([None, None, None, None]) };
 }
 
 pub fn set(stage: Stage, hook: impl FnOnce() + Send + 'static) {
