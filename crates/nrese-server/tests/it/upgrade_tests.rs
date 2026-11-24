@@ -46,8 +46,114 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Spec: a certified store written by the released server opens with its assertions
+/// and unaffected answers intact. A stale hidden membership disappears on the first
+/// start and the resulting certificate stands on the second.
+#[tokio::test]
+async fn released_hidden_union_is_revalidated_once() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hidden-union-v1.5.0");
+    let directory = tempfile::tempdir()?;
+    let data = directory.path().join("data");
+    copy_dir(&fixture.join("data"), &data)?;
+    let marker = data.join("reasoning.state");
+    let prior = std::fs::read(&marker)?;
+    let config = configure(directory.path(), &data)?;
+    let mut converted = Vec::new();
+    for first in [true, false] {
+        let server =
+            Server::start_with(&config, &[("NRESE_REASONING_UNNAMED_CLASSES", "skip")]).await?;
+        let prefix =
+            "PREFIX ex: <http://example.org/> PREFIX owl: <http://www.w3.org/2002/07/owl#>";
+        for (pattern, wanted) in [
+            ("?u owl:unionOf ?list . ex:y a ?u", false),
+            (
+                "ex:y a ex:C . ex:y ex:note ex:kept . ?u owl:unionOf ?list",
+                true,
+            ),
+            ("ex:k ex:consumer ?u", false),
+        ] {
+            let query = format!("{prefix} ASK {{ {pattern} }}");
+            let answer: serde_json::Value = server
+                .http
+                .post(format!("{}/api/v1/repositories/nrese/query", server.url))
+                .bearer_auth(TOKEN)
+                .header("Accept", "application/sparql-results+json")
+                .form(&[("query", query)])
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            assert_eq!(answer["boolean"], wanted, "{pattern}");
+        }
+        if first {
+            converted = std::fs::read(&marker)?;
+            assert_ne!(converted, prior);
+        } else {
+            assert_eq!(std::fs::read(&marker)?, converted);
+            assert!(server.output().contains("inferred stack is current"));
+        }
+    }
+    Ok(())
+}
+
 /// The longest a server may take to open main's store and say where it listens.
 const START: Duration = Duration::from_secs(120);
+
+/// Spec: an existing named repository prepares at restart and serves its first
+/// write without grounding on the request path.
+#[tokio::test]
+async fn named_repository_prepares_before_its_first_write_after_restart()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let config = configure(dir.path(), &dir.path().join("data"))?;
+    const EX: &str =
+        "PREFIX ex: <http://example.org/> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>";
+    {
+        let server = Server::start(&config).await?;
+        server
+            .send(
+                reqwest::Method::PUT,
+                "/api/v1/repositories/union",
+                r#"{"reasoning":"owl2-rl"}"#,
+            )
+            .await?;
+        server
+            .update(
+                "union",
+                &format!("{EX} INSERT DATA {{ ex:A rdfs:subClassOf ex:B . ex:x a ex:A }}"),
+            )
+            .await?;
+    }
+    let server = Server::start(&config).await?;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let metrics = server.get("/metrics").await?;
+            if metrics
+                .lines()
+                .any(|line| line == "nrese_write_program_state{repository=\"union\"} 2")
+            {
+                return Ok::<_, Box<dyn std::error::Error>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+    })
+    .await??;
+    server
+        .update("union", &format!("{EX} INSERT DATA {{ ex:y a ex:A }}"))
+        .await?;
+    let answers = server
+        .query("union", &format!("{EX} SELECT ?x WHERE {{ ?x a ex:B }}"))
+        .await?;
+    assert!(
+        answers.iter().any(|line| line == "<http://example.org/y>"),
+        "{answers:?}"
+    );
+    assert!(server.get("/metrics").await?.lines().any(|line| {
+        line == "nrese_write_program_builds_total{repository=\"union\",cause=\"commit\"} 0"
+    }));
+    Ok(())
+}
 /// The longest one request to the server may take.
 const REQUEST: Duration = Duration::from_secs(120);
 /// The longest `nrese-server restore` may take.
