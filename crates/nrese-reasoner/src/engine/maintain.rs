@@ -674,6 +674,7 @@ pub fn maintain_with_report_budget(
         // class. Ground the final prospective state, and publish this cache only if
         // the caller commits. Existing unrelated violations remain tolerated.
         let ground_at = |snapshot| {
+            operation.count_grounding();
             program
                 .ground_program_until(snapshot, &|| operation.fired())
                 .map_err(|_| operation.interrupted())

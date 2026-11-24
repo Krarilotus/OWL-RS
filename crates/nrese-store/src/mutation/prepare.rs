@@ -1,11 +1,13 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, OnceLock, Weak};
 
 use nrese_engine::engine::PublicationListener;
 use nrese_engine::{Snapshot, TermId, Transaction};
 use nrese_exec::cell::{Build, BuildCell, Claim, End, Ended, Joined, Kind};
 use nrese_exec::terminal::{Guard, terminal};
-use nrese_reasoner::{RuleProgram, eval::GroundProgram};
+use nrese_reasoner::RuleProgram;
+use nrese_reasoner::eval::{GroundProgram, OperationStop};
 use parking_lot::{Mutex, ReentrantMutex};
 
 use super::ticket::MutationTicket;
@@ -37,8 +39,9 @@ pub(super) struct Preparation {
     pub(super) rules: Option<RuleProgram>,
     program: OnceLock<Program>,
     pub(super) entry: Mutex<Entry>,
-    failed: Mutex<Option<GroundKey>>,
-    builds: BuildCell<(), GroundProgram>,
+    pub(super) failed: Mutex<Option<GroundKey>>,
+    pub(super) commit_groundings: AtomicU64,
+    pub(super) builds: BuildCell<(), GroundProgram>,
     pub(super) retired: Mutex<bool>,
     // Only this thread defers its own commit notification until its entry is tagged.
     pub(super) tagging: ReentrantMutex<()>,
@@ -58,6 +61,7 @@ impl Preparation {
             program: OnceLock::new(),
             entry: Mutex::default(),
             failed: Mutex::default(),
+            commit_groundings: AtomicU64::default(),
             builds: BuildCell::default(),
             retired: Mutex::default(),
             tagging: ReentrantMutex::default(),
@@ -209,9 +213,10 @@ impl Preparation {
         let key = *pinned;
         let moved = || ground_key(&store.engine().snapshot()) != key;
         let memory = store.memory_stop();
-        let built = program.ground_program_until(&base, &|| {
-            *self.retired.lock() || moved() || memory.exceeded()
-        });
+        let stop = || *self.retired.lock() || moved() || memory.exceeded();
+        let room = || memory.room();
+        let operation = OperationStop::new(&stop).within(&room);
+        let built = program.ground_program_until(&base, &|| operation.fired());
         let mut entry = self.entry.lock();
         let retired = self.retired.lock();
         if *retired || moved() {
@@ -228,16 +233,19 @@ impl Preparation {
             tracing::error!(%error, "starting write program preparation failed");
         }
     }
+
+    pub(super) fn covers(&self, key: GroundKey) -> bool {
+        self.entry
+            .try_lock()
+            .is_some_and(|entry| cached(&entry, key).is_some())
+    }
 }
 
 impl PublicationListener for Preparation {
     fn published(self: Arc<Self>, revision: u64, reading: Option<TermId>) {
         if !self.tagging.is_owned_by_current_thread()
             && !*self.retired.lock()
-            && !self
-                .entry
-                .try_lock()
-                .is_some_and(|entry| cached(&entry, (revision, reading)).is_some())
+            && !self.covers((revision, reading))
         {
             self.wake();
         }

@@ -71,6 +71,27 @@ impl MutationPipeline {
         &self.reasoner
     }
 
+    /// The write program's state (0 none, 1 building, 2 ready, 3 failed), preparation
+    /// attempts, and whole-store groundings on the commit path.
+    pub fn write_program_metrics(&self) -> (u8, u64, u64) {
+        let prep = &self.preparation;
+        let key = ground_key(&self.store.engine().snapshot());
+        let phase = match prep.rules.as_ref() {
+            _ if self.store.config().replica || self.is_retired() => 0,
+            None => 0,
+            Some(rules) if !self.store.reasoning_is_current(rules) => 0,
+            _ if prep.covers(key) => 2,
+            _ if *prep.failed.lock() == Some(key) => 3,
+            _ => 1,
+        };
+        let ends = prep.builds.ends();
+        let prepare = ends.kept + ends.empty + ends.later + ends.abandoned;
+        let commit = prep
+            .commit_groundings
+            .load(std::sync::atomic::Ordering::Relaxed);
+        (phase, prepare, commit)
+    }
+
     /// The most recent reasoning gate run, rejected or not.
     pub fn last_reasoning_run(&self) -> Option<ReasoningRunRecord> {
         self.last_reasoning_run
@@ -269,7 +290,9 @@ impl MutationPipeline {
             let memory = self.store.memory_stop();
             let stop = || ticket.stop_requested() || memory.exceeded();
             let room = || memory.room();
-            let operation = nrese_reasoner::eval::OperationStop::new(&stop).within(&room);
+            let operation = nrese_reasoner::eval::OperationStop::new(&stop)
+                .within(&room)
+                .counting_groundings(&preparation.commit_groundings);
             // The violations' list draws on the request's envelope: past it, the list stops
             // and the commit is still rejected (the change is inconsistent either way).
             let report_memory = Arc::new(envelope.part());

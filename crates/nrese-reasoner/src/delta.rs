@@ -762,6 +762,7 @@ fn update_body<B: Base + ?Sized>(
     let computed: Option<GroundProgram> = cache
         .is_none()
         .then(|| {
+            operation.count_grounding();
             let extra = Store::new(deleted.to_vec());
             let before = Overlay {
                 base,
