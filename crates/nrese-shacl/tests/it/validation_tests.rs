@@ -681,6 +681,7 @@ fn a_report_past_the_envelope_is_refused() {
         evaluations: std::sync::atomic::AtomicUsize::new(0),
         at: usize::MAX,
         in_report: false,
+        reverse_scan: None,
     };
     let resources = Resources {
         memory: nrese_exec::Envelope::new(Some(1 << 20), None),
@@ -775,13 +776,15 @@ fn repeated_results_of_a_change_s_validation_are_returned() {
 
 /// A view of `inner` that cancels `token` at its `at`-th query evaluation, or, with
 /// `in_report`, at the first term it decodes after that evaluation (by then the walk has
-/// run every query, so the decode is the report's).
+/// run every query, so the decode is the report's). `reverse_scan` cancels after the given
+/// number of rows of a reverse scan of its predicate.
 struct CancelAfter<'v> {
     inner: &'v Snapshot,
     token: CancellationToken,
     evaluations: std::sync::atomic::AtomicUsize,
     at: usize,
     in_report: bool,
+    reverse_scan: Option<(TermId, usize)>,
 }
 
 impl<'v> ReadView for CancelAfter<'v> {
@@ -790,7 +793,21 @@ impl<'v> ReadView for CancelAfter<'v> {
         model: ReadModel,
         pattern: &nrese_engine::QuadPattern,
     ) -> impl Iterator<Item = nrese_engine::EncodedQuad> + use<'a, 'v> {
-        self.inner.quads_for_pattern_in(model, pattern)
+        let cancel_at = self.reverse_scan.and_then(|(predicate, rows)| {
+            (pattern.subject.is_none()
+                && pattern.predicate == Some(predicate)
+                && pattern.object.is_some())
+            .then_some(rows)
+        });
+        self.inner
+            .quads_for_pattern_in(model, pattern)
+            .enumerate()
+            .map(move |(i, quad)| {
+                if Some(i) == cancel_at {
+                    self.token.cancel();
+                }
+                quad
+            })
     }
 
     fn named_graphs<'a>(&'a self) -> impl Iterator<Item = TermId> + use<'a, 'v> {
@@ -846,6 +863,7 @@ fn cancelled_after(
         evaluations: std::sync::atomic::AtomicUsize::new(0),
         at,
         in_report,
+        reverse_scan: None,
     };
     let resources = Resources {
         cancellation: Some(token),
@@ -883,6 +901,53 @@ fn a_cancellation_while_the_report_is_decoded_stops_it() {
         matches!(outcome, Err(QueryEvaluationError::Cancelled)),
         "{outcome:?}"
     );
+}
+
+/// Spec: a cancelled path scan stops the change validation. The partial output
+/// has more predecessors than the budget can hold, so trying to adopt it would refuse.
+#[test]
+fn cancelling_a_reverse_path_scan_stops_the_change() {
+    const ROWS: usize = 1024;
+    let data: String = (0..=ROWS)
+        .map(|i| format!("ex:n{i} ex:p ex:b .\n"))
+        .collect();
+    let store = engine(
+        &data,
+        "ex:S a sh:PropertyShape ; sh:targetNode ex:z ; sh:path ex:p .",
+    );
+    let before = store.snapshot();
+    let shapes = compiled(&before);
+    let mut tx = store.transaction();
+    tx.insert(QuadRef::new(
+        NamedNodeRef::new_unchecked("http://example.com/z"),
+        NamedNodeRef::new_unchecked("http://example.com/p"),
+        NamedNodeRef::new_unchecked("http://example.com/b"),
+        GraphNameRef::DefaultGraph,
+    ));
+    let changed: Vec<_> = tx.inserted().collect();
+    let after = tx.pending_snapshot();
+    let token = CancellationToken::new();
+    let view = CancelAfter {
+        inner: &before,
+        token: token.clone(),
+        evaluations: std::sync::atomic::AtomicUsize::new(0),
+        at: usize::MAX,
+        in_report: false,
+        reverse_scan: Some((id(&before, "http://example.com/p"), ROWS)),
+    };
+    let resources = Resources {
+        cancellation: Some(token),
+        memory: nrese_exec::Envelope::new(Some(4 << 10), None),
+        ..Resources::default()
+    };
+    let outcome =
+        nrese_shacl::validate_changes(&view, &after, &shapes, DEFAULT, &changed, &resources)
+            .map(|report| report.results.len());
+    assert!(
+        matches!(outcome, Err(QueryEvaluationError::Cancelled)),
+        "{outcome:?}"
+    );
+    assert_eq!(resources.memory.used(), 0);
 }
 
 /// Shapes with a component whose SELECT node validator reports `?failure` once for each of
@@ -983,6 +1048,7 @@ fn a_validation_s_charges_end_with_it() {
         evaluations: std::sync::atomic::AtomicUsize::new(0),
         at: 16,
         in_report: true,
+        reverse_scan: None,
     };
     let resources = Resources {
         cancellation: Some(token),

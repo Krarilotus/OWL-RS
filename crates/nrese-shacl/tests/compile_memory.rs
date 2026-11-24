@@ -4,11 +4,14 @@
 //! combinations, which grows as a power of it. Measured (`nrese_exec::measure`), so this
 //! file is a test binary of its own.
 
-use nrese_engine::{Engine, EngineConfig, GraphSelector, Snapshot};
-use nrese_exec::measure;
+use std::fmt::Write as _;
+
+use nrese_engine::{Engine, EngineConfig, GraphSelector, Snapshot, TermId};
+use nrese_exec::{Envelope, measure};
 use nrese_rdf::{GraphNameRef, NamedNodeRef, QuadRef};
 use nrese_rdf_io::{RdfFormat, RdfParser};
-use nrese_shacl::{Selection, compile};
+use nrese_shacl::{Selection, compile, validate_changes};
+use nrese_sparql::{QueryEvaluationError, Resources};
 
 #[global_allocator]
 static ALLOCATOR: measure::Measured<std::alloc::System> = measure::Measured(std::alloc::System);
@@ -40,6 +43,10 @@ fn snapshot(m: usize) -> Snapshot {
 
 /// A snapshot with `turtle` in the shapes graph. Made before any measurement.
 fn load(turtle: &str) -> Snapshot {
+    load_engine(turtle).snapshot()
+}
+
+fn load_engine(turtle: &str) -> Engine {
     let engine = Engine::new(EngineConfig::default()).expect("engine");
     let mut tx = engine.transaction();
     let graph = NamedNodeRef::new_unchecked(SHAPES);
@@ -53,7 +60,139 @@ fn load(turtle: &str) -> Snapshot {
         ));
     }
     tx.commit().expect("commit");
-    engine.snapshot()
+    engine
+}
+
+const WALK_SLACK: usize = 64 << 10;
+const CHAIN_CASES: [(bool, bool); 4] = [(false, true), (true, true), (false, false), (true, false)];
+
+/// A deep affected chain, with one focus node and 512 type inserts so the change copy
+/// and focus list fit in the same slack as the other scratch outside the walk.
+/// In the path cases each side child also finds a different predecessor.
+fn affected_chain(
+    path_child: bool,
+    side_first: bool,
+) -> impl Fn(&Resources) -> Result<usize, QueryEvaluationError> {
+    const DEPTH: usize = 64;
+    const EX: &str = "http://example.com/";
+    let mut turtle = format!(
+        "@prefix ex: <{EX}> . @prefix sh: <http://www.w3.org/ns/shacl#> .\n\
+         ex:S0 sh:targetClass ex:Target ; sh:nodeKind sh:Literal .\n"
+    );
+    for i in 0..DEPTH {
+        let next = i + 1;
+        let members = if side_first {
+            format!("ex:A{i} ex:S{next}")
+        } else {
+            format!("ex:S{next} ex:A{i}")
+        };
+        let child = if path_child {
+            format!("sh:PropertyShape ; sh:path ex:p{i}")
+        } else {
+            "sh:NodeShape".to_owned()
+        };
+        writeln!(
+            turtle,
+            "ex:S{i} a sh:NodeShape ; sh:and ( {members} ) . ex:A{i} a {child} ."
+        )
+        .expect("write shapes");
+    }
+    writeln!(turtle, "ex:S{DEPTH} a sh:NodeShape .").expect("write tail shape");
+    let engine = load_engine(&turtle);
+    if path_child {
+        let mut tx = engine.transaction();
+        let node = NamedNodeRef::new_unchecked("http://example.com/n0");
+        for i in 0..DEPTH {
+            tx.insert(QuadRef::new(
+                NamedNodeRef::new_unchecked(&format!("{EX}parent{i}")),
+                NamedNodeRef::new_unchecked(&format!("{EX}p{i}")),
+                node,
+                GraphNameRef::DefaultGraph,
+            ));
+        }
+        tx.commit().expect("commit path data");
+    }
+    let before = engine.snapshot();
+    let graph = before
+        .lookup(NamedNodeRef::new_unchecked(SHAPES).into())
+        .expect("the shapes graph");
+    let shapes =
+        compile(&before, Selection::asserted(GraphSelector::Exact(graph))).expect("shapes");
+    let mut tx = engine.transaction();
+    let rdf_type = NamedNodeRef::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+    for i in 0..512 {
+        let class = if i == 0 { "Target" } else { "C" };
+        tx.insert(QuadRef::new(
+            NamedNodeRef::new_unchecked(&format!("{EX}n{i}")),
+            rdf_type,
+            NamedNodeRef::new_unchecked(&format!("{EX}{class}")),
+            GraphNameRef::DefaultGraph,
+        ));
+    }
+    let changed: Vec<_> = tx.inserted().collect();
+    let after = tx.pending_snapshot();
+    let data = Selection::of(GraphSelector::Exact(TermId::DEFAULT_GRAPH));
+    move |resources| {
+        validate_changes(&before, &after, &shapes, data, &changed, resources)
+            .map(|report| report.results.len())
+    }
+}
+
+/// Spec: all affected sets held at once count against the call's envelope.
+#[test]
+fn the_change_walk_charges_the_sets_it_holds() {
+    if !measure::alone() {
+        return;
+    }
+    for (path_child, side_first) in CHAIN_CASES {
+        let validate = affected_chain(path_child, side_first);
+        let expected = validate(&Resources::default());
+        let resources = Resources {
+            memory: Envelope::new(Some(1 << 20), None),
+            ..Resources::default()
+        };
+        let (outcome, excess) = measure::measure_within(&resources.memory, || validate(&resources));
+        let case = format!("path child {path_child}, side first {side_first}");
+        assert!(
+            excess < WALK_SLACK,
+            "{case}: {excess} bytes beyond the charge"
+        );
+        assert!(matches!(expected, Ok(1)), "{case}: {expected:?}");
+        assert!(matches!(outcome, Ok(1)), "{case}: {outcome:?}");
+    }
+}
+
+/// Spec: a budget below the held sets stops the call and frees their memory.
+#[test]
+fn a_budget_below_the_walks_sets_stops_the_change() {
+    if !measure::alone() {
+        return;
+    }
+    for (path_child, side_first) in CHAIN_CASES
+        .into_iter()
+        .filter(|&(_, side_first)| side_first)
+    {
+        let validate = affected_chain(path_child, side_first);
+        let (unlimited, whole) = measure::measure(|| validate(&Resources::default()));
+        let resources = Resources {
+            memory: Envelope::new(Some(whole / 2), None),
+            ..Resources::default()
+        };
+        let (outcome, excess) = measure::measure_within(&resources.memory, || validate(&resources));
+        assert!(
+            matches!(outcome, Err(QueryEvaluationError::MemoryLimit(_))),
+            "path child {path_child}: {outcome:?} at half of {whole} bytes"
+        );
+        assert_eq!(resources.memory.used(), 0, "path child {path_child}");
+        assert!(
+            excess < WALK_SLACK,
+            "path child {path_child}: {excess} bytes beyond the charge"
+        );
+        assert!(
+            matches!(unlimited, Ok(1)),
+            "path child {path_child}: {unlimited:?}"
+        );
+    }
 }
 
 /// A validation that its envelope can't afford stops before it holds its

@@ -1,4 +1,6 @@
 //! Suspended callers of a depth-first shape walk, indexed by their active keys.
+//!
+//! The map charges its frame slots. Frames account for the heap storage they own.
 
 use std::hash::Hash;
 
