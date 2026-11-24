@@ -1724,10 +1724,10 @@ fn parts(
         }
     };
     let mut triples = ChargedVec::with_capacity(Arc::clone(kept), upper.stack.len()).ok()?;
-    for [s, p, o] in upper.stack.iter() {
+    let mut take = |[s, p, o]: Triple| {
         // L's memberships from the taxonomy are certain: no gap.
         if held_by_lower(lower, classes, [s, p, o]) {
-            continue;
+            return Some(());
         }
         for t in [s, p, o] {
             if upper.is_internal(t) {
@@ -1735,7 +1735,7 @@ fn parts(
             }
         }
         if p == clash {
-            continue;
+            return Some(());
         }
         // By representative here; by member once every fact is seen ([`by_member`]).
         if p == rdf_type {
@@ -1749,7 +1749,17 @@ fn parts(
                 view.named_gap_predicates.insert(p);
             }
         }
-        triples.push(encode([s, p, o])).ok()?;
+        triples.push(encode([s, p, o])).ok()
+    };
+    for t in upper.stack.iter() {
+        take(t)?;
+    }
+    for t in upper.facts() {
+        // The stack already holds the representative form of facts that touch a class.
+        if t.into_iter().any(|id| classes.class_of(id).is_some()) || in_view(snapshot, t) {
+            continue;
+        }
+        take(t)?;
     }
     for signature in [
         &mut view.gap_classes,

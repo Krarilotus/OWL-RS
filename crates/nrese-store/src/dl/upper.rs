@@ -1100,6 +1100,11 @@ impl Upper {
         !self.values.unread && !change.noted.unread
     }
 
+    /// The program's facts before projection onto equality representatives.
+    pub(crate) fn facts(&self) -> impl Iterator<Item = Triple> + '_ {
+        self.facts.iter().copied()
+    }
+
     /// U1's `owl:sameAs` classes: its stack is over their representatives, each other
     /// identity stored as `identity sameAs representative`; empty where nothing is
     /// equated. A U1 with classes is evaluated afresh on each commit.
