@@ -13,6 +13,9 @@ use crate::support::{in_memory_store_config, load_past_the_pipeline};
 const DIFFERENT: &str = "[] a owl:AllDifferent ; owl:members ( :a :a :b ) .";
 const CLASSES: &str = "[] a owl:AllDisjointClasses ; owl:members ( :A :A :B ) .";
 const RDF: &str = "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>";
+const ALIAS_OUTSIDE: &str = "[] a owl:AllDifferent ; owl:members ( :a :a :c ) . :a owl:sameAs :b .";
+const ALIAS_INSIDE: &str = "[] a owl:AllDifferent ; owl:members ( :a :b :c ) . :a owl:sameAs :b .";
+const MARKER: &str = ":Witness a owl:Class . :w a :Witness .";
 
 fn rl_pipeline(rewriting: QlRewritingMode) -> MutationPipeline {
     let store = StoreService::new(nrese_store::StoreConfig {
@@ -39,6 +42,13 @@ fn rebuilt(store: &StoreService, data: &str) -> (ConsistencyStatus, bool) {
 
 fn refused(result: &Result<u64, MutationError>) -> bool {
     matches!(result, Err(MutationError::Rejected(reject)) if reject.kind == RejectKind::Inconsistent)
+}
+
+fn dl_pipeline(representatives: bool) -> MutationPipeline {
+    super::pipeline_of(nrese_store::StoreConfig {
+        equality_by_representatives: representatives,
+        ..in_memory_store_config()
+    })
 }
 
 /// OWL 2 Structural Specification §2.3 and Direct Semantics Tables 5–7. Removing
@@ -134,13 +144,10 @@ fn same_as_members_still_clash_after_a_rebuild() {
     let mut failures = Vec::new();
     for representatives in [true, false] {
         for data in [
-            "[] a owl:AllDifferent ; owl:members ( :a :b :c ) . :a owl:sameAs :b .",
+            ALIAS_INSIDE,
             "[] a owl:AllDifferent ; owl:members ( :a :a :b :c ) . :b owl:sameAs :c .",
         ] {
-            let dl = super::pipeline_of(nrese_store::StoreConfig {
-                equality_by_representatives: representatives,
-                ..in_memory_store_config()
-            });
+            let dl = dl_pipeline(representatives);
             let (status, quarantine) = rebuilt(dl.store(), data);
             if !matches!(status, ConsistencyStatus::Inconsistent { .. }) || !quarantine {
                 failures.push(format!(
@@ -159,14 +166,8 @@ fn same_as_members_still_clash_after_a_rebuild() {
 #[test]
 fn an_alias_outside_the_list_does_not_clash_after_a_rebuild() {
     for representatives in [true, false] {
-        let dl = super::pipeline_of(nrese_store::StoreConfig {
-            equality_by_representatives: representatives,
-            ..in_memory_store_config()
-        });
-        let (status, quarantine) = rebuilt(
-            dl.store(),
-            "[] a owl:AllDifferent ; owl:members ( :a :a :c ) . :a owl:sameAs :b .",
-        );
+        let dl = dl_pipeline(representatives);
+        let (status, quarantine) = rebuilt(dl.store(), ALIAS_OUTSIDE);
         assert_eq!(
             status,
             ConsistencyStatus::Consistent,
@@ -174,6 +175,60 @@ fn an_alias_outside_the_list_does_not_clash_after_a_rebuild() {
         );
         assert!(!quarantine, "representatives={representatives}");
     }
+}
+
+#[test]
+fn single_writes_distinguish_equal_operands_from_an_alias_outside_the_list() {
+    let mut failures = Vec::new();
+    for representatives in [true, false] {
+        for seeded in [false, true] {
+            for (data, clashes) in [(ALIAS_OUTSIDE, false), (ALIAS_INSIDE, true)] {
+                let dl = dl_pipeline(representatives);
+                if seeded {
+                    insert(&dl, MARKER).expect("consistent seed");
+                }
+                let write = insert(&dl, data);
+                if !(if clashes {
+                    refused(&write)
+                } else {
+                    write.is_ok()
+                }) {
+                    failures.push(format!(
+                        "representatives={representatives}, seeded={seeded}, {data}: {write:?}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "single write: {failures:#?}");
+}
+
+#[test]
+fn reads_only_report_inconsistency_when_the_equal_terms_are_list_operands() {
+    let mut failures = Vec::new();
+    for representatives in [true, false] {
+        for (data, clashes) in [(ALIAS_OUTSIDE, false), (ALIAS_INSIDE, true)] {
+            let dl = dl_pipeline(representatives);
+            let (consistency, quarantine) = rebuilt(dl.store(), &format!("{MARKER} {data}"));
+            let (rows, status) = super::queries::query(&dl, "ASK { :w a :Witness }");
+            let correctly_reported = if clashes {
+                quarantine
+                    && !status.is_complete()
+                    && status
+                        .reasons()
+                        .iter()
+                        .any(|reason| reason.contains("the data is inconsistent under OWL 2 DL"))
+            } else {
+                !quarantine && status.is_complete()
+            };
+            if rows != ["true"] || !correctly_reported {
+                failures.push(format!(
+                    "representatives={representatives}, {data}: {consistency:?}, quarantine {quarantine}, {rows:?}, {status:?}"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "quarantine read: {failures:#?}");
 }
 
 #[test]
