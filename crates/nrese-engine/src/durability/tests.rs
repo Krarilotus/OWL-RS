@@ -1,5 +1,6 @@
-//! The commit point of a bulk load and the log's rotation (EEV-01, B-301): a load or
-//! rotation that fails at a durable step never costs a commit acknowledged after it.
+//! The commit point of a bulk load or a commit, and the log's rotation (EEV-01, B-301): a
+//! publication or rotation that fails at a durable step never costs a commit acknowledged
+//! after it.
 
 use std::cell::Cell;
 use std::collections::HashSet;
@@ -44,7 +45,7 @@ pub(super) fn contents(engine: &Engine) -> HashSet<Quad> {
         .collect()
 }
 
-/// How a bulk publication is made to fail at a durable step.
+/// How a publication is made to fail at a durable step.
 #[derive(Clone, Copy)]
 enum Fault {
     /// A test fault point returns an error there.
@@ -55,6 +56,10 @@ enum Fault {
     /// A panic at the install of the version the checkpoint holds, its directory synced, the
     /// log's and the compaction slot's locks held ([`fault::PANIC_AT_VERSION_INSTALL`]).
     PanicAtInstall,
+    /// A panic as a commit's version is built, its record of revision 2 in the log, the log's
+    /// lock held ([`fault::PANIC_IN_COMMIT_PUBLISH`]). A commit installs through
+    /// `Versions::publish`, so [`Self::PanicAtInstall`] isn't on its path.
+    PanicInCommitPublish,
 }
 
 /// What [`Fault::PanicPlaced`]'s panic says.
@@ -67,6 +72,7 @@ impl Fault {
             Self::Error(_) => None,
             Self::PanicPlaced => Some(PLACED_PANIC),
             Self::PanicAtInstall => Some(fault::VERSION_INSTALL_PANIC),
+            Self::PanicInCommitPublish => Some(fault::COMMIT_PUBLISH_PANIC),
         }
     }
 }
@@ -127,8 +133,8 @@ impl Later {
     }
 }
 
-/// What publishes revision 2 of a store at revision 1 by a checkpoint, before it installs
-/// the version the checkpoint holds.
+/// What publishes revision 2 of a store at revision 1, durably before it installs the
+/// version that names it: by a checkpoint, or a commit by its record in the log.
 #[derive(Clone, Copy, Debug)]
 enum Publication {
     /// A bulk load: an append builds its version in memory (`publish`), a replacement
@@ -138,6 +144,8 @@ enum Publication {
     Spilled,
     /// The inferred stack replaced (`publish`).
     Rematerialisation,
+    /// A transaction inserting the marker: its record appended, then its version published.
+    Commit,
 }
 
 fn example(name: &str) -> NamedNode {
@@ -201,6 +209,16 @@ impl Publication {
                 };
                 rematerialisation.finish(vec![triple])
             }
+            Self::Commit => commit(engine, 10),
+        }
+    }
+
+    /// Whether revision 2 is durable in the store at `root` (unknown: not counted): its
+    /// checkpoint is in place, or for a commit its record is in the log.
+    fn durable(self, root: &std::path::Path) -> bool {
+        match self {
+            Self::Commit => records_of(root, 2) > 0,
+            _ => super::checkpoint::placed(root, 2).unwrap_or(false),
         }
     }
 
@@ -212,6 +230,7 @@ impl Publication {
             Self::Load(_) => HashSet::from([quad(1), quad(10), quad(11)]),
             Self::Spilled => (10..18).map(quad).collect(),
             Self::Rematerialisation => HashSet::from([quad(1), inferred()]),
+            Self::Commit => HashSet::from([quad(1), quad(10)]),
         }
     }
 }
@@ -232,7 +251,7 @@ fn records_of(root: &std::path::Path, revision: u64) -> usize {
         .sum()
 }
 
-/// One row of [`a_failed_bulk_publication_never_costs_a_later_acknowledged_commit`]: what
+/// One row of [`a_failed_publication_never_costs_a_later_acknowledged_commit`]: what
 /// went wrong, if anything.
 fn publication_row(injected: Fault, publication: Publication, later: Later) -> Vec<String> {
     let mut wrong = Vec::new();
@@ -253,6 +272,7 @@ fn publication_row(injected: Fault, publication: Publication, later: Later) -> V
             })));
         }
         Fault::PanicAtInstall => fault::PANIC_AT_VERSION_INSTALL.set(true),
+        Fault::PanicInCommitPublish => fault::PANIC_IN_COMMIT_PUBLISH.set(true),
     }
     let published = catch_unwind(AssertUnwindSafe(|| publication.run(&engine)));
     match injected {
@@ -260,12 +280,13 @@ fn publication_row(injected: Fault, publication: Publication, later: Later) -> V
         Fault::PanicPlaced => fault::ON_DIR_SYNC.set(None),
         // Taken by the panic: still set, it was never reached.
         Fault::PanicAtInstall => fired.set(!fault::PANIC_AT_VERSION_INSTALL.replace(false)),
+        Fault::PanicInCommitPublish => fired.set(!fault::PANIC_IN_COMMIT_PUBLISH.replace(false)),
     }
     if injected.panic_text().is_some() && !fired.get() {
         return vec!["the panic's point was never reached".into()];
     }
-    // The checkpoint of revision 2 in place once the publication ended (unknown: not counted).
-    let placed = super::checkpoint::placed(dir.path(), 2).unwrap_or(false);
+    // Revision 2 durable once the publication ended.
+    let durable = publication.durable(dir.path());
     let published = match published {
         Ok(result) => result.map_err(|error| error.to_string()),
         // Only the injected panic is a row's: any other fails it.
@@ -305,15 +326,15 @@ fn publication_row(injected: Fault, publication: Publication, later: Later) -> V
         )),
         _ => {}
     }
-    // The whole recovered set: revision 1's, or the publication's where it is in or was placed,
-    // with the later write where it was acknowledged. A failure that left nothing placed and
+    // The whole recovered set: revision 1's, or the publication's where it is in or durable,
+    // with the later write where it was acknowledged. A failure that left nothing durable and
     // took no later write may have gone either way.
     let before = HashSet::from([quad(1)]);
     let acknowledged = |set: HashSet<Quad>| match after.is_ok() {
         true => later.applied(set),
         false => set,
     };
-    let expected = match (published.is_ok() || placed, after.is_ok()) {
+    let expected = match (published.is_ok() || durable, after.is_ok()) {
         (true, _) => vec![acknowledged(publication.holds())],
         (false, true) => vec![acknowledged(before)],
         (false, false) => vec![before, publication.holds()],
@@ -323,9 +344,9 @@ fn publication_row(injected: Fault, publication: Publication, later: Later) -> V
             "the reopen holds {held:?}, not one of {expected:?}"
         ));
     }
-    // Failed with its checkpoint in place: the log takes no write before a reopen, which
-    // recovers the publication at revision 2 and takes the next write at 3.
-    if published.is_err() && placed {
+    // Failed with revision 2 durable: the log takes no write before a reopen, which recovers
+    // the publication at revision 2 and takes the next write at 3.
+    if published.is_err() && durable {
         if !matches!(after, Err(EngineError::WalPoisoned)) {
             wrong.push(format!(
                 "the write after it is answered {:?}, not refused as poisoned",
@@ -355,15 +376,16 @@ fn publication_row(injected: Fault, publication: Publication, later: Later) -> V
 /// between a durable change and the install of the in-memory state that names it, no later
 /// write is acknowledged until the store is reopened, or memory agrees with what is durable.
 ///
-/// A store at revision 1 with its record in the log; a bulk publication of revision 2 fails at
-/// a durable step; then a write follows. After a restart, the write is there if it was
-/// acknowledged (checked first); the publication is there if it succeeded, and absent if it
-/// failed while the engine went on taking writes (a failure whose outcome is unknown takes no
-/// more: then either is right). A publication that failed with its checkpoint in place leaves
-/// the log taking no write before a reopen, which recovers it at revision 2 and takes the next
-/// commit at 3. The reopened store holds exactly what was recovered: revision 1's statements
-/// or the publication's, with the acknowledged write. A panic other than the one injected
-/// fails its row.
+/// A store at revision 1 with its record in the log; a publication of revision 2 (a bulk one,
+/// or a commit) fails at a durable step; then a write follows. After a restart, the write is
+/// there if it was acknowledged (checked first); the publication is there if it succeeded, and
+/// absent if it failed while the engine went on taking writes (a failure whose outcome is
+/// unknown takes no more: then either is right). A publication that failed with revision 2
+/// durable (its checkpoint in place, or its record in the log) leaves the log taking no write
+/// before a reopen, which recovers it at revision 2 and takes the next commit at 3. The
+/// reopened store holds exactly what was recovered: revision 1's statements or the
+/// publication's, with the acknowledged write. A panic other than the one injected fails its
+/// row.
 ///
 /// The write is a commit of a new statement, or one that changes nothing in memory: after a
 /// replacement, whose checkpoint lacks `quad(1)`, a transaction or an append of `quad(1)`,
@@ -373,10 +395,13 @@ fn publication_row(injected: Fault, publication: Publication, later: Later) -> V
 /// restart skipped it as covered by that checkpoint; the panic rows did the same until the log
 /// was poisoned on any exit, not only a returned error; the unchanged writes were acknowledged
 /// at revision 1 on a poisoned log until every acknowledgement asked the log. The install rows
-/// fail if the fence is let go before the install. Each row is judged on its own. The mapping
-/// rows of a built version are guards, right on the base too: it is then served from memory.
+/// fail if the fence is let go before the install. A commit that panicked as its version was
+/// built left the log taking writes: the next commit was acknowledged at revision 2 too, and
+/// the restart replayed the first record of revision 2 and skipped the second. Each row is
+/// judged on its own. The mapping rows of a built version are guards, right on the base too:
+/// it is then served from memory.
 #[test]
-fn a_failed_bulk_publication_never_costs_a_later_acknowledged_commit() {
+fn a_failed_publication_never_costs_a_later_acknowledged_commit() {
     let points: [(Fault, &str); 5] = [
         (Fault::Error(&fault::FAIL_ROTATE), "rotation"),
         (Fault::Error(&fault::FAIL_DIR_SYNC), "directory sync"),
@@ -391,7 +416,8 @@ fn a_failed_bulk_publication_never_costs_a_later_acknowledged_commit() {
         Publication::Rematerialisation,
     ];
     // Every point and publication with a commit after it; every point with each unchanged
-    // write after a replacement.
+    // write after a replacement; a commit at the one point of its own path.
+    let in_publish = (Fault::PanicInCommitPublish, "panic in the commit's publish");
     let rows = points
         .iter()
         .flat_map(|&point| {
@@ -409,7 +435,8 @@ fn a_failed_bulk_publication_never_costs_a_later_acknowledged_commit() {
                 Publication::Rematerialisation,
                 Later::UnchangedRematerialisation,
             )
-        }));
+        }))
+        .chain([(in_publish, Publication::Commit, Later::Commit)]);
     let mut failures = Vec::new();
     for ((injected, step), publication, later) in rows {
         let wrong = publication_row(injected, publication, later);
@@ -1358,7 +1385,7 @@ fn a_rotation_whose_segment_may_be_placed_takes_no_more_commits() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
-/// Spec: as [`a_failed_bulk_publication_never_costs_a_later_acknowledged_commit`], for a replica's
+/// Spec: as [`a_failed_publication_never_costs_a_later_acknowledged_commit`], for a replica's
 /// replay: once its log is poisoned, no replay is acknowledged before a reopen, whatever the
 /// batch holds. A durable replica at revision 1 (a primary's commit of `quad(1)` applied), its
 /// log poisoned by a rotation that failed with its new segment in place; then
@@ -1469,7 +1496,7 @@ fn settle_panic_row(step: impl FnOnce(&Engine) -> EngineResult<()>) -> Vec<Strin
     wrong
 }
 
-/// Spec: as [`a_failed_bulk_publication_never_costs_a_later_acknowledged_commit`], for the
+/// Spec: as [`a_failed_publication_never_costs_a_later_acknowledged_commit`], for the
 /// log's own append: a record written and synced but not yet installed is a durable change
 /// whose version memory doesn't hold, so an exit there takes no later write before a reopen.
 /// A reopened store, whose names are synced by its first append after the record (the
