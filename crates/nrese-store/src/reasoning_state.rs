@@ -286,7 +286,10 @@ mod tests {
     #[test]
     fn earlier_certificates_are_stale_only_for_hidden_unnamed_classes() {
         let program = RuleProgram::builtin(Ruleset::Owl2Rl);
-        let old = ReasoningState::of(&program, 0);
+        let old = ReasoningState {
+            fingerprint: program.fingerprint(),
+            ..ReasoningState::of(&program, 0)
+        };
         let old_hidden = ReasoningState {
             fingerprint: old.fingerprint ^ 0x5717_c1a5_5e5f_0008,
             ..old.clone()

@@ -49,6 +49,8 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
 /// Spec: a certified store written by the released server opens with its assertions
 /// and unaffected answers intact. A stale hidden membership disappears on the first
 /// start and the resulting certificate stands on the second.
+/// The v1.5.0 ruleset fingerprint already requires startup rematerialisation. The
+/// scoped reasoning-state unit test isolates the change to the hidden-class salt.
 #[tokio::test]
 async fn released_hidden_union_is_revalidated_once() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hidden-union-v1.5.0");
@@ -86,6 +88,8 @@ async fn released_hidden_union_is_revalidated_once() -> Result<(), Box<dyn std::
                 .await?;
             assert_eq!(answer["boolean"], wanted, "{pattern}");
         }
+        let info: serde_json::Value = serde_json::from_str(&server.get("/dataset/info").await?)?;
+        assert_eq!(info["quad_count"], 8, "all asserted statements remain");
         if first {
             converted = std::fs::read(&marker)?;
             assert_ne!(converted, prior);

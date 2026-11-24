@@ -477,10 +477,12 @@ fn a_waiting_write_joins_the_replacement_and_drops_its_reading() {
             .is_none_or(|(_, ground)| !Arc::ptr_eq(ground, &alternate))
     );
     assert_eq!(writer.write_program_metrics().2, 0);
+    let written = ask(&writer, "ex:z ex:p ex:y");
+    assert!(written, "the write answers before rematerialisation");
     store
         .rematerialise(rl().config().materialised_program().unwrap())
         .unwrap();
-    assert!(ask(&writer, "ex:z ex:p ex:y"));
+    assert_eq!(ask(&writer, "ex:z ex:p ex:y"), written);
 }
 
 /// Spec: a newer certified revision published while a write still tags its old
