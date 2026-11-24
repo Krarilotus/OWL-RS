@@ -274,7 +274,7 @@ impl Omissions {
         use Unsupported::{IrregularRoleHierarchy, RoleAutomatonOutsideRegularClass};
         // EL completion needs no regularity.
         self.fatal == self.role_regularity
-            && !self.causes.is_empty()
+            && (self.role_regularity > 0 || !self.causes.is_empty())
             && self
                 .causes
                 .iter()

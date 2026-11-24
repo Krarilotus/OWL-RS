@@ -306,24 +306,31 @@ fn an_irregular_el_ontology_is_answered_completely_by_the_el_classifier() {
 /// proves the subsumptions without a regular role order.
 #[test]
 fn role_regularity_diagnostics_do_not_prevent_a_complete_el_classification() {
-    let dl = pipeline();
-    insert(&dl, IRREGULAR).expect("ontology committed");
-    let store = dl.store();
-    let report = store.classify(&ReadScope::All).expect("classification");
-    assert_eq!(report.engine, "el");
-    assert!(report.complete(), "{:?}", report.incomplete);
-    assert!(has(&report.subsumptions, "A", "G"));
-    let verdict = store
-        .dl()
-        .status()
-        .expect("consistency status")
-        .consistency
-        .verdict;
-    let reason = verdict.reason().unwrap_or_default();
-    assert!(
-        reason.contains("irregular") && reason.contains(" < "),
-        "{verdict:?}"
-    );
+    let diagnostic_only = ":r1 a owl:ObjectProperty . :r2 a owl:ObjectProperty .
+        :r3 a owl:ObjectProperty ; owl:propertyChainAxiom ( :r1 :r2 ) ; rdfs:subPropertyOf :r1 .
+        :A a owl:Class . :B a owl:Class . :C a owl:Class .
+        :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r1 ; owl:someValuesFrom :B ] .
+        :B rdfs:subClassOf :C .";
+    for (data, sub, sup) in [(IRREGULAR, "A", "G"), (diagnostic_only, "B", "C")] {
+        let dl = pipeline();
+        insert(&dl, data).expect("ontology committed");
+        let store = dl.store();
+        let report = store.classify(&ReadScope::All).expect("classification");
+        assert_eq!(report.engine, "el", "classification of {sub} ⊑ {sup}");
+        assert!(report.complete(), "{:?}", report.incomplete);
+        assert!(has(&report.subsumptions, sub, sup));
+        let verdict = store
+            .dl()
+            .status()
+            .expect("consistency status")
+            .consistency
+            .verdict;
+        let reason = verdict.reason().unwrap_or_default();
+        assert!(
+            reason.contains("irregular") && reason.contains(" < "),
+            "{verdict:?}"
+        );
+    }
 }
 
 /// Without assertions, the ontology has a model iff `owl:Thing` is satisfiable: where the

@@ -1469,8 +1469,13 @@ impl<'a> Normaliser<'a> {
 
     /// Named roles whose automata depend on an impossible HKS Definition 2 order.
     fn irregular_roles(&self) -> HashSet<Term> {
+        let inclusions = || {
+            self.rias
+                .iter()
+                .filter(|(_, upper, _)| Some(*upper) != self.ontology.builtin.top_object)
+        };
         let mut classes = HashMap::new();
-        for (chain, upper, _) in &self.rias {
+        for (chain, upper, _) in inclusions() {
             let roles = chain.iter().copied().chain([ObjProp::Named(*upper)]);
             for role in roles.flat_map(|p| [p, p.inverse()]) {
                 if !classes.contains_key(&role) {
@@ -1484,7 +1489,7 @@ impl<'a> Normaliser<'a> {
         }
         let node = |p: ObjProp| classes[&p].min(classes[&p.inverse()]);
         let mut edges: HashMap<ObjProp, Vec<ObjProp>> = HashMap::new();
-        for (chain, upper, _) in &self.rias {
+        for (chain, upper, _) in inclusions() {
             let upper = ObjProp::Named(*upper);
             let root = node(upper);
             let same = |p| classes[&p] == classes[&upper];
@@ -1888,7 +1893,16 @@ fn taking_axioms(takers: &HashMap<u32, Vec<Taker>>, name: u32) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::variables;
+    use super::{HashMap, HashSet, ObjProp, irregular_role_nodes, variables};
+
+    /// The strict order in HKS Definition 2 cannot contain both R ≺ S and S ≺ R,
+    /// so neither role is regular, even if the automaton builder succeeds.
+    #[test]
+    fn a_two_role_order_cycle_makes_both_automata_irregular() {
+        let (r, s) = (ObjProp::Named(1), ObjProp::Named(2));
+        let constraints = HashMap::from([(r, vec![s]), (s, vec![r])]);
+        assert_eq!(irregular_role_nodes(&constraints), HashSet::from([r, s]));
+    }
 
     /// Guard (review A-1203): variables are numbered up to a `u16`'s last number, never past
     /// it. A key's 65,535 shared targets after `y` fit, 65,536 don't; 65,536 values fit,
