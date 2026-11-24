@@ -1456,6 +1456,19 @@ mod tests {
         assert!(changed.is_err(), "the change wasn't refused");
         assert_eq!(mode, "rdfs", "the old reasoning isn't the repository's");
         assert_eq!(got, rdfs, "the old reasoning's answers");
+        let restored = std::sync::Arc::clone(&*repository.pipeline.read());
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while restored.write_program_metrics().0 != 2 {
+            assert!(std::time::Instant::now() < until, "restored write program");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        commit(&restored, SAME_DOG);
+        assert_eq!(restored.write_program_metrics().2, 0);
+        assert_eq!(
+            animals(&store),
+            rdfs,
+            "the restored writer uses the old rules"
+        );
     }
 
     /// The same failure in a store whose reasoning is configured, not changed (the server's

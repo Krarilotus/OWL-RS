@@ -314,6 +314,70 @@ fn preparation_is_local_and_a_write_can_beat_startup() {
     drop(release_a);
 }
 
+/// Spec: a same-revision replacement while a write waits for the slot makes that
+/// write join the replacement. A successor with another reading drops its program.
+#[test]
+fn a_waiting_write_joins_the_replacement_and_drops_its_reading() {
+    let config = StoreConfig {
+        equality_compact: true,
+        ..StoreConfig::in_memory()
+    };
+    let store = loaded(
+        StoreService::new(config).unwrap(),
+        "ex:x owl:sameAs ex:y . ex:y ex:p ex:z .",
+    );
+    let writer = MutationPipeline::new(store.clone(), rl()).prepare_from_start();
+    ready(&writer);
+    let tx = store.engine().transaction();
+    let original = ground_key(tx.base());
+    assert!(original.1.is_some());
+    let certificate = tx.base().certificate().cloned();
+    let (before_slot, waiting_for_slot) = mpsc::channel();
+    let (joined, waiting_to_write) = mpsc::channel();
+    let (resume, wait) = mpsc::channel();
+    let client_writer = writer.clone();
+    let client = thread::spawn(move || {
+        hooks::AFTER_PREFLIGHT.set(Some(Box::new(move || {
+            hooks::AFTER_PREFLIGHT.set(Some(Box::new(move || {
+                joined.send(()).unwrap();
+                wait.recv_timeout(WAIT).unwrap();
+            })));
+            before_slot.send(()).unwrap();
+        })));
+        answer_at(&client_writer, "INSERT DATA { ex:z ex:p ex:x }");
+    });
+    waiting_for_slot.recv_timeout(WAIT).unwrap();
+    let (install, release) = pause(Stage::BeforeInstall);
+    tx.install(None, certificate);
+    until(|| !writer.preparation.builds.is_idle());
+    drop(tx);
+    install.recv_timeout(WAIT).unwrap();
+    until(|| writer.preparation.builds.waiting(&()) != 0);
+    release.send(()).unwrap();
+    waiting_to_write.recv_timeout(WAIT).unwrap();
+    let alternate = cached(&writer.preparation.entry.lock(), (original.0, None))
+        .cloned()
+        .expect("the joined program belongs to the alternate reading");
+    resume.send(()).unwrap();
+    client.join().unwrap();
+    let successor = ground_key(&store.engine().snapshot());
+    assert!(successor.0 > original.0);
+    assert_eq!(successor.1, original.1);
+    assert!(
+        writer
+            .preparation
+            .entry
+            .lock()
+            .as_ref()
+            .is_none_or(|(_, ground)| !Arc::ptr_eq(ground, &alternate))
+    );
+    assert_eq!(writer.write_program_metrics().2, 0);
+    store
+        .rematerialise(rl().config().materialised_program().unwrap())
+        .unwrap();
+    assert!(ask(&writer, "ex:z ex:p ex:y"));
+}
+
 /// Spec: a newer certified revision published while a write still tags its old
 /// result is ready before the next edit arrives.
 #[test]

@@ -9,6 +9,9 @@ use std::collections::BTreeSet;
 #[path = "../../../nrese-reasoner/src/tests/ontology_generator.rs"]
 mod generator;
 
+#[path = "prepare_fixed_edits.rs"]
+mod fixed;
+
 #[derive(Clone, Debug, Default)]
 struct Edit {
     insert: Vec<Quad>,
@@ -51,14 +54,16 @@ fn parse(data: &str) -> Vec<Quad> {
         .collect()
 }
 
-fn fill(config: StoreConfig, edit: &Edit) -> Arc<StoreService> {
+fn fill(
+    config: StoreConfig,
+    edit: &Edit,
+    rules: &nrese_reasoner::RuleProgram,
+) -> Arc<StoreService> {
     let store = Arc::new(StoreService::new(config).unwrap());
     let mut tx = store.engine().transaction();
     edit.change(&mut tx);
     tx.commit().unwrap();
-    store
-        .rematerialise(rl().config().materialised_program().unwrap())
-        .unwrap();
+    store.rematerialise(rules).unwrap();
     store
 }
 
@@ -70,12 +75,12 @@ fn inferred(store: &StoreService) -> BTreeSet<String> {
         .collect()
 }
 
-fn settled(store: &StoreService, edit: &Edit) -> bool {
-    let rules = rl().config().materialised_program().unwrap();
+fn settled(store: &StoreService, edit: &Edit, rules: &nrese_reasoner::RuleProgram) -> bool {
     let mut tx = store.engine().transaction();
-    let program = crate::reasoning::Program::compile(&rules, &|term| tx.intern(term))
+    let program = crate::reasoning::Program::compile(rules, &|term| tx.intern(term))
         .hiding_unnamed_classes(true)
         .unwrap()
+        .by_representatives(store.config().equality_by_representatives)
         .storing_representatives(store.config().equality_compact);
     let before = crate::reasoning::materialise(&program, tx.base()).violations;
     edit.change(&mut tx);
@@ -103,6 +108,7 @@ fn run_edit(writer: &MutationPipeline, edit: &Edit) -> bool {
 }
 
 fn replay(
+    reasoner: Arc<ReasonerService>,
     compact: bool,
     setup: Edit,
     edits: impl IntoIterator<Item = Edit>,
@@ -119,10 +125,13 @@ fn replay(
         data_dir: dir.path().to_owned(),
         ..config.clone()
     };
-    let warm = MutationPipeline::new(fill(config.clone(), &setup), rl()).prepare_from_start();
-    let cold = fill(config.clone(), &setup);
-    let oracle = fill(config, &setup);
-    drop(fill(disk.clone(), &setup));
+    let rules = reasoner.config().materialised_program().unwrap();
+    let warm = MutationPipeline::new(fill(config.clone(), &setup, &rules), reasoner.clone())
+        .prepare_from_start();
+    ready(&warm);
+    let cold = fill(config.clone(), &setup, &rules);
+    let oracle = fill(config, &setup, &rules);
+    drop(fill(disk.clone(), &setup, &rules));
     let worker = rayon::ThreadPoolBuilder::new()
         .num_threads(1)
         .build()
@@ -132,10 +141,10 @@ fn replay(
         until(|| previous.strong_count() == 0);
         let store = Arc::new(StoreService::new(disk.clone()).unwrap());
         previous = Arc::downgrade(&store);
-        let reopened = MutationPipeline::new(store, rl()).prepare_from_start();
+        let reopened = MutationPipeline::new(store, reasoner.clone()).prepare_from_start();
         ready(&reopened);
-        let verdict = settled(&oracle, &edit);
-        let cold_writer = MutationPipeline::new(cold.clone(), rl());
+        let verdict = settled(&oracle, &edit, &rules);
+        let cold_writer = MutationPipeline::new(cold.clone(), reasoner.clone());
         assert_eq!(
             [
                 run_edit(&warm, &edit),
@@ -181,7 +190,7 @@ fn prepared_writes_replay_seeded_histories_against_rematerialisation() {
             }
             edit
         });
-        replay(false, setup, edits, |_| {});
+        replay(rl(), false, setup, edits, |_| {});
     }
 }
 
@@ -199,7 +208,7 @@ fn keeping_one_support_preserves_the_correct_graph_view() {
         remove: parse("ex:g1 { ex:x a ex:A }"),
         ..Edit::default()
     };
-    replay(false, setup, [edit], |store| {
+    replay(rl(), false, setup, [edit], |store| {
         for (graphs, expected) in [(None, true), (Some("g1"), false), (Some("g2"), true)] {
             let scope = ReadScope::of(graphs.map(|g| {
                 Arc::new(GraphAccess {
@@ -207,6 +216,7 @@ fn keeping_one_support_preserves_the_correct_graph_view() {
                         format!("http://example.org/{g}"),
                         "http://example.org/gs".into(),
                     ],
+                    default_graph: true,
                     inferred: true,
                     inferred_by_support: true,
                     ..GraphAccess::default()
