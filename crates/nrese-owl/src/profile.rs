@@ -144,7 +144,7 @@ fn range(o: &Ontology, r: RangeId) -> Profiles {
             DataRange::Literal => Profiles::ALL,
             DataRange::Datatype(t) => datatype(o, *t),
             DataRange::And(rs) => {
-                stack.extend(rs);
+                stack.extend(rs.iter().rev());
                 Profiles::ALL
             }
             // EL: one literal only.
@@ -555,7 +555,7 @@ fn super_covered(o: &Ontology, e: ExprId, rl: bool) -> bool {
         let covered = plain
             || match o.class(e) {
                 ClassExpr::And(es) => {
-                    stack.extend(es);
+                    stack.extend(es.iter().rev());
                     true
                 }
                 ClassExpr::Some(..) | ClassExpr::DataSome(..) => true,

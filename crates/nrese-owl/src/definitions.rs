@@ -188,7 +188,9 @@ fn in_fillers(ontology: &Ontology, e: ExprId, out: &mut HashSet<Term>) {
             ClassExpr::Not(x) | ClassExpr::Some(_, x) | ClassExpr::All(_, x) => {
                 stack.push((*x, inside))
             }
-            ClassExpr::And(xs) | ClassExpr::Or(xs) => stack.extend(xs.iter().map(|&x| (x, inside))),
+            ClassExpr::And(xs) | ClassExpr::Or(xs) => {
+                stack.extend(xs.iter().rev().map(|&x| (x, inside)))
+            }
             _ => {}
         }
     }
