@@ -48,13 +48,15 @@ use nrese_exec::Budget;
 
 use super::batch::{Equality, Store, check, is_replacement};
 use super::eval::{
-    AllFacts, GroundProgram, Job, ListRuleHeads, NEVER, Poller, Probe, RuleKey, Schema, Seg,
-    Source, Stop, Stopped, Visit, Visits, WitnessIndex, instantiate_head, rule_key, run_jobs,
-    run_jobs_acyclic, transitive_predicate,
+    AllFacts, GroundProgram, Job, ListRuleHeads, NEVER, Poller, Probe, RuleKey, ScannedFacts,
+    Schema, Seg, Source, Stop, Stopped, Visit, Visits, WitnessIndex, instantiate_head, rule_key,
+    run_jobs, run_jobs_acyclic, transitive_predicate,
 };
 use super::ir::Triple;
 use super::ir::{Head, Rule};
-use super::lists::{ListDiagnostic, ListVocabulary, Predicates, RuleKind, internal};
+use super::lists::{
+    ListDiagnostic, ListRules, ListVocabulary, Predicates, RuleKind, WrittenLists, internal,
+};
 use super::violations::{Violations, unlimited};
 
 /// The materialised state: asserted facts after the change, and inferred facts before it.
@@ -213,17 +215,18 @@ pub struct Rules<'a> {
 impl Rules<'_> {
     /// The ground program over `source`; its bodiless facts count as handed out. List
     /// rules carry the list facts they come from as premises.
-    fn program<S: Source + ?Sized>(
+    fn program<B: Base + ?Sized>(
         &self,
-        source: &S,
+        source: &Overlay<'_, B>,
         predicates: Predicates,
         poll: &Poller<'_>,
+        restored: &[Triple],
     ) -> GroundProgram {
         let mut program = GroundProgram::default();
         program.list_predicates = predicates;
         program.ground(source, self.schema, self.rules);
         if let Some((rules, premises, diagnostics)) =
-            self.read_lists(source, &mut program.list_predicates, poll)
+            self.read_lists(source, &mut program.list_predicates, poll, restored)
         {
             program.ground_lists(source, self.schema, rules, premises);
             program.list_diagnostics = diagnostics;
@@ -232,7 +235,7 @@ impl Rules<'_> {
         program
     }
 
-    /// The list rules instantiated over `source` for overdeletion.
+    /// The inference list rules instantiated over `source` for overdeletion.
     fn list_rules<S: Source + ?Sized>(
         &self,
         source: &S,
@@ -241,24 +244,60 @@ impl Rules<'_> {
     ) -> Vec<Rule> {
         #[cfg(test)]
         crate::witness::add(crate::witness::Site::ListRules, 1);
-        self.read_lists(source, &mut predicates, poll)
-            .map(|(rules, _, _)| rules)
+        self.lists
+            .map(|vocabulary| {
+                super::lists::compile(
+                    vocabulary,
+                    &AllFacts(source, poll),
+                    &mut predicates,
+                    RuleKind::Inference,
+                    None,
+                )
+                .0
+            })
             .unwrap_or_default()
     }
 
     /// The list rules over `source`, their premises, and the lists left out.
-    fn read_lists<S: Source + ?Sized>(
+    fn read_lists<B: Base + ?Sized>(
         &self,
-        source: &S,
+        source: &Overlay<'_, B>,
         predicates: &mut Predicates,
         poll: &Poller<'_>,
+        restored: &[Triple],
     ) -> Option<ListRules> {
         let vocabulary = self.lists?;
+        let written = ScannedFacts(
+            |pattern: [Option<u64>; 3], found: &mut dyn FnMut(Triple)| {
+                source.base.scan_asserted(pattern, poll, &mut |fact| {
+                    if !source.hidden.contains(&fact) {
+                        found(fact);
+                    }
+                })?;
+                // The pending base has already deleted these assertions.
+                for fact in poll.counted(restored.iter().copied()) {
+                    if pattern
+                        .iter()
+                        .zip(fact)
+                        .all(|(want, n)| want.is_none_or(|want| want == n))
+                    {
+                        found(fact);
+                    }
+                }
+                poll.ended()
+            },
+            poll,
+        );
         Some(super::lists::compile(
             vocabulary,
             &AllFacts(source, poll),
             predicates,
             RuleKind::All,
+            Some(WrittenLists {
+                vocabulary,
+                facts: &written,
+                projection: None,
+            }),
         ))
     }
 
@@ -276,7 +315,7 @@ impl Rules<'_> {
         if list_changed {
             let program = program.to_mut();
             let (rules, premises, diagnostics) = self
-                .read_lists(state, &mut program.list_predicates, poll)
+                .read_lists(state, &mut program.list_predicates, poll, &[])
                 .expect("list vocabulary");
             poll.ended()?;
             program.ground_lists(state, self.schema, rules, premises);
@@ -368,9 +407,6 @@ impl<B: Base + ?Sized> Overlay<'_, B> {
         Ok(!self.hidden.contains(&fact) && !self.extra.contains(fact, poll)?)
     }
 }
-
-/// List rules, the list facts each comes from, and the lists left out.
-type ListRules = (Vec<Rule>, Vec<Vec<[u64; 3]>>, Vec<ListDiagnostic>);
 
 /// Reads count on the base's and the extra store's (each position they visit), and each
 /// base fact's check against the overlay on the extra store's probe.
@@ -465,7 +501,7 @@ pub(crate) fn program_until<B: Base + ?Sized>(
         table: None,
     };
     let stage = Poller::new(stop).ok_or(Stopped)?;
-    let mut program = rules.program(&source, Predicates::default(), &stage);
+    let mut program = rules.program(&source, Predicates::default(), &stage, &[]);
     stage.ended()?;
     program.table = rebuild_table(&program, &source, stop)?;
     if stop() {
@@ -769,7 +805,7 @@ fn update_body<B: Base + ?Sized>(
                 extra: &extra,
                 table: None,
             };
-            let mut program = rules.program(&before, Predicates::default(), &stage);
+            let mut program = rules.program(&before, Predicates::default(), &stage, deleted);
             stage.ended()?;
             program.table = rebuild_table(&program, &before, stop)?;
             Ok(program)
@@ -1233,6 +1269,7 @@ fn update_body<B: Base + ?Sized>(
                 },
                 predicates(),
                 &stage,
+                &[],
             ))
         } else {
             Cow::Borrowed(old_program)
@@ -1627,7 +1664,7 @@ fn update_body<B: Base + ?Sized>(
             extra: &extra,
             table: None,
         };
-        let mut current = rules.program(&state, program.list_predicates.clone(), &stage);
+        let mut current = rules.program(&state, program.list_predicates.clone(), &stage, &[]);
         stage.ended().map_err(stopped)?;
         current.table = rebuild_table(&current, &state, stop).map_err(stopped)?;
         program = Cow::Owned(current);
@@ -1713,7 +1750,7 @@ fn introduced_violations_body<B: Base + ?Sized>(
         table: None,
     };
     let computed = if cache.is_none() {
-        let mut program = rules.program(&before, Predicates::default(), &stage);
+        let mut program = rules.program(&before, Predicates::default(), &stage, &[]);
         stage.ended().map_err(|Stopped| Interrupted::default())?;
         program.table =
             rebuild_table(&program, &before, stop).map_err(|Stopped| Interrupted::default())?;

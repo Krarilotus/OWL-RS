@@ -503,15 +503,40 @@ impl<'v, 'p> Probe<'v, 'p> {
 /// the poller before using a program that may have been interrupted.
 pub struct AllFacts<'a, 'p, S: ?Sized>(pub &'a S, pub &'a Poller<'p>);
 
+impl<S: Source + ?Sized> AllFacts<'_, '_, S> {
+    fn scanned(&self) -> impl Facts + '_ {
+        ScannedFacts(
+            |pattern, found: &mut dyn FnMut(Triple)| self.0.scan(pattern, Seg::All, self.1, found),
+            self.1,
+        )
+    }
+}
+
 impl<S: Source + ?Sized> Facts for AllFacts<'_, '_, S> {
     fn objects(&self, subject: u64, predicate: u64) -> Vec<u64> {
+        self.scanned().objects(subject, predicate)
+    }
+
+    fn pairs(&self, predicate: u64) -> Vec<(u64, u64)> {
+        self.scanned().pairs(predicate)
+    }
+
+    fn stopped(&self) -> bool {
+        self.1.tick()
+    }
+}
+
+pub(crate) struct ScannedFacts<'a, 'p, F>(pub F, pub &'a Poller<'p>);
+
+impl<F> Facts for ScannedFacts<'_, '_, F>
+where
+    F: Fn([Option<u64>; 3], &mut dyn FnMut(Triple)) -> Result<(), Stopped>,
+{
+    fn objects(&self, subject: u64, predicate: u64) -> Vec<u64> {
         let mut out = Vec::new();
-        let read = self.0.scan(
-            [Some(subject), Some(predicate), None],
-            Seg::All,
-            self.1,
-            &mut |t| out.push(t[2]),
-        );
+        let read = (self.0)([Some(subject), Some(predicate), None], &mut |t| {
+            out.push(t[2])
+        });
         if read.is_err() {
             return Vec::new();
         }
@@ -522,11 +547,9 @@ impl<S: Source + ?Sized> Facts for AllFacts<'_, '_, S> {
 
     fn pairs(&self, predicate: u64) -> Vec<(u64, u64)> {
         let mut out = Vec::new();
-        let read = self
-            .0
-            .scan([None, Some(predicate), None], Seg::All, self.1, &mut |t| {
-                out.push((t[0], t[2]))
-            });
+        let read = (self.0)([None, Some(predicate), None], &mut |t| {
+            out.push((t[0], t[2]))
+        });
         if read.is_err() {
             return Vec::new();
         }
