@@ -30,6 +30,7 @@ mod queries;
 mod representatives;
 mod reserved_names;
 mod review;
+mod role_regularity;
 mod routing;
 mod safety;
 mod shapes;

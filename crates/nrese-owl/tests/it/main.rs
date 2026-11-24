@@ -6,6 +6,7 @@ mod functional;
 mod list_cells;
 mod order;
 mod ql_status;
+mod role_regularity;
 mod typing;
 
 use std::collections::HashMap;
