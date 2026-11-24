@@ -1044,6 +1044,7 @@ impl Engine {
             &dictionary,
             &config.compaction,
             config.durability,
+            None,
         )?;
         let version = recovered.version;
         dictionary.set_derived_dir(dir.as_ref().join("derived"));

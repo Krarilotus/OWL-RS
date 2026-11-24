@@ -164,12 +164,13 @@ fn opens_at(target: &Path, last: u64) -> String {
     )
 }
 
-fn check(row: &str, case: &str) {
+fn check(row: &str, case: &str, reason: &str) {
     eprintln!("CASE {row}: {case}");
     assert!(
         case.starts_with("REFUSED"),
         "{row}: the restore was not refused: {case}"
     );
+    assert!(case.contains(reason), "{row}: {case}");
 }
 
 /// Spec: `restore_until` rejects a WAL gap even at a record past the time cutoff.
@@ -185,6 +186,7 @@ fn a_time_cutoff_with_a_gap_in_the_log_is_refused() {
     }
     assert_eq!(image(&e, &backup), 10);
     e.checkpoint().unwrap();
+    let before_last_commit = now_micros();
     commit_plain(&e, 11);
     e.checkpoint().unwrap();
     std::thread::sleep(Duration::from_millis(30));
@@ -198,10 +200,13 @@ fn a_time_cutoff_with_a_gap_in_the_log_is_refused() {
     assert_eq!(segments(&live), [12], "setup: the live log");
     // Control (setup): the whole log, cut at T, gives 11.
     let control = root.path().join("control");
-    let at = nrese_store::restore_until(&backup, &control, &[archive, live.clone()], None, Some(t))
-        .unwrap()
-        .1;
+    let (_, at, report) =
+        nrese_store::restore_until(&backup, &control, &[archive, live.clone()], None, Some(t))
+            .unwrap();
     assert_eq!(at, 11, "setup: T falls between revisions 11 and 12");
+    // Spec: the report names the last kept commit and why recovery stopped.
+    assert_eq!(report.stop, nrese_store::RestoreStop::PastTime);
+    assert!((before_last_commit..=t).contains(&report.last_commit_micros.unwrap()));
 
     let supplied = root.path().join("supplied");
     fs::create_dir_all(&supplied).unwrap();
@@ -215,7 +220,7 @@ fn a_time_cutoff_with_a_gap_in_the_log_is_refused() {
             opens_at(&target, 13)
         ),
     };
-    check("time-cut-hides-gap", &case);
+    check("time-cut-hides-gap", &case, "WAL gap: expected revision 11");
 }
 
 /// Spec: `restore_until` rejects untimed records after the image under a time cutoff.
@@ -260,5 +265,9 @@ fn untimed_records_under_a_time_cutoff_are_refused() {
             opens_at(&target, 5)
         ),
     };
-    check("untimed-records-pass-time-cut", &case);
+    check(
+        "untimed-records-pass-time-cut",
+        &case,
+        "restore by revision",
+    );
 }

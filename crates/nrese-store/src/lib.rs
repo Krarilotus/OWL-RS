@@ -108,6 +108,7 @@ pub use nrese_engine::{
     Applied, CorpusTuning, EngineError, IndexEncoding, LogExpectation, ReadModel,
     VocabularyEncoding, WalDamage,
 };
+pub use nrese_engine::{RestoreReport, RestoreStop};
 pub use nrese_shacl::{ValidationReport, ValidationResult};
 pub use nrese_sparql::{
     CancellationToken, Explanation, PlanStep, PlannedQuery, PlannedStep, QueryEvaluationError,

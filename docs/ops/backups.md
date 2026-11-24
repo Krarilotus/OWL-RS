@@ -76,12 +76,15 @@ nrese-server restore DIR --wal DATA/wal-archive --wal DATA/wal --until-time 2026
 - `--until-time T` replays the commits made up to `T`, an RFC 3339 time with a zone, read by the
   `xsd:dateTime` calendar: no leap second `:60`, offsets within ±14:00, `24:00:00` the next day's
   midnight, and digits past the microsecond cut off. It doesn't check that the log reaches
-  `T`: the `restored` log line names the revision reached, so compare it with the one you expect.
+  `T`. The `restored` log line reports the last revision kept and its commit time in
+  microseconds since 1970, if known. `stopped_at=PastTime` means recovery found a record past
+  `T`, and `stopped_at=EndOfLog` means the supplied log ended.
 - With both, it stops at `N`, and fails if a commit after `T` comes before `N`.
 - Without either, it replays as far as the log goes.
 
-A restore by time refuses an image whose last commit was made after `T` (take an older image),
-and an image with no commit time (restore it by revision). These have none:
+A restore by time refuses an image whose last commit was made after `T` (take an older image).
+It also refuses an image or a later log record with no commit time (restore by revision).
+These images have none:
 
 - images written before 7 November 2026 (checkpoint format 11);
 - every image, a bulk replacement's included, of a store upgraded from such a checkpoint, or
@@ -91,8 +94,8 @@ and an image with no commit time (restore it by revision). These have none:
 To get restore by time for such a store, export it as N-Quads and `nrese-server load` the export
 into a new, empty data directory. That store's images have commit times.
 
-The target data directory must hold no store. After a failed restore, try again into a fresh,
-empty directory: a refusal can come before the image is placed, with the directory as it was.
+The target data directory must be empty apart from `LOCK` and an empty `wal/`. If the store
+reports an unfinished restore, empty the directory and restore again.
 
 `nrese-server prune-archive R` removes the archived segments whose records all come before
 revision `R`, so after an image at revision `R - 1` or later. It is safe while the server runs.

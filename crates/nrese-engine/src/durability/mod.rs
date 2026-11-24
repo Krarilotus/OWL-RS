@@ -40,6 +40,8 @@ use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
 
+pub use lock::StoreLock;
+
 use crate::engine::{Stack, Version, VersionData, Watch};
 use crate::error::{EngineError, EngineResult};
 use crate::index::compaction::merge_runs;
@@ -129,11 +131,9 @@ pub struct DurabilityConfig {
     /// the checkpoint is newer or the log ends before it.
     pub recover_until: Option<u64>,
     /// Recover the commits made up to this time only (microseconds since 1970), cut as
-    /// with `recover_until`; commits logged without a time (before WAL version 6) count as
-    /// earlier. Opening fails if the checkpoint's last commit was made after it, or its
-    /// time isn't known (format 11 and older, or any commit of unknown time in the store
-    /// before it, a bulk replacement since included): restore from an older image, or by
-    /// revision.
+    /// with `recover_until`. Opening fails if the checkpoint's last commit was made after
+    /// it (restore from an older image), or if the checkpoint or a record after it has no
+    /// commit time (restore by revision).
     pub recover_until_micros: Option<u64>,
     /// Damage in the newest WAL segment: refuse to open (the default), or keep the log up
     /// to it.
@@ -142,6 +142,32 @@ pub struct DurabilityConfig {
     /// (a torn or damaged tail, a point-in-time cut): what it says about the data may be about
     /// commits the cut takes.
     pub forget_on_cut: Option<&'static str>,
+}
+
+/// Present while a point-in-time restore is placing and cutting a copy of a store.
+pub const RESTORE_PENDING: &str = "restore.pending";
+
+/// Refuses a directory marked as an unfinished point-in-time restore.
+pub fn check_unfinished_restore(root: &Path) -> EngineResult<()> {
+    if root.join(RESTORE_PENDING).try_exists()? {
+        return Err(EngineError::UnfinishedRestore);
+    }
+    Ok(())
+}
+
+/// What ended recovery of a supplied log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreStop {
+    EndOfLog,
+    PastRevision,
+    PastTime,
+}
+
+/// Where recovery stopped and the time of the last commit kept, if known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestoreReport {
+    pub stop: RestoreStop,
+    pub last_commit_micros: Option<u64>,
 }
 
 impl Default for DurabilityConfig {
@@ -221,7 +247,7 @@ pub(crate) struct Durable {
     /// Set once the names a reopen left pending are synced ([`Self::settle_names`]): read
     /// without the WAL's lock, so the log is served without taking it after that.
     names_settled: std::sync::atomic::AtomicBool,
-    _lock: lock::StoreLock,
+    _lock: StoreLock,
 }
 
 /// State reconstructed by [`Durable::open`].
@@ -230,6 +256,7 @@ pub(crate) struct Recovered {
     pub version: Version,
     /// The store's commit clock: the latest of the checkpoint's and every logged commit time.
     pub clock: u64,
+    pub restore: RestoreReport,
 }
 
 impl Durable {
@@ -240,6 +267,7 @@ impl Durable {
         dictionary: &Dictionary,
         policy: &CompactionPolicy,
         config: DurabilityConfig,
+        restore_lock: Option<StoreLock>,
     ) -> EngineResult<Recovered> {
         // Durably named, every level of it: commits acknowledged in it must
         // not lose the directory that holds them. A root found: its holders' syncs are left to
@@ -255,7 +283,14 @@ impl Durable {
         // Whether the open changes the store on disk: then what it changed, and the names
         // with it, are synced before it returns, as before.
         let mut changed = !found;
-        let lock = lock::StoreLock::acquire(root)?;
+        let lock = match restore_lock {
+            Some(lock) => lock,
+            None => {
+                let lock = StoreLock::acquire(root)?;
+                check_unfinished_restore(root)?;
+                lock
+            }
+        };
         checkpoint::remove_temporaries(root)?;
         crate::engine::spill::remove_leftovers(root)?;
         let clock = std::time::Instant::now();
@@ -385,8 +420,8 @@ impl Durable {
                 Some(_) => {}
             }
         }
-        // Set once the log has been cut at `recover_until`: later segments go.
-        let mut cut = false;
+        let mut stop = RestoreStop::EndOfLog;
+        let mut last_commit_micros = version.committed_micros;
         // What the checkpoint holds, and the segments records were replayed from.
         let covered_through = version.revision;
         let mut replayed = Vec::new();
@@ -395,7 +430,7 @@ impl Durable {
         // one the replay removed (a point-in-time cut, a tail without even a header) not.
         let mut newest = None;
         for (position, (_, path)) in segments.iter().enumerate() {
-            if cut {
+            if stop != RestoreStop::EndOfLog {
                 #[cfg(feature = "fault-points")]
                 crate::fault_points::cut_step()?;
                 fs::remove_file(path)?;
@@ -454,14 +489,33 @@ impl Durable {
                 if record.revision <= version.revision {
                     continue; // covered by the checkpoint
                 }
-                let after = config
-                    .recover_until
-                    .is_some_and(|until| record.revision > until)
+                if record.revision != version.revision + 1 {
+                    return Err(EngineError::Corruption(format!(
+                        "WAL gap: expected revision {}, found {} in {}",
+                        version.revision + 1,
+                        record.revision,
+                        path.display()
+                    )));
+                }
+                let after_time = match config.recover_until_micros {
+                    Some(until) => record.committed_micros.ok_or_else(|| {
+                        EngineError::Configuration(format!(
+                            "the WAL record at revision {} has no commit time: restore by revision",
+                            record.revision
+                        ))
+                    })? > until,
+                    None => false,
+                };
+                if after_time
                     || config
-                        .recover_until_micros
-                        .zip(record.committed_micros)
-                        .is_some_and(|(until, committed)| committed > until);
-                if after {
+                        .recover_until
+                        .is_some_and(|until| record.revision > until)
+                {
+                    stop = if after_time {
+                        RestoreStop::PastTime
+                    } else {
+                        RestoreStop::PastRevision
+                    };
                     #[cfg(feature = "fault-points")]
                     crate::fault_points::cut_step()?;
                     forget_before_cut(root, &config)?;
@@ -473,23 +527,15 @@ impl Durable {
                         }
                         _ => wal::truncate_segment(path, contents.ends[index - 1])?,
                     };
-                    cut = true;
                     break;
                 }
-                if record.revision != version.revision + 1 {
-                    return Err(EngineError::Corruption(format!(
-                        "WAL gap: expected revision {}, found {} in {}",
-                        version.revision + 1,
-                        record.revision,
-                        path.display()
-                    )));
-                }
                 replay(&mut version, dictionary, policy, record)?;
+                last_commit_micros = record.committed_micros;
                 if replayed.last() != Some(&path) {
                     replayed.push(path);
                 }
             }
-            if contents.torn && !cut {
+            if contents.torn && stop == RestoreStop::EndOfLog {
                 if Some(position) != last {
                     return Err(EngineError::Corruption(format!(
                         "invalid record in {} (not the last segment)",
@@ -545,7 +591,7 @@ impl Durable {
             }
         }
         // A point-in-time cut removed or truncated segments.
-        changed |= cut;
+        changed |= stop != RestoreStop::EndOfLog;
 
         if let Some(until) = config.recover_until
             && version.revision < until
@@ -617,6 +663,10 @@ impl Durable {
                 _lock: lock,
             },
             clock: store_clock.max(version.committed_micros.unwrap_or(0)),
+            restore: RestoreReport {
+                stop,
+                last_commit_micros,
+            },
             version,
         })
     }

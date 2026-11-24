@@ -104,15 +104,17 @@ fn an_image_and_the_log_restore_a_later_revision() {
     let logs = [data.path().join("wal-archive"), data.path().join("wal")];
     for (i, &revision) in revisions.iter().enumerate() {
         let target = backups.path().join(format!("at-{revision}"));
-        let (restored, at) =
+        let (restored, at, _) =
             nrese_store::restore_until(&dir, &target, &logs, Some(revision), None).unwrap();
         assert_eq!((restored, at), (manifest.clone(), revision));
         let store = StoreService::new(StoreConfig::on_disk(&target)).unwrap();
         assert_eq!(count(&store), 2 + i as u64);
     }
     let target = backups.path().join("all");
-    let (_, at) = nrese_store::restore_until(&dir, &target, &logs, None, None).unwrap();
+    let (_, at, report) = nrese_store::restore_until(&dir, &target, &logs, None, None).unwrap();
     assert_eq!(at, *revisions.last().unwrap());
+    // Spec: recovery reports when it reaches the end of the supplied log.
+    assert_eq!(report.stop, nrese_store::RestoreStop::EndOfLog);
 }
 
 /// Pruning the archive keeps what a restore after a revision needs.
