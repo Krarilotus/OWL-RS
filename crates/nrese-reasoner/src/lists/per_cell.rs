@@ -27,6 +27,7 @@ pub(crate) fn internal(predicate: u64) -> bool {
 
 /// Predicate IDs stay stable while a ground program is extended.
 #[derive(Clone, Default)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub(crate) struct Predicates(Option<Arc<HashMap<u64, u64>>>);
 
 impl Predicates {

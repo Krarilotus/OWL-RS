@@ -916,6 +916,133 @@ mod tests {
     use nrese_rdf::{BlankNodeRef, NamedNodeRef};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// Spec: grounding a certified snapshot and grounding the same base through the
+    /// cold commit adapter give the same rule instances, premises and list tables.
+    #[test]
+    fn snapshot_and_cold_commit_ground_the_same_program() {
+        use crate::eval::{GroundProgram, Grounding, Seg, Source};
+        use nrese_rdf_io::{RdfFormat, RdfParser};
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        let input = b"@prefix ex: <http://example.org/> .
+            @prefix owl: <http://www.w3.org/2002/07/owl#> .
+            @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+            ex:p owl:propertyChainAxiom (ex:q ex:r) .
+            ex:A rdfs:subClassOf ex:B .
+            ex:x a ex:A ; ex:q ex:y . ex:y ex:r ex:z .
+            ex:B owl:disjointWith ex:C .
+            _:u owl:unionOf (ex:A ex:B) .";
+        for quad in RdfParser::from_format(RdfFormat::Turtle).for_reader(&input[..]) {
+            tx.insert(quad.unwrap().as_ref());
+        }
+        let rules = crate::rulesets::Ruleset::Owl2Rl.into();
+        let program = Program::compile(&rules, &|term| tx.intern(term))
+            .hiding_unnamed_classes(true)
+            .unwrap();
+        tx.commit().unwrap();
+        let remat = engine.rematerialisation();
+        let closure = super::super::materialise(&program, remat.base());
+        remat.finish(closure.inferred).unwrap();
+        let tx = engine.transaction();
+        let base = tx.base();
+        let adapter = EngineBase::new(&tx, program.axioms());
+        let schema = program.schema_for(base);
+        let rules = program.rules_for(base);
+        let cold = delta::program(
+            &adapter,
+            delta::Rules {
+                rules: &rules,
+                schema: &schema,
+                ..program.rules()
+            },
+        );
+        let prepared = program.ground_program(base);
+        let instances = |g: &GroundProgram| {
+            g.rules
+                .iter()
+                .enumerate()
+                .map(|(index, rule)| {
+                    let mut sets: Vec<_> = g
+                        .unpolled()
+                        .premise_alternatives(Grounding::Rule(index))
+                        .into_iter()
+                        .map(<[_]>::to_vec)
+                        .collect();
+                    sets.sort();
+                    (format!("{rule:?}"), sets, g.equality[index])
+                })
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(instances(&prepared), instances(&cold));
+        assert_eq!(prepared.bodiless, cold.bodiless);
+        assert_eq!(prepared.transitive, cold.transitive);
+        for grounding in prepared
+            .bodiless
+            .iter()
+            .copied()
+            .map(Grounding::Bodiless)
+            .chain(
+                prepared
+                    .transitive
+                    .iter()
+                    .copied()
+                    .map(Grounding::Transitive),
+            )
+        {
+            let alternatives = |g: &GroundProgram| {
+                g.unpolled()
+                    .premise_alternatives(grounding)
+                    .into_iter()
+                    .map(<[_]>::to_vec)
+                    .collect::<BTreeSet<_>>()
+            };
+            assert_eq!(alternatives(&prepared), alternatives(&cold));
+        }
+        for quad in base.quads_for_pattern_in(ReadModel::Materialised, &QuadPattern::all()) {
+            let produced = |g: &GroundProgram| {
+                g.unpolled()
+                    .producers(triple(quad))
+                    .into_iter()
+                    .map(|i| format!("{:?}", g.rules[i]))
+                    .collect::<BTreeSet<_>>()
+            };
+            assert_eq!(produced(&prepared), produced(&cold));
+        }
+        let consistency = |g: &GroundProgram| {
+            g.consistency
+                .iter()
+                .map(|(rule, bound)| {
+                    (
+                        format!("{rule:?}/{:?}", bound.rule),
+                        bound.substitution.clone(),
+                    )
+                })
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(consistency(&prepared), consistency(&cold));
+        assert_eq!(prepared.list_diagnostics, cold.list_diagnostics);
+        let table = |g: &GroundProgram| {
+            let mut rows = BTreeSet::new();
+            g.table
+                .as_ref()
+                .unwrap()
+                .scan([None; 3], Seg::All, &Poller::never(), &mut |fact| {
+                    rows.insert(
+                        fact.map(|id| super::super::decoded(base.decode(TermId::from_raw(id)), id)),
+                    );
+                })
+                .unwrap();
+            rows
+        };
+        let rows = table(&prepared);
+        assert!(!rows.is_empty());
+        assert_eq!(rows, table(&cold));
+        assert_eq!(prepared.list_predicates, cold.list_predicates);
+        assert_eq!(prepared.operand_templates(), cold.operand_templates());
+        assert_eq!(prepared.table_rules, cold.table_rules);
+        assert_eq!(prepared.family_relations, cold.family_relations);
+    }
+
     /// Spec: a redeclaration spends a second rebuild only for introduced-only judgement
     /// when the changed state reports a clash. A caller using the full report gets it from
     /// the pending rebuild alone. An ordinary insertion takes the delta.

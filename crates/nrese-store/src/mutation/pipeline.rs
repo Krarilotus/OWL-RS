@@ -16,6 +16,10 @@ use crate::graph_store::{GraphDeleteReport, GraphTarget, GraphWriteReport, Graph
 use crate::service::StoreService;
 use crate::update::{SparqlUpdateRequest, UpdateExecutionReport};
 
+#[cfg(test)]
+#[path = "prepare_tests.rs"]
+mod prepare_tests;
+
 /// The single owner of write semantics: plan → validate → claim → commit.
 ///
 /// 1. Open an engine transaction. Its writer slot serialises writers; readers never wait.

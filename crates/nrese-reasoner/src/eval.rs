@@ -2533,6 +2533,13 @@ impl std::fmt::Debug for GroundProgram {
 }
 
 impl GroundProgram {
+    #[cfg(test)]
+    pub(crate) fn operand_templates(&self) -> Option<&[(Rule, Vec<Triple>)]> {
+        self.list_operands
+            .as_ref()
+            .map(|ops| ops.templates.as_slice())
+    }
+
     /// Files one ground fact rule; returns its index if it is new and has a body.
     pub fn add(&mut self, rule: Rule) -> Option<usize> {
         self.add_with(rule, Vec::new(), None, None)

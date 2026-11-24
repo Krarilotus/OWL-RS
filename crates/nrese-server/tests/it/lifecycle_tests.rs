@@ -11,6 +11,81 @@ use tower::util::ServiceExt;
 
 use crate::support::{body_text, test_app_with_store};
 
+#[cfg(feature = "fault-points")]
+mod write_program {
+    use super::*;
+    use crate::support::test_state_with_store_config;
+    use nrese_store::mutation::write_program_hooks::{Stage, set};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    // Each hold is owned by the test that creates the server, across the worker's spawn.
+    fn hold(stage: Stage) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (entered, seen) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        set(stage, move || {
+            entered.send(()).unwrap();
+            let _ = wait.recv_timeout(Duration::from_secs(10));
+        });
+        (seen, release)
+    }
+
+    /// Spec: the serving router answers ready while write preparation is held before
+    /// its claim or inside grounding.
+    #[tokio::test]
+    async fn readiness_does_not_join_write_program_preparation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for stage in [Stage::BeforeClaim, Stage::DuringGrounding] {
+            let (entered, release) = hold(stage);
+            let state = test_state_with_store_config(
+                StoreConfig::in_memory(),
+                PolicyConfig::default(),
+                ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
+            )?;
+            entered.recv_timeout(Duration::from_secs(10))?;
+            let app = nrese_server::app::build_app(state);
+            let ready =
+                tokio::time::timeout(Duration::from_secs(2), app.oneshot(get("/readyz"))).await??;
+            assert_eq!(ready.status(), StatusCode::OK);
+            release.send(())?;
+        }
+        Ok(())
+    }
+
+    /// Spec: an update awaiting a preparation past its deadline gets a 408 and
+    /// publishes nothing after the preparation resumes.
+    #[tokio::test]
+    async fn a_write_program_wait_uses_the_http_deadline() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (entered, release) = hold(Stage::BeforeInstall);
+        let mut policy = PolicyConfig::default();
+        policy.timeouts.update = Duration::from_millis(150);
+        let state = test_state_with_store_config(
+            StoreConfig::in_memory(),
+            policy,
+            ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
+        )?;
+        entered.recv_timeout(Duration::from_secs(10))?;
+        let revision = state.store().current_revision();
+        let pipeline = state.pipeline();
+        let app = nrese_server::app::build_app(state);
+        let response = app.oneshot(update(
+            "INSERT DATA { <http://example.org/x> <http://example.org/p> <http://example.org/y> }",
+        )).await?;
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        release.send(())?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while pipeline.write_program_metrics().0 != 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        assert_eq!(pipeline.store().current_revision(), revision);
+        assert_eq!(pipeline.write_program_metrics().2, 0);
+        Ok(())
+    }
+}
+
 const EX: &str = "http://example.com/";
 
 fn get(uri: &str) -> Request<Body> {

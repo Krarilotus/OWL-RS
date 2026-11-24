@@ -119,13 +119,21 @@ impl Preparation {
 
     fn launch(self: &Arc<Self>, reply: Option<Guard<Handoff>>) -> std::io::Result<()> {
         let prep = Arc::clone(self);
+        #[cfg(any(test, feature = "fault-points"))]
+        let hooks = super::write_program_hooks::take();
         std::thread::Builder::new()
             .name("nrese-write-program".into())
-            .spawn(move || prep.run(reply))
+            .spawn(move || {
+                #[cfg(any(test, feature = "fault-points"))]
+                super::write_program_hooks::install(hooks);
+                prep.run(reply);
+            })
             .map(drop)
     }
 
     fn run(&self, mut reply: Option<Guard<Handoff>>) {
+        #[cfg(any(test, feature = "fault-points"))]
+        super::write_program_hooks::run(super::write_program_hooks::Stage::BeforeClaim);
         let requested = reply.is_some();
         while let Some(store) = self.store.upgrade().filter(|_| !*self.retired.lock()) {
             let key = ground_key(&store.engine().snapshot());
@@ -213,10 +221,16 @@ impl Preparation {
         let key = *pinned;
         let moved = || ground_key(&store.engine().snapshot()) != key;
         let memory = store.memory_stop();
-        let stop = || *self.retired.lock() || moved() || memory.exceeded();
+        let stop = || {
+            #[cfg(any(test, feature = "fault-points"))]
+            super::write_program_hooks::run(super::write_program_hooks::Stage::DuringGrounding);
+            *self.retired.lock() || moved() || memory.exceeded()
+        };
         let room = || memory.room();
         let operation = OperationStop::new(&stop).within(&room);
         let built = program.ground_program_until(&base, &|| operation.fired());
+        #[cfg(any(test, feature = "fault-points"))]
+        super::write_program_hooks::run(super::write_program_hooks::Stage::BeforeInstall);
         let mut entry = self.entry.lock();
         let retired = self.retired.lock();
         if *retired || moved() {
