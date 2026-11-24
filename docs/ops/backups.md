@@ -75,15 +75,17 @@ nrese-server restore DIR --wal DATA/wal-archive --wal DATA/wal --until-time 2026
   current one to whole-dataset readers and administrators.
 - `--until-time T` replays the commits made up to `T`, an RFC 3339 time with a zone, read by the
   `xsd:dateTime` calendar: no leap second `:60`, offsets within ±14:00, `24:00:00` the next day's
-  midnight, and digits past the microsecond cut off. It doesn't check that the log reaches
-  `T`. The `restored` log line reports the last revision kept and its commit time in
-  microseconds since 1970, if known. `stopped_at=PastTime` means recovery found a record past
-  `T`, and `stopped_at=EndOfLog` means the supplied log ended.
+  midnight, and digits past the microsecond cut off. It stops at the first record past `T`,
+  and doesn't check that the log reaches `T`. The `restored` log line reports the last
+  revision kept and the latest commit time it holds (`latest_commit_micros`), in microseconds
+  since 1970, if known. `stopped_at=PastTime` means recovery found a record past `T`, and
+  `stopped_at=EndOfLog` means the supplied log ended.
 - With both, it stops at `N`, and fails if a commit after `T` comes before `N`.
 - Without either, it replays as far as the log goes.
 
-A restore by time refuses an image whose last commit was made after `T` (take an older image).
-It also refuses an image or a later log record with no commit time (restore by revision).
+A restore by time refuses an image holding a commit made after `T` (take an older image). It
+also refuses an image with no commit time, or a log record with none that comes before the
+first record past `T` (restore by revision).
 These images have none:
 
 - images written before 7 November 2026 (checkpoint format 11);

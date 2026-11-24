@@ -280,7 +280,7 @@ async fn run() -> Result<()> {
             image_revision = manifest.revision,
             revision,
             stopped_at = ?report.stop,
-            last_commit_micros = ?report.last_commit_micros,
+            latest_commit_micros = ?report.latest_commit_micros,
             data_dir = %config.store.data_dir.display(),
             "restored"
         );

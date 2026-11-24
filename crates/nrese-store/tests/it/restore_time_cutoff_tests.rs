@@ -226,7 +226,7 @@ fn a_time_cutoff_with_a_gap_in_the_log_is_refused() {
     assert_eq!(at, 11, "setup: T falls between revisions 11 and 12");
     // Spec: the report names the last kept commit and why recovery stopped.
     assert_eq!(report.stop, nrese_store::RestoreStop::PastTime);
-    assert!((before_last_commit..=t).contains(&report.last_commit_micros.unwrap()));
+    assert!((before_last_commit..=t).contains(&report.latest_commit_micros.unwrap()));
 
     let supplied = root.path().join("supplied");
     fs::create_dir_all(&supplied).unwrap();
@@ -308,7 +308,7 @@ fn a_time_cutoff_past_the_log_reports_the_end_of_the_log() {
             .unwrap();
     assert_eq!(at, 5);
     assert_eq!(report.stop, nrese_store::RestoreStop::EndOfLog);
-    assert!((before_last_commit..=t).contains(&report.last_commit_micros.unwrap()));
+    assert!((before_last_commit..=t).contains(&report.latest_commit_micros.unwrap()));
 }
 
 /// Spec: revision 0 holds no commit, so a restore of an image at 0 with nothing replayed
@@ -324,7 +324,7 @@ fn an_empty_image_restored_reports_no_commit_time() {
     let (_, at, report) = nrese_store::restore_until(&backup, &target, &[], None, None).unwrap();
     assert_eq!(at, 0);
     assert_eq!(report.stop, nrese_store::RestoreStop::EndOfLog);
-    assert_eq!(report.last_commit_micros, None);
+    assert_eq!(report.latest_commit_micros, None);
 }
 
 /// Spec: the restore reports the latest commit time among the commits it keeps, as a version's
@@ -354,7 +354,7 @@ fn a_stepped_back_log_reports_its_latest_commit_time() {
     let (_, at, report) =
         nrese_store::restore_until(&backup, &target, &[supplied], None, None).unwrap();
     assert_eq!(at, 2);
-    assert_eq!(report.last_commit_micros, Some(2000));
+    assert_eq!(report.latest_commit_micros, Some(2000));
 }
 
 /// Spec: `restore_until` rejects untimed records after the image under a time cutoff.

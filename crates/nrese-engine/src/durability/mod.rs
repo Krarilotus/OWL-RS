@@ -163,11 +163,13 @@ pub enum RestoreStop {
     PastTime,
 }
 
-/// Where recovery stopped and the time of the last commit kept, if known.
+/// Where recovery stopped, and the latest commit time among the commits kept, if known: the
+/// recovered version's time, which bounds every commit in it (a log an earlier binary wrote may
+/// step back, so the last commit's own time can be earlier).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RestoreReport {
     pub stop: RestoreStop,
-    pub last_commit_micros: Option<u64>,
+    pub latest_commit_micros: Option<u64>,
 }
 
 impl Default for DurabilityConfig {
@@ -421,8 +423,6 @@ impl Durable {
             }
         }
         let mut stop = RestoreStop::EndOfLog;
-        // Revision 0 holds no commit, so it has no commit time to report.
-        let mut last_commit_micros = version.committed_micros.filter(|_| version.revision > 0);
         // What the checkpoint holds, and the segments records were replayed from.
         let covered_through = version.revision;
         let mut replayed = Vec::new();
@@ -533,7 +533,6 @@ impl Durable {
                     break;
                 }
                 replay(&mut version, dictionary, policy, record)?;
-                last_commit_micros = record.committed_micros;
                 if replayed.last() != Some(&path) {
                     replayed.push(path);
                 }
@@ -668,7 +667,8 @@ impl Durable {
             clock: store_clock.max(version.committed_micros.unwrap_or(0)),
             restore: RestoreReport {
                 stop,
-                last_commit_micros,
+                // Revision 0 holds no commit, so it has no commit time to report.
+                latest_commit_micros: version.committed_micros.filter(|_| version.revision > 0),
             },
             version,
         })
