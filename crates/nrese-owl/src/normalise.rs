@@ -193,6 +193,50 @@ struct Gci {
     taker: Taker,
 }
 
+/// A step of [`Normaliser::normal_form`].
+enum Step {
+    /// The form, interned.
+    Done(ExprId),
+    /// The form is that of an expression (negated, or not): nothing waits for it.
+    Then(ExprId, bool),
+    /// An operand's form (negated, or not) is needed first, for what waits.
+    Operand(ExprId, bool, Waiting),
+}
+
+/// What an expression of [`Normaliser::normal_form`] builds once its operand's form is known.
+enum Waiting {
+    /// An intersection (`or`: a union) of the forms of operands, all negated or none; `rest`
+    /// still to normalise.
+    Set {
+        negated: bool,
+        or: bool,
+        rest: std::vec::IntoIter<ExprId>,
+        done: Vec<ExprId>,
+    },
+    Wrap(fn(ObjProp, ExprId) -> ClassExpr, ObjProp),
+    Count(fn(u32, ObjProp, ExprId) -> ClassExpr, u32, ObjProp),
+    /// `= n R.C`: `≥ n R.C ⊓ ≤ n R.C`.
+    Exact(u32, ObjProp),
+    /// `¬= n R.C`: `≤ n-1 R.C ⊔ ≥ n+1 R.C`.
+    NotExact(u32, ObjProp),
+}
+
+impl Step {
+    fn wrap(x: ExprId, negated: bool, make: fn(ObjProp, ExprId) -> ClassExpr, r: ObjProp) -> Self {
+        Self::Operand(x, negated, Waiting::Wrap(make, r))
+    }
+
+    fn count(
+        x: ExprId,
+        negated: bool,
+        make: fn(u32, ObjProp, ExprId) -> ClassExpr,
+        n: u32,
+        r: ObjProp,
+    ) -> Self {
+        Self::Operand(x, negated, Waiting::Count(make, n, r))
+    }
+}
+
 struct Normaliser<'a> {
     ontology: &'a Ontology,
     classes: Interner<ClassExpr>,
@@ -284,26 +328,70 @@ impl<'a> Normaliser<'a> {
     /// The negation normal form of `id`; `None` where it needs `≥ n + 1` past a `u32`
     /// count (`nnf_not`).
     fn nnf(&mut self, id: ExprId) -> Option<ExprId> {
+        self.normal_form(id, false)
+    }
+
+    /// The negation normal form of `¬id`; `None` where it needs `≥ n + 1` for `≤ n` or
+    /// `= n` past a `u32` count, which nothing can stand for: the caller emits nothing of
+    /// it, and its axiom is unsupported.
+    fn nnf_not(&mut self, id: ExprId) -> Option<ExprId> {
+        self.normal_form(id, true)
+    }
+
+    /// The negation normal form of `id`, or of `¬id` where `negated`, with its own stack:
+    /// the nesting depth of an expression is no call depth. Operands are normalised in
+    /// order and each expression is interned once its operands are, as a recursive
+    /// descent would; the first `None` ends the whole form, interning nothing more.
+    fn normal_form(&mut self, id: ExprId, negated: bool) -> Option<ExprId> {
+        let mut waiting: Vec<Waiting> = Vec::new();
+        let mut next = (id, negated);
+        loop {
+            let mut found = loop {
+                match self.nnf_step(next.0, next.1)? {
+                    Step::Done(x) => break x,
+                    Step::Then(x, negated) => next = (x, negated),
+                    Step::Operand(x, negated, then) => {
+                        waiting.push(then);
+                        next = (x, negated);
+                    }
+                }
+            };
+            loop {
+                let Some(then) = waiting.pop() else {
+                    return Some(found);
+                };
+                match self.nnf_resume(then, found)? {
+                    Step::Done(x) => found = x,
+                    Step::Then(x, negated) => {
+                        next = (x, negated);
+                        break;
+                    }
+                    Step::Operand(x, negated, then) => {
+                        waiting.push(then);
+                        next = (x, negated);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// One expression of [`Self::normal_form`]: its form, or the operand to normalise first.
+    fn nnf_step(&mut self, id: ExprId, negated: bool) -> Option<Step> {
         let expr = self.get(id);
+        if negated {
+            return self.nnf_not_step(id, expr);
+        }
         let out = match expr {
-            ClassExpr::Not(x) => return self.nnf_not(x),
-            ClassExpr::And(xs) => {
-                let xs: Option<Vec<ExprId>> = xs.iter().map(|&x| self.nnf(x)).collect();
-                ClassExpr::And(crate::model::canonical(xs?))
-            }
-            ClassExpr::Or(xs) => {
-                let xs: Option<Vec<ExprId>> = xs.iter().map(|&x| self.nnf(x)).collect();
-                ClassExpr::Or(crate::model::canonical(xs?))
-            }
-            ClassExpr::Some(r, x) => ClassExpr::Some(r, self.nnf(x)?),
-            ClassExpr::All(r, x) => ClassExpr::All(r, self.nnf(x)?),
-            ClassExpr::Min(n, r, x) => ClassExpr::Min(n, r, self.nnf(x)?),
-            ClassExpr::Max(n, r, x) => ClassExpr::Max(n, r, self.nnf(x)?),
+            ClassExpr::Not(x) => return Some(Step::Then(x, true)),
+            ClassExpr::And(xs) => return Some(self.nnf_set(xs, false, false)),
+            ClassExpr::Or(xs) => return Some(self.nnf_set(xs, false, true)),
+            ClassExpr::Some(r, x) => return Some(Step::wrap(x, false, ClassExpr::Some, r)),
+            ClassExpr::All(r, x) => return Some(Step::wrap(x, false, ClassExpr::All, r)),
+            ClassExpr::Min(n, r, x) => return Some(Step::count(x, false, ClassExpr::Min, n, r)),
+            ClassExpr::Max(n, r, x) => return Some(Step::count(x, false, ClassExpr::Max, n, r)),
             ClassExpr::Exact(n, r, x) => {
-                let x = self.nnf(x)?;
-                let min = self.e(ClassExpr::Min(n, r, x));
-                let max = self.e(ClassExpr::Max(n, r, x));
-                ClassExpr::And(crate::model::canonical(vec![min, max]))
+                return Some(Step::Operand(x, false, Waiting::Exact(n, r)));
             }
             ClassExpr::HasValue(r, a) => {
                 let nominal = self.e(ClassExpr::OneOf(vec![a]));
@@ -320,18 +408,14 @@ impl<'a> Normaliser<'a> {
             }
             other => other,
         };
-        Some(self.e(out))
+        Some(Step::Done(self.e(out)))
     }
 
-    /// The negation normal form of `¬id`; `None` where it needs `≥ n + 1` for `≤ n` or
-    /// `= n` past a `u32` count, which nothing can stand for: the caller emits nothing of
-    /// it, and its axiom is unsupported.
-    fn nnf_not(&mut self, id: ExprId) -> Option<ExprId> {
-        let expr = self.get(id);
+    /// [`Self::nnf_step`] of `¬id`, `expr` being `id`'s expression.
+    fn nnf_not_step(&mut self, id: ExprId, expr: ClassExpr) -> Option<Step> {
         let out = match expr {
             ClassExpr::Class(a) if self.unfolded.by_class.contains_key(&a) => {
-                let d = self.unfolded.by_class[&a];
-                return self.nnf_not(d);
+                return Some(Step::Then(self.unfolded.by_class[&a], true));
             }
             ClassExpr::Class(_) | ClassExpr::HasSelf(_) => ClassExpr::Not(id),
             ClassExpr::OneOf(xs) => {
@@ -344,37 +428,31 @@ impl<'a> Normaliser<'a> {
                     })
                     .collect();
                 if parts.len() == 1 {
-                    return Some(parts[0]);
+                    return Some(Step::Done(parts[0]));
                 }
                 ClassExpr::And(crate::model::canonical(parts))
             }
             ClassExpr::Thing => ClassExpr::Nothing,
             ClassExpr::Nothing => ClassExpr::Thing,
-            ClassExpr::Not(x) => return self.nnf(x),
-            ClassExpr::And(xs) => {
-                let xs: Option<Vec<ExprId>> = xs.iter().map(|&x| self.nnf_not(x)).collect();
-                ClassExpr::Or(crate::model::canonical(xs?))
-            }
-            ClassExpr::Or(xs) => {
-                let xs: Option<Vec<ExprId>> = xs.iter().map(|&x| self.nnf_not(x)).collect();
-                ClassExpr::And(crate::model::canonical(xs?))
-            }
-            ClassExpr::Some(r, x) => ClassExpr::All(r, self.nnf_not(x)?),
-            ClassExpr::All(r, x) => ClassExpr::Some(r, self.nnf_not(x)?),
+            ClassExpr::Not(x) => return Some(Step::Then(x, false)),
+            ClassExpr::And(xs) => return Some(self.nnf_set(xs, true, true)),
+            ClassExpr::Or(xs) => return Some(self.nnf_set(xs, true, false)),
+            ClassExpr::Some(r, x) => return Some(Step::wrap(x, true, ClassExpr::All, r)),
+            ClassExpr::All(r, x) => return Some(Step::wrap(x, true, ClassExpr::Some, r)),
             ClassExpr::Min(0, _, _) => ClassExpr::Nothing,
-            ClassExpr::Min(n, r, x) => ClassExpr::Max(n - 1, r, self.nnf(x)?),
-            ClassExpr::Max(n, r, x) => ClassExpr::Min(n.checked_add(1)?, r, self.nnf(x)?),
+            ClassExpr::Min(n, r, x) => {
+                return Some(Step::count(x, false, ClassExpr::Max, n - 1, r));
+            }
+            ClassExpr::Max(n, r, x) => {
+                let n = n.checked_add(1)?;
+                return Some(Step::count(x, false, ClassExpr::Min, n, r));
+            }
             ClassExpr::Exact(n, r, x) => {
-                let x = self.nnf(x)?;
-                let more = self.e(ClassExpr::Min(n.checked_add(1)?, r, x));
-                if n == 0 {
-                    return Some(more);
-                }
-                let fewer = self.e(ClassExpr::Max(n - 1, r, x));
-                ClassExpr::Or(crate::model::canonical(vec![fewer, more]))
+                return Some(Step::Operand(x, false, Waiting::NotExact(n, r)));
             }
             ClassExpr::HasValue(r, a) => {
                 let nominal = self.e(ClassExpr::OneOf(vec![a]));
+                // A nominal's complement is read at once: no operand to wait for.
                 let not = self.nnf_not(nominal)?;
                 ClassExpr::All(r, not)
             }
@@ -386,7 +464,7 @@ impl<'a> Normaliser<'a> {
             ClassExpr::DataExact(n, d, r) => {
                 let more = self.e(ClassExpr::DataMin(n.checked_add(1)?, d, r));
                 if n == 0 {
-                    return Some(more);
+                    return Some(Step::Done(more));
                 }
                 let fewer = self.e(ClassExpr::DataMax(n - 1, d, r));
                 ClassExpr::Or(crate::model::canonical(vec![fewer, more]))
@@ -396,7 +474,73 @@ impl<'a> Normaliser<'a> {
                 ClassExpr::DataAll(d, self.range_not(one))
             }
         };
-        Some(self.e(out))
+        Some(Step::Done(self.e(out)))
+    }
+
+    /// The intersection (`or`: the union) of the forms of `xs`, each negated or none: its
+    /// first operand to normalise, or the empty one.
+    fn nnf_set(&mut self, xs: Vec<ExprId>, negated: bool, or: bool) -> Step {
+        let mut rest = xs.into_iter();
+        let Some(first) = rest.next() else {
+            return Step::Done(self.e(if or {
+                ClassExpr::Or(Vec::new())
+            } else {
+                ClassExpr::And(Vec::new())
+            }));
+        };
+        let done = Vec::with_capacity(rest.len() + 1);
+        let then = Waiting::Set {
+            negated,
+            or,
+            rest,
+            done,
+        };
+        Step::Operand(first, negated, then)
+    }
+
+    /// What `then` builds of its operand's form `x`.
+    fn nnf_resume(&mut self, then: Waiting, x: ExprId) -> Option<Step> {
+        let out = match then {
+            Waiting::Set {
+                negated,
+                or,
+                mut rest,
+                mut done,
+            } => {
+                done.push(x);
+                if let Some(next) = rest.next() {
+                    let then = Waiting::Set {
+                        negated,
+                        or,
+                        rest,
+                        done,
+                    };
+                    return Some(Step::Operand(next, negated, then));
+                }
+                let done = crate::model::canonical(done);
+                if or {
+                    ClassExpr::Or(done)
+                } else {
+                    ClassExpr::And(done)
+                }
+            }
+            Waiting::Wrap(make, r) => make(r, x),
+            Waiting::Count(make, n, r) => make(n, r, x),
+            Waiting::Exact(n, r) => {
+                let min = self.e(ClassExpr::Min(n, r, x));
+                let max = self.e(ClassExpr::Max(n, r, x));
+                ClassExpr::And(crate::model::canonical(vec![min, max]))
+            }
+            Waiting::NotExact(n, r) => {
+                let more = self.e(ClassExpr::Min(n.checked_add(1)?, r, x));
+                if n == 0 {
+                    return Some(Step::Done(more));
+                }
+                let fewer = self.e(ClassExpr::Max(n - 1, r, x));
+                ClassExpr::Or(crate::model::canonical(vec![fewer, more]))
+            }
+        };
+        Some(Step::Done(self.e(out)))
     }
 
     // Axioms ---------------------------------------------------------------------------
