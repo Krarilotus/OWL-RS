@@ -9,6 +9,7 @@ pub(crate) mod consistency;
 mod counterexample_witness;
 mod dataset_reasons;
 mod datatypes;
+mod deep_expressions;
 mod entailment;
 mod existential_refutation;
 mod explain;

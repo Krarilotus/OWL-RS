@@ -28,6 +28,7 @@ pub mod typing;
 mod universal;
 mod unsupported;
 pub mod vocab;
+mod walk;
 pub mod write;
 
 pub use clauses::{
