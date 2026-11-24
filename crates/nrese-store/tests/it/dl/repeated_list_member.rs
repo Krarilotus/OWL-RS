@@ -128,6 +128,65 @@ fn direct_semantics_still_refuses_lists_with_only_one_distinct_operand() {
     }
 }
 
+/// Equality between distinct operands still clashes after a bulk load and rebuild.
+#[test]
+fn same_as_members_still_clash_after_a_rebuild() {
+    let mut failures = Vec::new();
+    for representatives in [true, false] {
+        for data in [
+            "[] a owl:AllDifferent ; owl:members ( :a :b :c ) . :a owl:sameAs :b .",
+            "[] a owl:AllDifferent ; owl:members ( :a :a :b :c ) . :b owl:sameAs :c .",
+        ] {
+            let dl = super::pipeline_of(nrese_store::StoreConfig {
+                equality_by_representatives: representatives,
+                ..in_memory_store_config()
+            });
+            let (status, quarantine) = rebuilt(dl.store(), data);
+            if !matches!(status, ConsistencyStatus::Inconsistent { .. }) || !quarantine {
+                failures.push(format!(
+                    "representatives={representatives}, {data}: {status:?}, quarantine {quarantine}"
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "sameAs operands must clash: {failures:#?}"
+    );
+}
+
+/// An alias elsewhere in the ontology introduces no second operand into a list.
+#[test]
+fn an_alias_outside_the_list_does_not_clash_after_a_rebuild() {
+    let (status, quarantine) = rebuilt(
+        pipeline().store(),
+        "[] a owl:AllDifferent ; owl:members ( :a :a :c ) . :a owl:sameAs :b .",
+    );
+    assert_eq!(status, ConsistencyStatus::Consistent);
+    assert!(!quarantine);
+}
+
+#[test]
+fn same_as_members_clash_past_the_walk_limit_after_a_rebuild() {
+    use std::fmt::Write;
+
+    // Every one of the 65 walks has distinct operands (:a :b :c).
+    let mut data = format!(
+        "{RDF}\n[] a owl:AllDifferent ; owl:members _:head .
+         _:head rdf:first :a . _:end rdf:first :c ; rdf:rest rdf:nil .
+         :a owl:sameAs :b ."
+    );
+    for i in 0..65 {
+        write!(
+            data,
+            "_:head rdf:rest _:tail{i} . _:tail{i} rdf:first :b ; rdf:rest _:end ."
+        )
+        .unwrap();
+    }
+    let (status, quarantine) = rebuilt(pipeline().store(), &data);
+    assert!(quarantine, "the :a/:b pair must clash: {status:?}");
+}
+
 #[test]
 fn a_branching_list_can_still_have_a_single_operand_walk() {
     use std::fmt::Write;
