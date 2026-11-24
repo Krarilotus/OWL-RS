@@ -8,8 +8,10 @@ use nrese_engine::{Engine, EngineConfig, GraphSelector, Snapshot, TermId};
 use nrese_rdf::vocab::xsd;
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term};
 use nrese_rdf_io::{RdfFormat, RdfParser};
-use nrese_shacl::{Selection, Shapes, ValidationReport, compile, validate, validate_changes};
+use nrese_shacl::{Selection, Shapes, compile, validate, validate_changes};
 use nrese_sparql::{QueryEvaluationError, Resources};
+
+use super::change_differential::observe::{Observer, ResultKey};
 
 const EX: &str = "http://example.com/";
 const SHAPES_GRAPH: &str = "http://example.com/shapes";
@@ -36,17 +38,17 @@ ex:S5 a sh:NodeShape ; sh:targetNode ex:n0 , ex:n1 ;
 
 /// `seed` varied by `NRESE_FUZZ_SEED` (a number) for bug hunts over many seeds; without
 /// it, the same cases on every run.
-fn fuzz(seed: u64) -> u64 {
+pub(super) fn fuzz(seed: u64) -> u64 {
     let fuzz: u64 = std::env::var("NRESE_FUZZ_SEED")
         .ok()
         .and_then(|value| value.trim().parse().ok())
         .unwrap_or(0);
     seed ^ fuzz.wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
-struct Rng(u64);
+pub(super) struct Rng(pub(super) u64);
 
 impl Rng {
-    fn below(&mut self, n: u64) -> u64 {
+    pub(super) fn below(&mut self, n: u64) -> u64 {
         self.0 = self
             .0
             .wrapping_mul(6_364_136_223_846_793_005)
@@ -84,19 +86,6 @@ fn random_quad(rng: &mut Rng) -> Quad {
         node(rng).into()
     };
     Quad::new(subject, predicate, object, GraphName::DefaultGraph)
-}
-
-fn keys(report: &ValidationReport) -> BTreeSet<String> {
-    report
-        .results
-        .iter()
-        .map(|r| {
-            format!(
-                "{} | {:?} | {:?} | {} | {}",
-                r.focus_node, r.path, r.value, r.source_shape, r.component
-            )
-        })
-        .collect()
 }
 
 const CYCLIC_SHAPES: &str = include_str!("fixtures/cyclic.ttl");
@@ -279,11 +268,18 @@ fn differences_agree(shapes_turtle: &str, seed: u64) {
         let resources = Resources::default();
         let incremental = validate_changes(&before, &after, &shapes, DATA, &changed, &resources)
             .expect("nothing stops it");
-        let full_before = keys(&validate(&before, &shapes, DATA, &resources).expect("validated"));
-        let full_after = keys(&validate(&after, &shapes, DATA, &resources).expect("validated"));
-        let expected: BTreeSet<String> = full_after.difference(&full_before).cloned().collect();
+        let observer = Observer::new(&before, &after, false);
+        let full_before = observer
+            .observe(&validate(&before, &shapes, DATA, &resources).expect("validated"))
+            .unwrap()
+            .result_set();
+        let full_after = observer
+            .observe(&validate(&after, &shapes, DATA, &resources).expect("validated"))
+            .unwrap()
+            .result_set();
+        let expected: BTreeSet<ResultKey> = full_after.difference(&full_before).cloned().collect();
         assert_eq!(
-            keys(&incremental),
+            observer.observe(&incremental).unwrap().result_set(),
             expected,
             "round {round}: incremental results differ from the full difference"
         );

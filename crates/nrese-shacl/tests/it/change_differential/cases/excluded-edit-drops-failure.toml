@@ -1,0 +1,12 @@
+case = "row:failure-excluded-edit"
+selection = "any-excluding-shapes"
+equality = false
+shapes = """
+ex:T sh:targetNode ex:n5 ; sh:sparql ex:Check .
+ex:Check sh:select '''SELECT $this ?failure WHERE { BIND(true AS ?failure) }''' .
+"""
+
+[[steps]]
+add = """
+<http://example.com/n5> <http://example.com/p0> <http://example.com/v1> <http://example.com/shapes> .
+"""
