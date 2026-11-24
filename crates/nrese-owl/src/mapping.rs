@@ -437,6 +437,41 @@ pub const FACETS: [&str; 9] = [
     "http://www.w3.org/1999/02/22-rdf-syntax-ns#langRange",
 ];
 
+/// A class expression whose RDF form has been read, with class operands still to resolve.
+enum ClassRead {
+    Known(ExprId),
+    Ready(ClassExpr),
+    Unary(Term, ClassConstructor),
+    Set(Vec<Term>, bool),
+}
+
+enum ClassConstructor {
+    Not,
+    Some(ObjProp),
+    All(ObjProp),
+    Cardinality(Option<u32>, ObjProp, fn(u32, ObjProp, ExprId) -> ClassExpr),
+}
+
+impl ClassConstructor {
+    fn apply(self, operand: ExprId) -> Option<ClassExpr> {
+        Some(match self {
+            Self::Not => ClassExpr::Not(operand),
+            Self::Some(property) => ClassExpr::Some(property, operand),
+            Self::All(property) => ClassExpr::All(property, operand),
+            Self::Cardinality(n, property, make) => make(n?, property, operand),
+        })
+    }
+}
+
+enum ClassFrame {
+    Unary(ClassConstructor),
+    Set {
+        remaining: std::vec::IntoIter<Term>,
+        operands: Vec<ExprId>,
+        union: bool,
+    },
+}
+
 struct Reader<'a> {
     v: Vocabulary,
     /// [`DECLARATION_KINDS`] by the source's ids.
@@ -1086,41 +1121,122 @@ impl<'a> Reader<'a> {
 
     /// The class expression `term` stands for.
     fn class(&mut self, term: Term) -> Option<ExprId> {
+        let (node, input) = self.start_class(term);
+        self.read_class(node, input)
+    }
+
+    fn start_class(&mut self, term: Term) -> (Option<Term>, Option<ClassRead>) {
         match self.kind(term) {
-            TermKind::Iri => Some(if is(term, self.v.owl_thing) {
-                self.intern_class(ClassExpr::Thing)
-            } else if is(term, self.v.owl_nothing) {
-                self.intern_class(ClassExpr::Nothing)
-            } else {
-                self.intern_class(ClassExpr::Class(term))
-            }),
+            TermKind::Iri => {
+                let expr = if is(term, self.v.owl_thing) {
+                    ClassExpr::Thing
+                } else if is(term, self.v.owl_nothing) {
+                    ClassExpr::Nothing
+                } else {
+                    ClassExpr::Class(term)
+                };
+                (None, Some(ClassRead::Ready(expr)))
+            }
             TermKind::Literal => {
                 self.report(Diagnostic::Malformed {
                     node: term,
                     what: "a literal where a class expression belongs",
                 });
-                None
+                (None, None)
             }
             TermKind::Blank => {
                 self.used(term);
                 if let Some(&known) = self.class_memo.get(&term) {
-                    return known;
+                    return (None, known.map(ClassRead::Known));
                 }
                 // Guards against a cycle through this node.
                 self.class_memo.insert(term, None);
-                let found = self.blank_class(term);
-                if found.is_none() {
-                    // Whatever made it unreadable may not have been reported; the axiom
-                    // it belongs to is left out, never silently.
-                    self.report(Diagnostic::Malformed {
-                        node: term,
-                        what: "a class expression that can't be read",
-                    });
-                }
-                self.class_memo.insert(term, found);
-                found
+                (Some(term), self.blank_class(term))
             }
         }
+    }
+
+    fn read_class(
+        &mut self,
+        mut node: Option<Term>,
+        mut input: Option<ClassRead>,
+    ) -> Option<ExprId> {
+        let mut stack = Vec::new();
+        'read: loop {
+            let mut found = match input {
+                Some(ClassRead::Known(id)) => Some(id),
+                Some(ClassRead::Ready(expr)) => Some(self.intern_class(expr)),
+                Some(ClassRead::Unary(operand, make)) => {
+                    stack.push((node, ClassFrame::Unary(make)));
+                    (node, input) = self.start_class(operand);
+                    continue;
+                }
+                Some(ClassRead::Set(members, union)) => {
+                    let mut remaining = members.into_iter();
+                    if let Some(first) = remaining.next() {
+                        let operands = Vec::with_capacity(remaining.len() + 1);
+                        let frame = ClassFrame::Set {
+                            remaining,
+                            operands,
+                            union,
+                        };
+                        stack.push((node, frame));
+                        (node, input) = self.start_class(first);
+                        continue;
+                    }
+                    Some(self.intern_class(Self::class_set(Vec::new(), union)))
+                }
+                None => None,
+            };
+            loop {
+                if let Some(term) = node {
+                    self.finish_class(term, found);
+                }
+                let Some((parent, frame)) = stack.pop() else {
+                    return found;
+                };
+                node = parent;
+                found = match (frame, found) {
+                    (ClassFrame::Unary(make), Some(id)) => {
+                        make.apply(id).map(|expr| self.intern_class(expr))
+                    }
+                    (
+                        ClassFrame::Set {
+                            mut remaining,
+                            mut operands,
+                            union,
+                        },
+                        Some(id),
+                    ) => {
+                        operands.push(id);
+                        if let Some(next) = remaining.next() {
+                            let frame = ClassFrame::Set {
+                                remaining,
+                                operands,
+                                union,
+                            };
+                            stack.push((node, frame));
+                            (node, input) = self.start_class(next);
+                            continue 'read;
+                        }
+                        Some(self.intern_class(Self::class_set(operands, union)))
+                    }
+                    (_, None) => None,
+                };
+            }
+        }
+    }
+
+    fn finish_class(&mut self, term: Term, found: Option<ExprId>) {
+        if found.is_none() {
+            // Whatever made it unreadable may not have been reported; the axiom
+            // it belongs to is left out, never silently.
+            self.report(Diagnostic::Malformed {
+                node: term,
+                what: "a class expression that can't be read",
+            });
+        }
+        self.class_memo.insert(term, found);
     }
 
     fn classes(&mut self, terms: &[Term]) -> Option<Vec<ExprId>> {
@@ -1128,7 +1244,7 @@ impl<'a> Reader<'a> {
     }
 
     /// A blank class expression, by [`ClassExpressionMarkers`].
-    fn blank_class(&mut self, node: Term) -> Option<ExprId> {
+    fn blank_class(&mut self, node: Term) -> Option<ClassRead> {
         let v = self.v;
         let ClassExpressionMarkers {
             types,
@@ -1168,36 +1284,37 @@ impl<'a> Reader<'a> {
 
     /// The expression of a set operator (`owl:intersectionOf`, `owl:unionOf`,
     /// `owl:complementOf`, `owl:oneOf`) applied to `operand`.
-    fn set_operator(&mut self, operator: Term, operand: Term) -> Option<ExprId> {
+    fn set_operator(&mut self, operator: Term, operand: Term) -> Option<ClassRead> {
         let v = self.v;
         if is(operator, v.owl_complement_of) {
-            let operand = self.class(operand)?;
-            return Some(self.intern_class(ClassExpr::Not(operand)));
+            return Some(ClassRead::Unary(operand, ClassConstructor::Not));
         }
         let members = self.list(operand)?;
         if is(operator, v.owl_one_of) {
             let individuals = (members.iter())
                 .map(|&m| self.individual(m))
                 .collect::<Option<Vec<_>>>()?;
-            return Some(self.intern_class(ClassExpr::OneOf(canonical(individuals))));
+            return Some(ClassRead::Ready(ClassExpr::OneOf(canonical(individuals))));
         }
-        let operands = canonical(self.classes(&members)?);
         let union = is(operator, v.owl_union_of);
-        if operands.is_empty() {
+        if members.is_empty() {
             // An empty intersection is `owl:Thing`, an empty union `owl:Nothing` (OWL 2
             // Mapping to RDF, Tables 15 and 18), which the rules don't read
             // ([`Ontology::empty_list`]). The other short lists keep their form, which no
             // OWL 2 RL check takes.
             self.empty_list.get_or_insert(operand);
-            if !union {
-                return Some(self.intern_class(ClassExpr::Thing));
-            }
         }
-        Some(self.intern_class(if union {
-            ClassExpr::Or(operands)
+        Some(ClassRead::Set(members, union))
+    }
+
+    fn class_set(operands: Vec<ExprId>, union: bool) -> ClassExpr {
+        if union {
+            ClassExpr::Or(canonical(operands))
+        } else if operands.is_empty() {
+            ClassExpr::Thing
         } else {
-            ClassExpr::And(operands)
-        }))
+            ClassExpr::And(canonical(operands))
+        }
     }
 
     /// Whether the restriction `node` says its undeclared property is a data property, where
@@ -1263,7 +1380,7 @@ impl<'a> Reader<'a> {
     }
 
     /// A restriction on `property`.
-    fn restriction(&mut self, node: Term, property: Term) -> Option<ExprId> {
+    fn restriction(&mut self, node: Term, property: Term) -> Option<ClassRead> {
         let v = self.v;
         if self.forms(node, &self.restriction_fillers()) {
             return None;
@@ -1303,14 +1420,14 @@ impl<'a> Reader<'a> {
             };
             if let Some(filler) = self.one(node, v.owl_some_values_from) {
                 let range = self.range(filler)?;
-                return Some(self.intern_class(ClassExpr::DataSome(property, range)));
+                return Some(ClassRead::Ready(ClassExpr::DataSome(property, range)));
             }
             if let Some(filler) = self.one(node, v.owl_all_values_from) {
                 let range = self.range(filler)?;
-                return Some(self.intern_class(ClassExpr::DataAll(property, range)));
+                return Some(ClassRead::Ready(ClassExpr::DataAll(property, range)));
             }
             if let Some(value) = self.one(node, v.owl_has_value) {
-                return Some(self.intern_class(ClassExpr::DataHasValue(property, value)));
+                return Some(ClassRead::Ready(ClassExpr::DataHasValue(property, value)));
             }
             for (predicate, qualified, make) in [
                 (
@@ -1327,7 +1444,7 @@ impl<'a> Reader<'a> {
             ] {
                 if let Some(n) = number(self, predicate) {
                     let range = literal_range(self)?;
-                    return Some(self.intern_class(make(n?, property, range)));
+                    return Some(ClassRead::Ready(make(n?, property, range)));
                 }
                 if let Some(n) = number(self, qualified) {
                     let filler = self.one(node, v.owl_on_data_range)?;
@@ -1335,22 +1452,20 @@ impl<'a> Reader<'a> {
                     if qualified == v.owl_max_qualified {
                         self.qualified_data_max.get_or_insert(property);
                     }
-                    return Some(self.intern_class(make(n?, property, range)));
+                    return Some(ClassRead::Ready(make(n?, property, range)));
                 }
             }
         } else {
             let property = self.object_property(property)?;
             if let Some(filler) = self.one(node, v.owl_some_values_from) {
-                let class = self.class(filler)?;
-                return Some(self.intern_class(ClassExpr::Some(property, class)));
+                return Some(ClassRead::Unary(filler, ClassConstructor::Some(property)));
             }
             if let Some(filler) = self.one(node, v.owl_all_values_from) {
-                let class = self.class(filler)?;
-                return Some(self.intern_class(ClassExpr::All(property, class)));
+                return Some(ClassRead::Unary(filler, ClassConstructor::All(property)));
             }
             if let Some(value) = self.one(node, v.owl_has_value) {
                 let value = self.individual(value)?;
-                return Some(self.intern_class(ClassExpr::HasValue(property, value)));
+                return Some(ClassRead::Ready(ClassExpr::HasValue(property, value)));
             }
             if let Some(flag) = self.one(node, v.owl_has_self) {
                 let yes = self
@@ -1364,7 +1479,7 @@ impl<'a> Reader<'a> {
                     });
                     return None;
                 }
-                return Some(self.intern_class(ClassExpr::HasSelf(property)));
+                return Some(ClassRead::Ready(ClassExpr::HasSelf(property)));
             }
             for (predicate, qualified, make) in [
                 (
@@ -1377,12 +1492,14 @@ impl<'a> Reader<'a> {
             ] {
                 if let Some(n) = number(self, predicate) {
                     let thing = self.intern_class(ClassExpr::Thing);
-                    return Some(self.intern_class(make(n?, property, thing)));
+                    return Some(ClassRead::Ready(make(n?, property, thing)));
                 }
                 if let Some(n) = number(self, qualified) {
                     let filler = self.one(node, v.owl_on_class)?;
-                    let class = self.class(filler)?;
-                    return Some(self.intern_class(make(n?, property, class)));
+                    return Some(ClassRead::Unary(
+                        filler,
+                        ClassConstructor::Cardinality(n, property, make),
+                    ));
                 }
             }
         }
@@ -1915,7 +2032,9 @@ impl<'a> Reader<'a> {
         {
             // OWL 1's class axioms on a named class: the class is equivalent to the
             // expression (read so by the OWL 2 mapping, for backward compatibility).
-            if let (Some(named), Some(expr)) = (self.class(s), self.set_operator(p, o)) {
+            let named = self.class(s);
+            let input = self.set_operator(p, o);
+            if let (Some(named), Some(expr)) = (named, self.read_class(None, input)) {
                 self.add(
                     Axiom::EquivalentClasses(canonical(vec![named, expr])),
                     triple,
