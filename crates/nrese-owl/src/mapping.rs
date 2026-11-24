@@ -14,8 +14,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::diagnostics::{Diagnostic, Treatment, Treatments};
 use crate::model::{
-    Axiom, Characteristic, ClassExpr, DataRange, DataTerms, Disjoint, EntityKind, ExprId, Interner,
-    Literal, ObjProp, RangeId, Term, canonical,
+    Axiom, Characteristic, ClassExpr, DataRange, DataTerms, Disjoint, DisjointReading, EntityKind,
+    ExprId, Interner, Literal, ObjProp, RangeId, Term, canonical,
 };
 use crate::vocab::Vocabulary;
 
@@ -199,8 +199,19 @@ pub fn read(statements: &[Statement], terms: &dyn Terms) -> Ontology {
 /// [`read`], its SHACL rule ([`Ontology::shacl`]) over `beside` and `statements` as one source:
 /// a conclusion's read beside its premise's statements, which are read for nothing else.
 pub fn read_beside(statements: &[Statement], beside: &[Statement], terms: &dyn Terms) -> Ontology {
+    read_with_disjoint_reading(statements, beside, terms, DisjointReading::Canonical)
+}
+
+/// Reads as in [`read_beside`], with the given reading of repeated disjoint operands.
+pub fn read_with_disjoint_reading(
+    statements: &[Statement],
+    beside: &[Statement],
+    terms: &dyn Terms,
+    disjoint_reading: DisjointReading,
+) -> Ontology {
     let vocabulary = Vocabulary::new(&|iri| terms.iri(iri));
     let mut reader = Reader::new(statements, terms, vocabulary);
+    reader.disjoint_reading = disjoint_reading;
     reader.declarations();
     reader.shacl(beside);
     reader.axioms();
@@ -439,6 +450,7 @@ pub const FACETS: [&str; 9] = [
 
 struct Reader<'a> {
     v: Vocabulary,
+    disjoint_reading: DisjointReading,
     /// [`DECLARATION_KINDS`] by the source's ids.
     declaration_kinds: [(Option<Term>, EntityKind); 9],
     /// [`FACETS`] by the source's ids.
@@ -651,6 +663,7 @@ impl<'a> Reader<'a> {
         }
         Self {
             v,
+            disjoint_reading: DisjointReading::Canonical,
             declaration_kinds: DECLARATION_KINDS.map(|(iri, kind)| (terms.iri(iri), kind)),
             facets: FACETS.map(|iri| terms.iri(iri)),
             builtin_annotations: (
@@ -1507,7 +1520,8 @@ impl<'a> Reader<'a> {
     /// A disjointness's axioms (`Disjoint::axioms`): a repeated operand reported. Whether
     /// one was.
     fn disjoint(&mut self, d: Disjoint, triple: [Term; 3]) -> bool {
-        let (axioms, repeated) = d.axioms(&mut self.classes, &mut self.ranges);
+        let (axioms, repeated) =
+            d.axioms(&mut self.classes, &mut self.ranges, self.disjoint_reading);
         if repeated {
             self.report(Diagnostic::RepeatedOperand);
         }

@@ -59,6 +59,7 @@ pub struct ListVocabulary {
     all_different: u64,
     /// The blank nodes' ids, when keys bind named individuals only.
     named_keys: Option<(u64, u64)>,
+    pub(crate) canonical_disjoints: bool,
 }
 
 impl ListVocabulary {
@@ -90,6 +91,7 @@ impl ListVocabulary {
             all_disjoint_properties: vocabulary.iri(&format!("{OWL}AllDisjointProperties")),
             all_different: vocabulary.iri(&format!("{OWL}AllDifferent")),
             named_keys: None,
+            canonical_disjoints: false,
         }
     }
 
@@ -118,6 +120,7 @@ impl ListVocabulary {
             all_disjoint_properties: named(self.all_disjoint_properties),
             all_different: named(self.all_different),
             named_keys: self.named_keys,
+            canonical_disjoints: self.canonical_disjoints,
         };
         (vocabulary != *self).then_some(vocabulary)
     }
@@ -395,6 +398,34 @@ impl ListVocabulary {
                 }
             }
         }
+    }
+
+    /// A walk of at least two positions can choose `member` at every cell.
+    fn single_member_walk(
+        &self,
+        facts: &impl Facts,
+        cells: &HashMap<u64, Cell>,
+        head: u64,
+        member: u64,
+    ) -> bool {
+        if !cells[&head].firsts.contains(&member) {
+            return false;
+        }
+        let mut pending = cells[&head].rests.clone();
+        let mut visited = HashSet::new();
+        while let Some(node) = pending.pop() {
+            if facts.stopped() {
+                return false;
+            }
+            let cell = &cells[&node];
+            if visited.insert(node) && cell.firsts.contains(&member) {
+                if cell.rests.contains(&self.nil) {
+                    return true;
+                }
+                pending.extend(&cell.rests);
+            }
+        }
+        false
     }
 
     /// One path as first/rest premises, including a first at each position.
@@ -711,7 +742,14 @@ pub(crate) fn compile(
                 match list {
                     List::Walks(walks, extra_members) => {
                         let mut seen = HashSet::new();
-                        for (members, used) in walks {
+                        for (mut members, used) in walks {
+                            if matches!(kind, ListKind::Pairwise)
+                                && voc.canonical_disjoints
+                                && members.windows(2).any(|pair| pair[0] != pair[1])
+                            {
+                                let mut distinct = HashSet::new();
+                                members.retain(|&member| distinct.insert(member));
+                            }
                             if extra_members.is_some() {
                                 seen.extend(members.iter().copied());
                             }
@@ -773,7 +811,11 @@ pub(crate) fn compile(
                                 if facts.stopped() {
                                     return;
                                 }
-                                make_walk(&[member, member], Vec::new(), false);
+                                if !voc.canonical_disjoints
+                                    || voc.single_member_walk(facts, &cells, head, member)
+                                {
+                                    make_walk(&[member, member], Vec::new(), false);
+                                }
                             }
                             let pairs = Arc::new(pairs);
                             let mut long = long.borrow_mut();

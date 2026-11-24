@@ -13,6 +13,7 @@ use nrese_engine::{
     Snapshot, SnapshotIdentity, TermId,
 };
 use nrese_owl::ql::Tbox;
+use nrese_owl::{DisjointReading, Ontology, Statement};
 use nrese_rdf::{NamedNodeRef, Term, vocab};
 
 use crate::GraphAccess;
@@ -1301,6 +1302,15 @@ impl nrese_owl::Terms for SnapshotTerms<'_> {
     }
 }
 
+fn read_schema(snapshot: &Snapshot, statements: &[Statement], closure: Closure) -> Ontology {
+    let reading = if closure.lists {
+        DisjointReading::RdfBased
+    } else {
+        DisjointReading::Canonical
+    };
+    nrese_owl::read_with_disjoint_reading(statements, &[], &SnapshotTerms(snapshot), reading)
+}
+
 fn compile(
     snapshot: &Snapshot,
     statements: &[nrese_owl::Statement],
@@ -1308,8 +1318,7 @@ fn compile(
     thing: Option<nrese_owl::Term>,
     equality: bool,
 ) -> Tbox {
-    let terms = SnapshotTerms(snapshot);
-    let ontology = nrese_owl::read(statements, &terms);
+    let ontology = read_schema(snapshot, statements, closure);
     let tbox = Tbox::compile(&ontology, closure, thing);
     match equality {
         true => tbox.with_equality(closure),

@@ -170,11 +170,11 @@ impl RuleProgram {
 
     /// Identifies what the program derives: the built-in ruleset's fingerprint, and
     /// FNV-1a over [`SEMANTICS_VERSION`], the user rules' text, the relations their
-    /// contexts compile to and the versions of the semantic parts they use, and whether
-    /// keys bind named individuals only. Stable across builds and platforms.
+    /// contexts compile to and the versions of the semantic parts they use, and the
+    /// Direct Semantics of lists. Stable across builds and platforms.
     pub fn fingerprint(&self) -> u64 {
-        const NAMED_KEYS: u64 = 0x4e4d_ed4b_e75b_0001;
-        self.rules_fingerprint() ^ if self.named_keys { NAMED_KEYS } else { 0 }
+        const DIRECT_LISTS: u64 = 0x4e4d_ed4b_e75b_0002;
+        self.rules_fingerprint() ^ if self.named_keys { DIRECT_LISTS } else { 0 }
     }
 
     /// [`Self::fingerprint`] of the rules alone.
