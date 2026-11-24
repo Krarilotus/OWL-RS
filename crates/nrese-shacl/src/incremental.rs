@@ -19,6 +19,7 @@
 //! changed statement is an `rdfs:subClassOf` (class membership of every node may move).
 //! So is a shape whose affected nodes pass [`MAX_AFFECTED`]. When an active target can
 //! reach a cycle through active shapes, the difference is taken over both full reports.
+//! The same applies when an `owl:sameAs` change can alter the expansion of stored data.
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -50,10 +51,12 @@ const MAX_AFFECTED: usize = 100_000;
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const RDFS_SUB_CLASS_OF: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
+const OWL_SAME_AS: &str = "http://www.w3.org/2002/07/owl#sameAs";
 
 /// The results that `changed` (the statements inserted and deleted, asserted and inferred)
 /// introduce in `data`: results among the affected focus nodes in `after` that no
-/// targeted validation in `before` produced. Both views must share one dictionary (a
+/// targeted validation in `before` produced. An `owl:sameAs` edit on snapshots that
+/// expand equality compares the full reports. Both views must share one dictionary (a
 /// transaction and its base snapshot do), and `shapes` must be compiled from it.
 ///
 /// Both validations run on `resources` and stop as [`crate::validate`] does: a stop in
@@ -89,9 +92,16 @@ fn validate_changes_within<A: ReadView + Sync, B: ReadView + Sync>(
     route_limit: usize,
 ) -> Result<ValidationReport, QueryEvaluationError> {
     resources.check()?;
+    let graph_after =
+        GraphView::new(after, data).with_cancellation(resources.cancellation.as_ref());
+    let same_as = graph_after.iri(OWL_SAME_AS);
+    let mut edits_equality = false;
     let mut selected = Vec::new();
     for chunk in changed.chunks(CHECK_EVERY) {
         resources.check()?;
+        if !edits_equality && let Some(same_as) = same_as {
+            edits_equality = chunk.iter().any(|quad| quad.predicate == same_as);
+        }
         selected.extend(
             chunk
                 .iter()
@@ -100,22 +110,35 @@ fn validate_changes_within<A: ReadView + Sync, B: ReadView + Sync>(
         );
     }
     let changed = selected;
-    if shapes.has_cycles && !changed.is_empty() {
-        // A cycle can carry a change arbitrarily far. A finding can also be reached from
-        // several targets, so a finding reached by a new route may already be in the report.
+    // Test both sides: an insertion may enable expansion, and a deletion may end it.
+    let expands_equality = |view: Option<&nrese_engine::Snapshot>| {
+        view.is_some_and(|view| view.equality_classes().is_some())
+    };
+    let equality_changed = edits_equality
+        && (expands_equality(after.snapshot()) || expands_equality(before.snapshot()));
+    if equality_changed || (shapes.has_cycles && !changed.is_empty()) {
+        // A cycle can carry a change arbitrarily far. An equality edit can change what
+        // reads see far from the edited statement. Either needs the whole reports.
         let (mut results, failures, held) =
             validate_full_difference(before, Some(shapes), after, shapes, data, resources)?;
+        if equality_changed {
+            let order = |a: &RawResult, b: &RawResult| {
+                Key { result: a, shapes }.order(&Key { result: b, shapes })
+            };
+            results.sort_unstable_by(order);
+            results.dedup_by(|a, b| order(a, b).is_eq());
+        }
         // Change reports are sets in raw result order.
         results.sort_unstable();
-        results.dedup();
+        if !equality_changed {
+            results.dedup();
+        }
         let report = decode(after, shapes, results, failures, resources);
         drop(held);
         return report;
     }
     let graph_before =
         GraphView::new(before, data).with_cancellation(resources.cancellation.as_ref());
-    let graph_after =
-        GraphView::new(after, data).with_cancellation(resources.cancellation.as_ref());
     let sub_class_of = graph_after.iri(RDFS_SUB_CLASS_OF);
     let mut classes_moved = false;
     if let Some(predicate) = sub_class_of {
