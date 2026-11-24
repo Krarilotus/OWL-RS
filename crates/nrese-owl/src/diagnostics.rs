@@ -2,7 +2,7 @@
 //! involved, never dropped silently. A task an affected axiom takes part in is answered
 //! `unsupported` (docs/design/owl2-dl.md §2).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::mapping::{Ontology, Terms};
 use crate::model::{Axiom, Characteristic, ClassExpr, EntityKind, ObjProp, Term};
@@ -144,6 +144,8 @@ pub enum Diagnostic {
         axiom: usize,
         what: &'static str,
     },
+    /// An impossible pair in the strict property order required by OWL 2 DL (§11.2).
+    IrregularPropertyHierarchy { lower: ObjProp, upper: ObjProp },
     /// A global restriction of OWL 2 DL broken: an anonymous individual in a nominal or a
     /// `hasValue`, which take named ones only (*OWL 2 Structural Specification* §11.2).
     /// The Direct Semantics still reads it (§2.3.7–2.4): in an ontology, one individual,
@@ -184,6 +186,9 @@ impl Diagnostic {
             Self::NotOwl { triple } => return (triple, "not owl"),
             Self::Unused { node, .. } => (node, "unused"),
             Self::NonSimpleProperty { property, what, .. } => (property, what),
+            Self::IrregularPropertyHierarchy { upper, .. } => {
+                (upper.named(), "irregular property hierarchy")
+            }
             Self::AnonymousIndividual { node } => (node, "anonymous individual"),
             Self::Syntax { line, column, what } => {
                 ((u64::from(line) << 32) | u64::from(column), what)
@@ -222,6 +227,7 @@ impl Diagnostic {
             | Self::Unsupported { .. }
             | Self::NotOwl { .. }
             | Self::NonSimpleProperty { .. }
+            | Self::IrregularPropertyHierarchy { .. }
             | Self::Syntax { .. }
             | Self::Reserved { .. }
             | Self::Rule { .. } => true,
@@ -256,6 +262,7 @@ impl Diagnostic {
             | Self::Unsupported { .. }
             | Self::NotOwl { .. }
             | Self::NonSimpleProperty { .. }
+            | Self::IrregularPropertyHierarchy { .. }
             | Self::AnonymousIndividual { .. }
             | Self::Syntax { .. }
             | Self::RepeatedOperand
@@ -308,7 +315,7 @@ impl Diagnostic {
             // Read as written: only a global restriction of OWL 2 DL is broken (what keeps
             // reasoning decidable), not what the axiom says; what a reasoner doesn't follow
             // of it is that reasoner's own hazard.
-            Self::NonSimpleProperty { .. } => false,
+            Self::NonSimpleProperty { .. } | Self::IrregularPropertyHierarchy { .. } => false,
             // Read as written: the Direct Semantics reads it (§2.3.7–2.4), as above.
             Self::AnonymousIndividual { .. } => false,
             // Read as what being disjoint from itself means (`crate::model::Disjoint`).
@@ -338,6 +345,17 @@ impl Diagnostic {
             Self::NonSimpleProperty { property, what, .. } => {
                 at(&format!("a non-simple property in {what}"), property)
             }
+            Self::IrregularPropertyHierarchy { lower, upper } => {
+                let property = |p| match p {
+                    ObjProp::Named(t) => name(t),
+                    ObjProp::Inverse(t) => format!("inverse of {}", name(t)),
+                };
+                format!(
+                    "an irregular property hierarchy: {} < {}",
+                    property(lower),
+                    property(upper)
+                )
+            }
             Self::AnonymousIndividual { node } => at("a blank node in oneOf or hasValue", node),
             Self::Syntax { line, column, what } => {
                 format!("text not read at line {line}, column {column}: {what}")
@@ -356,6 +374,11 @@ impl Diagnostic {
 /// `owl:topObjectProperty`. (§11.1 makes `owl:bottomObjectProperty` composite too; it
 /// relates nothing, so nothing above it gets a pair from it, and it isn't counted.)
 pub(crate) fn check_global_restrictions(ontology: &mut Ontology) {
+    if let Some((lower, upper)) = impossible_role_order(ontology) {
+        ontology
+            .diagnostics
+            .push(Diagnostic::IrregularPropertyHierarchy { lower, upper });
+    }
     // Nominals and `hasValue` take named individuals only (§11.2).
     let anonymous: BTreeSet<Term> = crate::mapping::in_expressions(ontology)
         .filter(|t| ontology.anonymous.contains(t))
@@ -464,6 +487,99 @@ pub(crate) fn check_global_restrictions(ontology: &mut Ontology) {
         }
     }
     ontology.diagnostics.extend(found);
+}
+
+/// The first impossible pair in the least strict order required by §11.2.
+fn impossible_role_order(ontology: &Ontology) -> Option<(ObjProp, ObjProp)> {
+    let mut pairs = VecDeque::new();
+    for axiom in &ontology.axioms {
+        let Axiom::SubObjectPropertyOf(chain, upper) = axiom else {
+            continue;
+        };
+        if chain.len() < 2 || Some(upper.named()) == ontology.builtin.top_object {
+            continue;
+        }
+        let last = chain.len() - 1;
+        let required = match (chain[0] == *upper, chain[last] == *upper) {
+            (true, true) if last == 1 => continue,
+            (true, true) => return Some((*upper, *upper)),
+            (true, false) => &chain[1..],
+            (false, true) => &chain[..last],
+            (false, false) => chain,
+        };
+        pairs.extend(required.iter().map(|&lower| (lower, *upper)));
+    }
+    if pairs.is_empty() {
+        return None;
+    }
+
+    let mut seen = HashSet::new();
+    pairs.retain(|&pair| seen.insert(pair));
+    let mut before: BTreeMap<ObjProp, Vec<ObjProp>> = BTreeMap::new();
+    let mut after: HashMap<ObjProp, Vec<ObjProp>> = HashMap::new();
+    while let Some((lower, upper)) = pairs.pop_front() {
+        if lower == upper {
+            return Some((lower, upper));
+        }
+        let predecessors = before
+            .get(&lower)
+            .into_iter()
+            .flatten()
+            .map(|&p| (p, upper));
+        let successors = after.get(&upper).into_iter().flatten().map(|&s| (lower, s));
+        let inverted = matches!(upper, ObjProp::Named(_)).then(|| (lower.inverse(), upper));
+        pairs.extend(
+            predecessors
+                .chain(successors)
+                .chain(inverted)
+                .filter(|&p| seen.insert(p)),
+        );
+        before.entry(upper).or_default().push(lower);
+        after.entry(lower).or_default().push(upper);
+    }
+
+    // Test against the oriented property hierarchy, separately from the strict order.
+    let mut hierarchy: HashMap<ObjProp, Vec<ObjProp>> = HashMap::new();
+    let mut include = |lower: ObjProp, upper: ObjProp| {
+        for (a, b) in [(lower, upper), (lower.inverse(), upper.inverse())] {
+            hierarchy.entry(a).or_default().push(b);
+        }
+    };
+    for axiom in &ontology.axioms {
+        match axiom {
+            Axiom::SubObjectPropertyOf(chain, upper) if chain.len() == 1 => {
+                include(chain[0], *upper)
+            }
+            Axiom::EquivalentObjectProperties(ps) => {
+                for pair in ps.windows(2) {
+                    include(pair[0], pair[1]);
+                    include(pair[1], pair[0]);
+                }
+            }
+            Axiom::InverseObjectProperties(a, b) => {
+                include(*a, b.inverse());
+                include(b.inverse(), *a);
+            }
+            Axiom::ObjectCharacteristic(Characteristic::Symmetric, p) => include(*p, p.inverse()),
+            _ => {}
+        }
+    }
+    let mut reached = HashSet::new();
+    let mut todo = Vec::new();
+    for upper in before.into_keys() {
+        reached.clear();
+        todo.push(upper);
+        while let Some(lower) = todo.pop() {
+            if !reached.insert(lower) {
+                continue;
+            }
+            if seen.contains(&(lower, upper)) {
+                return Some((lower, upper));
+            }
+            todo.extend(hierarchy.get(&lower).into_iter().flatten().copied());
+        }
+    }
+    None
 }
 
 /// The class expressions an axiom holds directly.

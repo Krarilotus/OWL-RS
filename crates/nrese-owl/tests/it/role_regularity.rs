@@ -112,10 +112,12 @@ fn structural_membership_and_automaton_regularity_follow_their_own_orders() {
                 "{name}: structural regularity {is_dl}, expected {structural}"
             ));
         }
-        let supported = !normalise(&ontology)
-            .unsupported
-            .iter()
-            .any(|(_, why)| matches!(why, Unsupported::IrregularRoleHierarchy));
+        let supported = !normalise(&ontology).unsupported.iter().any(|(_, why)| {
+            matches!(
+                why,
+                Unsupported::IrregularRoleHierarchy | Unsupported::RoleAutomatonOutsideRegularClass
+            )
+        });
         if supported != engine {
             wrong.push(format!(
                 "{name}: automaton regularity {supported}, expected {engine}"

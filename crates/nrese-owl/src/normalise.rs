@@ -219,6 +219,7 @@ struct Normaliser<'a> {
     down: HashMap<ObjProp, Vec<(ObjProp, usize)>>,
     /// The roles equivalent to a role, as [`Normaliser::equivalents`] computes them.
     equivalent: std::cell::RefCell<HashMap<ObjProp, Members>>,
+    irregular_roles: std::cell::OnceCell<HashSet<Term>>,
     clause_index: HashMap<(Vec<BodyAtom>, Vec<HeadAtom>), usize, foldhash::fast::RandomState>,
     expand_up_to: u32,
     /// Definitions unfolded lazily (`Options::lazy_definitions`).
@@ -255,6 +256,7 @@ impl<'a> Normaliser<'a> {
             up: HashMap::new(),
             down: HashMap::new(),
             equivalent: std::cell::RefCell::new(HashMap::new()),
+            irregular_roles: Default::default(),
             clause_index: HashMap::default(),
             expand_up_to: Options::default().expand_at_most_up_to,
             unfolded: Default::default(),
@@ -1465,6 +1467,49 @@ impl<'a> Normaliser<'a> {
         out
     }
 
+    /// Named roles whose automata depend on an impossible HKS Definition 2 order.
+    fn irregular_roles(&self) -> HashSet<Term> {
+        let mut classes = HashMap::new();
+        for (chain, upper, _) in &self.rias {
+            let roles = chain.iter().copied().chain([ObjProp::Named(*upper)]);
+            for role in roles.flat_map(|p| [p, p.inverse()]) {
+                if !classes.contains_key(&role) {
+                    let members = self.equivalents(role);
+                    let representative = members[0].0;
+                    for (member, _) in members {
+                        classes.insert(member, representative);
+                    }
+                }
+            }
+        }
+        let node = |p: ObjProp| classes[&p].min(classes[&p.inverse()]);
+        let mut edges: HashMap<ObjProp, Vec<ObjProp>> = HashMap::new();
+        for (chain, upper, _) in &self.rias {
+            let upper = ObjProp::Named(*upper);
+            let root = node(upper);
+            let same = |p| classes[&p] == classes[&upper];
+            match chain.as_slice() {
+                [p] if node(*p) == root => continue,
+                [p, q] if same(*p) && same(*q) => continue,
+                _ => {}
+            }
+            let start = usize::from(chain.first().copied().is_some_and(same));
+            let end = usize::from(chain.last().copied().is_some_and(same));
+            let down = edges.entry(root).or_default();
+            if start + end == 2 {
+                down.push(root);
+            } else {
+                down.extend(chain[start..chain.len() - end].iter().copied().map(node));
+            }
+        }
+        let irregular = irregular_role_nodes(&edges);
+        classes
+            .keys()
+            .filter(|&&p| irregular.contains(&node(p)))
+            .map(|p| p.named())
+            .collect()
+    }
+
     /// The automaton of the non-simple role `role` (named), with the automata of the
     /// non-simple roles it builds on spliced in; `None` for an irregular RBox.
     ///
@@ -1664,6 +1709,16 @@ impl<'a> Normaliser<'a> {
         let start = names[nfa.start as usize];
         self.automata.insert((role, filler), start);
         self.take(start);
+        if self
+            .irregular_roles
+            .get_or_init(|| self.irregular_roles())
+            .contains(&role.named())
+        {
+            self.fail(
+                Taker::Name(start),
+                Unsupported::RoleAutomatonOutsideRegularClass,
+            );
+        }
         let state = |s: u32| Concept::Fresh(names[s as usize]);
         // A transition needs the universal and the role inclusions of its edge together
         // (justifications through a role hierarchy or chain name them: found by the
@@ -1755,6 +1810,57 @@ impl<'a> Normaliser<'a> {
         out.ranges = self.ranges;
         out
     }
+}
+
+/// Iterative Tarjan: a component is irregular if cyclic or if it reaches one already closed.
+fn irregular_role_nodes(edges: &HashMap<ObjProp, Vec<ObjProp>>) -> HashSet<ObjProp> {
+    let down = |role| edges.get(&role).map_or(&[][..], Vec::as_slice);
+    let mut active = HashMap::new();
+    let mut closed = HashMap::new();
+    let mut members = Vec::new();
+    for &root in edges.keys() {
+        if closed.contains_key(&root) {
+            continue;
+        }
+        active.insert(root, closed.len());
+        members.push(root);
+        let mut calls = vec![(root, down(root).iter(), closed.len())];
+        while let Some((role, children, low)) = calls.last_mut() {
+            if let Some(&child) = children.next() {
+                if let Some(&index) = active.get(&child) {
+                    *low = (*low).min(index);
+                } else if !closed.contains_key(&child) {
+                    let index = closed.len() + active.len();
+                    active.insert(child, index);
+                    members.push(child);
+                    calls.push((child, down(child).iter(), index));
+                }
+                continue;
+            }
+            let (role, low) = (*role, *low);
+            calls.pop();
+            if low == active[&role] {
+                let bad = members.last() != Some(&role)
+                    || down(role)
+                        .iter()
+                        .any(|p| *p == role || closed.get(p) == Some(&true));
+                while let Some(p) = members.pop() {
+                    active.remove(&p);
+                    closed.insert(p, bad);
+                    if p == role {
+                        break;
+                    }
+                }
+            }
+            if let Some((_, _, parent_low)) = calls.last_mut() {
+                *parent_low = (*parent_low).min(low);
+            }
+        }
+    }
+    closed
+        .into_iter()
+        .filter_map(|(p, bad)| bad.then_some(p))
+        .collect()
 }
 
 /// The axioms that take the shared name `name`, directly or through the definitions of

@@ -1001,7 +1001,9 @@ fn assert_round_trip(ontology: &Ontology, table: &mut Table) {
     let restriction = |d: &Diagnostic| {
         matches!(
             d,
-            Diagnostic::NonSimpleProperty { .. } | Diagnostic::AnonymousIndividual { .. }
+            Diagnostic::NonSimpleProperty { .. }
+                | Diagnostic::AnonymousIndividual { .. }
+                | Diagnostic::IrregularPropertyHierarchy { .. }
         )
     };
     assert!(

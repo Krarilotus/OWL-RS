@@ -358,9 +358,12 @@ fn assert_lower_bound(report: &nrese_store::ClassificationReport) {
     assert_eq!(report.engine, "tableau");
     assert!(!report.complete());
     assert!(
-        report.incomplete.contains(&format!(
-            "consistency not decided (unsupported): {LEFT_OUT}"
-        )),
+        report
+            .incomplete
+            .iter()
+            .any(|reason| reason.starts_with(&format!(
+                "consistency not decided (unsupported): {LEFT_OUT}"
+            )) && reason.contains("reader diagnostics")),
         "{:?}",
         report.incomplete
     );
