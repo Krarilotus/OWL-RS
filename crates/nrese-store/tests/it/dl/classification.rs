@@ -302,6 +302,30 @@ fn an_irregular_el_ontology_is_answered_completely_by_the_el_classifier() {
     assert!(report.equivalent_to_thing.is_empty());
 }
 
+/// Structural Specification §11.2 rejects the hierarchy, while EL++ completion
+/// proves the subsumptions without a regular role order.
+#[test]
+fn role_regularity_diagnostics_do_not_prevent_a_complete_el_classification() {
+    let dl = pipeline();
+    insert(&dl, IRREGULAR).expect("ontology committed");
+    let store = dl.store();
+    let report = store.classify(&ReadScope::All).expect("classification");
+    assert_eq!(report.engine, "el");
+    assert!(report.complete(), "{:?}", report.incomplete);
+    assert!(has(&report.subsumptions, "A", "G"));
+    let verdict = store
+        .dl()
+        .status()
+        .expect("consistency status")
+        .consistency
+        .verdict;
+    let reason = verdict.reason().unwrap_or_default();
+    assert!(
+        reason.contains("irregular") && reason.contains(" < "),
+        "{verdict:?}"
+    );
+}
+
 /// Without assertions, the ontology has a model iff `owl:Thing` is satisfiable: where the
 /// chain makes it unsatisfiable, the EL classifier's answer is "inconsistent", complete,
 /// listing nothing (the DL engines' Horn part, without the chain, can't find it).
