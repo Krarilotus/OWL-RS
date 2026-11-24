@@ -396,6 +396,8 @@ impl Durable {
         let mut newest = None;
         for (position, (_, path)) in segments.iter().enumerate() {
             if cut {
+                #[cfg(feature = "fault-points")]
+                crate::fault_points::cut_step()?;
                 fs::remove_file(path)?;
                 continue;
             }
@@ -460,6 +462,8 @@ impl Durable {
                         .zip(record.committed_micros)
                         .is_some_and(|(until, committed)| committed > until);
                 if after {
+                    #[cfg(feature = "fault-points")]
+                    crate::fault_points::cut_step()?;
                     forget_before_cut(root, &config)?;
                     // Point-in-time restore: the log ends before this record.
                     kept = match index {
