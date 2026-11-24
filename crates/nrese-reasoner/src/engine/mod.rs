@@ -404,6 +404,17 @@ impl Program {
     }
 }
 
+/// Whether an asserted or inferred statement mentions this term in any triple position.
+fn mentions(snapshot: &Snapshot, term: u64) -> bool {
+    [
+        [Some(term), None, None],
+        [None, Some(term), None],
+        [None, None, Some(term)],
+    ]
+    .into_iter()
+    .any(|terms| snapshot.exists_in(ReadModel::Materialised, &pattern(terms, GraphSelector::Any)))
+}
+
 /// An id decoded for reports (`term_text`); `#id` if the dictionary lacks it.
 pub fn decoded(term: Option<nrese_rdf::Term>, id: u64) -> String {
     term.map_or_else(|| format!("#{id}"), |term| term_text(&term))

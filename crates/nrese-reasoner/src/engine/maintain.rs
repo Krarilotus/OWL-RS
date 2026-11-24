@@ -322,15 +322,20 @@ pub fn maintain_with_report_budget(
 ) -> Result<Maintenance, delta::Interrupted> {
     // Axioms that need an inferred copy published by this commit.
     let mut missing_axioms: Vec<Triple> = Vec::new();
-    // Unnamed classes left out: as the commit leaves them; one it makes consumable
-    // needs a rematerialisation for the memberships left out so far.
-    let (schema, revived) = if program.hide_unnamed_classes {
+    // The new hidden map may restore memberships or withdraw ones the old closure held.
+    let (schema, revived, rehidden) = if program.hide_unnamed_classes {
         let before = program.hidden_classes(tx.base());
         let after = program.hidden_classes(&tx.pending_snapshot());
         let revived = before.keys().any(|class| !after.contains_key(class));
-        (program.schema.clone().hiding(after), revived)
+        let rehidden = after.iter().any(|(&class, hidden)| {
+            before.get(&class).map_or_else(
+                || super::mentions(tx.base(), class),
+                |previous| previous != hidden,
+            )
+        });
+        (program.schema.clone().hiding(after), revived, rehidden)
     } else {
-        (program.schema.clone(), false)
+        (program.schema.clone(), false, false)
     };
     // A first load (no asserted fact before, nothing deleted): its closure is the whole
     // closure, so it is materialised once, by the batch executor, and its violations are
@@ -373,7 +378,8 @@ pub fn maintain_with_report_budget(
         None
     };
     let redeclared = !first_load && changed_annotations.is_some();
-    let comparison_memory = (redeclared && !uses_rebuilt_report).then(working_memory);
+    let settled = !first_load && (redeclared || rehidden);
+    let comparison_memory = (settled && !uses_rebuilt_report).then(working_memory);
     let rebuild_memory = comparison_memory.as_ref().unwrap_or(memory);
     // Revived memberships participate in the delta executor's introduced-only checks.
     // Keep the full result for installation below, so it is computed once.
@@ -476,7 +482,7 @@ pub fn maintain_with_report_budget(
         // Facts with an inverse expression as their predicate: the stored closure lacks the
         // base's, so a delta can't read them. Such a change runs its delta, whose consistency
         // check stands, and is then rebuilt: the closure after it is the one a rebuild gives.
-        delta_ran = !(first_load || redeclared || inserted.is_empty() && deleted.is_empty());
+        delta_ran = !(first_load || settled || inserted.is_empty() && deleted.is_empty());
         deletes = !deleted.is_empty();
         unkept = delta_ran && has_inverse_expression(tx.base(), &prep).map_err(interrupted)?;
         // A rebuild reads the asserted facts and writes the closure, both about the size
@@ -489,7 +495,7 @@ pub fn maintain_with_report_budget(
                 .then(|| tx.base().len_in(ReadModel::Materialised)),
             split_rebuilds: program.stores_representatives(),
         };
-        if redeclared {
+        if settled {
             // Rebuilt, then judged by the rebuild's report or by what it introduces (below).
             delta::Update {
                 policy: delta::policy::Counts {
@@ -566,7 +572,7 @@ pub fn maintain_with_report_budget(
     // A list that already stopped at its budget makes the change inconsistent: the
     // datatype checks would add nothing to that. A first load judged by its rebuild has
     // them in the batch's report already.
-    if !redeclared && update.violations.complete() && !(first_load && uses_rebuilt_report) {
+    if !settled && update.violations.complete() && !(first_load && uses_rebuilt_report) {
         let datatypes = super::datatypes::violations(
             &update.insert,
             program.rdf_type,
