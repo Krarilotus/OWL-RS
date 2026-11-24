@@ -413,6 +413,53 @@ fn a_record_past_the_cutoff_with_a_time_out_of_range_is_cut() {
     }
 }
 
+/// Spec: `restore_until` by revision needs only the revisions up to it, so what follows the
+/// requested revision in a segment, an append a crash interrupted or a damaged record, is cut
+/// with the rest of the log. The image at 0, the segment of 1-2 with such bytes after 2, restored
+/// to revision 2: exactly 2, stopped past the revision, with the segment from 3 after it
+/// (torn), and alone (damaged, the last segment).
+#[test]
+fn bytes_past_the_requested_revision_are_cut() {
+    let root = tempdir().unwrap();
+    let (data, backup) = (root.path().join("data"), root.path().join("backup"));
+    let e = engine(&data, true);
+    assert_eq!(image(&e, &backup), 0);
+    commit_plain(&e, 1);
+    commit_plain(&e, 2);
+    e.checkpoint().unwrap();
+    commit_plain(&e, 3);
+    drop(e);
+    let (archive, live) = (data.join("wal-archive"), data.join("wal"));
+    assert_eq!(segments(&archive), [1], "setup: the archive");
+    assert_eq!(segments(&live), [3], "setup: the live log");
+    let first = fs::read(segment(&archive, 1)).unwrap();
+    // A frame header cut short; a whole frame whose checksum doesn't match.
+    let torn: &[u8] = &[9, 0, 0, 0];
+    let damaged: &[u8] = &[4, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4];
+    for (name, tail, next) in [("torn", torn, true), ("damaged", damaged, false)] {
+        let supplied = root.path().join(format!("supplied-{name}"));
+        fs::create_dir_all(&supplied).unwrap();
+        fs::write(segment(&supplied, 1), [first.as_slice(), tail].concat()).unwrap();
+        if next {
+            fs::copy(segment(&live, 3), segment(&supplied, 3)).unwrap();
+        }
+        let target = root.path().join(name);
+        let restored = nrese_store::restore_until(&backup, &target, &[supplied], Some(2), None);
+        let (_, at, report) = restored.unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert_eq!(at, 2, "{name}");
+        assert_eq!(
+            opens_at(&target, 3),
+            "content at revision 2, revision 2, 2 quads",
+            "{name}"
+        );
+        assert_eq!(
+            report.stop,
+            nrese_store::RestoreStop::PastRevision,
+            "{name}"
+        );
+    }
+}
+
 /// Spec: `restore_until` rejects untimed records after the image under a time cutoff.
 /// the image at 2, then records 3-5 without a time (a version 5 segment); 4 and 5
 /// were committed after T. Restored by time T: the time of what is kept is unknown.
