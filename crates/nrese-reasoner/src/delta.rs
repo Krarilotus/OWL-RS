@@ -54,9 +54,7 @@ use super::eval::{
 };
 use super::ir::Triple;
 use super::ir::{Head, Rule};
-use super::lists::{
-    ListDiagnostic, ListRules, ListVocabulary, Predicates, RuleKind, WrittenLists, internal,
-};
+use super::lists::{ListRules, ListVocabulary, Predicates, RuleKind, WrittenLists, internal};
 use super::violations::{Violations, unlimited};
 
 /// The materialised state: asserted facts after the change, and inferred facts before it.

@@ -170,7 +170,7 @@ pub fn materialise(input: &[Triple], rules: &[Rule], lists: Option<&ListVocabula
         let mut program: Vec<Rule> = rules.to_vec();
         if let Some(vocabulary) = lists {
             let (list_rules, _, diagnostics) =
-                compile(vocabulary, &index, &mut predicates, RuleKind::All);
+                compile(vocabulary, &index, &mut predicates, RuleKind::All, None);
             program.extend(list_rules);
             closure.diagnostics = diagnostics;
         }
