@@ -70,14 +70,18 @@ fn direct_semantics_reads_each_distinct_operand_once() {
          [] a owl:AllDisjointProperties ; owl:members ( :p :p :q ) . :x :p 1 .",
         ":C owl:disjointUnionOf ( :A :A :B ) . :x a :A .",
     ] {
-        let write = insert(&pipeline(), data);
-        let (status, quarantine) = rebuilt(pipeline().store(), data);
-        eprintln!("{data} => write {write:?}, rebuild {status:?}, quarantine {quarantine}");
-        if write.is_err() || matches!(status, ConsistencyStatus::Inconsistent { .. }) || quarantine
-        {
-            failures.push(format!(
-                "{data}: write {write:?}, rebuild {status:?}, quarantine {quarantine}"
-            ));
+        for representatives in [true, false] {
+            let write = insert(&dl_pipeline(representatives), data);
+            let (status, quarantine) = rebuilt(dl_pipeline(representatives).store(), data);
+            eprintln!("{data} => write {write:?}, rebuild {status:?}, quarantine {quarantine}");
+            if write.is_err()
+                || matches!(status, ConsistencyStatus::Inconsistent { .. })
+                || quarantine
+            {
+                failures.push(format!(
+                    "representatives={representatives}, {data}: write {write:?}, rebuild {status:?}, quarantine {quarantine}"
+                ));
+            }
         }
     }
     assert!(
@@ -97,18 +101,24 @@ fn direct_semantics_preserves_disjointness_between_distinct_operands() {
         ":p a owl:ObjectProperty . :q a owl:ObjectProperty .
          [] a owl:AllDisjointProperties ; owl:members ( :p :p :q ) . :x :p :y ; :q :y .",
     ] {
-        let write = insert(&pipeline(), data);
-        if !refused(&write) {
-            failures.push(format!("{data}: {write:?}"));
+        for representatives in [true, false] {
+            let write = insert(&dl_pipeline(representatives), data);
+            if !refused(&write) {
+                failures.push(format!(
+                    "representatives={representatives}, {data}: {write:?}"
+                ));
+            }
         }
     }
-    let dl = pipeline();
-    insert(&dl, ":C owl:disjointUnionOf ( :A :A ) .").expect("an empty class can be defined");
-    let write = insert(&dl, ":c a :C .");
-    if !refused(&write) {
-        failures.push(format!(
-            "instance of the empty one-operand union: {write:?}"
-        ));
+    for representatives in [true, false] {
+        let dl = dl_pipeline(representatives);
+        insert(&dl, ":C owl:disjointUnionOf ( :A :A ) .").expect("an empty class can be defined");
+        let write = insert(&dl, ":c a :C .");
+        if !refused(&write) {
+            failures.push(format!(
+                "representatives={representatives}, instance of the empty one-operand union: {write:?}"
+            ));
+        }
     }
     assert!(
         failures.is_empty(),
@@ -124,17 +134,22 @@ fn direct_semantics_still_refuses_lists_with_only_one_distinct_operand() {
         ":p a owl:ObjectProperty .
          [] a owl:AllDisjointProperties ; owl:members ( :p :p ) . :x :p :y .",
     ] {
-        let write = insert(&pipeline(), data);
-        assert!(refused(&write), "{data}: {write:?}");
-        let (status, quarantine) = rebuilt(pipeline().store(), data);
-        assert!(
-            matches!(status, ConsistencyStatus::Inconsistent { .. }),
-            "{data}: {status:?}"
-        );
-        assert!(
-            quarantine,
-            "{data}: a rebuild must quarantine the inconsistency"
-        );
+        for representatives in [true, false] {
+            let write = insert(&dl_pipeline(representatives), data);
+            assert!(
+                refused(&write),
+                "representatives={representatives}, {data}: {write:?}"
+            );
+            let (status, quarantine) = rebuilt(dl_pipeline(representatives).store(), data);
+            assert!(
+                matches!(status, ConsistencyStatus::Inconsistent { .. }),
+                "representatives={representatives}, {data}: {status:?}"
+            );
+            assert!(
+                quarantine,
+                "representatives={representatives}, {data}: a rebuild must quarantine the inconsistency"
+            );
+        }
     }
 }
 
@@ -196,6 +211,13 @@ fn single_writes_distinguish_equal_operands_from_an_alias_outside_the_list() {
                     failures.push(format!(
                         "representatives={representatives}, seeded={seeded}, {data}: {write:?}"
                     ));
+                } else if seeded && !clashes {
+                    let (rows, status) = super::queries::query(&dl, "ASK { :w a :Witness }");
+                    assert_eq!(rows, ["true"], "representatives={representatives}");
+                    assert!(
+                        status.is_complete(),
+                        "representatives={representatives}: {status:?}"
+                    );
                 }
             }
         }
@@ -260,6 +282,37 @@ fn writing_an_already_inferred_operand_can_introduce_a_clash() {
 }
 
 #[test]
+fn asserting_an_inferred_operand_beside_the_written_one_agrees_with_a_rebuild() {
+    for representatives in [true, false] {
+        let dl = dl_pipeline(representatives);
+        insert(&dl, ALIAS_OUTSIDE).expect("the alias is outside the written list");
+        let write = super::update(
+            &dl,
+            &format!(
+                "{RDF}
+             INSERT {{ ?second rdf:first :b }}
+             WHERE {{
+                 ?axiom a owl:AllDifferent ; owl:members ?head .
+                 ?head rdf:rest ?second .
+                 ?second rdf:first :a ; rdf:rest ?third .
+                 ?third rdf:first :c .
+             }}"
+            ),
+        );
+        if write.is_ok() {
+            let program = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl)
+                .materialised_program()
+                .unwrap();
+            dl.store().rematerialise(program).expect("rebuild");
+            assert!(
+                !dl.store().is_quarantined(),
+                "representatives={representatives}: admitted by the write, quarantined by the rebuild"
+            );
+        }
+    }
+}
+
+#[test]
 fn same_as_members_clash_past_the_walk_limit_after_a_rebuild() {
     use std::fmt::Write;
 
@@ -276,8 +329,13 @@ fn same_as_members_clash_past_the_walk_limit_after_a_rebuild() {
         )
         .unwrap();
     }
-    let (status, quarantine) = rebuilt(pipeline().store(), &data);
-    assert!(quarantine, "the :a/:b pair must clash: {status:?}");
+    for representatives in [true, false] {
+        let (status, quarantine) = rebuilt(dl_pipeline(representatives).store(), &data);
+        assert!(
+            quarantine,
+            "representatives={representatives}: the :a/:b pair must clash: {status:?}"
+        );
+    }
 }
 
 #[test]
@@ -297,22 +355,32 @@ fn a_branching_list_can_still_have_a_single_operand_walk() {
         )
         .unwrap();
     }
-    let write = super::update(&pipeline(), &format!("{RDF} INSERT DATA {{ {data} }}"));
-    // A branching RDF list is outside the structural mapping. Pin the rule that
-    // found the clash even when the public consistency verdict is Undecided.
-    assert!(
-        matches!(&write, Err(MutationError::Rejected(reject))
-            if reject.explanation.as_ref().is_some_and(|e| e.violated_constraint == "eq-diff2")),
-        "the (:a :a) walk clashes: {write:?}"
-    );
-
     // Extending the repeated walk to (:a :a :b) makes every walk mixed.
-    let data = data.replace(
+    let mixed = data.replace(
         "_:repeated rdf:first :a ; rdf:rest rdf:nil",
         "_:repeated rdf:first :a ; rdf:rest _:tail0",
     );
-    let (status, quarantine) = rebuilt(pipeline().store(), &format!("{RDF}\n{data}"));
-    assert!(!quarantine, "no walk disjoins a from itself: {status:?}");
+    for representatives in [true, false] {
+        let write = super::update(
+            &dl_pipeline(representatives),
+            &format!("{RDF} INSERT DATA {{ {data} }}"),
+        );
+        // A branching RDF list is outside the structural mapping. Pin the rule that
+        // found the clash even when the public consistency verdict is Undecided.
+        assert!(
+            matches!(&write, Err(MutationError::Rejected(reject))
+                if reject.explanation.as_ref().is_some_and(|e| e.violated_constraint == "eq-diff2")),
+            "representatives={representatives}: the (:a :a) walk clashes: {write:?}"
+        );
+        let (status, quarantine) = rebuilt(
+            dl_pipeline(representatives).store(),
+            &format!("{RDF}\n{mixed}"),
+        );
+        assert!(
+            !quarantine,
+            "representatives={representatives}: no walk disjoins a from itself: {status:?}"
+        );
+    }
 }
 
 #[test]
