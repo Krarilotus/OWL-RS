@@ -136,24 +136,46 @@ impl Import<'_> {
         }
     }
 
+    /// `id` copied as [`Self::class`] copies a class expression: with a stack of its own,
+    /// operands in order, each range interned once its operands are.
     fn range(&mut self, id: RangeId) -> RangeId {
-        let range = match self.from.range(id).clone() {
-            DataRange::And(v) => {
-                let mut v: Vec<RangeId> = v.into_iter().map(|r| self.range(r)).collect();
-                v.sort_unstable();
-                v.dedup();
-                DataRange::And(v)
+        // The ranges waiting for their operands, each with those copied so far.
+        let mut waiting: Vec<(DataRange, Vec<RangeId>)> = Vec::new();
+        let mut next = id;
+        loop {
+            let mut found = match self.from.range(next).clone() {
+                range @ (DataRange::And(_) | DataRange::Or(_) | DataRange::Not(_)) => {
+                    waiting.push((range, Vec::new()));
+                    None
+                }
+                leaf => Some(RangeId(self.to.ranges.intern(leaf))),
+            };
+            // Up through what waits, as far as it has every operand.
+            loop {
+                let Some((range, done)) = waiting.last_mut() else {
+                    return found.expect("the range is copied");
+                };
+                done.extend(found.take());
+                let operands = match range {
+                    DataRange::And(v) | DataRange::Or(v) => &v[..],
+                    DataRange::Not(r) => std::slice::from_ref(r),
+                    _ => &[],
+                };
+                if let Some(&operand) = operands.get(done.len()) {
+                    next = operand;
+                    break;
+                }
+                let (range, mut done) = waiting.pop().expect("a waiting range");
+                done.sort_unstable();
+                done.dedup();
+                let copy = match range {
+                    DataRange::And(_) => DataRange::And(done),
+                    DataRange::Or(_) => DataRange::Or(done),
+                    _ => DataRange::Not(done[0]),
+                };
+                found = Some(RangeId(self.to.ranges.intern(copy)));
             }
-            DataRange::Or(v) => {
-                let mut v: Vec<RangeId> = v.into_iter().map(|r| self.range(r)).collect();
-                v.sort_unstable();
-                v.dedup();
-                DataRange::Or(v)
-            }
-            DataRange::Not(r) => DataRange::Not(self.range(r)),
-            other => other,
-        };
-        RangeId(self.to.ranges.intern(range))
+        }
     }
 
     fn axiom(&mut self, axiom: &Axiom) -> Axiom {

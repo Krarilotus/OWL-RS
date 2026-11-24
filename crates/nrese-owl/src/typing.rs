@@ -253,19 +253,23 @@ impl Check<'_> {
         }
     }
 
-    /// A data range an axiom (or a rule) names, and every range in it.
+    /// A data range an axiom (or a rule) names, and every range in it, each before its
+    /// operands, from the left, with a stack of its own (the nesting depth is no call depth).
     #[deny(clippy::wildcard_enum_match_arm)]
     fn range(&mut self, id: RangeId) {
-        if !self.ranges.insert(id) {
-            return;
-        }
-        match self.o.range(id) {
-            DataRange::Literal | DataRange::OneOf(_) => {}
-            DataRange::Datatype(t) | DataRange::Restriction(t, _) => {
-                self.mark(*t, EntityKind::Datatype, true);
+        let mut stack = vec![id];
+        while let Some(id) = stack.pop() {
+            if !self.ranges.insert(id) {
+                continue;
             }
-            DataRange::And(rs) | DataRange::Or(rs) => rs.iter().for_each(|&r| self.range(r)),
-            DataRange::Not(r) => self.range(*r),
+            match self.o.range(id) {
+                DataRange::Literal | DataRange::OneOf(_) => {}
+                DataRange::Datatype(t) | DataRange::Restriction(t, _) => {
+                    self.mark(*t, EntityKind::Datatype, true);
+                }
+                DataRange::And(rs) | DataRange::Or(rs) => stack.extend(rs.iter().rev()),
+                DataRange::Not(r) => stack.push(*r),
+            }
         }
     }
 

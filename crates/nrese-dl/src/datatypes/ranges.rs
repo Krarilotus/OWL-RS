@@ -194,7 +194,7 @@ impl Ranges {
     pub fn finish(&mut self) {
         let mut evals: Vec<Option<Eval>> = vec![None; self.table.len()];
         for id in 0..self.table.len() as u32 {
-            self.compute(RangeId(id), &mut evals, &mut Vec::new());
+            self.compute(RangeId(id), &mut evals);
         }
         self.evals = evals.into_iter().map(|e| e.expect("evaluated")).collect();
     }
@@ -229,61 +229,121 @@ impl Ranges {
         Datatype::from_iri(iri).ok_or_else(|| format!("{iri} isn't in the OWL 2 datatype map"))
     }
 
-    fn compute(&self, id: RangeId, evals: &mut Vec<Option<Eval>>, stack: &mut Vec<Term>) -> Eval {
-        if let Some(Some(e)) = evals.get(id.0 as usize) {
-            return e.clone();
+    /// `id`'s value, with a stack of its own (the nesting depth is no call depth): each range
+    /// from its operands' values in order, a defined datatype from its definition's. A value
+    /// found inside no definition is kept in `evals`.
+    fn compute(&self, id: RangeId, evals: &mut [Option<Eval>]) -> Eval {
+        /// What a range waits for: its operands' values (with the value so far and the
+        /// operands left), its one operand's, or its definition's.
+        enum Waiting {
+            And(Eval, std::vec::IntoIter<RangeId>),
+            Or(Eval, std::vec::IntoIter<RangeId>),
+            Not,
+            Definition,
         }
-        let eval = match self.get(id).clone() {
-            DataRange::Literal => Eval::exact(ValueSet::all()),
-            DataRange::Datatype(t) => match self.definitions.get(&t) {
-                Some(_) if stack.contains(&t) => {
-                    Eval::unknown("a cyclic datatype definition".into())
+        let mut waiting: Vec<(RangeId, Waiting)> = Vec::new();
+        // The datatypes whose definitions are being evaluated.
+        let mut definitions: Vec<Term> = Vec::new();
+        let mut next = id;
+        'compute: loop {
+            let mut found = if let Some(Some(e)) = evals.get(next.0 as usize) {
+                Some(e.clone())
+            } else {
+                let found = match self.get(next).clone() {
+                    DataRange::Literal => Some(Eval::exact(ValueSet::all())),
+                    DataRange::Datatype(t) => match self.definitions.get(&t) {
+                        Some(_) if definitions.contains(&t) => {
+                            Some(Eval::unknown("a cyclic datatype definition".into()))
+                        }
+                        Some(&def) => {
+                            definitions.push(t);
+                            waiting.push((next, Waiting::Definition));
+                            next = def;
+                            continue 'compute;
+                        }
+                        None => Some(match self.datatype(t) {
+                            Ok(d) => Eval::exact(ValueSet::of(d)),
+                            Err(why) => Eval::unknown(why),
+                        }),
+                    },
+                    DataRange::And(xs) => {
+                        let all = Eval::exact(ValueSet::all());
+                        waiting.push((next, Waiting::And(all, xs.into_iter())));
+                        None
+                    }
+                    DataRange::Or(xs) => {
+                        let none = Eval::exact(ValueSet::empty());
+                        waiting.push((next, Waiting::Or(none, xs.into_iter())));
+                        None
+                    }
+                    DataRange::Not(x) => {
+                        waiting.push((next, Waiting::Not));
+                        next = x;
+                        continue 'compute;
+                    }
+                    DataRange::OneOf(literals) => {
+                        let mut e = Eval::exact(ValueSet::empty());
+                        for l in literals {
+                            let one = match self.value(l) {
+                                Ok(v) => Eval::exact(ValueSet::single(&v)),
+                                Err(why) => Eval::unknown(why),
+                            };
+                            e = e.or(&one);
+                        }
+                        Some(e)
+                    }
+                    DataRange::Restriction(t, facets) => Some(self.restriction(t, &facets)),
+                };
+                if let Some(eval) = &found
+                    && definitions.is_empty()
+                {
+                    evals[next.0 as usize] = Some(eval.clone());
                 }
-                Some(&def) => {
-                    stack.push(t);
-                    let e = self.compute(def, evals, stack);
-                    stack.pop();
-                    e
+                found
+            };
+            // Up through what waits, as far as it has every operand's value.
+            loop {
+                let Some((id, waits)) = waiting.pop() else {
+                    return found.expect("the range's value");
+                };
+                let (waits, operand) = match waits {
+                    Waiting::And(e, mut rest) => {
+                        let e = match found.take() {
+                            Some(other) => e.and(&other),
+                            None => e,
+                        };
+                        let operand = rest.next();
+                        (Waiting::And(e, rest), operand)
+                    }
+                    Waiting::Or(e, mut rest) => {
+                        let e = match found.take() {
+                            Some(other) => e.or(&other),
+                            None => e,
+                        };
+                        let operand = rest.next();
+                        (Waiting::Or(e, rest), operand)
+                    }
+                    other => (other, None),
+                };
+                if let Some(operand) = operand {
+                    waiting.push((id, waits));
+                    next = operand;
+                    continue 'compute;
                 }
-                None => match self.datatype(t) {
-                    Ok(d) => Eval::exact(ValueSet::of(d)),
-                    Err(why) => Eval::unknown(why),
-                },
-            },
-            DataRange::And(xs) => {
-                let mut e = Eval::exact(ValueSet::all());
-                for x in xs {
-                    let other = self.compute(x, evals, stack);
-                    e = e.and(&other);
+                let eval = match waits {
+                    Waiting::And(e, _) | Waiting::Or(e, _) => e,
+                    Waiting::Not => found.take().expect("the operand's value").not(),
+                    Waiting::Definition => {
+                        definitions.pop();
+                        found.take().expect("the definition's value")
+                    }
+                };
+                if definitions.is_empty() {
+                    evals[id.0 as usize] = Some(eval.clone());
                 }
-                e
+                found = Some(eval);
             }
-            DataRange::Or(xs) => {
-                let mut e = Eval::exact(ValueSet::empty());
-                for x in xs {
-                    let other = self.compute(x, evals, stack);
-                    e = e.or(&other);
-                }
-                e
-            }
-            DataRange::Not(x) => self.compute(x, evals, stack).not(),
-            DataRange::OneOf(literals) => {
-                let mut e = Eval::exact(ValueSet::empty());
-                for l in literals {
-                    let one = match self.value(l) {
-                        Ok(v) => Eval::exact(ValueSet::single(&v)),
-                        Err(why) => Eval::unknown(why),
-                    };
-                    e = e.or(&one);
-                }
-                e
-            }
-            DataRange::Restriction(t, facets) => self.restriction(t, &facets),
-        };
-        if stack.is_empty() {
-            evals[id.0 as usize] = Some(eval.clone());
         }
-        eval
     }
 
     fn restriction(&self, t: Term, facets: &[(Term, Term)]) -> Eval {

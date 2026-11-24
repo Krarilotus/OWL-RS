@@ -472,6 +472,23 @@ enum ClassFrame {
     },
 }
 
+/// A data range whose RDF form has been read, with range operands still to resolve.
+enum RangeRead {
+    Known(RangeId),
+    Ready(DataRange),
+    Not(Term),
+    Set(Vec<Term>, bool),
+}
+
+enum RangeFrame {
+    Not,
+    Set {
+        remaining: std::vec::IntoIter<Term>,
+        operands: Vec<RangeId>,
+        union: bool,
+    },
+}
+
 struct Reader<'a> {
     v: Vocabulary,
     /// [`DECLARATION_KINDS`] by the source's ids.
@@ -1329,24 +1346,57 @@ impl<'a> Reader<'a> {
         let Some(filler) = filler.or_else(|| first(self, self.v.owl_all_values_from)) else {
             return false;
         };
-        self.is_data_range(filler, &mut HashMap::new())
+        self.is_data_range(filler)
     }
 
     /// Whether `term` is a data range by its own statements: a datatype (declared, or of
     /// OWL 2's datatype map, whose names no class may take), or a blank node typed
     /// `rdfs:Datatype` (`owl:DataRange` in OWL 1), restricting a datatype, a datatype's
     /// complement, an enumeration of literals, or an intersection or union of data ranges.
-    /// A mix with classes, an empty list or a cycle is no evidence: read as before. `seen`
-    /// holds each operator node's answer, `false` while on the path (a shared one is read once).
-    fn is_data_range(&mut self, term: Term, seen: &mut HashMap<Term, bool>) -> bool {
+    /// A mix with classes, an empty list or a cycle is no evidence: read as before. Each
+    /// operator node's answer is kept, `false` while on the path (a shared one is read once).
+    /// The operands are decided from the left with a stack of its own (the nesting depth is
+    /// no call depth), the first that isn't a data range deciding.
+    fn is_data_range(&mut self, term: Term) -> bool {
+        let mut seen = HashMap::new();
+        // The open intersections and unions, each with its operands still to decide.
+        let mut open: Vec<(Term, std::vec::IntoIter<Term>)> = Vec::new();
+        let mut next = term;
+        loop {
+            let data = match self.data_range_operands(next, &mut seen) {
+                Ok(data) => data,
+                Err(operands) => {
+                    open.push((next, operands.into_iter()));
+                    true
+                }
+            };
+            loop {
+                let Some((operator, operands)) = open.last_mut() else {
+                    return data;
+                };
+                if data && let Some(operand) = operands.next() {
+                    next = operand;
+                    break;
+                }
+                seen.insert(*operator, data);
+                open.pop();
+            }
+        }
+    }
+
+    /// [`Self::is_data_range`] of `term` where its own statements decide it, else the
+    /// operands of the intersection or union it is (at least one), all of which must be.
+    fn data_range_operands(
+        &mut self,
+        term: Term,
+        seen: &mut HashMap<Term, bool>,
+    ) -> Result<bool, Vec<Term>> {
         let v = self.v;
         match self.kind(term) {
-            TermKind::Iri => {
-                self.declared_as(term, EntityKind::Datatype)
-                    || crate::vocab::DATA_IRIS
-                        .iter()
-                        .any(|&iri| self.terms.iri(iri) == Some(term))
-            }
+            TermKind::Iri => Ok(self.declared_as(term, EntityKind::Datatype)
+                || crate::vocab::DATA_IRIS
+                    .iter()
+                    .any(|&iri| self.terms.iri(iri) == Some(term))),
             TermKind::Blank => {
                 let first = |reader: &Self, p| reader.single(term, p);
                 if self.has_type(term, v.rdfs_datatype)
@@ -1354,15 +1404,15 @@ impl<'a> Reader<'a> {
                     || first(self, v.owl_on_datatype).is_some()
                     || first(self, v.owl_datatype_complement_of).is_some()
                 {
-                    return true;
+                    return Ok(true);
                 }
                 if let Some(list) = first(self, v.owl_one_of) {
                     let members = self.list(list).unwrap_or_default();
-                    return !members.is_empty()
-                        && members.iter().all(|&m| self.kind(m) == TermKind::Literal);
+                    return Ok(!members.is_empty()
+                        && members.iter().all(|&m| self.kind(m) == TermKind::Literal));
                 }
                 if let Some(&data) = seen.get(&term) {
-                    return data;
+                    return Ok(data);
                 }
                 seen.insert(term, false);
                 let operands =
@@ -1370,12 +1420,12 @@ impl<'a> Reader<'a> {
                 let members = operands
                     .and_then(|list| self.list(list))
                     .unwrap_or_default();
-                let data =
-                    !members.is_empty() && members.iter().all(|&m| self.is_data_range(m, seen));
-                seen.insert(term, data);
-                data
+                match members.is_empty() {
+                    true => Ok(false),
+                    false => Err(members),
+                }
             }
-            _ => false,
+            _ => Ok(false),
         }
     }
 
@@ -1510,40 +1560,118 @@ impl<'a> Reader<'a> {
         None
     }
 
-    /// The data range `term` stands for.
+    /// The data range `term` stands for, read as [`Self::class`] reads a class expression:
+    /// with a stack of its own, so that the nesting depth is no call depth.
     fn range(&mut self, term: Term) -> Option<RangeId> {
+        let (mut node, mut input) = self.start_range(term);
+        let mut stack = Vec::new();
+        'read: loop {
+            let mut found = match input {
+                Some(RangeRead::Known(id)) => Some(id),
+                Some(RangeRead::Ready(range)) => Some(self.intern_range(range)),
+                Some(RangeRead::Not(operand)) => {
+                    stack.push((node, RangeFrame::Not));
+                    (node, input) = self.start_range(operand);
+                    continue;
+                }
+                Some(RangeRead::Set(members, union)) => {
+                    let mut remaining = members.into_iter();
+                    if let Some(first) = remaining.next() {
+                        let operands = Vec::with_capacity(remaining.len() + 1);
+                        let frame = RangeFrame::Set {
+                            remaining,
+                            operands,
+                            union,
+                        };
+                        stack.push((node, frame));
+                        (node, input) = self.start_range(first);
+                        continue;
+                    }
+                    Some(self.intern_range(Self::range_set(Vec::new(), union)))
+                }
+                None => None,
+            };
+            loop {
+                if let Some(term) = node {
+                    self.finish_range(term, found);
+                }
+                let Some((parent, frame)) = stack.pop() else {
+                    return found;
+                };
+                node = parent;
+                found = match (frame, found) {
+                    (RangeFrame::Not, Some(id)) => Some(self.intern_range(DataRange::Not(id))),
+                    (
+                        RangeFrame::Set {
+                            mut remaining,
+                            mut operands,
+                            union,
+                        },
+                        Some(id),
+                    ) => {
+                        operands.push(id);
+                        if let Some(next) = remaining.next() {
+                            let frame = RangeFrame::Set {
+                                remaining,
+                                operands,
+                                union,
+                            };
+                            stack.push((node, frame));
+                            (node, input) = self.start_range(next);
+                            continue 'read;
+                        }
+                        Some(self.intern_range(Self::range_set(operands, union)))
+                    }
+                    (_, None) => None,
+                };
+            }
+        }
+    }
+
+    fn start_range(&mut self, term: Term) -> (Option<Term>, Option<RangeRead>) {
         match self.kind(term) {
             TermKind::Iri if is(term, self.v.rdfs_literal) => {
-                Some(self.intern_range(DataRange::Literal))
+                (None, Some(RangeRead::Ready(DataRange::Literal)))
             }
-            TermKind::Iri => Some(self.intern_range(DataRange::Datatype(term))),
+            TermKind::Iri => (None, Some(RangeRead::Ready(DataRange::Datatype(term)))),
             TermKind::Literal => {
                 self.report(Diagnostic::Malformed {
                     node: term,
                     what: "a literal where a data range belongs",
                 });
-                None
+                (None, None)
             }
             TermKind::Blank => {
                 self.used(term);
                 if let Some(&known) = self.range_memo.get(&term) {
-                    return known;
+                    return (None, known.map(RangeRead::Known));
                 }
+                // Guards against a cycle through this node.
                 self.range_memo.insert(term, None);
-                let found = self.blank_range(term);
-                if found.is_none() {
-                    self.report(Diagnostic::Malformed {
-                        node: term,
-                        what: "a data range that can't be read",
-                    });
-                }
-                self.range_memo.insert(term, found);
-                found
+                (Some(term), self.blank_range(term))
             }
         }
     }
 
-    fn blank_range(&mut self, node: Term) -> Option<RangeId> {
+    fn finish_range(&mut self, term: Term, found: Option<RangeId>) {
+        if found.is_none() {
+            self.report(Diagnostic::Malformed {
+                node: term,
+                what: "a data range that can't be read",
+            });
+        }
+        self.range_memo.insert(term, found);
+    }
+
+    fn range_set(operands: Vec<RangeId>, union: bool) -> DataRange {
+        match union {
+            true => DataRange::Or(canonical(operands)),
+            false => DataRange::And(canonical(operands)),
+        }
+    }
+
+    /// A blank data range, with its range operands still to read.
+    fn blank_range(&mut self, node: Term) -> Option<RangeRead> {
         let v = self.v;
         for range_type in [v.rdfs_datatype, v.owl_data_range] {
             if self.has_type(node, range_type) {
@@ -1553,25 +1681,18 @@ impl<'a> Reader<'a> {
         if self.twice(node) || self.forms(node, &self.expression_forms()) {
             return None;
         }
-        let ranges = |reader: &mut Self, list: Term| -> Option<Vec<RangeId>> {
-            let members = reader.list(list)?;
-            members.iter().map(|&m| reader.range(m)).collect()
-        };
         if let Some(list) = self.one(node, v.owl_intersection_of) {
-            let operands = ranges(self, list)?;
-            return Some(self.intern_range(DataRange::And(canonical(operands))));
+            return Some(RangeRead::Set(self.list(list)?, false));
         }
         if let Some(list) = self.one(node, v.owl_union_of) {
-            let operands = ranges(self, list)?;
-            return Some(self.intern_range(DataRange::Or(canonical(operands))));
+            return Some(RangeRead::Set(self.list(list)?, true));
         }
         if let Some(operand) = self.one(node, v.owl_datatype_complement_of) {
-            let operand = self.range(operand)?;
-            return Some(self.intern_range(DataRange::Not(operand)));
+            return Some(RangeRead::Not(operand));
         }
         if let Some(list) = self.one(node, v.owl_one_of) {
             let literals = self.list(list)?;
-            return Some(self.intern_range(DataRange::OneOf(canonical(literals))));
+            return Some(RangeRead::Ready(DataRange::OneOf(canonical(literals))));
         }
         if let Some(datatype) = self.one(node, v.owl_on_datatype) {
             let list = self.one(node, v.owl_with_restrictions)?;
@@ -1610,7 +1731,10 @@ impl<'a> Reader<'a> {
                 self.collect([restriction, facet, value]);
                 facets.push((facet, value));
             }
-            return Some(self.intern_range(DataRange::Restriction(datatype, canonical(facets))));
+            return Some(RangeRead::Ready(DataRange::Restriction(
+                datatype,
+                canonical(facets),
+            )));
         }
         self.report(Diagnostic::Malformed {
             node,
