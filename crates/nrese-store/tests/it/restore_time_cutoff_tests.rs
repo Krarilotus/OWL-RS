@@ -223,6 +223,90 @@ fn a_time_cutoff_with_a_gap_in_the_log_is_refused() {
     check("time-cut-hides-gap", &case, "WAL gap: expected revision 11");
 }
 
+/// Spec: `restore_until` by revision needs only the revisions up to it: a gap wholly past the
+/// requested revision cuts there, as before. The image at 2, the supplied log 3-5 then 9 (the
+/// segment from 6 left out), restored to revision 5: exactly 5, stopped past the revision.
+#[test]
+fn a_revision_cutoff_before_a_gap_restores_the_revision() {
+    let root = tempdir().unwrap();
+    let (data, backup) = (root.path().join("data"), root.path().join("backup"));
+    let e = engine(&data, true);
+    commit_plain(&e, 1);
+    commit_plain(&e, 2);
+    assert_eq!(image(&e, &backup), 2);
+    e.checkpoint().unwrap();
+    for n in 3..=5 {
+        commit_plain(&e, n);
+    }
+    e.checkpoint().unwrap();
+    for n in 6..=8 {
+        commit_plain(&e, n);
+    }
+    e.checkpoint().unwrap();
+    commit_plain(&e, 9);
+    drop(e);
+    let (archive, live) = (data.join("wal-archive"), data.join("wal"));
+    assert_eq!(segments(&archive), [1, 3, 6], "setup: the archive");
+    assert_eq!(segments(&live), [9], "setup: the live log");
+    let supplied = root.path().join("supplied");
+    fs::create_dir_all(&supplied).unwrap();
+    fs::copy(segment(&archive, 3), segment(&supplied, 3)).unwrap();
+    fs::copy(segment(&live, 9), segment(&supplied, 9)).unwrap();
+    let target = root.path().join("target");
+    let (_, at, report) =
+        nrese_store::restore_until(&backup, &target, &[supplied], Some(5), None).unwrap();
+    assert_eq!(at, 5);
+    assert_eq!(
+        opens_at(&target, 9),
+        "content at revision 5, revision 5, 5 quads"
+    );
+    assert_eq!(report.stop, nrese_store::RestoreStop::PastRevision);
+}
+
+/// Spec: the restore's report says when recovery stopped at the end of the supplied log, with
+/// the last kept commit's time. The image at 2, commits 3-5, restored by a time after commit 5.
+#[test]
+fn a_time_cutoff_past_the_log_reports_the_end_of_the_log() {
+    let root = tempdir().unwrap();
+    let (data, backup) = (root.path().join("data"), root.path().join("backup"));
+    let e = engine(&data, true);
+    commit_plain(&e, 1);
+    commit_plain(&e, 2);
+    assert_eq!(image(&e, &backup), 2);
+    e.checkpoint().unwrap();
+    commit_plain(&e, 3);
+    commit_plain(&e, 4);
+    let before_last_commit = now_micros();
+    commit_plain(&e, 5);
+    std::thread::sleep(Duration::from_millis(30));
+    let t = now_micros();
+    drop(e);
+    let live = data.join("wal");
+    let target = root.path().join("target");
+    let (_, at, report) =
+        nrese_store::restore_until(&backup, &target, std::slice::from_ref(&live), None, Some(t))
+            .unwrap();
+    assert_eq!(at, 5);
+    assert_eq!(report.stop, nrese_store::RestoreStop::EndOfLog);
+    assert!((before_last_commit..=t).contains(&report.last_commit_micros.unwrap()));
+}
+
+/// Spec: revision 0 holds no commit, so a restore of an image at 0 with nothing replayed
+/// reports no last commit time.
+#[test]
+fn an_empty_image_restored_reports_no_commit_time() {
+    let root = tempdir().unwrap();
+    let (data, backup) = (root.path().join("data"), root.path().join("backup"));
+    let e = engine(&data, false);
+    assert_eq!(image(&e, &backup), 0);
+    drop(e);
+    let target = root.path().join("target");
+    let (_, at, report) = nrese_store::restore_until(&backup, &target, &[], None, None).unwrap();
+    assert_eq!(at, 0);
+    assert_eq!(report.stop, nrese_store::RestoreStop::EndOfLog);
+    assert_eq!(report.last_commit_micros, None);
+}
+
 /// Spec: `restore_until` rejects untimed records after the image under a time cutoff.
 /// the image at 2, then records 3-5 without a time (a version 5 segment); 4 and 5
 /// were committed after T. Restored by time T: the time of what is kept is unknown.
