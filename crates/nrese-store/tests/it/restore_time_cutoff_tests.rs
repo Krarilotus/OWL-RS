@@ -357,6 +357,62 @@ fn a_stepped_back_log_reports_its_latest_commit_time() {
     assert_eq!(report.latest_commit_micros, Some(2000));
 }
 
+/// Spec: a record past the cutoff is not kept, so its time changes nothing, even one past what
+/// a store keeps (an earlier binary's replica could log it). The image at 0, then commits 1 and
+/// 2 logged at 2000 and 2^63: restored to revision 1, and to the time 3000, both give 1.
+#[test]
+fn a_record_past_the_cutoff_with_a_time_out_of_range_is_cut() {
+    let root = tempdir().unwrap();
+    let (data, backup) = (root.path().join("data"), root.path().join("backup"));
+    let e = engine(&data, false);
+    assert_eq!(image(&e, &backup), 0);
+    commit_plain(&e, 1);
+    commit_plain(&e, 2);
+    drop(e);
+    let live = data.join("wal");
+    let firsts = segments(&live);
+    assert_eq!(firsts.len(), 1, "setup: one live segment");
+    let supplied = root.path().join("supplied");
+    fs::create_dir_all(&supplied).unwrap();
+    let bytes = fs::read(segment(&live, firsts[0])).unwrap();
+    fs::write(
+        segment(&supplied, firsts[0]),
+        retimed(&bytes, &[2000, 1 << 63]),
+    )
+    .unwrap();
+    for (name, until, until_time, stop) in [
+        (
+            "by-revision",
+            Some(1),
+            None,
+            nrese_store::RestoreStop::PastRevision,
+        ),
+        (
+            "by-time",
+            None,
+            Some(3000),
+            nrese_store::RestoreStop::PastTime,
+        ),
+    ] {
+        let target = root.path().join(name);
+        let restored = nrese_store::restore_until(
+            &backup,
+            &target,
+            std::slice::from_ref(&supplied),
+            until,
+            until_time,
+        );
+        let (_, at, report) = restored.unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert_eq!(at, 1, "{name}");
+        assert_eq!(
+            opens_at(&target, 2),
+            "content at revision 1, revision 1, 1 quads",
+            "{name}"
+        );
+        assert_eq!(report.stop, stop, "{name}");
+    }
+}
+
 /// Spec: `restore_until` rejects untimed records after the image under a time cutoff.
 /// the image at 2, then records 3-5 without a time (a version 5 segment); 4 and 5
 /// were committed after T. Restored by time T: the time of what is kept is unknown.
