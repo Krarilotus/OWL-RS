@@ -98,73 +98,88 @@ impl Rw<'_> {
         Axiom::SubObjectPropertyOf(self.chain(&[top]), r)
     }
 
-    /// `e` with U encoded; `None` where it can't be.
+    /// `e` with U encoded; `None` where it can't be. Rebuilt from its operands up, each from
+    /// the left, with a stack of its own (the nesting depth is no call depth).
     fn expr(&mut self, e: ExprId) -> Option<ExprId> {
-        let x = self.o.classes.get(e.0).clone();
-        let list = |rw: &mut Self, xs: &[ExprId]| -> Option<Vec<ExprId>> {
-            let mut out: Vec<ExprId> = xs.iter().map(|&x| rw.expr(x)).collect::<Option<_>>()?;
-            out.sort();
-            out.dedup();
-            Some(out)
-        };
-        Some(match x {
-            ClassExpr::And(xs) => {
-                let xs = list(self, &xs)?;
-                self.e(ClassExpr::And(xs))
-            }
-            ClassExpr::Or(xs) => {
-                let xs = list(self, &xs)?;
-                self.e(ClassExpr::Or(xs))
-            }
-            ClassExpr::Not(x) => {
-                let x = self.expr(x)?;
-                self.e(ClassExpr::Not(x))
-            }
-            ClassExpr::Some(r, c) | ClassExpr::All(r, c) => {
-                let some = matches!(x, ClassExpr::Some(..));
-                let c = self.expr(c)?;
-                if self.is_top(r) {
-                    self.through_hub(some, c)
-                } else if some {
-                    self.e(ClassExpr::Some(r, c))
-                } else {
-                    self.e(ClassExpr::All(r, c))
+        // The expressions waiting for their operands, each with those encoded so far.
+        let mut open: Vec<(ClassExpr, Vec<ExprId>)> = Vec::new();
+        let mut next = e;
+        loop {
+            let x = self.o.classes.get(next.0).clone();
+            let mut done = match x {
+                // Every element is U-related to every individual and to itself.
+                ClassExpr::HasValue(r, _) | ClassExpr::HasSelf(r) if self.is_top(r) => {
+                    Some(self.e(ClassExpr::Thing))
                 }
+                ClassExpr::Min(_, r, _) | ClassExpr::Max(_, r, _) | ClassExpr::Exact(_, r, _)
+                    if self.is_top(r) =>
+                {
+                    return None;
+                }
+                ClassExpr::And(_)
+                | ClassExpr::Or(_)
+                | ClassExpr::Not(_)
+                | ClassExpr::Some(..)
+                | ClassExpr::All(..)
+                | ClassExpr::Min(..)
+                | ClassExpr::Max(..)
+                | ClassExpr::Exact(..) => {
+                    open.push((x, Vec::new()));
+                    None
+                }
+                ClassExpr::DataAll(..)
+                | ClassExpr::DataSome(..)
+                | ClassExpr::DataHasValue(..)
+                | ClassExpr::DataMin(..)
+                | ClassExpr::DataMax(..)
+                | ClassExpr::DataExact(..)
+                | ClassExpr::Class(_)
+                | ClassExpr::Thing
+                | ClassExpr::Nothing
+                | ClassExpr::OneOf(_)
+                | ClassExpr::HasValue(..)
+                | ClassExpr::HasSelf(_) => Some(next),
+            };
+            loop {
+                let Some((x, encoded)) = open.last_mut() else {
+                    return done;
+                };
+                encoded.extend(done.take());
+                let operands = match x {
+                    ClassExpr::And(xs) | ClassExpr::Or(xs) => &xs[..],
+                    ClassExpr::Not(c)
+                    | ClassExpr::Some(_, c)
+                    | ClassExpr::All(_, c)
+                    | ClassExpr::Min(_, _, c)
+                    | ClassExpr::Max(_, _, c)
+                    | ClassExpr::Exact(_, _, c) => std::slice::from_ref(c),
+                    _ => &[],
+                };
+                if let Some(&operand) = operands.get(encoded.len()) {
+                    next = operand;
+                    break;
+                }
+                let (x, xs) = open.pop().expect("an open expression");
+                let list = |mut xs: Vec<ExprId>| {
+                    xs.sort();
+                    xs.dedup();
+                    xs
+                };
+                done = Some(match x {
+                    ClassExpr::And(_) => self.e(ClassExpr::And(list(xs))),
+                    ClassExpr::Or(_) => self.e(ClassExpr::Or(list(xs))),
+                    ClassExpr::Not(_) => self.e(ClassExpr::Not(xs[0])),
+                    ClassExpr::Some(r, _) if self.is_top(r) => self.through_hub(true, xs[0]),
+                    ClassExpr::All(r, _) if self.is_top(r) => self.through_hub(false, xs[0]),
+                    ClassExpr::Some(r, _) => self.e(ClassExpr::Some(r, xs[0])),
+                    ClassExpr::All(r, _) => self.e(ClassExpr::All(r, xs[0])),
+                    ClassExpr::Min(n, r, _) => self.e(ClassExpr::Min(n, r, xs[0])),
+                    ClassExpr::Max(n, r, _) => self.e(ClassExpr::Max(n, r, xs[0])),
+                    ClassExpr::Exact(n, r, _) => self.e(ClassExpr::Exact(n, r, xs[0])),
+                    _ => unreachable!("only an expression with operands waits for them"),
+                });
             }
-            // Every element is U-related to every individual and to itself.
-            ClassExpr::HasValue(r, _) | ClassExpr::HasSelf(r) if self.is_top(r) => {
-                self.e(ClassExpr::Thing)
-            }
-            ClassExpr::Min(_, r, _) | ClassExpr::Max(_, r, _) | ClassExpr::Exact(_, r, _)
-                if self.is_top(r) =>
-            {
-                return None;
-            }
-            ClassExpr::Min(n, r, c) => {
-                let c = self.expr(c)?;
-                self.e(ClassExpr::Min(n, r, c))
-            }
-            ClassExpr::Max(n, r, c) => {
-                let c = self.expr(c)?;
-                self.e(ClassExpr::Max(n, r, c))
-            }
-            ClassExpr::Exact(n, r, c) => {
-                let c = self.expr(c)?;
-                self.e(ClassExpr::Exact(n, r, c))
-            }
-            ClassExpr::DataAll(..)
-            | ClassExpr::DataSome(..)
-            | ClassExpr::DataHasValue(..)
-            | ClassExpr::DataMin(..)
-            | ClassExpr::DataMax(..)
-            | ClassExpr::DataExact(..)
-            | ClassExpr::Class(_)
-            | ClassExpr::Thing
-            | ClassExpr::Nothing
-            | ClassExpr::OneOf(_)
-            | ClassExpr::HasValue(..)
-            | ClassExpr::HasSelf(_) => e,
-        })
+        }
     }
 
     /// `xs` rewritten, sorted, repeats kept: two operands of a disjointness that become

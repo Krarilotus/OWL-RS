@@ -56,11 +56,18 @@ impl Filler {
 /// `x` as a key and whether it says at least (`true`) or its negation (`false`); `None`
 /// for `≤ n` whose negation `≥ n + 1` has no `u32` count.
 fn key(o: &Ontology, x: ExprId) -> Option<(Key, bool)> {
+    // Each complement around the restriction flips what it says.
+    let (mut x, mut flipped) = (x, false);
+    while let ClassExpr::Not(y) = *o.classes.get(x.0) {
+        (x, flipped) = (y, !flipped);
+    }
+    let (k, positive) = restriction_key(o, x)?;
+    Some((k, positive != flipped))
+}
+
+/// [`key`] of a restriction, no complement.
+fn restriction_key(o: &Ontology, x: ExprId) -> Option<(Key, bool)> {
     Some(match *o.classes.get(x.0) {
-        ClassExpr::Not(y) => {
-            let (k, positive) = key(o, y)?;
-            (k, !positive)
-        }
         ClassExpr::Some(r, f) => (Key::Object(r, Filler::of(o, f), 1), true),
         ClassExpr::Min(n, r, f) if n > 0 => (Key::Object(r, Filler::of(o, f), n), true),
         ClassExpr::Max(n, r, f) => (Key::Object(r, Filler::of(o, f), n.checked_add(1)?), false),
@@ -186,41 +193,73 @@ pub(crate) fn rewrite(ontology: &Ontology) -> Option<Ontology> {
     Some(o)
 }
 
-/// `e` with each class in `replaced` replaced by its expression.
+/// `e` with each class in `replaced` replaced by its expression. Rebuilt from its operands
+/// up, each operand from the left, with a stack of its own (the nesting depth is no call
+/// depth).
 fn substitute(
     o: &mut Ontology,
     e: ExprId,
     replaced: &HashMap<Term, ExprId>,
     memo: &mut HashMap<ExprId, ExprId>,
 ) -> ExprId {
-    if let Some(&done) = memo.get(&e) {
-        return done;
-    }
-    let expr = o.classes.get(e.0).clone();
-    if let ClassExpr::Class(a) = expr {
-        return replaced.get(&a).copied().unwrap_or(e);
-    }
-    let mut one = |o: &mut Ontology, x: ExprId| substitute(o, x, replaced, memo);
-    let rebuilt = match expr {
-        ClassExpr::And(xs) => {
-            let xs = xs.iter().map(|&x| one(o, x)).collect();
-            ClassExpr::And(crate::model::canonical(xs))
+    // The expressions waiting for their operands, each with those substituted so far.
+    let mut open: Vec<(ExprId, ClassExpr, Vec<ExprId>)> = Vec::new();
+    let mut next = e;
+    loop {
+        let mut done = match memo.get(&next) {
+            Some(&done) => Some(done),
+            None => match o.classes.get(next.0).clone() {
+                ClassExpr::Class(a) => Some(replaced.get(&a).copied().unwrap_or(next)),
+                expr @ (ClassExpr::And(_)
+                | ClassExpr::Or(_)
+                | ClassExpr::Not(_)
+                | ClassExpr::Some(..)
+                | ClassExpr::All(..)
+                | ClassExpr::Min(..)
+                | ClassExpr::Max(..)
+                | ClassExpr::Exact(..)) => {
+                    open.push((next, expr, Vec::new()));
+                    None
+                }
+                _ => Some(next),
+            },
+        };
+        loop {
+            let Some((_, expr, substituted)) = open.last_mut() else {
+                return done.expect("the root is substituted");
+            };
+            substituted.extend(done.take());
+            let operands = match expr {
+                ClassExpr::And(xs) | ClassExpr::Or(xs) => &xs[..],
+                ClassExpr::Not(x)
+                | ClassExpr::Some(_, x)
+                | ClassExpr::All(_, x)
+                | ClassExpr::Min(_, _, x)
+                | ClassExpr::Max(_, _, x)
+                | ClassExpr::Exact(_, _, x) => std::slice::from_ref(x),
+                _ => &[],
+            };
+            if let Some(&operand) = operands.get(substituted.len()) {
+                next = operand;
+                break;
+            }
+            let (e, expr, xs) = open.pop().expect("an open expression");
+            let rebuilt = match expr {
+                ClassExpr::And(_) => ClassExpr::And(crate::model::canonical(xs)),
+                ClassExpr::Or(_) => ClassExpr::Or(crate::model::canonical(xs)),
+                ClassExpr::Not(_) => ClassExpr::Not(xs[0]),
+                ClassExpr::Some(r, _) => ClassExpr::Some(r, xs[0]),
+                ClassExpr::All(r, _) => ClassExpr::All(r, xs[0]),
+                ClassExpr::Min(n, r, _) => ClassExpr::Min(n, r, xs[0]),
+                ClassExpr::Max(n, r, _) => ClassExpr::Max(n, r, xs[0]),
+                ClassExpr::Exact(n, r, _) => ClassExpr::Exact(n, r, xs[0]),
+                other => other,
+            };
+            let out = ExprId(o.classes.intern(rebuilt));
+            memo.insert(e, out);
+            done = Some(out);
         }
-        ClassExpr::Or(xs) => {
-            let xs = xs.iter().map(|&x| one(o, x)).collect();
-            ClassExpr::Or(crate::model::canonical(xs))
-        }
-        ClassExpr::Not(x) => ClassExpr::Not(one(o, x)),
-        ClassExpr::Some(r, x) => ClassExpr::Some(r, one(o, x)),
-        ClassExpr::All(r, x) => ClassExpr::All(r, one(o, x)),
-        ClassExpr::Min(n, r, x) => ClassExpr::Min(n, r, one(o, x)),
-        ClassExpr::Max(n, r, x) => ClassExpr::Max(n, r, one(o, x)),
-        ClassExpr::Exact(n, r, x) => ClassExpr::Exact(n, r, one(o, x)),
-        _ => return e,
-    };
-    let out = ExprId(o.classes.intern(rebuilt));
-    memo.insert(e, out);
-    out
+    }
 }
 
 /// `axiom` with `f` applied to each class expression it holds.
