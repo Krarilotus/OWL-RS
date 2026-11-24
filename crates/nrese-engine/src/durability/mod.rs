@@ -485,9 +485,9 @@ impl Durable {
             }
             dictionary.set_integers_in_dictionary(integers_in_dictionary.unwrap_or(false));
             for (index, record) in contents.records.iter().enumerate() {
-                check_commit_time(record)?;
-                store_clock = store_clock.max(record.committed_micros.unwrap_or(0));
                 if record.revision <= version.revision {
+                    check_commit_time(record)?;
+                    store_clock = store_clock.max(record.committed_micros.unwrap_or(0));
                     continue; // covered by the checkpoint
                 }
                 // Past a requested revision, the log ends here whatever follows: the revisions
@@ -532,6 +532,10 @@ impl Durable {
                     };
                     break;
                 }
+                // Only a kept record's time is checked and raises the clock: one past a cutoff
+                // is removed with the rest of the log after it.
+                check_commit_time(record)?;
+                store_clock = store_clock.max(record.committed_micros.unwrap_or(0));
                 replay(&mut version, dictionary, policy, record)?;
                 if replayed.last() != Some(&path) {
                     replayed.push(path);
