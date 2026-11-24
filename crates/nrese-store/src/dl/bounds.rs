@@ -1327,9 +1327,28 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> ViewEnd {
 /// they assessed this revision, as the rebuild that assessed it installed it or a gated commit
 /// carried it from its base (`tx.vouch`), and found no violation. No certificate (data loaded
 /// past the gates, a replica, a commit that didn't maintain the closure) or violations, decided
-/// or not, prove nothing. A field read of the version, no lock.
+/// or not, prove nothing. A field read of the version, no lock. Where they prove it, an
+/// ill-typed literal still makes it unknown ([`holds_ill_typed`]).
 pub(crate) fn rules_prove(snapshot: &Snapshot) -> bool {
     crate::service::Certificate::of(snapshot).is_some_and(|c| c.dl && c.state.violations == 0)
+}
+
+/// Whether `snapshot`'s version holds an ill-typed literal, which OWL 2 doesn't admit; `None`
+/// without a certificate, or where the search stopped (`Certificate::ill_typed`): undecided.
+pub(crate) fn holds_ill_typed(store: &StoreService, snapshot: &Snapshot) -> Option<bool> {
+    let memory = store.memory_stop();
+    let certificate = crate::service::Certificate::of(snapshot)?;
+    let found = certificate.ill_typed(snapshot, &|| memory.exceeded())?;
+    Some(found.is_some())
+}
+
+/// [`holds_ill_typed`] of what the commit `tx` publishes, from its base's literal
+/// (`dl::query::ill_typed_after`), found on this need where it wasn't.
+pub(crate) fn holds_ill_typed_after(store: &StoreService, tx: &Transaction<'_>) -> Option<bool> {
+    let memory = store.memory_stop();
+    let stop = || memory.exceeded();
+    let base = crate::service::Certificate::of(tx.base())?.ill_typed(tx.base(), &stop)?;
+    Some(super::query::ill_typed_after(tx, base, &stop)?.is_some())
 }
 
 /// U1 compiled and evaluated afresh over `snapshot` (or, with the kinds it was decided on,

@@ -52,7 +52,9 @@ pub struct ReasoningState {
 /// Whether the stored data is consistent under the configured ruleset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsistencyStatus {
-    /// No current reasoning state (reasoning off, or not yet materialised).
+    /// No current reasoning state (reasoning off, or not yet materialised); or, under
+    /// `owl2-dl` and `owl2-ql`, no clash while the data hold an ill-typed literal, which OWL 2
+    /// doesn't admit, or before they are checked for one (`StoreService::consistency`).
     Unknown,
     Consistent,
     /// Quarantine: violations in the baseline (see the module docs).
