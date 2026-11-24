@@ -22,11 +22,13 @@ fn pipeline(gate: ShaclGate) -> MutationPipeline {
 }
 
 fn pipeline_with(config: StoreConfig) -> MutationPipeline {
+    pipeline_with_reasoning(config, ReasoningMode::Disabled)
+}
+
+fn pipeline_with_reasoning(config: StoreConfig, mode: ReasoningMode) -> MutationPipeline {
     MutationPipeline::new(
         Arc::new(StoreService::new(config).expect("store")),
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-            ReasoningMode::Disabled,
-        ))),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(mode))),
     )
 }
 
@@ -46,6 +48,48 @@ fn refuse(pipeline: &MutationPipeline, update_text: &str) -> Box<MutationReject>
         Err(MutationError::Rejected(reject)) => reject,
         other => panic!("expected a refusal, got {other:?}"),
     }
+}
+
+/// Spec (docs/design/shacl.md, commit gate): a write introducing a violation through
+/// equality of predicates or individuals is refused under either representation.
+#[test]
+fn enforce_rejects_violations_introduced_by_equality() {
+    let mut unexpected = Vec::new();
+    for compact in [false, true] {
+        for (data, left, right) in [
+            ("ex:a ex:q ex:b", "ex:q", "ex:p"),
+            ("ex:a2 ex:p ex:v", "ex:a", "ex:a2"),
+        ] {
+            let pipeline = pipeline_with_reasoning(
+                StoreConfig {
+                    shacl_gate: ShaclGate::Enforce(GateSeverity::Violation),
+                    equality_by_representatives: true,
+                    equality_compact: compact,
+                    ..StoreConfig::in_memory()
+                },
+                ReasoningMode::Owl2Rl,
+            );
+            update(&pipeline, &format!("INSERT DATA {{ {data} }}")).expect("store data");
+            update(
+                &pipeline,
+                &format!(
+                    "INSERT DATA {{ GRAPH <{DEFAULT_SHAPES_GRAPH}> {{ \
+                    ex:S sh:targetNode ex:a ; sh:property [ sh:path ex:p ; sh:maxCount 0 ] . \
+                }} }}"
+                ),
+            )
+            .expect("store shapes on conforming data");
+            let equality = format!("{left} <http://www.w3.org/2002/07/owl#sameAs> {right}");
+            let result = update(&pipeline, &format!("INSERT DATA {{ {equality} }}"));
+            if !matches!(&result, Err(MutationError::Rejected(reject)) if reject.shacl.is_some()) {
+                unexpected.push(format!("compact={compact}, {equality}: {result:?}"));
+            }
+        }
+    }
+    assert!(
+        unexpected.is_empty(),
+        "expected SHACL refusals: {unexpected:#?}"
+    );
 }
 
 /// Spec (docs/ops/http-api.md, docs/design/shacl.md): the refusal counts only results at
