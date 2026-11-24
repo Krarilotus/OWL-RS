@@ -153,6 +153,39 @@ fn anonymous_tree_attachments_are_reported_on_a_fixed_predicate_read() {
     );
 }
 
+/// A non-fatal anonymous-tree finding belongs to the committed revision.
+/// An empty update keeps that revision and its query report.
+#[test]
+fn an_empty_update_keeps_the_anonymous_report() {
+    let dl = pipeline();
+    insert(
+        &dl,
+        &format!(
+            "{FIXED_PREDICATE} :q a owl:ObjectProperty . :z a owl:NamedIndividual .
+             _:b :q :y, :z .
+             :A a owl:Class ; rdfs:subClassOf [
+                 a owl:Restriction ; owl:onProperty :q ; owl:someValuesFrom :B
+             ] . :B a owl:Class ."
+        ),
+    )
+    .expect("admitted");
+    let bounds = dl.store().dl_bounds();
+    assert_eq!(bounds.last, "rebuilt");
+    assert!(bounds.unavailable.is_none());
+    let report = || {
+        let (answers, status) = query(&dl, FIXED_READ);
+        assert_eq!(answers, ["true"]);
+        status
+            .reasons()
+            .into_iter()
+            .find(|reason| reason.contains("anonymous tree has no root"))
+    };
+    let before = report().expect("the original anonymous report");
+    let revision = dl.store().current_revision();
+    assert_eq!(insert(&dl, "").expect("empty update"), revision);
+    assert_eq!(report().as_deref(), Some(before.as_str()));
+}
+
 /// OWL 2 Mapping to RDF Graphs Table 12: one member cannot form a data
 /// intersection or union. Two members, and a one-literal enumeration, can.
 /// The test uses a fixed predicate because an unbound predicate already
