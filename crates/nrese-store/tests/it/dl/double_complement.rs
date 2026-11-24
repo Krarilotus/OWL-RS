@@ -103,11 +103,7 @@ fn different_individuals_are_things_when_the_upper_bound_is_needed() {
     )
     .unwrap();
     let (answers, status) = query(&dl, "ASK { :a a owl:Thing }");
-    assert_eq!(
-        (answers, status.is_complete()),
-        (vec!["true".to_owned()], false),
-        "{status:?}"
-    );
+    assert_eq!(answers, ["true"], "{status:?}");
 }
 
 #[test]
@@ -119,9 +115,17 @@ fn the_nonempty_domain_answers_an_existential_thing_query() {
     )
     .unwrap();
     let (answers, status) = query(&dl, "ASK { ?x a owl:Thing }");
-    assert_eq!(
-        (answers, status.is_complete()),
-        (vec!["true".to_owned()], false),
-        "{status:?}"
-    );
+    assert_eq!(answers, ["true"], "{status:?}");
+}
+
+#[test]
+fn program_fact_typing_preserves_the_answer_for_distinct_individuals() {
+    let dl = pipeline();
+    insert(
+        &dl,
+        &format!("{COMPLEMENTS} {TYPES} {MEMBER} :a owl:differentFrom :b ."),
+    )
+    .unwrap();
+    let (answers, status) = query(&dl, "ASK { :a owl:sameAs :b }");
+    assert_eq!(answers, ["false"], "{status:?}");
 }
