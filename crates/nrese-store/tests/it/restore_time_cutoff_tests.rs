@@ -246,9 +246,15 @@ fn untimed_records_under_a_time_cutoff_are_refused() {
     assert_eq!(segments(&live), [3], "setup: the live log");
     // Control (setup): the timed segment, cut at T, gives 3.
     let control = root.path().join("control");
-    let at = nrese_store::restore_until(&backup, &control, &[live.clone()], None, Some(t))
-        .unwrap()
-        .1;
+    let at = nrese_store::restore_until(
+        &backup,
+        &control,
+        std::slice::from_ref(&live),
+        None,
+        Some(t),
+    )
+    .unwrap()
+    .1;
     assert_eq!(at, 3, "setup: T falls between revisions 3 and 4");
 
     let supplied = root.path().join("supplied");
