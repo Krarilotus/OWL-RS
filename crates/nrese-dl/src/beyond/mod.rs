@@ -114,6 +114,10 @@ fn restriction(d: &Diagnostic) -> Option<(&'static str, bool)> {
             "OWL 2 Structural Specification §11.1-11.2: a simple property required",
             true,
         ),
+        Diagnostic::IrregularPropertyHierarchy { .. } => (
+            "OWL 2 Structural Specification §11.2: a regular property hierarchy",
+            true,
+        ),
         Diagnostic::AnonymousIndividual { .. } => (
             "OWL 2 Structural Specification §11.2: a named individual in a nominal or hasValue",
             true,
@@ -152,9 +156,8 @@ fn restriction(d: &Diagnostic) -> Option<(&'static str, bool)> {
 /// to the engines, as before: listed, not changed here.)
 fn engine_restriction(why: Unsupported) -> &'static str {
     match why {
-        Unsupported::IrregularRoleHierarchy => {
-            "OWL 2 Structural Specification §11.2: a regular property hierarchy"
-        }
+        Unsupported::IrregularRoleHierarchy => "the engine could not build a role automaton",
+        Unsupported::RoleAutomatonOutsideRegularClass => "outside the engine's regular class",
         Unsupported::DatatypeDefinitions => {
             "OWL 2 Structural Specification §4, §11.2: the datatype map"
         }

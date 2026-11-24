@@ -242,7 +242,8 @@ pub(crate) fn leaves_out(cause: Unsupported) -> bool {
         | Unsupported::UniversalObjectProperty
         | Unsupported::UncountedNegation
         | Unsupported::TooWide
-        | Unsupported::IrregularRoleHierarchy => true,
+        | Unsupported::IrregularRoleHierarchy
+        | Unsupported::RoleAutomatonOutsideRegularClass => true,
     }
 }
 
@@ -254,6 +255,7 @@ pub struct Omissions {
     /// Each cause once, in the order first met.
     causes: Vec<Unsupported>,
     fatal: usize,
+    role_regularity: usize,
 }
 
 impl Omissions {
@@ -265,6 +267,18 @@ impl Omissions {
     /// Whether `cause` is all that is left out: no other cause, no reader diagnostic.
     pub fn only(&self, cause: Unsupported) -> bool {
         self.fatal == 0 && self.causes == [cause]
+    }
+
+    /// The EL fallback can cover role automata and literal role regularity omissions.
+    pub fn only_role_automata_and_regularity(&self) -> bool {
+        use Unsupported::{IrregularRoleHierarchy, RoleAutomatonOutsideRegularClass};
+        // EL completion needs no regularity.
+        self.fatal == self.role_regularity
+            && (self.role_regularity > 0 || !self.causes.is_empty())
+            && self
+                .causes
+                .iter()
+                .all(|c| matches!(c, IrregularRoleHierarchy | RoleAutomatonOutsideRegularClass))
     }
 
     /// What is left out, in words: a line per cause, ordered by its text, then the reader's
@@ -297,10 +311,20 @@ pub fn left_out(ontology: &Ontology, normalised: &Normalised) -> Omissions {
             causes.push(cause);
         }
     }
-    let fatal = (ontology.diagnostics.iter())
-        .filter(|d| d.is_fatal() || d.joins_kinds())
-        .count();
-    Omissions { causes, fatal }
+    let mut fatal = 0;
+    let mut role_regularity = 0;
+    for d in &ontology.diagnostics {
+        fatal += usize::from(d.is_fatal() || d.joins_kinds());
+        role_regularity += usize::from(matches!(
+            d,
+            nrese_owl::Diagnostic::IrregularPropertyHierarchy { .. }
+        ));
+    }
+    Omissions {
+        causes,
+        fatal,
+        role_regularity,
+    }
 }
 
 impl Program {

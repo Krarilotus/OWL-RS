@@ -884,14 +884,81 @@ pub fn punned(o: &Ontology) -> Vec<Term> {
     punned
 }
 
-/// Whether the OWL 2 RL rules may read `o` otherwise than OWL 2 DL does: `o` has
-/// annotation-property axioms ([`Ontology::annotation_schema`]) or puns ([`punned`]), which
-/// theorem PR1 (OWL 2 Profiles §4.3) excludes, or an empty intersection or union
-/// ([`Ontology::empty_list`]), which they don't read, or a list's cell used outside its list
-/// ([`Ontology::list_cell_outside`]), which they may equate with another and so read
-/// sequences the graph doesn't write, or a name of two kinds or a structure no axiom uses that
-/// the rules read otherwise ([`crate::Diagnostic::reads_otherwise`]). The one detection the
-/// route, the answers' status and the consistency verdicts take.
+/// Whether the OWL 2 RL rules over the source read what OWL 2 DL reads of the ontology read:
+/// the premise of their closure (theorem PR1, OWL 2 Profiles §4.3: the graph is exactly the
+/// RDF mapping of that ontology), per way it breaks ([`premise`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Premise {
+    /// A diagnostic past which no model of the read ontology speaks of the source
+    /// ([`crate::Diagnostic::is_fatal`]).
+    pub fatal: bool,
+    /// The rules may read the source otherwise than OWL 2 DL reads the ontology, so a
+    /// conclusion of theirs, a clash too, may not be entailed ([`rules_read_differently`]).
+    pub reads_otherwise: bool,
+    /// The rules read less than the ontology says: what they conclude holds, but not all of it.
+    pub reads_less: bool,
+}
+
+impl Premise {
+    /// The graph is exactly the mapping of what the reader read: the rules decide it.
+    pub fn exact(self) -> bool {
+        !self.fatal && !self.reads_otherwise && !self.reads_less
+    }
+}
+
+/// [`Premise`] of `o`: the one place that tells it, from every diagnostic (each kind decided
+/// by [`crate::Diagnostic::is_fatal`] and [`crate::Diagnostic::reads_otherwise`], with no
+/// catch-all arm) and every part of `o`, each given its verdict below, so that a part added
+/// to [`Ontology`] doesn't compile here until it has one. Otherwise: annotation-property axioms
+/// or puns ([`punned`]), which PR1 excludes; an empty intersection or union, where a rule
+/// naming `owl:Thing` sees a blank node; a list's cell used outside its list, which the rules
+/// may equate with another and so read sequences the graph doesn't write. Less: a cardinality
+/// spelled otherwise than the rules name it, a statement the rules don't read that was read as
+/// axioms they would, or an axiom whose rules would compare or type data values
+/// ([`crate::ql::reads_data_values`]: the rule set has no dt-eq or dt-type2).
+pub fn premise(o: &Ontology) -> Premise {
+    let Ontology {
+        // The axioms read and their parts: what the checks below and the profile read.
+        classes: _,
+        ranges: _,
+        axioms: _,
+        sources: _,
+        diagnostics,
+        // Read past: no axiom (an annotation-property axiom is in `annotation_schema`).
+        annotations: _,
+        // Read by `rules_read_differently`, as are `empty_list` and `list_cell_outside`.
+        annotation_schema: _,
+        // A name of two kinds among them is a `Diagnostic::TwoKinds` (`crate::typing`).
+        annotation_uses: _,
+        annotation_axioms: _,
+        // SHACL content has no OWL meaning; copies across an equality are the status's own.
+        shacl: _,
+        // Ids, of the built-in properties and of the data axioms' literals.
+        builtin: _,
+        data: _,
+        // Each in a nominal or `hasValue` is a `Diagnostic::AnonymousIndividual`.
+        anonymous: _,
+        // Each is a `Diagnostic::Rule`, fatal.
+        rules: _,
+        noncanonical_cardinality,
+        empty_list: _,
+        // Read by `reads_data_values`.
+        qualified_data_max: _,
+        rules_unread,
+        list_cell_outside: _,
+    } = o;
+    Premise {
+        fatal: diagnostics.iter().any(crate::Diagnostic::is_fatal),
+        reads_otherwise: rules_read_differently(o),
+        reads_less: noncanonical_cardinality.is_some()
+            || rules_unread.is_some()
+            || crate::ql::reads_data_values(o).is_some(),
+    }
+}
+
+/// Whether the OWL 2 RL rules may read `o` otherwise than OWL 2 DL does
+/// ([`Premise::reads_otherwise`], as [`premise`] says): what a clash of theirs needs to be a
+/// verdict.
 pub fn rules_read_differently(o: &Ontology) -> bool {
     !o.annotation_schema.is_empty()
         || !punned(o).is_empty()

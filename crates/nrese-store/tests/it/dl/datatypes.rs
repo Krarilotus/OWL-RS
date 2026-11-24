@@ -85,6 +85,9 @@ const RULES: &[&str] = &["rules consistent; read complete"];
 /// `owl:sameAs`, so a later statement of one lacks its copy with the other, and a read of the
 /// property's values isn't complete (it::literal_equality_status_tests).
 const RULES_EQUATED: &[&str] = &["rules consistent; read not complete"];
+/// The rules' route over an ill-typed literal: no clash, but OWL 2 admits no such literal, so
+/// the rules prove nothing and no read is complete (it::ill_typed_literal_status_tests).
+const RULES_ILL_TYPED: &[&str] = &["rules unknown; read not complete"];
 const REFUSED: &[&str] = &["refused"];
 const DECIDED: &[&str] = &["hypertableau consistent; read complete"];
 
@@ -284,8 +287,9 @@ const NOTHING_READS: &[&str] = &[
 
 /// An ill-typed literal of a datatype of the map ("abc" isn't in `xsd:integer`'s lexical
 /// space) makes the input not OWL 2 DL (Structural Specification §5.7). OWL 2 RL's rules make
-/// it a clash only where a rule types it (dt-not-type, OWL 2 Profiles §4.3, table 8): alone it
-/// is told `consistent`, under a range the commit is refused. Where a value is read
+/// it a clash only where a rule types it (dt-not-type, OWL 2 Profiles §4.3, table 8): alone
+/// they find no clash, but as OWL 2 admits no such literal, the consistency is told `unknown`
+/// and no read is complete; under a range the commit is refused. Where a value is read
 /// (`hasValue`), the store leaves the rules' route, and the full check, which has no value for
 /// the literal, tells `unknown`.
 #[test]
@@ -293,7 +297,11 @@ fn an_ill_typed_literal_of_the_maps_datatypes_is_told_as_the_rules_tell_it() {
     const ILL: &str = r#":a :born "abc"^^xsd:integer ."#;
     let range = ":born rdfs:range xsd:integer .";
     let cells: Vec<(&str, Vec<&str>, &[&str])> = vec![
-        ("an ill-typed integer nothing reads", vec![DATA, ILL], RULES),
+        (
+            "an ill-typed integer nothing reads",
+            vec![DATA, ILL],
+            RULES_ILL_TYPED,
+        ),
         (
             "an ill-typed integer under an integer range",
             vec![DATA, range, ILL],

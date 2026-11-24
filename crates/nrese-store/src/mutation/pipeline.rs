@@ -311,7 +311,7 @@ impl MutationPipeline {
             let working_memory = || self.store.operation_memory();
             // A rebuild's own report judges only over a state assessed consistent.
             let base_consistent = matches!(
-                self.store.consistency(),
+                self.store.recorded_consistency(),
                 crate::ConsistencyStatus::Consistent
             );
             let (violations, materialisation, changed, literal_equality) =
@@ -427,6 +427,7 @@ impl MutationPipeline {
                         detail,
                         explanation,
                         attribution,
+                        shacl: None,
                     }
                 };
                 let view = evidence::EvidenceView::new(&requester.read, &tx);
@@ -499,6 +500,10 @@ impl MutationPipeline {
                 &evidence::EvidenceView::new(&requester.read, &tx),
                 |view, after| self.view_reason(view, Some(after), &dl_own_budget, &resources),
             )?;
+            // The version's certificate, its ill-typed literal judged under the writer slot alone
+            // (a whole-store scan where the commit deletes it), before the commit and its rights.
+            let certificate = (tx.base().certificate().cloned())
+                .map(|certificate| self.store.with_ill_typed(certificate, &tx));
             if !ticket.begin_commit() {
                 return Err(MutationError::Cancelled);
             }
@@ -533,7 +538,7 @@ impl MutationPipeline {
                 let writer = tx.writer().expect("a transaction holds the writer slot");
                 self.store.mark_literal_equality(writer);
             }
-            if let Some(mut certificate) = tx.base().certificate().cloned() {
+            if let Some(mut certificate) = certificate {
                 if literal_equality {
                     certificate = StoreService::with_literal_equality(certificate);
                 }
@@ -674,11 +679,14 @@ impl MutationPipeline {
         let report = match crate::shacl::introduced(tx, shapes_graph, resources, ticket) {
             Ok(report) => report,
             Err(error @ StoreError::SparqlEvaluation(_)) => return Err(stopped(error)),
-            // The stored shapes' problems, as the committer may be told them.
             Err(error) => {
                 ticket.claim_error()?;
-                let error = view.shapes_error(shapes_graph, error);
-                return Err(MutationError::Gate(error.to_string()));
+                return Err(match view.shapes_error(shapes_graph, error) {
+                    StoreError::ShaclShapes(problems) => {
+                        MutationError::ShaclShapesUnusable(problems)
+                    }
+                    error => MutationError::Gate(error.to_string()),
+                });
             }
         };
         let Some((report, pending)) = report else {
@@ -687,37 +695,29 @@ impl MutationPipeline {
         if report.results.is_empty() && report.failures.is_empty() {
             return Ok(());
         }
-        let rejects = matches!(
-            gate,
-            ShaclGate::Enforce(least)
-                if !report.failures.is_empty()
-                    || report.results.iter().any(|result| severity(result.severity.as_str()) >= least)
-        );
-        if rejects {
+        let rejects = |result: &nrese_shacl::ValidationResult| matches!(gate, ShaclGate::Enforce(least) if severity(result.severity.as_str()) >= least);
+        if matches!(gate, ShaclGate::Enforce(_))
+            && (!report.failures.is_empty() || report.results.iter().any(rejects))
+        {
             ticket.claim_error()?;
-        }
-        // Formatted only where it is told: a restricted committer's view is told its own.
-        let detail = || {
-            let first = report.results.first().map_or_else(String::new, |result| {
-                format!("; first: {}", crate::shacl::described(result))
-            });
-            format!(
-                "the commit introduces {} SHACL result(s) and {} failure(s){first}",
-                report.results.len(),
-                report.failures.len()
-            )
-        };
-        if rejects {
-            let full = || evidence::Draft {
-                kind: RejectKind::ShapesViolated,
-                detail: detail(),
-                explanation: None,
-                attribution: None,
+            let full = || {
+                crate::shacl::refusal(
+                    report,
+                    rejects,
+                    self.store.config().shacl_reject_results,
+                    &resources.memory,
+                    false,
+                    || true,
+                )
+                .expect("the gate rejected a result or a validation failure")
             };
             let reject = view.reject(full, |view| restricted(view, &pending));
             Err(MutationError::Rejected(Box::new(reject)))
         } else {
-            tracing::warn!("{} (SHACL gate: not rejected)", detail());
+            tracing::warn!(
+                "{} (SHACL gate: not rejected)",
+                crate::shacl::reported(report)
+            );
             Ok(())
         }
     }
@@ -762,6 +762,7 @@ impl MutationPipeline {
             pending,
             &self.store.config().shapes_graph,
             rejects,
+            self.store.config().shacl_reject_results,
             resources,
         )
         .unwrap_or_else(evidence::nothing_shown)

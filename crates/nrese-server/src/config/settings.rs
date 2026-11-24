@@ -320,6 +320,13 @@ pub const SETTINGS: &[Setting] = &[
         Unset::Text("violation"),
         "The least severity an enforcing gate rejects.",
     ),
+    setting(
+        "shacl.reject_results",
+        names::SHACL_REJECT_RESULTS,
+        Limit(None),
+        Unset::Number(10),
+        "The count limit for each list in a SHACL refusal (0 or unlimited: no count limit). The write's memory budget also applies.",
+    ),
     // [reasoner]
     setting(
         "reasoner.mode",

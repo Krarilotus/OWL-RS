@@ -191,7 +191,9 @@ fn consistency_at(
 }
 
 /// The data's consistency at `snapshot`'s revision where it is known without a check:
-/// recorded by its commit, or proved by U1, or by the rules for this snapshot's revision.
+/// recorded by its commit, or proved by U1, or by the rules for this snapshot's revision, unknown
+/// there where it holds an ill-typed literal ([`gate::ILL_TYPED`]) or the search for one stopped
+/// ([`UNCHECKED`], never recorded: a later read searches again).
 fn consistency_known(store: &StoreService, snapshot: &Snapshot, view: &View) -> Option<Verdict> {
     match store.dl().status() {
         Some(DlStatus {
@@ -199,8 +201,13 @@ fn consistency_known(store: &StoreService, snapshot: &Snapshot, view: &View) -> 
             consistency,
             ..
         }) if revision == snapshot.revision() => Some(consistency.verdict),
-        _ => (view.proves_consistency || view.rules && super::bounds::rules_prove(snapshot))
-            .then_some(Verdict::Consistent),
+        _ if view.proves_consistency => Some(Verdict::Consistent),
+        _ if !(view.rules && super::bounds::rules_prove(snapshot)) => None,
+        _ => Some(match super::bounds::holds_ill_typed(store, snapshot) {
+            Some(false) => Verdict::Consistent,
+            Some(true) => Verdict::Unknown(gate::ILL_TYPED.to_owned()),
+            None => Verdict::Unknown(UNCHECKED.to_owned()),
+        }),
     }
 }
 
@@ -816,7 +823,7 @@ pub(crate) fn certify_closure(
 /// The QL rewriting's own report as it leaves nrese-sparql (run, EXPLAIN, plan and the printed
 /// query), with the whole composition ([`certify_closure`]) on it: the answer's status is this
 /// report (`StoreService::status_outside_dl`), so the two are one value. Under `owl2-rl`, where
-/// the closure leaves out a list axiom (`lists_left_out`, asked only of a report still
+/// the closure leaves out a list axiom (`store`'s `lists_left_out`, asked only of a report still
 /// `complete` after the composition's other steps, so an earlier reason keeps its place), whose
 /// conclusions an answer may miss, it isn't `complete` ([`LIST`]); then the store's conditions
 /// of the certificate `snapshot` carries ([`withhold`], as the answer's composition takes
@@ -825,7 +832,7 @@ pub(crate) fn certify_report(
     completeness: Option<&mut Completeness>,
     query: (&Query, &Reads),
     snapshot: Option<&Snapshot>,
-    lists_left_out: impl FnOnce() -> bool,
+    store: &StoreService,
 ) {
     let Some(completeness) = completeness else {
         return;
@@ -834,7 +841,7 @@ pub(crate) fn certify_report(
         return;
     }
     let rl = completeness.regime == Some(nrese_sparql::Regime::Owl2Rl);
-    if completeness.complete && rl && lists_left_out() {
+    if completeness.complete && rl && snapshot.is_some_and(|s| store.lists_left_out(s)) {
         completeness.incomplete("rules", LIST.to_owned());
     }
     // With or without a certificate (`print-query --schema` prints over schema files nothing
@@ -846,8 +853,7 @@ pub(crate) fn certify_report(
         } else {
             "rules"
         };
-        let state = certificate.map(|c| &c.state);
-        conditions(completeness, query, source, snapshot, state);
+        conditions(completeness, query, source, (snapshot, certificate), store);
     }
     negation_rule(completeness, query, "ql");
 }
@@ -1084,14 +1090,19 @@ fn may_equate_literals(
 ///   the graphs it reads): every read.
 /// - A reader by support under `owl2-ql` may miss conclusions the store-wide annotation
 ///   declarations kept out of the closure. Its grant alone decides the cap on every read.
+/// - Under `owl2-dl` and `owl2-ql`, an ill-typed literal the version holds, as `certificate`
+///   finds it on its first need under `store`'s memory stop (`Certificate::ill_typed`): every
+///   read, [`ILL_TYPED`], naming the literal where the reader's graphs hold it; [`UNCHECKED`]
+///   while the search hasn't ended.
 pub(crate) fn withhold(
     completeness: &mut Completeness,
     (query, reads): (&Query, &Reads),
     source: &'static str,
-    snapshot: &Snapshot,
-    state: &crate::ReasoningState,
+    (snapshot, certificate): (&Snapshot, &crate::service::Certificate),
+    store: &StoreService,
 ) {
-    if conditions(completeness, (query, reads), source, snapshot, Some(state)) {
+    let read = (snapshot, Some(certificate));
+    if conditions(completeness, (query, reads), source, read, store) {
         negation_rule(completeness, (query, reads), source);
     }
 }
@@ -1102,13 +1113,14 @@ fn conditions(
     completeness: &mut Completeness,
     (query, reads): (&Query, &Reads),
     source: &'static str,
-    snapshot: &Snapshot,
-    state: Option<&crate::ReasoningState>,
+    (snapshot, certificate): (&Snapshot, Option<&crate::service::Certificate>),
+    store: &StoreService,
 ) -> bool {
     use nrese_sparql::Regime::{Owl2Dl, Owl2Ql, Owl2Rl};
     if !matches!(completeness.regime, Some(Owl2Dl | Owl2Ql | Owl2Rl)) {
         return false;
     }
+    let state = certificate.map(|c| &c.state);
     let access = reads.access.as_deref();
     let literals = |predicate: &Option<String>| match predicate {
         Some(p) => (snapshot.lookup(NamedNodeRef::new_unchecked(p).into()))
@@ -1145,7 +1157,164 @@ fn conditions(
                 .to_owned(),
         );
     }
+    let ill_typed = certificate.filter(|_| matches!(completeness.regime, Some(Owl2Dl | Owl2Ql)));
+    let found = ill_typed.map(|c| {
+        let memory = store.memory_stop();
+        c.ill_typed(snapshot, &|| memory.exceeded())
+    });
+    match found {
+        Some(Some(None)) | None => {}
+        Some(None) => completeness.incomplete(source, UNCHECKED.to_owned()),
+        Some(Some(Some(witness))) => {
+            let mut pattern = QuadPattern::all();
+            pattern.object = Some(witness);
+            let seen = (snapshot.quads_for_pattern_in(ReadModel::Asserted, &pattern))
+                .any(|q| access.is_none_or(|a| a.allows_id(snapshot, q.graph)));
+            let what = (seen.then(|| snapshot.decode(witness)).flatten())
+                .map_or_else(|| "a literal".into(), |t| format!("the literal {t}"));
+            completeness.incomplete(source, format!("the store holds {what}: {ILL_TYPED}"));
+        }
+    }
     true
+}
+
+/// Why no read is `complete` while the store holds an ill-typed literal
+/// (`Certificate::ill_typed`), and while it isn't known whether it holds one.
+const ILL_TYPED: &str = "it is ill-typed (its lexical form is outside its datatype's lexical \
+                         space), which OWL 2 doesn't admit (Structural Specification §5.7), so \
+                         the data's consistency isn't known";
+pub(crate) const UNCHECKED: &str = "the data are not yet checked for an ill-typed literal, which OWL 2 \
+                         doesn't admit, so their consistency isn't known";
+
+/// Whether a version reading under `owl2-dl` (`dl`) or under the rules program named `ruleset`
+/// keeps the witness of an ill-typed literal: under `owl2-dl` and a program on `owl2-ql`, user
+/// rules beside it or not (`owl2-ql+custom:…`, its base the name's first part, as the
+/// reasoner reads it), where [`withhold`] reads it, and nowhere else, so no other mode scans.
+pub(crate) fn keeps_ill_typed(dl: bool, ruleset: &str) -> bool {
+    dl || ruleset.split('+').next() == Some("owl2-ql")
+}
+
+/// Whether `id` is an ill-typed literal (RDF 1.1 Concepts §3.3): a datatype of the OWL 2
+/// datatype map, a lexical form outside its lexical space, as the map's owner decides it
+/// (`nrese_xsd::owl::Value::parse`, which the RL datatype rules and the DL reader read too).
+/// An inline literal is a canonical form of its datatype, so only the dictionary's are read.
+pub(crate) fn is_ill_typed(id: TermId, decode: &dyn Fn(TermId) -> Option<Term>) -> bool {
+    use nrese_xsd::owl::{Datatype, LiteralError, Value};
+    if !id.kind().is_dictionary_literal() {
+        return false;
+    }
+    let Some(Term::Literal(literal)) = decode(id) else {
+        return false;
+    };
+    Datatype::from_iri(literal.datatype().as_str()).is_some_and(|datatype| {
+        let value = Value::parse(literal.value(), datatype, literal.language());
+        matches!(value, Err(LiteralError::IllTyped(_)))
+    })
+}
+
+/// The ill-typed literal ([`is_ill_typed`]) of what the commit `tx` publishes, its base's being
+/// `base`: the base's while `tx` still holds it, else one `tx` inserts, else, where `tx`
+/// deleted the base's, one a scan of what `tx` commits finds ([`ill_typed`]); `None` where
+/// `stop`, asked before each walk and during it ([`polled`]), ended it.
+pub(crate) fn ill_typed_after(
+    tx: &nrese_engine::Transaction<'_>,
+    base: Option<TermId>,
+    stop: &dyn Fn() -> bool,
+) -> Option<Option<TermId>> {
+    let decode = |id: TermId| tx.decode(id);
+    let poll = polled(stop);
+    let stopped = || poll.ask();
+    if stopped() {
+        return None;
+    }
+    // The base's occurrences through its counted scan, which counts the keys it passes,
+    // deleted ones too (`nrese_engine::visit`); then those `tx` inserts.
+    let kept = base.filter(|&witness| {
+        let mut pattern = QuadPattern::all();
+        pattern.object = Some(witness);
+        let (counted, visit) = (tx.base().counted(), |units: u64| !poll.spend(units));
+        let mut stored =
+            (counted.quads(ReadModel::Asserted, &pattern, &visit)).map_while(Result::ok);
+        stored.any(|q| tx.contains_in(ReadModel::Asserted, &q))
+            || (tx.inserted().take_while(|_| !stopped())).any(|q| q.object == witness)
+    });
+    let mut judged = |o: &TermId| stopped() || is_ill_typed(*o, &decode);
+    let found = kept.or_else(|| (tx.inserted().map(|q| q.object)).find(&mut judged));
+    match (found, base) {
+        _ if stopped() => None,
+        (None, Some(_)) if stop() => None,
+        (None, Some(_)) => ill_typed(&tx.pending_snapshot(), stop),
+        _ => Some(found),
+    }
+}
+
+/// `stop` asked at the first unit of work and then once 4096 more are spent, and kept once it
+/// says stop: the poll of a walk, which a refusal ends with nothing kept. A walk's step spends
+/// one ([`Polled::ask`]); an engine's counted read, what it counts ([`Polled::spend`]). Asked
+/// by shared reference, so one poll serves the walks and the reads of one search.
+struct Polled<'a> {
+    stop: &'a dyn Fn() -> bool,
+    spent: std::cell::Cell<u64>,
+    due: std::cell::Cell<u64>,
+    stopped: std::cell::Cell<bool>,
+}
+fn polled(stop: &dyn Fn() -> bool) -> Polled<'_> {
+    let (spent, due, stopped) = Default::default();
+    Polled {
+        stop,
+        spent,
+        due,
+        stopped,
+    }
+}
+impl Polled<'_> {
+    fn ask(&self) -> bool {
+        self.spend(1)
+    }
+    fn spend(&self, units: u64) -> bool {
+        if !self.stopped.get() && self.spent.get() >= self.due.get() {
+            self.stopped.set((self.stop)());
+            self.due.set(self.spent.get() + 4096);
+        }
+        self.spent.set(self.spent.get() + units);
+        self.stopped.get()
+    }
+}
+
+/// An ill-typed literal ([`is_ill_typed`]) an asserted statement of `snapshot` holds as its
+/// object, in any graph: one walk of the object-first index over the dictionary's literals,
+/// each judged once (every asserted statement, where the index can't answer by range); `None`
+/// where `stop`, asked before the walk and during it ([`polled`]), ended it. One thread.
+pub(crate) fn ill_typed(snapshot: &Snapshot, stop: &dyn Fn() -> bool) -> Option<Option<TermId>> {
+    use nrese_engine::{TermKind, quad::Permutation};
+    let poll = polled(stop);
+    let stopped = || poll.ask();
+    if stopped() {
+        return None;
+    }
+    let decode = |id: TermId| snapshot.decode(id);
+    let mut last = None;
+    let mut judged =
+        |o: &TermId| stopped() || (last.replace(*o) != Some(*o) && is_ill_typed(*o, &decode));
+    let all = QuadPattern::all();
+    let kinds = [
+        TermKind::String,
+        TermKind::LangString,
+        TermKind::TypedLiteral,
+    ];
+    let ranges = kinds.map(|kind| {
+        let (low, high) = TermId::kind_range(kind);
+        snapshot.scan_range_in(ReadModel::Asserted, &all, Permutation::Ospg, low, high)
+    });
+    let found = match ranges {
+        [Some(a), Some(b), Some(c)] => a.chain(b).chain(c).map(|q| q.object).find(&mut judged),
+        _ => (snapshot.quads_for_pattern_in(ReadModel::Asserted, &all))
+            .map(|q| q.object)
+            .find(&mut judged),
+    };
+    // The stop asked again at the end, whatever the poll's count: the range scan can pass
+    // deleted keys within one step uncounted, and a stop it ran past leaves nothing found.
+    (!(stopped() || stop())).then_some(found)
 }
 
 /// The W3C vocabulary documents, whose meaning is built in: an import of one counts as read.

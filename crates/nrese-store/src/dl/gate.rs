@@ -110,6 +110,11 @@ fn budget_of(
     }
 }
 
+/// Why the data's consistency is unknown where the RL rules prove it but an ill-typed literal
+/// is held ([`super::bounds::holds_ill_typed`]).
+pub(crate) const ILL_TYPED: &str =
+    "the rules find no clash, but the data hold an ill-typed literal, which OWL 2 doesn't admit";
+
 /// Checks the state `tx` would commit. Where U1 after the commit proves it consistent
 /// ([`super::bounds::Preparation`]), nothing more runs: the cost of the U1's change.
 /// Otherwise O(asserted statements) for reading the ontology (unless the preparation
@@ -138,9 +143,19 @@ pub(crate) fn check_commit(
     // and their gate has admitted the commit on its own facts, as off the route: no DL check.
     let rules = matches!(preparation.prepared, super::bounds::Prepared::Rules(_));
     if preparation.proves_consistency || rules {
-        let verdict = match preparation.proves_consistency {
-            true => Verdict::Consistent,
-            false => Verdict::Unknown("the rules assessed no clean closure at the base".to_owned()),
+        let ill_typed = match rules && preparation.proves_consistency {
+            true => super::bounds::holds_ill_typed_after(store, tx),
+            false => Some(false),
+        };
+        // A search that stopped decides nothing: no verdict is recorded for the revision, as
+        // for an unproved base, and its reads search again (`dl::query::consistency_known`).
+        preparation.proves_consistency &= ill_typed.is_some();
+        let unknown = |why: &str| Verdict::Unknown(why.to_owned());
+        let verdict = match (preparation.proves_consistency, ill_typed) {
+            (true, Some(true)) => unknown(ILL_TYPED),
+            (true, _) => Verdict::Consistent,
+            (false, None) => unknown(super::query::UNCHECKED),
+            (false, _) => unknown("the rules assessed no clean closure at the base"),
         };
         return Gate {
             checked: Checked {
@@ -343,6 +358,7 @@ fn rejection(
             }),
             detail,
             attribution: None,
+            shacl: None,
         }
     };
     let reject = view.reject(full, |view| {

@@ -22,12 +22,15 @@ pub(crate) struct Problem {
     status: u16,
     detail: String,
     /// For a rejected commit (type `reasoner-reject`, `undecided-reject`, `shacl-reject` or
-    /// `commit-reject`): the violated rule or constraint and the statements it shows, where
-    /// there are any. The name is kept for every kind, so that clients that read it go on
-    /// working.
+    /// `commit-reject`): the rule or constraint and any statements shown. For `shacl-reject`,
+    /// the first listed result's component and focus node, with an empty evidence list.
     reasoner_reject: Option<serde_json::Value>,
     /// The request's id, as in the `x-request-id` header and the server's log.
     request_id: Option<String>,
+    /// For `shacl-reject`, the refusing `results` in the validation report's JSON form, with
+    /// sorted messages, the validation `failures`, and the counts `results_omitted` and
+    /// `failures_omitted` for items left out by the count or memory limit.
+    shacl: Option<serde_json::Value>,
 }
 
 /// Describes every response whose body is a [`Problem`] with the media type the server
@@ -323,6 +326,8 @@ const UPDATE_400: &str = "A syntax error; an empty or repeated update, or one in
     and the body; a commit a consistency check or the SHACL gate rejects";
 const DENIED: &str =
     "Not allowed: the requester may not do this, or read or write a graph it names";
+const SHAPES_UNUSABLE: &str = "The SHACL gate's stored shapes don't compile \
+    (`shacl-shapes-unusable`); nothing committed. Repair or clear the shapes graph";
 const QUERY_408: &str = "Timed out (`budgets.query_timeout`), or an operator cancelled it";
 const QUERY_413: &str =
     "Past `budgets.query_text`, or the query's memory past `budgets.query_memory`";
@@ -381,6 +386,7 @@ protocol!(update, post, path = "/api/v1/repositories/{id}/update", tag = "sparql
         (status = 401, description = "Not authenticated", body = Problem), (status = 403, description = DENIED, body = Problem),
         (status = 404, description = "No such repository, or updates are off in this deployment", body = Problem),
         (status = 408, description = "Timed out (`budgets.update_timeout`); nothing committed", body = Problem),
+        (status = 409, description = SHAPES_UNUSABLE, body = Problem),
         (status = 413, description = "Past `budgets.update_size`", body = Problem),
         (status = 415, description = "Another `Content-Type`", body = Problem),
         (status = 429, description = "Rate limited", body = Problem), (status = 503, description = UNAVAILABLE, body = Problem)));
@@ -450,6 +456,7 @@ protocol!(
             description = "Timed out, or an operator cancelled the query",
             body = Problem
         ),
+        (status = 409, description = SHAPES_UNUSABLE, body = Problem),
         (
             status = 413,
             description = "Past the query's or the update's budgets",

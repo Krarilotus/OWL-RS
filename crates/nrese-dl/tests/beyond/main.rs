@@ -53,6 +53,29 @@ fn a_name_declared_two_kinds_is_never_certified() {
     );
 }
 
+/// A chain into an inverse target can satisfy §11.2 and still fall outside the
+/// regular class required by the engine's automaton. The report states that limit.
+#[test]
+fn role_regularity_engine_limits_do_not_claim_a_structural_violation() {
+    let mut table = read::Table::default();
+    let text = format!(
+        "{PREFIXES}Ontology(Declaration(ObjectProperty(:p)) Declaration(ObjectProperty(:q))
+         Declaration(Class(:C)) Declaration(Class(:D))
+         SubObjectPropertyOf(ObjectPropertyChain(:p :q) ObjectInverseOf(:p))
+         SubClassOf(:C ObjectAllValuesFrom(:p :D)))"
+    );
+    let (o, _) = nrese_owl::read_functional(&text, &mut table);
+    assert!(!o.diagnostics.iter().any(nrese_owl::Diagnostic::is_fatal));
+    let d = consistency(&o, &Options::default());
+    assert_eq!(
+        d.left_out
+            .iter()
+            .map(|item| item.restriction)
+            .collect::<Vec<_>>(),
+        ["outside the engine's regular class"]
+    );
+}
+
 /// A rule whose body the assertions state: its head is added outright (the chase), and
 /// contradicts the DL part.
 #[test]

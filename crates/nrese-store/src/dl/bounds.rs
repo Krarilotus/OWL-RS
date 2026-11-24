@@ -184,22 +184,14 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// The route the ontology's profile gives (`nrese_owl::profile`): an OWL 2 RL ontology (its
-/// data's literals of RL's datatypes too) to the RL rules alone, unless an axiom's rules
-/// would compare or type data values: the rule set leaves out dt-eq and dt-type2
-/// (`nrese_owl::ql::reads_data_values`), so the DL path decides it by value; or where theorem
-/// PR1 doesn't hold, which needs no punning and no annotation-property axioms
-/// (`query::reads_differently` says what that costs); or unless a cardinality is spelled
-/// otherwise than the rules name it (`Ontology::noncanonical_cardinality`), so they
-/// wouldn't read it, or a statement the rules don't read was read as axioms they would
-/// (`Ontology::rules_unread`). Its callers also leave the route where the closure leaves out
-/// a list axiom (`StoreService::lists_left_out`): the rules lack that axiom's conclusions,
-/// and PR1's premise doesn't hold.
+/// data's literals of RL's datatypes too) to the RL rules alone where the premise of their
+/// closure holds, the graph exactly the mapping of what the reader read
+/// (`nrese_owl::profile::premise`, the one place that tells it; `query::reads_differently`
+/// says what a break costs). Its callers also leave the route where the closure leaves out
+/// a list axiom (`StoreService::lists_left_out`), the store's own: the rules lack that
+/// axiom's conclusions.
 fn routed_to_rules(ontology: &Ontology) -> bool {
-    nrese_owl::profile::of_ontology(ontology).rl
-        && nrese_owl::ql::reads_data_values(ontology).is_none()
-        && !nrese_owl::profile::rules_read_differently(ontology)
-        && ontology.noncanonical_cardinality.is_none()
-        && ontology.rules_unread.is_none()
+    nrese_owl::profile::of_ontology(ontology).rl && nrese_owl::profile::premise(ontology).exact()
 }
 
 /// What the RL route was decided on: the TBox signature as the reader typed it, the
@@ -274,7 +266,7 @@ impl Kinds {
         if self.cell(tx, s) || self.cell(tx, o) {
             return false;
         }
-        if self.shacl.contains(&p) || (k.annotations.contains(&p) && !named(tx, p, false)) {
+        if self.shacl.contains(&p) || (k.annotations.contains(&p) && !named(tx, p, None)) {
             return true;
         }
         if changes_schema(tx, triple)
@@ -809,8 +801,7 @@ pub(crate) fn prepare(
             ontology: None,
         };
     };
-    let fatal = ontology.diagnostics.iter().any(|d| d.is_fatal());
-    if routed_to_rules(&ontology) && !fatal && !lists_left_out {
+    if routed_to_rules(&ontology) && !lists_left_out {
         // The RL gate that ran before has decided the commit's consistency.
         let lookup = |iri: &str| tx.lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into());
         return Preparation {
@@ -840,22 +831,31 @@ pub(crate) fn prepare(
     }
 }
 
-/// Whether a statement's subject or object is a reserved name, which the reader leaves out,
-/// or it names a SHACL property (`nrese_owl::shacl_properties`) anywhere, which can change
+/// Whether a statement's subject or object is a name the reader leaves out in its place, or
+/// it names a SHACL property (`nrese_owl::shacl_properties`) anywhere, which can change
 /// whether the reader reads SHACL content as content or as any other statement
-/// (`Ontology::shacl`).
+/// (`Ontology::shacl`). The object of `rdf:type` is a class's place
+/// (`nrese_owl::diagnostics::reserved_name`); the subject, and any other object, is taken as
+/// an individual's (`reserved_as_individual`, which also refuses `owl:Thing` and the five
+/// other names OWL 2 gives a class or a property). Where the reader reads such a statement
+/// otherwise (an annotation's subject, OWL's vocabulary) that only reads again.
 fn reserved_named(tx: &impl PendingView, [s, p, o]: Triple) -> bool {
-    named(tx, s, true) || named(tx, o, true) || named(tx, p, false)
+    use nrese_owl::diagnostics::{reserved_as_individual, reserved_name};
+    let object: fn(&str) -> bool = if iri(tx, p).is_some_and(|p| p == RDF_TYPE) {
+        reserved_name
+    } else {
+        reserved_as_individual
+    };
+    named(tx, s, Some(reserved_as_individual)) || named(tx, o, Some(object)) || named(tx, p, None)
 }
 
-/// Whether the term `t` is a SHACL property (`nrese_owl::shacl_properties`) or, with
-/// `reserved`, a reserved name (`nrese_owl::diagnostics::reserved_name`).
-fn named(tx: &impl PendingView, t: u64, reserved: bool) -> bool {
+/// Whether the term `t` is a SHACL property (`nrese_owl::shacl_properties`) or one `reserved`
+/// leaves out.
+fn named(tx: &impl PendingView, t: u64, reserved: Option<fn(&str) -> bool>) -> bool {
     match tx.decode(TermId::from_raw(t)) {
         Some(nrese_rdf::Term::NamedNode(n)) => {
             let iri = n.as_str();
-            nrese_owl::is_shacl_property(iri)
-                || (reserved && nrese_owl::diagnostics::reserved_name(iri))
+            nrese_owl::is_shacl_property(iri) || reserved.is_some_and(|reserved| reserved(iri))
         }
         _ => false,
     }
@@ -1327,9 +1327,28 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> ViewEnd {
 /// they assessed this revision, as the rebuild that assessed it installed it or a gated commit
 /// carried it from its base (`tx.vouch`), and found no violation. No certificate (data loaded
 /// past the gates, a replica, a commit that didn't maintain the closure) or violations, decided
-/// or not, prove nothing. A field read of the version, no lock.
+/// or not, prove nothing. A field read of the version, no lock. Where they prove it, an
+/// ill-typed literal still makes it unknown ([`holds_ill_typed`]).
 pub(crate) fn rules_prove(snapshot: &Snapshot) -> bool {
     crate::service::Certificate::of(snapshot).is_some_and(|c| c.dl && c.state.violations == 0)
+}
+
+/// Whether `snapshot`'s version holds an ill-typed literal, which OWL 2 doesn't admit; `None`
+/// without a certificate, or where the search stopped (`Certificate::ill_typed`): undecided.
+pub(crate) fn holds_ill_typed(store: &StoreService, snapshot: &Snapshot) -> Option<bool> {
+    let memory = store.memory_stop();
+    let certificate = crate::service::Certificate::of(snapshot)?;
+    let found = certificate.ill_typed(snapshot, &|| memory.exceeded())?;
+    Some(found.is_some())
+}
+
+/// [`holds_ill_typed`] of what the commit `tx` publishes, from its base's literal
+/// (`dl::query::ill_typed_after`), found on this need where it wasn't.
+pub(crate) fn holds_ill_typed_after(store: &StoreService, tx: &Transaction<'_>) -> Option<bool> {
+    let memory = store.memory_stop();
+    let stop = || memory.exceeded();
+    let base = crate::service::Certificate::of(tx.base())?.ill_typed(tx.base(), &stop)?;
+    Some(super::query::ill_typed_after(tx, base, &stop)?.is_some())
 }
 
 /// U1 compiled and evaluated afresh over `snapshot` (or, with the kinds it was decided on,
@@ -1353,8 +1372,7 @@ fn afresh(
         Ok(ontology) => ontology,
         Err(_) => return (Err(GaveUp::refused(source::refused("the revision"))), None),
     };
-    let fatal = ontology.diagnostics.iter().any(|d| d.is_fatal());
-    if routed_to_rules(&ontology) && !fatal && !store.lists_left_out(snapshot) {
+    if routed_to_rules(&ontology) && !store.lists_left_out(snapshot) {
         let lookup =
             |iri: &str| snapshot.lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into());
         return (Err(not_compiled()), Some(Kinds::of(&ontology, &lookup)));

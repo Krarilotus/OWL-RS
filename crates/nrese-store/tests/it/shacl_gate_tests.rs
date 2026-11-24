@@ -7,9 +7,9 @@ use std::sync::Arc;
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
 use nrese_store::{
     BulkLoadRequest, CancellationToken, DEFAULT_SHAPES_GRAPH, GateSeverity, GraphTarget,
-    MutationCommand, MutationError, MutationPipeline, MutationTicket, QueryEvaluationError,
-    ReadScope, ShaclGate, ShaclValidationRequest, SparqlUpdateRequest, StoreConfig, StoreError,
-    StoreService,
+    MutationCommand, MutationError, MutationPipeline, MutationReject, MutationTicket,
+    QueryEvaluationError, ReadScope, ShaclGate, ShaclValidationRequest, SparqlUpdateRequest,
+    StoreConfig, StoreError, StoreService,
 };
 
 const PREFIXES: &str = "PREFIX ex: <http://example.com/> PREFIX sh: <http://www.w3.org/ns/shacl#> ";
@@ -39,6 +39,188 @@ fn update(pipeline: &MutationPipeline, body: &str) -> Result<(), MutationError> 
             &MutationTicket::new(),
         )
         .map(drop)
+}
+
+fn refuse(pipeline: &MutationPipeline, update_text: &str) -> Box<MutationReject> {
+    match update(pipeline, update_text) {
+        Err(MutationError::Rejected(reject)) => reject,
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// Spec (docs/ops/http-api.md, docs/design/shacl.md): the refusal counts only results at
+/// or above the threshold and names the first by decoded terms, regardless of term ids.
+#[test]
+fn only_refusing_severities_are_counted_and_listed_in_term_order() {
+    for (least, expected) in [
+        (GateSeverity::Violation, &["a", "z"][..]),
+        (GateSeverity::Warning, &["a", "w", "z"][..]),
+        (GateSeverity::Info, &["0", "a", "w", "z"][..]),
+    ] {
+        let pipeline = pipeline(ShaclGate::Enforce(least));
+        update(
+            &pipeline,
+            &format!(
+                "INSERT DATA {{
+                    ex:z ex:note ex:0, ex:w, ex:a .
+                    GRAPH <{DEFAULT_SHAPES_GRAPH}> {{
+                        ex:I sh:targetClass ex:Soft ; sh:path ex:name ; sh:minCount 1 ; sh:severity sh:Info .
+                        ex:W sh:targetClass ex:Warn ; sh:path ex:name ; sh:minCount 1 ; sh:severity sh:Warning .
+                        ex:V sh:targetClass ex:Hard ; sh:path ex:name ; sh:minCount 1 .
+                    }}
+                }}"
+            ),
+        )
+        .expect("shapes and terms");
+        let rejected = refuse(
+            &pipeline,
+            "INSERT DATA { ex:z a ex:Hard . ex:0 a ex:Soft . ex:w a ex:Warn . ex:a a ex:Hard }",
+        );
+        let first = format!(
+            "the commit introduces {} SHACL result(s) the gate rejects; first: focus node <http://example.com/{}>",
+            expected.len(),
+            expected[0]
+        );
+        assert!(rejected.detail.starts_with(&first), "{rejected:?}");
+        let report = rejected.shacl.as_ref().expect("SHACL refusal report");
+        let focuses: Vec<_> = report
+            .results
+            .iter()
+            .map(|result| {
+                result
+                    .focus_node
+                    .strip_prefix("http://example.com/")
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(focuses.as_slice(), expected);
+    }
+}
+
+/// Spec (docs/ops/http-api.md, docs/design/shacl.md): result paths and values in refusals
+/// use the validation report's spelling, including stored blank node labels.
+#[test]
+fn shacl_refusal_writes_rdf_terms_and_property_paths_as_text() {
+    let pipeline = pipeline_with(StoreConfig {
+        shacl_gate: ShaclGate::Enforce(GateSeverity::Violation),
+        shacl_reject_results: None,
+        ..StoreConfig::in_memory()
+    });
+    update(
+        &pipeline,
+        &format!(
+            "INSERT DATA {{ GRAPH <{DEFAULT_SHAPES_GRAPH}> {{
+                ex:inverse sh:targetClass ex:Paths ; sh:path [ sh:inversePath ex:p ] ; sh:minCount 1 .
+                ex:sequence sh:targetClass ex:Paths ; sh:path ( ex:p ex:q ) ; sh:minCount 1 .
+                ex:alternative sh:targetClass ex:Paths ; sh:path [ sh:alternativePath ( ex:p ex:q ) ] ; sh:minCount 1 .
+                ex:star sh:targetClass ex:Paths ; sh:path [ sh:zeroOrMorePath ex:p ] ; sh:maxCount 0 .
+                ex:plus sh:targetClass ex:Paths ; sh:path [ sh:oneOrMorePath ex:p ] ; sh:minCount 1 .
+                ex:question sh:targetClass ex:Paths ; sh:path [ sh:zeroOrOnePath ex:p ] ; sh:maxCount 0 .
+                ex:literals sh:targetClass ex:Values ; sh:path ex:p ; sh:nodeKind sh:IRI .
+                ex:resources sh:targetClass ex:Values ; sh:path ex:q ; sh:nodeKind sh:Literal .
+                ex:blank sh:targetClass ex:Blanks ; sh:nodeKind sh:IRI .
+            }} }}"
+        ),
+    )
+    .expect("shapes");
+    let rejected = refuse(
+        &pipeline,
+        r#"INSERT DATA {
+            ex:x a ex:Paths . ex:y a ex:Values ; ex:p 5, "x"@en ; ex:q ex:o, _:b .
+            _:b a ex:Blanks .
+        }"#,
+    );
+    let report = rejected.shacl.as_ref().expect("SHACL refusal report");
+    let rows = report
+        .results
+        .iter()
+        .map(|r| {
+            (
+                r.source_shape.as_str(),
+                r.path.as_deref(),
+                r.value.as_deref(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut paths = rows
+        .iter()
+        .filter_map(|(shape, path, value)| {
+            let p = shape.strip_prefix("http://example.com/")?;
+            (value.is_none()).then_some((p, (*path)?))
+        })
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    assert_eq!(
+        paths,
+        [
+            (
+                "alternative",
+                "(<http://example.com/p>|<http://example.com/q>)"
+            ),
+            ("inverse", "^<http://example.com/p>"),
+            ("plus", "(<http://example.com/p>)+"),
+            ("question", "(<http://example.com/p>)?"),
+            (
+                "sequence",
+                "(<http://example.com/p>/<http://example.com/q>)"
+            ),
+            ("star", "(<http://example.com/p>)*"),
+        ]
+    );
+    let blank = report
+        .results
+        .iter()
+        .find(|r| r.source_shape == "http://example.com/blank")
+        .expect("blank focus");
+    assert!(blank.focus_node.starts_with("_:"));
+    assert_eq!(blank.path, None);
+    assert_eq!(blank.value.as_deref(), Some(blank.focus_node.as_str()));
+    for (path, value) in [
+        ("p", r#""5"^^<http://www.w3.org/2001/XMLSchema#integer>"#),
+        ("p", r#""x"@en"#),
+        ("q", "http://example.com/o"),
+        ("q", blank.focus_node.as_str()),
+    ] {
+        let path = format!("http://example.com/{path}");
+        assert!(
+            rows.iter()
+                .any(|(_, p, v)| *p == Some(path.as_str()) && *v == Some(value)),
+            "{rows:?}"
+        );
+    }
+    assert!(report.results.iter().all(|r| r.messages.is_empty()));
+}
+
+/// Spec (docs/ops/http-api.md, docs/design/shacl.md): the default lists the first ten
+/// refusing results and counts omitted ones. An unlimited refusal lists them all.
+#[test]
+fn the_refusal_bounds_its_results_unless_unlimited() {
+    let default = pipeline(ShaclGate::Enforce(GateSeverity::Violation));
+    let unlimited = pipeline_with(StoreConfig {
+        shacl_gate: ShaclGate::Enforce(GateSeverity::Violation),
+        shacl_reject_results: None,
+        ..StoreConfig::in_memory()
+    });
+    let statements: String = (0..12)
+        .rev()
+        .map(|i| format!("ex:person{i:02} a ex:Person . "))
+        .collect();
+    let update = format!("INSERT DATA {{ {statements} }}");
+    for (pipeline, listed, omitted) in [(default, 10, 2), (unlimited, 12, 0)] {
+        add_shapes(&pipeline);
+        let rejected = refuse(&pipeline, &update);
+        let report = rejected.shacl.as_ref().expect("SHACL refusal report");
+        assert_eq!(
+            (report.results.len(), report.results_omitted),
+            (listed, omitted)
+        );
+        for (i, result) in report.results.iter().enumerate() {
+            assert_eq!(
+                result.focus_node,
+                format!("http://example.com/person{i:02}")
+            );
+        }
+    }
 }
 
 fn holds(pipeline: &MutationPipeline, pattern: &str) -> bool {
@@ -217,6 +399,46 @@ fn a_validation_past_the_writes_memory_fails_the_write_under_any_gate() {
     assert!(!holds(&pipeline, "ex:s0 ex:p ex:o"));
 }
 
+/// Spec: a report that fits the write's envelope can still have
+/// results omitted if their refusal text cannot fit alongside it.
+#[test]
+fn the_refusal_omits_results_that_would_exceed_the_writes_memory() {
+    let rejected = refuse_with_message(&"x".repeat(96 * 1024));
+    let refusal = rejected.shacl.as_ref().expect("SHACL refusal report");
+    assert_eq!((refusal.results.len(), refusal.results_omitted), (0, 1));
+    assert!(rejected.explanation.is_none());
+}
+
+/// Spec: results whose refusal text fits the write's memory
+/// alongside the report are listed whole.
+#[test]
+fn the_refusal_lists_results_that_fit_the_writes_memory() {
+    let message = "x".repeat(24 * 1024);
+    let rejected = refuse_with_message(&message);
+    let refusal = rejected.shacl.as_ref().expect("SHACL refusal report");
+    assert_eq!((refusal.results.len(), refusal.results_omitted), (1, 0));
+    assert_eq!(refusal.results[0].messages, [message]);
+}
+
+fn refuse_with_message(message: &str) -> Box<MutationReject> {
+    let pipeline = pipeline_with(StoreConfig {
+        shacl_gate: ShaclGate::Enforce(GateSeverity::Violation),
+        shacl_reject_results: None,
+        total_query_memory_bytes: 256 * 1024,
+        ..StoreConfig::in_memory()
+    });
+    load_shapes(
+        &pipeline,
+        &format!(
+            "<http://example.com/RequiresName> <http://www.w3.org/ns/shacl#targetClass> <http://example.com/Person> .
+             <http://example.com/RequiresName> <http://www.w3.org/ns/shacl#path> <http://example.com/name> .
+             <http://example.com/RequiresName> <http://www.w3.org/ns/shacl#minCount> \"1\"^^<http://www.w3.org/2001/XMLSchema#integer> .
+             <http://example.com/RequiresName> <http://www.w3.org/ns/shacl#message> \"{message}\" ."
+        ),
+    );
+    refuse(&pipeline, "INSERT DATA { ex:ada a ex:Person }")
+}
+
 /// Loads `ntriples` into the shapes graph without passing the gate (a bulk load doesn't).
 fn load_shapes(pipeline: &MutationPipeline, ntriples: &str) {
     let mut file = tempfile::Builder::new()
@@ -237,19 +459,33 @@ fn load_shapes(pipeline: &MutationPipeline, ntriples: &str) {
 
 /// SHACL §1.5: a shapes graph with `sh:entailment E` the processor doesn't support makes
 /// every validation fail, a shapes graph with nothing else included: the
-/// enforcing gate rejects a write, though no shape constrains anything.
+/// enforcing gate rejects a write, though no shape constrains anything. The refusal lists
+/// the failure texts in order, up to the limit (docs/ops/http-api.md, docs/design/shacl.md).
 #[test]
 fn a_shapes_graph_asking_for_an_unsupported_entailment_fails_the_gate() {
-    let pipeline = pipeline(ShaclGate::Enforce(GateSeverity::Violation));
+    let pipeline = pipeline_with(StoreConfig {
+        shacl_gate: ShaclGate::Enforce(GateSeverity::Violation),
+        shacl_reject_results: Some(1),
+        ..StoreConfig::in_memory()
+    });
     load_shapes(
         &pipeline,
-        "<http://example.com/S> <http://www.w3.org/ns/shacl#entailment> <http://www.w3.org/ns/entailment/RDFS> .",
+        "<http://example.com/S> <http://www.w3.org/ns/shacl#entailment> <urn:z> .
+         <http://example.com/S> <http://www.w3.org/ns/shacl#entailment> <urn:a> .",
     );
-    let rejected = update(&pipeline, "INSERT DATA { ex:a ex:name \"A\" }");
-    assert!(
-        matches!(rejected, Err(MutationError::Rejected(_))),
-        "{rejected:?}"
+    let rejected = refuse(&pipeline, "INSERT DATA { ex:a ex:name \"A\" }");
+    let report = rejected.shacl.as_ref().expect("SHACL refusal report");
+    assert_eq!(
+        report.failures,
+        [
+            "the shapes graph asks for the entailment regime <urn:a> (sh:entailment), \
+          which this processor doesn't support"
+        ]
     );
+    assert_eq!(report.failures_omitted, 1);
+    assert!(report.results.is_empty());
+    assert_eq!(report.results_omitted, 0);
+    assert!(rejected.explanation.is_none());
     assert!(!holds(&pipeline, "ex:a ex:name \"A\""));
 }
 

@@ -32,6 +32,7 @@ use rayon::prelude::*;
 
 use super::spill::{Spill, Spiller};
 use super::{CommitSummary, Inner, ReadModel, Snapshot, Stack, Version, VersionData, Watch};
+use crate::durability::wal::PendingInstall;
 use crate::durability::{Durable, checkpoint, later};
 use crate::error::{EngineError, EngineResult};
 use crate::index::keys::PackedKeys;
@@ -408,6 +409,7 @@ impl<'e> BulkLoad<'e> {
             }
         };
         if summary.inserted + summary.deleted + summary.inferred_deleted == 0 {
+            shared.acknowledge_unchanged()?;
             return Ok(CommitSummary {
                 revision: current.revision,
                 ..summary
@@ -597,7 +599,7 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
         }
     });
     let mut committed_micros = None;
-    let path = commit_image(durable, revision, || {
+    let (path, pending) = commit_image(durable, revision, || {
         checkpoint::write_stamped(
             durable.root(),
             &image,
@@ -653,6 +655,7 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
     let compaction = shared.versions.compaction_slot.lock();
     let mut wal = durable.wal.lock();
     shared.versions.install(next);
+    pending.disarm();
     release_covered(&mut wal, durable.root(), revision);
     drop(wal);
     drop(compaction);
@@ -750,7 +753,7 @@ fn publish_streamed(
         )
     });
     drop(source);
-    let path = path?;
+    let (path, pending) = path?;
     shared
         .checkpoints
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -759,7 +762,7 @@ fn publish_streamed(
         Err(error) => {
             // Committed (the checkpoint is in place), but nothing else holds the data to
             // serve it: no write may follow before a reopen recovers it.
-            durable.wal.lock().poison();
+            drop(pending);
             tracing::error!(%error, revision, "a committed bulk load's checkpoint couldn't be mapped; reopen the engine to serve it");
             return Err(EngineError::CommitUnsettled { revision });
         }
@@ -787,6 +790,7 @@ fn publish_streamed(
     let compaction = shared.versions.compaction_slot.lock();
     let mut wal = durable.wal.lock();
     shared.versions.install(next);
+    pending.disarm();
     release_covered(&mut wal, durable.root(), revision);
     drop(wal);
     drop(compaction);
@@ -798,19 +802,20 @@ fn publish_streamed(
 }
 
 /// Writes, with `write`, the checkpoint of `revision`, a new revision of a bulk load or
-/// rematerialisation, and returns its path: the commit point (EEV-01, B-301). The caller
-/// holds the writer, compaction and checkpoint slots.
+/// rematerialisation, and returns its path: the commit point (EEV-01, B-301), and the fence
+/// the caller disarms once it has installed the revision's version. The caller holds the
+/// writer, compaction and checkpoint slots.
 ///
 /// Before it the log moves to a new segment, the one step that can leave it unfit for the
 /// commits after; past it nothing may report the revision uncommitted, since a restart
-/// recovers it. A write that failed with the checkpoint possibly in place (its rename's
-/// outcome unknown, its directory unsynced) poisons the log: no commit of any kind can then
+/// recovers it. Any exit from the write on until the install, but a write that failed with
+/// the checkpoint proven absent, poisons the log (the fence): no commit of any kind can then
 /// take the revision again before a reopen settles which one is on disk.
 fn commit_image(
     durable: &Durable,
     revision: u64,
     write: impl FnOnce() -> EngineResult<PathBuf>,
-) -> EngineResult<PathBuf> {
+) -> EngineResult<(PathBuf, PendingInstall<'_>)> {
     {
         let mut wal = durable.wal.lock();
         // The names a reopen left pending, before anything is written (deferred-sync design
@@ -818,14 +823,18 @@ fn commit_image(
         wal.settle_names()?;
         wal.rotate(revision)?;
     }
+    let pending = PendingInstall::arm(&durable.wal);
     let error = match write() {
-        Ok(path) => return Ok(path),
+        Ok(path) => return Ok((path, pending)),
         Err(error) => error,
     };
     match checkpoint::placed(durable.root(), revision) {
-        Ok(false) => Err(error),
+        Ok(false) => {
+            pending.disarm();
+            Err(error)
+        }
         placed => {
-            durable.wal.lock().poison();
+            drop(pending);
             tracing::error!(%error, revision, ?placed, "a bulk publication's outcome is unknown until the engine is reopened");
             Err(EngineError::CommitUnsettled { revision })
         }
@@ -955,6 +964,7 @@ impl<'e> Rematerialisation<'e> {
             asserted: base.asserted_identity(),
         };
         if inserted + deleted == 0 {
+            shared.acknowledge_unchanged()?;
             shared.install(reading, certificate);
             let summary = CommitSummary {
                 revision: base.revision(),

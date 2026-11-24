@@ -1174,7 +1174,7 @@ fn a_shared_definition_that_fails_leaves_out_every_user() {
     let unsupported = normalise_with(&o, Options::default()).unsupported;
     if unsupported
         .iter()
-        .any(|&(i, why)| i != 4 || why == nrese_owl::Unsupported::IrregularRoleHierarchy)
+        .any(|&(i, why)| i != 4 || why != nrese_owl::Unsupported::Keys)
     {
         wrong.push(format!("needed nothing: {unsupported:?}"));
     }

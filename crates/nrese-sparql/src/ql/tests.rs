@@ -1082,11 +1082,14 @@ fn a_reserved_names_only_membership_lowers_the_kept_schema_as_a_fresh_read() {
     };
     let list = member(&format!("{RDF}List"));
     let m = member(&format!("{EX}m"));
+    let thing = member(&format!("{OWL}Thing"));
     let mut wrong = Vec::new();
     for (step, quad, added, reserved) in [
         ("rdf:List added", list, true, true),
         (":m added", m, true, false),
         (":m removed", m, false, true),
+        // `owl:Thing` is no individual either (§5.6.1): left out, `rdf:List` still the only one.
+        ("owl:Thing added", thing, true, true),
     ] {
         let mut tx = engine.transaction();
         match added {

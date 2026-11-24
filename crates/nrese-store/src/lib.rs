@@ -108,6 +108,7 @@ pub use nrese_engine::{
     Applied, CorpusTuning, EngineError, IndexEncoding, LogExpectation, ReadModel,
     VocabularyEncoding, WalDamage,
 };
+pub use nrese_engine::{RestoreReport, RestoreStop};
 pub use nrese_shacl::{ValidationReport, ValidationResult};
 pub use nrese_sparql::{
     CancellationToken, Explanation, PlanStep, PlannedQuery, PlannedStep, QueryEvaluationError,
@@ -132,8 +133,8 @@ pub use scope::{EntryPoint, ReadContext, ReadScope, Requester, WriteScope};
 pub use service::{QueryRun, StoreService};
 pub use sessions::{SESSION_IDLE, Sessions};
 pub use shacl::{
-    ShaclGateState, ShaclResultText, ShaclValidation, ShaclValidationRequest, ShapesSource,
-    ValidatedGraphs,
+    ShaclGateState, ShaclRefusal, ShaclResultText, ShaclValidation, ShaclValidationRequest,
+    ShapesSource, ValidatedGraphs,
 };
 pub use statements::{RdfPayload, StatementOp, StatementOps, StatementPattern, StatementsRequest};
 pub use stats::StoreStats;

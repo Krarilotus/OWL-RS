@@ -764,6 +764,7 @@ impl<'e> Transaction<'e> {
         };
         if asserted.is_empty() && inferred.is_empty() {
             // Nothing published: the note isn't called ([`Self::note_commit`]).
+            engine.shared.acknowledge_unchanged()?;
             let summary = checked(summary(base.revision(), base.asserted_identity()));
             if let Some(publication) = publication {
                 publication(summary.revision);
@@ -897,6 +898,10 @@ impl Inner {
         let published_to = &published;
         let publish = move |current: &Version, committed: Option<u64>| {
             debug_assert_eq!(current.revision + 1, revision, "single writer");
+            #[cfg(test)]
+            if crate::durability::fault::PANIC_IN_COMMIT_PUBLISH.replace(false) {
+                panic!("{}", crate::durability::fault::COMMIT_PUBLISH_PANIC);
+            }
             let asserted = converted.as_ref().unwrap_or(&current.asserted);
             let content = super::Content::fresh();
             published_to.set(Some((current.content, content)));
@@ -939,6 +944,8 @@ impl Inner {
                     true => Some(&mut stamp),
                     false => None,
                 };
+                // The log stays poisoned from the append's write until the version is
+                // installed: no exit in between leaves a later commit to take this revision.
                 let committed = wal.append(record, stamp, note)?;
                 if !local {
                     shared
@@ -948,6 +955,7 @@ impl Inner {
                 shared
                     .versions
                     .publish(|current| publish(current, committed));
+                wal.installed();
                 if let Some(publication) = publication {
                     publication(revision);
                 }

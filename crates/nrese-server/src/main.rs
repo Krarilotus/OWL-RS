@@ -268,7 +268,7 @@ async fn run() -> Result<()> {
         return Ok(());
     }
     if let CliCommand::Restore(restore) = &cli.command {
-        let (manifest, revision) = nrese_store::restore_until(
+        let (manifest, revision, report) = nrese_store::restore_until(
             &restore.backup,
             &config.store.data_dir,
             &restore.wal,
@@ -279,6 +279,8 @@ async fn run() -> Result<()> {
         tracing::info!(
             image_revision = manifest.revision,
             revision,
+            stopped_at = ?report.stop,
+            latest_commit_micros = ?report.latest_commit_micros,
             data_dir = %config.store.data_dir.display(),
             "restored"
         );
