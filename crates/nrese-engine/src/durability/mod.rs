@@ -541,7 +541,18 @@ impl Durable {
                     replayed.push(path);
                 }
             }
-            if contents.torn && stop == RestoreStop::EndOfLog {
+            if contents.torn
+                && stop == RestoreStop::EndOfLog
+                && config.recover_until == Some(version.revision)
+            {
+                // The requested revision is reached: the bytes after it, torn or damaged, are
+                // past it and cut with the rest of the log after them.
+                stop = RestoreStop::PastRevision;
+                #[cfg(feature = "fault-points")]
+                crate::fault_points::cut_step()?;
+                forget_before_cut(root, &config)?;
+                kept = wal::truncate_segment(path, contents.valid_len)?;
+            } else if contents.torn && stop == RestoreStop::EndOfLog {
                 if Some(position) != last {
                     return Err(EngineError::Corruption(format!(
                         "invalid record in {} (not the last segment)",
