@@ -629,46 +629,50 @@ pub fn concluded_terms(o: &Ontology, axiom: &Axiom, rl: bool) -> Vec<Term> {
 /// - A class adds a membership positively only.
 ///
 /// Equality is [`concludes_equality`]'s.
+///
+/// Walked with a stack of its own (the nesting depth is no call depth), each expression
+/// before its operands and the operands from the left.
 pub(crate) fn positive_terms(o: &Ontology, e: ExprId, positive: bool, out: &mut Vec<Term>) {
-    match (o.class(e), positive) {
-        (ClassExpr::Class(c), true) => out.push(*c),
-        (ClassExpr::And(es) | ClassExpr::Or(es), p) => {
-            for &e in es {
-                positive_terms(o, e, p, out);
+    let mut stack = vec![(e, positive)];
+    while let Some((e, positive)) = stack.pop() {
+        match (o.class(e), positive) {
+            (ClassExpr::Class(c), true) => out.push(*c),
+            (ClassExpr::And(es) | ClassExpr::Or(es), p) => {
+                stack.extend(es.iter().rev().map(|&e| (e, p)));
             }
-        }
-        (ClassExpr::Not(e), p) => positive_terms(o, *e, !p, out),
-        (ClassExpr::Some(r, f), true) | (ClassExpr::All(r, f), false) => {
-            out.push(r.named());
-            positive_terms(o, *f, positive, out);
-        }
-        (ClassExpr::Some(_, f), false) | (ClassExpr::All(_, f), true) => {
-            positive_terms(o, *f, positive, out)
-        }
-        (ClassExpr::Min(n, r, f) | ClassExpr::Exact(n, r, f), true) if *n >= 1 => {
-            out.push(r.named());
-            positive_terms(o, *f, true, out);
-        }
-        // `≤ 0 R.F` (also `= 0`, `¬≥ 1`) puts every successor outside `F`: facts of `¬F`,
-        // no `R` edge. A larger bound equates ([`concludes_equality`]).
-        (ClassExpr::Max(0, _, f) | ClassExpr::Exact(0, _, f), true)
-        | (ClassExpr::Min(1, _, f), false) => positive_terms(o, *f, false, out),
-        (ClassExpr::Max(_, r, f) | ClassExpr::Exact(_, r, f), false) => {
-            out.push(r.named());
-            positive_terms(o, *f, true, out);
-            // `¬= 1` may be `≤ 0`.
-            if matches!(o.class(e), ClassExpr::Exact(1, ..)) {
-                positive_terms(o, *f, false, out);
+            (ClassExpr::Not(e), p) => stack.push((*e, !p)),
+            (ClassExpr::Some(r, f), true) | (ClassExpr::All(r, f), false) => {
+                out.push(r.named());
+                stack.push((*f, positive));
             }
+            (ClassExpr::Some(_, f), false) | (ClassExpr::All(_, f), true) => {
+                stack.push((*f, positive))
+            }
+            (ClassExpr::Min(n, r, f) | ClassExpr::Exact(n, r, f), true) if *n >= 1 => {
+                out.push(r.named());
+                stack.push((*f, true));
+            }
+            // `≤ 0 R.F` (also `= 0`, `¬≥ 1`) puts every successor outside `F`: facts of `¬F`,
+            // no `R` edge. A larger bound equates ([`concludes_equality`]).
+            (ClassExpr::Max(0, _, f) | ClassExpr::Exact(0, _, f), true)
+            | (ClassExpr::Min(1, _, f), false) => stack.push((*f, false)),
+            (ClassExpr::Max(_, r, f) | ClassExpr::Exact(_, r, f), false) => {
+                out.push(r.named());
+                // `¬= 1` may be `≤ 0`: the filler's complement too, after the filler.
+                if matches!(o.class(e), ClassExpr::Exact(1, ..)) {
+                    stack.push((*f, false));
+                }
+                stack.push((*f, true));
+            }
+            (ClassExpr::HasValue(r, _) | ClassExpr::HasSelf(r), true) => out.push(r.named()),
+            (ClassExpr::DataSome(d, _) | ClassExpr::DataHasValue(d, _), true)
+            | (ClassExpr::DataAll(d, _) | ClassExpr::DataMax(_, d, _), false) => out.push(*d),
+            (ClassExpr::DataMin(n, d, _) | ClassExpr::DataExact(n, d, _), true) if *n >= 1 => {
+                out.push(*d)
+            }
+            (ClassExpr::DataExact(_, d, _), false) => out.push(*d),
+            _ => {}
         }
-        (ClassExpr::HasValue(r, _) | ClassExpr::HasSelf(r), true) => out.push(r.named()),
-        (ClassExpr::DataSome(d, _) | ClassExpr::DataHasValue(d, _), true)
-        | (ClassExpr::DataAll(d, _) | ClassExpr::DataMax(_, d, _), false) => out.push(*d),
-        (ClassExpr::DataMin(n, d, _) | ClassExpr::DataExact(n, d, _), true) if *n >= 1 => {
-            out.push(*d)
-        }
-        (ClassExpr::DataExact(_, d, _), false) => out.push(*d),
-        _ => {}
     }
 }
 
