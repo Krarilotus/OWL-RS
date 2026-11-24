@@ -326,6 +326,8 @@ const UPDATE_400: &str = "A syntax error; an empty or repeated update, or one in
     and the body; a commit a consistency check or the SHACL gate rejects";
 const DENIED: &str =
     "Not allowed: the requester may not do this, or read or write a graph it names";
+const SHAPES_UNUSABLE: &str = "The SHACL gate's stored shapes don't compile \
+    (`shacl-shapes-unusable`); nothing committed. Repair or clear the shapes graph";
 const QUERY_408: &str = "Timed out (`budgets.query_timeout`), or an operator cancelled it";
 const QUERY_413: &str =
     "Past `budgets.query_text`, or the query's memory past `budgets.query_memory`";
@@ -384,6 +386,7 @@ protocol!(update, post, path = "/api/v1/repositories/{id}/update", tag = "sparql
         (status = 401, description = "Not authenticated", body = Problem), (status = 403, description = DENIED, body = Problem),
         (status = 404, description = "No such repository, or updates are off in this deployment", body = Problem),
         (status = 408, description = "Timed out (`budgets.update_timeout`); nothing committed", body = Problem),
+        (status = 409, description = SHAPES_UNUSABLE, body = Problem),
         (status = 413, description = "Past `budgets.update_size`", body = Problem),
         (status = 415, description = "Another `Content-Type`", body = Problem),
         (status = 429, description = "Rate limited", body = Problem), (status = 503, description = UNAVAILABLE, body = Problem)));
@@ -453,6 +456,7 @@ protocol!(
             description = "Timed out, or an operator cancelled the query",
             body = Problem
         ),
+        (status = 409, description = SHAPES_UNUSABLE, body = Problem),
         (
             status = 413,
             description = "Past the query's or the update's budgets",

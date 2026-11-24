@@ -187,6 +187,129 @@ async fn a_restricted_shacl_refusal_can_withhold_the_report() -> TestResult {
     Ok(())
 }
 
+/// Spec (docs/ops/http-api.md): the gate refuses data writes with
+/// 409 when the stored shapes can't compile, and names the problem only to a writer
+/// who can read the shapes graph.
+#[tokio::test]
+async fn unusable_stored_shapes_conflict_with_data_writes() -> TestResult {
+    let app = restricted_shacl_app(false, None)?;
+    let admin = format!("Bearer {}", token(&["nrese.admin"]));
+    let writer = format!("Bearer {}", token(&["writer"]));
+    let uri = format!(
+        "/api/v1/repositories/nrese/import?graph={}",
+        encode(SHAPES_GRAPH)
+    );
+    let setup = send(
+        &app,
+        Method::POST,
+        &uri,
+        &[("content-type", "text/turtle"), ("authorization", &admin)],
+        format!(
+            "{PREFIXES}ex:NameShape a sh:PropertyShape ; sh:targetNode ex:a ; sh:path \"bad\" ."
+        ),
+    )
+    .await?;
+    assert_eq!(
+        setup.status(),
+        StatusCode::OK,
+        "{}",
+        body_text(setup).await?
+    );
+
+    for (authorization, detail) in [
+        (
+            admin.as_str(),
+            "ill-formed SHACL shapes: shape <http://example.com/NameShape>: sh:path isn't an IRI or a path",
+        ),
+        (
+            writer.as_str(),
+            "ill-formed SHACL shapes: the shapes graph has problems; it is a graph you can't read, so they aren't shown",
+        ),
+    ] {
+        let response = send(
+            &app,
+            Method::POST,
+            "/dataset/update",
+            &[
+                ("content-type", "application/sparql-update"),
+                ("authorization", authorization),
+            ],
+            "PREFIX ex: <http://example.com/>
+             INSERT DATA { GRAPH ex:open { ex:a a ex:Person } }",
+        )
+        .await?;
+        let status = response.status();
+        let body = body_text(response).await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        let problem: serde_json::Value = serde_json::from_str(&body)?;
+        assert_eq!(
+            problem["type"],
+            "https://nrese.dev/problems/shacl-shapes-unusable"
+        );
+        assert_eq!(problem["title"], "SHACL Shapes Unusable");
+        assert_eq!(problem["detail"], detail);
+        if authorization == writer.as_str() {
+            assert!(!body.contains("NameShape"), "{body}");
+        }
+    }
+    Ok(())
+}
+
+/// Spec (docs/ops/http-api.md): a reporting gate also refuses a data write
+/// whose stored shapes can't compile, and says so the same way, with 409.
+#[tokio::test]
+async fn a_reporting_gate_answers_unusable_shapes_as_a_conflict_too() -> TestResult {
+    let app = test_app_with_store_config(
+        StoreConfig {
+            shacl_gate: ShaclGate::Report,
+            ..StoreConfig::in_memory()
+        },
+        policy_of("default = \"deny\"")?,
+        ReasonerConfig::for_mode(ReasoningMode::Disabled),
+    )?;
+    let admin = format!("Bearer {}", token(&["nrese.admin"]));
+    let uri = format!(
+        "/api/v1/repositories/nrese/import?graph={}",
+        encode(SHAPES_GRAPH)
+    );
+    let setup = send(
+        &app,
+        Method::POST,
+        &uri,
+        &[("content-type", "text/turtle"), ("authorization", &admin)],
+        format!(
+            "{PREFIXES}ex:NameShape a sh:PropertyShape ; sh:targetNode ex:a ; sh:path \"bad\" ."
+        ),
+    )
+    .await?;
+    assert_eq!(
+        setup.status(),
+        StatusCode::OK,
+        "{}",
+        body_text(setup).await?
+    );
+    let response = send(
+        &app,
+        Method::POST,
+        "/dataset/update",
+        &[
+            ("content-type", "application/sparql-update"),
+            ("authorization", &admin),
+        ],
+        "INSERT DATA { <http://example.com/a> a <http://example.com/Person> }",
+    )
+    .await?;
+    let status = response.status();
+    let body = body_text(response).await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let problem: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(
+        problem["type"],
+        "https://nrese.dev/problems/shacl-shapes-unusable"
+    );
+    Ok(())
+}
+
 fn name_result(person: &str, messages: &[&str]) -> serde_json::Value {
     serde_json::json!({
         "focusNode": format!("http://example.com/{person}"),
@@ -1153,7 +1276,7 @@ async fn a_restart_counts_the_stored_shapes() -> TestResult {
 }
 
 /// Spec (docs/ops/http-api.md): malformed stored shapes cause an enforcing gate to
-/// warn at restart and refuse data writes until the shapes are repaired.
+/// warn at restart and refuse data writes with 409 until the shapes are repaired.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restart_with_malformed_shapes_warns_and_refuses_writes_until_repair() -> TestResult {
     let dir = tempfile::tempdir()?;
@@ -1179,8 +1302,10 @@ async fn a_restart_with_malformed_shapes_warns_and_refuses_writes_until_repair()
     let info: serde_json::Value = serde_json::from_str(&server.get("/dataset/info").await?)?;
     assert_eq!(info["shacl"].get("shapes"), Some(&serde_json::Value::Null));
     let write = "INSERT DATA { <http://example.com/a> a <http://example.com/Person> }";
-    // Refused; its status is not specified yet.
-    server.update("nrese", write).await.unwrap_err();
+    assert_eq!(
+        server.update_status("nrese", write).await?,
+        StatusCode::CONFLICT
+    );
     let output = server.output();
     assert!(
         output.lines().any(|line| line.contains("WARN")

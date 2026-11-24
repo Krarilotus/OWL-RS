@@ -35,6 +35,9 @@ pub enum ApiError {
     NotFound(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    /// The SHACL gate couldn't use the repository's stored shapes (409).
+    #[error("{0}")]
+    ShaclShapesUnusable(String),
     /// Exact answers asked for (`dl-answers=exact`) that can't be proven complete (422).
     #[error("incomplete answer: {0}")]
     IncompleteAnswer(Box<nrese_store::IncompleteAnswer>),
@@ -193,6 +196,7 @@ impl IntoResponse for ApiError {
             );
         }
         let rights_changed = matches!(self, Self::RightsChanged(_));
+        let shapes_unusable = matches!(self, Self::ShaclShapesUnusable(_));
         if let Self::Busy(detail) = self {
             let mut response = Self::ServiceUnavailable(detail).into_response();
             response
@@ -217,7 +221,9 @@ impl IntoResponse for ApiError {
             Self::Unauthorized(detail, _) => (StatusCode::UNAUTHORIZED, detail),
             Self::Forbidden(detail) => (StatusCode::FORBIDDEN, detail),
             Self::NotFound(detail) => (StatusCode::NOT_FOUND, detail),
-            Self::Conflict(detail) => (StatusCode::CONFLICT, detail),
+            Self::Conflict(detail) | Self::ShaclShapesUnusable(detail) => {
+                (StatusCode::CONFLICT, detail)
+            }
             Self::Rejected { .. }
             | Self::IncompleteAnswer(_)
             | Self::Busy(_)
@@ -239,6 +245,11 @@ impl IntoResponse for ApiError {
             (
                 Cow::Borrowed("https://nrese.dev/problems/rights-changed"),
                 Cow::Borrowed("Rights Changed"),
+            )
+        } else if shapes_unusable {
+            (
+                Cow::Borrowed("https://nrese.dev/problems/shacl-shapes-unusable"),
+                Cow::Borrowed("SHACL Shapes Unusable"),
             )
         } else {
             kind(status)
