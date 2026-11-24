@@ -1237,11 +1237,11 @@ fn member_of(snapshot: &Snapshot, node: u64, keep: &dyn Fn(u64) -> bool) -> Memb
     }
 }
 
-/// Whether membership `statement`'s individual is a reserved name, which the OWL reader
-/// leaves out with the membership (`Reserved`).
+/// Whether membership `statement`'s individual is a reserved name there, which the OWL reader
+/// leaves out with the membership (`Reserved`), `owl:Thing` and the other five included.
 fn reserved_individual(snapshot: &Snapshot, statement: &nrese_owl::Statement) -> bool {
     matches!(snapshot.decode(TermId::from_raw(statement.triple[0])),
-        Some(Term::NamedNode(n)) if nrese_owl::diagnostics::reserved_name(n.as_str()))
+        Some(Term::NamedNode(n)) if nrese_owl::diagnostics::reserved_as_individual(n.as_str()))
 }
 
 /// `core` with the memberships `members`, sorted: the schema the TBox is compiled from.

@@ -169,7 +169,9 @@ impl Ontology {
     }
 
     /// The named individuals: declared, asserted about, or in a nominal (blank nodes, the
-    /// anonymous individuals, left out). Sorted. O(axioms + class expressions).
+    /// anonymous individuals, left out, and so is a reserved name the reader left out,
+    /// [`Diagnostic::Reserved`]: the nominal or `hasValue` of an axiom left out stays among the
+    /// class expressions). Sorted. O(axioms + class expressions).
     pub fn named_individuals(&self) -> Vec<Term> {
         let mut out: Vec<Term> = Vec::new();
         for a in &self.axioms {
@@ -179,7 +181,13 @@ impl Ontology {
             out.extend(individuals(a));
         }
         out.extend(in_expressions(self));
-        out.retain(|t| !self.anonymous.contains(t));
+        let reserved: HashSet<Term> = (self.diagnostics.iter())
+            .filter_map(|d| match *d {
+                Diagnostic::Reserved { term } => Some(term),
+                _ => None,
+            })
+            .collect();
+        out.retain(|t| !self.anonymous.contains(t) && !reserved.contains(t));
         out.sort_unstable();
         out.dedup();
         out
@@ -284,6 +292,7 @@ impl ClassExpressionMarkers {
 /// individuals, and the diagnostics of OWL 2 DL's global restrictions.
 pub(crate) fn complete(ontology: &mut Ontology, terms: &dyn Terms) {
     crate::diagnostics::leave_out_reserved(ontology, terms);
+    crate::diagnostics::report_reserved_in_expressions(ontology, terms);
     ontology.data = data_terms(ontology, terms);
     // Wherever a blank node stands for an individual, it is an anonymous one.
     ontology.anonymous = (ontology.axioms.iter())
@@ -470,6 +479,8 @@ struct Reader<'a> {
     axioms: BTreeMap<Axiom, Vec<Source>>,
     diagnostics: Vec<Diagnostic>,
     reported: HashSet<([Term; 3], &'static str)>,
+    /// The reserved-name walk over a repeated disjointness's axioms, kept across them.
+    walk: crate::diagnostics::Walk,
     annotations: usize,
     noncanonical_cardinality: Option<Term>,
     empty_list: Option<Term>,
@@ -676,6 +687,7 @@ impl<'a> Reader<'a> {
             axioms: BTreeMap::new(),
             diagnostics: Vec::new(),
             reported: HashSet::new(),
+            walk: crate::diagnostics::Walk::new(0),
             annotations: 0,
             noncanonical_cardinality: None,
             empty_list: None,
@@ -1504,12 +1516,22 @@ impl<'a> Reader<'a> {
 
     // Axioms ---------------------------------------------------------------------------
 
-    /// A disjointness's axioms (`Disjoint::axioms`): a repeated operand reported. Whether
-    /// one was.
+    /// A disjointness's axioms (`Disjoint::axioms`): a repeated operand reported, and then,
+    /// where they name a reserved name in its place, all of them left out with it
+    /// (`diagnostics::reserved_in`). Whether one was.
     fn disjoint(&mut self, d: Disjoint, triple: [Term; 3]) -> bool {
         let (axioms, repeated) = d.axioms(&mut self.classes, &mut self.ranges);
         if repeated {
             self.report(Diagnostic::RepeatedOperand);
+            let reserved =
+                crate::diagnostics::reserved_in(&self.classes, &axioms, self.terms, &mut self.walk);
+            if !reserved.is_empty() {
+                for term in reserved {
+                    self.report(Diagnostic::Reserved { term });
+                }
+                self.collected.clear();
+                return repeated;
+            }
         }
         // Each axiom comes from the whole form: each gets its list's statements.
         let collected = std::mem::take(&mut self.collected);

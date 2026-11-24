@@ -660,3 +660,33 @@ fn a_sub_property_of_a_built_in_annotation_property_leaves_the_el_answer_complet
     assert_eq!(report.engine, "el");
     assert!(report.complete(), "{:?}", report.incomplete);
 }
+
+/// Spec (Structural Specification §2.4, §5.6.1: no IRI of the reserved vocabulary is an
+/// individual): a realisation names no reserved name as an individual where the data puts one
+/// in a nominal or a `hasValue` the reader leaves out (`owl:Thing` and `owl:Nothing` included),
+/// with its axiom or with a structure it rejects, and still names the data's own individuals.
+#[test]
+fn a_realisation_names_no_reserved_name_as_an_individual() {
+    let mut wrong = Vec::new();
+    for data in [
+        ":C owl:equivalentClass [ owl:oneOf ( owl:Thing ) ] . :a a :C .",
+        ":p a owl:ObjectProperty . :a :p :b . \
+         :C owl:equivalentClass [ a owl:Restriction ; owl:onProperty :p ; owl:hasValue owl:Nothing ] .",
+        ":C owl:equivalentClass [ owl:oneOf ( <http://www.w3.org/1999/02/22-rdf-syntax-ns#nil> ) ] . \
+         :a a :C .",
+        // A nominal read before its structure is rejected (a disjoint union of one class).
+        ":C owl:disjointUnionOf ( [ owl:oneOf ( owl:Thing ) ] ) . :a a :C .",
+    ] {
+        let dl = pipeline();
+        insert(&dl, data).expect("committed");
+        let real = dl.store().realise(&ReadScope::All).expect("realisation");
+        let named: Vec<&str> = real.types.iter().map(|(a, _)| a.as_str()).collect();
+        let own = format!("{EX}a");
+        if named.iter().any(|a| a.starts_with("http://www.w3.org/"))
+            || !named.contains(&own.as_str())
+        {
+            wrong.push(format!("{data}: {named:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
