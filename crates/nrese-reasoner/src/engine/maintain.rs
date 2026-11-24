@@ -921,6 +921,7 @@ mod tests {
     #[test]
     fn snapshot_and_cold_commit_ground_the_same_program() {
         use crate::eval::{GroundProgram, Grounding, Seg, Source};
+        use crate::ir::{Head, Rule, Term};
         use nrese_rdf_io::{RdfFormat, RdfParser};
         use std::fmt::Write as _;
         let engine = Engine::new(EngineConfig::default()).unwrap();
@@ -977,7 +978,24 @@ mod tests {
             },
         );
         let prepared = program.ground_program(base);
-        let instances = |g: &GroundProgram| {
+        let (prepared_cells, prepared_predicate) = prepared.list_predicates.by_cell();
+        let (cold_cells, cold_predicate) = cold.list_predicates.by_cell();
+        assert_eq!(prepared_cells, cold_cells);
+        // A private relation belongs to the RDF list cell, whichever index it got.
+        let rule_at = |rule: &Rule, predicate: &dyn Fn(u64) -> u64| {
+            let mut rule = rule.clone();
+            let heads = match &mut rule.head {
+                Head::Facts(heads) => heads.as_mut_slice(),
+                Head::Inconsistent => &mut [],
+            };
+            for atom in rule.body.iter_mut().chain(heads) {
+                if let Term::Const(id) = &mut atom.0[1] {
+                    *id = predicate(*id);
+                }
+            }
+            format!("{rule:?}")
+        };
+        let instances = |g: &GroundProgram, predicate: &dyn Fn(u64) -> u64| {
             g.rules
                 .iter()
                 .enumerate()
@@ -989,11 +1007,14 @@ mod tests {
                         .map(<[_]>::to_vec)
                         .collect();
                     sets.sort();
-                    (format!("{rule:?}"), sets, g.equality[index])
+                    (rule_at(rule, predicate), sets, g.equality[index])
                 })
                 .collect::<BTreeSet<_>>()
         };
-        assert_eq!(instances(&prepared), instances(&cold));
+        assert_eq!(
+            instances(&prepared, &prepared_predicate),
+            instances(&cold, &cold_predicate)
+        );
         assert_eq!(prepared.bodiless, cold.bodiless);
         assert_eq!(prepared.transitive, cold.transitive);
         for grounding in prepared
@@ -1019,14 +1040,17 @@ mod tests {
             assert_eq!(alternatives(&prepared), alternatives(&cold));
         }
         for quad in base.quads_for_pattern_in(ReadModel::Materialised, &QuadPattern::all()) {
-            let produced = |g: &GroundProgram| {
+            let produced = |g: &GroundProgram, predicate: &dyn Fn(u64) -> u64| {
                 g.unpolled()
                     .producers(triple(quad))
                     .into_iter()
-                    .map(|i| format!("{:?}", g.rules[i]))
+                    .map(|i| rule_at(&g.rules[i], predicate))
                     .collect::<BTreeSet<_>>()
             };
-            assert_eq!(produced(&prepared), produced(&cold));
+            assert_eq!(
+                produced(&prepared, &prepared_predicate),
+                produced(&cold, &cold_predicate)
+            );
         }
         let consistency = |g: &GroundProgram| {
             g.consistency
@@ -1041,12 +1065,13 @@ mod tests {
         };
         assert_eq!(consistency(&prepared), consistency(&cold));
         assert_eq!(prepared.list_diagnostics, cold.list_diagnostics);
-        let table = |g: &GroundProgram| {
+        let table = |g: &GroundProgram, predicate: &dyn Fn(u64) -> u64| {
             let mut rows = BTreeSet::new();
             g.table
                 .as_ref()
                 .unwrap()
-                .scan([None; 3], Seg::All, &Poller::never(), &mut |fact| {
+                .scan([None; 3], Seg::All, &Poller::never(), &mut |mut fact| {
+                    fact[1] = predicate(fact[1]);
                     rows.insert(
                         fact.map(|id| super::super::decoded(base.decode(TermId::from_raw(id)), id)),
                     );
@@ -1054,12 +1079,31 @@ mod tests {
                 .unwrap();
             rows
         };
-        let rows = table(&prepared);
+        let rows = table(&prepared, &prepared_predicate);
         assert!(!rows.is_empty());
-        assert_eq!(rows, table(&cold));
-        assert_eq!(prepared.list_predicates, cold.list_predicates);
-        assert_eq!(prepared.operand_templates(), cold.operand_templates());
-        assert_eq!(prepared.table_rules, cold.table_rules);
+        assert_eq!(rows, table(&cold, &cold_predicate));
+        let templates = |g: &GroundProgram, predicate: &dyn Fn(u64) -> u64| {
+            g.operand_templates().map(|templates| {
+                templates
+                    .iter()
+                    .map(|(rule, premises)| (rule_at(rule, predicate), premises.to_vec()))
+                    .collect::<BTreeSet<_>>()
+            })
+        };
+        assert_eq!(
+            templates(&prepared, &prepared_predicate),
+            templates(&cold, &cold_predicate)
+        );
+        let table_rules = |g: &GroundProgram, predicate: &dyn Fn(u64) -> u64| {
+            g.table_rules
+                .iter()
+                .map(|&index| rule_at(&g.rules[index], predicate))
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(
+            table_rules(&prepared, &prepared_predicate),
+            table_rules(&cold, &cold_predicate)
+        );
         assert_eq!(prepared.family_relations, cold.family_relations);
     }
 
