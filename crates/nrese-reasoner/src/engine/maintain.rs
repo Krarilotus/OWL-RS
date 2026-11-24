@@ -197,6 +197,8 @@ impl VisitsBase for EngineBase<'_> {
                 .all(|(want, have)| want.is_none_or(|want| want == *have))
         };
         for axiom in self.axioms.iter() {
+            #[cfg(test)]
+            crate::witness::add(crate::witness::Site::AssertedAxiom, 1);
             let going = match matches(axiom) {
                 true => visit.fact(*axiom),
                 false => visit.skip(),
@@ -1778,6 +1780,79 @@ mod tests {
         assert!(
             maintained.is_err(),
             "a stopped commit's maintenance is interrupted"
+        );
+    }
+
+    #[test]
+    fn writing_a_long_list_does_not_scan_unrelated_program_axioms() {
+        use crate::witness::{self, Site};
+        use std::fmt::Write;
+
+        let visits = [8, 64].map(|axioms| {
+            let engine = Engine::new(EngineConfig {
+                background_maintenance: false,
+                ..EngineConfig::default()
+            })
+            .unwrap();
+            let mut schema = String::new();
+            for i in 0..axioms {
+                writeln!(
+                    schema,
+                    "<http://example.com/C{i}> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://example.com/Root> ."
+                )
+                .unwrap();
+            }
+            let rules = crate::RuleProgram::new(
+                Some(crate::rulesets::Ruleset::Owl2Rl),
+                Some(Arc::new(crate::UserRules::n3("schema", schema).unwrap())),
+            )
+            .unwrap()
+            .with_named_keys(true);
+            let mut tx = engine.transaction();
+            let program = Program::compile(&rules, &|t| tx.intern(t));
+            let iri = |s: &str| tx.intern(NamedNodeRef::new_unchecked(s).into()).raw();
+            let sub = iri("http://www.w3.org/2000/01/rdf-schema#subClassOf");
+            let root = iri("http://example.com/Root");
+            let members: Vec<_> = (0..10_000)
+                .map(|i| iri(&format!("http://example.com/C{i}")))
+                .collect();
+            for &class in &members[..axioms] {
+                tx.insert_encoded(encode([class, sub, root]).in_default_graph());
+            }
+            let loaded = maintain(&program, None, &mut tx, crate::eval::NEVER).unwrap();
+            let ground = loaded.program.expect("schema ground program");
+            tx.commit().unwrap();
+
+            let mut tx = engine.transaction();
+            let iri = |s: &str| tx.intern(NamedNodeRef::new_unchecked(s).into()).raw();
+            let rdf = |s| iri(&format!("http://www.w3.org/1999/02/22-rdf-syntax-ns#{s}"));
+            let owl = |s| iri(&format!("http://www.w3.org/2002/07/owl#{s}"));
+            let blank = |s: &str| tx.intern(BlankNodeRef::new_unchecked(s).into()).raw();
+            let (first, rest, nil) = (rdf("first"), rdf("rest"), rdf("nil"));
+            let axiom = blank("axiom");
+            let cells: Vec<_> = (0..members.len()).map(|i| blank(&format!("c{i}"))).collect();
+            for fact in [
+                [axiom, rdf("type"), owl("AllDisjointClasses")],
+                [axiom, owl("members"), cells[0]],
+            ] {
+                tx.insert_encoded(encode(fact).in_default_graph());
+            }
+            for (i, (&cell, &member)) in cells.iter().zip(&members).enumerate() {
+                let next = cells.get(i + 1).copied().unwrap_or(nil);
+                tx.insert_encoded(encode([cell, first, member]).in_default_graph());
+                tx.insert_encoded(encode([cell, rest, next]).in_default_graph());
+            }
+            let before = witness::get(Site::AssertedAxiom);
+            let done = maintain(&program, Some(&ground), &mut tx, crate::eval::NEVER).unwrap();
+            let examined = witness::get(Site::AssertedAxiom) - before;
+            assert!(done.violations.consistent());
+            assert!(done.diagnostics.is_empty());
+            tx.commit().unwrap();
+            examined
+        });
+        assert_eq!(
+            visits[0], visits[1],
+            "unrelated axioms increased list reads"
         );
     }
 
