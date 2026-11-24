@@ -421,7 +421,8 @@ impl Durable {
             }
         }
         let mut stop = RestoreStop::EndOfLog;
-        let mut last_commit_micros = version.committed_micros;
+        // Revision 0 holds no commit, so it has no commit time to report.
+        let mut last_commit_micros = version.committed_micros.filter(|_| version.revision > 0);
         // What the checkpoint holds, and the segments records were replayed from.
         let covered_through = version.revision;
         let mut replayed = Vec::new();
@@ -489,7 +490,12 @@ impl Durable {
                 if record.revision <= version.revision {
                     continue; // covered by the checkpoint
                 }
-                if record.revision != version.revision + 1 {
+                // Past a requested revision, the log ends here whatever follows: the revisions
+                // up to it are contiguous, so a gap after them hides none of them.
+                let after_revision = config
+                    .recover_until
+                    .is_some_and(|until| record.revision > until);
+                if !after_revision && record.revision != version.revision + 1 {
                     return Err(EngineError::Corruption(format!(
                         "WAL gap: expected revision {}, found {} in {}",
                         version.revision + 1,
@@ -497,24 +503,21 @@ impl Durable {
                         path.display()
                     )));
                 }
+                // A time cut only after the gap check: a missing record could be one made by then.
                 let after_time = match config.recover_until_micros {
-                    Some(until) => record.committed_micros.ok_or_else(|| {
+                    Some(until) if !after_revision => record.committed_micros.ok_or_else(|| {
                         EngineError::Configuration(format!(
                             "the WAL record at revision {} has no commit time: restore by revision",
                             record.revision
                         ))
                     })? > until,
-                    None => false,
+                    _ => false,
                 };
-                if after_time
-                    || config
-                        .recover_until
-                        .is_some_and(|until| record.revision > until)
-                {
-                    stop = if after_time {
-                        RestoreStop::PastTime
-                    } else {
+                if after_revision || after_time {
+                    stop = if after_revision {
                         RestoreStop::PastRevision
+                    } else {
+                        RestoreStop::PastTime
                     };
                     #[cfg(feature = "fault-points")]
                     crate::fault_points::cut_step()?;
