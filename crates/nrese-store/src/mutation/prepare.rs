@@ -1,3 +1,4 @@
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, OnceLock, Weak};
 
 use nrese_engine::engine::PublicationListener;
@@ -36,6 +37,7 @@ pub(super) struct Preparation {
     pub(super) rules: Option<RuleProgram>,
     program: OnceLock<Program>,
     pub(super) entry: Mutex<Entry>,
+    failed: Mutex<Option<GroundKey>>,
     builds: BuildCell<(), GroundProgram>,
     pub(super) retired: Mutex<bool>,
     // Only this thread defers its own commit notification until its entry is tagged.
@@ -55,6 +57,7 @@ impl Preparation {
             rules,
             program: OnceLock::new(),
             entry: Mutex::default(),
+            failed: Mutex::default(),
             builds: BuildCell::default(),
             retired: Mutex::default(),
             tagging: ReentrantMutex::default(),
@@ -129,10 +132,15 @@ impl Preparation {
                 return;
             }
             let rules = self.rules.as_ref().expect("preparation requires rules");
-            if !requested && !store.reasoning_is_current(rules) {
+            if !requested
+                && (*self.failed.lock() == Some(key) || !store.reasoning_is_current(rules))
+            {
                 return;
             }
             let (build, owner) = match self.builds.claim((), Kind::Opaque, || {
+                if !requested && *self.failed.lock() == Some(key) {
+                    return Some(None);
+                }
                 let entry = self.entry.try_lock()?;
                 cached(&entry, key).cloned().map(Some)
             }) {
@@ -142,17 +150,24 @@ impl Preparation {
             if let Some(reply) = reply.take() {
                 reply.finish(Handoff::Joined(build.clone()));
             }
-            let completed = owner.map(|owner| (owner, self.build(&store, rules)));
+            let completed = owner.map(|owner| {
+                let mut pinned = key;
+                let end = catch_unwind(AssertUnwindSafe(|| {
+                    self.build(&store, rules, &mut pinned, requested)
+                }));
+                if matches!(end, Ok(End::Empty) | Err(_)) {
+                    *self.failed.lock() = Some(pinned);
+                }
+                (owner, end)
+            });
             drop(store);
             if let Some((owner, end)) = completed {
-                owner.end(end);
+                match end {
+                    Ok(end) => owner.end(end),
+                    Err(_) => drop(owner),
+                }
             }
-            if requested
-                || !matches!(
-                    build.join(None, &|| *self.retired.lock()),
-                    Joined::Told(Ended::End(End::Kept(_) | End::Later))
-                )
-            {
+            if requested || matches!(build.join(None, &|| *self.retired.lock()), Joined::Left) {
                 return;
             }
         }
@@ -161,7 +176,13 @@ impl Preparation {
         }
     }
 
-    fn build(&self, store: &StoreService, rules: &RuleProgram) -> End<GroundProgram> {
+    fn build(
+        &self,
+        store: &StoreService,
+        rules: &RuleProgram,
+        pinned: &mut GroundKey,
+        requested: bool,
+    ) -> End<GroundProgram> {
         let (base, program) = {
             let tx = store.engine().transaction();
             if *self.retired.lock()
@@ -170,15 +191,22 @@ impl Preparation {
                 return End::Later;
             }
             let base = tx.base();
-            if let Some(program) = cached(&self.entry.lock(), ground_key(base)).cloned() {
+            *pinned = ground_key(base);
+            if let Some(program) = cached(&self.entry.lock(), *pinned).cloned() {
                 return End::Kept(program);
+            }
+            if *self.failed.lock() == Some(*pinned) {
+                if !requested {
+                    return End::Empty;
+                }
+                *self.failed.lock() = None;
             }
             let Ok(program) = self.compiled(store, rules, &tx) else {
                 return End::Empty;
             };
             (base.clone(), program)
         };
-        let key = ground_key(&base);
+        let key = *pinned;
         let moved = || ground_key(&store.engine().snapshot()) != key;
         let memory = store.memory_stop();
         let built = program.ground_program_until(&base, &|| {
