@@ -52,6 +52,8 @@ pub struct MutationReject {
     pub detail: String,
     pub explanation: Option<RejectExplanation>,
     pub attribution: Option<RejectAttribution>,
+    /// Results and validation failures when a SHACL reason is shown.
+    pub shacl: Option<std::sync::Arc<crate::ShaclRefusal>>,
     pub(super) _projected: super::evidence::Projected,
 }
 

@@ -83,8 +83,19 @@ Validate RDF data against SHACL shapes, natively and fast enough to run on every
 - **Position:** after reasoning, before the commit, inside the transaction. A rejected commit changes nothing (the same contract as consistency rejection, [reasoning-semantics.md](../spec/reasoning-semantics.md)).
 - **Policy, configurable:**
   - `off`;
-  - `report`: validate and record, never reject;
-  - `enforce`: reject a commit that adds results at or above a severity (default `sh:Violation`).
+  - `report`: validate and log the result count and first result in term order.
+  - `enforce`: reject a commit that adds results at or above a severity (default
+    `sh:Violation`) or leaves a validation failure.
+- **Refusal:** the write reports only results that meet the gate's threshold and any
+  validation failures. The count and first result in its detail use the same selection as
+  the structured report. Results are ordered by decoded terms, their messages are sorted,
+  and failures are ordered by their text.
+  Each list has the bound [`shacl.reject_results`](../ops/config-reference.md#shacl.reject_results)
+  and a count of items omitted for that bound or the write's memory budget.
+  A committer with limited graph access sees the results of
+  validating its own readable assertions against the shapes it may read. If the shapes
+  graph is unreadable or the shapes use SHACL-SPARQL, this validation supplies no refusal
+  details to the restricted committer. See [HTTP problems](../ops/http-api.md#status-codes).
 - **Incremental:** a commit can only change the results of focus nodes it touches. From the inserted and deleted statements (asserted and inferred), the gate computes the affected focus nodes per shape:
   - subjects and objects of changed statements, carried backwards along each shape's paths to the focus nodes that reach them;
   - nodes whose target membership changed (a type added or removed).

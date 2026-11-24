@@ -397,6 +397,7 @@ impl MutationPipeline {
                         detail,
                         explanation,
                         attribution,
+                        shacl: None,
                     }
                 };
                 let view = evidence::EvidenceView::new(&requester.read, &tx);
@@ -647,37 +648,29 @@ impl MutationPipeline {
         if report.results.is_empty() && report.failures.is_empty() {
             return Ok(());
         }
-        let rejects = matches!(
-            gate,
-            ShaclGate::Enforce(least)
-                if !report.failures.is_empty()
-                    || report.results.iter().any(|result| severity(result.severity.as_str()) >= least)
-        );
-        if rejects {
+        let rejects = |result: &nrese_shacl::ValidationResult| matches!(gate, ShaclGate::Enforce(least) if severity(result.severity.as_str()) >= least);
+        if matches!(gate, ShaclGate::Enforce(_))
+            && (!report.failures.is_empty() || report.results.iter().any(rejects))
+        {
             ticket.claim_error()?;
-        }
-        // Formatted only where it is told: a restricted committer's view is told its own.
-        let detail = || {
-            let first = report.results.first().map_or_else(String::new, |result| {
-                format!("; first: {}", crate::shacl::described(result))
-            });
-            format!(
-                "the commit introduces {} SHACL result(s) and {} failure(s){first}",
-                report.results.len(),
-                report.failures.len()
-            )
-        };
-        if rejects {
-            let full = || evidence::Draft {
-                kind: RejectKind::ShapesViolated,
-                detail: detail(),
-                explanation: None,
-                attribution: None,
+            let full = || {
+                crate::shacl::refusal(
+                    report,
+                    rejects,
+                    self.store.config().shacl_reject_results,
+                    &resources.memory,
+                    false,
+                    || true,
+                )
+                .expect("the gate rejected a result or a validation failure")
             };
             let reject = view.reject(full, |view| restricted(view, &pending));
             Err(MutationError::Rejected(Box::new(reject)))
         } else {
-            tracing::warn!("{} (SHACL gate: not rejected)", detail());
+            tracing::warn!(
+                "{} (SHACL gate: not rejected)",
+                crate::shacl::reported(report)
+            );
             Ok(())
         }
     }
@@ -722,6 +715,7 @@ impl MutationPipeline {
             pending,
             &self.store.config().shapes_graph,
             rejects,
+            self.store.config().shacl_reject_results,
             resources,
         )
         .unwrap_or_else(evidence::nothing_shown)

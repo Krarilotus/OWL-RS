@@ -1182,6 +1182,21 @@
           "type": "string",
           "x-env": "NRESE_SHACL_GATE_SEVERITY"
         },
+        "reject_results": {
+          "default": 10,
+          "description": "The count limit for each list in a SHACL refusal (0 or unlimited: no count limit). The write's memory budget also applies.",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ],
+          "x-env": "NRESE_SHACL_REJECT_RESULTS",
+          "x-unit": "count",
+          "x-unlimited": [
+            "0",
+            "unlimited"
+          ]
+        },
         "shapes_graph": {
           "default": "http://rdf4j.org/schema/rdf4j#SHACLShapeGraph",
           "description": "The graph of the shapes validation uses (an IRI).",
