@@ -521,11 +521,13 @@ pub(crate) fn mark(
     use nrese_engine::{TermKind, quad::Permutation};
     let (low, high) = TermId::kind_range(TermKind::BlankNode);
     let all = QuadPattern::all();
-    if [Permutation::Spog, Permutation::Ospg].into_iter().any(|order| {
-        snapshot
-            .scan_range_in(ReadModel::Asserted, &all, order, low, high)
-            .is_some_and(|mut quads| quads.next().is_some())
-    }) && let Ok(ontology) = read(store, snapshot)
+    if !matches!(at, Revision::Pending { .. })
+        && [Permutation::Spog, Permutation::Ospg].into_iter().any(|order| {
+            snapshot
+                .scan_range_in(ReadModel::Asserted, &all, order, low, high)
+                .is_some_and(|mut quads| quads.next().is_some())
+        })
+        && let Ok(ontology) = ontology_at(store, snapshot)
         && let Some(finding) = ontology.value().diagnostics.iter().find(|d| {
             matches!(d, nrese_owl::Diagnostic::AnonymousIndividual { axioms, .. } if axioms.iter().any(Option::is_some))
         })
