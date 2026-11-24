@@ -777,25 +777,49 @@ pub fn concludes_equality(
     axiom: &Axiom,
     equating: &std::collections::HashSet<Term>,
 ) -> bool {
+    /// Whether `e` or an expression in it equates, with a stack of its own (the nesting
+    /// depth is no call depth).
     fn contains(o: &Ontology, e: ExprId, equating: &std::collections::HashSet<Term>) -> bool {
         let p = |r: &ObjProp| equating.contains(&r.named());
-        let inner = |f: &ExprId| contains(o, *f, equating);
-        match o.class(e) {
-            ClassExpr::OneOf(_) | ClassExpr::HasValue(..) | ClassExpr::HasSelf(_) => true,
-            ClassExpr::Class(_) | ClassExpr::Thing | ClassExpr::Nothing => false,
-            ClassExpr::And(es) | ClassExpr::Or(es) => es.iter().any(inner),
-            ClassExpr::Not(f) => inner(f),
-            ClassExpr::Min(0, ..) | ClassExpr::DataMin(0, ..) => false,
-            ClassExpr::Max(n, r, f) | ClassExpr::Exact(n, r, f) => *n >= 1 || p(r) || inner(f),
-            ClassExpr::Min(n, r, f) => *n >= 2 || p(r) || inner(f),
-            ClassExpr::Some(r, f) | ClassExpr::All(r, f) => p(r) || inner(f),
-            ClassExpr::DataSome(d, _)
-            | ClassExpr::DataAll(d, _)
-            | ClassExpr::DataHasValue(d, _)
-            | ClassExpr::DataMin(_, d, _)
-            | ClassExpr::DataMax(_, d, _)
-            | ClassExpr::DataExact(_, d, _) => equating.contains(d),
+        let mut stack = vec![e];
+        while let Some(e) = stack.pop() {
+            // Whether `e` equates by itself, its operands aside.
+            let equates = match o.class(e) {
+                ClassExpr::OneOf(_) | ClassExpr::HasValue(..) | ClassExpr::HasSelf(_) => true,
+                ClassExpr::Class(_) | ClassExpr::Thing | ClassExpr::Nothing => false,
+                ClassExpr::And(es) | ClassExpr::Or(es) => {
+                    stack.extend(es.iter().rev());
+                    false
+                }
+                ClassExpr::Not(f) => {
+                    stack.push(*f);
+                    false
+                }
+                ClassExpr::Min(0, ..) | ClassExpr::DataMin(0, ..) => false,
+                ClassExpr::Max(n, r, f) | ClassExpr::Exact(n, r, f) => {
+                    stack.push(*f);
+                    *n >= 1 || p(r)
+                }
+                ClassExpr::Min(n, r, f) => {
+                    stack.push(*f);
+                    *n >= 2 || p(r)
+                }
+                ClassExpr::Some(r, f) | ClassExpr::All(r, f) => {
+                    stack.push(*f);
+                    p(r)
+                }
+                ClassExpr::DataSome(d, _)
+                | ClassExpr::DataAll(d, _)
+                | ClassExpr::DataHasValue(d, _)
+                | ClassExpr::DataMin(_, d, _)
+                | ClassExpr::DataMax(_, d, _)
+                | ClassExpr::DataExact(_, d, _) => equating.contains(d),
+            };
+            if equates {
+                return true;
+            }
         }
+        false
     }
     let any = |v: &[ExprId]| v.iter().any(|&e| contains(o, e, equating));
     match axiom {
