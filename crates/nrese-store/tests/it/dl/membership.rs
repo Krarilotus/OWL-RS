@@ -4,6 +4,10 @@ use super::entailment::{turtle, unchecked_inconsistent};
 use super::queries::query;
 use super::{PREFIXES, insert, pipeline};
 
+const FIXED_PREDICATE: &str = ":p a owl:ObjectProperty . :x a owl:NamedIndividual ; :p :y .
+    :y a owl:NamedIndividual .";
+const FIXED_READ: &str = "ASK { :x :p ?o }";
+
 fn preloaded(data: &str) -> nrese_store::MutationPipeline {
     let dl = pipeline();
     crate::support::load_past_the_pipeline(dl.store(), &format!("{PREFIXES}{data}"));
@@ -44,12 +48,22 @@ fn a_property_above_the_bottom_property_is_not_simple() {
 }
 
 /// OWL 2 Structural Specification §11.2: two distinct definitions of the same
-/// datatype put the stored ontology outside OWL 2 DL, even without data assertions.
+/// datatype put the stored ontology outside OWL 2 DL, even if no assertion uses it.
+/// One definition is permitted. The test uses a fixed predicate because an
+/// unbound predicate already makes a read incomplete over a valid ontology.
 #[test]
 fn two_datatype_definitions_withhold_the_word() {
-    let dl = preloaded(":dt a rdfs:Datatype ; owl:equivalentClass xsd:integer, xsd:string .");
-    let (_, status) = query(&dl, "ASK { ?s ?p ?o }");
-    assert!(!status.is_complete(), "{status:?}");
+    let mut wrong = Vec::new();
+    for (definitions, complete) in [("xsd:integer", true), ("xsd:integer, xsd:string", false)] {
+        let dl = preloaded(&format!(
+            "{FIXED_PREDICATE} :dt a rdfs:Datatype ; owl:equivalentClass {definitions} ."
+        ));
+        let (_, status) = query(&dl, FIXED_READ);
+        if status.is_complete() != complete {
+            wrong.push(format!("{definitions}: {status:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// OWL 2 Structural Specification §§4 and 7.5: minInclusive has no facet space
@@ -130,6 +144,8 @@ fn anonymous_individuals_outside_owl2_dl_are_reported() {
 
 /// OWL 2 Mapping to RDF Graphs Table 12: one member cannot form a data
 /// intersection or union. Two members, and a one-literal enumeration, can.
+/// The test uses a fixed predicate because an unbound predicate already
+/// makes a read incomplete over a valid ontology.
 #[test]
 fn a_one_member_data_intersection_or_union_has_no_reading() {
     let cases = [
@@ -142,9 +158,10 @@ fn a_one_member_data_intersection_or_union_has_no_reading() {
     let mut wrong = Vec::new();
     for (expression, complete) in cases {
         let dl = preloaded(&format!(
-            ":d a owl:DatatypeProperty ; rdfs:range [ a rdfs:Datatype ; {expression} ] ."
+            "{FIXED_PREDICATE} :d a owl:DatatypeProperty ;
+             rdfs:range [ a rdfs:Datatype ; {expression} ] ."
         ));
-        let (_, status) = query(&dl, "ASK { ?s ?p ?o }");
+        let (_, status) = query(&dl, FIXED_READ);
         if status.is_complete() != complete
             || (!complete
                 && !status
