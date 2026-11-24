@@ -239,9 +239,9 @@ impl Program {
             .expect("the built-in rulesets parse (tested), user rules are checked at startup");
         let blank_nodes = constants.blank_node_ids().filter(|_| program.named_keys);
         let lists = program.has_list_rules().then(|| {
-            let mut vocabulary = ListVocabulary::new(&mut constants).named_keys(blank_nodes);
-            vocabulary.canonical_disjoints = program.named_keys;
-            vocabulary
+            ListVocabulary::new(&mut constants)
+                .named_keys(blank_nodes)
+                .canonical_disjoints(program.named_keys)
         });
         let schema = Schema::owl(&mut constants);
         let unnamed = UnnamedVocabulary::new(&mut constants);

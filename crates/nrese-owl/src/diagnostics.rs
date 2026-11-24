@@ -158,9 +158,9 @@ pub enum Diagnostic {
         column: u32,
         what: &'static str,
     },
-    /// A disjointness that repeats an operand (`x owl:disjointWith x`, `a owl:differentFrom
-    /// a`): OWL 2 DL's n-ary axioms take operands without repeats, so it is read as what
-    /// being disjoint from itself means (`crate::model::Disjoint`).
+    /// A disjointness with a repeated operand. The canonical reading deduplicates it
+    /// when at least two operands remain. With one operand, and under the RDF-Based
+    /// reading, a repeat expresses self-disjointness.
     RepeatedOperand,
     /// An IRI of the reserved vocabulary used as a class, property or individual (*OWL 2
     /// Structural Specification* §2.4): the axioms that do are left out.
@@ -311,7 +311,7 @@ impl Diagnostic {
             Self::NonSimpleProperty { .. } => false,
             // Read as written: the Direct Semantics reads it (§2.3.7–2.4), as above.
             Self::AnonymousIndividual { .. } => false,
-            // Read as what being disjoint from itself means (`crate::model::Disjoint`).
+            // Read according to the selected disjointness semantics.
             Self::RepeatedOperand => false,
         }
     }

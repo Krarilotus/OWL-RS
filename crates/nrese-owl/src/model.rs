@@ -239,8 +239,10 @@ impl<T: Clone + Eq + Hash> Interner<T> {
 /// How repeated operands of disjointness and distinctness are read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisjointReading {
-    /// Read operands as a set when at least two distinct operands remain.
+    /// Use the distinct operands if at least two remain. A repeat with one
+    /// distinct operand expresses self-disjointness.
     Canonical,
+    /// Every repeated operand expresses self-disjointness.
     RdfBased,
 }
 
@@ -256,7 +258,10 @@ pub(crate) enum Disjoint {
 }
 
 impl Disjoint {
-    /// The axioms it stands for, and whether an operand was repeated.
+    /// The axioms it stands for, and whether an operand was repeated. With at least
+    /// two distinct operands, emit the n-ary axiom. Where the reading calls for
+    /// self-disjointness, a repeated class or property is empty and a repeated
+    /// individual contradicts.
     pub(crate) fn axioms(
         self,
         classes: &mut Interner<ClassExpr>,

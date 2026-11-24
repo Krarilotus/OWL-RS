@@ -59,13 +59,18 @@ pub struct ListVocabulary {
     all_different: u64,
     /// The blank nodes' ids, when keys bind named individuals only.
     named_keys: Option<(u64, u64)>,
-    pub(crate) canonical_disjoints: bool,
+    canonical_disjoints: bool,
 }
 
 impl ListVocabulary {
     /// Keys that bind no individual whose id is in `blank_nodes` (`owl2-dl`).
     pub fn named_keys(mut self, blank_nodes: Option<(u64, u64)>) -> Self {
         self.named_keys = blank_nodes;
+        self
+    }
+
+    pub(crate) fn canonical_disjoints(mut self, canonical: bool) -> Self {
+        self.canonical_disjoints = canonical;
         self
     }
 
