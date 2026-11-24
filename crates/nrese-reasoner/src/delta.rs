@@ -265,6 +265,15 @@ impl Rules<'_> {
         restored: &[Triple],
     ) -> Option<ListRules> {
         let vocabulary = self.lists?;
+        // The pending base has already deleted these assertions. Index just the restored
+        // list facts so each written lookup visits only its matching positions.
+        let restored = (vocabulary.uses_written_disjoints() && !restored.is_empty()).then(|| {
+            Store::new(
+                poll.counted(restored.iter().copied())
+                    .filter(|&fact| vocabulary.is_list_fact(fact))
+                    .collect(),
+            )
+        });
         let written = ScannedFacts(
             |pattern: [Option<u64>; 3], found: &mut dyn FnMut(Triple)| {
                 source.base.scan_asserted(pattern, poll, &mut |fact| {
@@ -272,15 +281,8 @@ impl Rules<'_> {
                         found(fact);
                     }
                 })?;
-                // The pending base has already deleted these assertions.
-                for fact in poll.counted(restored.iter().copied()) {
-                    if pattern
-                        .iter()
-                        .zip(fact)
-                        .all(|(want, n)| want.is_none_or(|want| want == n))
-                    {
-                        found(fact);
-                    }
+                if let Some(restored) = &restored {
+                    restored.scan(pattern, Seg::All, poll, found)?;
                 }
                 poll.ended()
             },

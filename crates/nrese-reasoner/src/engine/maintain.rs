@@ -46,22 +46,26 @@ impl<'a> EngineBase<'a> {
         }
     }
 
-    /// Whether `fact` was in the state before the transaction (any graph, either stack): one
+    /// Whether `fact` was in `model` before the transaction (any graph): one
     /// lookup, counted on `poll` before it is made; [`Stopped`] once `poll`
     /// has stopped, never a "not known" that would keep the fact.
-    fn known_before(&self, fact: Triple, poll: &Poller<'_>) -> Result<bool, Stopped> {
+    fn known_before(
+        &self,
+        model: ReadModel,
+        fact: Triple,
+        poll: &Poller<'_>,
+    ) -> Result<bool, Stopped> {
         #[cfg(test)]
         crate::witness::add(crate::witness::Site::KnownBefore, 1);
         if poll.tick() {
             return Err(Stopped);
         }
         // Its work in the engine counted too (REAS-3, SW016), a deleted copy found as any.
-        let found = self.snapshot.point_graphs(
-            ReadModel::Materialised,
-            ids(fact),
-            &|n| poll.visit(n),
-            |_| Ok(ControlFlow::Break(())),
-        )?;
+        let found = self
+            .snapshot
+            .point_graphs(model, ids(fact), &|n| poll.visit(n), |_| {
+                Ok(ControlFlow::Break(()))
+            })?;
         Ok(found.is_break())
     }
 
@@ -416,20 +420,29 @@ pub fn maintain_with_report_budget(
         // derived one known before) count on the commit's stop, as the update's do.
         let stop: crate::eval::Stop<'_> = &|| operation.fired();
         let prep = Poller::new(stop).ok_or_else(|| operation.interrupted())?;
-        // Facts new to the state: in no graph and not inferred before the transaction. Each
-        // lookup in the state before counts on `prep`; the first that finds
-        // `prep` stopped ends the maintenance there, its partial lists dropped (a stopped lookup read as "not known" kept every fact after
-        // it).
+        // Each lookup in the old state counts on `prep`; a stop ends maintenance.
         let interrupted = |_: Stopped| operation.interrupted();
         let mut inserted: Vec<Triple> = Vec::new();
         for fact in tx.inserted().map(triple) {
-            if !base.known_before(fact, &prep).map_err(interrupted)? {
+            // An assertion changes a written list even if the fact was already inferred.
+            let model = if rules
+                .lists
+                .is_some_and(|lists| lists.uses_written_disjoints() && lists.is_list_fact(fact))
+            {
+                ReadModel::Asserted
+            } else {
+                ReadModel::Materialised
+            };
+            if !base.known_before(model, fact, &prep).map_err(interrupted)? {
                 inserted.push(fact);
             }
         }
         if !(inserted.is_empty() && tx.deleted().next().is_none()) {
             for &axiom in &program.axioms {
-                if base.known_before(axiom, &prep).map_err(interrupted)? {
+                if base
+                    .known_before(ReadModel::Materialised, axiom, &prep)
+                    .map_err(interrupted)?
+                {
                     continue;
                 }
                 if !base.inserts.contains(axiom, &prep).map_err(interrupted)? {
@@ -444,15 +457,18 @@ pub fn maintain_with_report_budget(
                 .iter()
                 .map(|t| triple(t.in_default_graph()))
             {
-                if !base.known_before(fact, &prep).map_err(interrupted)? {
+                if !base
+                    .known_before(ReadModel::Materialised, fact, &prep)
+                    .map_err(interrupted)?
+                {
                     inserted.push(fact);
                 }
             }
         }
         inserted.sort_unstable();
         inserted.dedup();
-        // A triple deleted from one graph but still asserted in another stays a fact. The
-        // first probe that finds `prep` stopped ends the maintenance.
+        // A triple deleted from one graph but still asserted in another stays a fact.
+        // Loss of the last assertion changes a written list even if the fact is rederived.
         let mut deleted: Vec<Triple> = Vec::new();
         let mut republished = BTreeSet::new();
         for fact in tx.deleted().map(triple) {
@@ -1267,7 +1283,7 @@ mod tests {
             assert_eq!(base.contains(fact, &poll), Ok(left), "held: {left}");
             assert_eq!(base.is_asserted(fact, &poll), Ok(left), "asserted: {left}");
             assert_eq!(
-                base.known_before(fact, &poll),
+                base.known_before(ReadModel::Materialised, fact, &poll),
                 Ok(true),
                 "known before the change"
             );

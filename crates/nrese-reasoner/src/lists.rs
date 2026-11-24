@@ -76,6 +76,10 @@ impl ListVocabulary {
         self
     }
 
+    pub(crate) fn uses_written_disjoints(&self) -> bool {
+        self.canonical_disjoints
+    }
+
     pub fn new(vocabulary: &mut impl Vocabulary) -> Self {
         let mut rdf = |local: &str| vocabulary.iri(&format!("{RDF}{local}"));
         let (rdf_type, first, rest, nil) = (rdf("type"), rdf("first"), rdf("rest"), rdf("nil"));
@@ -717,7 +721,7 @@ pub(crate) fn compile(
             }
             let written = written
                 .as_ref()
-                .filter(|_| matches!(kind, ListKind::Pairwise) && voc.canonical_disjoints);
+                .filter(|_| matches!(kind, ListKind::Pairwise) && voc.uses_written_disjoints());
             let asserted = written.into_iter().flat_map(|w| {
                 let p = if predicate == voc.members {
                     w.vocabulary.members
