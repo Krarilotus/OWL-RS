@@ -7,6 +7,7 @@ mod list_cells;
 mod order;
 mod premise;
 mod ql_status;
+mod role_regularity;
 mod typing;
 
 use std::collections::HashMap;
@@ -1105,7 +1106,9 @@ fn assert_round_trip(ontology: &Ontology, table: &mut Table) {
     let restriction = |d: &Diagnostic| {
         matches!(
             d,
-            Diagnostic::NonSimpleProperty { .. } | Diagnostic::AnonymousIndividual { .. }
+            Diagnostic::NonSimpleProperty { .. }
+                | Diagnostic::AnonymousIndividual { .. }
+                | Diagnostic::IrregularPropertyHierarchy { .. }
         )
     };
     assert!(

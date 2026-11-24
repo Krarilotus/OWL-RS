@@ -302,6 +302,37 @@ fn an_irregular_el_ontology_is_answered_completely_by_the_el_classifier() {
     assert!(report.equivalent_to_thing.is_empty());
 }
 
+/// Structural Specification §11.2 rejects the hierarchy, while EL++ completion
+/// proves the subsumptions without a regular role order.
+#[test]
+fn role_regularity_diagnostics_do_not_prevent_a_complete_el_classification() {
+    let diagnostic_only = ":r1 a owl:ObjectProperty . :r2 a owl:ObjectProperty .
+        :r3 a owl:ObjectProperty ; owl:propertyChainAxiom ( :r1 :r2 ) ; rdfs:subPropertyOf :r1 .
+        :A a owl:Class . :B a owl:Class . :C a owl:Class .
+        :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r1 ; owl:someValuesFrom :B ] .
+        :B rdfs:subClassOf :C .";
+    for (data, sub, sup) in [(IRREGULAR, "A", "G"), (diagnostic_only, "B", "C")] {
+        let dl = pipeline();
+        insert(&dl, data).expect("ontology committed");
+        let store = dl.store();
+        let report = store.classify(&ReadScope::All).expect("classification");
+        assert_eq!(report.engine, "el", "classification of {sub} ⊑ {sup}");
+        assert!(report.complete(), "{:?}", report.incomplete);
+        assert!(has(&report.subsumptions, sub, sup));
+        let verdict = store
+            .dl()
+            .status()
+            .expect("consistency status")
+            .consistency
+            .verdict;
+        let reason = verdict.reason().unwrap_or_default();
+        assert!(
+            reason.contains("irregular") && reason.contains(" < "),
+            "{verdict:?}"
+        );
+    }
+}
+
 /// Without assertions, the ontology has a model iff `owl:Thing` is satisfiable: where the
 /// chain makes it unsatisfiable, the EL classifier's answer is "inconsistent", complete,
 /// listing nothing (the DL engines' Horn part, without the chain, can't find it).
@@ -334,9 +365,12 @@ fn assert_lower_bound(report: &nrese_store::ClassificationReport) {
     assert_eq!(report.engine, "tableau");
     assert!(!report.complete());
     assert!(
-        report.incomplete.contains(&format!(
-            "consistency not decided (unsupported): {LEFT_OUT}"
-        )),
+        report
+            .incomplete
+            .iter()
+            .any(|reason| reason.starts_with(&format!(
+                "consistency not decided (unsupported): {LEFT_OUT}"
+            )) && reason.contains("reader diagnostics")),
         "{:?}",
         report.incomplete
     );
@@ -609,7 +643,8 @@ fn an_irregular_el_answer_leaves_an_annotation_propertys_domain_out() {
 /// classifier reads the class axiom its node carries (`X ⊓ Y ⊑ Z`): its answer names
 /// classes the DL engines' signature lacks, so neither reading is trusted, and the answer
 /// stays the DL engines' marked lower bound. The reification has no main triple
-/// (*Mapping to RDF* Table 17), so the reader reports it, and the bound says so too.
+/// (*Mapping to RDF* Table 17). The bound counts the reader's diagnostic for that
+/// reification and the one for the irregular role hierarchy.
 #[test]
 fn an_irregular_ontology_whose_classes_the_two_readers_read_differently_is_not_answered_by_the_el_classifier()
  {
@@ -628,7 +663,7 @@ fn an_irregular_ontology_whose_classes_the_two_readers_read_differently_is_not_a
     assert!(
         report.incomplete.contains(&format!(
             "consistency not decided (unsupported): {LEFT_OUT}; \
-             1 reader diagnostics (not OWL 2 DL, left out)"
+             2 reader diagnostics (not OWL 2 DL, left out)"
         )),
         "{:?}",
         report.incomplete
