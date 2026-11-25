@@ -1336,6 +1336,66 @@ fn check_stopped_dl_commit(data: &str, readings: u32, route: &str) {
     );
 }
 
+/// OWL 2 Structural Specification §5.7: a literal's lexical form must belong to its
+/// datatype. The read must withhold consistency and completeness even where the DL engine
+/// can model the logical axioms and the commit left no verdict.
+#[test]
+fn a_dl_read_does_not_record_consistency_for_an_ill_typed_literal() {
+    let store = Arc::new(
+        StoreService::new(StoreConfig::in_memory())
+            .expect("store")
+            .with_capacity(counted),
+    );
+    let dl = pipeline(&store, ReasoningMode::Owl2Dl);
+    commit(&dl, DATA);
+
+    // U1 shares the existential witness, so it collides with the disjoint ranges. The
+    // logical axioms have a model with a different successor for each individual.
+    let schema =
+        ":A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; owl:someValuesFrom :B ] .
+         :Left rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; owl:allValuesFrom :C ] .
+         :Right rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; owl:allValuesFrom :D ] .
+         :C owl:disjointWith :D . :left a :A, :Left . :right a :A, :Right .";
+    // Let the rules and U1 use memory. The commit's DL witness search then stops.
+    hooks::AFTER_PREFLIGHT.set(Some(Box::new(|| READINGS.set(Some(2)))));
+    commit(
+        &dl,
+        &format!("{schema} :d a owl:AnnotationProperty . {ILL_TYPED}"),
+    );
+    READINGS.set(None);
+    let at = store.current_revision();
+    let committed = store.dl().status().filter(|report| report.revision == at);
+    assert!(committed.is_none(), "the commit left {committed:?}");
+
+    let read = status(&store, READ);
+    let recorded = store
+        .dl()
+        .status()
+        .filter(|report| report.revision == at)
+        .expect("the read reached the consistency engine");
+    let snapshot = store.engine().snapshot();
+    let witness = super::Certificate::of(&snapshot)
+        .expect("the read has a certified revision")
+        .ill_typed(&snapshot, &|| false)
+        .flatten();
+    assert!(
+        witness.is_some(),
+        "the store still holds the ill-typed literal"
+    );
+    println!(
+        "F3 engine={} verdict={:?} read={read}",
+        recorded.consistency.engine, recorded.consistency.verdict
+    );
+    assert_eq!(
+        (
+            recorded.consistency.verdict == crate::dl::Verdict::Consistent,
+            read.starts_with("complete"),
+        ),
+        (false, false),
+        "an ill-typed literal withholds the read verdict and completeness"
+    );
+}
+
 /// Removing the last occurrence of the literal needs one scan for both the DL verdict and
 /// the version's certificate. Both must then vouch for the repaired store.
 #[test]
