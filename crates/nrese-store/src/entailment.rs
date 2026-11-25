@@ -739,17 +739,22 @@ fn fresh_blank(
             .lookup(nrese_rdf::TermRef::BlankNode(cand.as_ref()))
             .is_none()
         {
+            #[cfg(test)]
+            let old_cap = blanks.capacity();
             blanks.insert(blank.as_str().to_owned(), cand.clone());
             #[cfg(test)]
             {
-                let held: usize = blanks.capacity()
-                    * (std::mem::size_of::<(String, nrese_rdf::BlankNode)>() + 1)
+                let entry_slot = std::mem::size_of::<(String, nrese_rdf::BlankNode)>() + 1;
+                let new_cap = blanks.capacity();
+                let resized = old_cap > 0 && new_cap > old_cap;
+                let held: usize = new_cap * entry_slot
                     + blanks
                         .iter()
                         .map(|(k, v)| k.capacity() + v.as_str().len())
                         .sum::<usize>()
                     + cand.as_str().len();
-                blank_test_hooks::record(held, scratch.bytes());
+                let peak_with_overlap = held + if resized { old_cap * entry_slot } else { 0 };
+                blank_test_hooks::record(held, scratch.bytes(), resized, peak_with_overlap);
             }
             return Ok(Some(cand));
         }
@@ -765,19 +770,28 @@ mod blank_test_hooks {
         static MAX_UNCHARGED: Cell<usize> = const { Cell::new(0) };
         static MAX_HELD: Cell<usize> = const { Cell::new(0) };
         static MAX_CHARGED: Cell<usize> = const { Cell::new(0) };
+        static RESIZES: Cell<usize> = const { Cell::new(0) };
+        static MAX_RESIZE_UNCHARGED: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(crate) fn reset() {
         MAX_UNCHARGED.with(|c| c.set(0));
         MAX_HELD.with(|c| c.set(0));
         MAX_CHARGED.with(|c| c.set(0));
+        RESIZES.with(|c| c.set(0));
+        MAX_RESIZE_UNCHARGED.with(|c| c.set(0));
     }
 
-    pub(crate) fn record(held: usize, charged: usize) {
+    pub(crate) fn record(held: usize, charged: usize, resized: bool, peak_with_overlap: usize) {
         let uncharged = held.saturating_sub(charged);
         MAX_UNCHARGED.with(|c| c.set(c.get().max(uncharged)));
         MAX_HELD.with(|c| c.set(c.get().max(held)));
         MAX_CHARGED.with(|c| c.set(c.get().max(charged)));
+        if resized {
+            RESIZES.with(|c| c.set(c.get() + 1));
+        }
+        let resize_uncharged = peak_with_overlap.saturating_sub(charged);
+        MAX_RESIZE_UNCHARGED.with(|c| c.set(c.get().max(resize_uncharged)));
     }
 
     pub(crate) fn snapshot() -> (usize, usize, usize) {
@@ -785,6 +799,13 @@ mod blank_test_hooks {
             MAX_HELD.with(Cell::get),
             MAX_CHARGED.with(Cell::get),
             MAX_UNCHARGED.with(Cell::get),
+        )
+    }
+
+    pub(crate) fn resize_snapshot() -> (usize, usize) {
+        (
+            RESIZES.with(Cell::get),
+            MAX_RESIZE_UNCHARGED.with(Cell::get),
         )
     }
 }

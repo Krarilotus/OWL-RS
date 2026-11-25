@@ -466,6 +466,10 @@ pub(crate) fn check_global_restrictions(
     }
     let mut found = Vec::new();
     let mut memo = (!needing.is_empty()).then(|| vec![UNSEEN; ontology.classes.len()]);
+    #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+    if let Some(m) = memo.as_ref() {
+        record_non_simple_scratch(m.capacity() * std::mem::size_of::<u32>());
+    }
     for (index, axiom) in ontology.axioms.iter().enumerate() {
         let direct = match axiom {
             Axiom::ObjectCharacteristic(
@@ -689,6 +693,11 @@ fn uses_any(
         if !kids.is_empty() {
             stack.push((cur, true));
             stack.extend(kids.iter().map(|c| (c.0, false)));
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+            record_non_simple_scratch(
+                memo.len() * std::mem::size_of::<u32>()
+                    + stack.capacity() * std::mem::size_of::<(u32, bool)>(),
+            );
         }
     }
     needing.get(&memo[id as usize]).copied()
@@ -697,12 +706,24 @@ fn uses_any(
 #[cfg(any(test, all(feature = "witness", debug_assertions)))]
 thread_local! {
     static NON_SIMPLE_EXPANSIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static NON_SIMPLE_SCRATCH_PEAK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, all(feature = "witness", debug_assertions)))]
+fn record_non_simple_scratch(bytes: usize) {
+    NON_SIMPLE_SCRATCH_PEAK.with(|p| p.set(p.get().max(bytes)));
 }
 
 /// Class-expression expansions made by the non-simple-property check on this thread.
 #[cfg(any(test, all(feature = "witness", debug_assertions)))]
 pub fn non_simple_expansions() -> u64 {
     NON_SIMPLE_EXPANSIONS.with(std::cell::Cell::get)
+}
+
+/// Peak scratch bytes held by the non-simple-property memo pass on this thread, resetting it.
+#[cfg(any(test, all(feature = "witness", debug_assertions)))]
+pub fn take_non_simple_scratch_peak() -> usize {
+    NON_SIMPLE_SCRATCH_PEAK.with(|p| p.replace(0))
 }
 
 /// Whether an IRI is of the reserved vocabulary (`rdf:`, `rdfs:`, `xsd:`, `owl:`) and not
@@ -1062,5 +1083,49 @@ mod tests {
             })
             .collect();
         assert_eq!(single_hits, vec![(1, sub_idx, "a self restriction")]);
+    }
+
+    /// Spec (contracts.md, Memory; Structural Specification §11.2): the non-simple-property
+    /// memo's advertised byte bound covers all live scratch held during the pass on a dense
+    /// acyclic DAG with many shared parent edges.
+    #[test]
+    fn non_simple_memo_reservation_covers_shared_parent_edges() {
+        let mut o = Ontology::default();
+        let hit = ExprId(o.classes.intern(ClassExpr::HasSelf(ObjProp::Named(1))));
+        let leaf = ExprId(o.classes.intern(ClassExpr::Class(2)));
+        let c = ExprId(o.classes.intern(ClassExpr::Class(3)));
+        let mut prior = vec![hit, leaf];
+        let mut root = hit;
+        for _ in 0..1_024usize {
+            root = ExprId(o.classes.intern(ClassExpr::And(prior.clone())));
+            prior.push(root);
+        }
+        o.axioms = vec![
+            Axiom::ObjectCharacteristic(Characteristic::Transitive, ObjProp::Named(1)),
+            Axiom::SubClassOf(c, root),
+        ];
+        o.axioms.sort_unstable();
+
+        let _ = take_non_simple_scratch_peak();
+        let mut out = Vec::new();
+        check_global_restrictions(&o, true, &mut out);
+        let held = take_non_simple_scratch_peak();
+        let reserved = non_simple_memo_bytes(o.classes.len());
+        assert!(
+            out.iter().any(|d| matches!(
+                d,
+                Diagnostic::NonSimpleProperty {
+                    property: 1,
+                    what: "a self restriction",
+                    ..
+                }
+            )),
+            "expected non-simple self-restriction finding: {out:?}"
+        );
+        assert!(
+            held <= reserved,
+            "shared-parent DAG held {held} scratch bytes against {reserved} reserved ({} classes)",
+            o.classes.len()
+        );
     }
 }

@@ -1270,4 +1270,123 @@ mod import_tests {
             ),
         }
     }
+
+    /// Spec (contracts.md, Memory; Structural Specification §11.2): a dense shared-operand
+    /// class DAG in the joint ontology must keep its live non-simple-property scratch within
+    /// the advertised memo reservation and remaining envelope headroom.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn joint_membership_bounds_shared_operand_stack() {
+        use nrese_exec::{Envelope, Reservation};
+        use std::time::Duration;
+
+        let mut premise = Ontology::default();
+        premise.axioms.push(Axiom::ObjectCharacteristic(
+            Characteristic::Transitive,
+            ObjProp::Named(1),
+        ));
+        premise.sources.push(Vec::new());
+
+        let mut conclusion = Ontology::default();
+        let mut leaves = Vec::with_capacity(512);
+        for i in 0..512u64 {
+            leaves.push(ExprId(conclusion.classes.intern(ClassExpr::Class(100 + i))));
+        }
+        let mut prev = ExprId(
+            conclusion
+                .classes
+                .intern(ClassExpr::HasSelf(ObjProp::Named(1))),
+        );
+        for _ in 0..512usize {
+            let mut operands = leaves.clone();
+            operands.push(prev);
+            prev = ExprId(conclusion.classes.intern(ClassExpr::And(operands)));
+        }
+        let sub = ExprId(conclusion.classes.intern(ClassExpr::Class(1)));
+        conclusion.axioms.push(Axiom::SubClassOf(sub, prev));
+        conclusion.sources.push(Vec::new());
+
+        let total_classes = premise.classes.len() + conclusion.classes.len();
+        let advertised = nrese_owl::diagnostics::non_simple_memo_bytes(total_classes);
+        let headroom = advertised + 4_096;
+        let terms = StubTerms;
+        let name = |t: u64| format!("t{t}");
+        let generous = Deadline::after(Some(Duration::from_secs(60)));
+
+        // Tight cell: leave only the advertised headroom at membership entry.
+        let tight_env = Envelope::exact(Some(128 << 20), None);
+        test_hooks::MEMBERSHIP_ENTRY.replace(Some(Box::new(move |envelope| {
+            let env = envelope.expect("bounded envelope");
+            let take = env.remaining().saturating_sub(headroom);
+            let mut held = Reservation::new(env.clone());
+            held.charge(take).expect("tighten membership headroom");
+            Some(held)
+        })));
+        let _ = nrese_owl::diagnostics::take_non_simple_scratch_peak();
+        let tight = admit_and_prepare(
+            &premise,
+            &conclusion,
+            &terms,
+            &name,
+            &test_budget(Some(tight_env)),
+            generous,
+        );
+        test_hooks::MEMBERSHIP_ENTRY.replace(None);
+        let tight_peak = nrese_owl::diagnostics::take_non_simple_scratch_peak();
+        match tight {
+            Err(Entailed::Unknown(why)) if Limit::named_in(&why) == Some(Limit::Envelope) => {
+                assert!(
+                    tight_peak <= headroom,
+                    "refused pass held {tight_peak} scratch bytes past headroom {headroom}"
+                );
+            }
+            Err(Entailed::Unknown(why))
+                if why.contains("a non-simple property in a self restriction") =>
+            {
+                assert!(
+                    tight_peak <= advertised && tight_peak <= headroom,
+                    "live scratch {tight_peak} exceeded advertised memo {advertised} (headroom {headroom})"
+                );
+            }
+            other => panic!(
+                "expected memory or non-simple Unknown, got {}",
+                match other {
+                    Ok(_) => "Ok(PreparedCheck)".to_owned(),
+                    Err(e) => format!("Err({e:?})"),
+                }
+            ),
+        }
+
+        // Roomy control: reports the self-restriction finding within the advertised bound.
+        let roomy_env = Envelope::exact(Some(128 << 20), None);
+        let _ = nrese_owl::diagnostics::take_non_simple_scratch_peak();
+        let roomy = admit_and_prepare(
+            &premise,
+            &conclusion,
+            &terms,
+            &name,
+            &test_budget(Some(roomy_env)),
+            generous,
+        );
+        let roomy_peak = nrese_owl::diagnostics::take_non_simple_scratch_peak();
+        match roomy {
+            Err(Entailed::Unknown(why)) => {
+                assert!(
+                    why.contains("a non-simple property in a self restriction"),
+                    "roomy control must report non-simple restriction, got: {why}"
+                );
+                assert!(
+                    roomy_peak <= advertised,
+                    "roomy live scratch {roomy_peak} exceeded advertised memo {advertised}"
+                );
+            }
+            other => panic!(
+                "expected non-simple Unknown on roomy envelope, got {}",
+                match other {
+                    Ok(_) => "Ok(PreparedCheck)".to_owned(),
+                    Err(e) => format!("Err({e:?})"),
+                }
+            ),
+        }
+    }
 }

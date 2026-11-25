@@ -943,3 +943,94 @@ fn fresh_blank_peak_covers_live_candidate() {
     );
     assert_eq!(blanks.get(label.as_str()), Some(&second));
 }
+
+/// Spec (contracts.md, Memory): conclusion blank-node renaming sizes its map once from the
+/// conclusion's blank positions before allocating it, so crossing a hash-table growth
+/// threshold never resizes past its charged capacity or overlaps two bucket arrays; a
+/// repeated label keeps one fresh identity.
+#[test]
+fn fresh_blank_resize_stays_within_envelope() {
+    use super::blank_test_hooks;
+
+    let rdf_type = nrese_rdf::vocab::rdf::TYPE.into_owned();
+    let p = iri("p");
+    let q = iri("q");
+    let a = iri("a");
+    let mut distinct = Vec::with_capacity(899);
+    distinct.push(Triple::new(
+        p.clone(),
+        rdf_type.clone(),
+        nrese_rdf::NamedNode::new_unchecked(format!("{OWL}ObjectProperty")),
+    ));
+    distinct.push(Triple::new(
+        q.clone(),
+        rdf_type,
+        nrese_rdf::NamedNode::new_unchecked(format!("{OWL}ObjectProperty")),
+    ));
+    for i in 0..897usize {
+        distinct.push(Triple::new(
+            BlankNode::new_unchecked(format!("b{i:07}")),
+            p.clone(),
+            a.clone(),
+        ));
+    }
+
+    // Tight cell around the 1,024 -> 2,048 bucket threshold: never resize past charged capacity.
+    let (tight_store, _pipeline) = clash_store(DlConfig::default(), 164_952);
+    blank_test_hooks::reset();
+    let tight = tight_store.entails_dl(&distinct).unwrap();
+    let (tight_held, tight_charged, tight_uncharged) = blank_test_hooks::snapshot();
+    let (tight_resizes, tight_overlap_uncharged) = blank_test_hooks::resize_snapshot();
+    assert!(
+        tight.answer == Entailed::Yes
+            || matches!(&tight.answer, Entailed::Unknown(why) if why.contains("memory")),
+        "unexpected tight answer: {tight:?}"
+    );
+    assert_eq!(
+        tight_resizes, 0,
+        "renaming map resized {tight_resizes} times under tight envelope"
+    );
+    assert_eq!(
+        tight_uncharged, 0,
+        "tight held={tight_held} exceeded charged={tight_charged}"
+    );
+    assert_eq!(
+        tight_overlap_uncharged, 0,
+        "tight resize overlap exceeded charged={tight_charged} by {tight_overlap_uncharged}"
+    );
+
+    // Roomy control: all 897 distinct blanks succeed with zero resizes and full accounting.
+    let (roomy_store, _roomy_pipeline) = clash_store(DlConfig::default(), 64 << 20);
+    blank_test_hooks::reset();
+    let roomy = roomy_store.entails_dl(&distinct).unwrap();
+    let (held, charged, uncharged) = blank_test_hooks::snapshot();
+    let (resizes, overlap_uncharged) = blank_test_hooks::resize_snapshot();
+    assert_eq!(roomy.answer, Entailed::Yes, "roomy 897 blanks: {roomy:?}");
+    assert!(roomy.holds());
+    assert_eq!(resizes, 0, "renaming map resized {resizes} times");
+    assert_eq!(uncharged, 0, "held={held} exceeded charged={charged}");
+    assert_eq!(
+        overlap_uncharged, 0,
+        "resize overlap exceeded charged={charged} by {overlap_uncharged}"
+    );
+
+    // Repeated-label control: repeating b0000000 on a second property maps to the same fresh
+    // blank identity, producing a two-attachment anonymous individual (Unknown, not Yes).
+    let mut repeated = distinct;
+    repeated.push(Triple::new(BlankNode::new_unchecked("b0000000"), q, a));
+    blank_test_hooks::reset();
+    let rep = roomy_store.entails_dl(&repeated).unwrap();
+    let (rep_resizes, rep_overlap) = blank_test_hooks::resize_snapshot();
+    assert!(
+        matches!(&rep.answer, Entailed::Unknown(why) if why.contains("anonymous")),
+        "repeated blank must keep one identity and report anonymous restriction: {rep:?}"
+    );
+    assert_eq!(
+        rep_resizes, 0,
+        "repeated-label map resized {rep_resizes} times"
+    );
+    assert_eq!(
+        rep_overlap, 0,
+        "repeated-label resize overlap uncharged: {rep_overlap}"
+    );
+}
