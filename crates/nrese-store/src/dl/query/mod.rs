@@ -1222,6 +1222,8 @@ pub(crate) fn ill_typed_after(
     base: Option<TermId>,
     stop: &dyn Fn() -> bool,
 ) -> Option<Option<TermId>> {
+    #[cfg(test)]
+    ILL_TYPED_AFTER_CALLS.set(ILL_TYPED_AFTER_CALLS.get() + 1);
     let decode = |id: TermId| tx.decode(id);
     let poll = polled(stop);
     let stopped = || poll.ask();
@@ -1247,6 +1249,11 @@ pub(crate) fn ill_typed_after(
         (None, Some(_)) => ill_typed(&tx.pending_snapshot(), stop),
         _ => Some(found),
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static ILL_TYPED_AFTER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// `stop` asked at the first unit of work and then once 4096 more are spent, and kept once it

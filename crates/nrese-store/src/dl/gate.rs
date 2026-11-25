@@ -268,6 +268,16 @@ fn check_with_budget(
         .unwrap_or_else(|| {
             consistency::check_naming(ontology, &budget, &|t| consistency::named(tx, t))
         });
+    #[cfg(test)]
+    let checked = if TABLEAU_FINDS_MODEL.replace(false) {
+        assert_eq!(checked.engine, "hypertableau", "{checked:?}");
+        Checked {
+            verdict: Verdict::Consistent,
+            ..checked
+        }
+    } else {
+        checked
+    };
     if checked.verdict != Verdict::Inconsistent {
         return Gate {
             checked,
@@ -300,6 +310,11 @@ fn check_with_budget(
     rejection(
         ontology, view, then, checked, operation, deadline, treatments,
     )
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TABLEAU_FINDS_MODEL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// What a restricted committer is told of a rejection ([`crate::mutation::evidence`]),

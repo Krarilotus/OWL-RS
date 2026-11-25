@@ -1336,6 +1336,97 @@ fn check_stopped_dl_commit(data: &str, readings: u32, route: &str) {
     );
 }
 
+/// Removing the last occurrence of the literal needs one scan for both the DL verdict and
+/// the version's certificate. Both must then vouch for the repaired store.
+#[test]
+fn a_dl_witness_search_is_shared_when_the_last_ill_typed_literal_is_removed() {
+    use crate::dl::query::ILL_TYPED_AFTER_CALLS;
+    let store = Arc::new(StoreService::new(StoreConfig::in_memory()).expect("store"));
+    let dl = pipeline(&store, ReasoningMode::Owl2Dl);
+    commit(
+        &dl,
+        &format!("{DATA} :d a owl:DatatypeProperty . {ILL_TYPED}"),
+    );
+    assert_eq!(store.consistency(), crate::ConsistencyStatus::Unknown);
+    ILL_TYPED_AFTER_CALLS.set(0);
+    dl.execute_update_str(&format!("{PREFIXES}DELETE DATA {{ {ILL_TYPED} }}"))
+        .expect("delete the sole occurrence");
+    assert_eq!(
+        ILL_TYPED_AFTER_CALLS.replace(0),
+        1,
+        "commit witness searches"
+    );
+    let recorded = store.dl().status().expect("the repair's verdict");
+    assert_eq!(recorded.revision, store.current_revision());
+    assert_eq!(recorded.consistency.verdict, crate::dl::Verdict::Consistent);
+    assert_eq!(store.consistency(), crate::ConsistencyStatus::Consistent);
+    assert!(status(&store, READ).starts_with("complete"));
+}
+
+/// Even if the tableau finds a model, the commit gate must withhold consistency when its
+/// RDF data contain an ill-typed literal. The real tableau also has its own approximation guard.
+#[test]
+fn a_dl_witness_search_checks_even_a_tableau_model() {
+    use crate::dl::{Verdict, gate};
+    let store = Arc::new(StoreService::new(StoreConfig::in_memory()).expect("store"));
+    let dl = pipeline(&store, ReasoningMode::Owl2Dl);
+    gate::TABLEAU_FINDS_MODEL.set(true);
+    commit(
+        &dl,
+        &format!(
+            "{DATA} :A rdfs:subClassOf [ owl:unionOf ( :B :C ) ] . \
+                  :a a :A . :B owl:disjointWith :C . {ILL_TYPED}"
+        ),
+    );
+    let checked = store
+        .dl()
+        .status()
+        .expect("the write's verdict")
+        .consistency;
+    assert_eq!(checked.engine, "hypertableau", "{checked:?}");
+    assert_eq!(
+        checked.verdict,
+        Verdict::Unknown(gate::ILL_TYPED.to_owned())
+    );
+}
+
+/// A pending proof has no reusable verdict once the gate's request has stopped. Calling the
+/// gate directly leaves the separately cancelled publication out of the experiment.
+#[test]
+fn a_dl_witness_search_stops_with_the_gate_request() {
+    use crate::dl::{Verdict, bounds, gate, query};
+    use crate::mutation::evidence::{EvidenceView, nothing_shown};
+    let store = Arc::new(StoreService::new(StoreConfig::in_memory()).expect("store"));
+    let dl = pipeline(&store, ReasoningMode::Owl2Dl);
+    commit(&dl, DATA);
+    let mut tx = store.engine().transaction();
+    tx.insert(
+        nrese_rdf::Quad::new(
+            nrese_rdf::NamedNode::new_unchecked("http://example.com/fido"),
+            nrese_rdf::vocab::rdf::TYPE,
+            nrese_rdf::NamedNode::new_unchecked("http://example.com/Dog"),
+            nrese_rdf::GraphName::DefaultGraph,
+        )
+        .as_ref(),
+    );
+    let mut prepared = bounds::prepare(&store, &tx, nrese_reasoner::eval::NEVER, false);
+    assert!(prepared.proves_consistency);
+    let gate = gate::check_commit(
+        &store,
+        &tx,
+        &|| true,
+        &mut prepared,
+        &EvidenceView::new(&crate::ReadScope::All, &tx),
+        &|_, _| nothing_shown(),
+        &nrese_exec::Envelope::unlimited(),
+    );
+    assert_eq!(
+        gate.checked.verdict,
+        Verdict::Unknown(query::UNCHECKED.to_owned())
+    );
+    assert!(!gate.record_verdict, "another read must be able to retry");
+}
+
 /// `consistency()` decides from one observation. A store holding an ill-typed literal,
 /// materialised under the plain `owl2-rl` program, then taken over by an `owl2-dl` pipeline:
 /// no certificate vouches for its version, so `unknown`. Between the reading's assessment (the
