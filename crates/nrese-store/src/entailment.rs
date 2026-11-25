@@ -495,7 +495,7 @@ impl StoreService {
     ) -> StoreResult<DlEntailment> {
         use crate::dl::entailment::{Entailed, admit_and_prepare, entails_prepared_within};
         use crate::dl::{Verdict, consistency, gate, source};
-        use nrese_rdf::{BlankNode, NamedNodeRef, NamedOrBlankNode};
+        use nrese_rdf::{NamedNodeRef, NamedOrBlankNode};
         if self.dl().replica() {
             // Reading a conclusion interns its terms, which a replica must not.
             return Err(StoreError::Configuration(

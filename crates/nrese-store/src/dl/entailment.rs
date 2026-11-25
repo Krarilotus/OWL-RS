@@ -12,8 +12,8 @@ use std::mem::{size_of, take};
 use nrese_dl::limits::{Deadline, Limit};
 use nrese_dl::memory::Scratch;
 use nrese_owl::{
-    Axiom, Characteristic, ClassExpr, DataRange, DataTerms, Diagnostic, ExprId, ObjProp, Ontology,
-    RangeId, Terms,
+    Axiom, Characteristic, ClassExpr, DataRange, Diagnostic, ExprId, ObjProp, Ontology, RangeId,
+    Terms,
 };
 
 use super::consistency::{self, Budget, Verdict};
@@ -50,10 +50,15 @@ impl Entailed {
 }
 
 /// Copies class expressions and data ranges of one ontology into another's interners
-/// (the terms are the same store ids in both).
+/// (the terms are the same store ids in both), memoised by source id and bounded by one
+/// entry reservation and a deadline poll per visited node.
 struct Import<'a> {
     from: &'a Ontology,
     to: &'a mut Ontology,
+    classes: Vec<Option<ExprId>>,
+    ranges: Vec<Option<RangeId>>,
+    deadline: Deadline,
+    work: u64,
 }
 
 /// What a class expression [`Import::class`] copies waits for: its operands' copies.
@@ -69,10 +74,34 @@ enum Copying {
     Count(fn(u32, ObjProp, ExprId) -> ClassExpr, u32, ObjProp),
 }
 
-impl Import<'_> {
+impl<'a> Import<'a> {
+    fn new(
+        from: &'a Ontology,
+        to: &'a mut Ontology,
+        copy_scratch: &mut Scratch,
+        memo_scratch: &mut Scratch,
+        deadline: Deadline,
+    ) -> Result<Self, Stopped> {
+        charge(
+            copy_scratch,
+            nrese_dl::memory::ontology_bytes(from).saturating_mul(2),
+        )?;
+        let memo = from.classes.len() * size_of::<Option<ExprId>>()
+            + from.ranges.len() * size_of::<Option<RangeId>>();
+        charge(memo_scratch, memo)?;
+        Ok(Self {
+            from,
+            to,
+            classes: vec![None; from.classes.len()],
+            ranges: vec![None; from.ranges.len()],
+            deadline,
+            work: 0,
+        })
+    }
+
     /// `id` copied, with a stack of its own (the nesting depth is no call depth): operands
     /// in order, each expression interned once its operands are.
-    fn class(&mut self, id: ExprId) -> ExprId {
+    fn class(&mut self, id: ExprId) -> Result<ExprId, Stopped> {
         let sorted = |mut v: Vec<ExprId>| {
             v.sort_unstable();
             v.dedup();
@@ -85,10 +114,19 @@ impl Import<'_> {
             let done = Vec::with_capacity(rest.len() + 1);
             (Copying::Set { or, rest, done }, first)
         };
-        let mut waiting: Vec<Copying> = Vec::new();
+        let mut waiting: Vec<(ExprId, Copying)> = Vec::new();
         let mut next = id;
         'copy: loop {
-            let (then, operand) = match self.from.class(next).clone() {
+            #[cfg(test)]
+            test_hooks::visit();
+            tick(&mut self.work, 1, self.deadline)?;
+            let hit = self.classes[next.0 as usize];
+            let expr = if hit.is_some() {
+                ClassExpr::Thing
+            } else {
+                self.from.class(next).clone()
+            };
+            let (then, operand) = match expr {
                 ClassExpr::And(v) if !v.is_empty() => set(false, v),
                 ClassExpr::Or(v) if !v.is_empty() => set(true, v),
                 ClassExpr::Not(e) => (Copying::Not, e),
@@ -98,19 +136,31 @@ impl Import<'_> {
                 ClassExpr::Max(n, p, e) => (Copying::Count(ClassExpr::Max, n, p), e),
                 ClassExpr::Exact(n, p, e) => (Copying::Count(ClassExpr::Exact, n, p), e),
                 leaf => {
-                    let expr = match leaf {
-                        ClassExpr::DataSome(d, r) => ClassExpr::DataSome(d, self.range(r)),
-                        ClassExpr::DataAll(d, r) => ClassExpr::DataAll(d, self.range(r)),
-                        ClassExpr::DataMin(n, d, r) => ClassExpr::DataMin(n, d, self.range(r)),
-                        ClassExpr::DataMax(n, d, r) => ClassExpr::DataMax(n, d, self.range(r)),
-                        ClassExpr::DataExact(n, d, r) => ClassExpr::DataExact(n, d, self.range(r)),
-                        other => other,
+                    let mut found = if let Some(mapped) = hit {
+                        mapped
+                    } else {
+                        #[cfg(test)]
+                        if let ClassExpr::OneOf(v) = &leaf {
+                            test_hooks::record_clone(v.len());
+                        }
+                        let expr = match leaf {
+                            ClassExpr::DataSome(d, r) => ClassExpr::DataSome(d, self.range(r)?),
+                            ClassExpr::DataAll(d, r) => ClassExpr::DataAll(d, self.range(r)?),
+                            ClassExpr::DataMin(n, d, r) => ClassExpr::DataMin(n, d, self.range(r)?),
+                            ClassExpr::DataMax(n, d, r) => ClassExpr::DataMax(n, d, self.range(r)?),
+                            ClassExpr::DataExact(n, d, r) => {
+                                ClassExpr::DataExact(n, d, self.range(r)?)
+                            }
+                            other => other,
+                        };
+                        let mapped = ExprId(self.to.classes.intern(expr));
+                        self.classes[next.0 as usize] = Some(mapped);
+                        mapped
                     };
-                    let mut found = ExprId(self.to.classes.intern(expr));
                     // Up through what waits, as far as it has every operand.
                     loop {
-                        let Some(then) = waiting.pop() else {
-                            return found;
+                        let Some((src, then)) = waiting.pop() else {
+                            return Ok(found);
                         };
                         let expr = match then {
                             Copying::Set {
@@ -120,7 +170,7 @@ impl Import<'_> {
                             } => {
                                 done.push(found);
                                 if let Some(operand) = rest.next() {
-                                    waiting.push(Copying::Set { or, rest, done });
+                                    waiting.push((src, Copying::Set { or, rest, done }));
                                     next = operand;
                                     continue 'copy;
                                 }
@@ -134,32 +184,43 @@ impl Import<'_> {
                             Copying::Count(make, n, p) => make(n, p, found),
                         };
                         found = ExprId(self.to.classes.intern(expr));
+                        self.classes[src.0 as usize] = Some(found);
                     }
                 }
             };
-            waiting.push(then);
+            waiting.push((next, then));
             next = operand;
         }
     }
 
     /// `id` copied as [`Self::class`] copies a class expression: with a stack of its own,
     /// operands in order, each range interned once its operands are.
-    fn range(&mut self, id: RangeId) -> RangeId {
+    fn range(&mut self, id: RangeId) -> Result<RangeId, Stopped> {
         // The ranges waiting for their operands, each with those copied so far.
-        let mut waiting: Vec<(DataRange, Vec<RangeId>)> = Vec::new();
+        let mut waiting: Vec<(RangeId, DataRange, Vec<RangeId>)> = Vec::new();
         let mut next = id;
         loop {
-            let mut found = match self.from.range(next).clone() {
-                range @ (DataRange::And(_) | DataRange::Or(_) | DataRange::Not(_)) => {
-                    waiting.push((range, Vec::new()));
-                    None
-                }
-                leaf => Some(RangeId(self.to.ranges.intern(leaf))),
+            #[cfg(test)]
+            test_hooks::visit();
+            tick(&mut self.work, 1, self.deadline)?;
+            let mut found = match self.ranges[next.0 as usize] {
+                Some(mapped) => Some(mapped),
+                None => match self.from.range(next).clone() {
+                    range @ (DataRange::And(_) | DataRange::Or(_) | DataRange::Not(_)) => {
+                        waiting.push((next, range, Vec::new()));
+                        None
+                    }
+                    leaf => {
+                        let mapped = RangeId(self.to.ranges.intern(leaf));
+                        self.ranges[next.0 as usize] = Some(mapped);
+                        Some(mapped)
+                    }
+                },
             };
             // Up through what waits, as far as it has every operand.
             loop {
-                let Some((range, done)) = waiting.last_mut() else {
-                    return found.expect("the range is copied");
+                let Some((_, range, done)) = waiting.last_mut() else {
+                    return Ok(found.expect("the range is copied"));
                 };
                 done.extend(found.take());
                 let operands = match range {
@@ -171,7 +232,7 @@ impl Import<'_> {
                     next = operand;
                     break;
                 }
-                let (range, mut done) = waiting.pop().expect("a waiting range");
+                let (src, range, mut done) = waiting.pop().expect("a waiting range");
                 done.sort_unstable();
                 done.dedup();
                 let copy = match range {
@@ -179,32 +240,43 @@ impl Import<'_> {
                     DataRange::Or(_) => DataRange::Or(done),
                     _ => DataRange::Not(done[0]),
                 };
-                found = Some(RangeId(self.to.ranges.intern(copy)));
+                let mapped = RangeId(self.to.ranges.intern(copy));
+                self.ranges[src.0 as usize] = Some(mapped);
+                found = Some(mapped);
             }
         }
     }
 
-    fn axiom(&mut self, axiom: &Axiom) -> Axiom {
-        let classes = |v: &[ExprId], me: &mut Self| {
-            let mut out: Vec<ExprId> = v.iter().map(|&e| me.class(e)).collect();
+    fn axiom(&mut self, axiom: &Axiom) -> Result<Axiom, Stopped> {
+        let classes = |v: &[ExprId], me: &mut Self| -> Result<Vec<ExprId>, Stopped> {
+            let mut out = Vec::with_capacity(v.len());
+            for &e in v {
+                out.push(me.class(e)?);
+            }
             out.sort_unstable();
             out.dedup();
-            out
+            Ok(out)
         };
-        match axiom {
-            Axiom::SubClassOf(a, b) => Axiom::SubClassOf(self.class(*a), self.class(*b)),
-            Axiom::EquivalentClasses(v) => Axiom::EquivalentClasses(classes(v, self)),
-            Axiom::DisjointClasses(v) => Axiom::DisjointClasses(classes(v, self)),
-            Axiom::DisjointUnion(c, v) => Axiom::DisjointUnion(self.class(*c), classes(v, self)),
-            Axiom::ObjectPropertyDomain(p, c) => Axiom::ObjectPropertyDomain(*p, self.class(*c)),
-            Axiom::ObjectPropertyRange(p, c) => Axiom::ObjectPropertyRange(*p, self.class(*c)),
-            Axiom::DataPropertyDomain(d, c) => Axiom::DataPropertyDomain(*d, self.class(*c)),
-            Axiom::DataPropertyRange(d, r) => Axiom::DataPropertyRange(*d, self.range(*r)),
-            Axiom::DatatypeDefinition(t, r) => Axiom::DatatypeDefinition(*t, self.range(*r)),
-            Axiom::HasKey(c, p, d) => Axiom::HasKey(self.class(*c), p.clone(), d.clone()),
-            Axiom::ClassAssertion(c, a) => Axiom::ClassAssertion(self.class(*c), *a),
-            other => other.clone(),
-        }
+        Ok(match axiom {
+            Axiom::SubClassOf(a, b) => Axiom::SubClassOf(self.class(*a)?, self.class(*b)?),
+            Axiom::EquivalentClasses(v) => Axiom::EquivalentClasses(classes(v, self)?),
+            Axiom::DisjointClasses(v) => Axiom::DisjointClasses(classes(v, self)?),
+            Axiom::DisjointUnion(c, v) => Axiom::DisjointUnion(self.class(*c)?, classes(v, self)?),
+            Axiom::ObjectPropertyDomain(p, c) => Axiom::ObjectPropertyDomain(*p, self.class(*c)?),
+            Axiom::ObjectPropertyRange(p, c) => Axiom::ObjectPropertyRange(*p, self.class(*c)?),
+            Axiom::DataPropertyDomain(d, c) => Axiom::DataPropertyDomain(*d, self.class(*c)?),
+            Axiom::DataPropertyRange(d, r) => Axiom::DataPropertyRange(*d, self.range(*r)?),
+            Axiom::DatatypeDefinition(t, r) => Axiom::DatatypeDefinition(*t, self.range(*r)?),
+            Axiom::HasKey(c, p, d) => Axiom::HasKey(self.class(*c)?, p.clone(), d.clone()),
+            Axiom::ClassAssertion(c, a) => Axiom::ClassAssertion(self.class(*c)?, *a),
+            other => {
+                #[cfg(test)]
+                if let Axiom::DifferentIndividuals(v) = other {
+                    test_hooks::record_clone(v.len());
+                }
+                other.clone()
+            }
+        })
     }
 }
 
@@ -541,62 +613,47 @@ fn tick(work: &mut u64, units: u64, deadline: Deadline) -> Result<(), Stopped> {
     Ok(())
 }
 
-fn data_bytes(d: &DataTerms) -> usize {
-    d.literals
-        .values()
-        .map(|l| {
-            size_of::<(u64, nrese_owl::Literal)>()
-                + 16
-                + l.lexical.len()
-                + l.datatype.as_ref().map_or(0, String::len)
-                + l.language.as_ref().map_or(0, String::len)
-        })
-        .sum::<usize>()
-        + d.iris
-            .values()
-            .map(|s| size_of::<(u64, String)>() + 16 + s.len())
-            .sum::<usize>()
-}
-
 /// A premise copy and imported conclusion axioms ready for entailment testing.
 pub(crate) struct PreparedCheck {
     o: Ontology,
     _copy_scratch: Scratch,
     axioms: Vec<Axiom>,
-    imported_scratch: Scratch,
 }
 
 #[derive(Clone, Copy)]
 enum Origin {
-    Premise(usize),
-    Conclusion(usize),
+    Premise,
+    Conclusion,
 }
 
 fn import_into(
     premise: &Ontology,
     conclusion: &Ontology,
     budget: &Budget,
+    deadline: Deadline,
 ) -> Result<PreparedCheck, Entailed> {
     let (mut o, mut copy_scratch) = copy(premise, budget)?;
-    charge(&mut copy_scratch, data_bytes(&conclusion.data))?;
-    o.data.extend(&conclusion.data);
-    let mut imported_scratch = Scratch::new(budget.memory.as_ref());
-    charge(
-        &mut imported_scratch,
-        conclusion.axioms.len() * size_of::<Axiom>(),
+    #[cfg(test)]
+    let _entry_guard = test_hooks::on_entry(budget.memory.as_ref());
+    let mut memo_scratch = Scratch::new(budget.memory.as_ref());
+    let mut import = Import::new(
+        conclusion,
+        &mut o,
+        &mut copy_scratch,
+        &mut memo_scratch,
+        deadline,
     )?;
-    let axioms = {
-        let mut import = Import {
-            from: conclusion,
-            to: &mut o,
-        };
-        conclusion.axioms.iter().map(|a| import.axiom(a)).collect()
-    };
+    o.data.extend(&conclusion.data);
+    let mut axioms = Vec::with_capacity(conclusion.axioms.len());
+    for a in &conclusion.axioms {
+        axioms.push(import.axiom(a)?);
+    }
+    drop(import);
+    drop(memo_scratch);
     Ok(PreparedCheck {
         o,
         _copy_scratch: copy_scratch,
         axioms,
-        imported_scratch,
     })
 }
 
@@ -610,28 +667,21 @@ pub(crate) fn admit_and_prepare(
     budget: &Budget,
     deadline: Deadline,
 ) -> Result<PreparedCheck, Entailed> {
-    let mut prepared = import_into(premise, conclusion, budget)?;
+    let mut prepared = import_into(premise, conclusion, budget, deadline)?;
     let o = &mut prepared.o;
-    let imported = take(&mut prepared.axioms);
+    let mut imported = take(&mut prepared.axioms);
+    imported.sort_unstable();
+    imported.dedup();
 
     let mut js = Scratch::new(budget.memory.as_ref());
-    charge(&mut js, imported.len() * size_of::<(Axiom, usize)>())?;
-    let mut keyed: Vec<_> = imported
-        .into_iter()
-        .enumerate()
-        .map(|(j, a)| (a, j))
-        .collect();
-    keyed.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
-    keyed.dedup_by(|(a, _), (b, _)| a == b);
-
-    charge(&mut js, keyed.len() * size_of::<(Axiom, usize)>())?;
-    let (mut extra, mut already, mut work) = (Vec::with_capacity(keyed.len()), Vec::new(), 0u64);
-    for (a, j) in keyed {
+    charge(&mut js, imported.len() * size_of::<Axiom>())?;
+    let (mut extra, mut already, mut work) = (Vec::with_capacity(imported.len()), Vec::new(), 0u64);
+    for a in imported {
         tick(&mut work, 1, deadline)?;
         if o.axioms.binary_search(&a).is_ok() {
             already.push(a);
         } else {
-            extra.push((a, j));
+            extra.push(a);
         }
     }
 
@@ -639,23 +689,21 @@ pub(crate) fn admit_and_prepare(
     let (extra_len, total) = (extra.len(), p_axioms.len() + extra.len());
     charge(&mut js, total * (size_of::<Axiom>() + size_of::<Origin>()))?;
     let (mut joint, mut origin) = (Vec::with_capacity(total), Vec::with_capacity(total));
-    let mut p_it = p_axioms.into_iter().enumerate().peekable();
+    let mut p_it = p_axioms.into_iter().peekable();
     let mut c_it = extra.into_iter().peekable();
     while p_it.peek().is_some() || c_it.peek().is_some() {
         tick(&mut work, 1, deadline)?;
         let from_p = match (p_it.peek(), c_it.peek()) {
-            (Some((_, pa)), Some((ca, _))) => pa <= ca,
+            (Some(pa), Some(ca)) => pa <= ca,
             (Some(_), None) => true,
             _ => false,
         };
         if from_p {
-            let (i, a) = p_it.next().unwrap();
-            joint.push(a);
-            origin.push(Origin::Premise(i));
+            joint.push(p_it.next().unwrap());
+            origin.push(Origin::Premise);
         } else {
-            let (a, j) = c_it.next().unwrap();
-            joint.push(a);
-            origin.push(Origin::Conclusion(j));
+            joint.push(c_it.next().unwrap());
+            origin.push(Origin::Conclusion);
         }
     }
 
@@ -685,14 +733,12 @@ pub(crate) fn admit_and_prepare(
             axioms
                 .iter()
                 .flatten()
-                .any(|&k| matches!(origin[k], Origin::Conclusion(_)))
+                .any(|&k| matches!(origin[k], Origin::Conclusion))
                 || (axioms.iter().all(Option::is_none) && conclusion.anonymous.contains(&node))
         }
-        _ => true,
+        _ => d.is_fatal(),
     };
-    let blocks_p = |d: &Diagnostic| {
-        d.is_fatal() || matches!(d, Diagnostic::TwoKinds { .. } | Diagnostic::RepeatedOperand)
-    };
+    let blocks_p = |d: &Diagnostic| d.is_fatal() || matches!(d, Diagnostic::RepeatedOperand);
     if let Some(d) = findings
         .iter()
         .find(|d| blocks_j(d))
@@ -708,8 +754,8 @@ pub(crate) fn admit_and_prepare(
     axioms.reserve(extra_len);
     for (a, from) in take(&mut o.axioms).into_iter().zip(origin) {
         match from {
-            Origin::Premise(_) => restored.push(a),
-            Origin::Conclusion(_) => axioms.push(a),
+            Origin::Premise => restored.push(a),
+            Origin::Conclusion => axioms.push(a),
         }
     }
     (o.axioms, o.sources) = (restored, p_sources);
@@ -728,7 +774,7 @@ pub(crate) fn entails_ontology_within(
     budget: &Budget,
     deadline: Deadline,
 ) -> Entailed {
-    match import_into(premise, conclusion, budget) {
+    match import_into(premise, conclusion, budget, deadline) {
         Ok(p) => {
             entails_prepared_within(p, !conclusion.anonymous.is_empty(), fresh, budget, deadline)
         }
@@ -748,7 +794,6 @@ pub(crate) fn entails_prepared_within(
         mut o,
         _copy_scratch,
         axioms,
-        imported_scratch,
     } = prepared;
     let tests: Vec<Test> = axioms.into_iter().map(Test::Axiom).collect();
     let compiled = Batch::new(&mut o, &tests, budget.memory.as_ref());
@@ -759,13 +804,44 @@ pub(crate) fn entails_prepared_within(
             break;
         }
     }
-    drop(imported_scratch);
     if answer == Entailed::No && conclusion_has_anonymous {
         return Entailed::Unknown(
             "not entailed for one value of the conclusion's anonymous individual".into(),
         );
     }
     answer
+}
+
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::cell::{Cell, RefCell};
+
+    use nrese_exec::{Envelope, Reservation};
+
+    type VisitHook = Box<dyn Fn()>;
+    type EntryHook = Box<dyn Fn(Option<&Envelope>) -> Option<Reservation<Envelope>>>;
+
+    thread_local! {
+        pub(crate) static IMPORT_VISIT: RefCell<Option<VisitHook>> = const { RefCell::new(None) };
+        pub(crate) static IMPORT_ENTRY: RefCell<Option<EntryHook>> = const { RefCell::new(None) };
+        pub(crate) static IMPORT_CLONED_OPERANDS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn visit() {
+        IMPORT_VISIT.with(|slot| {
+            if let Some(f) = slot.borrow().as_ref() {
+                f();
+            }
+        });
+    }
+
+    pub(crate) fn on_entry(envelope: Option<&Envelope>) -> Option<Reservation<Envelope>> {
+        IMPORT_ENTRY.with(|slot| slot.borrow().as_ref().and_then(|f| f(envelope)))
+    }
+
+    pub(crate) fn record_clone(operands: usize) {
+        IMPORT_CLONED_OPERANDS.with(|c| c.set(c.get() + operands));
+    }
 }
 
 #[cfg(test)]
@@ -790,21 +866,19 @@ mod import_tests {
         let to_c = ExprId(to.classes.intern(ClassExpr::Class(30)));
         assert!(to_a < to_b);
 
-        let mut import = Import {
-            from: &from,
-            to: &mut to,
-        };
+        let (mut cs, mut ms) = (Scratch::default(), Scratch::default());
+        let mut import = Import::new(&from, &mut to, &mut cs, &mut ms, Deadline::none()).unwrap();
         assert_eq!(
-            import.axiom(&eq),
-            Axiom::EquivalentClasses(vec![to_a, to_b])
+            import.axiom(&eq).ok(),
+            Some(Axiom::EquivalentClasses(vec![to_a, to_b]))
         );
         assert_eq!(
-            import.axiom(&disj),
-            Axiom::DisjointClasses(vec![to_a, to_b])
+            import.axiom(&disj).ok(),
+            Some(Axiom::DisjointClasses(vec![to_a, to_b]))
         );
         assert_eq!(
-            import.axiom(&union),
-            Axiom::DisjointUnion(to_c, vec![to_a, to_b])
+            import.axiom(&union).ok(),
+            Some(Axiom::DisjointUnion(to_c, vec![to_a, to_b]))
         );
     }
 }
