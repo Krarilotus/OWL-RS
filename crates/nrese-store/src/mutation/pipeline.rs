@@ -503,8 +503,9 @@ impl MutationPipeline {
             )?;
             // The version's certificate, its ill-typed literal judged under the writer slot alone
             // (a whole-store scan where the commit deletes it), before the commit and its rights.
+            let witness = dl.as_ref().and_then(|(gate, _, _)| gate.ill_typed);
             let certificate = (tx.base().certificate().cloned())
-                .map(|certificate| self.store.with_ill_typed(certificate, &tx));
+                .map(|certificate| self.store.with_ill_typed(certificate, &tx, witness));
             if !ticket.begin_commit() {
                 return Err(MutationError::Cancelled);
             }
@@ -570,13 +571,8 @@ impl MutationPipeline {
             }
             (self.store.lists).commit(before, summary.revision, lists_left_out);
             if let Some((gate, bounds, left_out)) = dl {
-                // On the RL route unproved (in quarantine) nothing decided the revision's
-                // consistency: no verdict is recorded for it, and its reads check it
-                // (`dl::query::consistency_at`).
-                let rules = matches!(bounds.prepared, crate::dl::bounds::Prepared::Rules(_));
-                let unproved = rules && !bounds.proves_consistency;
                 crate::dl::bounds::install(&self.store, bounds, summary.revision);
-                if !unproved {
+                if gate.record_verdict {
                     self.store.dl().record(crate::dl::DlStatus {
                         revision: summary.revision,
                         consistency: gate.checked,

@@ -946,23 +946,27 @@ impl StoreService {
     }
 
     /// `certificate` with the ill-typed literal ([`Certificate::ill_typed`]) of what the
-    /// maintained commit `tx` publishes, where its base's is found (`dl::query::ill_typed_after`,
-    /// under the memory stop); else its own cell, unset. The same object where that is the
+    /// maintained commit `tx` publishes. Reuses the gate's search if it ran, otherwise searches
+    /// under the memory stop if the base witness is known. The same object where that is the
     /// base's, or the certificate isn't this store's or keeps none
     /// ([`crate::dl::query::keeps_ill_typed`]).
     pub(crate) fn with_ill_typed(
         &self,
         certificate: nrese_engine::Certificate,
         tx: &nrese_engine::Transaction<'_>,
+        witness: Option<IllTyped>,
     ) -> nrese_engine::Certificate {
         let keeps = |c: &Certificate| crate::dl::query::keeps_ill_typed(c.dl, &c.state.ruleset);
         if !certificate.downcast_ref::<Certificate>().is_some_and(keeps) {
             return certificate;
         }
-        let memory = self.memory_stop();
-        let stop = || memory.exceeded();
         Self::with_state(certificate, |held, base| {
-            let found = base.and_then(|base| crate::dl::query::ill_typed_after(tx, base, &stop));
+            let found = witness.unwrap_or_else(|| {
+                let memory = self.memory_stop();
+                base.and_then(|base| {
+                    crate::dl::query::ill_typed_after(tx, base, &|| memory.exceeded())
+                })
+            });
             (base.is_none() || found != base).then(|| (held.state.clone(), found))
         })
     }
