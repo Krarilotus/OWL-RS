@@ -1245,8 +1245,6 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
     host_errors, summary["host_notes"] = host_states(passes)
     summary["errors"] += host_errors
     host_provenance += host_errors
-    if require_valid_passes and summary["errors"]:
-        raise ValueError("round 2 passes don't qualify: " + "; ".join(summary["errors"]))
     summary["host"] = sorted({(p["report"].get("machine") or {}).get("host") for p in passes}, key=str)
     by_side = {s: sorted([p for p in passes if p["side"] == s], key=lambda p: p["n"]) for s in sides}
     checks = {c["name"]: {path.split(".")[1] for path in c.get("check", {}) if path.startswith("q.")}
@@ -1327,6 +1325,8 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
             summary["not_compared"][h] = row["not_compared"][d]
         else:
             summary["errors"].append(f"{h}: declared, but no evidence from the candidate and no reason")
+    if require_valid_passes and summary["errors"]:
+        raise ValueError("round 2 evidence doesn't qualify: " + "; ".join(summary["errors"]))
     summary["other_blocking"] = list(summary["blocking"])
     summary["counts"] = {side: dict(Counter(r["status"] for row in rows.values() for r in row["dimensions"].values()))
                          for side, rows in summary["comparisons"].items()}
@@ -3087,15 +3087,17 @@ def case_seconds(measure: dict | None, case: str) -> float | None:
 
 
 def product_changed(checkout: str, base: str, candidate: str) -> bool:
-    changed = git_line(checkout, "diff", "--name-only", "-z", "--no-renames", base, candidate, "--")
-    if changed is None:
+    diff = subprocess.run(["git", "-C", checkout, "diff", "--name-only", "-z", "--no-renames", base, candidate, "--"],
+                          capture_output=True, timeout=60)
+    if diff.returncode:
         raise SystemExit(f"landing timing could not diff {base} against {candidate}")
-    for path in changed.split("\0"):
-        parts = path.split("/")
-        if parts[-1] == "Cargo.toml" or path == "Cargo.lock":
+    source_dirs = (b"src", b"examples")
+    for path in diff.stdout.split(b"\0"):
+        parts = path.split(b"/")
+        if parts[-1] == b"Cargo.toml" or path == b"Cargo.lock":
             return True
-        if parts[0] == "crates" and (len(parts) > 3 and parts[2] in ("src", "examples")
-                                   or len(parts) > 4 and parts[1] == "rdf" and parts[3] in ("src", "examples")):
+        if parts[0] == b"crates" and (len(parts) > 3 and parts[2] in source_dirs
+                                    or len(parts) > 4 and parts[1] == b"rdf" and parts[3] in source_dirs):
             return True
     return False
 
@@ -3122,8 +3124,8 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
             raise SystemExit("mode C uses the landing cases, one baseline and layout 1")
         cases = ",".join(LANDING_CASES)
         blocks_per_round = LANDING_BLOCKS
-    if layouts < 1 or blocks_per_round % layouts:
-        raise SystemExit("the number of blocks must be a multiple of the positive number of layouts")
+    if layouts < 1:
+        raise SystemExit("the number of layouts must be positive")
     catalog = cases_registry.load() if catalog is None else catalog
     selection = cases.split(",") if cases else None
     run, _, elsewhere = plan(catalog, max_gb, selection, 0, big_gb)
@@ -3370,6 +3372,9 @@ def landing_round_two(out: Path) -> None:
     subprocess.run([*gate_, "report", harness, "--round-one", str(output),
                     *(f"{side}={rev}" for side, rev in revs.items())], env=env, check=True)
     paired = json.loads((second / "release-gate.json").read_text(encoding="utf-8"))
+    # A compatible harness can predate the completed-evidence check in its reporter.
+    if paired["errors"]:
+        raise ValueError("round 2 evidence doesn't qualify: " + "; ".join(paired["errors"]))
     paired["attempt"] = attempt["attempt"]
     (second / "release-gate.md").replace(hosts_registry.evidence_path(out / "release-gate.md"))
     publish(output, paired)
@@ -4169,6 +4174,9 @@ def main() -> int:
             print("no product change: nothing to time")
             return 0
         harness = rev(args.harness or candidate)
+        if args.mode == "C" and git_line(args.checkout, "grep", "-q", "-F", "-e", 'summary["landing"] =',
+                                         harness, "--", "benches/fast/release_gate.py") is None:
+            p.error(f"mode C requires a harness that marks landing reports: {harness}")
         main_side = rev(args.main or (args.base if args.mode else MAIN))
         # The harness's calibration, and batched timing only where every side's perf lab batches.
         shown = subprocess.run(["git", "-C", args.checkout, "show", f"{harness}:benches/fast/measure.toml"],

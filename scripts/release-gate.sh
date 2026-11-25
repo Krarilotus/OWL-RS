@@ -713,13 +713,17 @@ p = sys.argv[1]; v = json.load(open(p)); v["repeat"] = True; json.dump(v, open(p
 report)
   harness=$(git rev-parse "$2") || exit 2
   shift 2
-  tree=$(worktree "$harness") || exit 2
   args=() candidate= round_one=
   if [ "${1:-}" = --round-one ]; then
-    round_one=${2:?report --round-one needs a file}
+    round_one=$(cd "$launch" && realpath -e -- "${2:?report --round-one needs a file}") || exit 2
+    if [ "$round_one" -ef "$OUT/release-gate.json" ] || [ "$round_one" -ef "$OUT/release-gate.md" ]; then
+      echo "report: the first-round input is also a report output ($round_one)" >&2
+      exit 2
+    fi
     args+=(--round-one "$round_one")
     shift 2
   fi
+  tree=$(worktree "$harness") || exit 2
   for spec in "$@"; do
     name=${spec%%=*}
     rev=$(git rev-parse "${spec#*=}") || exit 2
@@ -754,8 +758,12 @@ report)
      --context "layouts=$LAYOUTS" \
      --out "$OUT/release-gate.md" --json "$OUT/release-gate.json") > "$OUT/report.log" 2>&1
   code=$?
+  if [ "$code" -gt 1 ]; then
+    rm -f "$OUT/release-gate.json" "$OUT/release-gate.md"
+    exit "$code"
+  fi
   log "timed part: $( [ $code -eq 0 ] && echo passed || echo 'not passed') ($OUT/release-gate.md)"
-  # The verdict is the gate's; this step only fails when no report could be written.
+  # Exit 1 with a completed report is a judged result, including a confirmed timing loss.
   [ -f "$OUT/release-gate.json" ] || exit 1
   ;;
 
