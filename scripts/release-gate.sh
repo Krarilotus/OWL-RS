@@ -15,7 +15,7 @@
 #                                           every side's runs centred on the same time), on each
 #                                           side's build of layout LAYOUT (GATE_LAYOUTS), copied
 #                                           for the block; orientation and case order from GATE_SEED
-#   release-gate.sh report HARNESS SIDE=REV ...   the timed part's report (the first SIDE the candidate)
+#   release-gate.sh report HARNESS [--round-one FILE] SIDE=REV ...   the timed part's report
 #   release-gate.sh w3c                     the W3C suites with their data required, their counts checked
 #   release-gate.sh guards                  every guard docs/design/performance.md §0 names, run and passed
 #   release-gate.sh pack REV ...            the revisions' verified binaries as one tar (FLEET_OUT/binaries),
@@ -714,7 +714,12 @@ report)
   harness=$(git rev-parse "$2") || exit 2
   shift 2
   tree=$(worktree "$harness") || exit 2
-  args=() candidate=
+  args=() candidate= round_one=
+  if [ "${1:-}" = --round-one ]; then
+    round_one=${2:?report --round-one needs a file}
+    args+=(--round-one "$round_one")
+    shift 2
+  fi
   for spec in "$@"; do
     name=${spec%%=*}
     rev=$(git rev-parse "${spec#*=}") || exit 2
@@ -726,7 +731,10 @@ report)
   # the gate directory holds by now; a confirmation prepares nothing and reads
   # its part's (GATE_PLAN, the part's plan.json and inputs.txt).
   own_plan=$PLAN own_family=$GATE/plan.json own_inputs=$GATE/inputs.txt
-  if [ -z "${GATE_PLAN:-}" ] && [ -f "$OUT/plan.json" ] && [ -f "$OUT/inputs.txt" ]; then
+  if [ -n "$round_one" ]; then
+    first_out=$(dirname "$round_one")
+    own_family=$first_out/plan.json own_inputs=$first_out/inputs.txt
+  elif [ -z "${GATE_PLAN:-}" ] && [ -f "$OUT/plan.json" ] && [ -f "$OUT/inputs.txt" ]; then
     own_plan=$OUT/plan.json own_family=$OUT/plan.json own_inputs=$OUT/inputs.txt
   fi
   for key in not_run elsewhere; do

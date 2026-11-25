@@ -52,8 +52,9 @@ from suitekit.checkout import STORED_OBJECTS, checkout_differs  # noqa: E402,F40
 
 CAMPAIGN_BLOCKS = 2  # blocks a round at least (each: every case on every side, twice, as a palindrome)
 LANDING_BLOCKS = 8
-LANDING_CASE_LIMIT = 5
-LANDING_PASS_SECONDS = 32
+LANDING_CASES = ("load-entities", "load-threads", "q-snowflake", "q-star", "op-group", "commits-plain",
+                 "commits-rdfs", "custom-tc", "rl-single-thread", "rl-clique", "ql-lubm10", "dl-pipeline",
+                 "shacl-lubm", "deletes-tail", "writes-under-readers")
 PASS_FILE = re.compile(r"pass-(\d+)-([A-Za-z0-9_.-]+)\.json$")
 
 
@@ -1175,7 +1176,8 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
          min_blocks: int = CAMPAIGN_BLOCKS, diagnostic: bool = False, not_run: dict | None = None,
          catalog: list[dict] | None = None, elsewhere: dict | None = None,
          context: dict | None = None, family: list[str] | None = None, floor: dict | None = None,
-         baseline_candidate: bool = False, timing_errors: list[str] | None = None) -> dict:
+         baseline_candidate: bool = False, timing_errors: list[str] | None = None,
+         *, require_valid_passes: bool = False) -> dict:
     """One round of one timed part: the schedule and provenance checked, every comparison's
     blocks tested; each declared hypothesis's p-value (untested: 1). The decision over the family
     and the rounds is verdict()'s, which alone applies the owner's policy (load_policy()), read
@@ -1243,6 +1245,8 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
     host_errors, summary["host_notes"] = host_states(passes)
     summary["errors"] += host_errors
     host_provenance += host_errors
+    if require_valid_passes and summary["errors"]:
+        raise ValueError("round 2 passes don't qualify: " + "; ".join(summary["errors"]))
     summary["host"] = sorted({(p["report"].get("machine") or {}).get("host") for p in passes}, key=str)
     by_side = {s: sorted([p for p in passes if p["side"] == s], key=lambda p: p["n"]) for s in sides}
     checks = {c["name"]: {path.split(".")[1] for path in c.get("check", {}) if path.startswith("q.")}
@@ -1416,14 +1420,6 @@ def landing_opening(summary: dict, first: dict | None) -> list[str]:
     for h, reading in summary["lines"].items():
         lines += [f"- **{h}**", f"  - {reading['clearance']}",
                   f"  - Sensitivity: {reading['sensitivity'] or 'unavailable'}"]
-    if landing := summary.get("landing"):
-        lines += ["", "## Landing plan", "", landing_plan_line(landing)]
-        if landing["not_run"]:
-            lines += ["", "### Landing cases skipped", ""]
-            for case, last in landing["not_run"].items():
-                reading = last["word"] or ("no word recorded" if last["tree"] else "no previous reading")
-                tree = f" on tree {last['tree']}" if last["tree"] else ""
-                lines.append(f"- {case}: {reading}{tree}")
     return [*lines, ""]
 
 
@@ -2213,7 +2209,7 @@ def side_weights(passes: list[dict], candidate: str = "cand") -> dict[str, float
     return out
 
 
-def write_measure(result: dict, source: str, previous: dict | None = None) -> str:
+def write_measure(result: dict, source: str) -> str:
     lines = ["# The release gate's measurement per case (fast.py --measure; benches/PROTOCOL.md §5, \"Noise\").",
              "# Written by `release_gate.py calibrate`, not by hand: " + source + ".",
              "# runs, warmup, batch: the perf lab's a process; repeat, processes: the DL tool's; blocks: a round's,",
@@ -2222,11 +2218,9 @@ def write_measure(result: dict, source: str, previous: dict | None = None) -> st
              "# sd of log pass medians of its series where that loss exceeds the resolution); power: at those passes;",
              f"# seconds: a side's run. Timed part {result['minutes']} min (budget {result['budget_min']}, blocks at most "
              f"{result['cap']}).", ""]
-    mapping = {name: e for name, e in (previous or {}).items() if "paths" in e}
-    for name, e in {**mapping, **result["cases"]}.items():
-        route = {k: mapping[name][k] for k in ("paths", "route")} if name in mapping else {}
+    for name, e in result["cases"].items():
         lines.append(f"[case.{name}]")
-        lines += [f"{k} = {toml_value(v)}" for k, v in {**route, **e}.items()]
+        lines += [f"{k} = {json.dumps(v) if isinstance(v, list) else v}" for k, v in e.items()]
         lines.append("")
     return "\n".join(lines)
 
@@ -3092,80 +3086,24 @@ def case_seconds(measure: dict | None, case: str) -> float | None:
     return float(value) if value else None
 
 
-def landing_history(checkout: str, paths: tuple[Path, ...] | list[Path]) -> dict[str, tuple[int, dict]]:
-    """Each case's latest reading from the reports, supplied oldest first."""
-    latest = {}
-    for order, path in enumerate(paths):
-        try:
-            report = json.loads(path.read_text(encoding="utf-8"))
-            cases = (report.get("landing") or {}).get("ran_cases", report.get("planned"))
-            if not isinstance(cases, list) or any(not isinstance(c, str) for c in cases):
-                raise ValueError("expected the report's case list")
-            tree = report.get("tree")
-            if not tree and (rev := report.get("candidate", {}).get("revision")):
-                tree = git_line(checkout, "rev-parse", "--verify", "--quiet", f"{rev}^{{tree}}")
-            for case in cases:
-                latest[case] = order, {"word": report.get("word"), "tree": tree}
-        except (OSError, AttributeError, ValueError) as error:
-            raise SystemExit(f"landing history {path}: {error}") from None
-    return latest
-
-
-def landing_selection(mode: str, checkout: str, base: str, candidate: str,
-                      measure: dict, history: tuple[Path, ...] | list[Path]) -> dict:
-    mapped = {case: e for case, e in measure.items() if "paths" in e}
-    if not mapped:
-        raise SystemExit("landing timing needs a case path mapping in the harness's measure.toml")
-    costs = {case: case_seconds(measure, case) for case in mapped}
-    if any(s is None or s <= 0 or not math.isfinite(s) for s in costs.values()):
-        raise SystemExit("landing timing needs seconds for every mapped case in measure.toml")
-    mandatory, reasons = set(), {}
-    if mode == "B":
-        changed = git_line(checkout, "diff", "--name-only", "-z", "--no-renames", base, candidate, "--")
-        if changed is None:
-            raise SystemExit(f"landing timing could not diff {base} against {candidate}")
-        for path in filter(None, changed.split("\0")):
-            matches = [case for case, e in mapped.items() if
-                       any(path == p or path.startswith(p + "/") for p in e["paths"])]
-            mandatory.update(matches)
-            if not matches and not path.startswith(("benches/", "docs/", "notes/")):
-                reasons.setdefault("unmapped", f"unmapped path {path}")
-            if {"query", "write"} <= {mapped[case]["route"] for case in matches}:
-                reasons.setdefault("overlap", f"path used by query and write cases: {path}")
-        if len(mandatory) > LANDING_CASE_LIMIT:
-            reasons["count"] = f"{len(mandatory)} mandatory cases"
-    effective = "C" if reasons else mode
-    required = [case for case in mapped if case in mandatory]
-    last = landing_history(checkout, history)
-    never = (-1, {"word": None, "tree": None})
-    selected = list(mapped) if effective == "C" else required[:]
-    seconds = math.fsum(costs[c] for c in selected)
-    if effective == "B":
-        rotating = sorted((c for c in mapped if c not in mandatory), key=lambda c: last.get(c, never)[0])
-        for case in rotating:
-            if len(selected) == LANDING_CASE_LIMIT:
-                break
-            with_case = math.fsum(costs[c] for c in [*selected, case])
-            if with_case <= LANDING_PASS_SECONDS:
-                selected.append(case)
-                seconds = with_case
-    if not selected:
-        raise SystemExit("landing timing selected no case within the pass budget")
-    return {"mode": effective, "requested": mode, "reasons": list(reasons.values()), "mandatory": required, "cases": selected,
-            "seconds": seconds, "not_run": {c: last.get(c, never)[1] for c in mapped if c not in selected}}
-
-
-def landing_plan_line(landing: dict) -> str:
-    why = f" (requested {landing['requested']}: {'; '.join(landing['reasons'])})" if landing["reasons"] else ""
-    return (f"mode {landing['mode']}{why}, {landing['seconds']:g} s a pass: {', '.join(landing['cases'])}; "
-            f"mandatory: {', '.join(landing['mandatory']) or 'none'}")
+def product_changed(checkout: str, base: str, candidate: str) -> bool:
+    changed = git_line(checkout, "diff", "--name-only", "-z", "--no-renames", base, candidate, "--")
+    if changed is None:
+        raise SystemExit(f"landing timing could not diff {base} against {candidate}")
+    for path in changed.split("\0"):
+        parts = path.split("/")
+        if parts[-1] == "Cargo.toml" or path == "Cargo.lock":
+            return True
+        if parts[0] == "crates" and (len(parts) > 3 and parts[2] in ("src", "examples")
+                                   or len(parts) > 4 and parts[1] == "rdf" and parts[3] in ("src", "examples")):
+            return True
+    return False
 
 
 def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_round: int, cases: str | None,
          base: str = BASE, main: str | None = None, max_gb: float = 24, checks: bool = True,
          big_gb: float | None = 28, measure: dict | None = None, batch: bool = False,
-         layouts: int = 1, catalog: list[dict] | None = None, *, mode: str | None = None,
-         history: tuple[Path, ...] | list[Path] = ()) -> dict[str, dict]:
+         layouts: int = 1, catalog: list[dict] | None = None, *, mode: str | None = None) -> dict[str, dict]:
     """The gate's fleet jobs, one set: its timed part (the cases up to `max_gb`) and its big part
     (those up to `big_gb`), each one owlrs.timed job on a timing host the fleet picks by capability
     (TIMING_ROLES, Linux: ELF binaries, never native Windows; the memory; the data its cases read):
@@ -3173,20 +3111,23 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
     blocks alone and reports; and the W3C suites and the guards on any test host. With `measure` the
     k-th block runs the cases needing k blocks; blocks rotate through `layouts` builds. Each job's
     `est_min` is its planned minutes (plan_minutes())."""
-    main = main or (base if mode else MAIN)
-    landing = None
-    if mode:
+    if blocks_per_round < 1:
+        raise SystemExit("the number of blocks must be positive")
+    if mode not in (None, "C"):
+        raise SystemExit("the landing timing mode is C")
+    landing = mode == "C"
+    main = main or (base if landing else MAIN)
+    if landing:
         if cases or main != base or layouts != 1:
-            raise SystemExit("landing modes select their own cases and time one baseline and layout 1")
-        landing = landing_selection(mode, checkout, base, candidate, measure or {}, history)
-        cases = ",".join(landing["cases"])
+            raise SystemExit("mode C uses the landing cases, one baseline and layout 1")
+        cases = ",".join(LANDING_CASES)
         blocks_per_round = LANDING_BLOCKS
     if layouts < 1 or blocks_per_round % layouts:
         raise SystemExit("the number of blocks must be a multiple of the positive number of layouts")
     catalog = cases_registry.load() if catalog is None else catalog
     selection = cases.split(",") if cases else None
     run, _, elsewhere = plan(catalog, max_gb, selection, 0, big_gb)
-    if landing and (missing := set(landing["cases"]) - set(run)):
+    if landing and (missing := set(LANDING_CASES) - set(run)):
         raise SystemExit(f"landing cases must fit one timed part: {', '.join(sorted(missing))} unavailable "
                          f"or above --max-gb {max_gb:g}")
     by_name = {c["name"]: c for c in catalog}
@@ -3204,15 +3145,18 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
     source = [{"name": "checkout", "source": {"git": checkout, "rev": checkout_rev(checkout, candidate, harness)}}]
     gate_ = ["bash", "scripts/release-gate.sh"]
     revs = {"base": base, "main": main, "cand": candidate}
-    revisions = list(dict.fromkeys([base, main, candidate, harness]))
+    timed_revisions = list(dict.fromkeys([base, main, candidate]))
+    revisions = list(dict.fromkeys([*timed_revisions, harness]))
     inputs = source + side_inputs(checkout, source[0]["source"]["rev"], revisions)
     # Every build and the data's preparation in one first step, exclusive like every step: the fleet
     # keeps an exclusive job's host only before an exclusive step and while the host takes exclusive
     # work, so the part starts only where it can time and every step runs where these binaries are
     # (an untimed first step built on a host outside its timing window).
+    harness_build = 'GATE_LAYOUTS=1 bash scripts/release-gate.sh build "$harness"; ' if harness not in timed_revisions else ""
     builds = [["bash", "-c", 'set -e; harness=$1; shift; bash scripts/release-gate.sh begin; '
                'for rev in "$@"; do bash scripts/release-gate.sh build "$rev"; '
-               'done; bash scripts/release-gate.sh prepare "$harness"', "prepare", harness, *revisions]]
+               'done; ' + harness_build + 'bash scripts/release-gate.sh prepare "$harness"',
+               "prepare", harness, *timed_revisions]]
     # the sides timed (a main that is the base isn't timed again)
     sides = 2 + (main != base)
     # Whole Latin squares (whole_squares()): every timed side opens a case's blocks alike.
@@ -3232,7 +3176,8 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
         if (not visits or count % layouts or any(n % layouts for n in visits.values())
                 or (elsewhere and blocks_per_round % layouts)):
             raise SystemExit("planned timed blocks must be a multiple of the layouts after rounding for side order")
-    report = [[*gate_, "report", harness, f"cand={candidate}", f"base={base}", f"main={main}"], [*gate_, "clean"]]
+    finish = ["python3", "benches/fast/release_gate.py", "landing-round-two"] if landing else [*gate_, "clean"]
+    report = [[*gate_, "report", harness, f"cand={candidate}", f"base={base}", f"main={main}"], finish]
     overlay = hosts_registry.overlay_env()  # one overlay commit for every part
 
     def part(job_id: str, part_env: dict, planned: list[str], timed_steps: list[list[str]], ram_gb: float,
@@ -3253,9 +3198,8 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
             part_env = {**part_env, "BENCH_INPUTS_REV": fetched[0]["source"]["rev"]}
         est = plan_minutes(len(revisions), sides, block_cases, measure)
         if landing:
-            part_env["GATE_LANDING"] = json.dumps(landing)
-            est["landing"] = landing
-            steps.append(["python3", "benches/fast/release_gate.py", "landing-round-two"])
+            part_env["GATE_LANDING"] = "1"
+            est["landing"] = True
         return overlay_job({"id": job_id, "group": "release", "kind": "owlrs.timed", "class": "exclusive", **data_fields,
                 "priority_class": "merge-gate", "env": part_env, "stall_after_min": 90,
                 "est_min": round(est["total_min"]), "_plan": est,
@@ -3343,8 +3287,9 @@ def set_plan(found: dict[str, dict], prefix: str, candidate: str, harness: str, 
                      + f", {asks.get('os', 'any OS')}, {asks['cores']} cores, {asks['ram_gb']} GB"
                      + (f", has {'+'.join(asks['has'])}" if asks.get("has") else ""))
         est = job.get("_plan", {})
-        if landing := est.get("landing"):
-            lines.append(f"    {landing_plan_line(landing)}")
+        if est.get("landing"):
+            seconds = sum(case_seconds(measure, c) or 60 for c in LANDING_CASES)
+            lines.append(f"    mode C, {seconds:g} s a pass: {', '.join(LANDING_CASES)}")
             lines.append(f"    a second round adds up to {est['timed_min']:g} timed min, only if a dimension screens")
         total += job["est_min"]
         exclusive += job["est_min"] if timed else 0  # a timed part holds its host from its first step
@@ -3396,7 +3341,7 @@ def landing_screen_cases(report: dict) -> list[str]:
     return sorted({h.split("|", 2)[1] for h in report["screened"]})
 
 
-def landing_round_two(out: Path) -> int:
+def landing_round_two(out: Path) -> None:
     """Continue the current attempt on its host using the original gate and binary cache."""
     output = hosts_registry.evidence_path(out / "release-gate.json")
     first = json.loads(output.read_text(encoding="utf-8"))
@@ -3404,7 +3349,7 @@ def landing_round_two(out: Path) -> int:
     if not attempt or first.get("attempt") != attempt["attempt"] or not first.get("landing"):
         raise SystemExit(f"landing round 2 needs the current attempt's landing report: {error or output}")
     if first["word"] != "needs a second round":
-        return 0
+        return
     cases = landing_screen_cases(first)
     if not cases or not set(cases) <= set(first["planned"]):
         raise SystemExit("landing round 2 needs screened cases from round 1")
@@ -3413,8 +3358,7 @@ def landing_round_two(out: Path) -> int:
     # Use a fresh directory per original attempt and leave the first-round input there.
     second = hosts_registry.evidence_path(out / "round-two" / attempt["attempt"])
     second.mkdir(parents=True, exist_ok=True)
-    first_path = second / "round-one.json"
-    publish(first_path, first)
+    publish(second / "round-one.json", first)
     env = {**os.environ, "FLEET_OUT": str(second), "GATE_ROUND": "1", "GATE_PLAN": "plan-landing-round-two.json"}
     gate_ = ["bash", "scripts/release-gate.sh"]
     revs = {"cand": first["candidate"]["revision"], **first["baselines"]}
@@ -3423,18 +3367,12 @@ def landing_round_two(out: Path) -> int:
     for n in range(1, LANDING_BLOCKS + 1):
         subprocess.run(block_step(gate_, n, harness, 1, None, revs), env=env, check=True)
 
-    args = ["report", "--passes", str(second / "passes"), "--candidate", first["candidate"]["name"],
-            "--require", ",".join(first["required"]), "--harness-revision", harness,
-            "--inputs", str(out / "inputs.txt"), "--min-blocks", str(LANDING_BLOCKS),
-            "--family", str(out / "plan.json"), "--round-one", str(first_path),
-            "--out", str(out / "release-gate.md"), "--json", str(output)]
-    for side, rev in revs.items():
-        args.extend(("--side", f"{side}={rev}"))
-    for key, value in first["context"].items():
-        if key != "round":
-            args.extend(("--context", f"{key}={value}"))
-    main(args)
-    return 0
+    subprocess.run([*gate_, "report", harness, "--round-one", str(output),
+                    *(f"{side}={rev}" for side, rev in revs.items())], env=env, check=True)
+    paired = json.loads((second / "release-gate.json").read_text(encoding="utf-8"))
+    paired["attempt"] = attempt["attempt"]
+    (second / "release-gate.md").replace(hosts_registry.evidence_path(out / "release-gate.md"))
+    publish(output, paired)
 
 
 def confirm_job(rounds: list[dict], checkout: str, measure: dict | None = None) -> dict | None:
@@ -3816,7 +3754,7 @@ def pairs(values: list[str], what: str) -> dict[str, str]:
     return out
 
 
-def main(argv: list[str] | None = None) -> int:
+def main() -> int:
     sys.stdout.reconfigure(encoding="utf-8")
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="command", required=True)
@@ -3884,8 +3822,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--cases", help="a selection: a dry run, diagnostic only")
     s.add_argument("--base", default=BASE)
     s.add_argument("--main", help="second baseline for the release gate (default: recorded main)")
-    s.add_argument("--mode", choices=("B", "C"), help="landing timing: rotating selection (B) or all cases (C)")
-    s.add_argument("--history", type=Path, nargs="+", default=(), help="earlier release-gate.json files, oldest first")
+    s.add_argument("--mode", choices=("C",), help="after-landing timing of all landing cases after a product change")
     s.add_argument("--max-gb", type=float, default=24)
     s.add_argument("--no-checks", action="store_true", help="without the W3C and guards job")
     s.add_argument("--big-gb", type=float, default=28,
@@ -3931,7 +3868,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("ref")
     s.add_argument("commit")
     s.add_argument("--remote", help="the remote the ref is pushed to, whose branches must have its side")
-    args = p.parse_args(argv)
+    args = p.parse_args()
 
     if args.command == "measured-at":
         print(measured_at(str(ROOT), args.rev))
@@ -3957,9 +3894,12 @@ def main(argv: list[str] | None = None) -> int:
         if not os.environ.get("FLEET_OUT"):
             p.error("landing-round-two needs FLEET_OUT")
         try:
-            return landing_round_two(Path(os.environ["FLEET_OUT"]).resolve())
+            landing_round_two(Path(os.environ["FLEET_OUT"]).resolve())
         except (OSError, ValueError, subprocess.CalledProcessError) as error:
             p.error(f"landing round 2: {error}")
+        finally:
+            cleanup = subprocess.run(["bash", "scripts/release-gate.sh", "clean"], check=False)
+        return cleanup.returncode
     if args.command == "report":
         sides = pairs(args.side, "--side")
         passes = load_passes(args.passes)
@@ -3982,23 +3922,24 @@ def main(argv: list[str] | None = None) -> int:
         floor = timing["floor"] if timing else None
         if args.floor and (not args.floor.is_file() or read_floor(args.floor) != floor):
             errors.append("the requested floor differs from the floor recorded by the passes")
-        summary = gate(passes, sides, args.candidate, [s for s in args.require.split(",") if s], args.harness_revision,
-                       args.min_blocks, args.diagnostic, pairs(args.not_run, "--not-run"),
-                       cases_registry.load(), pairs(args.elsewhere, "--elsewhere"), context, family,
-                       floor, timing_errors=errors)
+        landing_pairing = first is not None and bool(first.get("landing"))
+        try:
+            summary = gate(passes, sides, args.candidate, [s for s in args.require.split(",") if s], args.harness_revision,
+                           args.min_blocks, args.diagnostic, pairs(args.not_run, "--not-run"),
+                           cases_registry.load(), pairs(args.elsewhere, "--elsewhere"), context, family, floor,
+                           timing_errors=errors, require_valid_passes=landing_pairing)
+        except ValueError as error:
+            p.error(str(error))
         summary["timing_inputs"] = timing
-        landing = os.environ.get("GATE_LANDING")
+        landing = bool(os.environ.get("GATE_LANDING")) or landing_pairing
         if landing:
-            summary["landing"] = json.loads(landing)
-            if first and first.get("landing"):
-                summary["landing"]["ran_cases"] = first["planned"]
-            summary["tree"] = git_line(str(ROOT), "rev-parse", "--verify", "--quiet", f"{sides[args.candidate]}^{{tree}}")
+            summary["landing"] = True
         for key in ("round", "max_gb", "ram_gb", "layouts"):
             if key in summary["context"]:
                 summary["context"][key] = float(summary["context"][key]) if "gb" in key else int(summary["context"][key])
         if first is not None:
             try:
-                if first.get("landing"):
+                if landing_pairing:
                     different = round_input_errors([[first, summary]])
                     screened = landing_screen_cases(first)
                     incomplete = (set(summary["planned"]) != set(screened) or
@@ -4009,6 +3950,14 @@ def main(argv: list[str] | None = None) -> int:
                 summary.update(landing_pair(first, summary))
             except ValueError as error:
                 p.error(str(error))
+            if landing_pairing:
+                omitted = set(first["planned"]) - set(summary["planned"])
+                summary["candidate_failures"].update(
+                    (case, why) for case, why in first["candidate_failures"].items() if case in omitted)
+                for key in ("blocking", "other_blocking"):
+                    summary[key].extend(line for line in first[key]
+                                        if line.split(":", 1)[0].split(" against ", 1)[0] in omitted)
+                summary["passed"] = summary["passed"] and not summary["blocking"]
         if args.inputs and args.inputs.is_file():
             summary["inputs"] = args.inputs.read_text(encoding="utf-8").splitlines()
         summary["quiet"], notes = quiet_verdicts(args.passes)
@@ -4175,8 +4124,7 @@ def main(argv: list[str] | None = None) -> int:
         hosts_ = sorted({str((p["report"].get("machine") or {}).get("host")) for p in found})
         source = f"{len(found)} passes on {', '.join(hosts_)} ({', '.join(sorted({p['path'] for p in found})[:2])} ...)"
         out.parent.mkdir(parents=True, exist_ok=True)
-        previous = read_measure((HERE / "measure.toml").read_text(encoding="utf-8"))
-        hosts_registry.evidence_path(out, private).write_text(write_measure(result, source, previous), encoding="utf-8")
+        hosts_registry.evidence_path(out, private).write_text(write_measure(result, source), encoding="utf-8")
         under = {c: e for c, e in result["cases"].items() if e.get("power", 1) < TARGET_POWER}
         print(f"{len(result['cases'])} cases, family m = {result['m']}; timed part {result['minutes']} min; "
               f"blocks at most {result['cap']}; "
@@ -4214,8 +4162,13 @@ def main(argv: list[str] | None = None) -> int:
         rev = lambda r: subprocess.run(["git", "-C", args.checkout, "rev-parse", r], capture_output=True,  # noqa: E731
                                        text=True, check=True).stdout.strip()
         candidate = rev(args.candidate)
-        harness = rev(args.harness or candidate)
         base = rev(args.base)
+        if args.blocks < 1:
+            p.error("the number of blocks must be positive")
+        if args.mode == "C" and not product_changed(args.checkout, base, candidate):
+            print("no product change: nothing to time")
+            return 0
+        harness = rev(args.harness or candidate)
         main_side = rev(args.main or (args.base if args.mode else MAIN))
         # The harness's calibration, and batched timing only where every side's perf lab batches.
         shown = subprocess.run(["git", "-C", args.checkout, "show", f"{harness}:benches/fast/measure.toml"],
@@ -4229,7 +4182,7 @@ def main(argv: list[str] | None = None) -> int:
                      args.blocks, args.cases, base, main_side, max_gb=args.max_gb,
                      checks=not args.no_checks, big_gb=None if args.no_big else args.big_gb,
                      measure=measure, batch=batch, layouts=args.layouts,
-                     catalog=cases_registry.load_at(args.checkout, harness), mode=args.mode, history=args.history)
+                     catalog=cases_registry.load_at(args.checkout, harness), mode=args.mode)
         out = args.out or hosts_registry.jobs_dir()
         path = hosts_registry.write_job(out / f"{prefix}.set.toml",
                                         toml_set({"id": prefix, "fail": "continue"}, list(found.values())),
