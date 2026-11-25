@@ -448,9 +448,6 @@ impl DlEntailment {
     }
 }
 
-/// Blank nodes of conclusions get labels of their own, so none is a premise's.
-static CONCLUSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 impl StoreService {
     /// Whether the asserted statements (every graph) entail `conclusion` under the OWL 2
     /// Direct Semantics: each logical axiom of the conclusion read as an OWL 2 ontology
@@ -496,7 +493,7 @@ impl StoreService {
         conclusion: &[Triple],
         deadline: Deadline,
     ) -> StoreResult<DlEntailment> {
-        use crate::dl::entailment::{Entailed, entails_ontology_within};
+        use crate::dl::entailment::{Entailed, admit_and_prepare, entails_prepared_within};
         use crate::dl::{Verdict, consistency, gate, source};
         use nrese_rdf::{BlankNode, NamedNodeRef, NamedOrBlankNode};
         if self.dl().replica() {
@@ -509,7 +506,7 @@ impl StoreService {
         // Undecided where the request's envelope can't take reading the premise (SYN-61).
         let treatments = &self.config().dl.treatments;
         let Ok((premise, read_statements)) =
-            source::read_premise(snapshot, memory.clone(), treatments, false)
+            source::read_premise(snapshot, memory.clone(), treatments, true)
         else {
             let why = source::refused("the premise");
             return Ok(DlEntailment {
@@ -543,11 +540,21 @@ impl StoreService {
         // vocabulary charged to its envelope, past the premise's ids.
         source::intern_system_vocabulary(self.engine())?;
         let tx = source::private_over(self.engine(), snapshot, Arc::new(memory.part()));
-        let n = CONCLUSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let blank = |b: &BlankNode| BlankNode::new_unchecked(format!("nresec{n}x{}", b.as_str()));
-        let id = |t: Term| -> nrese_engine::EngineResult<u64> {
+        let (mut blanks, mut probes, mut late) = (std::collections::HashMap::new(), 0u64, false);
+        let mut id = |t: Term| -> nrese_engine::EngineResult<u64> {
+            if late {
+                return Ok(0);
+            }
             let t = match t {
-                Term::BlankNode(b) => Term::BlankNode(blank(&b)),
+                Term::BlankNode(b) => {
+                    match fresh_blank(&tx, &mut blanks, &mut probes, deadline, &b) {
+                        Some(mapped) => Term::BlankNode(mapped),
+                        None => {
+                            late = true;
+                            return Ok(0);
+                        }
+                    }
+                }
                 other => other,
             };
             Ok(tx.try_intern(t.as_ref())?.raw())
@@ -569,6 +576,14 @@ impl StoreService {
                 })
             })
             .collect();
+        if late {
+            return Ok(DlEntailment {
+                answer: Entailed::Unknown(
+                    nrese_dl::limits::Limit::Time.reached("the deadline passed"),
+                ),
+                premise: checked.verdict,
+            });
+        }
         // Undecided where the envelope can't take the conclusion's terms, as the premise's.
         let Ok(statements) = statements else {
             return Ok(DlEntailment {
@@ -581,30 +596,27 @@ impl StoreService {
         };
         let decode = |term| tx.decode(term);
         let lookup = |iri: &str| tx.lookup(NamedNodeRef::new_unchecked(iri).into());
+        let terms = source::StoreTerms {
+            decode: &decode,
+            lookup: &lookup,
+        };
         // The conclusion reads SHACL content as one source of it and the premise would
         // (`nrese_owl::read_beside`); the premise keeps its own reading.
-        let read = nrese_owl::read_beside(
-            &statements,
-            &read_statements,
-            &source::StoreTerms {
-                decode: &decode,
-                lookup: &lookup,
-            },
-        );
+        let read = nrese_owl::read_beside(&statements, &read_statements, &terms);
         // The premise's statements are read: their charge goes back to the envelope before
         // the check draws on it.
         drop(read_statements);
+        let name = |t| {
+            let written = decode(nrese_engine::TermId::from_raw(t));
+            written
+                .and_then(consistency::as_written)
+                .unwrap_or_else(|| "_".into())
+        };
         // A structure no axiom uses says nothing under the Direct Semantics (OWL 1
         // conclusions state expressions so); anything else unread leaves it undecided.
         // Named by the conclusion's IRIs and literals, as the requester wrote them; its blank
         // nodes, relabelled here, by none.
         if let Some(diagnostic) = read.diagnostics.iter().find(|d| d.is_fatal()) {
-            let name = |t| {
-                let written = decode(nrese_engine::TermId::from_raw(t));
-                written
-                    .and_then(consistency::as_written)
-                    .unwrap_or_else(|| "_".into())
-            };
             return Ok(DlEntailment {
                 answer: Entailed::Unknown(format!(
                     "the conclusion isn't well-formed OWL 2 DL: {}",
@@ -613,6 +625,27 @@ impl StoreService {
                 premise: checked.verdict,
             });
         }
+        if let Some(bad) = statements.iter().find_map(|s| {
+            let obj = nrese_engine::TermId::from_raw(s.triple[2]);
+            crate::dl::query::is_ill_typed(obj, &decode).then_some(s.triple[2])
+        }) {
+            return Ok(DlEntailment {
+                answer: Entailed::Unknown(format!(
+                    "the conclusion isn't well-formed OWL 2 DL: ill-typed literal: {}",
+                    name(bad)
+                )),
+                premise: checked.verdict,
+            });
+        }
+        let prepared = match admit_and_prepare(&premise, &read, &terms, &name, &budget, deadline) {
+            Ok(prepared) => prepared,
+            Err(answer) => {
+                return Ok(DlEntailment {
+                    answer,
+                    premise: checked.verdict,
+                });
+            }
+        };
         // Admitted: an inconsistent premise has no model, so it entails the conclusion.
         if inconsistent {
             return Ok(DlEntailment {
@@ -631,10 +664,46 @@ impl StoreService {
             .collect();
         let fresh = fresh?;
         Ok(DlEntailment {
-            answer: entails_ontology_within(&premise, &read, &fresh, &budget, deadline),
+            answer: entails_prepared_within(
+                prepared,
+                !read.anonymous.is_empty(),
+                &fresh,
+                &budget,
+                deadline,
+            ),
             premise: checked.verdict,
         })
     }
+}
+
+fn fresh_blank(
+    tx: &nrese_engine::PrivateTransaction<'_>,
+    blanks: &mut std::collections::HashMap<String, nrese_rdf::BlankNode>,
+    probes: &mut u64,
+    deadline: Deadline,
+    blank: &nrese_rdf::BlankNode,
+) -> Option<nrese_rdf::BlankNode> {
+    if let Some(existing) = blanks.get(blank.as_str()) {
+        return Some(existing.clone());
+    }
+    for k in 0u64.. {
+        *probes = probes.saturating_add(1);
+        if *probes >= 4_096 {
+            *probes = 0;
+            if deadline.passed() {
+                return None;
+            }
+        }
+        let cand = nrese_rdf::BlankNode::new_unchecked(format!("nresec{k}x{}", blank.as_str()));
+        if tx
+            .lookup(nrese_rdf::TermRef::BlankNode(cand.as_ref()))
+            .is_none()
+        {
+            blanks.insert(blank.as_str().to_owned(), cand.clone());
+            return Some(cand);
+        }
+    }
+    unreachable!()
 }
 
 #[cfg(test)]

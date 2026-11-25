@@ -7,8 +7,14 @@
 //! It is the oracle of the exact services (`ExactGroundEntailment`: a ground atom is an
 //! axiom), and of entailment checks of whole documents ([`crate::StoreService::entails_dl`]).
 
-use nrese_dl::limits::Deadline;
-use nrese_owl::{Axiom, Characteristic, ClassExpr, DataRange, ExprId, ObjProp, Ontology, RangeId};
+use std::mem::{size_of, take};
+
+use nrese_dl::limits::{Deadline, Limit};
+use nrese_dl::memory::Scratch;
+use nrese_owl::{
+    Axiom, Characteristic, ClassExpr, DataRange, DataTerms, Diagnostic, ExprId, ObjProp, Ontology,
+    RangeId, Terms,
+};
 
 use super::consistency::{self, Budget, Verdict};
 
@@ -179,7 +185,12 @@ impl Import<'_> {
     }
 
     fn axiom(&mut self, axiom: &Axiom) -> Axiom {
-        let classes = |v: &[ExprId], me: &mut Self| v.iter().map(|&e| me.class(e)).collect();
+        let classes = |v: &[ExprId], me: &mut Self| {
+            let mut out: Vec<ExprId> = v.iter().map(|&e| me.class(e)).collect();
+            out.sort_unstable();
+            out.dedup();
+            out
+        };
         match axiom {
             Axiom::SubClassOf(a, b) => Axiom::SubClassOf(self.class(*a), self.class(*b)),
             Axiom::EquivalentClasses(v) => Axiom::EquivalentClasses(classes(v, self)),
@@ -501,6 +512,213 @@ pub fn entails_ontology(
     )
 }
 
+enum Stopped {
+    Time,
+    Memory,
+}
+
+impl From<Stopped> for Entailed {
+    fn from(s: Stopped) -> Self {
+        match s {
+            Stopped::Time => Self::Unknown(Limit::Time.reached("the deadline passed")),
+            Stopped::Memory => Self::Unknown(nrese_dl::memory::EXHAUSTED.to_owned()),
+        }
+    }
+}
+
+fn charge(s: &mut Scratch, bytes: usize) -> Result<(), Stopped> {
+    s.charge(|| bytes).map_err(|_| Stopped::Memory)
+}
+
+fn tick(work: &mut u64, units: u64, deadline: Deadline) -> Result<(), Stopped> {
+    *work = work.saturating_add(units);
+    if *work >= 4_096 {
+        *work %= 4_096;
+        if deadline.passed() {
+            return Err(Stopped::Time);
+        }
+    }
+    Ok(())
+}
+
+fn data_bytes(d: &DataTerms) -> usize {
+    d.literals
+        .values()
+        .map(|l| {
+            size_of::<(u64, nrese_owl::Literal)>()
+                + 16
+                + l.lexical.len()
+                + l.datatype.as_ref().map_or(0, String::len)
+                + l.language.as_ref().map_or(0, String::len)
+        })
+        .sum::<usize>()
+        + d.iris
+            .values()
+            .map(|s| size_of::<(u64, String)>() + 16 + s.len())
+            .sum::<usize>()
+}
+
+/// A premise copy and imported conclusion axioms ready for entailment testing.
+pub(crate) struct PreparedCheck {
+    o: Ontology,
+    _copy_scratch: Scratch,
+    axioms: Vec<Axiom>,
+    imported_scratch: Scratch,
+}
+
+#[derive(Clone, Copy)]
+enum Origin {
+    Premise(usize),
+    Conclusion(usize),
+}
+
+fn import_into(
+    premise: &Ontology,
+    conclusion: &Ontology,
+    budget: &Budget,
+) -> Result<PreparedCheck, Entailed> {
+    let (mut o, mut copy_scratch) = copy(premise, budget)?;
+    charge(&mut copy_scratch, data_bytes(&conclusion.data))?;
+    o.data.extend(&conclusion.data);
+    let mut imported_scratch = Scratch::new(budget.memory.as_ref());
+    charge(
+        &mut imported_scratch,
+        conclusion.axioms.len() * size_of::<Axiom>(),
+    )?;
+    let axioms = {
+        let mut import = Import {
+            from: conclusion,
+            to: &mut o,
+        };
+        conclusion.axioms.iter().map(|a| import.axiom(a)).collect()
+    };
+    Ok(PreparedCheck {
+        o,
+        _copy_scratch: copy_scratch,
+        axioms,
+        imported_scratch,
+    })
+}
+
+/// Copies `premise` once, imports `conclusion` once, checks OWL 2 DL membership over the
+/// deduplicated joint union, and restores the premise copy by identity.
+pub(crate) fn admit_and_prepare(
+    premise: &Ontology,
+    conclusion: &Ontology,
+    terms: &dyn Terms,
+    name: &dyn Fn(u64) -> String,
+    budget: &Budget,
+    deadline: Deadline,
+) -> Result<PreparedCheck, Entailed> {
+    let mut prepared = import_into(premise, conclusion, budget)?;
+    let o = &mut prepared.o;
+    let imported = take(&mut prepared.axioms);
+
+    let mut js = Scratch::new(budget.memory.as_ref());
+    charge(&mut js, imported.len() * size_of::<(Axiom, usize)>())?;
+    let mut keyed: Vec<_> = imported
+        .into_iter()
+        .enumerate()
+        .map(|(j, a)| (a, j))
+        .collect();
+    keyed.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+    keyed.dedup_by(|(a, _), (b, _)| a == b);
+
+    charge(&mut js, keyed.len() * size_of::<(Axiom, usize)>())?;
+    let (mut extra, mut already, mut work) = (Vec::with_capacity(keyed.len()), Vec::new(), 0u64);
+    for (a, j) in keyed {
+        tick(&mut work, 1, deadline)?;
+        if o.axioms.binary_search(&a).is_ok() {
+            already.push(a);
+        } else {
+            extra.push((a, j));
+        }
+    }
+
+    let (p_axioms, p_sources) = (take(&mut o.axioms), take(&mut o.sources));
+    let (extra_len, total) = (extra.len(), p_axioms.len() + extra.len());
+    charge(&mut js, total * (size_of::<Axiom>() + size_of::<Origin>()))?;
+    let (mut joint, mut origin) = (Vec::with_capacity(total), Vec::with_capacity(total));
+    let mut p_it = p_axioms.into_iter().enumerate().peekable();
+    let mut c_it = extra.into_iter().peekable();
+    while p_it.peek().is_some() || c_it.peek().is_some() {
+        tick(&mut work, 1, deadline)?;
+        let from_p = match (p_it.peek(), c_it.peek()) {
+            (Some((_, pa)), Some((ca, _))) => pa <= ca,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if from_p {
+            let (i, a) = p_it.next().unwrap();
+            joint.push(a);
+            origin.push(Origin::Premise(i));
+        } else {
+            let (a, j) = c_it.next().unwrap();
+            joint.push(a);
+            origin.push(Origin::Conclusion(j));
+        }
+    }
+
+    let saved = (
+        take(&mut o.anonymous),
+        take(&mut o.annotation_uses),
+        take(&mut o.annotation_axioms),
+    );
+    let n_sets = saved.0.len()
+        + conclusion.anonymous.len()
+        + saved.1.len()
+        + conclusion.annotation_uses.len()
+        + saved.2.len()
+        + conclusion.annotation_axioms.len();
+    charge(&mut js, n_sets * (size_of::<u64>() + 8))?;
+    let merge = |a: &std::collections::BTreeSet<u64>, b: &std::collections::BTreeSet<u64>| {
+        a.union(b).copied().collect()
+    };
+    o.anonymous = merge(&saved.0, &conclusion.anonymous);
+    o.annotation_uses = merge(&saved.1, &conclusion.annotation_uses);
+    o.annotation_axioms = merge(&saved.2, &conclusion.annotation_axioms);
+    o.axioms = joint;
+
+    let findings = nrese_owl::membership(o, terms);
+    let blocks_j = |d: &Diagnostic| match *d {
+        Diagnostic::AnonymousIndividual { node, axioms, .. } => {
+            axioms
+                .iter()
+                .flatten()
+                .any(|&k| matches!(origin[k], Origin::Conclusion(_)))
+                || (axioms.iter().all(Option::is_none) && conclusion.anonymous.contains(&node))
+        }
+        _ => true,
+    };
+    let blocks_p = |d: &Diagnostic| {
+        d.is_fatal() || matches!(d, Diagnostic::TwoKinds { .. } | Diagnostic::RepeatedOperand)
+    };
+    if let Some(d) = findings
+        .iter()
+        .find(|d| blocks_j(d))
+        .or_else(|| premise.diagnostics.iter().find(|d| blocks_p(d)))
+    {
+        return Err(Entailed::Unknown(format!(
+            "the joint ontology isn't well-formed OWL 2 DL: {}",
+            d.describe(name)
+        )));
+    }
+
+    let (mut restored, mut axioms) = (Vec::with_capacity(premise.axioms.len()), already);
+    axioms.reserve(extra_len);
+    for (a, from) in take(&mut o.axioms).into_iter().zip(origin) {
+        match from {
+            Origin::Premise(_) => restored.push(a),
+            Origin::Conclusion(_) => axioms.push(a),
+        }
+    }
+    (o.axioms, o.sources) = (restored, p_sources);
+    (o.anonymous, o.annotation_uses, o.annotation_axioms) = saved;
+    drop(js);
+    prepared.axioms = axioms;
+    Ok(prepared)
+}
+
 /// [`entails_ontology`], each test within what is left of `deadline` (a caller's, that
 /// began before this check).
 pub(crate) fn entails_ontology_within(
@@ -510,22 +728,29 @@ pub(crate) fn entails_ontology_within(
     budget: &Budget,
     deadline: Deadline,
 ) -> Entailed {
-    let (mut o, _scratch) = match copy(premise, budget) {
-        Ok(copy) => copy,
-        Err(unknown) => return unknown,
-    };
-    o.data.extend(&conclusion.data);
-    let tests: Vec<Test> = {
-        let mut import = Import {
-            from: conclusion,
-            to: &mut o,
-        };
-        conclusion
-            .axioms
-            .iter()
-            .map(|a| Test::Axiom(import.axiom(a)))
-            .collect()
-    };
+    match import_into(premise, conclusion, budget) {
+        Ok(p) => {
+            entails_prepared_within(p, !conclusion.anonymous.is_empty(), fresh, budget, deadline)
+        }
+        Err(unknown) => unknown,
+    }
+}
+
+/// Runs entailment tests on an already-prepared premise copy and imported conclusion axioms.
+pub(crate) fn entails_prepared_within(
+    prepared: PreparedCheck,
+    conclusion_has_anonymous: bool,
+    fresh: &[u64],
+    budget: &Budget,
+    deadline: Deadline,
+) -> Entailed {
+    let PreparedCheck {
+        mut o,
+        _copy_scratch,
+        axioms,
+        imported_scratch,
+    } = prepared;
+    let tests: Vec<Test> = axioms.into_iter().map(Test::Axiom).collect();
     let compiled = Batch::new(&mut o, &tests, budget.memory.as_ref());
     let mut answer = Entailed::Yes;
     for (index, test) in tests.iter().enumerate() {
@@ -534,7 +759,8 @@ pub(crate) fn entails_ontology_within(
             break;
         }
     }
-    if answer == Entailed::No && !conclusion.anonymous.is_empty() {
+    drop(imported_scratch);
+    if answer == Entailed::No && conclusion_has_anonymous {
         return Entailed::Unknown(
             "not entailed for one value of the conclusion's anonymous individual".into(),
         );
