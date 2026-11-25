@@ -51,6 +51,12 @@ from suitekit.hosts import run_identity  # noqa: E402
 from suitekit.checkout import STORED_OBJECTS, checkout_differs  # noqa: E402,F401
 
 CAMPAIGN_BLOCKS = 2  # blocks a round at least (each: every case on every side, twice, as a palindrome)
+LANDING_BLOCKS = 8
+# A complete pair exits zero even when it records a release verdict failure.
+PAIRED_REPORT_VERSION = 1
+LANDING_CASES = ("load-entities", "load-threads", "q-snowflake", "q-star", "op-group", "commits-plain",
+                 "commits-rdfs", "custom-tc", "rl-single-thread", "rl-clique", "ql-lubm10", "dl-pipeline",
+                 "shacl-lubm", "deletes-tail", "writes-under-readers")
 PASS_FILE = re.compile(r"pass-(\d+)-([A-Za-z0-9_.-]+)\.json$")
 
 
@@ -1172,7 +1178,8 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
          min_blocks: int = CAMPAIGN_BLOCKS, diagnostic: bool = False, not_run: dict | None = None,
          catalog: list[dict] | None = None, elsewhere: dict | None = None,
          context: dict | None = None, family: list[str] | None = None, floor: dict | None = None,
-         baseline_candidate: bool = False, timing_errors: list[str] | None = None) -> dict:
+         baseline_candidate: bool = False, timing_errors: list[str] | None = None,
+         *, require_valid_passes: bool = False) -> dict:
     """One round of one timed part: the schedule and provenance checked, every comparison's
     blocks tested; each declared hypothesis's p-value (untested: 1). The decision over the family
     and the rounds is verdict()'s, which alone applies the owner's policy (load_policy()), read
@@ -1320,6 +1327,8 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
             summary["not_compared"][h] = row["not_compared"][d]
         else:
             summary["errors"].append(f"{h}: declared, but no evidence from the candidate and no reason")
+    if require_valid_passes and summary["errors"]:
+        raise ValueError("round 2 evidence doesn't qualify: " + "; ".join(summary["errors"]))
     summary["other_blocking"] = list(summary["blocking"])
     summary["counts"] = {side: dict(Counter(r["status"] for row in rows.values() for r in row["dimensions"].values()))
                          for side, rows in summary["comparisons"].items()}
@@ -3079,10 +3088,26 @@ def case_seconds(measure: dict | None, case: str) -> float | None:
     return float(value) if value else None
 
 
+def product_changed(checkout: str, base: str, candidate: str) -> bool:
+    argv = ["git", "-C", checkout, "diff", "--name-only", "-z", "--no-renames", base, candidate, "--"]
+    diff = hosts_registry.launch(subprocess.run, argv, capture_output=True, timeout=60)
+    if diff.returncode:
+        raise SystemExit(f"landing timing could not diff {base} against {candidate}")
+    source_dirs = (b"src", b"examples")
+    for path in diff.stdout.split(b"\0"):
+        parts = path.split(b"/")
+        if parts[-1] == b"Cargo.toml" or path == b"Cargo.lock":
+            return True
+        if parts[0] == b"crates" and (len(parts) > 3 and parts[2] in source_dirs
+                                    or len(parts) > 4 and parts[1] == b"rdf" and parts[3] in source_dirs):
+            return True
+    return False
+
+
 def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_round: int, cases: str | None,
-         base: str = BASE, main: str = MAIN, max_gb: float = 24, checks: bool = True,
+         base: str = BASE, main: str | None = None, max_gb: float = 24, checks: bool = True,
          big_gb: float | None = 28, measure: dict | None = None, batch: bool = False,
-         layouts: int = 1, catalog: list[dict] | None = None) -> dict[str, dict]:
+         layouts: int = 1, catalog: list[dict] | None = None, *, mode: str | None = None) -> dict[str, dict]:
     """The gate's fleet jobs, one set: its timed part (the cases up to `max_gb`) and its big part
     (those up to `big_gb`), each one owlrs.timed job on a timing host the fleet picks by capability
     (TIMING_ROLES, Linux: ELF binaries, never native Windows; the memory; the data its cases read):
@@ -3090,16 +3115,32 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
     blocks alone and reports; and the W3C suites and the guards on any test host. With `measure` the
     k-th block runs the cases needing k blocks; blocks rotate through `layouts` builds. Each job's
     `est_min` is its planned minutes (plan_minutes())."""
+    if blocks_per_round < 1:
+        raise SystemExit("the number of blocks must be positive")
+    if mode not in (None, "C"):
+        raise SystemExit("the landing timing mode is C")
+    landing = mode == "C"
+    main = main or (base if landing else MAIN)
+    if landing:
+        if cases or main != base or layouts != 1:
+            raise SystemExit("mode C uses the landing cases, one baseline and layout 1")
+        cases = ",".join(LANDING_CASES)
+        blocks_per_round = LANDING_BLOCKS
+    if layouts < 1:
+        raise SystemExit("the number of layouts must be positive")
     catalog = cases_registry.load() if catalog is None else catalog
     selection = cases.split(",") if cases else None
     run, _, elsewhere = plan(catalog, max_gb, selection, 0, big_gb)
+    if landing and (missing := set(LANDING_CASES) - set(run)):
+        raise SystemExit(f"landing cases must fit one timed part: {', '.join(sorted(missing))} unavailable "
+                         f"or above --max-gb {max_gb:g}")
     by_name = {c["name"]: c for c in catalog}
     # Each part's mutable gate state (release-gate.sh GATE: its plan, data view, passes) is the
     # request's and the part's own: placed by capability, two requests at one candidate, or a part and
     # the checks, may meet on one host. The shared binaries and data caches stay
     # shared (GATE_BIN, SPARQL_DATA).
     request = json.dumps([candidate, harness, base, main, cases, blocks_per_round, max_gb, big_gb, layouts, batch,
-                          prefix])
+                          prefix] + ([mode] if landing else []))
     gate_name = f"gate-v2-{candidate[:8]}-{hashlib.sha256(request.encode()).hexdigest()[:8]}"
     env = {"GATE_NAME": gate_name, "GATE_MAX_GB": str(max_gb), "NRESE_QUIET_SLOT": "0",
            "GATE_MIN_BLOCKS": str(blocks_per_round), **({"GATE_CASES": cases} if cases else {}),
@@ -3108,24 +3149,39 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
     source = [{"name": "checkout", "source": {"git": checkout, "rev": checkout_rev(checkout, candidate, harness)}}]
     gate_ = ["bash", "scripts/release-gate.sh"]
     revs = {"base": base, "main": main, "cand": candidate}
-    revisions = list(dict.fromkeys([base, main, candidate, harness]))
+    timed_revisions = list(dict.fromkeys([base, main, candidate]))
+    revisions = list(dict.fromkeys([*timed_revisions, harness]))
     inputs = source + side_inputs(checkout, source[0]["source"]["rev"], revisions)
     # Every build and the data's preparation in one first step, exclusive like every step: the fleet
     # keeps an exclusive job's host only before an exclusive step and while the host takes exclusive
     # work, so the part starts only where it can time and every step runs where these binaries are
     # (an untimed first step built on a host outside its timing window).
+    harness_build = 'GATE_LAYOUTS=1 bash scripts/release-gate.sh build "$harness"; ' if harness not in timed_revisions else ""
     builds = [["bash", "-c", 'set -e; harness=$1; shift; bash scripts/release-gate.sh begin; '
                'for rev in "$@"; do bash scripts/release-gate.sh build "$rev"; '
-               'done; bash scripts/release-gate.sh prepare "$harness"', "prepare", harness, *revisions]]
+               'done; ' + harness_build + 'bash scripts/release-gate.sh prepare "$harness"',
+               "prepare", harness, *timed_revisions]]
     # the sides timed (a main that is the base isn't timed again)
     sides = 2 + (main != base)
     # Whole Latin squares (whole_squares()): every timed side opens a case's blocks alike.
     env["GATE_SQUARE"] = str(sides)
     blocks_per_round = whole_squares(blocks_per_round, sides)
     env["GATE_MIN_BLOCKS"] = str(blocks_per_round)
-    need = {c: whole_squares(int(e.get("blocks", blocks_per_round)), sides) for c, e in (measure or {}).items()}
-    count = max([blocks_per_round, *need.values()]) if measure else blocks_per_round
-    report = [[*gate_, "report", harness, f"cand={candidate}", f"base={base}", f"main={main}"], [*gate_, "clean"]]
+    calibrated = measure if not landing else None
+    need = {c: whole_squares(int(e.get("blocks", blocks_per_round)), sides) for c, e in (calibrated or {}).items()}
+    count = max([blocks_per_round, *need.values()])
+    layout_plan = None
+    if layouts > 1:
+        checked = {c for c in run if by_name[c].get("outcome", "ok") != "ok"}
+        layout_plan = (blocks(run, calibrated, blocks_per_round, square=sides, checked=checked)
+                       if calibrated else [run] * blocks_per_round)
+        count = len(layout_plan)
+        visits = Counter(c for row in layout_plan for c in row if c not in checked)
+        if (not visits or count % layouts or any(n % layouts for n in visits.values())
+                or (elsewhere and blocks_per_round % layouts)):
+            raise SystemExit("planned timed blocks must be a multiple of the layouts after rounding for side order")
+    finish = ["python3", "benches/fast/release_gate.py", "landing-round-two"] if landing else [*gate_, "clean"]
+    report = [[*gate_, "report", harness, f"cand={candidate}", f"base={base}", f"main={main}"], finish]
     overlay = hosts_registry.overlay_env()  # one overlay commit for every part
 
     def part(job_id: str, part_env: dict, planned: list[str], timed_steps: list[list[str]], ram_gb: float,
@@ -3145,6 +3201,9 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
         if fetched:
             part_env = {**part_env, "BENCH_INPUTS_REV": fetched[0]["source"]["rev"]}
         est = plan_minutes(len(revisions), sides, block_cases, measure)
+        if landing:
+            part_env["GATE_LANDING"] = "1"
+            est["landing"] = True
         return overlay_job({"id": job_id, "group": "release", "kind": "owlrs.timed", "class": "exclusive", **data_fields,
                 "priority_class": "merge-gate", "env": part_env, "stall_after_min": 90,
                 "est_min": round(est["total_min"]), "_plan": est,
@@ -3154,12 +3213,12 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
                 "step_deadline_min": BUILD_MIN * len(revisions) + 120,
                 "requires": requires, "inputs": inputs + fetched}, overlay)
 
-    timed_steps = [[*gate_, "plan-blocks", harness]] if measure else []
-    block_cases = []
+    timed_steps = [[*gate_, "plan-blocks", harness]] if calibrated else []
     for k in range(1, count + 1):
         timed_steps.append(block_step(gate_, k, harness, block_layout(k, layouts),
-                                      f"plan-block-{k}.json" if measure else None, revs))
-        block_cases.append([c for c in run if not measure or k == 1 or need.get(c, blocks_per_round) >= k])
+                                      f"plan-block-{k}.json" if calibrated else None, revs))
+    block_cases = layout_plan if layout_plan is not None else [
+        [c for c in run if not calibrated or k == 1 or need.get(c, blocks_per_round) >= k] for k in range(1, count + 1)]
     out = {f"{prefix}-timed": part(f"{prefix}-timed", {**env, "GATE_NAME": f"{gate_name}-timed", "GATE_PREFIX": prefix,
                                                            "GATE_RAM_GB": str(max_gb)},
                                    run, timed_steps, max_gb, block_cases)}
@@ -3231,6 +3290,11 @@ def set_plan(found: dict[str, dict], prefix: str, candidate: str, harness: str, 
                      + f"; asks {job['kind']}" + (f", roles {'+'.join(asks['roles'])}" if asks.get("roles") else "")
                      + f", {asks.get('os', 'any OS')}, {asks['cores']} cores, {asks['ram_gb']} GB"
                      + (f", has {'+'.join(asks['has'])}" if asks.get("has") else ""))
+        est = job.get("_plan", {})
+        if est.get("landing"):
+            seconds = sum(case_seconds(measure, c) or 60 for c in LANDING_CASES)
+            lines.append(f"    mode C, {seconds:g} s a pass: {', '.join(LANDING_CASES)}")
+            lines.append(f"    a second round adds up to {est['timed_min']:g} timed min, only if a dimension screens")
         total += job["est_min"]
         exclusive += job["est_min"] if timed else 0  # a timed part holds its host from its first step
     guessed = sorted({c for job in found.values() for c in (job.get("_plan") or {}).get("guessed", [])})
@@ -3275,6 +3339,47 @@ def latest(parts: list, side: str, case: str, dimension: str) -> dict | None:
 
 
 CONFIRM_BLOCKS = (2, 30)  # blocks of a confirmation round: its cases' calibrated blocks, within these
+
+
+def landing_screen_cases(report: dict) -> list[str]:
+    return sorted({h.split("|", 2)[1] for h in report["screened"]})
+
+
+def landing_round_two(out: Path) -> None:
+    """Continue the current attempt on its host using the original gate and binary cache."""
+    output = hosts_registry.evidence_path(out / "release-gate.json")
+    first = json.loads(output.read_text(encoding="utf-8"))
+    attempt, error = newest_attempt(out, "timed")
+    if not attempt or first.get("attempt") != attempt["attempt"] or not first.get("landing"):
+        raise SystemExit(f"landing round 2 needs the current attempt's landing report: {error or output}")
+    if first["word"] != "needs a second round":
+        return
+    cases = landing_screen_cases(first)
+    if not cases or not set(cases) <= set(first["planned"]):
+        raise SystemExit("landing round 2 needs screened cases from round 1")
+
+    # The block runner stores its seed, passes and resume state beside its output.
+    # Use a fresh directory per original attempt and leave the first-round input there.
+    second = hosts_registry.evidence_path(out / "round-two" / attempt["attempt"])
+    second.mkdir(parents=True, exist_ok=True)
+    publish(second / "round-one.json", first)
+    env = {**os.environ, "FLEET_OUT": str(second), "GATE_ROUND": "1", "GATE_PLAN": "plan-landing-round-two.json"}
+    gate_ = ["bash", "scripts/release-gate.sh"]
+    revs = {"cand": first["candidate"]["revision"], **first["baselines"]}
+    harness = first["harness"]
+    hosts_registry.launch(subprocess.run, [*gate_, "plan-cases", ",".join(cases)], environ=env, check=True)
+    for n in range(1, LANDING_BLOCKS + 1):
+        hosts_registry.launch(subprocess.run, block_step(gate_, n, harness, 1, None, revs), environ=env, check=True)
+
+    hosts_registry.launch(subprocess.run, [*gate_, "report", harness, "--round-one", str(output),
+                                         *(f"{side}={rev}" for side, rev in revs.items())], environ=env, check=True)
+    paired = json.loads((second / "release-gate.json").read_text(encoding="utf-8"))
+    # A compatible harness can predate the completed-evidence check in its reporter.
+    if paired["errors"]:
+        raise ValueError("round 2 evidence doesn't qualify: " + "; ".join(paired["errors"]))
+    paired["attempt"] = attempt["attempt"]
+    (second / "release-gate.md").replace(hosts_registry.evidence_path(out / "release-gate.md"))
+    publish(output, paired)
 
 
 def confirm_job(rounds: list[dict], checkout: str, measure: dict | None = None) -> dict | None:
@@ -3687,6 +3792,7 @@ def main() -> int:
     s.add_argument("--round-one", type=Path, help="the first round's release-gate.json, for the landing timing word")
     s.add_argument("--out", type=Path)
     s.add_argument("--json", type=Path)
+    sub.add_parser("landing-round-two", help="finish screened landing timing cases in this fleet job")
     s = sub.add_parser("floor", help="a host's noise floor (noise-floor/HOST.toml) from an A-A' gate's report")
     s.add_argument("report", type=Path, help="its release-gate.json (every side one revision)")
     s.add_argument("--host", required=True, help="fleet's name of the host")
@@ -3722,7 +3828,8 @@ def main() -> int:
     s.add_argument("--blocks", type=int, default=CAMPAIGN_BLOCKS, help="blocks of round 1 at least (fewer than 2: diagnostic)")
     s.add_argument("--cases", help="a selection: a dry run, diagnostic only")
     s.add_argument("--base", default=BASE)
-    s.add_argument("--main", default=MAIN)
+    s.add_argument("--main", help="second baseline for the release gate (default: recorded main)")
+    s.add_argument("--mode", choices=("C",), help="after-landing timing of all landing cases after a product change")
     s.add_argument("--max-gb", type=float, default=24)
     s.add_argument("--no-checks", action="store_true", help="without the W3C and guards job")
     s.add_argument("--big-gb", type=float, default=28,
@@ -3786,9 +3893,20 @@ def main() -> int:
         catalog = cases_registry.load()
         run, not_run, elsewhere = plan(catalog, args.max_gb, args.cases.split(",") if args.cases else None,
                                        args.min_gb, args.big_gb, args.big_host)
-        family = family_of(catalog, run, tuple(b for b in args.baselines.split(",") if b))
+        baselines = ("base",) if os.environ.get("GATE_LANDING") else tuple(filter(None, args.baselines.split(",")))
+        family = family_of(catalog, run, baselines)
         print(json.dumps({"run": run, "not_run": not_run, "elsewhere": elsewhere, "family": family}, indent=1))
         return 0
+    if args.command == "landing-round-two":
+        if not os.environ.get("FLEET_OUT"):
+            p.error("landing-round-two needs FLEET_OUT")
+        try:
+            landing_round_two(Path(os.environ["FLEET_OUT"]).resolve())
+        except (OSError, ValueError, subprocess.CalledProcessError) as error:
+            p.error(f"landing round 2: {error}")
+        finally:
+            cleanup = hosts_registry.launch(subprocess.run, ["bash", "scripts/release-gate.sh", "clean"], check=False)
+        return cleanup.returncode
     if args.command == "report":
         sides = pairs(args.side, "--side")
         passes = load_passes(args.passes)
@@ -3811,35 +3929,66 @@ def main() -> int:
         floor = timing["floor"] if timing else None
         if args.floor and (not args.floor.is_file() or read_floor(args.floor) != floor):
             errors.append("the requested floor differs from the floor recorded by the passes")
-        summary = gate(passes, sides, args.candidate, [s for s in args.require.split(",") if s], args.harness_revision,
-                       args.min_blocks, args.diagnostic, pairs(args.not_run, "--not-run"),
-                       cases_registry.load(), pairs(args.elsewhere, "--elsewhere"), context, family,
-                       floor, timing_errors=errors)
+        landing_pairing = first is not None and bool(first.get("landing"))
+        try:
+            summary = gate(passes, sides, args.candidate, [s for s in args.require.split(",") if s], args.harness_revision,
+                           args.min_blocks, args.diagnostic, pairs(args.not_run, "--not-run"),
+                           cases_registry.load(), pairs(args.elsewhere, "--elsewhere"), context, family, floor,
+                           timing_errors=errors, require_valid_passes=landing_pairing)
+        except ValueError as error:
+            p.error(str(error))
         summary["timing_inputs"] = timing
+        landing = bool(os.environ.get("GATE_LANDING")) or landing_pairing
+        if landing:
+            summary["landing"] = True
         for key in ("round", "max_gb", "ram_gb", "layouts"):
             if key in summary["context"]:
                 summary["context"][key] = float(summary["context"][key]) if "gb" in key else int(summary["context"][key])
         if first is not None:
             try:
+                if landing_pairing:
+                    different = round_input_errors([[first, summary]])
+                    screened = landing_screen_cases(first)
+                    incomplete = (set(summary["planned"]) != set(screened) or
+                                  len({p["block"] for p in summary["passes"]}) != LANDING_BLOCKS)
+                    if different or incomplete:
+                        raise ValueError(", ".join(different) if different else
+                                         "round 2 did not time the screened cases in eight blocks")
                 summary.update(landing_pair(first, summary))
             except ValueError as error:
                 p.error(str(error))
+            if landing_pairing:
+                omitted = set(first["planned"]) - set(summary["planned"])
+                summary["candidate_failures"].update(
+                    (case, why) for case, why in first["candidate_failures"].items() if case in omitted)
+                for key in ("blocking", "other_blocking"):
+                    summary[key].extend(line for line in first[key]
+                                        if line.split(":", 1)[0].split(" against ", 1)[0] in omitted)
+                summary["passed"] = summary["passed"] and not summary["blocking"]
         if args.inputs and args.inputs.is_file():
             summary["inputs"] = args.inputs.read_text(encoding="utf-8").splitlines()
         summary["quiet"], notes = quiet_verdicts(args.passes)
         summary["host_notes"] = [*summary.get("host_notes", []), *notes]
         prepared = {(p["report"].get("prepared") or {}).get("manifest_sha256") for p in passes}
         summary["prepared_manifest"] = sorted(map(str, prepared))
-        # The part's run this report is of: the newest attempt record beside the report.
-        record, _ = newest_attempt(args.json.parent, "timed") if args.json else (None, None)
+        record = None
+        if args.json:
+            # A paired report is staged away from its results and their attempt records.
+            results = args.passes.parent if first is not None else args.json.parent
+            record, _ = newest_attempt(results, "timed")
         summary["attempt"] = record["attempt"] if record else None
         text = render(summary, first)
         print(text)
         if output:
             hosts_registry.evidence_path(output, private).write_text(text, encoding="utf-8")
         if json_output:
-            hosts_registry.evidence_path(json_output, private).write_text(json.dumps(summary, indent=1, default=str), encoding="utf-8")
-        return 0 if summary["passed"] else 1
+            if landing:
+                publish(json_output, summary)
+            else:
+                hosts_registry.evidence_path(json_output, private).write_text(
+                    json.dumps(summary, indent=1, default=str), encoding="utf-8")
+        # A completed pair can record a timing loss or an earlier correctness failure.
+        return 0 if summary["passed"] or (first is not None and not summary["errors"]) else 1
     if args.command == "floor":
         summary = json.loads(args.report.read_text(encoding="utf-8"))
         floor = noise_floor(summary)
@@ -4021,29 +4170,39 @@ def main() -> int:
                 print(f"  {path}: {len(job['steps']) - 3} blocks, est {job['est_min']} min")
         return 0
     if args.command == "jobs":
-        import subprocess
         rev = lambda r: subprocess.run(["git", "-C", args.checkout, "rev-parse", r], capture_output=True,  # noqa: E731
                                        text=True, check=True).stdout.strip()
         candidate = rev(args.candidate)
+        base = rev(args.base)
+        if args.blocks < 1:
+            p.error("the number of blocks must be positive")
+        if args.mode == "C" and not product_changed(args.checkout, base, candidate):
+            print("no product change: nothing to time")
+            return 0
         harness = rev(args.harness or candidate)
+        if args.mode == "C" and git_line(args.checkout, "grep", "-qE", "-e",
+                                         f"^PAIRED_REPORT_VERSION = {PAIRED_REPORT_VERSION}$",
+                                         harness, "--", "benches/fast/release_gate.py") is None:
+            p.error(f"mode C requires a harness with paired report version {PAIRED_REPORT_VERSION}: {harness}")
+        main_side = rev(args.main or (args.base if args.mode else MAIN))
         # The harness's calibration, and batched timing only where every side's perf lab batches.
         shown = subprocess.run(["git", "-C", args.checkout, "show", f"{harness}:benches/fast/measure.toml"],
                                capture_output=True, text=True)
         measure = read_measure(shown.stdout if shown.returncode == 0 else None)
         batch = all(subprocess.run(["git", "-C", args.checkout, "grep", "-q", "-e", '"--batch"', r, "--",
                                     "crates/nrese-store/examples"], capture_output=True).returncode == 0
-                    for r in {candidate, rev(args.base), rev(args.main)})
+                    for r in {candidate, base, main_side})
         prefix = args.id or f"rg-{candidate[:8]}"
         found = jobs(candidate, harness, args.checkout, prefix,
-                     args.blocks, args.cases, rev(args.base), rev(args.main), max_gb=args.max_gb,
+                     args.blocks, args.cases, base, main_side, max_gb=args.max_gb,
                      checks=not args.no_checks, big_gb=None if args.no_big else args.big_gb,
                      measure=measure, batch=batch, layouts=args.layouts,
-                     catalog=cases_registry.load_at(args.checkout, harness))
+                     catalog=cases_registry.load_at(args.checkout, harness), mode=args.mode)
         out = args.out or hosts_registry.jobs_dir()
         path = hosts_registry.write_job(out / f"{prefix}.set.toml",
                                         toml_set({"id": prefix, "fail": "continue"}, list(found.values())),
                                         args.checkout, found.values())
-        print(set_plan(found, prefix, candidate, harness, rev(args.base), rev(args.main), measure))
+        print(set_plan(found, prefix, candidate, harness, base, main_side, measure))
         print(f"  set file: {path}")
         if not (args.plan or args.submit):
             print(f"  not checked or submitted: --plan asks fleet where it can run, --submit submits it")
