@@ -70,7 +70,9 @@
 #                                  releases, never resting on another commit's nightly result
 #                                  (a requirement it doesn't meet yet). Its pass is its own tier's
 #                                  (scripts/lib/gate-key.sh): it never stands for a push pass,
-#                                  nor a push pass for it, and it lands nothing.
+#                                  nor a push pass for it, and it lands nothing. Beside it, a job of its
+#                                  own runs `nightly-outside` (below): the outside reasoners' check,
+#                                  which needs Docker; its verdict is its own job's.
 #        scripts/check.sh [all]    milestones and CI: everything, both Cargo workspaces,
 #                                  doc tests, cargo-deny, the console.
 #        scripts/check.sh crates FILE...
@@ -314,6 +316,39 @@ reported() {
 ignored_test() {
   "$guarded" nextest run --locked --no-fail-fast --no-tests=fail --run-ignored only -p "$1" \
     -E "binary_id($1::$2) & test(=$3)"
+}
+# The known open faults (scripts/lib/known-faults.tsv), alone: each listed #[ignore]d test by its exact
+# name. Its exit is 0 or nextest's 100 (tests ran, some failed): the receipt judges each outcome. Anything
+# else (no build, no test selected) fails the step.
+known_faults() {
+  local filter code=0
+  filter=$(awk -F'\t' '!/^#/ && NF { split($1, t, " "); f = f (f ? " | " : "") "(binary_id(" t[1] ") & test(=" t[2] "))" }
+    END { print f }' scripts/lib/known-faults.tsv) || return 2
+  "$guarded" nextest run --locked --no-fail-fast --no-tests=fail --run-ignored only --workspace -E "$filter" || code=$?
+  [ $code -eq 0 ] || [ $code -eq 100 ]
+}
+# NAME FIRST CASES: benches/reasoning/dl/outside.sh over seeds FIRST.. (CASES of them) into $out/NAME,
+# its exit kept in $out/NAME/exit for the counts (scripts/lib/outside-counts.py), which judge it. Within
+# what is left of the outside check's 30 minutes ($outside_by): the run, its 20 s kill grace and the
+# removal of the containers it leaves (labelled with the job, removed by that label alone, 25 s each,
+# and 5 s more to kill, for the listing and the removal) all end 10 s before it. No time left is exit
+# 124, as a timeout's.
+outside_block() {
+  local left=$((outside_by - SECONDS)) code=0 left_over
+  mkdir -p "$out/$1"
+  if [ $left -gt 120 ]; then
+    NRESE_FUZZ_SEED=$2 NRESE_FUZZ_CASES=$3 NRESE_DL_WORKERS=3 DL_OUTSIDE_LABEL=fleet.job=${FLEET_JOB:-none} \
+      timeout --kill-after=20 $((left - 90)) sh benches/reasoning/dl/outside.sh "$out/$1" || code=$?
+  else
+    code=124
+  fi
+  echo "$code" > "$out/$1/exit"
+  [ $code -ne 124 ] && [ $code -ne 137 ] || echo "$1: over the outside check's 30 minutes" >&2
+  [ ! -f "$out/$1/counts.txt" ] || sed 's/^/  /' "$out/$1/counts.txt"
+  left_over=$(timeout -k 5 25 docker ps -aq --filter "label=fleet.job=${FLEET_JOB:-none}")
+  # shellcheck disable=SC2086
+  [ -z "$left_over" ] || { echo "$1: removing its containers left: $left_over"; timeout -k 5 25 docker rm -f $left_over > /dev/null; }
+  return 0
 }
 # STEP=SELECTION...: the receipt of the run (scripts/lib/nightly-receipt.py), with the gate's own
 # fields: the commit, its tree, tracked changes, the build identity (scripts/lib/gate-key.sh), the host,
@@ -663,6 +698,11 @@ if [ "$mode" = windows ] && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
   git cat-file -e "$push_commit:scripts/lib/windows-job.ps1" 2> /dev/null \
     || { echo "$(git rev-parse --short "$push_commit") has no Windows tier (scripts/lib/windows-job.ps1): it can't be checked" >&2; exit 2; }
 fi
+# The nightly run's outside check runs in its own fleet job only (scripts/lib/fleet-gate.sh nightly).
+if [ "$mode" = nightly-outside ] && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
+  echo "nightly-outside runs in its fleet job only: scripts/check.sh nightly submits it" >&2
+  exit 2
+fi
 # The nightly run checks one commit, whole, by its own check.sh, so a commit from before the tier
 # can't be checked.
 if [ "$mode" = nightly ] && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
@@ -906,8 +946,11 @@ case "$mode" in
     # - count past 64 bits: a COUNT past 2^64 (the n³ statements of 2.7 M equal identities) fails as
     #   the engine's range limit and never answers a wrapped number (nrese-sparql's
     #   a_count_past_64_bits_fails_as_a_range_limit, #[ignore]d for its size: alone, by its exact name).
+    # - known open faults: the tests of scripts/lib/known-faults.tsv, each #[ignore]d and failing while
+    #   its fault is there: alone, by exact name; none listed, no step.
     # - receipt: one outcome per test of the inventory, each step's selection whole: no test it
-    #   selected without an outcome, none with two, none outside the inventory.
+    #   selected without an outcome, none with two, none outside the inventory; a known open fault
+    #   that fails counted and named apart, one that passes red.
     # A later full run (the status sweep's, the whole suite contracts') is a step here, not a job, with
     # its selection in the receipt.
     mapfile -t everything < <(workspace_packages)
@@ -919,7 +962,38 @@ case "$mode" in
     step "test (full forms)" reported full-forms run_tests "${everything[@]}"
     count=equality_answer_tests::a_count_past_64_bits_fails_as_a_range_limit
     step "count past 64 bits" reported count ignored_test nrese-sparql it "$count"
-    step receipt receipt full-forms=not-ignored "count=exact:nrese-sparql::it/$count"
+    known=()
+    if grep -q '^[^#]' scripts/lib/known-faults.tsv; then
+      step "known open faults" reported known known_faults
+      known=(known=known)
+    fi
+    step receipt receipt full-forms=not-ignored "count=exact:nrese-sparql::it/$count" "${known[@]}"
+    ;;
+  nightly-outside)
+    # The nightly run's outside check, a fleet job of its own beside it (scripts/lib/fleet-gate.sh
+    # nightly submits it; its references run in Docker, which the gate's job never reaches): the store's
+    # owl2-dl answers against HermiT and Openllet (benches/reasoning/dl/outside.sh, its planted faults
+    # first) on generated OWL 2 DL, in two blocks, each run to its end; the last step judges both:
+    # - outside (fixed seeds): seeds 0..1999, the same every night.
+    # - outside (fresh seeds): 1,000 more, from the commit and the day, clear of 0..4999.
+    # - outside counts (scripts/lib/outside-counts.py): each block's cases compared and dropped by reason.
+    #   It fails on a block whose run didn't end cleanly (a seed missing, a planted fault missed, a crash,
+    #   a timeout); on a fixed seed's difference both references hold against the store; and on an empty
+    #   run, fewer than half the fixed block's cases compared. A fresh seed's difference is listed for a
+    #   reader (outside/outside.json, new_disagreements), never a failure. Left out of the comparison,
+    #   counted: a key over a property that isn't simple (outside the references' OWL 2 DL), cases where
+    #   the references split, on a row or a key control (neither is an oracle then), or give no answer,
+    #   writes the store declines as undecided.
+    # Budget: 20 minutes, a cold build included (3,000 cases took 7 min, the release build 6); both blocks
+    # end within 30 minutes of the first, their cleanup included, or fail.
+    out=${FLEET_OUT:-$(mktemp -d)}/outside
+    mkdir -p "$out" || exit 2
+    outside_by=$((SECONDS + 1800))
+    first=$(printf '%s %s' "$(git rev-parse HEAD)" "$(date -u +%F)" | sha256sum | cut -c1-6)
+    first=$((5000 + 1000 * (16#$first % 1000000)))
+    step "outside (fixed seeds)" outside_block fixed 0 2000
+    step "outside (fresh seeds)" outside_block fresh "$first" 1000
+    step "outside counts" python scripts/lib/outside-counts.py "$out" 2000 "$first" 1000
     ;;
   all)
     step fmt cargo fmt --all --check
@@ -941,7 +1015,7 @@ case "$mode" in
     console
     ;;
   *)
-    echo "usage: scripts/check.sh commit|push|quick|windows [COMMIT]|nightly [COMMIT]|all" >&2
+    echo "usage: scripts/check.sh commit|push|quick|windows [COMMIT]|nightly [COMMIT]|nightly-outside|all" >&2
     exit 2
     ;;
 esac

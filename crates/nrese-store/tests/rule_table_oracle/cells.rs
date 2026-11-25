@@ -698,7 +698,7 @@ fn long_property_chain_reaches_its_endpoint() {
 }
 
 #[test]
-#[ignore = "undocumented: declaring owl:sameAs irreflexive is accepted despite its diagonal"]
+#[ignore = "known open fault, run by the nightly tier: scripts/lib/known-faults.tsv"]
 fn irreflexive_same_as_is_inconsistent() {
     // Spec: Table 4 eq-ref gives the diagonal, which Table 5 prp-irp forbids.
     check(
@@ -716,7 +716,7 @@ fn irreflexive_same_as_is_inconsistent() {
 }
 
 #[test]
-#[ignore = "rows, not the word: literal equalities kept beside the store come with v1.6; until then such reads are withheld from complete (it::literal_equality_status_tests)"]
+#[ignore = "known open fault, run by the nightly tier: scripts/lib/known-faults.tsv"]
 fn functional_literal_equality_reaches_later_writes() {
     // Spec: Table 5 prp-fp equates the two forms; Table 4 eq-rep-o copies
     // either one into the later row. Table 8 dt-diff sees one data value.

@@ -14,9 +14,10 @@ the §0 guards green and the W3C suites' counts what they must be?
         the declared kits (--run: launched here first), each one's outcome and its suites' counts
     release_gate.py guards [--names NAMES] --log LOG [--run --identity ID] [--json JSON]
     release_gate.py verdict --candidate REV [--checkout DIR] --timed JSON [--timed JSON] --w3c JSON
-                            --guards JSON [--out MD]
+                            --guards JSON [--full-correctness] [--out MD]
         every part, each bound to REV's tree (a check by its receipt), under the policy at REV
-        (benches/release-tradeoffs.toml)
+        (benches/release-tradeoffs.toml), the known open faults at REV named
+        (scripts/lib/known-faults.tsv); --full-correctness: a cut that claims it needs that list, empty
 
 Each subcommand exits 0 only when its part passes; `verdict` only when every part does.
 """
@@ -3352,12 +3353,26 @@ def known_lines(timed: list[dict], policy: Policy) -> tuple[list[str], list[str]
     return lines, blocking
 
 
+KNOWN_FAULTS = "scripts/lib/known-faults.tsv"
+
+
+def known_faults(text: str | None) -> list[tuple[str, str]] | None:
+    """The known open faults a tree lists (KNOWN_FAULTS, its TEXT; None: the tree has no list): each
+    test's id and what is wrong."""
+    if text is None:
+        return None
+    return [tuple(line.split("\t", 1)) for line in text.splitlines() if line.strip() and not line.startswith("#")]
+
+
 def verdict(timed: list[dict], w3c: dict, guards: dict, policy: Policy = NO_POLICY,
-            evidence: list[str] | None = None) -> tuple[bool, str]:
+            evidence: list[str] | None = None, open_faults: list[tuple[str, str]] | None = (),
+            full_correctness: bool = False) -> tuple[bool, str]:
     """Every part together: the family over every timed part decided (decide()), the other blocks
     of every round, the cases one part left to another, the W3C counts and the guards, under the
     owner's POLICY (none: nothing the bar forbids is accepted). EVIDENCE: what binding the parts to
-    the candidate found (release_verdict(), the command's only way here)."""
+    the candidate found (release_verdict(), the command's only way here). OPEN_FAULTS: the candidate's
+    known open faults (known_faults(); None: it lists none, not even an empty list), named for the cut's
+    notes; a cut that claims FULL_CORRECTNESS needs a list, and an empty one."""
     parts = rounds_of(timed)
     if errors := round_input_errors(parts):
         return False, "# Release verdict\n\n" + "\n".join(f"- {e}" for e in errors) + "\n\n**NOT PASSED**\n"
@@ -3460,7 +3475,14 @@ def verdict(timed: list[dict], w3c: dict, guards: dict, policy: Policy = NO_POLI
                  f"({'; '.join(map(str, w3c.get('errors') or [])) or 'every suite as required'})")
     lines.append(f"- §0 guards: {'passed' if guards_ok else 'NOT passed'} "
                  f"({'; '.join(map(str, (guards.get('errors') or [])[:5])) or str(guards.get('guards')) + ' guards ran and passed'})")
-    passed = (not blocking_losses and not blocking_emerged and not d["pending"] and not not_compared and not other
+    unclaimed = full_correctness and (open_faults is None or len(open_faults) > 0)
+    mark = "**known open fault**" if unclaimed else "known open fault"
+    lines += [f"- {mark}: {test}: {about}" for test, about in open_faults or []]
+    lines.append("- known open faults: "
+                 + (f"no list ({KNOWN_FAULTS})" if open_faults is None else str(len(open_faults)))
+                 + ("; a cut that claims full correctness needs a list, and an empty one" if unclaimed else ""))
+    passed = (not unclaimed
+              and not blocking_losses and not blocking_emerged and not d["pending"] and not not_compared and not other
               and not errors
               and not diagnostic and not missing and not empty and w3c_ok and guards_ok
               and not evidence and not policy.errors and not wrong)
@@ -3626,13 +3648,15 @@ def evidence_errors(timed: list[dict], checks: dict[str, dict | None], candidate
 def release_verdict(timed: list[dict], w3c: dict | None, guards: dict | None, candidate: Candidate,
                     policy: Policy, contract: Contract,
                     attempts: dict[str, tuple[dict | None, str | None]],
-                    timed_attempts: list[tuple[dict | None, str | None]]) -> tuple[bool, str]:
+                    timed_attempts: list[tuple[dict | None, str | None]],
+                    open_faults: list[tuple[str, str]] | None = (),
+                    full_correctness: bool = False) -> tuple[bool, str]:
     """`verdict`: the parts bound to the candidate, each check to its step's latest attempt (ATTEMPTS)
     and each timed part's report to its part's (TIMED_ATTEMPTS)
     and to its tree's contract (evidence_errors()), under its tree's policy. A check without a result
-    (None) is no pass."""
+    (None) is no pass. OPEN_FAULTS, FULL_CORRECTNESS: as verdict()'s."""
     evidence = evidence_errors(timed, {"w3c": w3c, "guards": guards}, candidate, contract, attempts, timed_attempts)
-    passed, text = verdict(timed, w3c or {}, guards or {}, policy, evidence)
+    passed, text = verdict(timed, w3c or {}, guards or {}, policy, evidence, open_faults, full_correctness)
     head, rest = text.split("\n", 1)
     return passed, f"{head}\n\nCandidate: {candidate.commit} (tree {candidate.tree})\n{rest}"
 
@@ -3761,6 +3785,8 @@ def main() -> int:
     s.add_argument("--timed", type=Path, action="append", required=True)
     s.add_argument("--w3c", type=Path, required=True)
     s.add_argument("--guards", type=Path, required=True)
+    s.add_argument("--full-correctness", action="store_true",
+                   help=f"a cut that claims full correctness: it needs {KNOWN_FAULTS} at the candidate, empty")
     s.add_argument("--out", type=Path)
     s = sub.add_parser("measured-at", help="the commit a side is built and timed from (release-gate.sh build)")
     s.add_argument("rev")
@@ -4083,8 +4109,11 @@ def main() -> int:
         attempts[kind] = newest_attempt(path.parent, kind)
     if not all(isinstance(part, dict) for part in [*timed, *(c for c in checks.values() if c is not None)]):
         p.error("verdict: every part is a JSON object (release-gate.json, w3c.json, guards.json)")
+    # The known open faults as the candidate's tree lists them (None: it has no list).
+    open_faults = known_faults(git_line(args.checkout, "show", f"{commit}:{KNOWN_FAULTS}"))
     passed, text = release_verdict(timed, checks["w3c"], checks["guards"], candidate, policy, contract, attempts,
-                                   [newest_attempt(path.parent, "timed") for path in args.timed])
+                                   [newest_attempt(path.parent, "timed") for path in args.timed],
+                                   open_faults, args.full_correctness)
     print(text)
     if args.out:
         hosts_registry.evidence_path(args.out, any(private_report(report) for report in timed),

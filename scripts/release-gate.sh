@@ -29,7 +29,10 @@
 #                                           runs it
 #   release-gate.sh verdict CAND TIMED_DIR... CHECKS_DIR   every part together, each host's rounds
 #                                           combined, every part bound to CAND's tree, under the
-#                                           policy CAND's tree holds (benches/release-tradeoffs.toml)
+#                                           policy CAND's tree holds (benches/release-tradeoffs.toml), its
+#                                           known open faults named (scripts/lib/known-faults.tsv); with
+#                                           GATE_FULL_CORRECTNESS=1, a cut that claims full correctness,
+#                                           it passes only with that list at CAND, empty
 #   release-gate.sh jobs CAND [OPTIONS]     the fleet jobs of a whole gate (release_gate.py jobs --help)
 #   release-gate.sh clean                   the gate's worktrees and build trees, and what dead invocations
 #                                           of its process space left (binaries and data stay; a live
@@ -830,7 +833,7 @@ verdict)
   }
   w3c=$(one w3c.json "$1") && guards=$(one guards.json "$1") || exit 2
   py "$CODE/benches/fast/release_gate.py" verdict --checkout "$launch" --candidate "$candidate" "${args[@]}" \
-    --w3c "$w3c" --guards "$guards" --out "$OUT/verdict.md"
+    --w3c "$w3c" --guards "$guards" ${GATE_FULL_CORRECTNESS:+--full-correctness} --out "$OUT/verdict.md"
   ;;
 
 pack)
