@@ -644,6 +644,11 @@ fn import_into(
         deadline,
     )?;
     import.to.data.extend(&conclusion.data);
+    let (b, cb) = (&mut import.to.builtin, conclusion.builtin);
+    b.top_object = b.top_object.or(cb.top_object);
+    b.bottom_object = b.bottom_object.or(cb.bottom_object);
+    b.top_data = b.top_data.or(cb.top_data);
+    b.bottom_data = b.bottom_data.or(cb.bottom_data);
     let mut axioms = Vec::with_capacity(conclusion.axioms.len());
     for a in &conclusion.axioms {
         axioms.push(import.axiom(a)?);
@@ -709,6 +714,8 @@ pub(crate) fn admit_and_prepare(
             origin.push(Origin::Conclusion);
         }
     }
+    drop(p_it);
+    drop(c_it);
 
     let saved = (
         take(&mut o.anonymous),
@@ -730,6 +737,9 @@ pub(crate) fn admit_and_prepare(
     o.annotation_axioms = merge(&saved.2, &conclusion.annotation_axioms);
     o.axioms = joint;
 
+    if deadline.passed() {
+        return Err(Stopped::Time.into());
+    }
     let findings = nrese_owl::membership(o, terms);
     let blocks_j = |d: &Diagnostic| match *d {
         Diagnostic::AnonymousIndividual { node, axioms, .. } => {

@@ -465,6 +465,7 @@ pub(crate) fn check_global_restrictions(
         }
     }
     let mut found = Vec::new();
+    let mut memo = (!needing.is_empty()).then(|| vec![None; ontology.classes.len()]);
     for (index, axiom) in ontology.axioms.iter().enumerate() {
         let direct = match axiom {
             Axiom::ObjectCharacteristic(
@@ -496,14 +497,16 @@ pub(crate) fn check_global_restrictions(
             });
             continue;
         }
-        for expr in expressions_of(axiom) {
-            if let Some(&(property, what)) = uses_any(ontology, expr, &needing) {
-                found.push(Diagnostic::NonSimpleProperty {
-                    property,
-                    axiom: index,
-                    what,
-                });
-                break;
+        if let Some(memo) = memo.as_deref_mut() {
+            for expr in expressions_of(axiom) {
+                if let Some((property, what)) = uses_any(ontology, expr, &needing, memo) {
+                    found.push(Diagnostic::NonSimpleProperty {
+                        property,
+                        axiom: index,
+                        what,
+                    });
+                    break;
+                }
             }
         }
     }
@@ -631,35 +634,54 @@ fn push_expressions(axiom: &Axiom, out: &mut Vec<u32>) {
     }
 }
 
-/// The first expression in `id`'s subexpressions that `needing` names.
-fn uses_any<'a>(
+fn class_children(expr: &ClassExpr) -> &[crate::ExprId] {
+    match expr {
+        ClassExpr::And(xs) | ClassExpr::Or(xs) => xs,
+        ClassExpr::Not(x)
+        | ClassExpr::Some(_, x)
+        | ClassExpr::All(_, x)
+        | ClassExpr::Min(_, _, x)
+        | ClassExpr::Max(_, _, x)
+        | ClassExpr::Exact(_, _, x) => std::slice::from_ref(x),
+        _ => &[],
+    }
+}
+
+/// The first expression in `id`'s subexpressions that `needing` names, memoised across axioms.
+// Acyclic: Interner::intern is append-only and immutable (model.rs:211-219), and the RDF
+// reader guards against cyclic blank-node class expressions (mapping.rs:1205-1210).
+fn uses_any(
     ontology: &Ontology,
     id: u32,
-    needing: &'a HashMap<u32, (Term, &'static str)>,
-) -> Option<&'a (Term, &'static str)> {
-    let mut stack = vec![id];
-    let mut seen = HashSet::new();
-    while let Some(id) = stack.pop() {
-        if !seen.insert(id) {
+    needing: &HashMap<u32, (Term, &'static str)>,
+    memo: &mut [Option<Option<(Term, &'static str)>>],
+) -> Option<(Term, &'static str)> {
+    let mut stack = vec![(id, false)];
+    while let Some((cur, post)) = stack.pop() {
+        if post {
+            let hit = class_children(ontology.classes.get(cur))
+                .iter()
+                .find_map(|&c| memo[c.0 as usize].flatten());
+            memo[cur as usize] = Some(hit);
+            continue;
+        }
+        if memo[cur as usize].is_some() {
             continue;
         }
         #[cfg(any(test, all(feature = "witness", debug_assertions)))]
         NON_SIMPLE_EXPANSIONS.with(|c| c.set(c.get() + 1));
-        if let Some(found) = needing.get(&id) {
-            return Some(found);
+        if let Some(&hit) = needing.get(&cur) {
+            memo[cur as usize] = Some(Some(hit));
+            continue;
         }
-        match ontology.classes.get(id) {
-            ClassExpr::And(xs) | ClassExpr::Or(xs) => stack.extend(xs.iter().map(|x| x.0)),
-            ClassExpr::Not(x)
-            | ClassExpr::Some(_, x)
-            | ClassExpr::All(_, x)
-            | ClassExpr::Min(_, _, x)
-            | ClassExpr::Max(_, _, x)
-            | ClassExpr::Exact(_, _, x) => stack.push(x.0),
-            _ => {}
+        memo[cur as usize] = Some(None);
+        let kids = class_children(ontology.classes.get(cur));
+        if !kids.is_empty() {
+            stack.push((cur, true));
+            stack.extend(kids.iter().map(|c| (c.0, false)));
         }
     }
-    None
+    memo[id as usize].flatten()
 }
 
 #[cfg(any(test, all(feature = "witness", debug_assertions)))]

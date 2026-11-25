@@ -535,19 +535,38 @@ impl StoreService {
                 premise: checked.verdict,
             });
         }
+        if conclusion
+            .iter()
+            .any(|t| matches!(t.object, Term::Triple(_)))
+        {
+            return Ok(DlEntailment {
+                answer: Entailed::Unknown(
+                    "the conclusion holds a triple term, which OWL 2 doesn't define".to_owned(),
+                ),
+                premise: checked.verdict,
+            });
+        }
         // The OWL vocabulary and the fresh names are system vocabulary, shared (dictionary
         // lifecycle V1); the conclusion's terms are the request's own, in a private
         // vocabulary charged to its envelope, past the premise's ids.
         source::intern_system_vocabulary(self.engine())?;
         let tx = source::private_over(self.engine(), snapshot, Arc::new(memory.part()));
         let (mut blanks, mut probes, mut late) = (std::collections::HashMap::new(), 0u64, false);
+        let mut blank_scratch = nrese_dl::memory::Scratch::new(Some(&memory));
         let mut id = |t: Term| -> nrese_engine::EngineResult<u64> {
             if late {
                 return Ok(0);
             }
             let t = match t {
                 Term::BlankNode(b) => {
-                    match fresh_blank(&tx, &mut blanks, &mut probes, deadline, &b) {
+                    match fresh_blank(
+                        &tx,
+                        &mut blanks,
+                        &mut blank_scratch,
+                        &mut probes,
+                        deadline,
+                        &b,
+                    )? {
                         Some(mapped) => Term::BlankNode(mapped),
                         None => {
                             late = true;
@@ -576,6 +595,8 @@ impl StoreService {
                 })
             })
             .collect();
+        drop(blanks);
+        drop(blank_scratch);
         if late {
             return Ok(DlEntailment {
                 answer: Entailed::Unknown(
@@ -679,19 +700,34 @@ impl StoreService {
 fn fresh_blank(
     tx: &nrese_engine::PrivateTransaction<'_>,
     blanks: &mut std::collections::HashMap<String, nrese_rdf::BlankNode>,
+    scratch: &mut nrese_dl::memory::Scratch,
     probes: &mut u64,
     deadline: Deadline,
     blank: &nrese_rdf::BlankNode,
-) -> Option<nrese_rdf::BlankNode> {
+) -> nrese_engine::EngineResult<Option<nrese_rdf::BlankNode>> {
     if let Some(existing) = blanks.get(blank.as_str()) {
-        return Some(existing.clone());
+        return Ok(Some(existing.clone()));
     }
+    let table = |n: usize| {
+        if n == 0 {
+            0
+        } else {
+            n.saturating_mul(8)
+                .div_ceil(7)
+                .max(4)
+                .next_power_of_two()
+                .saturating_mul(std::mem::size_of::<(String, nrese_rdf::BlankNode)>() + 1)
+        }
+    };
+    let growth = table(blanks.len() + 1).saturating_sub(table(blanks.len()));
+    let strings = blank.as_str().len().saturating_mul(2).saturating_add(32);
+    scratch.charge(|| growth + strings)?;
     for k in 0u64.. {
         *probes = probes.saturating_add(1);
         if *probes >= 4_096 {
             *probes = 0;
             if deadline.passed() {
-                return None;
+                return Ok(None);
             }
         }
         let cand = nrese_rdf::BlankNode::new_unchecked(format!("nresec{k}x{}", blank.as_str()));
@@ -708,9 +744,9 @@ fn fresh_blank(
                         .iter()
                         .map(|(k, v)| k.capacity() + v.as_str().len())
                         .sum::<usize>();
-                blank_test_hooks::record(held, 0);
+                blank_test_hooks::record(held, scratch.bytes());
             }
-            return Some(cand);
+            return Ok(Some(cand));
         }
     }
     unreachable!()

@@ -252,8 +252,10 @@ impl Check<'_> {
     fn expression(&mut self, id: ExprId, by_axiom: bool) {
         let mut stack = vec![(id, by_axiom)];
         while let Some((id, by_axiom)) = stack.pop() {
-            // Only the walks from an axiom are remembered: one from an assertion marks less.
-            if by_axiom && !self.classes.insert(id) {
+            // Only named classes mark differently from an assertion; compound roots reuse the cache.
+            if (by_axiom || !matches!(self.o.class(id), ClassExpr::Class(_)))
+                && !self.classes.insert(id)
+            {
                 continue;
             }
             match self.o.class(id) {
