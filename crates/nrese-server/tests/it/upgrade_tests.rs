@@ -46,14 +46,26 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Spec: a certified store written by the released server opens with its assertions
-/// and unaffected answers intact. A stale hidden membership disappears on the first
-/// start and the resulting certificate stands on the second.
-/// The v1.5.0 ruleset fingerprint already requires startup rematerialisation. The
-/// scoped reasoning-state unit test isolates the change to the hidden-class salt.
+/// The v1.5.0 ruleset fingerprint already requires startup rematerialisation.
 #[tokio::test]
 async fn released_hidden_union_is_revalidated_once() -> Result<(), Box<dyn std::error::Error>> {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hidden-union-v1.5.0");
+    check_hidden_union_upgrade("hidden-union-v1.5.0").await
+}
+
+/// The previous line uses the same ruleset fingerprint. The hidden-class salt
+/// makes this certificate stale.
+#[tokio::test]
+async fn line_hidden_union_is_revalidated_once() -> Result<(), Box<dyn std::error::Error>> {
+    check_hidden_union_upgrade("hidden-union-line-58e547384").await
+}
+
+/// Spec: a certified store opens with its assertions and unaffected answers intact.
+/// A stale hidden membership disappears on the first start and the resulting
+/// certificate stands on the second.
+async fn check_hidden_union_upgrade(fixture_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(fixture_name);
     let directory = tempfile::tempdir()?;
     let data = directory.path().join("data");
     copy_dir(&fixture.join("data"), &data)?;
@@ -61,7 +73,7 @@ async fn released_hidden_union_is_revalidated_once() -> Result<(), Box<dyn std::
     let prior = std::fs::read(&marker)?;
     let config = configure(directory.path(), &data)?;
     let mut converted = Vec::new();
-    for first in [true, false] {
+    for start in 1..=2 {
         let server =
             Server::start_with(&config, &[("NRESE_REASONING_UNNAMED_CLASSES", "skip")]).await?;
         let prefix =
@@ -86,11 +98,14 @@ async fn released_hidden_union_is_revalidated_once() -> Result<(), Box<dyn std::
                 .error_for_status()?
                 .json()
                 .await?;
-            assert_eq!(answer["boolean"], wanted, "{pattern}");
+            assert_eq!(
+                answer["boolean"], wanted,
+                "{fixture_name}, start {start}: {pattern}"
+            );
         }
         let info: serde_json::Value = serde_json::from_str(&server.get("/dataset/info").await?)?;
         assert_eq!(info["quad_count"], 8, "all asserted statements remain");
-        if first {
+        if start == 1 {
             converted = std::fs::read(&marker)?;
             assert_ne!(converted, prior);
         } else {
