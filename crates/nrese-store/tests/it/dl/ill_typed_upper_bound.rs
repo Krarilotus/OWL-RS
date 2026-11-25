@@ -75,6 +75,20 @@ fn an_ill_typed_literal_withholds_the_word_after_a_write() {
 }
 
 #[test]
+fn an_ill_typed_literal_withholds_the_word_after_a_tableau_check() {
+    let dl = pipeline();
+    // U1 puts :a in both disjuncts and clashes. A model needs only one of them.
+    insert(
+        &dl,
+        &format!("{OFF_RULES} :a a :A . :B owl:disjointWith :C . {MARKER} {ILL_TYPED}"),
+    )
+    .expect("write applies");
+    let status = dl.store().dl().status().expect("the write's DL verdict");
+    assert_eq!(status.consistency.engine, "hypertableau", "{status:?}");
+    check("tableau", &dl, true, false);
+}
+
+#[test]
 fn an_ill_typed_literal_withholds_the_word_after_a_rebuild() {
     let dl = rebuilt(&format!("{OFF_RULES} {MARKER} {ILL_TYPED}"));
     check("rebuild", &dl, true, false);
