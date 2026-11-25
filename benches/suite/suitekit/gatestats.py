@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import itertools
 import math
+import random
 import statistics
+from functools import lru_cache
 
 ALPHA = 0.05
 PAIR_WEIGHTS = (0.9, 0.1)  # rounds (1, 2), then (2, 3)
@@ -78,6 +80,7 @@ def t_sf(t: float, df: float) -> float:
     return tail if t > 0 else 1.0 - tail
 
 
+@lru_cache(maxsize=256)
 def t_ppf(q: float, df: float) -> float:
     """The `q` quantile of Student's t (bisection on t_sf; for intervals, not decisions)."""
     lo, hi = -1e3, 1e3
@@ -135,6 +138,8 @@ def loss_test(contrasts: list[float], layouts: list | None = None, higher_is_bet
         return out
     mean = statistics.fmean(u)
     sd = statistics.stdev(u)
+    out["sample_sd"] = sd
+    out["distinct_units"] = len(set(u))
     if floor > 0:
         least = floor / math.sqrt(len(contrasts) / len(u))
         out["floor"] = least
@@ -186,6 +191,84 @@ def rejectable(p: float, m: int, alpha: float = ALPHA) -> bool:
     """Whether a hypothesis with this p-value could still be rejected by Holm in a family of m
     (the most lenient threshold is alpha itself, the last step)."""
     return p <= alpha
+
+
+# --- after-landing timing ----------------------------------------------------------------------
+
+LANDING_SCREEN = 0.10
+CLEARANCE_PERCENT = 3.0
+ROUND_POWER = 0.90
+SENSITIVITY_DRAWS = 10_000
+
+
+def landing_words(family: list[str], first: dict[str, float], second: dict[str, float] | None = None) -> dict:
+    """Screen the frozen family, then apply Holm to the first two rounds only."""
+    cutoff = LANDING_SCREEN / len(family) if family else 0
+    screened = [h for h in family if first.get(h, 1.0) <= cutoff]
+    result = {"word": "cleared", "screened": screened, "confirmed": []}
+    if not screened:
+        return result
+    if second is None:
+        return {**result, "word": "needs a second round"}
+    eligible = set(screened)
+    adjusted = {h: combine_rounds([first.get(h, 1.0), second.get(h, 1.0) if h in eligible else 1.0])
+                for h in family}
+    rejected = holm(adjusted)
+    if rejected:
+        result.update(word="confirmed loss", confirmed=[h for h in screened if h in rejected])
+    return result
+
+
+@lru_cache(maxsize=16)
+def _normal_mean_and_sd(df: int) -> list[tuple[float, float]]:
+    """Independent standardized mean and sample sd draws for normal units."""
+    rng = random.Random(513)
+    return [(rng.gauss(0, 1), math.sqrt(rng.gammavariate(df / 2, 2) / df))
+            for _ in range(SENSITIVITY_DRAWS)]
+
+
+@lru_cache(maxsize=256)
+def _sensitivity_shift(n: int, m: int, relative_floor: float) -> float:
+    """Smallest standardized mean shift that rejects in 90 % of simulated rounds."""
+    critical = t_ppf(1 - ALPHA * PAIR_WEIGHTS[0] / m, n - 1)
+    # Invert each simulated test at its own clamped sd, then take the empirical quantile.
+    # The shift is in standard errors of the true mean, before clamping.
+    shifts = sorted(critical * max(sd, relative_floor) - mean for mean, sd in _normal_mean_and_sd(n - 1))
+    return shifts[math.ceil(ROUND_POWER * len(shifts)) - 1]
+
+
+def landing_lines(reading: dict | None, m: int, p: float | None, *, below_step: bool = False) -> dict:
+    """The screen's p-value, clearance and sensitivity for one planned dimension."""
+    out = {"p": 1.0, "clearance": "not resolved: not measured", "sensitivity": None}
+    if reading is None or reading["units"] < 2:
+        return out
+    n = reading["units"]
+    floor = reading.get("floor", 0.0)  # loss_test has already scaled it to the units.
+    sd = max(reading["sample_sd"], floor)
+    discrete = reading["distinct_units"] < 4
+    if below_step or reading.get("below_resolution"):
+        out["clearance"] = "not resolved to 3 % (below the counter's step)"
+    elif sd == 0:
+        out["clearance"] = "not resolved: no spread"
+    elif discrete:
+        out["clearance"] = "not resolved to 3 % (discrete counter)"
+    else:
+        log_upper = reading["mean_log"] + t_ppf(0.95, n - 1) * sd / math.sqrt(n)
+        upper = _ceil_percent(log_upper)
+        out["clearance"] = (f"not resolved to 3 % ({upper:.2f} %)" if upper > CLEARANCE_PERCENT
+                            else f"no loss above {upper:.2f} % shown")
+    if p is not None and sd > 0 and not discrete:
+        # Use the effective spread as the true sd estimate, and clamp each simulated sample too.
+        shift = _sensitivity_shift(n, m, floor / sd) * sd / math.sqrt(n)
+        percent = _ceil_percent(shift)
+        two_round_power = 2 * ROUND_POWER - 1
+        out.update(p=p, sensitivity=f"{percent:.2f} % loss at two-round power ≥ {two_round_power * 100:.0f} %")
+    return out
+
+
+def _ceil_percent(log_ratio: float) -> float:
+    """Display at one basis point, rounding toward the more conservative loss."""
+    return math.ceil(10_000 * math.expm1(log_ratio)) / 100
 
 
 # --- power -------------------------------------------------------------------------------------
