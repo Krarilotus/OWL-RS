@@ -143,7 +143,7 @@ pub(crate) fn check_commit(
     // and their gate has admitted the commit on its own facts, as off the route: no DL check.
     let rules = matches!(preparation.prepared, super::bounds::Prepared::Rules(_));
     if preparation.proves_consistency || rules {
-        let ill_typed = match rules && preparation.proves_consistency {
+        let ill_typed = match preparation.proves_consistency {
             true => super::bounds::holds_ill_typed_after(store, tx),
             false => Some(false),
         };
