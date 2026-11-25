@@ -11,7 +11,8 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::reject_view::RejectExplanationView;
-use nrese_store::{MutationReject, RejectKind, ShaclRefusal};
+use nrese_store::service::UndecidedReason;
+use nrese_store::{MutationReject, RejectKind, ShaclRefusal, UndecidedCause};
 
 #[derive(Clone, Debug, Error)]
 pub enum ApiError {
@@ -175,6 +176,8 @@ impl IntoResponse for ApiError {
                 detail,
                 reasoner_reject: *reject,
                 shacl: shacl.as_deref().map(crate::http::refusal_json),
+                undecided: (kind == RejectKind::Undecided(UndecidedCause::NoDecider))
+                    .then_some(UndecidedReason::NO_DECIDER),
             };
             return match shacl.as_deref() {
                 Some(refusal) => shacl_problem(body, refusal),
@@ -263,6 +266,7 @@ impl IntoResponse for ApiError {
                 detail,
                 reasoner_reject: None,
                 shacl: None,
+                undecided: None,
             },
         );
         if let Some(challenge) = challenge {
@@ -285,7 +289,7 @@ impl IntoResponse for ApiError {
 fn reject_label(kind: RejectKind) -> (&'static str, &'static str) {
     match kind {
         RejectKind::Inconsistent => ("reasoner-reject", "Reasoner Reject"),
-        RejectKind::Undecided => ("undecided-reject", "Undecided Reject"),
+        RejectKind::Undecided(_) => ("undecided-reject", "Undecided Reject"),
         RejectKind::ShapesViolated => ("shacl-reject", "SHACL Reject"),
         RejectKind::NotShown => ("commit-reject", "Commit Reject"),
     }
@@ -454,6 +458,8 @@ struct ProblemJson<'a> {
     reasoner_reject: Option<RejectExplanationView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     shacl: Option<crate::http::RefusalJson<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    undecided: Option<UndecidedReason>,
 }
 
 #[cfg(test)]

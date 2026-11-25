@@ -156,6 +156,10 @@ OWL 2 DL with arbitrary rules is undecidable; rules whose variables bind to name
 
 ## Consistency
 
+Under `owl2-ql`, a clean rules assessment leaves consistency `undecided` until a consistency check can decide it. With `gates.undecided = "mark"` (the default), writes with that verdict commit, `/info` names the cause, and reads carry a consistency reason.
+
+With `refuse`, writes with an `undecided` verdict get HTTP 400 `undecided-reject`. A published store with that verdict is quarantined whenever it rebuilds, including after a bulk load, or reopens. This includes an empty store once assessed and a store written under `mark` that is reopened under `refuse`. An ill-typed literal or an interrupted literal check gives `unknown`, and the write can proceed subject to the other gates. OWL 2 DL's existing refusal and quarantine apply under either setting.
+
 - A commit whose closure violates a consistency rule is rejected. The response carries an explanation: the rule, its premises (asserted or inferred) and the likely commit-local trigger. A committer who may not read every graph is shown the premises asserted in graphs it may read; the others (asserted elsewhere, or inferred: a rejected commit's state has no support sets to tell what it could have derived) are counted, not shown, and none of their terms reaches the report.
 - Commit-path checking examines what the commit adds, so it relies on a consistent baseline. When a full materialisation finds violations (data imported without reasoning, or a ruleset switched on later), the store is quarantined:
   - `/readyz` answers 503 with only status `quarantined`; `/api/v1/repositories/{id}/info` gives the violation count to whole-dataset readers or administrators;

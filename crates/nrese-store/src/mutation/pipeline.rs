@@ -4,16 +4,18 @@ use nrese_reasoner::ReasonerService;
 
 use super::attribution::attribute_reject_delta;
 use super::command::{MutationCommand, MutationCommitReport};
+use super::disposition::Route;
 use super::error::{MutationError, RejectKind};
 use super::evidence;
 use super::prepare::{Preparation, cached, ground_key};
 use super::record::ReasoningRunRecord;
 use super::ticket::{MutationTicket, publishing};
+use crate::WhyUndecided;
 use crate::config::{GateSeverity, ShaclGate};
 use crate::delta::MutationDeltaPreview;
 use crate::error::StoreError;
 use crate::graph_store::{GraphDeleteReport, GraphTarget, GraphWriteReport, GraphWriteRequest};
-use crate::service::StoreService;
+use crate::service::{Certificate, StoreService};
 use crate::update::{SparqlUpdateRequest, UpdateExecutionReport};
 
 #[cfg(test)]
@@ -426,10 +428,12 @@ impl MutationPipeline {
                     }
                     detail.push_str(&evidence::trigger(attribution.as_ref()));
                     evidence::Draft {
-                        kind: match undecided {
-                            Some(_) => RejectKind::Undecided,
-                            None => RejectKind::Inconsistent,
-                        },
+                        kind: undecided.map_or(RejectKind::Inconsistent, |why| {
+                            self.store
+                                .dispose(Route::Commit(why))
+                                .refusal()
+                                .expect("an unsettled DL clash is refused")
+                        }),
                         detail,
                         explanation,
                         attribution,
@@ -442,6 +446,22 @@ impl MutationPipeline {
                 });
                 return Err(MutationError::Rejected(Box::new(reject)));
             }
+            let ql_witness = if Certificate::of(tx.base()).is_some_and(Certificate::uses_owl2_ql)
+                && let Some(kind) = self
+                    .store
+                    .dispose(Route::Commit(WhyUndecided::NoQlDecider))
+                    .refusal()
+            {
+                let found = crate::dl::bounds::find_ill_typed_after(&self.store, &tx, &stop);
+                if found == Some(None) {
+                    ticket.claim_error()?;
+                    let view = evidence::EvidenceView::new(&requester.read, &tx);
+                    return Err(MutationError::Rejected(Box::new(view.no_ql_decider(kind))));
+                }
+                Some(found)
+            } else {
+                None
+            };
             self.record_run(ReasoningRunRecord::from_report(
                 &materialisation,
                 None,
@@ -509,7 +529,8 @@ impl MutationPipeline {
             )?;
             // The new record shares the gate's witness. Where the gate did not ask for one,
             // judge it under the writer slot before taking the commit's rights.
-            let witness = dl.as_ref().and_then(|(gate, _, _)| gate.ill_typed);
+            let witness =
+                ql_witness.or_else(|| dl.as_ref().and_then(|(gate, _, _)| gate.ill_typed));
             let certificate = self.store.successor(&tx, literal_equality, witness);
             if !ticket.begin_commit() {
                 return Err(MutationError::Cancelled);

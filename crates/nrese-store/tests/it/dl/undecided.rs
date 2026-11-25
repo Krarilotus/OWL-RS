@@ -498,7 +498,7 @@ fn a_kind_keeping_refusal_on_the_rules_route_is_decided_past_the_reads_budget() 
     assert_eq!(dl.store().dl_bounds().last, "rules", "the store's route");
     assert_eq!(
         control.0,
-        RejectKind::Undecided,
+        RejectKind::Undecided(nrese_store::UndecidedCause::ReadsDifferently),
         "the control: {}",
         control.1
     );
@@ -576,7 +576,12 @@ fn a_refusal_that_puns_a_name_stays_undecided() {
     let write = "INSERT DATA { GRAPH :open { :x a :A , :B . :y :p :A } }";
     let with = refused(&kept(BASE), &Requester::all(), write);
     let without = refused(&read_in_full(BASE), &Requester::all(), write);
-    assert_eq!(with.0, RejectKind::Undecided, "{}", with.1);
+    assert_eq!(
+        with.0,
+        RejectKind::Undecided(nrese_store::UndecidedCause::ReadsDifferently),
+        "{}",
+        with.1
+    );
     assert!(
         with.1
             .contains("annotation-property axioms or a punned name")
@@ -597,7 +602,11 @@ fn a_refusal_with_no_kinds_kept_reads_as_before() {
     let data = format!("{ROUTED} {}", members(0..GROWN));
     assert_eq!(loaded(&dl, &data), ConsistencyStatus::Consistent);
     let (kind, detail) = refused(&dl, &Requester::all(), REFUSED);
-    assert_eq!(kind, RejectKind::Undecided, "{detail}");
+    assert_eq!(
+        kind,
+        RejectKind::Undecided(nrese_store::UndecidedCause::ReadsDifferently),
+        "{detail}"
+    );
     assert!(
         detail.contains("did not finish within its budget"),
         "{detail}"

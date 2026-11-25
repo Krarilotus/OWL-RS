@@ -147,6 +147,8 @@ pub struct StoreConfig {
     /// How checkpoints store the dictionary's keys (`store.vocabulary`): `Plain`, or `Fsst`
     /// (compressed to about half; a key costs a decode when read).
     pub vocabulary: nrese_engine::VocabularyEncoding,
+    /// How to handle a write whose consistency cannot be decided.
+    pub gates_undecided: crate::UndecidedPolicy,
     /// SHACL as a commit gate (design `docs/design/shacl.md` §7): what a commit's changes
     /// may introduce against the shapes graph.
     pub shacl_gate: ShaclGate,
@@ -422,6 +424,7 @@ impl StoreConfig {
             wal_damage: nrese_engine::WalDamage::Refuse,
             index_encoding: nrese_engine::IndexEncoding::Fast,
             vocabulary: nrese_engine::VocabularyEncoding::Plain,
+            gates_undecided: crate::UndecidedPolicy::Mark,
             shacl_gate: ShaclGate::Off,
             shacl_reject_results: Some(DEFAULT_SHACL_REJECT_RESULTS),
             dl: crate::dl::DlConfig::default(),
@@ -463,6 +466,7 @@ impl StoreConfig {
             wal_damage: nrese_engine::WalDamage::Refuse,
             index_encoding: nrese_engine::IndexEncoding::Fast,
             vocabulary: nrese_engine::VocabularyEncoding::Plain,
+            gates_undecided: crate::UndecidedPolicy::Mark,
             shacl_gate: ShaclGate::Off,
             shacl_reject_results: Some(DEFAULT_SHACL_REJECT_RESULTS),
             dl: crate::dl::DlConfig::default(),

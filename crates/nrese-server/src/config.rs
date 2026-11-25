@@ -150,6 +150,7 @@ impl ServerConfig {
                 },
             ),
             ("shacl.shapes_graph", store.shapes_graph.clone()),
+            ("gates.undecided", store.gates_undecided.as_str().to_owned()),
             ("shacl.gate", format!("{:?}", store.shacl_gate)),
             ("reasoner.mode", self.reasoner.mode().as_str().to_owned()),
             (

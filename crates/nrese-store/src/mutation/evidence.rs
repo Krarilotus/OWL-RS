@@ -145,6 +145,22 @@ impl<'v, 'e> EvidenceView<'v, 'e> {
             _projected: Projected(()),
         }
     }
+
+    /// The fixed explanation for this refusal carries no graph evidence.
+    pub(crate) fn no_ql_decider(&self, kind: RejectKind) -> MutationReject {
+        let draft = || Draft {
+            kind,
+            detail: format!(
+                "the write is refused: gates.undecided is refuse, and {}. \
+                 Set gates.undecided to mark to accept it marked.",
+                crate::WhyUndecided::NoQlDecider.text(0)
+            ),
+            explanation: None,
+            attribution: None,
+            shacl: None,
+        };
+        self.reject(draft, |_| draft())
+    }
 }
 
 /// A restricted rejection whose view shows no reason by itself (or none within the

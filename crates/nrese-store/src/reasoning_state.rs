@@ -50,8 +50,7 @@ pub enum ConsistencyStatus {
     Inconsistent {
         violations: usize,
     },
-    /// The rules' violations, which `owl2-dl` doesn't decide, for `why`: in quarantine as
-    /// [`Self::Inconsistent`] is, but not said to be inconsistent.
+    /// Consistency could not be decided. The rules may have found violations.
     Undecided {
         violations: usize,
         why: WhyUndecided,
@@ -69,9 +68,11 @@ impl ConsistencyStatus {
     }
 }
 
-/// Why the OWL 2 RL rules' violations aren't decided under OWL 2 DL in this release.
+/// Why the active profile does not decide consistency in this release.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WhyUndecided {
+    /// No complete consistency check runs under OWL 2 QL.
+    NoQlDecider,
     /// The ontology has annotation-property axioms or a punned name, or an empty
     /// intersection or union, or a list's cell used outside its list, or a structure no
     /// axiom uses or a name used as two kinds that the rules read otherwise
@@ -86,6 +87,9 @@ impl WhyUndecided {
     /// What is known, and the ways out: the one text for each place that says it.
     pub fn text(self, violations: usize) -> String {
         let why = match self {
+            Self::NoQlDecider => {
+                return "no check decides this store's consistency under owl2-ql yet".to_owned();
+            }
             Self::ReadsDifferently => {
                 "the ontology has annotation-property axioms or a punned name, or an empty \
                  intersection or union, or a list's cell used outside its list, or a \

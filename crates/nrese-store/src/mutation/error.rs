@@ -69,11 +69,19 @@ pub enum RejectKind {
     /// The data shown is inconsistent (an OWL 2 RL consistency rule, or OWL 2 DL): the
     /// whole data for a reader of every graph, else the committer's own graphs.
     Inconsistent,
-    /// Under `owl2-dl`, the OWL 2 RL rules find a clash in the whole data that OWL 2 DL may
-    /// read as consistent, and the store doesn't decide which (`crate::WhyUndecided`).
-    Undecided,
+    /// No consistency decision is available under the active profile.
+    Undecided(UndecidedCause),
     /// The data shown has SHACL results the gate rejects for, as above.
     ShapesViolated,
     /// The committer's graphs show no reason by themselves: the same for every gate.
     NotShown,
+}
+
+/// The cause of an undecided refusal that may be shown to the committer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UndecidedCause {
+    /// The OWL 2 RL rules found a clash whose interpretation under OWL 2 DL is unsettled.
+    ReadsDifferently,
+    /// No consistency check runs under OWL 2 QL.
+    NoDecider,
 }

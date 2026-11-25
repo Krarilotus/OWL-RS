@@ -31,6 +31,8 @@ pub(crate) struct Problem {
     /// sorted messages, the validation `failures`, and the counts `results_omitted` and
     /// `failures_omitted` for items left out by the count or memory limit.
     shacl: Option<serde_json::Value>,
+    /// For an undecided OWL 2 QL refusal, the gate, causes and deciding profile.
+    undecided: Option<serde_json::Value>,
 }
 
 /// Describes every response whose body is a [`Problem`] with the media type the server

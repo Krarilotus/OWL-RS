@@ -1167,10 +1167,10 @@ fn counted() -> nrese_exec::memory::Reading {
 /// Under `owl2-ql`, a store far shorter than one poll of the search for an ill-typed literal
 /// (4096 statements), its memory unreadable: the search stops before it starts, so the
 /// consistency is `unknown` and the read isn't `complete`, and nothing is kept. With the memory
-/// readable again, the next need searches, finds none, and `consistent` and the word come back.
+/// readable again, the next need searches, finds none, and the QL no-decider reason applies.
 #[test]
 fn an_ill_typed_search_stopped_before_it_starts_keeps_nothing_and_the_next_need_searches() {
-    use crate::ConsistencyStatus::{Consistent, Unknown};
+    use crate::ConsistencyStatus::{Undecided, Unknown};
     let store = StoreService::new(StoreConfig::in_memory())
         .expect("store")
         .with_capacity(counted);
@@ -1185,9 +1185,50 @@ fn an_ill_typed_search_stopped_before_it_starts_keeps_nothing_and_the_next_need_
         "stopped: {stopped:?}"
     );
     assert!(
-        again.0 == Consistent && again.1.starts_with("complete"),
+        again.0
+            == Undecided {
+                violations: 0,
+                why: crate::WhyUndecided::NoQlDecider,
+            }
+            && again.1.starts_with("sound-only")
+            && again.1.contains("consistency:"),
         "again: {again:?}"
     );
+}
+
+/// A stopped ill-typed search proves nothing even when the rules have found no clash.
+/// Under QL's refuse policy that leaves the write accepted, with consistency unknown.
+#[test]
+fn a_stopped_ql_literal_check_leaves_the_write_accepted_under_refuse() {
+    let store = Arc::new(
+        StoreService::new(StoreConfig {
+            gates_undecided: crate::UndecidedPolicy::Refuse,
+            ..StoreConfig::in_memory()
+        })
+        .expect("store")
+        .with_capacity(counted),
+    );
+    let ql = pipeline(&store, ReasoningMode::Owl2Ql);
+    load(&store, DATA);
+    store.rematerialise(Ruleset::Owl2Ql).expect("reasoned");
+    let before = store.current_revision();
+
+    // Let the rules use memory first. The candidate's literal check then cannot get a reading.
+    hooks::AFTER_PREFLIGHT.set(Some(Box::new(|| READINGS.set(Some(1)))));
+    let written = ql.execute_update_str(&format!("{PREFIXES}INSERT DATA {{ :fido a :Dog }}"));
+    hooks::AFTER_PREFLIGHT.set(None);
+    let status = store.consistency();
+    READINGS.set(None);
+
+    assert!(
+        written.is_ok(),
+        "the interrupted check refused: {written:?}"
+    );
+    assert!(
+        store.current_revision() > before,
+        "the write didn't publish"
+    );
+    assert_eq!(status, crate::ConsistencyStatus::Unknown);
 }
 
 /// A stopped ill-typed search proves nothing even when the rules have found no clash.
@@ -1399,7 +1440,7 @@ fn an_ill_typed_consistency_reading_decides_from_one_observation() {
     store.use_dl(false, false);
     assert_eq!(store.current_revision(), snapshot.revision());
     assert_eq!(
-        (store.consistency_at(&snapshot), store.consistency()),
+        (store.consistency_at(&snapshot, None), store.consistency()),
         (Unknown, Consistent)
     );
 }

@@ -15,6 +15,7 @@ use crate::graph_store::{
 };
 use crate::graph_store_executor::{graph_exists, write_graph};
 use crate::loader::preload_ontology;
+use crate::mutation::disposition::{Disposition, Route};
 use crate::mutation::{MutationCommand, MutationCommitReport};
 use crate::query::{SerializedQueryResult, SparqlQueryRequest};
 use crate::query_executor::{PreparedQuery, explain_prepared, plan_prepared, run_query};
@@ -243,7 +244,35 @@ const DELETES: &str = "the pending operations may delete statements whose infere
 /// A certificate's QL rewriting, if it has one.
 type Ql = Option<std::sync::Arc<nrese_sparql::ql::QlRewriting>>;
 
+/// The whole-store explanation of an undecided OWL 2 QL verdict.
+#[derive(Debug, serde::Serialize)]
+pub struct UndecidedReport {
+    pub disposition: &'static str,
+    #[serde(flatten)]
+    pub reason: UndecidedReason,
+}
+
+/// The explanation shared by a published verdict and a refusal.
+#[derive(Debug, serde::Serialize)]
+pub struct UndecidedReason {
+    pub gate: &'static str,
+    pub causes: [&'static str; 1],
+    pub decided_by: &'static str,
+}
+
+impl UndecidedReason {
+    pub const NO_DECIDER: Self = Self {
+        gate: "consistency",
+        causes: ["no-decider"],
+        decided_by: "owl2-dl",
+    };
+}
+
 impl Certificate {
+    pub(crate) fn uses_owl2_ql(&self) -> bool {
+        self.state.ruleset.split('+').next() == Some("owl2-ql")
+    }
+
     /// The version's reasoning record. A pending snapshot carries its base's record.
     /// A withheld view has only the certificate for producing rows ([`Self::for_rows`]).
     pub(crate) fn record(snapshot: &Snapshot) -> Option<&Self> {
@@ -910,35 +939,80 @@ impl StoreService {
             .map(|c| &c.state)
     }
 
-    /// Whether the data is consistent under the rules, as the current version's record says
+    /// Whether the data is consistent, starting from the current version's rules assessment
     /// ([`Certificate::assessment`]; see [`crate::reasoning_state`] for the quarantine this
     /// reports). `Unknown` on a replica, and where no record the rules registered checked
     /// assessed the version. Under `owl2-dl` or `owl2-ql`, also for no clash where the version
     /// holds an ill-typed literal, which OWL 2 doesn't admit, or the search for one, on this
-    /// first need, stopped ([`Certificate::ill_typed`]).
+    /// first need, stopped ([`Certificate::ill_typed`]). A clean OWL 2 QL assessment
+    /// remains undecided until a consistency check can decide it.
     pub fn consistency(&self) -> crate::ConsistencyStatus {
-        self.consistency_at(&self.engine.snapshot())
+        self.consistency_at(&self.engine.snapshot(), None)
     }
 
-    /// [`Self::consistency`] of `snapshot`'s version.
-    pub(crate) fn consistency_at(&self, snapshot: &Snapshot) -> crate::ConsistencyStatus {
-        use crate::ConsistencyStatus::{Consistent, Unknown};
+    /// [`Self::consistency`] of `snapshot`'s version, reusing its literal check when supplied.
+    pub(crate) fn consistency_at(
+        &self,
+        snapshot: &Snapshot,
+        witness: Option<IllTyped>,
+    ) -> crate::ConsistencyStatus {
+        use crate::ConsistencyStatus::{Consistent, Undecided, Unknown};
         let status = Certificate::assessment(snapshot, self.config.replica).rules;
         let Some(certificate) = Certificate::of(snapshot).filter(|_| status == Consistent) else {
             return status;
         };
-        let memory = self.memory_stop();
-        match certificate.ill_typed(snapshot, &|| memory.exceeded()) {
+        let found = witness.unwrap_or_else(|| {
+            let memory = self.memory_stop();
+            certificate.ill_typed(snapshot, &|| memory.exceeded())
+        });
+        match found {
+            Some(None) if certificate.uses_owl2_ql() => Undecided {
+                violations: 0,
+                why: crate::WhyUndecided::NoQlDecider,
+            },
             Some(None) => status,
             _ => Unknown,
         }
     }
 
+    /// The verdict, its OWL 2 QL explanation when available, and quarantine on one snapshot.
+    pub fn undecided_report(&self) -> (crate::ConsistencyStatus, Option<UndecidedReport>, bool) {
+        use crate::{ConsistencyStatus::Undecided, WhyUndecided::NoQlDecider};
+        let snapshot = self.engine.snapshot();
+        let status = self.consistency_at(&snapshot, None);
+        let mut quarantined = Certificate::assessment(&snapshot, self.config.replica).held;
+        let report = match status {
+            Undecided {
+                why: NoQlDecider, ..
+            } => {
+                let disposition = self.dispose(Route::Published);
+                quarantined |= disposition == Disposition::Quarantined;
+                Some(UndecidedReport {
+                    disposition: disposition.published_status(),
+                    reason: UndecidedReason::NO_DECIDER,
+                })
+            }
+            _ => None,
+        };
+        (status, report, quarantined)
+    }
+
     /// Whether the store is in quarantine, readable and repairable but not ready: the current
-    /// version's record holds the rules' hold ([`Certificate::held`]), set by a check that
-    /// found a clash and carried until a rebuild assesses the data again.
+    /// version's record holds a rules clash, or the consistency policy quarantines its
+    /// undecided OWL 2 QL verdict.
     pub fn is_quarantined(&self) -> bool {
-        Certificate::assessment(&self.engine.snapshot(), self.config.replica).held
+        use crate::{ConsistencyStatus::Undecided, WhyUndecided::NoQlDecider};
+        let snapshot = self.engine.snapshot();
+        Certificate::assessment(&snapshot, self.config.replica).held
+            || (Certificate::of(&snapshot).is_some_and(Certificate::uses_owl2_ql)
+                && self.dispose(Route::Published) == Disposition::Quarantined
+                && matches!(
+                    self.consistency_at(&snapshot, None),
+                    Undecided {
+                        why: NoQlDecider,
+                        ..
+                    }
+                ))
     }
 
     /// Whether the certificate covers `program` for a holder of the writer slot: no write can

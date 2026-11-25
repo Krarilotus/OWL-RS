@@ -10,6 +10,7 @@
 
 mod attribution;
 pub(crate) mod command;
+pub(crate) mod disposition;
 mod error;
 pub(crate) mod evidence;
 mod pipeline;
@@ -24,7 +25,8 @@ pub use attribution::{RejectAttribution, RejectAttributionCandidate};
 pub use command::{
     DeltaPlanner, MutationCommand, MutationCommitReport, MutationKind, UpdateContext,
 };
-pub use error::{MutationError, MutationReject, RejectKind};
+pub use disposition::UndecidedPolicy;
+pub use error::{MutationError, MutationReject, RejectKind, UndecidedCause};
 pub use pipeline::MutationPipeline;
 pub use record::ReasoningRunRecord;
 pub use ticket::{MutationState, MutationTicket};

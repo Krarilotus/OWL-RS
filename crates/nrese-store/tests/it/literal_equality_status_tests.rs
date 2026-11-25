@@ -352,8 +352,8 @@ fn literal_read_over_reopened_subproperty(
     (rebuilt, reopened)
 }
 
-/// On reopen with matching rules, unrestricted OWL 2 QL reads stay complete and
-/// restricted reads by support keep the grant cap. OWL 2 RL withholds both
+/// On reopen with matching rules, unrestricted OWL 2 QL reads keep their consistency
+/// reason and restricted reads by support keep the grant cap. OWL 2 RL withholds both
 /// reads for possible literal equality until a rebuild.
 #[test]
 fn reopened_literal_reads_by_support_follow_the_matching_program() {
@@ -386,7 +386,8 @@ fn reopened_literal_reads_by_support_follow_the_matching_program() {
             ]
             .map(|(reader, scope, capped)| {
                 let unknown = reopened && ruleset == Ruleset::Owl2Rl;
-                let expected = if capped || unknown {
+                let ql_undecided = ruleset == Ruleset::Owl2Ql;
+                let expected = if ql_undecided || unknown {
                     "sound-only"
                 } else {
                     "complete"
@@ -395,6 +396,7 @@ fn reopened_literal_reads_by_support_follow_the_matching_program() {
                 if word != expected
                     || reasons.iter().any(|r| r.contains(REOPENED)) != unknown
                     || reasons.iter().any(|r| r.contains("can't read every graph")) != capped
+                    || reasons.iter().any(|r| r.contains("no check decides")) != ql_undecided
                 {
                     unmet.push(format!("{regime} {reader} {phase}: {word} {reasons:?}"));
                 }

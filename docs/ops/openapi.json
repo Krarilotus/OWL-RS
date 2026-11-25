@@ -859,6 +859,9 @@
           "type": {
             "description": "The problem's kind, a URI (`https://nrese.dev/problems/…`).",
             "type": "string"
+          },
+          "undecided": {
+            "description": "For an undecided OWL 2 QL refusal, the gate, causes and deciding profile."
           }
         },
         "required": [
@@ -1014,7 +1017,7 @@
             "type": "string"
           },
           "violations": {
-            "description": "The consistency violations found: 0 exactly when the data is consistent.",
+            "description": "Violations found by the materialisation rules. A count of zero means the rules found none.",
             "minimum": 0,
             "type": "integer"
           },

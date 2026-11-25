@@ -127,7 +127,7 @@ impl StoreService {
         dl: Option<Deadline>,
         premise: Premise,
     ) -> StoreResult<Entailment> {
-        let consistency = self.consistency_at(at);
+        let consistency = Certificate::assessment(at, self.config().replica).rules;
         // Not known to entail everything, nor not to: no answer.
         if let crate::ConsistencyStatus::Undecided { violations, why } = consistency {
             return Err(StoreError::Undecided(why.text(violations)));

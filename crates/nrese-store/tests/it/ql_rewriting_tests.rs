@@ -992,9 +992,9 @@ fn rewritten_answers_are_the_certain_answers_of_random_ql_cases() {
                 ruleset.name(),
                 query.sparql(true)
             );
-            // Pure QL: nothing the rewriting doesn't follow.
+            // The rewriting follows the fixture. QL still has no consistency decider.
             assert!(
-                completeness.complete,
+                clean_read_claim(ruleset, &completeness),
                 "case {case}: {completeness:?}\n{turtle}\n{}",
                 query.sparql(true)
             );
@@ -1183,6 +1183,19 @@ fn hazard_kinds(completeness: &Completeness) -> Vec<&'static str> {
         .collect()
 }
 
+fn only_consistency(status: &Completeness) -> bool {
+    status.as_str() == "sound-only"
+        && matches!(&status.reasons[..], [reason] if reason.source == "consistency")
+}
+
+fn clean_read_claim(ruleset: Ruleset, status: &Completeness) -> bool {
+    if ruleset == Ruleset::Owl2Ql {
+        only_consistency(status)
+    } else {
+        status.as_str() == "complete"
+    }
+}
+
 /// `owl:Thing` on the left of an OWL 2 QL axiom (OWL 2 Profiles §3.2.3 allows any class
 /// there): every individual is in its right side (OWL 2 Direct Semantics §2.3.1), and the
 /// domain is never empty. `⊤ ⊑ A` with no data must answer
@@ -1210,7 +1223,7 @@ fn owl_thing_on_the_left_answers_for_every_individual() {
         owl:someValuesFrom owl:Thing ] .";
     let edge = ":a0 :P0 :a1 .";
     let data = ":D a owl:DatatypeProperty . :a0 :D \"3\" .";
-    let ask = |store: &StoreService, query: &str| -> (String, String) {
+    let ask = |store: &StoreService, query: &str| {
         let result = store
             .execute_query(&SparqlQueryRequest::all(query))
             .unwrap_or_else(|e| panic!("{query}: {e}"));
@@ -1220,8 +1233,7 @@ fn owl_thing_on_the_left_answers_for_every_individual() {
         } else {
             "false"
         };
-        let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
-        (answer.to_owned(), status.to_owned())
+        (answer.to_owned(), result.completeness.unwrap_or_default())
     };
     let dir = tempfile::tempdir().unwrap();
     let mut wrong = Vec::new();
@@ -1237,19 +1249,19 @@ fn owl_thing_on_the_left_answers_for_every_individual() {
         ] {
             let (answer, status) = ask(&open(axiom), &query);
             if answer != "true" {
-                wrong.push(format!("{name}, {query}: {answer}, {status}"));
+                wrong.push(format!("{name}, {query}: {answer}, {status:?}"));
             }
         }
         // Guard: a class no axiom names has no member.
         let unseen = format!("ASK {{ ?x a <{E}Zzz> }}");
         let (answer, status) = ask(&open(top), &unseen);
-        if (answer.as_str(), status.as_str()) != ("false", "complete") {
-            wrong.push(format!("{name}, guard {unseen}: {answer}, {status}"));
+        if answer != "false" || !clean_read_claim(ruleset, &status) {
+            wrong.push(format!("{name}, guard {unseen}: {answer}, {status:?}"));
         }
         let store_ = open(&format!("{top}\n{edge}"));
         let through = format!("SELECT ?x {{ ?x <{E}P0> ?y . ?y a <{E}A> }}");
         let (rows, status) = store_answer(&store_, &through);
-        if rows != [vec![0]] || status.as_str() != "complete" {
+        if rows != [vec![0]] || !clean_read_claim(ruleset, &status) {
             wrong.push(format!("{name}, {through}: {rows:?}, {}", status.as_str()));
         }
         let all = format!("SELECT ?x {{ ?x a <{E}A> }}");
@@ -1266,9 +1278,9 @@ fn owl_thing_on_the_left_answers_for_every_individual() {
             .execute_query(&SparqlQueryRequest::all(literal.as_str()))
             .unwrap_or_else(|e| panic!("{literal}: {e}"));
         let text = String::from_utf8(result.payload).unwrap();
-        let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
-        if text.contains("\"3\"") || status != "complete" {
-            wrong.push(format!("{name}, guard {literal}: {text}, {status}"));
+        let status = result.completeness.unwrap_or_default();
+        if text.contains("\"3\"") || !clean_read_claim(ruleset, &status) {
+            wrong.push(format!("{name}, guard {literal}: {text}, {status:?}"));
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
@@ -1926,16 +1938,20 @@ fn axioms_outside_the_profile_are_answered_or_reported() {
                 })
                 .collect();
             rows.sort();
-            let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
+            let clean = result
+                .completeness
+                .as_ref()
+                .is_none_or(|status| clean_read_claim(ruleset, status));
             if rows != expected {
                 wrong.push(format!(
                     "guard, {}, {query}: {rows:?}, expected {expected:?}",
                     ruleset.name()
                 ));
-            } else if complete && !matches!(status, "complete" | "none") {
+            } else if complete && !clean {
                 wrong.push(format!(
-                    "guard, {}, {query}: {status}, expected complete",
-                    ruleset.name()
+                    "guard, {}, {query}: {:?}, expected the clean read claim",
+                    ruleset.name(),
+                    result.completeness
                 ));
             }
         }
@@ -2116,8 +2132,10 @@ fn schema_the_reader_or_the_mapping_leaves_out_is_reported() {
                 .execute_query(&SparqlQueryRequest::all(query.as_str()))
                 .unwrap();
             let rows = select_rows(&result.payload);
-            let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
-            let claimed = matches!(status, "complete" | "none");
+            let claimed = result
+                .completeness
+                .as_ref()
+                .is_none_or(|status| clean_read_claim(ruleset, status));
             if rows != expected {
                 wrong.push(format!(
                     "{name}, {}, {query}: {rows:?}, expected {expected:?}",
@@ -2125,8 +2143,9 @@ fn schema_the_reader_or_the_mapping_leaves_out_is_reported() {
                 ));
             } else if claimed != complete {
                 wrong.push(format!(
-                    "{name}, {}, {query}: {status}, expected complete: {complete}",
-                    ruleset.name()
+                    "{name}, {}, {query}: {:?}, expected the clean read claim: {complete}",
+                    ruleset.name(),
+                    result.completeness
                 ));
             }
         }
@@ -2177,12 +2196,7 @@ fn an_axiom_the_reader_leaves_out_is_never_told_complete_under_owl2_ql() {
     );
     let (rows, status) = read(":D");
     assert_eq!(rows, a, "the control");
-    assert_eq!(
-        status.as_str(),
-        "complete",
-        "the control: {:?}",
-        status.reasons
-    );
+    assert!(only_consistency(&status), "the control: {status:?}");
 }
 
 /// A membership the reader leaves out lowers the rewriting's claim under owl2-ql, as a
@@ -2261,10 +2275,11 @@ fn a_membership_the_reader_leaves_out_is_never_told_complete_under_owl2_ql() {
     let before = told(&cached);
     assert_eq!(
         (&before.0, before.1.as_str()),
-        (&vec![c.clone()], "complete"),
+        (&vec![c.clone()], "sound-only"),
         "before the membership: {:?}",
         before.2
     );
+    assert!(matches!(&before.2[..], [reason] if reason.contains("no check decides")));
     cached
         .execute_update(&SparqlUpdateRequest::new(
             "PREFIX owl: <http://www.w3.org/2002/07/owl#>
@@ -3099,15 +3114,22 @@ fn a_rewritten_read_in_quarantine_names_it_with_a_list_left_out() {
     );
 }
 
-/// Spec (docs/spec/reasoning-semantics.md, "What `complete` refers to"): on clean data under
-/// `owl2-ql`, a read the QL rewriting ran on, of a named class of the data's own, is `complete`.
-/// The control of the `owl2-ql` quarantine cell.
+/// Spec: clean rules under `owl2-ql` leave the store undecided without quarantining it.
+/// Even a read of a named class of the data's own carries that consistency reason.
 #[test]
-fn a_rewritten_read_over_clean_data_under_owl2_ql_is_complete() {
+fn a_rewritten_read_over_clean_data_under_owl2_ql_names_undecided_consistency() {
     let store = quarantine_case(Ruleset::Owl2Ql, QlRewritingMode::Auto, true);
-    assert_clean(&store);
+    assert!(!store.is_quarantined());
+    assert!(matches!(
+        store.consistency(),
+        ConsistencyStatus::Undecided {
+            why: nrese_store::WhyUndecided::NoQlDecider,
+            ..
+        }
+    ));
     let status = rewritten_read_of_a(&store);
-    assert_eq!(status_class(&status), "complete", "status: {status}");
+    assert_eq!(status_class(&status), "sound-only", "status: {status}");
+    assert!(status.contains("consistency:"), "{status}");
 }
 
 /// Spec: as under `owl2-ql`, under `owl2-rl` with the rewriting on. The control of the `owl2-rl`
@@ -3410,10 +3432,10 @@ fn ql_completeness_for_a_reader_by_support_depends_on_the_grant() {
             write("GRAPH :hidden { :note a owl:AnnotationProperty }");
         }
         let ask = format!("{prefixes}ASK {{ :alice a :Doc }}");
-        for (reader, scope, expected) in [
-            ("by support", reader_by_support(), "sound-only"),
-            ("all-graph grant", all_graphs.clone(), "complete"),
-            ("unrestricted", ReadScope::All, "complete"),
+        for (reader, scope, by_support) in [
+            ("by support", reader_by_support(), true),
+            ("all-graph grant", all_graphs.clone(), false),
+            ("unrestricted", ReadScope::All, false),
         ] {
             let request = SparqlQueryRequest::new(&ask, scope);
             let cold = store.execute_query(&request).unwrap();
@@ -3448,13 +3470,10 @@ fn ql_completeness_for_a_reader_by_support_depends_on_the_grant() {
             ];
             for (route, status) in statuses {
                 let status = status.unwrap_or_else(|| panic!("{reader}, {route}: no status"));
-                if status.as_str() != expected {
-                    wrong.push(format!(
-                        "hidden={hidden}, {reader}, {route}: {} (expected {expected})",
-                        status.as_str()
-                    ));
+                if status.as_str() != "sound-only" || (!by_support && !only_consistency(&status)) {
+                    wrong.push(format!("hidden={hidden}, {reader}, {route}: {status:?}"));
                 }
-                if reader == "by support" {
+                if by_support {
                     restricted.push(status);
                 }
             }
