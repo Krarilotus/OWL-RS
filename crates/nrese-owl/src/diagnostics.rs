@@ -465,7 +465,7 @@ pub(crate) fn check_global_restrictions(
         }
     }
     let mut found = Vec::new();
-    let mut memo = (!needing.is_empty()).then(|| vec![None; ontology.classes.len()]);
+    let mut memo = (!needing.is_empty()).then(|| vec![UNSEEN; ontology.classes.len()]);
     for (index, axiom) in ontology.axioms.iter().enumerate() {
         let direct = match axiom {
             Axiom::ObjectCharacteristic(
@@ -634,6 +634,14 @@ fn push_expressions(axiom: &Axiom, out: &mut Vec<u32>) {
     }
 }
 
+const UNSEEN: u32 = u32::MAX;
+const CLEAN: u32 = u32::MAX - 1;
+
+/// Bytes for the non-simple-property memo table and traversal stack over `classes` expressions.
+pub fn non_simple_memo_bytes(classes: usize) -> usize {
+    classes.saturating_mul(std::mem::size_of::<u32>() + std::mem::size_of::<(u32, bool)>())
+}
+
 fn class_children(expr: &ClassExpr) -> &[crate::ExprId] {
     match expr {
         ClassExpr::And(xs) | ClassExpr::Or(xs) => xs,
@@ -654,34 +662,36 @@ fn uses_any(
     ontology: &Ontology,
     id: u32,
     needing: &HashMap<u32, (Term, &'static str)>,
-    memo: &mut [Option<Option<(Term, &'static str)>>],
+    memo: &mut [u32],
 ) -> Option<(Term, &'static str)> {
     let mut stack = vec![(id, false)];
     while let Some((cur, post)) = stack.pop() {
         if post {
-            let hit = class_children(ontology.classes.get(cur))
+            memo[cur as usize] = class_children(ontology.classes.get(cur))
                 .iter()
-                .find_map(|&c| memo[c.0 as usize].flatten());
-            memo[cur as usize] = Some(hit);
+                .rev()
+                .map(|c| memo[c.0 as usize])
+                .find(|&h| h < CLEAN)
+                .unwrap_or(CLEAN);
             continue;
         }
-        if memo[cur as usize].is_some() {
+        if memo[cur as usize] != UNSEEN {
             continue;
         }
         #[cfg(any(test, all(feature = "witness", debug_assertions)))]
         NON_SIMPLE_EXPANSIONS.with(|c| c.set(c.get() + 1));
-        if let Some(&hit) = needing.get(&cur) {
-            memo[cur as usize] = Some(Some(hit));
+        if needing.contains_key(&cur) {
+            memo[cur as usize] = cur;
             continue;
         }
-        memo[cur as usize] = Some(None);
+        memo[cur as usize] = CLEAN;
         let kids = class_children(ontology.classes.get(cur));
         if !kids.is_empty() {
             stack.push((cur, true));
             stack.extend(kids.iter().map(|c| (c.0, false)));
         }
     }
-    memo[id as usize].flatten()
+    needing.get(&memo[id as usize]).copied()
 }
 
 #[cfg(any(test, all(feature = "witness", debug_assertions)))]

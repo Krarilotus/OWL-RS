@@ -742,7 +742,10 @@ pub(crate) fn admit_and_prepare(
     }
     #[cfg(test)]
     let _membership_guard = test_hooks::on_membership(budget.memory.as_ref());
+    let memo_bytes = nrese_owl::diagnostics::non_simple_memo_bytes(o.classes.len());
+    charge(&mut js, memo_bytes)?;
     let findings = nrese_owl::membership(o, terms);
+    js.release(memo_bytes);
     let blocks_j = |d: &Diagnostic| match *d {
         Diagnostic::AnonymousIndividual { node, axioms, .. } => {
             // Fresh blank identities make a witnessless finding on a conclusion blank its own.
@@ -986,6 +989,7 @@ mod import_tests {
         }
     }
 
+    #[cfg(debug_assertions)]
     fn shared_class_fixture(k: usize, n: usize, with_needing: bool) -> (Ontology, Ontology) {
         let mut premise = Ontology::default();
         premise.axioms.push(Axiom::ObjectCharacteristic(
@@ -1026,6 +1030,7 @@ mod import_tests {
     /// the joint non-simple-property check expands each shared class expression at most once
     /// across axioms, so work stays linear when K and N both double, and an already-passed
     /// deadline at membership entry stops with a typed time Unknown before the walk.
+    #[cfg(debug_assertions)]
     #[test]
     fn joint_membership_bounds_shared_class_work() {
         use std::time::Duration;

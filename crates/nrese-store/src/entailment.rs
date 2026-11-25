@@ -576,7 +576,11 @@ impl StoreService {
                 }
                 other => other,
             };
-            Ok(tx.try_intern(t.as_ref())?.raw())
+            let raw = tx.try_intern(t.as_ref())?.raw();
+            if let Term::BlankNode(b) = t {
+                blank_scratch.release(b.as_str().len());
+            }
+            Ok(raw)
         };
         let statements: nrese_engine::EngineResult<Vec<nrese_owl::Statement>> = conclusion
             .iter()
@@ -706,21 +710,21 @@ fn fresh_blank(
     blank: &nrese_rdf::BlankNode,
 ) -> nrese_engine::EngineResult<Option<nrese_rdf::BlankNode>> {
     if let Some(existing) = blanks.get(blank.as_str()) {
+        scratch.charge(|| existing.as_str().len())?;
         return Ok(Some(existing.clone()));
     }
-    let table = |n: usize| {
-        if n == 0 {
-            0
-        } else {
-            n.saturating_mul(8)
-                .div_ceil(7)
-                .max(4)
-                .next_power_of_two()
-                .saturating_mul(std::mem::size_of::<(String, nrese_rdf::BlankNode)>() + 1)
-        }
+    let slot = std::mem::size_of::<(String, nrese_rdf::BlankNode)>() + 1;
+    let table = |n: usize| match n {
+        0 => 0,
+        _ => n
+            .saturating_mul(8)
+            .div_ceil(7)
+            .max(4)
+            .next_power_of_two()
+            .saturating_mul(slot),
     };
     let growth = table(blanks.len() + 1).saturating_sub(table(blanks.len()));
-    let strings = blank.as_str().len().saturating_mul(2).saturating_add(32);
+    let strings = blank.as_str().len().saturating_mul(3).saturating_add(64);
     scratch.charge(|| growth + strings)?;
     for k in 0u64.. {
         *probes = probes.saturating_add(1);
@@ -743,7 +747,8 @@ fn fresh_blank(
                     + blanks
                         .iter()
                         .map(|(k, v)| k.capacity() + v.as_str().len())
-                        .sum::<usize>();
+                        .sum::<usize>()
+                    + cand.as_str().len();
                 blank_test_hooks::record(held, scratch.bytes());
             }
             return Ok(Some(cand));
