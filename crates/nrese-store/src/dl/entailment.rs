@@ -624,7 +624,8 @@ fn tick(work: &mut u64, units: u64, deadline: Deadline) -> Result<(), Stopped> {
 pub(crate) struct PreparedCheck {
     o: Ontology,
     axioms: Vec<Axiom>,
-    _copy_scratch: CopyScratch,
+    // Fields drop in declaration order. Keep the reservation through both payloads.
+    copy_scratch: CopyScratch,
 }
 
 #[derive(Clone, Copy)]
@@ -639,17 +640,21 @@ fn import_into(
     budget: &Budget,
     deadline: Deadline,
 ) -> Result<PreparedCheck, Entailed> {
-    let (mut o, copy_scratch) = copy(premise, budget)?;
+    let (o, copy_scratch) = copy(premise, budget)?;
     #[cfg(test)]
     let copy_scratch = CopyScratch::copy(copy_scratch, &o);
-    let mut copy_scratch = copy_scratch;
+    let mut prepared = PreparedCheck {
+        o,
+        axioms: Vec::new(),
+        copy_scratch,
+    };
     #[cfg(test)]
     let _entry_guard = test_hooks::on_entry(budget.memory.as_ref());
     let mut memo_scratch = Scratch::new(budget.memory.as_ref());
     let mut import = Import::new(
         conclusion,
-        &mut o,
-        &mut copy_scratch,
+        &mut prepared.o,
+        &mut prepared.copy_scratch,
         &mut memo_scratch,
         deadline,
     )?;
@@ -659,17 +664,13 @@ fn import_into(
     b.bottom_object = b.bottom_object.or(cb.bottom_object);
     b.top_data = b.top_data.or(cb.top_data);
     b.bottom_data = b.bottom_data.or(cb.bottom_data);
-    let mut axioms = Vec::with_capacity(conclusion.axioms.len());
+    prepared.axioms = Vec::with_capacity(conclusion.axioms.len());
     for a in &conclusion.axioms {
-        axioms.push(import.axiom(a)?);
+        prepared.axioms.push(import.axiom(a)?);
     }
     drop(import);
     drop(memo_scratch);
-    Ok(PreparedCheck {
-        o,
-        _copy_scratch: copy_scratch,
-        axioms,
-    })
+    Ok(prepared)
 }
 
 /// Copies `premise` once, imports `conclusion` once, checks OWL 2 DL membership over the
@@ -825,22 +826,20 @@ pub(crate) fn entails_ontology_within(
 
 /// Runs entailment tests on an already-prepared premise copy and imported conclusion axioms.
 pub(crate) fn entails_prepared_within(
-    prepared: PreparedCheck,
+    mut prepared: PreparedCheck,
     conclusion_has_anonymous: bool,
     fresh: &[u64],
     budget: &Budget,
     deadline: Deadline,
 ) -> Entailed {
-    let PreparedCheck {
-        mut o,
-        _copy_scratch,
-        axioms,
-    } = prepared;
-    let tests: Vec<Test> = axioms.into_iter().map(Test::Axiom).collect();
-    let compiled = Batch::new(&mut o, &tests, budget.memory.as_ref());
+    let tests: Vec<Test> = take(&mut prepared.axioms)
+        .into_iter()
+        .map(Test::Axiom)
+        .collect();
+    let compiled = Batch::new(&mut prepared.o, &tests, budget.memory.as_ref());
     let mut answer = Entailed::Yes;
     for (index, test) in tests.iter().enumerate() {
-        answer = answer.and(compiled.check(index, test, &o, fresh, budget, deadline));
+        answer = answer.and(compiled.check(index, test, &prepared.o, fresh, budget, deadline));
         if answer == Entailed::No {
             break;
         }
