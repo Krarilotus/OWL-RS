@@ -39,7 +39,7 @@ use nrese_sparql::{QueryOptions, QueryResults};
 use nrese_sparql_syntax::SparqlParser;
 
 use crate::error::{StoreError, StoreResult};
-use crate::service::StoreService;
+use crate::service::{Certificate, Premise, StoreService};
 
 /// Why a conclusion is entailed, or that it isn't.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,48 +79,19 @@ impl StoreService {
         // included.
         let from_the_call = Deadline::after(self.config().dl.timeout);
         let program = program.into();
-        // One certified closure: reads start only on a settled certificate (an
-        // even epoch; odd, a change is in progress and the old certificate may still be
-        // visible), and an answer stands only if no change began while they took their
-        // snapshots. An open or changed certificate refuses without waiting or retrying.
-        // The mode is one of those reads: switching it is a change of the certificate.
-        let epoch = self.certificate_epoch();
-        if epoch.is_multiple_of(2) {
-            // The mode, read once: under owl2-dl, the DL route with the call's deadline.
-            let dl = self.dl().active().then_some(from_the_call);
-            #[cfg(test)]
-            crate::service::hooks::run(&crate::service::hooks::AFTER_MODE_READ);
-            let answer = self.entails_once(&program, conclusion, dl)?;
-            // Let go before the checks below, so freeing the caller's program (its user rules,
-            // perhaps large) takes none of the time an answer is judged by.
-            drop(program);
-            #[cfg(test)]
-            crate::service::hooks::run(&crate::service::hooks::AFTER_ENTAILMENT_READS);
-            if self.certificate_epoch() == epoch {
-                // Under owl2-dl, an answer stands only within its time, the snapshot let go.
-                if dl.is_some_and(Deadline::passed) {
-                    return Err(out_of_time());
-                }
-                return Ok(answer);
-            }
-            // The certificate changed during the reads: the closure may be certified already.
-            return Err(StoreError::Undecided(CHANGED.to_owned()));
-        }
-        Err(StoreError::Configuration(format!(
-            "the inferred statements aren't {}'s closure: rematerialise first",
-            program.name()
-        )))
-    }
-
-    /// One try of [`Self::entails`]; it stands only if the certificate didn't change meanwhile.
-    /// Under owl2-dl, `dl` is the deadline before which the DL engines decide it.
-    fn entails_once(
-        &self,
-        program: &RuleProgram,
-        conclusion: &[Triple],
-        dl: Option<Deadline>,
-    ) -> StoreResult<Entailment> {
-        if !self.reasoning_is_current(program.clone()) {
+        // One version for the whole answer: its record says whether its closure is
+        // `program`'s, its consistency and its mode, and every read is of it.
+        let at = self.engine().snapshot();
+        let record = Certificate::record(&at).filter(|c| c.exact);
+        let premise = Certificate::assessment(&at, self.config().replica).premise();
+        let (hide, compact) = (
+            self.config().hide_unnamed_classes,
+            self.config().equality_compact,
+        );
+        let nil = || crate::reasoning_state::nil_equated(&at);
+        if premise == Premise::Unassessed
+            || !record.is_some_and(|c| c.state.is_current_with(&program, hide, compact, nil))
+        {
             return Err(StoreError::Configuration(format!(
                 "the inferred statements aren't {}'s closure: rematerialise first",
                 program.name()
@@ -128,7 +99,35 @@ impl StoreService {
         }
         #[cfg(test)]
         crate::service::hooks::run(&crate::service::hooks::AFTER_CERTIFIED);
-        let consistency = self.rules_found();
+        // Under owl2-dl, the DL route with the call's deadline.
+        let dl = record.is_some_and(|c| c.dl).then_some(from_the_call);
+        #[cfg(test)]
+        crate::service::hooks::run(&crate::service::hooks::AFTER_MODE_READ);
+        let answer = self.entails_at(&at, &program, conclusion, dl, premise)?;
+        drop(at);
+        #[cfg(test)]
+        crate::service::hooks::run(&crate::service::hooks::AFTER_ENTAILMENT_READS);
+        // Let go before the check below, so freeing the caller's program (its user rules,
+        // perhaps large) takes none of the time an answer is judged by.
+        drop(program);
+        // Under owl2-dl, an answer stands only within its time.
+        if dl.is_some_and(Deadline::passed) {
+            return Err(out_of_time());
+        }
+        Ok(answer)
+    }
+
+    /// [`Self::entails`] of the version `at`, whose record certifies `program`'s closure.
+    /// Under owl2-dl, `dl` is the deadline before which the DL engines decide it.
+    fn entails_at(
+        &self,
+        at: &Snapshot,
+        program: &RuleProgram,
+        conclusion: &[Triple],
+        dl: Option<Deadline>,
+        premise: Premise,
+    ) -> StoreResult<Entailment> {
+        let consistency = Certificate::assessment(at, self.config().replica).rules;
         // Not known to entail everything, nor not to: no answer.
         if let crate::ConsistencyStatus::Undecided { violations, why } = consistency {
             return Err(StoreError::Undecided(why.text(violations)));
@@ -136,14 +135,14 @@ impl StoreService {
         // Under owl2-dl the closure is no proof, its inconsistency included: the DL engines
         // decide, the premise's consistency too.
         if let Some(deadline) = dl {
-            return self.decided_by_dl(&self.engine().snapshot(), conclusion, deadline);
+            return self.decided_by_dl(at, conclusion, deadline);
         }
-        if let crate::ConsistencyStatus::Inconsistent { .. } = consistency {
+        if premise == Premise::HeldInconsistent
+            || matches!(consistency, crate::ConsistencyStatus::Inconsistent { .. })
+        {
             return Ok(Entailment::InconsistentPremise);
         }
-        // One revision for the whole answer: the closure's read and every refutation are of it.
-        let at = self.engine().snapshot();
-        match self.shown_by_rules(&at, program, &split(conclusion))? {
+        match self.shown_by_rules(at, program, &split(conclusion))? {
             true => Ok(Entailment::Entailed),
             false => Ok(Entailment::NotEntailed),
         }
@@ -210,8 +209,7 @@ impl StoreService {
 
     /// Whether adding `opposite` to the data at `at` makes it inconsistent under `program`:
     /// the reasoner maintains the closure over a speculative transaction, which is dropped.
-    /// Undecided where a commit came after `at` (the transaction starts from the latest
-    /// revision): its answer would be another revision's.
+    /// Undecided if the speculative transaction reads a different stack than `at`.
     fn refutes(
         &self,
         at: &Snapshot,
@@ -226,7 +224,7 @@ impl StoreService {
         // form, so the rule constants this compiles still enter the dictionary.
         #[allow(clippy::disallowed_methods)]
         let mut tx = self.engine().speculative_shared();
-        if tx.base().revision() != at.revision() {
+        if tx.base().identity() != at.identity() {
             return Err(StoreError::Undecided(CHANGED.to_owned()));
         }
         for t in opposite {

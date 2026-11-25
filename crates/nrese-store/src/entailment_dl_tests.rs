@@ -258,10 +258,10 @@ fn a_mode_switch_during_the_check_leaves_it_on_its_route() {
     let rules = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl)
         .materialised_program()
         .unwrap();
-    store.dl().set_active(false, false);
+    store.use_dl(false, false);
     let switched = Arc::clone(&store);
     hooks::AFTER_CERTIFIED.set(Some(Box::new(move || {
-        switched.dl().set_active(true, false);
+        switched.use_dl(true, false);
     })));
     hooks::AFTER_DL_PREMISE.set(Some(Box::new(|| {
         std::thread::sleep(Duration::from_millis(600));
@@ -337,13 +337,10 @@ fn an_answer_past_the_time_after_the_reads_is_undecided() {
     assert_eq!(answers, ["Ok(Entailed)".to_owned(), "undecided".to_owned()]);
 }
 
-/// Spec (`entails`: one certified closure; a certificate changed during the check refuses,
-/// asking again): a check with `owl2-dl` off that has read its mode, while the store switches
-/// it on and commits a premise whose annotation property's domain puts `:x a :C` in the
-/// closure, refuses as undecided. It never answers by the rules over a revision `owl2-dl`
-/// reads, where `:x a :C` isn't entailed.
+/// The entailment answers the version and route it pinned. The subsequent DL commit puts
+/// `:x a :C` in the rules' closure, but the answer uses the version without that statement.
 #[test]
-fn a_switch_to_owl2_dl_during_the_check_is_refused() {
+fn a_switch_to_owl2_dl_during_the_check_leaves_the_pinned_answer() {
     let (store, pipeline) = dl_store(DlConfig::default(), ":a a :D .");
     let rules = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl)
         .materialised_program()
@@ -363,10 +360,7 @@ fn a_switch_to_owl2_dl_during_the_check_is_refused() {
         &[Triple::new(iri("x"), nrese_rdf::vocab::rdf::TYPE, iri("C"))],
     );
     hooks::AFTER_MODE_READ.set(None);
-    assert!(
-        matches!(&answer, Err(crate::StoreError::Undecided(why)) if why.ends_with("ask again")),
-        "{answer:?}"
-    );
+    assert_eq!(answer.unwrap(), crate::Entailment::NotEntailed);
 }
 
 /// Spec (`entailment` module docs: under `owl2-dl` the DL engines decide the whole

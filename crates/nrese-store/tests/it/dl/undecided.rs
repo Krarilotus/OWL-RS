@@ -115,8 +115,8 @@ fn a_detection_refused_at_its_budget_leaves_the_clash_undecided() {
     );
 }
 
-/// The reason is derived, never stored: a store opened again finds it again under
-/// `owl2-dl`, and not under `owl2-rl`, whose promise is the rules' reading.
+/// The reason is derived at reopen under the matching `owl2-dl` program. Opening with
+/// the different `owl2-rl` program carries only the hold until it rebuilds.
 #[test]
 fn the_reason_is_derived_again_at_open_under_the_mode_opened_with() {
     let dir = tempfile::tempdir().unwrap();
@@ -124,11 +124,8 @@ fn the_reason_is_derived_again_at_open_under_the_mode_opened_with() {
     loaded(&dl, ANNOTATION_CLASH);
     drop(dl);
     let rl = store(StoreConfig::on_disk(dir.path()), ReasoningMode::Owl2Rl);
-    let consistency = rl.store().consistency();
-    assert!(
-        matches!(consistency, ConsistencyStatus::Inconsistent { .. }),
-        "{consistency:?}"
-    );
+    assert_eq!(rl.store().consistency(), ConsistencyStatus::Unknown);
+    assert!(rl.store().is_quarantined());
     drop(rl);
     let dl = store(StoreConfig::on_disk(dir.path()), ReasoningMode::Owl2Dl);
     let consistency = dl.store().consistency();

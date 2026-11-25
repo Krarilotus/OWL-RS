@@ -92,6 +92,7 @@ impl MutationPipeline {
             _ if self.store.config().replica || self.is_retired() => 0,
             None => 0,
             Some(rules) if !self.store.reasoning_is_current(rules) => 1,
+            _ if self.store.engine().check_writable().is_err() => 1,
             _ if prep.covers(key) => 2,
             _ if *prep.failed.lock() == Some(key) => 3,
             _ => 1,
@@ -245,10 +246,14 @@ impl MutationPipeline {
                 continue;
             }
             let entry = preparation.entry.lock();
-            if cached(&entry, ground_key(tx.base())).is_some()
-                || self.store.config().replica
-                || rayon::current_thread_index().is_some()
-            {
+            let covered = cached(&entry, ground_key(tx.base())).is_some();
+            if !covered {
+                self.store
+                    .engine()
+                    .check_writable()
+                    .map_err(|error| store_error(error.into()))?;
+            }
+            if covered || self.store.config().replica || rayon::current_thread_index().is_some() {
                 break (tx, Some(entry));
             }
             drop(entry);
@@ -311,9 +316,10 @@ impl MutationPipeline {
             // and the commit is still rejected (the change is inconsistent either way).
             let report_memory = Arc::new(envelope.part());
             let working_memory = || self.store.operation_memory();
-            // A rebuild's own report judges only over a state assessed consistent.
+            // A rebuild's own report judges only over a base its record assessed consistent.
+            let replica = self.store.config().replica;
             let base_consistent = matches!(
-                self.store.recorded_consistency(),
+                crate::service::Certificate::assessment(tx.base(), replica).rules,
                 crate::ConsistencyStatus::Consistent
             );
             let (violations, materialisation, changed, literal_equality) =
@@ -518,12 +524,11 @@ impl MutationPipeline {
                 &evidence::EvidenceView::new(&requester.read, &tx),
                 |view, after| self.view_reason(view, Some(after), &dl_own_budget, &resources),
             )?;
-            // The version's certificate, its ill-typed literal judged under the writer slot alone
-            // (a whole-store scan where the commit deletes it), before the commit and its rights.
+            // The new record shares the gate's witness. Where the gate did not ask for one,
+            // judge it under the writer slot before taking the commit's rights.
             let witness =
                 ql_witness.or_else(|| dl.as_ref().and_then(|(gate, _, _)| gate.ill_typed));
-            let certificate = (tx.base().certificate().cloned())
-                .map(|certificate| self.store.with_ill_typed(certificate, &tx, witness));
+            let certificate = self.store.successor(&tx, literal_equality, witness);
             if !ticket.begin_commit() {
                 return Err(MutationError::Cancelled);
             }
@@ -539,29 +544,15 @@ impl MutationPipeline {
             let ql = crate::service::Certificate::of(tx.base()).and_then(|c| c.ql.clone());
             // Its rights hold from here through the publication (contracts.md, lock order).
             let rights = ticket.hold_rights()?;
-            // In quarantine the commit checks only its own facts: its version keeps no
-            // assessment of its consistency. The mark rises first (odd: unassessed), then the
-            // old assessment and its marker go, before the commit publishes: a removal that
-            // fails fails the write and leaves the store in quarantine.
-            let quarantined = self.store.is_quarantined();
+            // In quarantine (the base's record holds the rules' hold) the commit checks only its
+            // own facts: its record carries the hold, not assessed, and the marker goes before
+            // the commit publishes: a removal that fails fails the write.
+            let writer = tx.writer().expect("a transaction holds the writer slot");
+            let quarantined = crate::service::Certificate::assessment(tx.base(), replica).held;
             if quarantined {
-                (self.store.unassessed).fetch_or(1, std::sync::atomic::Ordering::Release);
-                let writer = tx.writer().expect("a transaction holds the writer slot");
-                self.store.invalidate_held(writer).map_err(store_error)?;
+                self.store.forget_marker(writer).map_err(store_error)?;
             }
-            // A commit that equated a literal with another term: its version and every later
-            // one withhold the word from reads of literals, until a rematerialisation finds no
-            // such equality (`ReasoningState::literal_equality`). The mark goes on the state
-            // kept in memory, certificate or not, and on the version's certificate where it
-            // has one.
-            if literal_equality {
-                let writer = tx.writer().expect("a transaction holds the writer slot");
-                self.store.mark_literal_equality(writer);
-            }
-            if let Some(mut certificate) = certificate {
-                if literal_equality {
-                    certificate = StoreService::with_literal_equality(certificate);
-                }
+            if let Some(certificate) = certificate {
                 tx.vouch(certificate);
             }
             if let Some(shapes) = shapes {
@@ -627,9 +618,10 @@ impl MutationPipeline {
             return Ok(report);
         }
 
-        // Without reasoning, commits don't maintain the inferred stack.
+        // Without reasoning, commits don't maintain the inferred stack, and no rules' hold is
+        // carried: the rules don't run.
         self.store
-            .invalidate_held(tx.writer().expect("a transaction holds the writer slot"))
+            .forget_marker(tx.writer().expect("a transaction holds the writer slot"))
             .map_err(store_error)?;
         let shapes = crate::shacl::check_shapes(
             &tx,
