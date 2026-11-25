@@ -1304,7 +1304,9 @@ dependencies = [
  "nrese-xsd",
  "rayon",
  "regex",
+ "serde",
  "tempfile",
+ "toml",
 ]
 
 [[package]]

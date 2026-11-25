@@ -163,7 +163,7 @@ pub fn measure(
     let restored_dir = root.path().join("restored");
     let phase = crate::Phase::start();
     let at = Instant::now();
-    let (_, restored_revision) =
+    let (_, restored_revision, _) =
         nrese_store::restore_until(&image, &restored_dir, &logs, Some(cut), None)?;
     let restore_ms = at.elapsed().as_secs_f64() * 1e3;
     let restore_memory = phase.json();

@@ -161,3 +161,80 @@ pub(crate) fn panic_in_maintenance(dir: &Path, step: &'static str) {
         panic!("simulated failure in {step}");
     }
 }
+
+// Counted fault points let a test stop a sequence of durable steps on its own thread.
+type DirSyncFailure = (PathBuf, usize, Box<dyn FnOnce()>);
+thread_local! {
+    /// The directory whose next sync fails once this many more of its syncs have passed.
+    static FAIL_DIR_SYNC_AFTER: RefCell<Option<DirSyncFailure>> = const { RefCell::new(None) };
+    /// How many steps of a recovery's point-in-time cut pass before the next one fails.
+    static STOP_IN_CUT_AFTER: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Makes one sync of the directory `dir` through [`crate::place`] on this thread fail, the
+/// first after `passes` of them have passed; `None` ends it. `dir` need not exist yet: both
+/// sides are compared by their canonical paths at each sync.
+pub fn fail_dir_sync_after(dir: Option<(&Path, usize)>) {
+    FAIL_DIR_SYNC_AFTER.set(dir.map(|(dir, passes)| {
+        (
+            dir.to_path_buf(),
+            passes,
+            Box::new(|| {}) as Box<dyn FnOnce()>,
+        )
+    }));
+}
+
+/// Like [`fail_dir_sync_after`], running `inspect` just before the sync fails.
+pub fn inspect_failed_dir_sync(dir: &Path, passes: usize, inspect: impl FnOnce() + 'static) {
+    FAIL_DIR_SYNC_AFTER.set(Some((dir.to_path_buf(), passes, Box::new(inspect))));
+}
+
+/// Whether this sync of `dir` is the one [`fail_dir_sync_after`] makes fail.
+#[cfg(feature = "fault-points")]
+pub(crate) fn counted_dir_sync_fails(dir: &Path) -> bool {
+    let inspect = FAIL_DIR_SYNC_AFTER.with_borrow_mut(|armed| {
+        let (failing, passes, _) = armed.as_mut()?;
+        if !matches!(
+            (dir.canonicalize(), failing.canonicalize()),
+            (Ok(a), Ok(b)) if a == b
+        ) {
+            return None;
+        }
+        if let Some(left) = passes.checked_sub(1) {
+            *passes = left;
+            return None;
+        }
+        armed.take().map(|(_, _, inspect)| inspect)
+    });
+    if let Some(inspect) = inspect {
+        inspect();
+        return true;
+    }
+    false
+}
+
+/// Makes a recovery's point-in-time cut (`DurabilityConfig::recover_until`) on this thread
+/// stop with an error once `passes` of its steps have passed: step 0 is before anything is
+/// cut, each later one before the removal of a segment after the cut. `None` ends it.
+pub fn stop_in_cut_after(passes: Option<usize>) {
+    STOP_IN_CUT_AFTER.set(passes);
+}
+
+/// One step of a recovery's point-in-time cut ([`stop_in_cut_after`]).
+#[cfg(feature = "fault-points")]
+pub(crate) fn cut_step() -> std::io::Result<()> {
+    match STOP_IN_CUT_AFTER.get() {
+        None => Ok(()),
+        Some(0) => {
+            STOP_IN_CUT_AFTER.set(None);
+            Err(std::io::Error::other(
+                "stopped in the recovery's cut (a fault point's)",
+            ))
+        }
+        Some(left) => {
+            STOP_IN_CUT_AFTER.set(Some(left - 1));
+            Ok(())
+        }
+    }
+}

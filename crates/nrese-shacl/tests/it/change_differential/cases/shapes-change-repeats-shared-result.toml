@@ -1,0 +1,17 @@
+case = "row:shapes-shared-target"
+selection = "any-excluding-shapes"
+equality = false
+shapes = ""
+asserted = """
+<http://example.com/n0> <http://example.com/p1> <http://example.com/n3> .
+<http://example.com/n1> <http://example.com/p1> <http://example.com/n3> .
+<http://example.com/n3> <http://example.com/p0> <http://example.com/v1> .
+"""
+
+[[steps]]
+shapes = """
+ex:A sh:targetNode ex:n0 ; sh:property ex:R .
+ex:B sh:targetNode ex:n1 ; sh:property ex:R .
+ex:R sh:path ex:p1 ; sh:property ex:Q .
+ex:Q sh:path ex:p0 ; sh:maxCount 0 .
+"""
