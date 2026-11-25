@@ -118,6 +118,10 @@ def sign_flip_p(values: list[float]) -> float | None:
     return hits / 2 ** n
 
 
+def _log_counter_step(step: float, scale: float) -> float:
+    return math.log1p(step / scale) if step and scale > 0 else 0.0
+
+
 def loss_test(contrasts: list[float], layouts: list | None = None, higher_is_better: bool = False,
               resolution: float = 0.0, scale: float = 1.0, floor: float = 0.0) -> dict:
     """The one-sided test of a loss over block contrasts (log new/base, one per block), the units
@@ -157,7 +161,7 @@ def loss_test(contrasts: list[float], layouts: list | None = None, higher_is_bet
         half = t_ppf(0.975, len(u) - 1) * sd / math.sqrt(len(u))
         out["ci"] = [mean - half, mean + half]
     out["verdict"] = "measured"
-    if resolution and scale > 0 and abs(mean) < math.log1p(resolution / scale):
+    if abs(mean) < _log_counter_step(resolution, scale):
         out["below_resolution"] = True
     return out
 
@@ -221,7 +225,7 @@ def landing_words(family: list[str], first: dict[str, float], second: dict[str, 
 
 
 @lru_cache(maxsize=256)
-def _sensitivity_shift(n: int, m: int, relative_floor: float) -> float:
+def _sensitivity_shift(n: int, m: int, relative_floor: float, step_in_mean_se: float) -> float:
     """Find the shift reaching 90 % power by integrating over the sample sd."""
     df = n - 1
     critical = t_ppf(1 - ALPHA * PAIR_WEIGHTS[0] / m, df)
@@ -230,7 +234,9 @@ def _sensitivity_shift(n: int, m: int, relative_floor: float) -> float:
     # Integrate in x = chi - mode. The chi log-density has curvature at most -1,
     # so its mass beyond 12 from the mode is below floating-point precision.
     low, high = max(-mode, -12.0), 12.0
-    clamp = min(high, max(low, root_df * relative_floor - mode))
+    # Clearing the step and the clamped t cutoff requires exceeding their maximum.
+    min_sd = max(relative_floor, step_in_mean_se / critical)
+    clamp = min(high, max(low, root_df * min_sd - mode))
     # Split at the clamp's kink. Limit each interval's change in the normal CDF
     # argument to two, even for a large family or few units.
     width = min(1.0, 2 * root_df / critical)
@@ -246,7 +252,7 @@ def _sensitivity_shift(n: int, m: int, relative_floor: float) -> float:
                 for x in (centre - half * node, centre + half * node):
                     log_density = (df - 1) * math.log1p(x / mode) - mode * x - x * x / 2
                     sd = (mode + x) / root_df
-                    terms.append((critical * max(sd, relative_floor), half * weight * math.exp(log_density)))
+                    terms.append((critical * max(sd, min_sd), half * weight * math.exp(log_density)))
     # The chi density's normalization cancels. Conditional rejection probability
     # is half erfc((threshold - shift) / sqrt(2)).
     target = 2 * ROUND_POWER * math.fsum(w for _, w in terms)
@@ -285,7 +291,9 @@ def landing_lines(reading: dict | None, m: int, p: float | None, *, below_step: 
                             else f"no loss above {upper:.2f} % shown")
     if p is not None and sd > 0 and not discrete and not below_step:
         # Use the effective spread as the true sd estimate, with the same floor in the test.
-        shift = _sensitivity_shift(n, m, floor / sd) * sd / math.sqrt(n)
+        mean_se = sd / math.sqrt(n)
+        log_step = _log_counter_step(reading.get("step") or 0.0, reading.get("base") or 0.0)
+        shift = _sensitivity_shift(n, m, floor / sd, log_step / mean_se) * mean_se
         percent = _ceil_percent(shift)
         two_round_power = 2 * ROUND_POWER - 1
         out.update(p=p, sensitivity=f"{percent:.2f} % loss at two-round power ≥ {two_round_power * 100:.0f} %")

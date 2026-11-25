@@ -177,11 +177,12 @@ def fleet_host_errors(passes: list[dict], host: str) -> list[str]:
 
 
 def provenance_errors(passes: list[dict], sides: dict[str, str], harness: str, planned: list[str],
-                      *, host_errors: list[str] | None = None) -> list[str]:
+                      *, host_errors: list[str] | None = None, verified_binaries: dict | None = None) -> list[str]:
     """What each pass must say about itself: complete, one repetition of exactly the planned
     cases, the clean harness revision at start and end, its side's verified binaries (the same
     in every pass of the side), the same prepared data unchanged, one host and configuration."""
     errors, binaries, prepared, identities, options, layouts = [], {}, set(), set(), {}, {}
+    all_verified = True
     registry = hosts_registry.public_registry() if passes else {}
     for p in passes:
         r, name = p["report"], p["path"]
@@ -203,17 +204,22 @@ def provenance_errors(passes: list[dict], sides: dict[str, str], harness: str, p
         for key in ("binaries", "binaries_finished"):
             b = r.get(key) or {}
             if not b.get("verified") or b.get("revision") != rev:
+                all_verified = False
                 errors.append(f"{name}: {key}: revision {b.get('revision')} verified {b.get('verified')}, "
                               f"expected {rev} verified")
-        if (r.get("binaries") or {}).get("sha256") != (r.get("binaries_finished") or {}).get("sha256"):
+        built = r.get("binaries") or {}
+        hashes = built.get("sha256")
+        if hashes != (r.get("binaries_finished") or {}).get("sha256"):
+            all_verified = False
             errors.append(f"{name}: binaries changed during the pass")
+        if not isinstance(hashes, dict) or not hashes:
+            all_verified = False
         if not (r.get("instance") or {}).get("built"):
             # Blocks timing one cached instance of a build share its offset (lks-aa-20): no
             # independent units (fast.py block --fresh-copies).
             errors.append(f"{name}: timed its side's build in place, not a copy made for its block")
-        layout = (r.get("binaries") or {}).get("layout", 1)
-        binaries.setdefault((p["side"], layout), set()).add(
-            json.dumps((r.get("binaries") or {}).get("sha256"), sort_keys=True))
+        layout = built.get("layout", 1)
+        binaries.setdefault((p["side"], layout), set()).add(json.dumps(hashes, sort_keys=True))
         layouts.setdefault(p["side"], Counter())[layout] += 1
         info = r.get("prepared") or {}
         if not info:
@@ -226,6 +232,9 @@ def provenance_errors(passes: list[dict], sides: dict[str, str], harness: str, p
                                    "runtime": r.get("runtime")}, sort_keys=True))
     errors += [f"{side}: different binaries in its passes" + (f" of layout {layout}" if layout > 1 else "")
                for (side, layout), shas in binaries.items() if len(shas) > 1]
+    if verified_binaries is not None and all_verified and all(len(shas) == 1 for shas in binaries.values()):
+        for (side, layout), shas in binaries.items():
+            verified_binaries.setdefault(side, {})[str(layout)] = json.loads(next(iter(shas)))
     # Builds of several layouts (release-gate.sh GATE_LAYOUTS): every side the same layouts as
     # often, so that a layout's luck falls on all alike.
     if len({json.dumps(sorted(c.items())) for c in layouts.values()}) > 1:
@@ -1210,7 +1219,9 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
     if not planned:
         summary["errors"].append(f"nothing timed: {len(passes)} passes, none planned a case")
     host_provenance: list[str] = []
-    summary["errors"] += provenance_errors(passes, sides, harness, planned, host_errors=host_provenance)
+    verified_binaries: dict = {}
+    summary["errors"] += provenance_errors(passes, sides, harness, planned, host_errors=host_provenance,
+                                           verified_binaries=verified_binaries)
     # Sides that ran one build compare nothing (D16-593): a round of a build against itself reads "no
     # loss". Sides of one revision are declared identical (an A-A' control; a confirmation's main that
     # is its base); any other two must differ, layout by layout. Per build, not per case: a case one
@@ -1228,6 +1239,7 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
     host_provenance += fleet_errors
     host_errors, summary["host_notes"] = host_states(passes)
     summary["errors"] += host_errors
+    host_provenance += host_errors
     summary["host"] = sorted({(p["report"].get("machine") or {}).get("host") for p in passes}, key=str)
     by_side = {s: sorted([p for p in passes if p["side"] == s], key=lambda p: p["n"]) for s in sides}
     checks = {c["name"]: {path.split(".")[1] for path in c.get("check", {}) if path.startswith("q.")}
@@ -1326,6 +1338,7 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
         summary["lines"] = {h: landing_dimension(summary, h, len(landing_family)) for h in landing_family}
         summary.update(gatestats.landing_words(landing_family, landing_pvalues(summary)))
         summary["host_provenance_errors"] = host_provenance
+        summary["verified_binary_hashes"] = verified_binaries
         for entry, p in zip(summary["passes"], ordered_passes):
             # The same pass keeps its identity if copied, renamed, or re-encoded as JSON.
             content = json.dumps(p["report"], sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -1357,7 +1370,7 @@ def landing_pair(first: dict, second: dict) -> dict:
     first_context, second_context = first.get("context") or {}, second["context"]
     if first_context.get("round", 0) not in (0, "0") or second_context.get("round") != 1:
         raise ValueError("round 1 report must be paired with round 2")
-    for key in ("candidate", "baselines", "host", "family"):
+    for key in ("candidate", "baselines", "host"):
         if first.get(key) != second[key]:
             raise ValueError(f"round 1 report: {key} does not match round 2")
     first_host, second_host = first_context.get("host") or "", second_context.get("host") or ""
@@ -1377,6 +1390,9 @@ def landing_pair(first: dict, second: dict) -> dict:
             raise ValueError(f"round {k} has a host provenance error or no host provenance record")
     if landing_pass_hashes(first, 1) & landing_pass_hashes(second, 2):
         raise ValueError("the rounds share a pass")
+    hashes = first.get("verified_binary_hashes")
+    if not hashes or hashes != second.get("verified_binary_hashes"):
+        raise ValueError("the rounds' verified binary hashes are missing or differ")
     return gatestats.landing_words(list(second_p), first_p, second_p)
 
 
