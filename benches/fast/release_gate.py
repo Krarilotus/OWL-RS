@@ -3982,7 +3982,8 @@ def main() -> int:
             else:
                 hosts_registry.evidence_path(json_output, private).write_text(
                     json.dumps(summary, indent=1, default=str), encoding="utf-8")
-        return 0 if summary["passed"] else 1
+        # A completed pair can record a timing loss or an earlier correctness failure.
+        return 0 if summary["passed"] or (first is not None and not summary["errors"]) else 1
     if args.command == "floor":
         summary = json.loads(args.report.read_text(encoding="utf-8"))
         floor = noise_floor(summary)

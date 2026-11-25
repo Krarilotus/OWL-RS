@@ -119,10 +119,12 @@ drop_checkout() {
   rm -rf "$1" && git worktree remove --force "$1" 2>/dev/null
   return 0
 }
+report_stage=
 finish() {
   local dir
   cd "$launch" 2>/dev/null || cd /
   for dir in "$RUN"/src-*; do [ ! -d "$dir" ] || drop_checkout "$dir"; done
+  [ -z "$report_stage" ] || rm -rf -- "$report_stage"
   rm -rf "$RUN"
 }
 trap finish EXIT
@@ -715,7 +717,8 @@ report)
   shift 2
   args=() candidate= round_one=
   if [ "${1:-}" = --round-one ]; then
-    round_one=$(cd "$launch" && realpath -e -- "${2:?report --round-one needs a file}") || exit 2
+    round_one=$(cd "$launch" && anchored "${2:?report --round-one needs a file}") || exit 2
+    [ -f "$round_one" ] || { echo "report: no first-round file ($round_one)" >&2; exit 2; }
     if [ "$round_one" -ef "$OUT/release-gate.json" ] || [ "$round_one" -ef "$OUT/release-gate.md" ]; then
       echo "report: the first-round input is also a report output ($round_one)" >&2
       exit 2
@@ -750,20 +753,39 @@ report)
   # writing left the earlier PASSED one, which the step and the verdict took for this run's).
   { rm -f "$OUT/release-gate.json" "$OUT/release-gate.md" && [ ! -e "$OUT/release-gate.json" ]; } \
     || { log "report: the earlier report $OUT/release-gate.json can't be removed: no report"; exit 1; }
+  report_out=$OUT
+  if [ -n "$round_one" ]; then
+    report_stage=$(mktemp -d "$OUT/.paired-report-XXXXXX") || exit 2
+    report_out=$report_stage
+  fi
   (cd "$tree" && py benches/fast/release_gate.py report --passes "$OUT/passes" --candidate "$candidate" "${args[@]}" \
      --require "$required" --harness-revision "$harness" --min-blocks "${GATE_MIN_BLOCKS:-2}" --family "$own_family" \
      --inputs "$own_inputs" \
      --context "host=${GATE_HOST:-}" --context "round=${GATE_ROUND:-0}" --context "prefix=${GATE_PREFIX:-}" \
      --context "gate_name=${GATE_NAME:-}" --context "max_gb=$MAX_GB" --context "ram_gb=${GATE_RAM_GB:-$MAX_GB}" \
      --context "layouts=$LAYOUTS" \
-     --out "$OUT/release-gate.md" --json "$OUT/release-gate.json") > "$OUT/report.log" 2>&1
+     --out "$report_out/release-gate.md" --json "$report_out/release-gate.json") > "$OUT/report.log" 2>&1
   code=$?
-  if [ "$code" -gt 1 ]; then
+  if [ -n "$round_one" ]; then
+    [ "$code" -eq 0 ] || exit "$code"
+    if ! [ -f "$report_out/release-gate.md" ] ||
+       ! py -c 'import json, sys; sys.exit(json.load(open(sys.argv[1], encoding="utf-8")).get("errors") != [])' \
+            "$report_out/release-gate.json" >> "$OUT/report.log" 2>&1; then
+      log "paired report: incomplete outputs or evidence errors ($OUT/report.log)"
+      exit 1
+    fi
+    # The JSON is the receipt that both files are ready, so it goes last.
+    if ! mv -- "$report_out/release-gate.md" "$OUT/release-gate.md" ||
+       ! mv -- "$report_out/release-gate.json" "$OUT/release-gate.json"; then
+      rm -f "$OUT/release-gate.json" "$OUT/release-gate.md"
+      exit 1
+    fi
+  elif [ "$code" -gt 1 ]; then
     rm -f "$OUT/release-gate.json" "$OUT/release-gate.md"
     exit "$code"
   fi
   log "timed part: $( [ $code -eq 0 ] && echo passed || echo 'not passed') ($OUT/release-gate.md)"
-  # Exit 1 with a completed report is a judged result, including a confirmed timing loss.
+  # For an ordinary round, exit 1 with a completed report is a judged result.
   [ -f "$OUT/release-gate.json" ] || exit 1
   ;;
 
