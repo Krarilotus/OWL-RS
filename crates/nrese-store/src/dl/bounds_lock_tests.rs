@@ -115,6 +115,7 @@ fn program_fact_snapshot_probes_leave_the_bounds_state_unlocked() {
         assert_eq!(after.last, "delta", "{after:?}");
         assert_eq!(after.unavailable, None, "{after:?}");
     });
+    eprintln!("{total} snapshot probes, {locked} under the bounds state lock");
     assert!(
         total >= MEMBERS,
         "the read made only {total} snapshot probes"
@@ -122,6 +123,56 @@ fn program_fact_snapshot_probes_leave_the_bounds_state_unlocked() {
     assert_eq!(
         locked, 0,
         "snapshot probes with the bounds state locked, of {total}"
+    );
+}
+
+/// A view can't use an older U1's facts with a newer compilation of its stack.
+#[test]
+fn a_rebuild_during_fact_probes_does_not_mix_revisions() {
+    let (store, pipeline) = pipeline();
+    update(
+        &pipeline,
+        "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+         INSERT DATA {
+           :Before a owl:Class . :After a owl:Class .
+           :x a owl:NamedIndividual , [ owl:complementOf [ owl:complementOf :Before ] ] .
+         }",
+    );
+    let old = store.engine().snapshot();
+    seam::set(&store.dl().bounds, Point::Eligible, move || {
+        assert!(pipeline.store().dl().bounds.state.try_lock().is_ok());
+        update(
+            &pipeline,
+            "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+             DELETE { :x a ?outer . ?outer owl:complementOf ?inner . ?inner owl:complementOf :Before }
+             INSERT { :x a [ owl:complementOf [ owl:complementOf :After ] ] }
+             WHERE  { :x a ?outer . ?outer owl:complementOf ?inner . ?inner owl:complementOf :Before }",
+        );
+    });
+
+    let old_read = view_until(&store, &old, None, None);
+    let (current, latest) = view(&store);
+    assert!(
+        current.revision() > old.revision(),
+        "the rebuild must advance the revision"
+    );
+    let upper = latest.upper.as_ref().expect("the rebuilt upper bound");
+    let id = |iri| {
+        current
+            .lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into())
+            .unwrap()
+            .raw()
+    };
+    let x = id("urn:test:x");
+    let rdf_type = id(RDF_TYPE);
+    assert_eq!(
+        (
+            matches!(old_read, Some(Err(Missing::Later))),
+            in_view(upper, [x, rdf_type, id("urn:test:Before")]),
+            in_view(upper, [x, rdf_type, id("urn:test:After")]),
+        ),
+        (true, false, true),
+        "the previous read must yield to the rebuild and the new view use the new facts"
     );
 }
 

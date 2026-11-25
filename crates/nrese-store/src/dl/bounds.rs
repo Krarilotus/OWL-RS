@@ -32,7 +32,7 @@ use nrese_reasoner::eval::Stop;
 use nrese_reasoner::ir::Triple;
 
 use super::source;
-use super::upper::{Change, GaveUp, Upper};
+use super::upper::{Change, GaveUp, ProgramFacts, Upper};
 use crate::StoreService;
 
 #[cfg(test)]
@@ -73,6 +73,8 @@ pub(crate) mod seam {
         BuildDeadline,
         /// The TBox's taxonomy for a read, not begun.
         Taxonomy,
+        /// A read filtered the program facts and has yet to recheck the revision.
+        Eligible,
         /// A revision's read view, not begun.
         View,
         /// A commit's ontology read again, not begun.
@@ -1244,7 +1246,7 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> ViewEnd {
         }
     };
     drop(stale);
-    // The bounds' U1 at the revision: its compilation, route, `rdf:type`, taxonomy.
+    // The bounds' U1 at the revision: its compilation, route, program facts and taxonomy.
     let found = {
         let state = lock(&bounds.state);
         match state.as_ref() {
@@ -1254,6 +1256,7 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> ViewEnd {
                 s.kinds.is_some(),
                 s.upper.as_ref().ok().map(|u| u.program.names.rdf_type),
                 s.taxonomy.clone(),
+                s.upper.as_deref().ok().map(|u| Arc::clone(u.facts())),
             )),
             _ => None,
         }
@@ -1265,7 +1268,7 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> ViewEnd {
         super::lower::memberships(snapshot, taxonomy, rdf_type, kept).ok()
     };
     let parts = match found {
-        Some((compiled, rules, rdf_type, kept_taxonomy)) => {
+        Some((compiled, rules, rdf_type, kept_taxonomy, facts)) => {
             let lower = match rdf_type {
                 Some(rdf_type) if !rules => {
                     // Held, with its charge, while its memberships are read.
@@ -1276,9 +1279,11 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> ViewEnd {
                 _ => Some(ChargedVec::new(Arc::clone(kept))),
             };
             match lower {
-                // Serial: what the view takes of U1, under the state (a commit's install
-                // may change U1 in place once it is let go).
                 Some(lower) => {
+                    let eligible = facts.and_then(|facts| eligible_facts(snapshot, &facts, kept));
+                    #[cfg(test)]
+                    seam::at(bounds, seam::Point::Eligible);
+                    // The stack may have moved on while the program facts were filtered.
                     let state = lock(&bounds.state);
                     let Some(s) = state
                         .as_ref()
@@ -1292,6 +1297,7 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> ViewEnd {
                         s.upper.as_deref(),
                         s.kinds.is_some(),
                         &lower,
+                        eligible,
                         kept,
                     )
                 }
@@ -1322,8 +1328,13 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> ViewEnd {
                 }
                 _ => Some(ChargedVec::new(Arc::clone(kept))),
             };
-            let parts = lower
-                .and_then(|lower| parts(snapshot, revision, upper.as_ref(), rules, &lower, kept));
+            let parts = lower.and_then(|lower| {
+                let upper = upper.as_ref();
+                let eligible = upper
+                    .ok()
+                    .and_then(|u| eligible_facts(snapshot, u.facts(), kept));
+                parts(snapshot, revision, upper, rules, &lower, eligible, kept)
+            });
             // A U1 a budget refused is not kept: the next read builds it again.
             let refused_upper = upper.as_ref().is_err_and(|g| g.refused);
             keep &= !refused_upper;
@@ -1629,6 +1640,24 @@ fn assemble(snapshot: &Snapshot, parts: Parts, kept: &Arc<nrese_exec::Budget>) -
     (view, true)
 }
 
+/// The program facts the stack and snapshot don't already supply, for this revision.
+fn eligible_facts(
+    snapshot: &Snapshot,
+    facts: &ProgramFacts,
+    kept: &Arc<nrese_exec::Budget>,
+) -> Option<ChargedVec<Triple>> {
+    let mut eligible = ChargedVec::new(Arc::clone(kept));
+    let ProgramFacts { triples, classes } = facts;
+    for &t in triples {
+        // The stack already holds the representative form of facts that touch a class.
+        if t.into_iter().any(|id| classes.class_of(id).is_some()) || in_view(snapshot, t) {
+            continue;
+        }
+        eligible.push(t).ok()?;
+    }
+    Some(eligible)
+}
+
 /// What a view of `revision` takes of U1 and of L's memberships `lower` (sorted, each once):
 /// serial, nothing waited for (U1-I): one pass over U1's facts, each with the searches of
 /// [`held_by_lower`], then one over the members of the gap signature's classes. Its copies
@@ -1654,6 +1683,7 @@ fn parts(
     upper: Result<&Upper, &GaveUp>,
     rules: bool,
     lower: &[Triple],
+    eligible: Option<ChargedVec<Triple>>,
     kept: &Arc<nrese_exec::Budget>,
 ) -> Option<Parts> {
     let empty = || ChargedVec::new(Arc::clone(kept));
@@ -1704,6 +1734,7 @@ fn parts(
             });
         }
     };
+    let eligible = eligible?;
     let rdf_type = upper.program.names.rdf_type;
     let clash = upper.program.names.clash;
     let encode = |[s, p, o]: Triple| {
@@ -1763,14 +1794,6 @@ fn parts(
             Some(over)
         }
     };
-    let mut eligible = ChargedVec::new(Arc::clone(kept));
-    for t in upper.facts() {
-        // The stack already holds the representative form of facts that touch a class.
-        if t.into_iter().any(|id| classes.class_of(id).is_some()) || in_view(snapshot, t) {
-            continue;
-        }
-        eligible.push(t).ok()?;
-    }
     let capacity = upper.stack.len().checked_add(eligible.len())?;
     let mut triples = ChargedVec::with_capacity(Arc::clone(kept), capacity).ok()?;
     let mut take = |[s, p, o]: Triple| {
