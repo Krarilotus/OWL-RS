@@ -18,7 +18,7 @@ const SUBPROPERTY: &str = ":q a owl:ObjectProperty ; rdfs:subPropertyOf owl:topO
 enum Expected {
     True,
     False,
-    FalseComplete,
+    FalseWithConsistencyReason,
     TrueOrIncomplete,
     Incomplete,
     /// A `SELECT` with no row, or one not told `complete`.
@@ -30,7 +30,9 @@ enum Expected {
 // and superproperties keep that relation. A subproperty may be empty.
 #[test]
 fn reads_of_universal_roles() {
-    use Expected::{False, FalseComplete, Incomplete, NoRowOrIncomplete, True, TrueOrIncomplete};
+    use Expected::{
+        False, FalseWithConsistencyReason, Incomplete, NoRowOrIncomplete, True, TrueOrIncomplete,
+    };
 
     let cases = [
         ("equivalent", EQUIVALENT, "ASK { :a :q ?y }", True),
@@ -84,31 +86,31 @@ fn reads_of_universal_roles() {
             "control: object subproperty",
             SUBPROPERTY,
             "ASK { :a :q ?y }",
-            FalseComplete,
+            FalseWithConsistencyReason,
         ),
         (
             "control: named pair",
             SUBPROPERTY,
             "ASK { :a :q :b }",
-            FalseComplete,
+            FalseWithConsistencyReason,
         ),
         (
             "control: class join",
             SUBPROPERTY,
             "ASK { :a :q ?y . ?y a :C }",
-            FalseComplete,
+            FalseWithConsistencyReason,
         ),
         (
             "control: no class witness",
             EQUIVALENT,
             "ASK { :a :q ?y . ?y a :Absent }",
-            FalseComplete,
+            FalseWithConsistencyReason,
         ),
         (
             "control: data subproperty",
             ":d a owl:DatatypeProperty ; rdfs:subPropertyOf owl:topDataProperty .",
             "ASK { :a :d ?v }",
-            FalseComplete,
+            FalseWithConsistencyReason,
         ),
     ];
 
@@ -144,11 +146,18 @@ fn reads_of_universal_roles() {
                 .unwrap();
             let value: Value = serde_json::from_slice(&result.payload).unwrap();
             let answer = value["boolean"].as_bool();
-            let complete = result.completeness.map(|status| status.complete);
+            let complete = result.completeness.as_ref().map(|status| status.complete);
             let correct = match expected {
                 True => answer == Some(true),
                 False => answer == Some(false),
-                FalseComplete => answer == Some(false) && complete == Some(true),
+                FalseWithConsistencyReason => {
+                    answer == Some(false)
+                        && result.completeness.is_some_and(|status| {
+                            status.as_str() == "sound-only"
+                                && status.reasons.len() == 1
+                                && status.reasons[0].source == "consistency"
+                        })
+                }
                 TrueOrIncomplete => answer == Some(true) || complete == Some(false),
                 Incomplete => complete == Some(false),
                 NoRowOrIncomplete => {

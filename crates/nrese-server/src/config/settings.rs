@@ -298,6 +298,14 @@ pub const SETTINGS: &[Setting] = &[
         OPTIONAL_FILE,
         "A file loaded at startup; a missing file is a startup error.",
     ),
+    // [gates]
+    setting(
+        "gates.undecided",
+        names::GATES_UNDECIDED,
+        Choice(&["mark", "refuse"]),
+        Unset::Text("mark"),
+        "What to do when the store's consistency cannot be decided.",
+    ),
     // [shacl]
     setting(
         "shacl.shapes_graph",

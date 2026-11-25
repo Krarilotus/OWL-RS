@@ -4,11 +4,13 @@ use nrese_reasoner::ReasonerService;
 
 use super::attribution::attribute_reject_delta;
 use super::command::{MutationCommand, MutationCommitReport};
+use super::disposition::Route;
 use super::error::{MutationError, RejectKind};
 use super::evidence;
 use super::prepare::{Preparation, cached, ground_key};
 use super::record::ReasoningRunRecord;
 use super::ticket::{MutationTicket, publishing};
+use crate::WhyUndecided;
 use crate::config::{GateSeverity, ShaclGate};
 use crate::delta::MutationDeltaPreview;
 use crate::error::StoreError;
@@ -420,10 +422,12 @@ impl MutationPipeline {
                     }
                     detail.push_str(&evidence::trigger(attribution.as_ref()));
                     evidence::Draft {
-                        kind: match undecided {
-                            Some(_) => RejectKind::Undecided,
-                            None => RejectKind::Inconsistent,
-                        },
+                        kind: undecided.map_or(RejectKind::Inconsistent, |why| {
+                            self.store
+                                .dispose(why, Route::Commit)
+                                .refusal()
+                                .expect("an unsettled DL clash is refused")
+                        }),
                         detail,
                         explanation,
                         attribution,
@@ -435,6 +439,19 @@ impl MutationPipeline {
                     self.view_reason(view, None, &dl_own_budget, &resources)
                 });
                 return Err(MutationError::Rejected(Box::new(reject)));
+            }
+            let ql_witness = (self.reasoner.config().mode()
+                == nrese_reasoner::ReasoningMode::Owl2Ql)
+                .then(|| crate::dl::bounds::find_ill_typed_after(&self.store, &tx, &stop));
+            if ql_witness == Some(Some(None))
+                && let Some(kind) = self
+                    .store
+                    .dispose(WhyUndecided::NoQlDecider, Route::Commit)
+                    .refusal()
+            {
+                ticket.claim_error()?;
+                let view = evidence::EvidenceView::new(&requester.read, &tx);
+                return Err(MutationError::Rejected(Box::new(view.no_ql_decider(kind))));
             }
             self.record_run(ReasoningRunRecord::from_report(
                 &materialisation,
@@ -503,7 +520,8 @@ impl MutationPipeline {
             )?;
             // The version's certificate, its ill-typed literal judged under the writer slot alone
             // (a whole-store scan where the commit deletes it), before the commit and its rights.
-            let witness = dl.as_ref().and_then(|(gate, _, _)| gate.ill_typed);
+            let witness =
+                ql_witness.or_else(|| dl.as_ref().and_then(|(gate, _, _)| gate.ill_typed));
             let certificate = (tx.base().certificate().cloned())
                 .map(|certificate| self.store.with_ill_typed(certificate, &tx, witness));
             if !ticket.begin_commit() {

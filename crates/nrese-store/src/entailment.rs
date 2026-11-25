@@ -128,7 +128,7 @@ impl StoreService {
         }
         #[cfg(test)]
         crate::service::hooks::run(&crate::service::hooks::AFTER_CERTIFIED);
-        let consistency = self.consistency();
+        let consistency = self.rules_found();
         // Not known to entail everything, nor not to: no answer.
         if let crate::ConsistencyStatus::Undecided { violations, why } = consistency {
             return Err(StoreError::Undecided(why.text(violations)));

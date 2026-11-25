@@ -1180,6 +1180,26 @@ fn conditions(
         let memory = store.memory_stop();
         c.ill_typed(snapshot, &|| memory.exceeded())
     });
+    use crate::{ConsistencyStatus::Undecided, WhyUndecided::NoQlDecider};
+    if found == Some(Some(None))
+        && state.is_some_and(|state| {
+            matches!(
+                state.consistency(),
+                Undecided {
+                    why: NoQlDecider,
+                    ..
+                }
+            )
+        })
+    {
+        completeness.incomplete(
+            "consistency",
+            format!(
+                "{}, and inconsistent data entail every answer",
+                NoQlDecider.text(0)
+            ),
+        );
+    }
     match found {
         Some(Some(None)) | None => {}
         Some(None) => completeness.incomplete(source, UNCHECKED.to_owned()),

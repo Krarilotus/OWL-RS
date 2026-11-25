@@ -196,7 +196,12 @@ fn an_unused_negative_assertion_clash_is_refused_as_undecided() {
     );
     match refused {
         Err(MutationError::Rejected(reject)) => {
-            assert_eq!(reject.kind, RejectKind::Undecided, "{}", reject.detail);
+            assert_eq!(
+                reject.kind,
+                RejectKind::Undecided(nrese_store::UndecidedCause::ReadsDifferently),
+                "{}",
+                reject.detail
+            );
         }
         other => panic!("expected a refusal, got {other:?}"),
     }
@@ -400,7 +405,12 @@ fn a_clash_through_a_part_left_out_is_refused_as_undecided() {
     );
     match refused {
         Err(MutationError::Rejected(reject)) => {
-            assert_eq!(reject.kind, RejectKind::Undecided, "{}", reject.detail);
+            assert_eq!(
+                reject.kind,
+                RejectKind::Undecided(nrese_store::UndecidedCause::ReadsDifferently),
+                "{}",
+                reject.detail
+            );
         }
         other => panic!("expected a refusal, got {other:?}"),
     }

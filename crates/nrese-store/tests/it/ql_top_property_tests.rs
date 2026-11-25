@@ -24,7 +24,11 @@ fn answer(store: &StoreService, query: &str) -> (Value, bool) {
         .clone();
     (
         value,
-        result.completeness.is_some_and(|status| status.complete),
+        result.completeness.is_some_and(|status| {
+            status.as_str() == "sound-only"
+                && status.reasons.len() == 1
+                && status.reasons[0].source == "consistency"
+        }),
     )
 }
 
@@ -58,13 +62,15 @@ fn check_ql_reads(premises: &[&str], query: &str, expected: Value) {
                     .unwrap();
                 "commit"
             };
-            let (actual, complete) = answer(&store, &query);
+            let (actual, consistency_only) = answer(&store, &query);
             if actual != expected {
                 failures.push(format!(
-                    "{route}, {premise}: expected {expected}, got {actual} (complete={complete})"
+                    "{route}, {premise}: expected {expected}, got {actual}"
                 ));
-            } else if !complete {
-                failures.push(format!("{route}, {premise}: answer was incomplete"));
+            } else if !consistency_only {
+                failures.push(format!(
+                    "{route}, {premise}: expected the consistency reason alone"
+                ));
             }
         }
     }

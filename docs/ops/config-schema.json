@@ -747,6 +747,22 @@
       },
       "type": "object"
     },
+    "gates": {
+      "additionalProperties": false,
+      "properties": {
+        "undecided": {
+          "default": "mark",
+          "description": "What to do when the store's consistency cannot be decided.",
+          "enum": [
+            "mark",
+            "refuse"
+          ],
+          "type": "string",
+          "x-env": "NRESE_GATES_UNDECIDED"
+        }
+      },
+      "type": "object"
+    },
     "policy": {
       "additionalProperties": false,
       "properties": {

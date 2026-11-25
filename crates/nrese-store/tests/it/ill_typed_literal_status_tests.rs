@@ -13,6 +13,7 @@ use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
 use nrese_store::{
     ConsistencyStatus, MutationCommand, MutationPipeline, MutationTicket, Requester,
     SolutionsResultFormat, SparqlQueryRequest, SparqlUpdateRequest, StoreConfig, StoreService,
+    WhyUndecided,
 };
 
 const PREFIXES: &str = "PREFIX : <http://example.org/> \
@@ -100,12 +101,24 @@ fn not_withheld(store: &StoreService, case: &str, named: Option<&str>) -> Option
     (!withheld).then(|| format!("{case}: {word} {reasons:?}, {consistency:?}"))
 }
 
-/// What `store` says of itself where it isn't `complete` and `consistent`.
-fn not_complete(store: &StoreService, case: &str) -> Option<String> {
+/// A well-typed store is complete and consistent under DL, undecided under QL.
+fn not_as_well_typed(store: &StoreService, ruleset: &str, case: &str) -> Option<String> {
     let (word, reasons) = read(store);
     let consistency = store.consistency();
-    (word != "complete" || consistency != ConsistencyStatus::Consistent)
-        .then(|| format!("{case}: {word} {reasons:?}, {consistency:?}"))
+    let expected = if ruleset == "owl2-ql" {
+        word == "sound-only"
+            && reasons
+                .iter()
+                .any(|reason| reason.contains("no check decides"))
+            && consistency
+                == (ConsistencyStatus::Undecided {
+                    why: WhyUndecided::NoQlDecider,
+                    violations: 0,
+                })
+    } else {
+        word == "complete" && consistency == ConsistencyStatus::Consistent
+    };
+    (!expected).then(|| format!("{case}: {word} {reasons:?}, {consistency:?}"))
 }
 
 fn assert_none(unmet: &[String], what: &str) {
@@ -133,7 +146,7 @@ fn a_store_holding_an_ill_typed_literal_is_told_neither_complete_nor_consistent(
     );
 }
 
-/// Controls: a well-typed `"5"^^xsd:integer` keeps the word and `consistent`; under a range
+/// Controls: a well-typed `"5"^^xsd:integer` keeps the profile's normal verdict; under a range
 /// of `xsd:integer`, the ill-typed literal's commit is refused (dt-not-type), as before.
 #[test]
 fn a_well_typed_literal_keeps_the_word_and_a_range_still_refuses_an_ill_typed_one() {
@@ -141,8 +154,9 @@ fn a_well_typed_literal_keeps_the_word_and_a_range_still_refuses_an_ill_typed_on
     for ruleset in RULESETS {
         let pipeline = open(ruleset, None);
         update(&pipeline, "INSERT DATA { :a :d \"5\"^^xsd:integer }");
-        unmet.extend(not_complete(
+        unmet.extend(not_as_well_typed(
             pipeline.store(),
+            ruleset,
             &format!("{ruleset} well-typed"),
         ));
         let ranged = open(ruleset, None);
@@ -155,8 +169,8 @@ fn a_well_typed_literal_keeps_the_word_and_a_range_still_refuses_an_ill_typed_on
 }
 
 /// The state holds across a restart: the store, written on disk, reopened without a rebuild,
-/// still withholds its first read and its consistency; a well-typed store, reopened so, is
-/// `complete` and `consistent` at its first read.
+/// still withholds its first read and its consistency; a well-typed store, reopened so,
+/// reports the profile's normal verdict at its first read.
 #[test]
 fn a_store_reopened_without_a_rebuild_still_withholds() {
     let mut unmet = Vec::new();
@@ -187,14 +201,14 @@ fn a_store_reopened_without_a_rebuild_still_withholds() {
             }
             unmet.extend(match ill_typed {
                 true => not_withheld(after.store(), &case, Some("\"abc\"")),
-                false => not_complete(after.store(), &case),
+                false => not_as_well_typed(after.store(), ruleset, &case),
             });
         }
     }
     assert_none(&unmet, "a reopened store is told otherwise");
 }
 
-/// Deleting the literal gives the word and `consistent` back; on disk, after a reopen without
+/// Deleting the literal restores the profile's normal verdict; on disk, after a reopen without
 /// a rebuild, too, with no rebuild (a store in memory rebuilds at its first commit anyway).
 #[test]
 fn deleting_the_ill_typed_literal_gives_the_word_back() {
@@ -212,7 +226,7 @@ fn deleting_the_ill_typed_literal_gives_the_word_back() {
             }
             update(&pipeline, "DELETE DATA { :a :d \"abc\"^^xsd:integer }");
             let case = format!("{ruleset} {case}");
-            unmet.extend(not_complete(pipeline.store(), &case));
+            unmet.extend(not_as_well_typed(pipeline.store(), ruleset, &case));
             if disk.is_some() && pipeline.store().last_materialisation().is_some() {
                 unmet.push(format!("{case}: rematerialised"));
             }
@@ -255,8 +269,9 @@ fn deleting_one_of_two_ill_typed_literals_keeps_the_other_withheld() {
             update(&pipeline, &format!("DELETE DATA {{ {gone} }}"));
             unmet.extend(not_withheld(pipeline.store(), &case, Some(named)));
             update(&pipeline, &format!("DELETE DATA {{ {kept} }}"));
-            unmet.extend(not_complete(
+            unmet.extend(not_as_well_typed(
                 pipeline.store(),
+                ruleset,
                 &format!("{case}, then {kept}"),
             ));
         }

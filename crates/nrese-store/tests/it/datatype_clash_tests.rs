@@ -146,7 +146,9 @@ fn commit(pipeline: &MutationPipeline, data: &str) -> String {
         Err(MutationError::Rejected(r)) if r.kind == RejectKind::Inconsistent => {
             "refused".to_owned()
         }
-        Err(MutationError::Rejected(r)) if r.kind == RejectKind::Undecided => {
+        Err(MutationError::Rejected(r))
+            if r.kind == RejectKind::Undecided(nrese_store::UndecidedCause::ReadsDifferently) =>
+        {
             "refused as undecided".to_owned()
         }
         Err(e) => format!("failed: {e:?}"),

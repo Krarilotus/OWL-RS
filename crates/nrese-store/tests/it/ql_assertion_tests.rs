@@ -16,8 +16,15 @@ const PREFIXES: &str = "PREFIX : <http://example.com/> \
     PREFIX owl: <http://www.w3.org/2002/07/owl#> \
     PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> ";
 
-/// The answer to `ASK { question }` after one commit of `data`, and whether the read is
-/// told complete; `None` where the commit is refused as inconsistent (any other refusal
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadClaim {
+    Complete,
+    OnlyConsistency,
+    Other,
+}
+
+/// The answer to `ASK { question }` after one commit of `data`, and the claim the read
+/// carries. `None` where the commit is refused as inconsistent (any other refusal
 /// fails the cell).
 fn ask(
     mode: ReasoningMode,
@@ -25,7 +32,7 @@ fn ask(
     equality: &str,
     data: &str,
     question: &str,
-) -> Option<(bool, bool)> {
+) -> Option<(bool, ReadClaim)> {
     let store = StoreService::new(StoreConfig {
         equality_by_representatives: equality != "replicate",
         equality_compact: equality == "compact",
@@ -53,8 +60,18 @@ fn ask(
         .chars()
         .filter(|c| !c.is_whitespace())
         .collect();
-    let complete = result.completeness.is_some_and(|c| c.complete);
-    Some((text.contains("\"boolean\":true"), complete))
+    let claim = match result.completeness {
+        Some(status) if status.complete => ReadClaim::Complete,
+        Some(status)
+            if status.as_str() == "sound-only"
+                && status.reasons.len() == 1
+                && status.reasons[0].source == "consistency" =>
+        {
+            ReadClaim::OnlyConsistency
+        }
+        _ => ReadClaim::Other,
+    };
+    Some((text.contains("\"boolean\":true"), claim))
 }
 
 /// Each equality setting, under `mode` with the rewriting at `ql`: `check` of the outcome.
@@ -63,7 +80,7 @@ fn each(
     ql: QlRewritingMode,
     data: &str,
     question: &str,
-    check: impl Fn(Option<(bool, bool)>) -> bool,
+    check: impl Fn(Option<(bool, ReadClaim)>) -> bool,
 ) {
     for equality in ["representatives", "replicate", "compact"] {
         let outcome = ask(mode, ql, equality, data, question);
@@ -80,7 +97,7 @@ const INTERSECTION: &str = ":x a [ a owl:Class ; owl:intersectionOf ( :A :B ) ] 
 fn an_asserted_intersection_is_not_told_complete_without_its_members() {
     for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
         each(ReasoningMode::Owl2Ql, ql, INTERSECTION, ":x a :A", |o| {
-            matches!(o, Some((true, _) | (false, false)))
+            o.is_some_and(|(answer, claim)| answer || claim != ReadClaim::Complete)
         });
     }
 }
@@ -105,20 +122,21 @@ fn asserted_expressions_the_rules_apply_stay_complete() {
             QlRewritingMode::On,
             &data,
             question,
-            |o| o == Some((true, true)),
+            |o| o == Some((true, ReadClaim::Complete)),
         );
     }
 }
 
 /// Spec: OWL 2 Profiles §3.2.4 allows an intersection on the right of a subclass axiom, so
-/// `:C ⊑ :A ⊓ :B` with `:x a :C` is OWL 2 QL, and `:x a :A` follows: right, and complete.
+/// `:C ⊑ :A ⊓ :B` with `:x a :C` is OWL 2 QL, and `:x a :A` follows with only the
+/// store's undecided consistency reason.
 #[test]
-fn an_inclusion_into_an_intersection_stays_complete() {
+fn an_inclusion_into_an_intersection_has_only_the_consistency_reason() {
     let data = ":C <http://www.w3.org/2000/01/rdf-schema#subClassOf> \
                 [ a owl:Class ; owl:intersectionOf ( :A :B ) ] . :x a :C .";
     for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
         each(ReasoningMode::Owl2Ql, ql, data, ":x a :A", |o| {
-            o == Some((true, true))
+            o == Some((true, ReadClaim::OnlyConsistency))
         });
     }
 }
@@ -137,7 +155,7 @@ fn such_an_assertion_takes_complete_from_every_read() {
         QlRewritingMode::Auto,
         &data,
         ":y a :E",
-        |o| o == Some((true, false)),
+        |o| o == Some((true, ReadClaim::Other)),
     );
 }
 
@@ -152,20 +170,20 @@ fn an_asserted_maximum_of_none_is_not_told_complete() {
                 :x :p :y . :D a owl:Class .";
     for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
         each(ReasoningMode::Owl2Ql, ql, data, ":x a :D", |o| {
-            matches!(o, None | Some((true, _) | (false, false)))
+            o.is_none_or(|(answer, claim)| answer || claim != ReadClaim::Complete)
         });
     }
 }
 
 /// The control: a named class in the assertion is OWL 2 QL, and the rewriting gives
-/// `:x a :E` from `:A rdfs:subClassOf :E`, complete.
+/// `:x a :E` from `:A rdfs:subClassOf :E` with the consistency reason alone.
 #[test]
-fn an_asserted_named_class_stays_complete() {
+fn an_asserted_named_class_has_only_the_consistency_reason() {
     each(
         ReasoningMode::Owl2Ql,
         QlRewritingMode::Auto,
         ":x a :A . :A <http://www.w3.org/2000/01/rdf-schema#subClassOf> :E .",
         ":x a :E",
-        |o| o == Some((true, true)),
+        |o| o == Some((true, ReadClaim::OnlyConsistency)),
     );
 }

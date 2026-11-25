@@ -173,6 +173,7 @@ fn loaded(mode: ReasoningMode, ql: QlRewritingMode, data: &str, question: &str) 
     let verdict = match store.consistency() {
         ConsistencyStatus::Consistent => "consistent",
         ConsistencyStatus::Inconsistent { .. } => "inconsistent",
+        ConsistencyStatus::Undecided { .. } => "undecided",
         _ => "other",
     };
     format!(
@@ -300,7 +301,7 @@ fn the_same_axioms_without_a_clash_stay_consistent() {
         }
         for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
             let found = loaded(ReasoningMode::Owl2Ql, ql, data, question);
-            if !found.starts_with("consistent, quarantined false, read true, ") {
+            if !found.starts_with("undecided, quarantined false, read true, ") {
                 wrong.push(format!("{name}, loaded, {ql:?}: {found}"));
             }
         }
@@ -324,7 +325,7 @@ fn an_annotation_propertys_domain_and_range_mean_nothing_under_owl2_ql() {
         }
         for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
             let found = loaded(ReasoningMode::Owl2Ql, ql, data, ":alice a :Doc");
-            if !found.starts_with("consistent, quarantined false, read false, ") {
+            if !found.starts_with("undecided, quarantined false, read false, ") {
                 wrong.push(format!("{name}, loaded, {ql:?}: {found}"));
             }
         }
@@ -493,7 +494,7 @@ fn no_owl2_ql_rule_reads_an_annotation_as_an_axiom() {
         }
         for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
             let found = loaded(ReasoningMode::Owl2Ql, ql, &data, asked);
-            if !found.starts_with("consistent, quarantined false, read false, ") {
+            if !found.starts_with("undecided, quarantined false, read false, ") {
                 wrong.push(format!("{rule}, loaded, {ql:?}: {found}"));
             }
         }
@@ -753,7 +754,12 @@ fn owl_thing_and_owl_nothing_in_their_own_places_stay_consistent() {
         }
         for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
             let found = loaded(mode, ql, data, ":x a :C");
-            if !found.starts_with("consistent, quarantined false, read true, ") {
+            let verdict = if mode == ReasoningMode::Owl2Ql {
+                "undecided"
+            } else {
+                "consistent"
+            };
+            if !found.starts_with(&format!("{verdict}, quarantined false, read true, ")) {
                 wrong.push(format!("{mode:?}, loaded, {ql:?}: {found}"));
             }
         }

@@ -1271,10 +1271,10 @@ fn counted() -> nrese_exec::memory::Reading {
 /// Under `owl2-ql`, a store far shorter than one poll of the search for an ill-typed literal
 /// (4096 statements), its memory unreadable: the search stops before it starts, so the
 /// consistency is `unknown` and the read isn't `complete`, and nothing is kept. With the memory
-/// readable again, the next need searches, finds none, and `consistent` and the word come back.
+/// readable again, the next need searches, finds none, and the QL no-decider reason applies.
 #[test]
 fn an_ill_typed_search_stopped_before_it_starts_keeps_nothing_and_the_next_need_searches() {
-    use crate::ConsistencyStatus::{Consistent, Unknown};
+    use crate::ConsistencyStatus::{Undecided, Unknown};
     let store = StoreService::new(StoreConfig::in_memory())
         .expect("store")
         .with_capacity(counted);
@@ -1289,7 +1289,13 @@ fn an_ill_typed_search_stopped_before_it_starts_keeps_nothing_and_the_next_need_
         "stopped: {stopped:?}"
     );
     assert!(
-        again.0 == Consistent && again.1.starts_with("complete"),
+        again.0
+            == Undecided {
+                violations: 0,
+                why: crate::WhyUndecided::NoQlDecider,
+            }
+            && again.1.starts_with("sound-only")
+            && again.1.contains("consistency:"),
         "again: {again:?}"
     );
 }

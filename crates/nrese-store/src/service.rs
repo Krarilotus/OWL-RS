@@ -15,6 +15,7 @@ use crate::graph_store::{
 };
 use crate::graph_store_executor::{graph_exists, write_graph};
 use crate::loader::preload_ontology;
+use crate::mutation::disposition::{Disposition, Route};
 use crate::mutation::{MutationCommand, MutationCommitReport};
 use crate::query::{SerializedQueryResult, SparqlQueryRequest};
 use crate::query_executor::{PreparedQuery, explain_prepared, plan_prepared, run_query};
@@ -193,6 +194,15 @@ const DELETES: &str = "the pending operations may delete statements whose infere
 
 /// A certificate's QL rewriting, if it has one.
 type Ql = Option<std::sync::Arc<nrese_sparql::ql::QlRewriting>>;
+
+/// The whole-store explanation of an undecided OWL 2 QL verdict.
+#[derive(Debug, serde::Serialize)]
+pub struct UndecidedReport {
+    pub gate: &'static str,
+    pub disposition: &'static str,
+    pub causes: [&'static str; 1],
+    pub decided_by: &'static str,
+}
 
 impl Certificate {
     /// `snapshot`'s, if it has one of this type; any other reads as none.
@@ -758,7 +768,20 @@ impl StoreService {
     /// version and the registration's generation the same after as before); else taken again
     /// once, else `Unknown`.
     pub fn consistency(&self) -> crate::ConsistencyStatus {
-        use crate::ConsistencyStatus::{Consistent, Unknown};
+        self.consistency_reading(crate::ReasoningState::consistency)
+    }
+
+    /// The rules' assessment with the public verdict's freshness and datatype checks.
+    pub(crate) fn rules_found(&self) -> crate::ConsistencyStatus {
+        self.consistency_reading(crate::ReasoningState::rules_found)
+    }
+
+    fn consistency_reading(
+        &self,
+        verdict: fn(&crate::ReasoningState) -> crate::ConsistencyStatus,
+    ) -> crate::ConsistencyStatus {
+        use crate::ConsistencyStatus::{Consistent, Undecided, Unknown};
+        use crate::WhyUndecided::NoQlDecider;
         for _ in 0..2 {
             let (epoch, rules) = (self.certificate_epoch(), self.supports.epoch());
             let snapshot = self.engine.snapshot();
@@ -771,7 +794,7 @@ impl StoreService {
             if !(same && self.engine.snapshot().same_version(&snapshot)) {
                 continue;
             }
-            let status = recorded.as_ref().map_or(Unknown, |s| s.consistency());
+            let status = recorded.as_ref().map_or(Unknown, verdict);
             let Some(certificate) = Certificate::of(&snapshot) else {
                 let name = registered.map(|r| r.name()).or(recorded.map(|s| s.ruleset));
                 let keeps = dl || name.is_some_and(|n| crate::dl::query::keeps_ill_typed(dl, &n));
@@ -780,21 +803,49 @@ impl StoreService {
             let memory = self.memory_stop();
             return match certificate.ill_typed(&snapshot, &|| memory.exceeded()) {
                 Some(None) => status,
-                _ if matches!(status, Consistent) => Unknown,
+                _ if matches!(
+                    status,
+                    Consistent
+                        | Undecided {
+                            why: NoQlDecider,
+                            ..
+                        }
+                ) =>
+                {
+                    Unknown
+                }
                 _ => status,
             };
         }
         Unknown
     }
 
-    /// [`Self::consistency`] as the recorded reasoning alone says it: what a commit's own
-    /// checks and the quarantine rely on (`MutationPipeline`, [`Self::is_quarantined`]), which
-    /// an ill-typed literal doesn't change.
+    /// The whole-store verdict and the disposition of an undecided OWL 2 QL assessment.
+    pub fn undecided_report(&self) -> (crate::ConsistencyStatus, Option<UndecidedReport>) {
+        use crate::{ConsistencyStatus::Undecided, WhyUndecided::NoQlDecider};
+        let status = self.consistency();
+        let report = match status {
+            Undecided {
+                why: NoQlDecider, ..
+            } => Some(UndecidedReport {
+                gate: "consistency",
+                disposition: self
+                    .dispose(NoQlDecider, Route::Published)
+                    .published_status(),
+                causes: ["no-decider"],
+                decided_by: "owl2-dl",
+            }),
+            _ => None,
+        };
+        (status, report)
+    }
+
+    /// The recorded rules' assessment for a commit's baseline, before datatype checks.
     pub(crate) fn recorded_consistency(&self) -> crate::ConsistencyStatus {
         self.reasoning_state()
             .filter(|_| !self.config.replica)
             .map_or(crate::ConsistencyStatus::Unknown, |state| {
-                state.consistency()
+                state.rules_found()
             })
     }
 
@@ -810,12 +861,32 @@ impl StoreService {
     /// the end of one; it may also have seen one already finished, and answers quarantine
     /// then too.
     pub fn is_quarantined(&self) -> bool {
-        use crate::ConsistencyStatus::{Inconsistent, Undecided};
+        use crate::{
+            ConsistencyStatus::{Inconsistent, Undecided},
+            WhyUndecided::NoQlDecider,
+        };
         let mark = self.unassessed.load(std::sync::atomic::Ordering::Acquire);
         #[cfg(test)]
         hooks::run(&hooks::BETWEEN_QUARANTINE_READS);
-        let recorded = self.recorded_consistency();
-        let assessed = matches!(recorded, Inconsistent { .. } | Undecided { .. });
+        let recorded = self
+            .reasoning_state()
+            .filter(|_| !self.config.replica)
+            .map(|state| state.consistency());
+        let assessed = match recorded {
+            Some(Inconsistent { .. }) => true,
+            Some(Undecided { why, .. }) => {
+                let checked = why != NoQlDecider
+                    || matches!(
+                        self.consistency(),
+                        Undecided {
+                            why: NoQlDecider,
+                            ..
+                        }
+                    );
+                checked && self.dispose(why, Route::Published) == Disposition::Quarantined
+            }
+            _ => false,
+        };
         assessed
             || mark % 2 == 1
             || mark != self.unassessed.load(std::sync::atomic::Ordering::Acquire)

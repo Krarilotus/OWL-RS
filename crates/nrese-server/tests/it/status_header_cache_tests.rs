@@ -219,7 +219,11 @@ async fn an_answer_from_the_cache_says_the_status_its_request_is_told_without_it
     // Each kind the server writes is among them.
     let first =
         |label: &str| text(&cached.iter().find(|(l, _, _)| *l == label).expect(label).1[0].0);
-    assert_eq!(first("complete"), "complete; regime=owl2-ql");
+    let clean = first("complete");
+    assert!(
+        clean.starts_with("sound-only; regime=owl2-ql") && clean.contains("consistency:"),
+        "{clean}"
+    );
     assert_eq!(first("not-certified"), "not-certified");
     for kind in ["sound-only", "unsound"] {
         let told = first(kind);

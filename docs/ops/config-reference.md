@@ -196,6 +196,12 @@ Set by `budgets.result_cache` (`NRESE_QUERY_CACHE_BYTES`; older key `store.query
 - EXPLAIN marks each operator answered from the cache (`"cache": "hit"`) or taken from another query computing it (`"cache": "shared"`); `GET /api/v1/repositories/{id}/cache` shows the counts, `DELETE` on it drops every result not pinned
 - pins (`budgets.result_cache_pins`, paths separated by `;` in the environment): SPARQL query files run at startup and pinned in the result cache, each under its file name without the extension (`top-classes.rq` is the pin `top-classes`); a missing file, a query that can't be cached, or results larger than the budget leaves are a startup error. A pinned result is never evicted while the store doesn't change; after a commit it is pinned again the next time its query runs. Pins are also set and removed while the server runs, through `PUT`/`DELETE /api/v1/repositories/{id}/cache/pins/{name}` ([http-api.md](http-api.md))
 
+## Consistency gate
+
+| Key | Env | Type | Default | Scope | Meaning |
+|---|---|---|---|---|---|
+| <a id="gates.undecided"></a>`gates.undecided` | `NRESE_GATES_UNDECIDED` | choice: `mark`, `refuse` | `mark` | start | Accept or refuse an undecided OWL 2 QL candidate |
+
 ## SHACL
 
 | Key | Env | Type | Default | Scope | Meaning |

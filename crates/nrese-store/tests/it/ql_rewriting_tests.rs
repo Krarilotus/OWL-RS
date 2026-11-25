@@ -3099,15 +3099,22 @@ fn a_rewritten_read_in_quarantine_names_it_with_a_list_left_out() {
     );
 }
 
-/// Spec (docs/spec/reasoning-semantics.md, "What `complete` refers to"): on clean data under
-/// `owl2-ql`, a read the QL rewriting ran on, of a named class of the data's own, is `complete`.
-/// The control of the `owl2-ql` quarantine cell.
+/// Spec: clean rules under `owl2-ql` leave the store undecided without quarantining it.
+/// Even a read of a named class of the data's own carries that consistency reason.
 #[test]
-fn a_rewritten_read_over_clean_data_under_owl2_ql_is_complete() {
+fn a_rewritten_read_over_clean_data_under_owl2_ql_names_undecided_consistency() {
     let store = quarantine_case(Ruleset::Owl2Ql, QlRewritingMode::Auto, true);
-    assert_clean(&store);
+    assert!(!store.is_quarantined());
+    assert!(matches!(
+        store.consistency(),
+        ConsistencyStatus::Undecided {
+            why: nrese_store::WhyUndecided::NoQlDecider,
+            ..
+        }
+    ));
     let status = rewritten_read_of_a(&store);
-    assert_eq!(status_class(&status), "complete", "status: {status}");
+    assert_eq!(status_class(&status), "sound-only", "status: {status}");
+    assert!(status.contains("consistency:"), "{status}");
 }
 
 /// Spec: as under `owl2-ql`, under `owl2-rl` with the rewriting on. The control of the `owl2-rl`

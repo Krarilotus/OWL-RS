@@ -859,6 +859,9 @@
           "type": {
             "description": "The problem's kind, a URI (`https://nrese.dev/problems/…`).",
             "type": "string"
+          },
+          "undecided": {
+            "description": "For an undecided OWL 2 QL refusal, the gate, causes and deciding profile."
           }
         },
         "required": [
