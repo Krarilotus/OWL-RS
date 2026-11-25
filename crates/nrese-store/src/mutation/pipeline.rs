@@ -493,8 +493,7 @@ impl MutationPipeline {
             // own facts: its record carries the hold, not assessed, and the marker goes before
             // the commit publishes: a removal that fails fails the write.
             let writer = tx.writer().expect("a transaction holds the writer slot");
-            let base = crate::service::Certificate::record(tx.base());
-            let quarantined = base.is_some_and(|c| c.held);
+            let quarantined = crate::service::Certificate::assessment(tx.base(), replica).held;
             if quarantined {
                 self.store.forget_marker(writer).map_err(store_error)?;
             }

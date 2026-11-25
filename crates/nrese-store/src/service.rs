@@ -142,24 +142,20 @@ pub(crate) const REASONING_MARKER: &str = "reasoning.state";
 pub(crate) struct Certificate {
     /// What the inferred stack is exact for, where [`Self::exact`].
     pub(crate) state: crate::ReasoningState,
-    /// `state` describes this version's inferred stack: a rebuild's, the open's from its
-    /// marker, a maintained commit's. False on a record that only carries a hold
-    /// ([`StoreService::withheld`]).
+    /// The state describes the stack of this version.
     pub(crate) exact: bool,
     /// The store vouches for the rows ([`StoreService::vouches`]): exact, not a replica, and
     /// made by the rules registered (or, with none registered, as the marker says).
-    pub(crate) vouched: bool,
+    vouched: bool,
     /// The rules registered made the stack (`ReasoningState::made_by`): only then is `state`'s
     /// violation count the rules' word for this version.
     checked: bool,
     /// A rebuild in this process supplied the assessment, even without registered rules.
     rebuilt_here: bool,
-    /// The rules assessed this version's whole closure: a rebuild, the open, a commit outside
-    /// quarantine. A commit in quarantine checks only its own facts.
-    pub(crate) assessed: bool,
-    /// The rules' hold: a check found a clash, and no later check of the rules cleared it.
-    /// Carried by every record until a rebuild assesses the version again; readiness reads it.
-    pub(crate) held: bool,
+    /// The rules assessed the whole closure.
+    assessed: bool,
+    /// A check found a clash and the store still holds it in quarantine.
+    held: bool,
     /// Whether the rules equated a literal with another term in this version.
     pub(crate) literal: Literal,
     /// The QL rewriting its queries get, the same object a commit that maintains the closure
@@ -248,10 +244,8 @@ const DELETES: &str = "the pending operations may delete statements whose infere
 type Ql = Option<std::sync::Arc<nrese_sparql::ql::QlRewriting>>;
 
 impl Certificate {
-    /// The one place that decides what a version is told: `snapshot`'s record, if it has one
-    /// of this type (a pending snapshot carries its base's; a withheld view none). Every reader
-    /// of a verdict or of "certified" goes through it; [`Self::for_rows`] reads the slot too,
-    /// for how rows are produced only.
+    /// The version's reasoning record. A pending snapshot carries its base's record.
+    /// A withheld view has only the certificate for producing rows ([`Self::for_rows`]).
     pub(crate) fn record(snapshot: &Snapshot) -> Option<&Self> {
         snapshot.certificate()?.downcast_ref()
     }
@@ -268,9 +262,7 @@ impl Certificate {
         rows.vouched.then_some(rows)
     }
 
-    /// Every verdict of `snapshot`'s version, from its record alone: the rules' word only from
-    /// an exact record the rules registered checked, assessed whole; the hold from any record;
-    /// neither on a replica, which reasons nothing (its own `owl2-dl` checks stay its own).
+    /// The version's verdict and hold. Replicas have no rules verdict or hold.
     pub(crate) fn assessment(snapshot: &Snapshot, replica: bool) -> Assessment {
         let Some(record) = Self::record(snapshot) else {
             let rules = crate::ConsistencyStatus::Unknown;
@@ -571,11 +563,9 @@ impl StoreService {
         Ok(service)
     }
 
-    /// Installs a record of `state` on the current version under `tx`'s writer slot, with the
-    /// certified stack's reading: the open, from its marker, and [`Self::recertify`]. It keeps
-    /// the current record's QL schema where its closure is the same, its hold, and whether the
-    /// rules assessed it; a literal mark `Unknown` since the open is `Clear` where the rules
-    /// registered made the stack and can't equate literals.
+    /// Installs the state and reading under the writer slot. Recertification carries the
+    /// hold, assessment and reusable QL schema. Marker-only literal certainty requires
+    /// matching registered rules that cannot equate literals.
     fn certify(
         &self,
         tx: &nrese_engine::Transaction<'_>,
@@ -964,8 +954,9 @@ impl StoreService {
         let tx = self.engine.transaction();
         let writer = tx.writer().expect("a transaction holds the writer slot");
         // The stack stays, read as it was; the version vouches for nothing, its hold kept.
-        let state = self.reasoning_state();
-        let reading = state.and_then(|s| self.note_equality(writer, &s));
+        let reading = Certificate::record(tx.base())
+            .filter(|c| c.exact)
+            .and_then(|c| self.note_equality(writer, &c.state));
         let withheld = self.invalidate_held(writer)?;
         tx.install(reading, withheld);
         Ok(())
@@ -2661,9 +2652,7 @@ impl StoreService {
         progress: &crate::LoadProgress,
     ) -> StoreResult<BulkLoadReport> {
         let invalid = request.invalid.unwrap_or(self.config.invalid_statements);
-        // Cleared under the load's writer slot, before it commits (invariant C).
-        let invalidate =
-            |writer: nrese_engine::WriterHeld<'_>| self.invalidate_held(writer).map(drop);
+        let invalidate = |writer: nrese_engine::WriterHeld<'_>| self.invalidate_held(writer);
         let loaded = bulk_load(
             &self.engine,
             request,

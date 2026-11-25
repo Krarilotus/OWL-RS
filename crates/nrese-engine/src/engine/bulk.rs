@@ -201,16 +201,17 @@ impl<'e> BulkLoad<'e> {
     /// Publishes the loaded quads as one new revision (see the module docs for durability).
     /// Returns the revision and the asserted and inferred quads added and removed.
     pub fn finish(self) -> EngineResult<CommitSummary> {
-        self.finish_with(|_| Ok(()))
+        self.finish_with(|_| Ok(None))
     }
 
     /// [`finish`](Self::finish), calling `before_publish` once the load is known to publish,
     /// under its writer slot and before anything of the new version is written (its
     /// checkpoint) or served. A load that changes nothing, or fails before, doesn't call it;
-    /// its error fails the load, nothing published.
+    /// its error fails the load, nothing published. The certificate it returns is the new
+    /// version's, published with it ([`super::Certificate`]; none: the version has none).
     pub fn finish_with(
         self,
-        before_publish: impl FnOnce(super::WriterHeld<'_>) -> EngineResult<()>,
+        before_publish: impl FnOnce(super::WriterHeld<'_>) -> EngineResult<Option<super::Certificate>>,
     ) -> EngineResult<CommitSummary> {
         // A load that spilled sends what is left as its last chunk.
         if self.spiller.lock().is_some() {
@@ -280,8 +281,8 @@ impl<'e> BulkLoad<'e> {
         renumbered?;
         if let Some(spill) = spilled {
             // A load spills only what it holds: it publishes.
-            before_publish(super::WriterHeld::new())?;
-            return publish_spilled(engine, spill, current, started);
+            let certificate = before_publish(super::WriterHeld::new())?;
+            return publish_spilled(engine, spill, current, started, certificate);
         }
         // By radix over the bits the ids use ([`nrese_exec::sort`]).
         nrese_exec::heap::phase("load: sorting");
@@ -311,6 +312,7 @@ impl<'e> BulkLoad<'e> {
                         previous: current.committed_micros,
                     },
                     dictionary_len: shared.dictionary.len(),
+                    certificate: None,
                 };
                 (next, summary)
             }
@@ -416,7 +418,14 @@ impl<'e> BulkLoad<'e> {
             });
         }
 
-        before_publish(super::WriterHeld::new())?;
+        // The version's certificate, from the caller under the writer slot: built in, never
+        // installed after.
+        let mut next = next;
+        let installed = before_publish(super::WriterHeld::new())?;
+        match &mut next {
+            Next::Built(version, _) => version.certificate = installed,
+            Next::Streamed { certificate, .. } => *certificate = installed,
+        }
         let built = started.elapsed();
         publish(engine, next)?;
         // The writer slot is held: the latest version is the one just published.
@@ -455,6 +464,7 @@ fn publish_spilled(
     spill: Spill,
     current: &Version,
     started: Instant,
+    certificate: Option<super::Certificate>,
 ) -> EngineResult<CommitSummary> {
     let revision = current.revision + 1;
     let dictionary_len = engine.shared.dictionary.len();
@@ -468,6 +478,7 @@ fn publish_spilled(
             previous: current.committed_micros,
         },
         dictionary_len,
+        certificate,
     )?;
     let summary = CommitSummary {
         revision,
@@ -519,6 +530,8 @@ enum Next {
         revision: u64,
         stamp: Stamp,
         dictionary_len: u64,
+        /// What its caller publishes with it ([`BulkLoad::finish_with`]).
+        certificate: Option<super::Certificate>,
     },
 }
 
@@ -562,10 +575,19 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
             revision,
             stamp,
             dictionary_len,
+            certificate,
         } => {
             let source = Source::Memory(builder);
-            return publish_streamed(engine, source, layout, revision, stamp, dictionary_len)
-                .map(|_| ());
+            return publish_streamed(
+                engine,
+                source,
+                layout,
+                revision,
+                stamp,
+                dictionary_len,
+                certificate,
+            )
+            .map(|_| ());
         }
     };
     let Some(durable) = &shared.durable else {
@@ -675,6 +697,7 @@ fn publish_streamed(
     revision: u64,
     stamp: Stamp,
     dictionary_len: u64,
+    certificate: Option<super::Certificate>,
 ) -> EngineResult<u64> {
     let shared = &engine.shared;
     let Some(durable) = &shared.durable else {
@@ -696,7 +719,7 @@ fn publish_streamed(
             equality: Default::default(),
             // An empty inferred stack, kept by no program: read as stored.
             reading: None,
-            certificate: None,
+            certificate,
             canonical: Default::default(),
             own: Default::default(),
         };
@@ -776,7 +799,7 @@ fn publish_streamed(
         equality: Default::default(),
         // An empty inferred stack, kept by no program: read as stored.
         reading: None,
-        certificate: None,
+        certificate,
         canonical: Default::default(),
         own: Default::default(),
     };
