@@ -4291,9 +4291,8 @@ mod equality_publication_tests {
         );
     }
 
-    /// A reader while a compact store's reasoning changes, after the old certificate is gone
-    /// and before the new stack is published (`hooks::BEFORE_PUBLICATION`), answers as one of
-    /// the two programs, uncertified: as RDFS-Plus before the change or as RDFS after it. Over
+    /// Before a rebuild publishes its compact stack, readers still see the old RDFS-Plus
+    /// record and rows. The RDFS record and rows appear together afterward. Over
     /// `a sameAs b . b a Dog . Dog subClassOf Animal`, `a` loaded first so that it has the
     /// smaller id and represents the class: RDFS-Plus's stack keeps `a a Animal` over it and
     /// is read expanded (`a`, `b`); RDFS entails only `b a Animal`. `a` alone is neither.
@@ -4339,13 +4338,16 @@ mod equality_publication_tests {
         let window = Arc::new(Mutex::new(None));
         let (reader, seen) = (Arc::clone(&store), Arc::clone(&window));
         hooks::BEFORE_PUBLICATION.set(Some(Box::new(move || {
-            *seen.lock().unwrap() = Some((answers(&reader), reader.reasoning_state().is_some()));
+            *seen.lock().unwrap() = Some((
+                answers(&reader),
+                reader.reasoning_state().map(|state| state.ruleset),
+            ));
         })));
         store
             .rematerialise(program(ReasoningMode::Rdfs))
             .expect("RDFS");
         let after = answers(&store);
-        let (between, certified) = window.lock().unwrap().take().expect("the hook ran");
+        let (between, ruleset) = window.lock().unwrap().take().expect("the hook ran");
         println!(
             "CASE RdfsPlus to Rdfs: before {before:?} | between {between:?} | after {after:?}"
         );
@@ -4353,10 +4355,19 @@ mod equality_publication_tests {
             before, after,
             "the two programs answer alike: the case shows nothing"
         );
-        assert!(!certified, "a certificate in the window");
-        assert!(
-            between == before || between == after,
-            "between {between:?} is neither RDFS-Plus's {before:?} nor RDFS's {after:?}"
+        assert_eq!(between, before, "rows before publication");
+        assert_eq!(
+            ruleset.as_deref(),
+            Some("rdfs-plus"),
+            "record before publication"
+        );
+        assert_eq!(
+            store
+                .reasoning_state()
+                .map(|state| state.ruleset)
+                .as_deref(),
+            Some("rdfs"),
+            "record after publication"
         );
     }
 }
