@@ -29,8 +29,29 @@ fn unchecked(data: &str) -> MutationPipeline {
 }
 
 fn preloaded(data: &str) -> MutationPipeline {
-    let dl = unchecked("");
-    crate::support::load_past_the_pipeline(dl.store(), &format!("{PREFIXES}{data}"));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("premise.ttl");
+    let prefixes = PREFIXES
+        .split("PREFIX ")
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| format!("@prefix {} .\n", p.trim()))
+        .collect::<String>();
+    std::fs::write(&file, format!("{prefixes}{data}")).expect("write premise");
+    let store = std::sync::Arc::new(
+        nrese_store::StoreService::new(nrese_store::StoreConfig {
+            dl: DlConfig {
+                consistency: DlConsistency::Off,
+                ..DlConfig::default()
+            },
+            ontology_path: Some(file),
+            ..nrese_store::StoreConfig::in_memory()
+        })
+        .expect("store"),
+    );
+    let reasoner = std::sync::Arc::new(nrese_reasoner::ReasonerService::new(
+        nrese_reasoner::ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Dl),
+    ));
+    let dl = MutationPipeline::new(store, reasoner);
     dl.store()
         .rematerialise(rules(&dl))
         .expect("rematerialisation");
