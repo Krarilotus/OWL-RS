@@ -201,20 +201,30 @@ impl Ontology {
 
 /// Reads the ontology of `statements` (any graphs, the union of them).
 pub fn read(statements: &[Statement], terms: &dyn Terms) -> Ontology {
-    read_beside(statements, &[], terms)
+    read_rdf(statements, &[], terms, true, DisjointReading::Canonical)
 }
 
 /// [`read`], its SHACL rule ([`Ontology::shacl`]) over `beside` and `statements` as one source:
 /// a conclusion's read beside its premise's statements, which are read for nothing else.
 pub fn read_beside(statements: &[Statement], beside: &[Statement], terms: &dyn Terms) -> Ontology {
-    read_with_disjoint_reading(statements, beside, terms, DisjointReading::Canonical)
+    read_rdf(statements, beside, terms, false, DisjointReading::Canonical)
 }
 
-/// Reads as in [`read_beside`], with the given reading of repeated disjoint operands.
+/// Reads as in [`read`] (a stored ontology, membership checked), with the given reading of repeated disjoint operands.
 pub fn read_with_disjoint_reading(
     statements: &[Statement],
     beside: &[Statement],
     terms: &dyn Terms,
+    disjoint_reading: DisjointReading,
+) -> Ontology {
+    read_rdf(statements, beside, terms, true, disjoint_reading)
+}
+
+fn read_rdf(
+    statements: &[Statement],
+    beside: &[Statement],
+    terms: &dyn Terms,
+    membership: bool,
     disjoint_reading: DisjointReading,
 ) -> Ontology {
     let vocabulary = Vocabulary::new(&|iri| terms.iri(iri));
@@ -223,7 +233,7 @@ pub fn read_with_disjoint_reading(
     reader.declarations();
     reader.shacl(beside);
     reader.axioms();
-    reader.finish()
+    reader.finish(membership)
 }
 
 /// What makes a blank node a class expression to [`read`], by the source's ids: its types,
@@ -301,7 +311,7 @@ impl ClassExpressionMarkers {
 
 /// What every reader adds to the axioms it read: the literals' parts, the anonymous
 /// individuals, and the diagnostics of OWL 2 DL's global restrictions.
-pub(crate) fn complete(ontology: &mut Ontology, terms: &dyn Terms) {
+pub(crate) fn complete(ontology: &mut Ontology, terms: &dyn Terms, membership: bool) {
     crate::diagnostics::leave_out_reserved(ontology, terms);
     crate::diagnostics::report_reserved_in_expressions(ontology, terms);
     ontology.data = data_terms(ontology, terms);
@@ -311,7 +321,7 @@ pub(crate) fn complete(ontology: &mut Ontology, terms: &dyn Terms) {
         .chain(in_expressions(ontology))
         .filter(|&t| terms.kind(t) == TermKind::Blank)
         .collect();
-    crate::diagnostics::check_global_restrictions(ontology);
+    crate::diagnostics::check_global_restrictions(ontology, membership);
     // An unused structure that is also an individual: an equality the rules derive may give
     // it a second structure's statements (`Reader::reads_more`).
     for d in &mut ontology.diagnostics {
@@ -322,7 +332,9 @@ pub(crate) fn complete(ontology: &mut Ontology, terms: &dyn Terms) {
             *reads_more |= ontology.anonymous.contains(node);
         }
     }
-    let two_kinds = crate::typing::two_kinds(ontology).into_iter();
+    let (two_kinds, findings) = crate::typing::check(ontology, membership.then_some(terms));
+    ontology.diagnostics.extend(findings);
+    let two_kinds = two_kinds.into_iter();
     ontology
         .diagnostics
         .extend(two_kinds.map(|t| Diagnostic::TwoKinds {
@@ -1706,11 +1718,18 @@ impl<'a> Reader<'a> {
         if self.twice(node) || self.forms(node, &self.expression_forms()) {
             return None;
         }
-        if let Some(list) = self.one(node, v.owl_intersection_of) {
-            return Some(RangeRead::Set(self.list(list)?, false));
-        }
-        if let Some(list) = self.one(node, v.owl_union_of) {
-            return Some(RangeRead::Set(self.list(list)?, true));
+        for (operator, union) in [(v.owl_intersection_of, false), (v.owl_union_of, true)] {
+            if let Some(list) = self.one(node, operator) {
+                let members = self.list(list)?;
+                if members.len() == 1 {
+                    self.report(Diagnostic::Malformed {
+                        node,
+                        what: "an intersection or union needs at least two data ranges",
+                    });
+                    return None;
+                }
+                return Some(RangeRead::Set(members, union));
+            }
         }
         if let Some(operand) = self.one(node, v.owl_datatype_complement_of) {
             return Some(RangeRead::Not(operand));
@@ -2444,7 +2463,7 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn finish(mut self) -> Ontology {
+    fn finish(mut self, membership: bool) -> Ontology {
         self.cells_outside_their_lists();
         let mut axioms = Vec::with_capacity(self.axioms.len());
         let mut sources = Vec::with_capacity(self.axioms.len());
@@ -2475,7 +2494,7 @@ impl<'a> Reader<'a> {
             rules_unread: self.rules_unread,
             list_cell_outside: self.list_cell_outside,
         };
-        complete(&mut ontology, self.terms);
+        complete(&mut ontology, self.terms, membership);
         ontology
     }
 }

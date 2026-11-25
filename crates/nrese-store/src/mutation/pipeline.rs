@@ -471,6 +471,7 @@ impl MutationPipeline {
                 // delta, its base's record (the delta keeps what the reader reads); else no
                 // record, never "nothing".
                 let name = |t| crate::dl::consistency::named(&tx, t);
+                bounds.record_gate_anonymous();
                 let read = bounds
                     .ontology
                     .take()
@@ -506,9 +507,10 @@ impl MutationPipeline {
                 &evidence::EvidenceView::new(&requester.read, &tx),
                 |view, after| self.view_reason(view, Some(after), &dl_own_budget, &resources),
             )?;
-            // The version's record, its ill-typed literal judged under the writer slot alone (a
-            // whole-store scan where the commit deletes it), before the commit and its rights.
-            let certificate = self.store.successor(&tx, literal_equality);
+            // The new record shares the gate's witness. Where the gate did not ask for one,
+            // judge it under the writer slot before taking the commit's rights.
+            let witness = dl.as_ref().and_then(|(gate, _, _)| gate.ill_typed);
+            let certificate = self.store.successor(&tx, literal_equality, witness);
             if !ticket.begin_commit() {
                 return Err(MutationError::Cancelled);
             }
@@ -560,13 +562,8 @@ impl MutationPipeline {
             }
             (self.store.lists).commit(before, summary.revision, lists_left_out);
             if let Some((gate, bounds, left_out)) = dl {
-                // On the RL route unproved (in quarantine) nothing decided the revision's
-                // consistency: no verdict is recorded for it, and its reads check it
-                // (`dl::query::consistency_at`).
-                let rules = matches!(bounds.prepared, crate::dl::bounds::Prepared::Rules(_));
-                let unproved = rules && !bounds.proves_consistency;
                 crate::dl::bounds::install(&self.store, bounds, summary.revision);
-                if !unproved {
+                if gate.record_verdict {
                     self.store.dl().record(crate::dl::DlStatus {
                         revision: summary.revision,
                         consistency: gate.checked,

@@ -617,20 +617,25 @@ impl StoreService {
 
     /// The record a maintained commit `tx` publishes, from its base's: the same stack's state,
     /// QL schema and settings; its literal mark `Set` where the commit derived a literal
-    /// equality; its ill-typed literal judged for `tx` (`dl::query::ill_typed_after`, under the
-    /// memory stop) where the base's is found; assessed where the base isn't held (a commit in
-    /// quarantine checks only its own facts: the hold carried, not assessed). `None` where no
-    /// record describes the base's stack.
+    /// equality; the gate's ill-typed witness, or its own search under the memory stop where
+    /// the gate didn't search and the base's witness is known; assessed where the base isn't
+    /// held (a commit in quarantine checks only its own facts: the hold carried, not assessed).
+    /// `None` where no record describes the base's stack.
     pub(crate) fn successor(
         &self,
         tx: &nrese_engine::Transaction<'_>,
         literal_equality: bool,
+        witness: Option<IllTyped>,
     ) -> Option<nrese_engine::Certificate> {
         let base = Certificate::record(tx.base()).filter(|c| c.exact)?;
         let cell = *base.ill_typed.lock().unwrap_or_else(|p| p.into_inner());
         let ill_typed = if crate::dl::query::keeps_ill_typed(base.dl, &base.state.ruleset) {
-            let memory = self.memory_stop();
-            cell.and_then(|cell| crate::dl::query::ill_typed_after(tx, cell, &|| memory.exceeded()))
+            witness.unwrap_or_else(|| {
+                let memory = self.memory_stop();
+                cell.and_then(|cell| {
+                    crate::dl::query::ill_typed_after(tx, cell, &|| memory.exceeded())
+                })
+            })
         } else {
             cell
         };

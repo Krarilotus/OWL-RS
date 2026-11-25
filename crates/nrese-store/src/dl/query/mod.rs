@@ -173,11 +173,21 @@ fn consistency_at(
     if let Some(stopped) = stopped() {
         return stopped;
     }
-    let checked = consistency::check(ontology.value(), &budget);
+    let mut checked = consistency::check(ontology.value(), &budget);
     // Request-local cancellation, expiry or memory must not replace shared revision
     // status.
     if let Some(stopped) = stopped() {
         return stopped;
+    }
+    if checked.verdict == Verdict::Consistent {
+        checked.verdict = match super::bounds::holds_ill_typed(store, snapshot) {
+            Some(false) => Verdict::Consistent,
+            Some(true) => Verdict::Unknown(gate::ILL_TYPED.to_owned()),
+            None => return Verdict::Unknown(UNCHECKED.to_owned()),
+        };
+        if let Some(stopped) = stopped() {
+            return stopped;
+        }
     }
     if memory.refused() {
         return checked.verdict;
@@ -201,8 +211,9 @@ fn consistency_known(store: &StoreService, snapshot: &Snapshot, view: &View) -> 
             consistency,
             ..
         }) if revision == snapshot.revision() => Some(consistency.verdict),
-        _ if view.proves_consistency => Some(Verdict::Consistent),
-        _ if !(view.rules && super::bounds::rules_prove(snapshot)) => None,
+        _ if !(view.proves_consistency || view.rules && super::bounds::rules_prove(snapshot)) => {
+            None
+        }
         _ => Some(match super::bounds::holds_ill_typed(store, snapshot) {
             Some(false) => Verdict::Consistent,
             Some(true) => Verdict::Unknown(gate::ILL_TYPED.to_owned()),
@@ -500,6 +511,13 @@ pub(crate) fn mark(
         completeness.unsound("dl", reason);
     }
     let snapshot = at.snapshot();
+    if !matches!(at, Revision::Pending { .. })
+        && let Some(text) = store.dl().bounds.anonymous(snapshot.revision())
+    {
+        completeness
+            .reasons
+            .push(nrese_sparql::completeness::Reason { source: "dl", text });
+    }
     let held = |iri: &str| {
         let Some(t) = snapshot.lookup(NamedNodeRef::new_unchecked(iri).into()) else {
             return false;
@@ -1221,6 +1239,8 @@ pub(crate) fn ill_typed_after(
     base: Option<TermId>,
     stop: &dyn Fn() -> bool,
 ) -> Option<Option<TermId>> {
+    #[cfg(test)]
+    ILL_TYPED_AFTER_CALLS.set(ILL_TYPED_AFTER_CALLS.get() + 1);
     let decode = |id: TermId| tx.decode(id);
     let poll = polled(stop);
     let stopped = || poll.ask();
@@ -1246,6 +1266,11 @@ pub(crate) fn ill_typed_after(
         (None, Some(_)) => ill_typed(&tx.pending_snapshot(), stop),
         _ => Some(found),
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static ILL_TYPED_AFTER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// `stop` asked at the first unit of work and then once 4096 more are spent, and kept once it

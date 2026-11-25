@@ -182,7 +182,14 @@ fn every_functional_construct_is_read() {
     let mut table = Table::default();
     let (o, header) = read_functional(EVERYTHING, &mut table);
     let x = table.ids[&RdfTerm::BlankNode(BlankNode::new_unchecked("x"))];
-    assert_eq!(o.diagnostics, [Diagnostic::AnonymousIndividual { node: x }]);
+    assert_eq!(
+        o.diagnostics,
+        [Diagnostic::AnonymousIndividual {
+            node: x,
+            what: "a blank node in oneOf or hasValue",
+            axioms: [None; 2],
+        }]
+    );
     assert_eq!(header.iri.as_deref(), Some("http://example.com/o"));
     assert_eq!(header.version.as_deref(), Some("http://example.com/o/1"));
     assert_eq!(header.imports, vec!["http://example.com/other".to_owned()]);
@@ -518,7 +525,7 @@ ClassAssertion(:C :a)
     assert_eq!(o.anonymous.len(), 2, "{:?}", o.anonymous);
     let reported: Vec<Term> = (o.diagnostics.iter())
         .filter_map(|d| match d {
-            Diagnostic::AnonymousIndividual { node } => Some(*node),
+            Diagnostic::AnonymousIndividual { node, .. } => Some(*node),
             _ => None,
         })
         .collect();

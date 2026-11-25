@@ -152,7 +152,17 @@ pub enum Diagnostic {
     /// existential over the whole ontology, which keys skip as they skip every anonymous
     /// one ([`Diagnostic::is_fatal`]); in a conclusion, as every anonymous individual
     /// there, one to prove.
-    AnonymousIndividual { node: Term },
+    AnonymousIndividual {
+        node: Term,
+        what: &'static str,
+        axioms: [Option<usize>; 2],
+    },
+    /// A retained axiom that witnesses a violation of OWL 2 DL's global restrictions.
+    GlobalRestriction {
+        term: Term,
+        axiom: usize,
+        what: &'static str,
+    },
     /// Text the functional-syntax reader can't read (`crate::ofn`), where it is (from 1;
     /// the column in characters): the axiom it is in is left out.
     Syntax {
@@ -187,7 +197,8 @@ impl Diagnostic {
             Self::Unused { node, .. } => (node, "unused"),
             Self::NonSimpleProperty { property, what, .. } => (property, what),
             Self::IrregularPropertyHierarchy { upper, .. } => (upper.named(), "irregular roles"),
-            Self::AnonymousIndividual { node } => (node, "anonymous individual"),
+            Self::AnonymousIndividual { node, what, .. } => (node, what),
+            Self::GlobalRestriction { term, what, .. } => (term, what),
             Self::Syntax { line, column, what } => {
                 ((u64::from(line) << 32) | u64::from(column), what)
             }
@@ -206,7 +217,7 @@ impl Diagnostic {
     /// no axiom uses says nothing; by default a name of two kinds an axiom reads is fatal).
     ///
     /// *OWL 2 Structural Specification* §11.2 keeps anonymous individuals out of OWL 2 DL in
-    /// more places: in a nominal or `hasValue` (flagged here) and, unflagged, in
+    /// more places: in a nominal or `hasValue`, in
     /// `SameIndividual`, `DifferentIndividuals` or a negative assertion, and in assertions
     /// whose anonymous individuals don't form its forest. None of them is fatal: why the
     /// answers on such input stay those of the Direct Semantics, and what witnesses it, is in
@@ -226,6 +237,7 @@ impl Diagnostic {
             | Self::NotOwl { .. }
             | Self::NonSimpleProperty { .. }
             | Self::IrregularPropertyHierarchy { .. }
+            | Self::GlobalRestriction { .. }
             | Self::Syntax { .. }
             | Self::Reserved { .. }
             | Self::Rule { .. } => true,
@@ -261,6 +273,7 @@ impl Diagnostic {
             | Self::NotOwl { .. }
             | Self::NonSimpleProperty { .. }
             | Self::IrregularPropertyHierarchy { .. }
+            | Self::GlobalRestriction { .. }
             | Self::AnonymousIndividual { .. }
             | Self::Syntax { .. }
             | Self::RepeatedOperand
@@ -313,7 +326,9 @@ impl Diagnostic {
             // Read as written: only a global restriction of OWL 2 DL is broken (what keeps
             // reasoning decidable), not what the axiom says; what a reasoner doesn't follow
             // of it is that reasoner's own hazard.
-            Self::NonSimpleProperty { .. } | Self::IrregularPropertyHierarchy { .. } => false,
+            Self::NonSimpleProperty { .. }
+            | Self::IrregularPropertyHierarchy { .. }
+            | Self::GlobalRestriction { .. } => false,
             // Read as written: the Direct Semantics reads it (§2.3.7–2.4), as above.
             Self::AnonymousIndividual { .. } => false,
             // Read according to the selected disjointness semantics.
@@ -354,7 +369,8 @@ impl Diagnostic {
                     property(upper)
                 )
             }
-            Self::AnonymousIndividual { node } => at("a blank node in oneOf or hasValue", node),
+            Self::AnonymousIndividual { node, what, .. } => at(what, node),
+            Self::GlobalRestriction { term, what, .. } => at(what, term),
             Self::Syntax { line, column, what } => {
                 format!("text not read at line {line}, column {column}: {what}")
             }
@@ -369,9 +385,9 @@ impl Diagnostic {
 /// ones. A property is non-simple if a composite one is (through the hierarchy) a
 /// subproperty of it; so is its inverse. Composite (*OWL 2 Structural Specification*
 /// §11.1): a chain's or a transitive property's superproperty, and
-/// `owl:topObjectProperty`. (§11.1 makes `owl:bottomObjectProperty` composite too; it
-/// relates nothing, so nothing above it gets a pair from it, and it isn't counted.)
-pub(crate) fn check_global_restrictions(ontology: &mut Ontology) {
+/// `owl:topObjectProperty` and `owl:bottomObjectProperty`. The bottom seed belongs to
+/// the stored ontology's membership check.
+pub(crate) fn check_global_restrictions(ontology: &mut Ontology, membership: bool) {
     if let Some((lower, upper)) = impossible_role_order(ontology) {
         ontology
             .diagnostics
@@ -382,12 +398,17 @@ pub(crate) fn check_global_restrictions(ontology: &mut Ontology) {
         .filter(|t| ontology.anonymous.contains(t))
         .collect();
     for node in anonymous {
-        ontology
-            .diagnostics
-            .push(Diagnostic::AnonymousIndividual { node });
+        ontology.diagnostics.push(Diagnostic::AnonymousIndividual {
+            node,
+            what: "a blank node in oneOf or hasValue",
+            axioms: [None; 2],
+        });
     }
     let mut supers: HashMap<Term, Vec<Term>> = HashMap::new();
     let mut seeds: Vec<Term> = ontology.builtin.top_object.into_iter().collect();
+    if membership {
+        seeds.extend(ontology.builtin.bottom_object);
+    }
     for axiom in &ontology.axioms {
         match axiom {
             Axiom::SubObjectPropertyOf(chain, sup) => {

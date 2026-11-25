@@ -1190,22 +1190,35 @@ fn an_ill_typed_search_stopped_before_it_starts_keeps_nothing_and_the_next_need_
     );
 }
 
-/// Under `owl2-dl`, a commit whose search for an ill-typed literal stops (the memory readable
-/// for its reasoning, the first reading after its preflight, and unreadable from its DL gate
-/// on) decides nothing: no verdict is recorded at its revision. With the memory readable
-/// again, the next read searches, finds none, and is `complete` and `consistent`; recorded as
-/// found, the revision would stay withheld.
+/// A stopped ill-typed search proves nothing even when the rules have found no clash.
 #[test]
 fn an_ill_typed_search_stopped_at_a_dl_commit_records_no_verdict_and_the_next_read_searches() {
+    check_stopped_dl_commit(DATA, 1, "rules");
+}
+
+/// A stopped ill-typed search proves nothing even when U1 has found no clash.
+#[test]
+fn an_ill_typed_search_stopped_at_an_upper_bound_commit_leaves_the_verdict_for_the_next_read() {
+    check_stopped_dl_commit(
+        &format!("{DATA} :A rdfs:subClassOf [ owl:unionOf ( :B :C ) ] . :rex a :A ."),
+        2,
+        "delta",
+    );
+}
+
+/// Let the reasoning and bounds finish, then stop the commit's witness search. The revision
+/// has no verdict. Once memory is readable, its next read searches and is complete and consistent.
+fn check_stopped_dl_commit(data: &str, readings: u32, route: &str) {
     let store = StoreService::new(StoreConfig::in_memory())
         .expect("store")
         .with_capacity(counted);
     let store = Arc::new(store);
     let dl = pipeline(&store, ReasoningMode::Owl2Dl);
-    commit(&dl, DATA);
-    hooks::AFTER_PREFLIGHT.set(Some(Box::new(|| READINGS.set(Some(1)))));
+    commit(&dl, data);
+    hooks::AFTER_PREFLIGHT.set(Some(Box::new(move || READINGS.set(Some(readings)))));
     commit(&dl, ":fido a :Dog .");
     READINGS.set(None);
+    assert_eq!(store.dl_bounds().last, route);
     let at = store.current_revision();
     let recorded = (store.dl().status()).filter(|s| s.revision == at);
     assert!(
@@ -1216,6 +1229,178 @@ fn an_ill_typed_search_stopped_at_a_dl_commit_records_no_verdict_and_the_next_re
     assert!(
         read.0.starts_with("complete") && read.1 == crate::ConsistencyStatus::Consistent,
         "after the stop: {read:?}"
+    );
+}
+
+/// OWL 2 Structural Specification §5.7: a literal's lexical form must belong to its
+/// datatype. The read must withhold consistency and completeness even where the DL engine
+/// can model the logical axioms and the commit left no verdict.
+#[test]
+fn a_dl_read_does_not_record_consistency_for_an_ill_typed_literal() {
+    let store = Arc::new(
+        StoreService::new(StoreConfig::in_memory())
+            .expect("store")
+            .with_capacity(counted),
+    );
+    let dl = pipeline(&store, ReasoningMode::Owl2Dl);
+    commit(&dl, DATA);
+
+    // U1 shares the existential witness, so it collides with the disjoint ranges. The
+    // logical axioms have a model with a different successor for each individual.
+    let schema =
+        ":A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; owl:someValuesFrom :B ] .
+         :Left rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; owl:allValuesFrom :C ] .
+         :Right rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; owl:allValuesFrom :D ] .
+         :C owl:disjointWith :D . :left a :A, :Left . :right a :A, :Right .";
+    // Let the rules and U1 use memory. The commit's DL witness search then stops.
+    hooks::AFTER_PREFLIGHT.set(Some(Box::new(|| READINGS.set(Some(2)))));
+    commit(
+        &dl,
+        &format!("{schema} :d a owl:AnnotationProperty . {ILL_TYPED}"),
+    );
+    READINGS.set(None);
+    let at = store.current_revision();
+    let committed = store.dl().status().filter(|report| report.revision == at);
+    assert!(committed.is_none(), "the commit left {committed:?}");
+
+    let read = status(&store, READ);
+    let recorded = store
+        .dl()
+        .status()
+        .filter(|report| report.revision == at)
+        .expect("the read reached the consistency engine");
+    let snapshot = store.engine().snapshot();
+    let witness = super::Certificate::of(&snapshot)
+        .expect("the read has a certified revision")
+        .ill_typed(&snapshot, &|| false)
+        .flatten();
+    assert!(
+        witness.is_some(),
+        "the store still holds the ill-typed literal"
+    );
+    println!(
+        "F3 engine={} verdict={:?} read={read}",
+        recorded.consistency.engine, recorded.consistency.verdict
+    );
+    assert_eq!(
+        (
+            recorded.consistency.verdict == crate::dl::Verdict::Consistent,
+            read.starts_with("complete"),
+        ),
+        (false, false),
+        "an ill-typed literal withholds the read verdict and completeness"
+    );
+}
+
+/// Removing the last occurrence of the literal needs one scan for both the DL verdict and
+/// the version's certificate. Both must then vouch for the repaired store.
+#[test]
+fn a_dl_witness_search_is_shared_when_the_last_ill_typed_literal_is_removed() {
+    use crate::dl::query::ILL_TYPED_AFTER_CALLS;
+    let store = Arc::new(StoreService::new(StoreConfig::in_memory()).expect("store"));
+    let dl = pipeline(&store, ReasoningMode::Owl2Dl);
+    commit(
+        &dl,
+        &format!("{DATA} :d a owl:DatatypeProperty . {ILL_TYPED}"),
+    );
+    assert_eq!(store.consistency(), crate::ConsistencyStatus::Unknown);
+    ILL_TYPED_AFTER_CALLS.set(0);
+    dl.execute_update_str(&format!("{PREFIXES}DELETE DATA {{ {ILL_TYPED} }}"))
+        .expect("delete the sole occurrence");
+    assert_eq!(
+        ILL_TYPED_AFTER_CALLS.replace(0),
+        1,
+        "commit witness searches"
+    );
+    let recorded = store.dl().status().expect("the repair's verdict");
+    assert_eq!(recorded.revision, store.current_revision());
+    assert_eq!(recorded.consistency.verdict, crate::dl::Verdict::Consistent);
+    assert_eq!(store.consistency(), crate::ConsistencyStatus::Consistent);
+    assert!(status(&store, READ).starts_with("complete"));
+}
+
+/// Even if the tableau finds a model, the commit gate must withhold consistency when its
+/// RDF data contain an ill-typed literal. The real tableau also has its own approximation guard.
+#[test]
+fn a_dl_witness_search_checks_even_a_tableau_model() {
+    use crate::dl::{Verdict, gate};
+    let store = Arc::new(StoreService::new(StoreConfig::in_memory()).expect("store"));
+    let dl = pipeline(&store, ReasoningMode::Owl2Dl);
+    gate::TABLEAU_FINDS_MODEL.set(true);
+    commit(
+        &dl,
+        &format!(
+            "{DATA} :A rdfs:subClassOf [ owl:unionOf ( :B :C ) ] . \
+                  :a a :A . :B owl:disjointWith :C . {ILL_TYPED}"
+        ),
+    );
+    let checked = store
+        .dl()
+        .status()
+        .expect("the write's verdict")
+        .consistency;
+    assert_eq!(checked.engine, "hypertableau", "{checked:?}");
+    assert_eq!(
+        checked.verdict,
+        Verdict::Unknown(gate::ILL_TYPED.to_owned())
+    );
+}
+
+/// A pending proof has no reusable verdict once the gate's request has stopped. Calling the
+/// gate directly leaves the separately cancelled publication out of the experiment.
+#[test]
+fn a_dl_witness_search_stops_with_the_gate_request() {
+    use crate::dl::{Verdict, bounds, gate, query};
+    use crate::mutation::evidence::{EvidenceView, nothing_shown};
+    let store = Arc::new(StoreService::new(StoreConfig::in_memory()).expect("store"));
+    let dl = pipeline(&store, ReasoningMode::Owl2Dl);
+    commit(&dl, DATA);
+    let mut tx = store.engine().transaction();
+    tx.insert(
+        nrese_rdf::Quad::new(
+            nrese_rdf::NamedNode::new_unchecked("http://example.com/fido"),
+            nrese_rdf::vocab::rdf::TYPE,
+            nrese_rdf::NamedNode::new_unchecked("http://example.com/Dog"),
+            nrese_rdf::GraphName::DefaultGraph,
+        )
+        .as_ref(),
+    );
+    let mut prepared = bounds::prepare(&store, &tx, nrese_reasoner::eval::NEVER, false);
+    assert!(prepared.proves_consistency);
+    let gate = gate::check_commit(
+        &store,
+        &tx,
+        &|| true,
+        &mut prepared,
+        &EvidenceView::new(&crate::ReadScope::All, &tx),
+        &|_, _| nothing_shown(),
+        &nrese_exec::Envelope::unlimited(),
+    );
+    assert_eq!(
+        gate.checked.verdict,
+        Verdict::Unknown(query::UNCHECKED.to_owned())
+    );
+    assert!(!gate.record_verdict, "another read must be able to retry");
+}
+
+/// A pinned consistency read still checks its DL record's ill-typed witness after DL is
+/// switched off at the same revision. A new read answers under the new record.
+#[test]
+fn an_ill_typed_consistency_reading_decides_from_one_observation() {
+    use crate::ConsistencyStatus::{Consistent, Unknown};
+    let store = Arc::new(StoreService::new(StoreConfig::in_memory()).expect("store"));
+    let dl = pipeline(&store, ReasoningMode::Owl2Dl);
+    commit(
+        &dl,
+        &format!("{DATA} :d a owl:DatatypeProperty . {ILL_TYPED}"),
+    );
+    let snapshot = store.engine().snapshot();
+    assert_eq!(store.consistency(), Unknown);
+    store.use_dl(false, false);
+    assert_eq!(store.current_revision(), snapshot.revision());
+    assert_eq!(
+        (store.consistency_at(&snapshot), store.consistency()),
+        (Unknown, Consistent)
     );
 }
 

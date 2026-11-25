@@ -15,6 +15,7 @@ pub mod diagnostics;
 pub mod functional;
 pub mod fuzz;
 pub mod mapping;
+mod membership;
 pub mod model;
 pub mod normalise;
 pub mod ofn;
