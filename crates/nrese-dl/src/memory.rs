@@ -92,7 +92,7 @@ pub fn taxonomy_bytes(taxonomy: &crate::classify::Taxonomy) -> usize {
         + taxonomy.incomplete.iter().map(text).sum::<usize>()
 }
 
-/// What a copy of `ontology` holds. O(axioms + sources).
+/// What a copy of `ontology` holds. O(axioms + sources + interners).
 pub fn ontology_bytes(ontology: &Ontology) -> usize {
     let axioms = vec(&ontology.axioms, ontology.axioms.capacity())
         + ontology.axioms.iter().map(axiom_lists).sum::<usize>();
@@ -123,10 +123,26 @@ pub fn ontology_bytes(ontology: &Ontology) -> usize {
         .sum::<usize>();
     let iris = table(data.iris.len(), size_of::<(nrese_owl::Term, String)>())
         + data.iris.values().map(String::capacity).sum::<usize>();
+    let class_lists: usize = (0..ontology.classes.len() as u32)
+        .map(|id| match ontology.classes.get(id) {
+            nrese_owl::ClassExpr::And(v) | nrese_owl::ClassExpr::Or(v) => vec(v, v.capacity()),
+            nrese_owl::ClassExpr::OneOf(v) => vec(v, v.capacity()),
+            _ => 0,
+        })
+        .sum();
+    let range_lists: usize = (0..ontology.ranges.len() as u32)
+        .map(|id| match ontology.ranges.get(id) {
+            nrese_owl::DataRange::And(v) | nrese_owl::DataRange::Or(v) => vec(v, v.capacity()),
+            nrese_owl::DataRange::OneOf(v) => vec(v, v.capacity()),
+            nrese_owl::DataRange::Restriction(_, v) => vec(v, v.capacity()),
+            _ => 0,
+        })
+        .sum();
     axioms
         + sources
         + interner::<nrese_owl::ClassExpr>(ontology.classes.len())
         + interner::<nrese_owl::DataRange>(ontology.ranges.len())
+        + 2 * (class_lists + range_lists)
         + vec(&ontology.diagnostics, ontology.diagnostics.capacity())
         + literals
         + iris

@@ -42,6 +42,7 @@ pub use mapping::{
     TermKind, Terms, is_shacl_property, may_name_annotation, read, read_beside,
     read_with_disjoint_reading, shacl_properties,
 };
+pub use membership::membership;
 pub use model::{
     Axiom, Characteristic, ClassExpr, DataRange, DataTerms, DisjointReading, EntityKind, ExprId,
     Interner, Literal, ObjProp, RangeId, Term,

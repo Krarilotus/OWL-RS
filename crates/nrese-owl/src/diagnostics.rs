@@ -387,18 +387,20 @@ impl Diagnostic {
 /// §11.1): a chain's or a transitive property's superproperty, and
 /// `owl:topObjectProperty` and `owl:bottomObjectProperty`. The bottom seed belongs to
 /// the stored ontology's membership check.
-pub(crate) fn check_global_restrictions(ontology: &mut Ontology, membership: bool) {
+pub(crate) fn check_global_restrictions(
+    ontology: &Ontology,
+    membership: bool,
+    out: &mut Vec<Diagnostic>,
+) {
     if let Some((lower, upper)) = impossible_role_order(ontology) {
-        ontology
-            .diagnostics
-            .push(Diagnostic::IrregularPropertyHierarchy { lower, upper });
+        out.push(Diagnostic::IrregularPropertyHierarchy { lower, upper });
     }
     // Nominals and `hasValue` take named individuals only (§11.2).
     let anonymous: BTreeSet<Term> = crate::mapping::in_expressions(ontology)
         .filter(|t| ontology.anonymous.contains(t))
         .collect();
     for node in anonymous {
-        ontology.diagnostics.push(Diagnostic::AnonymousIndividual {
+        out.push(Diagnostic::AnonymousIndividual {
             node,
             what: "a blank node in oneOf or hasValue",
             axioms: [None; 2],
@@ -463,6 +465,7 @@ pub(crate) fn check_global_restrictions(ontology: &mut Ontology, membership: boo
         }
     }
     let mut found = Vec::new();
+    let memo = (!needing.is_empty()).then(|| build_non_simple_memo(ontology, &needing));
     for (index, axiom) in ontology.axioms.iter().enumerate() {
         let direct = match axiom {
             Axiom::ObjectCharacteristic(
@@ -494,18 +497,20 @@ pub(crate) fn check_global_restrictions(ontology: &mut Ontology, membership: boo
             });
             continue;
         }
-        for expr in expressions_of(axiom) {
-            if let Some(&(property, what)) = uses_any(ontology, expr, &needing) {
-                found.push(Diagnostic::NonSimpleProperty {
-                    property,
-                    axiom: index,
-                    what,
-                });
-                break;
+        if let Some(memo) = memo.as_deref() {
+            for expr in expressions_of(axiom) {
+                if let Some(&(property, what)) = needing.get(&memo[expr as usize]) {
+                    found.push(Diagnostic::NonSimpleProperty {
+                        property,
+                        axiom: index,
+                        what,
+                    });
+                    break;
+                }
             }
         }
     }
-    ontology.diagnostics.extend(found);
+    out.extend(found);
 }
 
 /// The first impossible pair in the least strict order required by §11.2.
@@ -629,33 +634,75 @@ fn push_expressions(axiom: &Axiom, out: &mut Vec<u32>) {
     }
 }
 
-/// The first expression in `id`'s subexpressions that `needing` names.
-fn uses_any<'a>(
-    ontology: &Ontology,
-    id: u32,
-    needing: &'a HashMap<u32, (Term, &'static str)>,
-) -> Option<&'a (Term, &'static str)> {
-    let mut stack = vec![id];
-    let mut seen = HashSet::new();
-    while let Some(id) = stack.pop() {
-        if !seen.insert(id) {
-            continue;
-        }
-        if let Some(found) = needing.get(&id) {
-            return Some(found);
-        }
-        match ontology.classes.get(id) {
-            ClassExpr::And(xs) | ClassExpr::Or(xs) => stack.extend(xs.iter().map(|x| x.0)),
-            ClassExpr::Not(x)
-            | ClassExpr::Some(_, x)
-            | ClassExpr::All(_, x)
-            | ClassExpr::Min(_, _, x)
-            | ClassExpr::Max(_, _, x)
-            | ClassExpr::Exact(_, _, x) => stack.push(x.0),
-            _ => {}
-        }
+const CLEAN: u32 = u32::MAX;
+
+/// Bytes for the non-simple-property memo table over `classes` expressions.
+pub fn non_simple_memo_bytes(classes: usize) -> usize {
+    classes.saturating_mul(std::mem::size_of::<u32>())
+}
+
+fn class_children(expr: &ClassExpr) -> &[crate::ExprId] {
+    match expr {
+        ClassExpr::And(xs) | ClassExpr::Or(xs) => xs,
+        ClassExpr::Not(x)
+        | ClassExpr::Some(_, x)
+        | ClassExpr::All(_, x)
+        | ClassExpr::Min(_, _, x)
+        | ClassExpr::Max(_, _, x)
+        | ClassExpr::Exact(_, _, x) => std::slice::from_ref(x),
+        _ => &[],
     }
-    None
+}
+
+/// First non-simple-property expression reachable from each interned class, filled bottom-up.
+// Child-before-parent: Interner::intern is append-only and immutable (model.rs:211-219), the RDF
+// reader guards against cycles (mapping.rs:1205-1210), and the importer interns children first.
+fn build_non_simple_memo(
+    ontology: &Ontology,
+    needing: &HashMap<u32, (Term, &'static str)>,
+) -> Vec<u32> {
+    let n = ontology.classes.len();
+    let mut memo = vec![CLEAN; n];
+    #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+    record_non_simple_scratch(memo.capacity() * std::mem::size_of::<u32>());
+    for id in 0..n as u32 {
+        #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+        NON_SIMPLE_EXPANSIONS.with(|c| c.set(c.get() + 1));
+        memo[id as usize] = if needing.contains_key(&id) {
+            id
+        } else {
+            class_children(ontology.classes.get(id))
+                .iter()
+                .rev()
+                .map(|c| memo[c.0 as usize])
+                .find(|&h| h != CLEAN)
+                .unwrap_or(CLEAN)
+        };
+    }
+    memo
+}
+
+#[cfg(any(test, all(feature = "witness", debug_assertions)))]
+thread_local! {
+    static NON_SIMPLE_EXPANSIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static NON_SIMPLE_SCRATCH_PEAK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, all(feature = "witness", debug_assertions)))]
+fn record_non_simple_scratch(bytes: usize) {
+    NON_SIMPLE_SCRATCH_PEAK.with(|p| p.set(p.get().max(bytes)));
+}
+
+/// Class-expression expansions made by the non-simple-property check on this thread.
+#[cfg(any(test, all(feature = "witness", debug_assertions)))]
+pub fn non_simple_expansions() -> u64 {
+    NON_SIMPLE_EXPANSIONS.with(std::cell::Cell::get)
+}
+
+/// Peak scratch bytes held by the non-simple-property memo pass on this thread, resetting it.
+#[cfg(any(test, all(feature = "witness", debug_assertions)))]
+pub fn take_non_simple_scratch_peak() -> usize {
+    NON_SIMPLE_SCRATCH_PEAK.with(|p| p.replace(0))
 }
 
 /// Whether an IRI is of the reserved vocabulary (`rdf:`, `rdfs:`, `xsd:`, `owl:`) and not
@@ -928,4 +975,136 @@ fn entities_of<'w>(
         }
     }
     (out, ind)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::ExprId;
+
+    /// Spec (Structural Specification §11.2): memoising non-simple-property reachability
+    /// preserves the right-to-left witness choice across set operands for every axiom sharing
+    /// the expression; a single matching child reports that child's property and reason.
+    #[test]
+    fn non_simple_memo_preserves_first_finding() {
+        let mut o = Ontology::default();
+        let thing = ExprId(o.classes.intern(ClassExpr::Thing));
+        let self_p = ExprId(o.classes.intern(ClassExpr::HasSelf(ObjProp::Named(1))));
+        let max_q = ExprId(
+            o.classes
+                .intern(ClassExpr::Max(1, ObjProp::Named(2), thing)),
+        );
+        let both = ExprId(o.classes.intern(ClassExpr::And(vec![self_p, max_q])));
+        let c1 = ExprId(o.classes.intern(ClassExpr::Class(10)));
+        let c2 = ExprId(o.classes.intern(ClassExpr::Class(11)));
+        o.axioms = vec![
+            Axiom::ObjectCharacteristic(Characteristic::Transitive, ObjProp::Named(1)),
+            Axiom::ObjectCharacteristic(Characteristic::Transitive, ObjProp::Named(2)),
+            Axiom::SubClassOf(c1, both),
+            Axiom::SubClassOf(c2, both),
+        ];
+        o.axioms.sort_unstable();
+        let expected_indices: Vec<usize> = o
+            .axioms
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| matches!(a, Axiom::SubClassOf(..)).then_some(i))
+            .collect();
+        assert_eq!(expected_indices.len(), 2);
+
+        let mut out = Vec::new();
+        check_global_restrictions(&o, true, &mut out);
+        let hits: Vec<_> = out
+            .iter()
+            .filter_map(|d| match *d {
+                Diagnostic::NonSimpleProperty {
+                    property,
+                    axiom,
+                    what,
+                } => Some((property, axiom, what)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            hits,
+            expected_indices
+                .into_iter()
+                .map(|idx| (2, idx, "a cardinality restriction"))
+                .collect::<Vec<_>>()
+        );
+
+        // One-child control: reports the sole matching child's property and reason.
+        let mut single = Ontology::default();
+        let only_p = ExprId(single.classes.intern(ClassExpr::HasSelf(ObjProp::Named(1))));
+        let wrap = ExprId(single.classes.intern(ClassExpr::Not(only_p)));
+        let c = ExprId(single.classes.intern(ClassExpr::Class(10)));
+        single.axioms = vec![
+            Axiom::ObjectCharacteristic(Characteristic::Transitive, ObjProp::Named(1)),
+            Axiom::SubClassOf(c, wrap),
+        ];
+        single.axioms.sort_unstable();
+        let sub_idx = single
+            .axioms
+            .iter()
+            .position(|a| matches!(a, Axiom::SubClassOf(..)))
+            .unwrap();
+        let mut single_out = Vec::new();
+        check_global_restrictions(&single, true, &mut single_out);
+        let single_hits: Vec<_> = single_out
+            .iter()
+            .filter_map(|d| match *d {
+                Diagnostic::NonSimpleProperty {
+                    property,
+                    axiom,
+                    what,
+                } => Some((property, axiom, what)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(single_hits, vec![(1, sub_idx, "a self restriction")]);
+    }
+
+    /// Spec (contracts.md, Memory; Structural Specification §11.2): the non-simple-property
+    /// memo's advertised byte bound covers all live scratch held during the pass on a dense
+    /// acyclic DAG with many shared parent edges.
+    #[test]
+    fn non_simple_memo_reservation_covers_shared_parent_edges() {
+        let mut o = Ontology::default();
+        let hit = ExprId(o.classes.intern(ClassExpr::HasSelf(ObjProp::Named(1))));
+        let leaf = ExprId(o.classes.intern(ClassExpr::Class(2)));
+        let c = ExprId(o.classes.intern(ClassExpr::Class(3)));
+        let mut prior = vec![hit, leaf];
+        let mut root = hit;
+        for _ in 0..1_024usize {
+            root = ExprId(o.classes.intern(ClassExpr::And(prior.clone())));
+            prior.push(root);
+        }
+        o.axioms = vec![
+            Axiom::ObjectCharacteristic(Characteristic::Transitive, ObjProp::Named(1)),
+            Axiom::SubClassOf(c, root),
+        ];
+        o.axioms.sort_unstable();
+
+        let _ = take_non_simple_scratch_peak();
+        let mut out = Vec::new();
+        check_global_restrictions(&o, true, &mut out);
+        let held = take_non_simple_scratch_peak();
+        let reserved = non_simple_memo_bytes(o.classes.len());
+        assert!(
+            out.iter().any(|d| matches!(
+                d,
+                Diagnostic::NonSimpleProperty {
+                    property: 1,
+                    what: "a self restriction",
+                    ..
+                }
+            )),
+            "expected non-simple self-restriction finding: {out:?}"
+        );
+        assert!(
+            held <= reserved,
+            "shared-parent DAG held {held} scratch bytes against {reserved} reserved ({} classes)",
+            o.classes.len()
+        );
+    }
 }

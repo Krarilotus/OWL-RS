@@ -446,9 +446,6 @@ impl DlEntailment {
     }
 }
 
-/// Blank nodes of conclusions get labels of their own, so none is a premise's.
-static CONCLUSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 impl StoreService {
     /// Whether the asserted statements (every graph) entail `conclusion` under the OWL 2
     /// Direct Semantics: each logical axiom of the conclusion read as an OWL 2 ontology
@@ -494,9 +491,9 @@ impl StoreService {
         conclusion: &[Triple],
         deadline: Deadline,
     ) -> StoreResult<DlEntailment> {
-        use crate::dl::entailment::{Entailed, entails_ontology_within};
+        use crate::dl::entailment::{Entailed, admit_and_prepare, entails_prepared_within};
         use crate::dl::{Verdict, consistency, gate, source};
-        use nrese_rdf::{BlankNode, NamedNodeRef, NamedOrBlankNode};
+        use nrese_rdf::{NamedNodeRef, NamedOrBlankNode};
         if self.dl().replica() {
             // Reading a conclusion interns its terms, which a replica must not.
             return Err(StoreError::Configuration(
@@ -507,7 +504,7 @@ impl StoreService {
         // Undecided where the request's envelope can't take reading the premise (SYN-61).
         let treatments = &self.config().dl.treatments;
         let Ok((premise, read_statements)) =
-            source::read_premise(snapshot, memory.clone(), treatments, false)
+            source::read_premise(snapshot, memory.clone(), treatments, true)
         else {
             let why = source::refused("the premise");
             return Ok(DlEntailment {
@@ -536,19 +533,67 @@ impl StoreService {
                 premise: checked.verdict,
             });
         }
+        let reply = |premise, answer| Ok(DlEntailment { answer, premise });
+        if conclusion
+            .iter()
+            .any(|t| matches!(t.object, Term::Triple(_)))
+        {
+            return reply(
+                checked.verdict,
+                Entailed::Unknown(
+                    "the conclusion holds a triple term, which OWL 2 doesn't define".to_owned(),
+                ),
+            );
+        }
         // The OWL vocabulary and the fresh names are system vocabulary, shared (dictionary
         // lifecycle V1); the conclusion's terms are the request's own, in a private
         // vocabulary charged to its envelope, past the premise's ids.
         source::intern_system_vocabulary(self.engine())?;
         let tx = source::private_over(self.engine(), snapshot, Arc::new(memory.part()));
-        let n = CONCLUSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let blank = |b: &BlankNode| BlankNode::new_unchecked(format!("nresec{n}x{}", b.as_str()));
-        let id = |t: Term| -> nrese_engine::EngineResult<u64> {
+        let blank_positions = conclusion.iter().fold(0usize, |n, t| {
+            n + usize::from(matches!(t.subject, NamedOrBlankNode::BlankNode(_)))
+                + usize::from(matches!(t.object, Term::BlankNode(_)))
+        });
+        let mut blank_scratch = nrese_dl::memory::Scratch::new(Some(&memory));
+        let Ok(mut blanks) = new_blank_map(blank_positions, &mut blank_scratch) else {
+            return reply(
+                checked.verdict,
+                Entailed::Unknown(format!(
+                    "the conclusion: {}",
+                    source::refused("the conclusion")
+                )),
+            );
+        };
+        let (mut probes, mut late) = (0u64, false);
+        let mut id = |t: Term| -> nrese_engine::EngineResult<u64> {
+            if late {
+                return Ok(0);
+            }
             let t = match t {
-                Term::BlankNode(b) => Term::BlankNode(blank(&b)),
+                Term::BlankNode(b) => {
+                    let Some(mapped) = fresh_blank(
+                        &tx,
+                        &mut blanks,
+                        &mut blank_scratch,
+                        &mut probes,
+                        deadline,
+                        &b,
+                    )?
+                    else {
+                        late = true;
+                        return Ok(0);
+                    };
+                    Term::BlankNode(mapped)
+                }
                 other => other,
             };
-            Ok(tx.try_intern(t.as_ref())?.raw())
+            let raw = tx.try_intern(t.as_ref())?.raw();
+            if let Term::BlankNode(b) = t {
+                let len = b.as_str().len();
+                drop(b);
+                blank_scratch.release(len);
+            }
+            Ok(raw)
         };
         let statements: nrese_engine::EngineResult<Vec<nrese_owl::Statement>> = conclusion
             .iter()
@@ -567,6 +612,14 @@ impl StoreService {
                 })
             })
             .collect();
+        drop(blanks);
+        drop(blank_scratch);
+        if late {
+            return reply(
+                checked.verdict,
+                Entailed::Unknown(nrese_dl::limits::Limit::Time.reached("the deadline passed")),
+            );
+        }
         // Undecided where the envelope can't take the conclusion's terms, as the premise's.
         let Ok(statements) = statements else {
             return Ok(DlEntailment {
@@ -579,30 +632,27 @@ impl StoreService {
         };
         let decode = |term| tx.decode(term);
         let lookup = |iri: &str| tx.lookup(NamedNodeRef::new_unchecked(iri).into());
+        let terms = source::StoreTerms {
+            decode: &decode,
+            lookup: &lookup,
+        };
         // The conclusion reads SHACL content as one source of it and the premise would
         // (`nrese_owl::read_beside`); the premise keeps its own reading.
-        let read = nrese_owl::read_beside(
-            &statements,
-            &read_statements,
-            &source::StoreTerms {
-                decode: &decode,
-                lookup: &lookup,
-            },
-        );
+        let read = nrese_owl::read_beside(&statements, &read_statements, &terms);
         // The premise's statements are read: their charge goes back to the envelope before
         // the check draws on it.
         drop(read_statements);
+        let name = |t| {
+            let written = decode(nrese_engine::TermId::from_raw(t));
+            written
+                .and_then(consistency::as_written)
+                .unwrap_or_else(|| "_".into())
+        };
         // A structure no axiom uses says nothing under the Direct Semantics (OWL 1
         // conclusions state expressions so); anything else unread leaves it undecided.
         // Named by the conclusion's IRIs and literals, as the requester wrote them; its blank
         // nodes, relabelled here, by none.
         if let Some(diagnostic) = read.diagnostics.iter().find(|d| d.is_fatal()) {
-            let name = |t| {
-                let written = decode(nrese_engine::TermId::from_raw(t));
-                written
-                    .and_then(consistency::as_written)
-                    .unwrap_or_else(|| "_".into())
-            };
             return Ok(DlEntailment {
                 answer: Entailed::Unknown(format!(
                     "the conclusion isn't well-formed OWL 2 DL: {}",
@@ -611,6 +661,22 @@ impl StoreService {
                 premise: checked.verdict,
             });
         }
+        if let Some(bad) = statements.iter().find_map(|s| {
+            let obj = nrese_engine::TermId::from_raw(s.triple[2]);
+            crate::dl::query::is_ill_typed(obj, &decode).then_some(s.triple[2])
+        }) {
+            return Ok(DlEntailment {
+                answer: Entailed::Unknown(format!(
+                    "the conclusion isn't well-formed OWL 2 DL: ill-typed literal: {}",
+                    name(bad)
+                )),
+                premise: checked.verdict,
+            });
+        }
+        let prepared = match admit_and_prepare(&premise, &read, &terms, &name, &budget, deadline) {
+            Ok(prepared) => prepared,
+            Err(answer) => return reply(checked.verdict, answer),
+        };
         // Admitted: an inconsistent premise has no model, so it entails the conclusion.
         if inconsistent {
             return Ok(DlEntailment {
@@ -629,9 +695,125 @@ impl StoreService {
             .collect();
         let fresh = fresh?;
         Ok(DlEntailment {
-            answer: entails_ontology_within(&premise, &read, &fresh, &budget, deadline),
+            answer: entails_prepared_within(
+                prepared,
+                !read.anonymous.is_empty(),
+                &fresh,
+                &budget,
+                deadline,
+            ),
             premise: checked.verdict,
         })
+    }
+}
+
+fn new_blank_map(
+    cap: usize,
+    scratch: &mut nrese_dl::memory::Scratch,
+) -> nrese_engine::EngineResult<std::collections::HashMap<String, nrese_rdf::BlankNode>> {
+    if cap > 0 {
+        let raw = cap.saturating_mul(8).div_ceil(7).max(4);
+        let buckets = raw.checked_next_power_of_two().unwrap_or(usize::MAX);
+        let slot = std::mem::size_of::<(String, nrese_rdf::BlankNode)>() + 1;
+        scratch.charge(|| buckets.saturating_mul(slot).saturating_add(32))?;
+    }
+    Ok(std::collections::HashMap::with_capacity(cap))
+}
+
+fn fresh_blank(
+    tx: &nrese_engine::PrivateTransaction<'_>,
+    blanks: &mut std::collections::HashMap<String, nrese_rdf::BlankNode>,
+    scratch: &mut nrese_dl::memory::Scratch,
+    probes: &mut u64,
+    deadline: Deadline,
+    blank: &nrese_rdf::BlankNode,
+) -> nrese_engine::EngineResult<Option<nrese_rdf::BlankNode>> {
+    if let Some(existing) = blanks.get(blank.as_str()) {
+        scratch.charge(|| existing.as_str().len())?;
+        return Ok(Some(existing.clone()));
+    }
+    scratch.charge(|| blank.as_str().len().saturating_mul(3).saturating_add(64))?;
+    for k in 0u64.. {
+        *probes = probes.saturating_add(1);
+        if *probes >= 4_096 {
+            *probes = 0;
+            if deadline.passed() {
+                return Ok(None);
+            }
+        }
+        let cand = nrese_rdf::BlankNode::new_unchecked(format!("nresec{k}x{}", blank.as_str()));
+        if tx
+            .lookup(nrese_rdf::TermRef::BlankNode(cand.as_ref()))
+            .is_none()
+        {
+            #[cfg(test)]
+            let old_cap = blanks.capacity();
+            blanks.insert(blank.as_str().to_owned(), cand.clone());
+            #[cfg(test)]
+            {
+                let entry_slot = std::mem::size_of::<(String, nrese_rdf::BlankNode)>() + 1;
+                let new_cap = blanks.capacity();
+                let resized = old_cap > 0 && new_cap > old_cap;
+                let held: usize = new_cap * entry_slot
+                    + blanks
+                        .iter()
+                        .map(|(k, v)| k.capacity() + v.as_str().len())
+                        .sum::<usize>()
+                    + cand.as_str().len();
+                let peak_with_overlap = held + if resized { old_cap * entry_slot } else { 0 };
+                blank_test_hooks::record(held, scratch.bytes(), resized, peak_with_overlap);
+            }
+            return Ok(Some(cand));
+        }
+    }
+    unreachable!()
+}
+
+#[cfg(test)]
+mod blank_test_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static MAX_UNCHARGED: Cell<usize> = const { Cell::new(0) };
+        static MAX_HELD: Cell<usize> = const { Cell::new(0) };
+        static MAX_CHARGED: Cell<usize> = const { Cell::new(0) };
+        static RESIZES: Cell<usize> = const { Cell::new(0) };
+        static MAX_RESIZE_UNCHARGED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn reset() {
+        MAX_UNCHARGED.with(|c| c.set(0));
+        MAX_HELD.with(|c| c.set(0));
+        MAX_CHARGED.with(|c| c.set(0));
+        RESIZES.with(|c| c.set(0));
+        MAX_RESIZE_UNCHARGED.with(|c| c.set(0));
+    }
+
+    pub(crate) fn record(held: usize, charged: usize, resized: bool, peak_with_overlap: usize) {
+        let uncharged = held.saturating_sub(charged);
+        MAX_UNCHARGED.with(|c| c.set(c.get().max(uncharged)));
+        MAX_HELD.with(|c| c.set(c.get().max(held)));
+        MAX_CHARGED.with(|c| c.set(c.get().max(charged)));
+        if resized {
+            RESIZES.with(|c| c.set(c.get() + 1));
+        }
+        let resize_uncharged = peak_with_overlap.saturating_sub(charged);
+        MAX_RESIZE_UNCHARGED.with(|c| c.set(c.get().max(resize_uncharged)));
+    }
+
+    pub(crate) fn snapshot() -> (usize, usize, usize) {
+        (
+            MAX_HELD.with(Cell::get),
+            MAX_CHARGED.with(Cell::get),
+            MAX_UNCHARGED.with(Cell::get),
+        )
+    }
+
+    pub(crate) fn resize_snapshot() -> (usize, usize) {
+        (
+            RESIZES.with(Cell::get),
+            MAX_RESIZE_UNCHARGED.with(Cell::get),
+        )
     }
 }
 

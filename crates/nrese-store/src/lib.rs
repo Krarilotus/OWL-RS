@@ -7,8 +7,8 @@
 /// fails a test (as `nrese-engine`'s unit tests do).
 #[cfg(test)]
 #[global_allocator]
-static MEASURED: nrese_exec::measure::Measured<std::alloc::System> =
-    nrese_exec::measure::Measured(std::alloc::System);
+static MEASURED: dl::entailment::scratch_lifetime_tests::WatchFrees =
+    dl::entailment::scratch_lifetime_tests::WatchFrees;
 
 pub mod access;
 pub mod autocomplete;
