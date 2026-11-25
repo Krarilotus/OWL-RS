@@ -3373,6 +3373,30 @@ mod certificate_tests {
     const C_D: &str = "<http://example.com/C> <http://www.w3.org/2000/01/rdf-schema#subClassOf> \
                        <http://example.com/D> .\n";
 
+    // An ungated write publishes its statements with the existing hold and no rules verdict.
+    #[test]
+    fn ungated_publication_preserves_quarantine() {
+        use super::certificate_lifecycle_tests::certificate_record_tests::quarantined;
+        use crate::{ConsistencyStatus, SparqlQueryRequest};
+
+        const EX: &str = "PREFIX ex: <http://example.org/>";
+        let (store, _) = quarantined(StoreConfig::in_memory());
+        let before = store.current_revision();
+        store
+            .update_str_ungated(&format!("{EX} INSERT DATA {{ ex:s ex:p ex:o }}"))
+            .expect("setup: ungated update committed");
+        assert!(
+            store.current_revision() > before,
+            "setup: new revision published"
+        );
+        assert!(store.is_quarantined(), "readiness after ungated write");
+        assert_eq!(store.consistency(), ConsistencyStatus::Unknown);
+        let ask = SparqlQueryRequest::all(format!("{EX} ASK {{ ex:s ex:p ex:o }}"));
+        let result = store.execute_query(&ask).expect("query answered");
+        let json: serde_json::Value = serde_json::from_slice(&result.payload).expect("ASK result");
+        assert_eq!(json["boolean"], true);
+    }
+
     fn rdfs() -> nrese_reasoner::RuleProgram {
         nrese_reasoner::ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Rdfs)
             .materialised_program()

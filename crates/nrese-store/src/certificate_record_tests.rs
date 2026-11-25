@@ -57,7 +57,9 @@ fn update(pipeline: &MutationPipeline, update: &str) {
         .expect("setup: update committed");
 }
 
-fn quarantined(config: StoreConfig) -> (Arc<StoreService>, MutationPipeline) {
+pub(in crate::service) fn quarantined(
+    config: StoreConfig,
+) -> (Arc<StoreService>, MutationPipeline) {
     let store = Arc::new(
         StoreService::new(config)
             .expect("setup: store")
@@ -331,26 +333,6 @@ fn invalidation_preserves_quarantine_until_repair() {
     update(&pipeline, REPAIR);
     assert!(!store.is_quarantined());
     assert_eq!(store.consistency(), ConsistencyStatus::Consistent);
-}
-
-// An ungated write publishes its statements with the existing hold and no rules verdict.
-#[test]
-fn ungated_publication_preserves_quarantine() {
-    let (store, _) = quarantined(StoreConfig::in_memory());
-    let before = store.current_revision();
-    store
-        .update_str_ungated(&format!("{EX} INSERT DATA {{ ex:s ex:p ex:o }}"))
-        .expect("setup: ungated update committed");
-    assert!(
-        store.current_revision() > before,
-        "setup: new revision published"
-    );
-    assert!(store.is_quarantined(), "readiness after ungated write");
-    assert_eq!(store.consistency(), ConsistencyStatus::Unknown);
-    let ask = SparqlQueryRequest::all(format!("{EX} ASK {{ ex:s ex:p ex:o }}"));
-    let result = store.execute_query(&ask).expect("query answered");
-    let json: serde_json::Value = serde_json::from_slice(&result.payload).expect("ASK result");
-    assert_eq!(json["boolean"], true);
 }
 
 // A refutation accepts an identical recertification and refuses a changed reading at the same revision.

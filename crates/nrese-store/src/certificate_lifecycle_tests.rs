@@ -19,7 +19,7 @@ use nrese_reasoner::rulesets::Ruleset;
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
 
 #[path = "certificate_record_tests.rs"]
-mod certificate_record_tests;
+pub(super) mod certificate_record_tests;
 
 const PREFIXES: &str = "PREFIX : <http://example.com/> \
      PREFIX owl: <http://www.w3.org/2002/07/owl#> \
