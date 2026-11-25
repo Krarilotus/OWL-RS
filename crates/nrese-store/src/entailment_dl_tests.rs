@@ -501,10 +501,13 @@ fn import_stops_at_the_deadline() {
     use crate::dl::entailment::test_hooks::IMPORT_VISIT;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    // Leave time to read 10,000 axioms in a debug build. Two poll intervals
+    // still take at least 8,192 ms of seam delay.
+    let timeout = Duration::from_secs(5);
     let conclusion = many_restrictions(10_000);
     let (store, _pipeline) = clash_store(
         DlConfig {
-            timeout: Some(Duration::from_secs(1)),
+            timeout: Some(timeout),
             ..DlConfig::default()
         },
         0,
@@ -516,10 +519,7 @@ fn import_stops_at_the_deadline() {
     let f = Arc::clone(&first_before);
     IMPORT_VISIT.replace(Some(Box::new(move || {
         if v.fetch_add(1, Ordering::Relaxed) == 0 {
-            f.store(
-                started.elapsed() < Duration::from_secs(1),
-                Ordering::Relaxed,
-            );
+            f.store(started.elapsed() < timeout, Ordering::Relaxed);
         }
         std::thread::sleep(Duration::from_millis(1));
     })));
