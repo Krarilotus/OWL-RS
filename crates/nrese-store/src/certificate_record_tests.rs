@@ -4,7 +4,11 @@ use crate::{
     MutationCommand, MutationPipeline, MutationTicket, Requester, SparqlQueryRequest,
     SparqlUpdateRequest, StoreConfig, StoreError, StoreService,
 };
-use nrese_rdf::{NamedNode, Triple, vocab::rdf};
+use nrese_engine::{EncodedTriple, QuadPattern, ReadModel};
+use nrese_rdf::{
+    NamedNode, Triple,
+    vocab::{owl, rdf},
+};
 use nrese_reasoner::ReasoningMode;
 use nrese_reasoner::rulesets::Ruleset;
 use std::path::Path;
@@ -17,6 +21,10 @@ const REPAIR: &str = "DELETE DATA { ex:x a ex:B }";
 const READ: &str = "SELECT ?x WHERE { ?x a ex:A }";
 
 fn load(store: &StoreService, data: &str) -> crate::StoreResult<()> {
+    load_with_mode(store, data, false)
+}
+
+fn load_with_mode(store: &StoreService, data: &str, replace: bool) -> crate::StoreResult<()> {
     let dir = tempfile::tempdir().expect("setup: input directory");
     let file = dir.path().join("data.ttl");
     std::fs::write(
@@ -32,7 +40,7 @@ fn load(store: &StoreService, data: &str) -> crate::StoreResult<()> {
     store
         .bulk_load(&BulkLoadRequest {
             files: vec![file],
-            replace: false,
+            replace,
             graph: GraphTarget::DefaultGraph,
             invalid: Some(InvalidStatements::Strict),
         })
@@ -188,7 +196,7 @@ fn a_bare_open_cannot_report_the_old_rules_verdict() {
     cells.finish();
 }
 
-// A query under DL cannot turn a bare open's unverified zero into a DL consistency verdict.
+// A DL query detects the asserted disjointness clash even when a stale marker has zero violations.
 #[test]
 fn a_dl_read_cannot_prove_consistency_from_an_old_rules_marker() {
     let dir = tempfile::tempdir().expect("setup: store directory");
@@ -199,13 +207,13 @@ fn a_dl_read_cannot_prove_consistency_from_an_old_rules_marker() {
         .expect("setup: DL query answered");
     let status = answer
         .completeness
-        .expect("setup: DL query reported its status")
-        .header();
+        .expect("setup: DL query reported its status");
     assert!(
-        status.contains("inconsistent under OWL 2 DL")
-            || status.contains("consistency under OWL 2 DL isn't known")
-            || status.contains("not-certified"),
-        "DL read gave no qualification of its consistency: {status}"
+        status.reasons.iter().any(|reason| {
+            reason.text == "the data is inconsistent under OWL 2 DL, so it entails every answer"
+        }),
+        "expected an inconsistent DL verdict, got {}",
+        status.header()
     );
     assert_eq!(store.consistency(), ConsistencyStatus::Unknown);
 }
@@ -325,11 +333,144 @@ fn invalidation_preserves_quarantine_until_repair() {
     assert_eq!(store.consistency(), ConsistencyStatus::Consistent);
 }
 
+// An ungated write publishes its statements with the existing hold and no rules verdict.
+#[test]
+fn ungated_publication_preserves_quarantine() {
+    let (store, _) = quarantined(StoreConfig::in_memory());
+    let before = store.current_revision();
+    store
+        .update_str_ungated(&format!("{EX} INSERT DATA {{ ex:s ex:p ex:o }}"))
+        .expect("setup: ungated update committed");
+    assert!(
+        store.current_revision() > before,
+        "setup: new revision published"
+    );
+    assert!(store.is_quarantined(), "readiness after ungated write");
+    assert_eq!(store.consistency(), ConsistencyStatus::Unknown);
+    let ask = SparqlQueryRequest::all(format!("{EX} ASK {{ ex:s ex:p ex:o }}"));
+    let result = store.execute_query(&ask).expect("query answered");
+    let json: serde_json::Value = serde_json::from_slice(&result.payload).expect("ASK result");
+    assert_eq!(json["boolean"], true);
+}
+
+// A refutation accepts an identical recertification and refuses a changed reading at the same revision.
+#[test]
+fn refutation_checks_the_reading_after_a_same_revision_rebuild() {
+    let store = StoreService::new(StoreConfig {
+        equality_by_representatives: true,
+        equality_compact: true,
+        ..StoreConfig::in_memory()
+    })
+    .expect("setup: compact store");
+    load(
+        &store,
+        "ex:A owl:disjointWith ex:B . ex:u a ex:A . ex:v a ex:B . \
+         ex:alias owl:sameAs ex:item . ex:item a ex:Seed . ex:Seed rdfs:subClassOf ex:C .",
+    )
+    .expect("setup: premise loaded");
+    store
+        .rematerialise(Ruleset::Owl2Rl)
+        .expect("setup: premise rebuilt");
+    let conclusion = [Triple::new(
+        NamedNode::new_unchecked("http://example.org/u"),
+        owl::DIFFERENT_FROM.into_owned(),
+        NamedNode::new_unchecked("http://example.org/v"),
+    )];
+    assert_eq!(
+        store
+            .entails(Ruleset::Owl2Rl, &conclusion)
+            .expect("setup: refutation"),
+        Entailment::Entailed
+    );
+
+    let before = store.engine().snapshot();
+    let other = store.clone();
+    hooks::BETWEEN_ENTAILMENT_HALVES.set(Some(Box::new(move || {
+        other.set_ql_rewriting(crate::QlRewritingMode::On);
+    })));
+    let allowed = store.entails(Ruleset::Owl2Rl, &conclusion);
+    let after = store.engine().snapshot();
+    assert!(
+        !before.same_version(&after),
+        "setup: a new record was published"
+    );
+    assert_eq!(
+        before.identity(),
+        after.identity(),
+        "setup: same stack and reading"
+    );
+    assert_eq!(
+        allowed.expect("entailment after recertification"),
+        Entailment::Entailed
+    );
+
+    let other = store.clone();
+    hooks::BETWEEN_ENTAILMENT_HALVES.set(Some(Box::new(move || {
+        let rebuild = other.engine().rematerialisation();
+        let rows = rebuild
+            .base()
+            .stored()
+            .quads_for_pattern_in(ReadModel::Inferred, &QuadPattern::all())
+            .map(EncodedTriple::from)
+            .collect();
+        // Keeping the stored triples and switching off equality expansion exercises
+        // the rebuild's same-revision install.
+        rebuild
+            .finish_held(rows, None, None)
+            .expect("setup: rebuilt reading");
+    })));
+    let answer = store.entails(Ruleset::Owl2Rl, &conclusion);
+    let rebuilt = store.engine().snapshot();
+    assert!(
+        after.identity().equality.is_some(),
+        "setup: compact reading"
+    );
+    assert_eq!(rebuilt.revision(), after.revision(), "setup: same revision");
+    assert_eq!(rebuilt.identity().equality, None, "setup: changed reading");
+    assert!(
+        matches!(&answer, Err(StoreError::Undecided(why))
+            if why == "the data changed during the entailment check: ask again"),
+        "refutation after the reading changed: {answer:?}"
+    );
+}
+
 // A failed load leaves the held version, and a successful load carries its hold into the new data.
 #[test]
 fn bulk_publication_preserves_quarantine_until_repair() {
+    check_bulk_publication(false, 0);
+}
+
+// A mapped replacement with spilling disabled carries the hold through the streamed publication.
+#[test]
+fn streamed_bulk_publication_preserves_quarantine_until_repair() {
+    check_bulk_publication(true, 0);
+}
+
+// A mapped replacement exceeding the spill threshold carries the hold through spilled publication.
+#[test]
+fn spilled_bulk_publication_preserves_quarantine_until_repair() {
+    check_bulk_publication(true, 2048);
+}
+
+fn check_bulk_publication(replace: bool, bulk_load_memory_bytes: u64) {
     let dir = tempfile::tempdir().expect("setup: store directory");
-    let (store, pipeline) = quarantined(StoreConfig::on_disk(dir.path()));
+    let (store, pipeline) = quarantined(StoreConfig {
+        bulk_load_memory_bytes,
+        map_checkpoints: true,
+        ..StoreConfig::on_disk(dir.path())
+    });
+    let mut data = String::from("ex:tom a ex:A .");
+    if replace {
+        data.push_str(CLASH);
+    }
+    let spills = bulk_load_memory_bytes > 0;
+    if spills {
+        use std::fmt::Write;
+        // The engine's 2 KiB test budget starts a spill at 21 quads.
+        for i in 0..32 {
+            write!(data, " ex:s{i} ex:p ex:o .").unwrap();
+        }
+    }
     let read = |store: &StoreService| {
         store
             .execute_query(&SparqlQueryRequest::all(format!("{EX} {READ}")))
@@ -338,7 +479,7 @@ fn bulk_publication_preserves_quarantine_until_repair() {
     let old = read(&store);
     let before = store.current_revision();
     nrese_engine::fault_points::fail_dir_sync_of(Some((dir.path(), std::io::ErrorKind::Other)));
-    let failed = load(&store, "ex:tom a ex:A .");
+    let failed = load_with_mode(&store, &data, replace);
     nrese_engine::fault_points::fail_dir_sync_of(None);
     assert!(failed.is_err(), "setup: load publication failed");
     assert!(store.is_quarantined(), "readiness after failed load");
@@ -351,10 +492,12 @@ fn bulk_publication_preserves_quarantine_until_repair() {
 
     let seen = Arc::new(Mutex::new(None));
     let (reader, result) = (Arc::clone(&store), Arc::clone(&seen));
+    let spill = dir.path().join("bulk-spill");
     hooks::AFTER_INVALIDATION.set(Some(Box::new(move || {
+        assert_eq!(spill.is_dir(), spills, "setup: selected bulk path");
         *result.lock().unwrap() = Some((reader.is_quarantined(), read(&reader)));
     })));
-    load(&store, "ex:tom a ex:A .").expect("setup: successful load");
+    load_with_mode(&store, &data, replace).expect("setup: successful load");
     let (held, during) = seen
         .lock()
         .unwrap()
