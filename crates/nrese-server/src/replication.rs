@@ -432,6 +432,7 @@ const STAGED_IMAGE: &str = "image.download";
 /// follows the log from its own revision).
 pub async fn bootstrap(config: &ReplicationConfig, data_dir: &Path) -> anyhow::Result<Option<u64>> {
     use anyhow::Context;
+    nrese_store::image_backup::check_unfinished_restore(data_dir)?;
     let holds_store = std::fs::read_dir(data_dir).is_ok_and(|entries| {
         entries.flatten().any(|entry| {
             let name = entry.file_name();

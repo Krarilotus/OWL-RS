@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::eval::Poller;
 use super::ir::{Atom, Head, Rule, Term};
-use super::lists::{Facts, ListVocabulary, Predicates, RuleKind, compile, internal};
+use super::lists::{Facts, ListVocabulary, Predicates, RuleKind, WrittenLists, compile, internal};
 
 pub use super::ir::{Triple, Violation};
 
@@ -164,13 +164,21 @@ pub fn materialise(input: &[Triple], rules: &[Rule], lists: Option<&ListVocabula
     let mut facts: HashSet<Triple> = input_set.clone();
     let mut closure = Closure::default();
     let mut predicates = Predicates::default();
+    let written = lists
+        .filter(|lists| lists.uses_written_disjoints())
+        .map(|_| Index::new(input.iter().copied()));
     loop {
         closure.rounds += 1;
         let index = Index::new(facts.iter().copied());
         let mut program: Vec<Rule> = rules.to_vec();
         if let Some(vocabulary) = lists {
+            let written = written.as_ref().map(|facts| WrittenLists {
+                vocabulary,
+                facts,
+                projection: None,
+            });
             let (list_rules, _, diagnostics) =
-                compile(vocabulary, &index, &mut predicates, RuleKind::All);
+                compile(vocabulary, &index, &mut predicates, RuleKind::All, written);
             program.extend(list_rules);
             closure.diagnostics = diagnostics;
         }

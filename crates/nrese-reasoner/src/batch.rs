@@ -31,12 +31,12 @@ use rayon::prelude::*;
 use super::delta::Interrupted;
 pub use super::eval::Schema;
 use super::eval::{
-    AllFacts, GroundProgram, Job, MORSEL, NEVER, OperationStop, Poller, Probe, Probes, Seg, Source,
-    Stopped, Visit, Visits, guards_hold, run_jobs_by_morsel,
+    AllFacts, GroundProgram, Job, MORSEL, NEVER, OperationStop, Poller, Probe, Probes,
+    ScannedFacts, Seg, Source, Stopped, Visit, Visits, guards_hold, run_jobs_by_morsel,
 };
 use super::ir::Triple;
 use super::ir::{Guard, Head, Rule, SharedClasses, Term};
-use super::lists::{ListVocabulary, Predicates, RuleKind, internal};
+use super::lists::{ListVocabulary, Predicates, RuleKind, WrittenLists, internal};
 use super::representatives::{EqualityClasses, Guarded, over_classes};
 use super::violations::{Violations, unlimited};
 use nrese_exec::Budget;
@@ -2845,6 +2845,7 @@ pub(crate) fn fact_rules<S: Source + ?Sized>(
             &AllFacts(source, poll),
             predicates,
             RuleKind::Inference,
+            None,
         );
         out.extend(
             list_rules
@@ -2857,11 +2858,12 @@ pub(crate) fn fact_rules<S: Source + ?Sized>(
 }
 
 /// The consistency rules and the pairwise list checks over `source`.
-pub(crate) fn consistency_rules<S: Source + ?Sized>(
-    source: &S,
+fn consistency_rules(
+    source: &Current<'_>,
     rules: &[Rule],
     lists: Option<&ListVocabulary>,
     projection: Option<&ListVocabulary>,
+    classes: Option<&EqualityClasses>,
     diagnostics: &mut Vec<super::lists::ListDiagnostic>,
     poll: &Poller<'_>,
 ) -> Vec<Rule> {
@@ -2871,11 +2873,31 @@ pub(crate) fn consistency_rules<S: Source + ?Sized>(
         .cloned()
         .collect();
     if let Some(vocabulary) = lists {
+        let written = ScannedFacts(
+            |[s, p, o]: [Option<u64>; 3], found: &mut dyn FnMut(Triple)| {
+                if poll.tick() {
+                    return Err(Stopped);
+                }
+                if let Some((p, r)) = p.and_then(|p| source.store.relation(p).map(|r| (p, r))) {
+                    let mut visit = Visit::new(poll, found);
+                    r.input.scan(s, o, &|_, _| true, &r.missed, &mut |at| {
+                        on(&mut visit, p, at)
+                    });
+                }
+                poll.ended()
+            },
+            poll,
+        );
         let (list_rules, _, found) = super::lists::compile(
             projection.unwrap_or(vocabulary),
             &AllFacts(source, poll),
             &mut Predicates::default(),
             RuleKind::Consistency,
+            Some(WrittenLists {
+                vocabulary,
+                facts: &written,
+                projection: classes,
+            }),
         );
         diagnostics.extend(found);
         out.extend(
@@ -3584,6 +3606,7 @@ fn run_body(
             &rules,
             lists,
             schema.list_projection(),
+            representatives.as_ref().map(|reps| &reps.classes),
             &mut result.diagnostics,
             &poll,
         );
