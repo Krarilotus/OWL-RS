@@ -137,6 +137,32 @@ class LandingPlans(PlanningFixtures):
         self.assertNotEqual(code, 0)
         self.assertIn("harness", str(code) + error)
 
+    # Spec: fix pass 4 K1. An old paired-report exit contract refuses Mode C before writing a set.
+    def test_mode_c_refuses_an_old_paired_report_contract(self):
+        def refuses(result):
+            members, code, plan, error = result
+            self.assertEqual(members, [], error or plan)
+            self.assertNotEqual(code, 0)
+            self.assertIn("paired report", error)
+
+        with self.subTest(harness="legacy landing marker"), tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            git_fixture(root, "init", "-q")
+            runner = root / "benches" / "fast" / "release_gate.py"
+            runner.parent.mkdir(parents=True)
+            runner.write_text('summary["landing"] = True\n', encoding="utf-8")
+            commit_fixture(root)
+            (root / "Cargo.lock").touch()
+            commit_fixture(root)
+            refuses(self.cli_plan(checkout=root, harness="HEAD^"))
+
+        landed = "8664708d869cfc9119a96b28bb2321fb82e68525"
+        # The synthetic harness above also covers checkouts without the historical object.
+        if subprocess.run(["git", "-C", str(gate_module.ROOT), "cat-file", "-e", landed],
+                          capture_output=True).returncode == 0:
+            with self.subTest(harness=landed):
+                refuses(self.cli_plan("Cargo.lock", harness=landed))
+
     # Spec: fix pass 2 H5. The leading space in a Git filename is significant, so " Cargo.lock" plans nothing.
     def test_git_filename_with_a_leading_space_is_not_the_lockfile(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -227,11 +253,12 @@ class LandingRoundJob(PlanningFixtures):
                 data["git_finished"]["dirty"] = 1
             (directory / p["path"]).write_text(json.dumps(data), encoding="utf-8")
 
-    def report(self, root, harness, sides, first=None):
+    def report(self, root, harness, sides, first=None, output=None):
         plan = (first.parent if first else root) / "plan.json"
+        output = output or root
         args = ["report", "--passes", root / "passes", "--candidate", "cand", "--require", "base,main",
                 "--min-blocks", 8, "--harness-revision", harness, "--family", plan,
-                "--out", root / "release-gate.md", "--json", root / "release-gate.json"]
+                "--out", output / "release-gate.md", "--json", output / "release-gate.json"]
         for side in sides:
             args.extend(("--side", side))
         if first:
@@ -323,6 +350,26 @@ class LandingRoundJob(PlanningFixtures):
         self.assertEqual((code, final["word"], final["passed"]), (0, "cleared", False))
         self.assertTrue(any(line.startswith(f"{OTHER}:") for line in final["blocking"]))
         self.assertTrue(any(line.startswith(f"{OTHER}:") for line in final["other_blocking"]))
+
+    # Spec: fix pass 4 K2. A standalone paired report carries the timed attempt from its results directory.
+    def test_staged_paired_report_carries_the_results_attempt(self):
+        sides = [f"cand={REVS['cand']}", f"base={REVS['base']}", f"main={REVS['base']}"]
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"GATE_LANDING": "1"}):
+            root = Path(tmp)
+            first, second = root / "first", root / "second"
+            stage = second / ".paired-report-test"
+            self.write_passes(first / "passes", LOSS)
+            (first / "plan.json").write_text(json.dumps({"family": [MEASURED]}), encoding="utf-8")
+            gate_module.attempt_record("timed", first)
+            self.report(first, HARNESS, sides)
+            self.write_passes(second / "passes", LOSS, round_number=1)
+            attempt = gate_module.attempt_record("timed", second)
+            stage.mkdir()
+            code, _, error = self.report(second, HARNESS, sides, first / "release-gate.json", output=stage)
+            report = json.loads((stage / "release-gate.json").read_bytes())
+        self.assertEqual(report["attempt"], attempt)
+        self.assertEqual(code, 0, error)
+        self.assertEqual(report["word"], "confirmed loss")
 
 
 class ShellReport(unittest.TestCase):
