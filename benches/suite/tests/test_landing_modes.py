@@ -4,6 +4,8 @@ import io
 import json
 import math
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -20,6 +22,7 @@ LANDING = {"load-entities", "load-threads", "q-snowflake", "q-star", "op-group",
 OTHER = "lab-yago-tiny"
 LOSS = [0.05 + i * 0.001 for i in range(8)]
 CALM = [(-1) ** i * (i + 1) / 1000 for i in range(8)]
+GATE = ["bash", "scripts/release-gate.sh"]
 
 
 def command(*args):
@@ -33,13 +36,8 @@ def command(*args):
     return code, out.getvalue(), err.getvalue()
 
 
-def timed_steps(job, action="block"):
-    return [s for s in job["steps"] if s[2:3] == [action]]
-
-
-def fixture_measure(rows):
-    return {case: {"route": route, "paths": [f"crates/{path}"], "seconds": seconds}
-            for case, route, path, seconds in rows}
+def timed_steps(job):
+    return [s for s in job["steps"] if s[:3] == [*GATE, "block"]]
 
 
 class PlanningFixtures(unittest.TestCase):
@@ -50,113 +48,105 @@ class PlanningFixtures(unittest.TestCase):
                                      (gate_module.hosts_registry, "overlay_env", {})]:
             self.enterContext(patch.object(owner, member, return_value=value))
 
-    def plan(self, measure, mode=None, changed=(), **options):
-        catalog = [{"name": name, "cap_gb": 4} for name in measure or ["a"]]
-        with patch.object(gate_module, "git_line", side_effect=lambda _, action, *args:
-                          "\0".join(changed) if action == "diff" else "b" * 40):
+    def plan(self, blocks=2, layouts=1, mode=None):
+        measure = gate_module.read_measure((gate_module.HERE / "measure.toml").read_text(encoding="utf-8")) if mode else {}
+        catalog = gate_module.cases_registry.load() if mode else [{"name": "a", "cap_gb": 4}]
+        with patch.object(gate_module, "git_line", return_value="crates/nrese-store/src/lib.rs\0"):
             try:
-                jobs = gate_module.jobs(REVS["cand"], HARNESS, "repo", "test", options.pop("blocks", 2),
-                                        options.pop("cases", None), REVS["base"], REVS["base"],
-                                        checks=False, big_gb=None, measure=measure, catalog=catalog,
-                                        **({"mode": mode} if mode else {}), **options)
-            except (SystemExit, TypeError) as error:
+                jobs = gate_module.jobs(REVS["cand"], HARNESS, "repo", "test", blocks, None if mode else "a",
+                                        REVS["base"], REVS["base"], checks=False, big_gb=None, layouts=layouts,
+                                        measure=measure, catalog=catalog, mode=mode)
+            except SystemExit as error:
                 return None, str(error)
         return jobs["test-timed"], gate_module.set_plan(jobs, "test", REVS["cand"], HARNESS,
                                                          REVS["base"], REVS["base"], measure)
 
 
 class LandingPlans(PlanningFixtures):
-    # Spec: design §4 C and slice 2 §2 say --mode C -> all 15 landing cases, each in eight blocks.
-    def test_mode_c_plans_the_landing_set(self):
-        # Use the working calibration to exercise the same fixture before and after commit.
+    def cli_plan(self, changed):
         gate = gate_module
         measure = gate.read_measure((gate.HERE / "measure.toml").read_text(encoding="utf-8"))
+        actual_git = gate.git_line
         with tempfile.TemporaryDirectory() as tmp, \
                 patch.object(gate, "read_measure", return_value=measure), \
+                patch.object(gate, "git_line", side_effect=lambda checkout, *args:
+                             changed + "\0" if args[0] == "diff" else actual_git(checkout, *args)), \
                 patch.object(gate.hosts_registry, "write_job") as write:
             code, plan, error = command("jobs", "HEAD", "--base", "HEAD^", "--mode", "C", "--no-checks",
                                         "--out", tmp)
-        members = list(write.call_args.args[3]) if write.called else []
-        observed = [(set(j["env"].get("GATE_CASES", "").split(",")), len(timed_steps(j))) for j in members]
-        self.assertEqual(observed, [(LANDING, 8)], error)
-        self.assertEqual(code, 0, error)
-        self.assertIn("mode C", plan)
+        return (list(write.call_args.args[3]) if write.called else []), code, plan, error
 
-    # Spec: design §4 B says a touched case runs first and the longest-waiting cases fill at most
-    # five cases and 32 seconds, skipping a case that would exceed the remaining time.
-    def test_b_uses_mandatory_then_oldest_cases_within_budget(self):
-        measure = fixture_measure([(name, "query", name, seconds) for name, seconds in
-                                   [("new", 5), ("heavy", 15), ("old", 7), ("next", 6), ("small", 1),
-                                    ("mandatory", 18), ("unused", 15)]])
-        with tempfile.TemporaryDirectory() as tmp:
-            old, new = Path(tmp) / "old.json", Path(tmp) / "new.json"
-            for path, cases in [(old, ["old", "next", "small", "heavy"]), (new, ["new", "mandatory"]),
-                                (Path(tmp) / "previous.json", ["unused"])]:
-                path.write_text(json.dumps({"planned": cases, "word": "cleared", "tree": "a" * 40}), encoding="utf-8")
-            job, plan = self.plan(measure, "B", ["crates/mandatory/src/lib.rs"],
-                                  history=[Path(tmp) / "previous.json", old, new])
-        self.assertEqual(job and job["env"]["GATE_CASES"], "mandatory,old,next,small", plan)
-        self.assertEqual(len(timed_steps(job)), 8)
-        self.assertIn("32", plan)
+    # Spec: fix pass 1 ruling. Docs-only and tests-only changes write no job and exit 0 with the reason.
+    def test_non_product_changes_plan_nothing(self):
+        for changed in ["docs/explainer.md", "crates/nrese-store/tests/queries.rs"]:
+            with self.subTest(changed=changed):
+                members, code, plan, error = self.cli_plan(changed)
+                self.assertEqual(members, [], error or plan)
+                self.assertEqual(code, 0, error)
+                self.assertIn("no product change: nothing to time", plan.splitlines())
 
-    # Spec: design §4 B says unmapped, query/write overlap and more than five mandatory each
-    # run the full C set, with the triggering cause in the plan.
-    def test_b_expands_to_c_for_each_required_cause(self):
-        for changes, rows, why in [(["src/lib.rs"], [("a", "query", "a", 1)], "unmapped"),
-                                   (["crates/shared/lib.rs"], [("a", "query", "shared", 1),
-                                                               ("b", "write", "shared", 1)], "query and write"),
-                                   (["crates/shared/lib.rs"], [(str(i), "load", "shared", 1) for i in range(6)],
-                                    "6 mandatory")]:
-            with self.subTest(cause=why):
-                measure = fixture_measure([*rows, ("rotating", "load", "other", 1)])
-                job, plan = self.plan(measure, "B", changes)
-                self.assertEqual(job and set(job["env"]["GATE_CASES"].split(",")), set(measure), plan)
-                self.assertEqual(len(timed_steps(job)), 8)
+    # Spec: fix pass 1 ruling. Nested crate src and Cargo.lock changes run all 15 cases in eight blocks.
+    def test_product_changes_plan_every_landing_case(self):
+        for changed in ["crates/rdf/nrese-rdf-io/src/lib.rs", "Cargo.lock"]:
+            with self.subTest(changed=changed):
+                members, code, plan, error = self.cli_plan(changed)
+                observed = [(set(j["env"].get("GATE_CASES", "").split(",")), len(timed_steps(j))) for j in members]
+                self.assertEqual(observed, [(LANDING, 8)], error)
+                self.assertEqual(code, 0, error)
                 self.assertIn("mode C", plan)
-                self.assertIn(why, plan)
 
-    # Spec: slice 2 §3 exempts docs paths -> no mandatory cases, only the ordinary rotation.
-    def test_docs_only_uses_the_rotation_alone(self):
-        measure = fixture_measure([(str(i), "query", str(i), 1) for i in range(6)])
-        job, plan = self.plan(measure, "B", ["docs/explainer.md"])
-        self.assertEqual(job and job["env"]["GATE_CASES"], "0,1,2,3,4", plan)
-        self.assertIn("mandatory: none", plan)
-
-    # Spec: design §4 B says mandatory cases run past the budget and their length is visible.
-    def test_mandatory_cases_are_kept_over_budget(self):
-        measure = fixture_measure([("a", "load", "shared", 23), ("b", "load", "shared", 19),
-                                   ("c", "query", "other", 1)])
-        job, plan = self.plan(measure, "B", ["crates/shared/lib.rs"])
-        self.assertEqual(job and job["env"]["GATE_CASES"], "a,b", plan)
-        self.assertIn("42 s", plan)
-
-    # Spec: design §3 D5 and slice 2 §5 say a three-layout job needs whole layout cycles ->
-    # two blocks are refused, while six visit layouts 1, 2 and 3 twice.
+    # Spec: design §3 D5. Two blocks are refused for three layouts. Six cover each layout twice.
     def test_blocks_must_cover_every_layout_evenly(self):
-        measure = fixture_measure([("a", "load", "a", 1)])
-        job, reason = self.plan(measure, blocks=2, layouts=3)
+        job, reason = self.plan(blocks=2, layouts=3)
         self.assertIsNone(job, reason)
         self.assertIn("multiple", reason)
-        job, plan = self.plan(measure, blocks=6, layouts=3)
+        job, plan = self.plan(blocks=6, layouts=3)
         self.assertEqual(job and [s[5] for s in timed_steps(job)], ["1", "2", "3", "1", "2", "3"], plan)
-        self.assertEqual(job["env"]["GATE_LAYOUTS"], "3")
 
-    # Spec: slice 2 §1 preserves today's no-mode job. The legacy two-side, uncalibrated
-    # selection builds, times two plain blocks, reports and cleans up in that order.
+    # Spec: fix pass 1 R2. A request for zero blocks is refused before it produces a build plan.
+    def test_zero_blocks_are_refused(self):
+        job, reason = self.plan(blocks=0)
+        self.assertIsNone(job, reason)
+        self.assertIn("positive", reason)
+
+    # Spec: fix pass 1 R3. The preparation-only revision builds once even when timed sides use three layouts.
+    def test_only_timed_revisions_build_extra_layouts(self):
+        job, plan = self.plan(blocks=6, layouts=3)
+        self.assertIsNotNone(job, plan)
+        if os.name == "nt":
+            git_core = Path(subprocess.check_output(["git", "--exec-path"], text=True).strip())
+            bash = str(git_core.parents[2] / "bin" / "bash.exe")
+        else:
+            bash = shutil.which("bash")
+        self.assertTrue(bash, "the generated build step requires bash")
+        with tempfile.TemporaryDirectory() as tmp:
+            scripts = Path(tmp) / "scripts"
+            scripts.mkdir()
+            (scripts / "release-gate.sh").write_bytes(
+                b'if [ "$1" = build ]; then printf "%s %s\n" "$2" "${GATE_LAYOUTS:-1}"; fi\n')
+            step = job["steps"][0]
+            path = str(Path(bash).parent) + os.pathsep + os.environ["PATH"]
+            result = subprocess.run([bash, *step[1:]], cwd=tmp, text=True, capture_output=True, check=True,
+                                    env={**os.environ, **job["env"], "PATH": path})
+        self.assertCountEqual(result.stdout.splitlines(),
+                              [f"{REVS['base']} 3", f"{REVS['cand']} 3", f"{HARNESS} 1"])
+
+    # Spec: slice 2 §1 preserves the legacy two-side uncalibrated plan and its step order.
     def test_no_mode_preserves_the_legacy_plan(self):
-        job, plan = self.plan({}, cases="a")
-        steps = [step[2] if step[:2] == ["bash", "scripts/release-gate.sh"] else step[1] for step in job["steps"]]
+        job, plan = self.plan()
+        steps = [step[2] if step[:2] == GATE else step[1] for step in job["steps"]]
         self.assertEqual(steps, ["-c", "block", "block", "report", "clean"], plan)
         self.assertEqual([s[3:7] for s in timed_steps(job)], [["1", HARNESS, "1", "-"], ["2", HARNESS, "1", "-"]])
         self.assertEqual(job["env"]["GATE_CASES"], "a")
 
 
 class LandingRoundJob(PlanningFixtures):
-    def write_passes(self, directory, contrasts, round_number=0, other=False):
+    def write_passes(self, directory, contrasts, round_number=0, other=False, failed_other=False, fault=None):
         def records_of(side, n):
             contrast = contrasts[(n - 1) // 4] if side == "cand" else 0
             reading = record(samples={"q06": [10.123 * math.exp(contrast)]})
-            return [reading, record(case=OTHER, samples={"_": [10.123]})] if other else [reading]
+            status = "failed" if failed_other and side == "cand" else "ok"
+            return [reading, record(case=OTHER, status=status, samples={"_": [10.123]})] if other else [reading]
 
         directory.mkdir(parents=True, exist_ok=True)
         for p in passes(records_of, blocks=len(contrasts), sides=SIDES):
@@ -167,76 +157,101 @@ class LandingRoundJob(PlanningFixtures):
             data["timing_inputs"] = {"overlay": None, "floor": None}
             data["machine"].pop("fleet_host", None)
             data["machine"]["overlay"] = None
+            if fault == "schedule" and data["block"] == 8:
+                data["records"] = []
+            if fault == "provenance" and p["n"] == 1:
+                data["git_finished"]["dirty"] = 1
             (directory / p["path"]).write_text(json.dumps(data), encoding="utf-8")
 
-    def first_report(self, root, contrasts, other=False):
-        self.write_passes(root / "passes", contrasts, other=other)
-        plan = root / "plan.json"
-        family = [*FAMILY, f"base|{OTHER}|time/_"] if other else FAMILY
-        plan.write_text(json.dumps({"run": [CASE, OTHER] if other else [CASE], "family": family}), encoding="utf-8")
+    def report(self, root, harness, sides, first=None):
+        plan = (first.parent if first else root) / "plan.json"
+        args = ["report", "--passes", root / "passes", "--candidate", "cand", "--require", "base,main",
+                "--min-blocks", 8, "--harness-revision", harness, "--family", plan,
+                "--out", root / "release-gate.md", "--json", root / "release-gate.json"]
+        for side in sides:
+            args.extend(("--side", side))
+        if first:
+            args.extend(("--round-one", first))
+        return command(*args)
+
+    def continue_fixture(self, root, first_contrasts=LOSS, second_contrasts=LOSS, fault=None, failed_other=False):
+        job, plan = self.plan(mode="C")
+        self.assertIsNotNone(job, plan)
+        self.write_passes(root / "passes", first_contrasts, other=True, failed_other=failed_other)
+        first_path = root / "release-gate.json"
+        (root / "plan.json").write_text(json.dumps({"run": [CASE, OTHER],
+                                                   "family": [*FAMILY, f"base|{OTHER}|time/_"]}), encoding="utf-8")
         gate_module.attempt_record("timed", root)
-        _, _, error = command("report", "--passes", root / "passes", "--candidate", "cand",
-                              "--side", f"cand={REVS['cand']}", "--side", f"base={REVS['base']}",
-                              "--side", f"main={REVS['base']}", "--require", "base,main", "--min-blocks", 8,
-                              "--harness-revision", HARNESS, "--family", plan, "--out", root / "release-gate.md",
-                              "--json", root / "release-gate.json")
-        self.assertFalse(error)
-        return json.loads((root / "release-gate.json").read_bytes())
+        seen = []
+        real_run = gate_module.subprocess.run
 
-    # Spec: design §4 report says each case skipped by B has its last word and tree if supplied;
-    # a case absent from history still appears in the report.
-    def test_reports_show_the_unrun_landing_cases(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            prior = root / "older.json"
-            prior.write_text(json.dumps({"tree": "f" * 40, "word": "cleared", "planned": [OTHER]}), encoding="utf-8")
-            rows = [(CASE, "query", "a", 32), (OTHER, "query", "b", 3), ("unknown", "query", "c", 2)]
-            job, _ = self.plan(fixture_measure(rows), "B", ["crates/a/lib.rs"], history=[prior])
-            with patch.dict(os.environ, job["env"] if job else {}):
-                report = self.first_report(root, CALM)
-            md = (root / "release-gate.md").read_text(encoding="utf-8")
-        self.assertEqual(report.get("landing", {}).get("not_run"),
-                         {OTHER: {"word": "cleared", "tree": "f" * 40}, "unknown": {"word": None, "tree": None}})
-        self.assertIn(f"{OTHER}: cleared on tree {'f' * 40}", md)
-        self.assertIn("unknown: no previous reading", md)
-
-    # Spec: design §3 D3 says the same job's last step leaves a cleared round alone, or times
-    # only screened cases for eight blocks on the same binaries and writes the paired word.
-    def test_last_step_with_cleared_and_screened_reports(self):
-        rows = [(CASE, "query", "a", 3), (OTHER, "query", "b", 3)]
-        for contrasts, word in [(CALM, "cleared"), (LOSS, "confirmed loss")]:
-            with self.subTest(word=word), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                job, plan = self.plan(fixture_measure(rows), "C")
-                step = job["steps"][-1][2:] if job else ["clean"]
-                env = {**(job["env"] if job else {}), "FLEET_OUT": str(root)}
+        def runner(argv, **kwargs):
+            if argv[:2] != GATE:
+                return real_run(argv, **kwargs)
+            action = argv[2]
+            seen.append(argv)
+            env = kwargs.get("env", os.environ)
+            out = Path(env["FLEET_OUT"])
+            if argv[2:4] == ["block", "8"]:
+                self.write_passes(out / "passes", second_contrasts, round_number=1, fault=fault)
+            if action == "report":
                 with patch.dict(os.environ, env):
-                    first = self.first_report(root, contrasts, other=True)
-                    bash_steps = []
-                    real_run = gate_module.subprocess.run
+                    _, _, error = self.report(out, argv[3], argv[6:], Path(argv[5]))
+                if error:
+                    raise subprocess.CalledProcessError(1, argv, stderr=error)
+            return subprocess.CompletedProcess(argv, 0)
 
-                    def runner(argv, **kwargs):
-                        if argv[:2] != ["bash", "scripts/release-gate.sh"]:
-                            return real_run(argv, **kwargs)
-                        bash_steps.append(argv)
-                        if argv[2:4] == ["block", "8"]:
-                            self.write_passes(Path(kwargs["env"]["FLEET_OUT"]) / "passes", contrasts, 1)
+        with patch.dict(os.environ, {**job["env"], "FLEET_OUT": str(root)}):
+            _, _, error = self.report(root, HARNESS, [f"cand={REVS['cand']}", f"base={REVS['base']}", f"main={REVS['base']}"])
+            self.assertFalse(error)
+            first = json.loads(first_path.read_bytes())
+            report_index = job["steps"].index(timed_step := next(s for s in job["steps"] if s[:3] == [*GATE, "report"]))
+            with patch.object(gate_module.subprocess, "run", side_effect=runner):
+                for step in job["steps"][report_index + 1:]:
+                    if step[:2] == GATE:
+                        runner(step)
+                    else:
+                        code, _, _ = command(*step[2:])
+        return code, first, json.loads(first_path.read_bytes()), seen, timed_steps(job), timed_step
 
-                    with patch.object(gate_module.subprocess, "run", side_effect=runner):
-                        code, _, error = command(*step)
-                final = json.loads((root / "release-gate.json").read_bytes())
-                self.assertEqual((code, final["word"]), (0, word), error + plan)
-                if word == "cleared":
-                    self.assertEqual((bash_steps, final), ([], first))
-                else:
-                    self.assertEqual(first["word"], "needs a second round")
-                    self.assertEqual([s[3] for s in bash_steps if s[2] == "plan-cases"], [CASE])
-                    round_two = [s for s in bash_steps if s[2] == "block"]
+    # Spec: design §3 D3 and fix pass 1 R1/R4/R5. A screen runs exactly the named cases and uses the
+    # first report's harness. A bad second round leaves the first word standing, and cleanup comes last.
+    def test_last_step_with_cleared_and_screened_reports(self):
+        runs = [(CALM, None, "cleared"), (LOSS, None, "confirmed loss"),
+                (LOSS, "schedule", "needs a second round"), (LOSS, "provenance", "needs a second round")]
+        for contrasts, fault, word in runs:
+            with tempfile.TemporaryDirectory() as tmp:
+                code, first, final, seen, blocks, report = self.continue_fixture(
+                    Path(tmp), first_contrasts=contrasts, fault=fault)
+            with self.subTest(check="word", word=word, fault=fault):
+                self.assertEqual((code == 0, final["word"]), (fault is None, word))
+                if contrasts == CALM or fault:
+                    self.assertEqual(final, first)
+            with self.subTest(check="cleanup", word=word, fault=fault):
+                self.assertEqual([s[2] for s in seen].count("clean"), 1)
+                self.assertEqual(seen[-1][2], "clean")
+            if contrasts == CALM:
+                self.assertEqual([s[2] for s in seen], ["clean"])
+            else:
+                with self.subTest(check="harness", fault=fault):
+                    self.assertEqual([s[3] for s in seen if s[2] == "report"], [report[3]])
+                with self.subTest(check="blocks", fault=fault):
+                    self.assertEqual([s[3] for s in seen if s[2] == "plan-cases"], [CASE])
+                    round_two = [s for s in seen if s[2] == "block"]
                     self.assertEqual([s[3] for s in round_two], list(map(str, range(1, 9))))
-                    self.assertEqual([s[4:6] + s[7:] for s in round_two],
-                                     [s[4:6] + s[7:] for s in timed_steps(job)])
+                    self.assertEqual([s[4:6] + s[7:] for s in round_two], [s[4:6] + s[7:] for s in blocks])
                     self.assertEqual(final["verified_binary_hashes"], first["verified_binary_hashes"])
-                    self.assertEqual(final["confirmed"], [MEASURED])
+                    if not fault:
+                        self.assertEqual(final["confirmed"], [MEASURED])
+
+    # Spec: fix pass 1 R6. A failed case omitted from round 2 remains a correctness failure and blocker.
+    def test_pair_preserves_failures_for_cases_round_two_did_not_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, first, final, _, _, _ = self.continue_fixture(Path(tmp), second_contrasts=CALM, failed_other=True)
+        self.assertEqual(final["candidate_failures"].get(OTHER), first["candidate_failures"][OTHER])
+        self.assertEqual((code, final["word"], final["passed"]), (0, "cleared", False))
+        self.assertTrue(any(line.startswith(f"{OTHER}:") for line in final["blocking"]))
+        self.assertTrue(any(line.startswith(f"{OTHER}:") for line in final["other_blocking"]))
 
 
 if __name__ == "__main__":
