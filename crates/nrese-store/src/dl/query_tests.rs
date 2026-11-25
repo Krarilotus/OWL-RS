@@ -102,6 +102,7 @@ fn retained_dl_answers_honor_reporting_cancellation_before_writing() {
 #[test]
 fn cancelled_consistency_is_not_published_or_reused_by_another_request() {
     let store = StoreService::new(crate::StoreConfig::in_memory()).unwrap();
+    store.rematerialise(Ruleset::Owl2Rl).unwrap();
     let snapshot = store.read_snapshot(None).unwrap();
     let deadline = Deadline::after(store.config().dl.timeout);
     let view = unproved_view(&snapshot);
@@ -191,6 +192,7 @@ fn unproved_view(snapshot: &Snapshot) -> View {
 #[test]
 fn expired_consistency_keeps_request_timeout_out_of_shared_status() {
     let store = StoreService::new(crate::StoreConfig::in_memory()).unwrap();
+    store.rematerialise(Ruleset::Owl2Rl).unwrap();
     let snapshot = store.read_snapshot(None).unwrap();
     let view = unproved_view(&snapshot);
     let fresh = CancellationToken::new();

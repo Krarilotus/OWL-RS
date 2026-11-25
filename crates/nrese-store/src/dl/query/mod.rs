@@ -173,11 +173,21 @@ fn consistency_at(
     if let Some(stopped) = stopped() {
         return stopped;
     }
-    let checked = consistency::check(ontology.value(), &budget);
+    let mut checked = consistency::check(ontology.value(), &budget);
     // Request-local cancellation, expiry or memory must not replace shared revision
     // status.
     if let Some(stopped) = stopped() {
         return stopped;
+    }
+    if checked.verdict == Verdict::Consistent {
+        checked.verdict = match super::bounds::holds_ill_typed(store, snapshot) {
+            Some(false) => Verdict::Consistent,
+            Some(true) => Verdict::Unknown(gate::ILL_TYPED.to_owned()),
+            None => return Verdict::Unknown(UNCHECKED.to_owned()),
+        };
+        if let Some(stopped) = stopped() {
+            return stopped;
+        }
     }
     if memory.refused() {
         return checked.verdict;
