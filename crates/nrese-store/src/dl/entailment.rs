@@ -739,11 +739,10 @@ pub(crate) fn admit_and_prepare(
         }
         _ => d.is_fatal(),
     };
-    let blocks_p = |d: &Diagnostic| d.is_fatal() || matches!(d, Diagnostic::RepeatedOperand);
     if let Some(d) = findings
         .iter()
         .find(|d| blocks_j(d))
-        .or_else(|| premise.diagnostics.iter().find(|d| blocks_p(d)))
+        .or_else(|| premise.diagnostics.iter().find(|d| d.is_fatal()))
     {
         return Err(Entailed::Unknown(format!(
             "the joint ontology isn't well-formed OWL 2 DL: {}",
