@@ -151,8 +151,8 @@ pub(crate) mod seam {
 struct State {
     revision: u64,
     /// Shared only with the commit computing its change ([`prepare`]), which lets go
-    /// before [`install`] changes it in place: a read takes what it needs of U1 under the
-    /// bounds' state, never keeping it.
+    /// before [`install`] changes it in place. A read keeps only the immutable
+    /// [`ProgramFacts`] while filtering outside the lock.
     upper: Result<Arc<Upper>, GaveUp>,
     /// How U1 got to this revision: `delta` (the delta executor), `rebuilt` (compiled
     /// and evaluated afresh on commit), `read` (afresh for a query), `kept` (U1 gave up
@@ -1658,10 +1658,11 @@ fn eligible_facts(
     Some(eligible)
 }
 
-/// What a view of `revision` takes of U1 and of L's memberships `lower` (sorted, each once):
-/// serial, nothing waited for (U1-I): one pass over U1's facts, each with the searches of
-/// [`held_by_lower`], then one over the members of the gap signature's classes. Its copies
-/// are charged to `kept` as they grow (SYN-61); `None` where it can't take them.
+/// What a view of `revision` takes of U1 and of L's memberships `lower` (sorted, each once).
+/// [`eligible_facts`] filters the program facts before the maintained read rechecks the
+/// revision. Here one serial pass over the stack and eligible facts checks [`held_by_lower`],
+/// then a pass over the gap signature's class members expands it (U1-I). Copies are charged
+/// to `kept` as they grow (SYN-61). Returns `None` where they don't fit.
 ///
 /// Each structure's form in subject, predicate and class object:
 /// - `lower`, L's memberships beyond the RL closure: as derived, by member.
