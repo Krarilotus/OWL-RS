@@ -7,7 +7,7 @@ the §0 guards green and the W3C suites' counts what they must be?
         the cases a host giving GB can run at their declared caps; the others, with why
     release_gate.py report --passes DIR --candidate NAME --side NAME=REV ... --require NAME,...
                            --harness-revision REV [--min-passes 4] [--diagnostic]
-                           [--not-run CASE=WHY] [--out MD] [--json JSON]
+                           [--not-run CASE=WHY] [--round-one JSON] [--out MD] [--json JSON]
         the timed part: DIR holds the passes, pass-N-SIDE.json, each a full `fast.py run
         --reps 1 --prepared` report of one side's binaries over the same harness and data
     release_gate.py w3c LOGDIR --expected benches/fast/w3c-expected.toml [--run --identity ID] [--json JSON]
@@ -176,11 +176,13 @@ def fleet_host_errors(passes: list[dict], host: str) -> list[str]:
     return out
 
 
-def provenance_errors(passes: list[dict], sides: dict[str, str], harness: str, planned: list[str]) -> list[str]:
+def provenance_errors(passes: list[dict], sides: dict[str, str], harness: str, planned: list[str],
+                      *, host_errors: list[str] | None = None, verified_binaries: dict | None = None) -> list[str]:
     """What each pass must say about itself: complete, one repetition of exactly the planned
     cases, the clean harness revision at start and end, its side's verified binaries (the same
     in every pass of the side), the same prepared data unchanged, one host and configuration."""
     errors, binaries, prepared, identities, options, layouts = [], {}, set(), set(), {}, {}
+    all_verified = True
     registry = hosts_registry.public_registry() if passes else {}
     for p in passes:
         r, name = p["report"], p["path"]
@@ -202,17 +204,22 @@ def provenance_errors(passes: list[dict], sides: dict[str, str], harness: str, p
         for key in ("binaries", "binaries_finished"):
             b = r.get(key) or {}
             if not b.get("verified") or b.get("revision") != rev:
+                all_verified = False
                 errors.append(f"{name}: {key}: revision {b.get('revision')} verified {b.get('verified')}, "
                               f"expected {rev} verified")
-        if (r.get("binaries") or {}).get("sha256") != (r.get("binaries_finished") or {}).get("sha256"):
+        built = r.get("binaries") or {}
+        hashes = built.get("sha256")
+        if hashes != (r.get("binaries_finished") or {}).get("sha256"):
+            all_verified = False
             errors.append(f"{name}: binaries changed during the pass")
+        if not isinstance(hashes, dict) or not hashes:
+            all_verified = False
         if not (r.get("instance") or {}).get("built"):
             # Blocks timing one cached instance of a build share its offset (lks-aa-20): no
             # independent units (fast.py block --fresh-copies).
             errors.append(f"{name}: timed its side's build in place, not a copy made for its block")
-        layout = (r.get("binaries") or {}).get("layout", 1)
-        binaries.setdefault((p["side"], layout), set()).add(
-            json.dumps((r.get("binaries") or {}).get("sha256"), sort_keys=True))
+        layout = built.get("layout", 1)
+        binaries.setdefault((p["side"], layout), set()).add(json.dumps(hashes, sort_keys=True))
         layouts.setdefault(p["side"], Counter())[layout] += 1
         info = r.get("prepared") or {}
         if not info:
@@ -225,6 +232,9 @@ def provenance_errors(passes: list[dict], sides: dict[str, str], harness: str, p
                                    "runtime": r.get("runtime")}, sort_keys=True))
     errors += [f"{side}: different binaries in its passes" + (f" of layout {layout}" if layout > 1 else "")
                for (side, layout), shas in binaries.items() if len(shas) > 1]
+    if verified_binaries is not None and all_verified and all(len(shas) == 1 for shas in binaries.values()):
+        for (side, layout), shas in binaries.items():
+            verified_binaries.setdefault(side, {})[str(layout)] = json.loads(next(iter(shas)))
     # Builds of several layouts (release-gate.sh GATE_LAYOUTS): every side the same layouts as
     # often, so that a layout's luck falls on all alike.
     if len({json.dumps(sorted(c.items())) for c in layouts.values()}) > 1:
@@ -243,7 +253,10 @@ def provenance_errors(passes: list[dict], sides: dict[str, str], harness: str, p
     if len(prepared) > 1:
         errors.append("the passes read different prepared data")
     if len(identities) > 1:
-        errors.append("not one host and configuration: " + " | ".join(sorted(identities)))
+        error = "not one host and configuration: " + " | ".join(sorted(identities))
+        errors.append(error)
+        if host_errors is not None:
+            host_errors.append(error)
     return errors
 
 
@@ -1178,6 +1191,7 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
         if same is not None:
             aliases[s] = same
     context = dict(context or {})
+    ordered_passes = sorted(passes, key=lambda p: p["n"])
     summary = {"candidate": {"name": candidate, "revision": sides[candidate]},
                "baselines": {s: sides[s] for s in baselines}, "harness": harness,
                "policy": {"alpha": gatestats.ALPHA, "pair_weights": gatestats.PAIR_WEIGHTS,
@@ -1186,7 +1200,7 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
                           "floor": (floor or {}).get("source")},
                "passes": [{"n": p["n"], "side": p["side"], "file": p["path"], "block": p["report"].get("block"),
                            "run": p["report"].get("run"), "layout": p["report"].get("layout")}
-                          for p in sorted(passes, key=lambda p: p["n"])],
+                          for p in ordered_passes],
                "diagnostic": diagnostic or min_blocks < CAMPAIGN_BLOCKS, "required": required,
                "context": context, "flagged": [], "other_blocking": [], "pvalues": {}, "resolution": {}, "emerged": [],
                "not_run": not_run, "elsewhere": elsewhere, "errors": list(timing_errors or ()),
@@ -1204,7 +1218,10 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
     # Fail closed: a part that timed nothing (no pass, or none that planned a case) passes nothing.
     if not planned:
         summary["errors"].append(f"nothing timed: {len(passes)} passes, none planned a case")
-    summary["errors"] += provenance_errors(passes, sides, harness, planned)
+    host_provenance: list[str] = []
+    verified_binaries: dict = {}
+    summary["errors"] += provenance_errors(passes, sides, harness, planned, host_errors=host_provenance,
+                                           verified_binaries=verified_binaries)
     # Sides that ran one build compare nothing (D16-593): a round of a build against itself reads "no
     # loss". Sides of one revision are declared identical (an A-A' control; a confirmation's main that
     # is its base); any other two must differ, layout by layout. Per build, not per case: a case one
@@ -1217,9 +1234,12 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
                 hashes.setdefault(p["side"], built.get("sha256"))
         identical = {frozenset((s, t)) for s in hashes for t in hashes if s != t and sides.get(s) == sides.get(t)}
         summary["errors"] += [f"layout {layout}: {e}" if layout > 1 else e for e in manifest.one_binary(hashes, identical)]
-    summary["errors"] += fleet_host_errors(passes, str(context.get("host") or ""))
+    fleet_errors = fleet_host_errors(passes, str(context.get("host") or ""))
+    summary["errors"] += fleet_errors
+    host_provenance += fleet_errors
     host_errors, summary["host_notes"] = host_states(passes)
     summary["errors"] += host_errors
+    host_provenance += host_errors
     summary["host"] = sorted({(p["report"].get("machine") or {}).get("host") for p in passes}, key=str)
     by_side = {s: sorted([p for p in passes if p["side"] == s], key=lambda p: p["n"]) for s in sides}
     checks = {c["name"]: {path.split(".")[1] for path in c.get("check", {}) if path.startswith("q.")}
@@ -1309,15 +1329,101 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
     summary["passed"] = (not summary["diagnostic"] and not summary["errors"] and not summary["blocking"]
                          and not summary["flagged"] and not summary["emerged"]
                          and not any(set(v.split(", ")) & BAR_OUTCOMES for v in summary["known_issues"].values()))
+    landing_family = family
+    if landing_family is None and planned:
+        selected = [c for c in catalog or [] if c["name"] in planned and "metric" in c]
+        if {c["name"] for c in selected} == set(planned):
+            landing_family = family_of(selected, planned, tuple(baselines))
+    if landing_family is not None:
+        summary["lines"] = {h: landing_dimension(summary, h, len(landing_family)) for h in landing_family}
+        summary.update(gatestats.landing_words(landing_family, landing_pvalues(summary)))
+        summary["host_provenance_errors"] = host_provenance
+        summary["verified_binary_hashes"] = verified_binaries
+        for entry, p in zip(summary["passes"], ordered_passes):
+            # The same pass keeps its identity if copied, renamed, or re-encoded as JSON.
+            content = json.dumps(p["report"], sort_keys=True, separators=(",", ":")).encode("utf-8")
+            entry["sha256"] = hashlib.sha256(content).hexdigest()
     return summary
 
 
-def render(summary: dict) -> str:
+def landing_dimension(summary: dict, h: str, m: int) -> dict:
+    reading = dimension_in(summary, *h.split("|", 2))
+    if reading is None or reading["status"] == "incomplete":
+        return gatestats.landing_lines(None, m, None)
+    return gatestats.landing_lines(reading, m, summary["pvalues"].get(h),
+                                   below_step=reading["status"] in OUTSIDE_FAMILY)
+
+
+def landing_pvalues(summary: dict) -> dict[str, float]:
+    return {h: entry["p"] for h, entry in summary["lines"].items()}
+
+
+def landing_pass_hashes(summary: dict, round_number: int) -> set[str]:
+    hashes = [p.get("sha256") for p in summary.get("passes") or []]
+    if not hashes or any(not isinstance(h, str) or not re.fullmatch(r"[0-9a-f]{64}", h) for h in hashes):
+        raise ValueError(f"round {round_number} has no complete pass identities")
+    return set(hashes)
+
+
+def landing_pair(first: dict, second: dict) -> dict:
+    """Combine the landing-timing words only, using the first report's frozen family."""
+    first_context, second_context = first.get("context") or {}, second["context"]
+    if first_context.get("round", 0) not in (0, "0") or second_context.get("round") != 1:
+        raise ValueError("round 1 report must be paired with round 2")
+    for key in ("candidate", "baselines", "host"):
+        if first.get(key) != second[key]:
+            raise ValueError(f"round 1 report: {key} does not match round 2")
+    first_host, second_host = first_context.get("host") or "", second_context.get("host") or ""
+    if first_host != second_host or (not second_host and not any(second["host"])):
+        raise ValueError("round 1 report: host does not match round 2 or is unknown")
+    try:
+        first_p = landing_pvalues(first)
+        second_p = landing_pvalues(second)
+    except (AttributeError, KeyError, TypeError) as error:
+        raise ValueError("the two reports need landing timing readings from a planned family") from error
+    if first_p.keys() != second_p.keys():
+        raise ValueError("round 1 report: planned family does not match round 2")
+    if any(not number(p) or not 0 <= p <= 1 for p in first_p.values()):
+        raise ValueError("round 1 report has invalid landing timing p-values")
+    for k, report in enumerate((first, second), 1):
+        if report.get("host_provenance_errors") != []:
+            raise ValueError(f"round {k} has a host provenance error or no host provenance record")
+    if landing_pass_hashes(first, 1) & landing_pass_hashes(second, 2):
+        raise ValueError("the rounds share a pass")
+    hashes = first.get("verified_binary_hashes")
+    if not hashes or hashes != second.get("verified_binary_hashes"):
+        raise ValueError("the rounds' verified binary hashes are missing or differ")
+    return gatestats.landing_words(list(second_p), first_p, second_p)
+
+
+def landing_opening(summary: dict, first: dict | None) -> list[str]:
+    lines = [summary["word"], ""]
+    for h in summary["confirmed"] or summary["screened"]:
+        estimates = []
+        for k, report in enumerate([first, summary] if first is not None else [summary], 1):
+            reading = dimension_in(report, *h.split("|", 2)) or {}
+            ci = reading.get("ci")
+            interval = f"{fmt(ci[0])}–{fmt(ci[1])}" if ci else "unavailable"
+            label = f"round {k}" if first is not None else "this round"
+            estimates.append(f"{label} ratio {fmt(reading.get('ratio'))}, interval {interval}")
+        lines.append(f"- **{h}** — " + " / ".join(estimates))
+    if summary["screened"]:
+        lines.append("")
+    lines += ["## Per-dimension resolution", ""]
+    for h, reading in summary["lines"].items():
+        lines += [f"- **{h}**", f"  - {reading['clearance']}",
+                  f"  - Sensitivity: {reading['sensitivity'] or 'unavailable'}"]
+    return [*lines, ""]
+
+
+def render(summary: dict, first: dict | None = None) -> str:
     c = summary["candidate"]
     verdict_ = "PASSED" if summary["passed"] else ("DIAGNOSTIC ONLY, not a release verdict" if summary["diagnostic"]
                                                    else "NOT PASSED on its own (verdict combines the rounds)")
     blocks = sorted({p["block"] for p in summary["passes"] if p.get("block") is not None}, key=str)
-    lines = [f"# Release gate round {summary['context'].get('round', 0)}: {c['name']} {c['revision']}", "",
+    landing = "word" in summary
+    lines = landing_opening(summary, first) if landing else []
+    lines += [f"# Release gate round {summary['context'].get('round', 0)}: {c['name']} {c['revision']}", "",
              f"Against {', '.join(f'{s} {r}' for s, r in summary['baselines'].items())}; harness {summary['harness']}; "
              f"host {', '.join(map(str, summary['host']))}; {len(blocks)} blocks, {len(summary['passes'])} side-runs."
              + "".join(f" {s} is {t}'s build (one revision): timed once, as {t}; its hypotheses are {t}'s."
@@ -1325,7 +1431,7 @@ def render(summary: dict) -> str:
              f"**{verdict_}.** Each declared hypothesis (case x series or metric x baseline: {len(summary['family'])}) "
              "gets a one-sided p-value of a loss from its block contrasts (layouts the outer unit); a loss counts "
              f"when two consecutive rounds show it and Holm over the family rejects at {gatestats.ALPHA} "
-             "(benches/PROTOCOL.md §5). Flagged here: due for confirmation.", ""]
+             "(benches/PROTOCOL.md §5)." + ("" if landing else " Flagged here: due for confirmation."), ""]
     if summary["errors"]:
         lines += ["## The passes don't qualify", ""] + [f"- {e}" for e in summary["errors"]] + [""]
     floor = summary["policy"].get("floor")
@@ -1338,7 +1444,8 @@ def render(summary: dict) -> str:
         lines += [f"- {line}" for line in summary.get("inputs", [])] + [""]
     lines += ["## Blocking (not statistical)", ""] + ([f"- {b}" for b in summary["blocking"]] or ["- nothing"]) + [""]
     if summary["flagged"]:
-        lines += ["## Flagged: a loss shown this round, a confirmation due", "",
+        heading = "nominal p below 0.05: not findings" if landing else "Flagged: a loss shown this round, a confirmation due"
+        lines += [f"## {heading}", "",
                   "| baseline | case / dimension | ratio | interval | p | units |", "|---|---|---|---|---|---|"]
         for f in sorted(summary["flagged"], key=lambda f: f["p"]):
             ci = f"{f['ci'][0]:.4f}-{f['ci'][1]:.4f}" if f.get("ci") else "-"
@@ -3577,6 +3684,7 @@ def main() -> int:
                    help="the job: host (fleet's name), round (0 the first run), prefix, gate_name, max_gb, ram_gb, "
                         "layouts")
     s.add_argument("--floor", type=Path, help="check that this file supplies the floor recorded by the passes")
+    s.add_argument("--round-one", type=Path, help="the first round's release-gate.json, for the landing timing word")
     s.add_argument("--out", type=Path)
     s.add_argument("--json", type=Path)
     s = sub.add_parser("floor", help="a host's noise floor (noise-floor/HOST.toml) from an A-A' gate's report")
@@ -3686,7 +3794,17 @@ def main() -> int:
         passes = load_passes(args.passes)
         family = json.loads(args.family.read_text(encoding="utf-8")).get("family") if args.family else None
         context = {k: v for k, v in pairs(args.context, "--context").items()}
+        first = None
+        if args.round_one:
+            try:
+                first = json.loads(args.round_one.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as error:
+                p.error(f"cannot read round 1 report: {error}")
+            if not isinstance(first, dict):
+                p.error("round 1 report must be a JSON object")
+            context.setdefault("round", "1")
         private = bool(context.get("host")) or any(private_report(p["report"]) for p in passes)
+        private = private or (first is not None and private_report(first))
         output = hosts_registry.evidence_path(args.out, private) if args.out else None
         json_output = hosts_registry.evidence_path(args.json, private) if args.json else None
         timing, errors = pass_inputs(passes)
@@ -3701,6 +3819,11 @@ def main() -> int:
         for key in ("round", "max_gb", "ram_gb", "layouts"):
             if key in summary["context"]:
                 summary["context"][key] = float(summary["context"][key]) if "gb" in key else int(summary["context"][key])
+        if first is not None:
+            try:
+                summary.update(landing_pair(first, summary))
+            except ValueError as error:
+                p.error(str(error))
         if args.inputs and args.inputs.is_file():
             summary["inputs"] = args.inputs.read_text(encoding="utf-8").splitlines()
         summary["quiet"], notes = quiet_verdicts(args.passes)
@@ -3710,7 +3833,7 @@ def main() -> int:
         # The part's run this report is of: the newest attempt record beside the report.
         record, _ = newest_attempt(args.json.parent, "timed") if args.json else (None, None)
         summary["attempt"] = record["attempt"] if record else None
-        text = render(summary)
+        text = render(summary, first)
         print(text)
         if output:
             hosts_registry.evidence_path(output, private).write_text(text, encoding="utf-8")

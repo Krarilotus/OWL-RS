@@ -26,6 +26,7 @@ from __future__ import annotations
 import itertools
 import math
 import statistics
+from functools import lru_cache
 
 ALPHA = 0.05
 PAIR_WEIGHTS = (0.9, 0.1)  # rounds (1, 2), then (2, 3)
@@ -78,6 +79,7 @@ def t_sf(t: float, df: float) -> float:
     return tail if t > 0 else 1.0 - tail
 
 
+@lru_cache(maxsize=256)
 def t_ppf(q: float, df: float) -> float:
     """The `q` quantile of Student's t (bisection on t_sf; for intervals, not decisions)."""
     lo, hi = -1e3, 1e3
@@ -116,6 +118,10 @@ def sign_flip_p(values: list[float]) -> float | None:
     return hits / 2 ** n
 
 
+def _log_counter_step(step: float, scale: float) -> float:
+    return math.log1p(step / scale) if step and scale > 0 else 0.0
+
+
 def loss_test(contrasts: list[float], layouts: list | None = None, higher_is_better: bool = False,
               resolution: float = 0.0, scale: float = 1.0, floor: float = 0.0) -> dict:
     """The one-sided test of a loss over block contrasts (log new/base, one per block), the units
@@ -135,6 +141,8 @@ def loss_test(contrasts: list[float], layouts: list | None = None, higher_is_bet
         return out
     mean = statistics.fmean(u)
     sd = statistics.stdev(u)
+    out["sample_sd"] = sd
+    out["distinct_units"] = len(set(u))
     if floor > 0:
         least = floor / math.sqrt(len(contrasts) / len(u))
         out["floor"] = least
@@ -153,7 +161,7 @@ def loss_test(contrasts: list[float], layouts: list | None = None, higher_is_bet
         half = t_ppf(0.975, len(u) - 1) * sd / math.sqrt(len(u))
         out["ci"] = [mean - half, mean + half]
     out["verdict"] = "measured"
-    if resolution and scale > 0 and abs(mean) < math.log1p(resolution / scale):
+    if abs(mean) < _log_counter_step(resolution, scale):
         out["below_resolution"] = True
     return out
 
@@ -186,6 +194,115 @@ def rejectable(p: float, m: int, alpha: float = ALPHA) -> bool:
     """Whether a hypothesis with this p-value could still be rejected by Holm in a family of m
     (the most lenient threshold is alpha itself, the last step)."""
     return p <= alpha
+
+
+# --- after-landing timing ----------------------------------------------------------------------
+
+LANDING_SCREEN = 0.10
+CLEARANCE_PERCENT = 3.0
+ROUND_POWER = 0.90
+# Positive nodes and paired weights of the eight-point Gauss–Legendre rule.
+GAUSS_LEGENDRE_8 = ((0.1834346424956498, 0.3626837833783620), (0.5255324099163290, 0.3137066458778873),
+                    (0.7966664774136267, 0.2223810344533745), (0.9602898564975363, 0.1012285362903763))
+
+
+def landing_words(family: list[str], first: dict[str, float], second: dict[str, float] | None = None) -> dict:
+    """Screen the frozen family, then apply Holm to the first two rounds only."""
+    cutoff = LANDING_SCREEN / len(family) if family else 0
+    screened = [h for h in family if first.get(h, 1.0) <= cutoff]
+    result = {"word": "cleared", "screened": screened, "confirmed": []}
+    if not screened:
+        return result
+    if second is None:
+        return {**result, "word": "needs a second round"}
+    eligible = set(screened)
+    adjusted = {h: combine_rounds([first.get(h, 1.0), second.get(h, 1.0) if h in eligible else 1.0])
+                for h in family}
+    rejected = holm(adjusted)
+    if rejected:
+        result.update(word="confirmed loss", confirmed=[h for h in screened if h in rejected])
+    return result
+
+
+@lru_cache(maxsize=256)
+def _sensitivity_shift(n: int, m: int, relative_floor: float, step_in_mean_se: float) -> float:
+    """Find the shift reaching 90 % power by integrating over the sample sd."""
+    df = n - 1
+    critical = t_ppf(1 - ALPHA * PAIR_WEIGHTS[0] / m, df)
+    root_df, mode = math.sqrt(df), math.sqrt(df - 1)
+    # sqrt(df) * sample_sd / true_sd follows chi(df) and is independent of the mean.
+    # Integrate in x = chi - mode. The chi log-density has curvature at most -1,
+    # so its mass beyond 12 from the mode is below floating-point precision.
+    low, high = max(-mode, -12.0), 12.0
+    # Clearing the step and the clamped t cutoff requires exceeding their maximum.
+    min_sd = max(relative_floor, step_in_mean_se / critical)
+    clamp = min(high, max(low, root_df * min_sd - mode))
+    # Split at the clamp's kink. Limit each interval's change in the normal CDF
+    # argument to two, even for a large family or few units.
+    width = min(1.0, 2 * root_df / critical)
+    terms = []
+    for a, b in ((low, clamp), (clamp, high)):
+        count = math.ceil((b - a) / width)
+        if not count:
+            continue
+        half = (b - a) / (2 * count)
+        for i in range(count):
+            centre = a + (2 * i + 1) * half
+            for node, weight in GAUSS_LEGENDRE_8:
+                for x in (centre - half * node, centre + half * node):
+                    log_density = (df - 1) * math.log1p(x / mode) - mode * x - x * x / 2
+                    sd = (mode + x) / root_df
+                    terms.append((critical * max(sd, min_sd), half * weight * math.exp(log_density)))
+    # The chi density's normalization cancels. Conditional rejection probability
+    # is half erfc((threshold - shift) / sqrt(2)).
+    target = 2 * ROUND_POWER * math.fsum(w for _, w in terms)
+    lo, hi = 0.0, max(t for t, _ in terms) + 2.0
+    inv_sqrt_two = math.sqrt(0.5)
+    for _ in range(40):
+        mid = (lo + hi) / 2
+        mass = math.fsum(w * math.erfc((t - mid) * inv_sqrt_two) for t, w in terms)
+        if mass >= target:
+            hi = mid
+        else:
+            lo = mid
+    return hi
+
+
+def landing_lines(reading: dict | None, m: int, p: float | None, *, below_step: bool = False) -> dict:
+    """The screen's p-value, clearance and sensitivity for one planned dimension."""
+    out = {"p": 1.0, "clearance": "not resolved: not measured", "sensitivity": None}
+    if reading is None or reading["units"] < 2:
+        return out
+    n = reading["units"]
+    floor = reading.get("floor", 0.0)  # loss_test has already scaled it to the units.
+    sd = max(reading["sample_sd"], floor)
+    discrete = reading["distinct_units"] < 4
+    below_step = below_step or reading.get("below_resolution", False)
+    if below_step:
+        out["clearance"] = "not resolved to 3 % (below the counter's step)"
+    elif sd == 0:
+        out["clearance"] = "not resolved: no spread"
+    elif discrete:
+        out["clearance"] = "not resolved to 3 % (discrete counter)"
+    else:
+        log_upper = reading["mean_log"] + t_ppf(0.95, n - 1) * sd / math.sqrt(n)
+        upper = _ceil_percent(log_upper)
+        out["clearance"] = (f"not resolved to 3 % ({upper:.2f} %)" if upper > CLEARANCE_PERCENT
+                            else f"no loss above {upper:.2f} % shown")
+    if p is not None and sd > 0 and not discrete and not below_step:
+        # Use the effective spread as the true sd estimate, with the same floor in the test.
+        mean_se = sd / math.sqrt(n)
+        log_step = _log_counter_step(reading.get("step") or 0.0, reading.get("base") or 0.0)
+        shift = _sensitivity_shift(n, m, floor / sd, log_step / mean_se) * mean_se
+        percent = _ceil_percent(shift)
+        two_round_power = 2 * ROUND_POWER - 1
+        out.update(p=p, sensitivity=f"{percent:.2f} % loss at two-round power ≥ {two_round_power * 100:.0f} %")
+    return out
+
+
+def _ceil_percent(log_ratio: float) -> float:
+    """Display at one basis point, rounding toward the more conservative loss."""
+    return math.ceil(10_000 * math.expm1(log_ratio)) / 100
 
 
 # --- power -------------------------------------------------------------------------------------
