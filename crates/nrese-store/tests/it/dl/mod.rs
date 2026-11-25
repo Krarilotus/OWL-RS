@@ -17,6 +17,7 @@ mod gap;
 mod gates;
 mod ground_conclusions;
 mod identity;
+mod ill_typed_upper_bound;
 mod islands;
 mod keys;
 mod left_out;
