@@ -166,17 +166,55 @@ fn committed(more: &str) -> nrese_store::MutationPipeline {
 
 /// The rows of `query` and its statuses, as the answer and its plan give them.
 fn answer(store: &StoreService, query: &str) -> (String, [&'static str; 2]) {
+    let (rows, claims) = answer_claims(store, query);
+    (
+        rows,
+        claims.map(|claim| claim.map_or("none", |c| c.as_str())),
+    )
+}
+
+fn answer_claims(
+    store: &StoreService,
+    query: &str,
+) -> (String, [Option<nrese_sparql::Completeness>; 2]) {
     let request = SparqlQueryRequest::all(format!("{PREFIXES}{RDF}{query}"));
     let result = store.execute_query(&request).expect("answered");
     let prepared = store.prepare_query(&request).expect("prepared");
     let planned = store
         .plan_query(&prepared, &CancellationToken::new())
         .expect("planned");
-    let status = |c: Option<nrese_sparql::Completeness>| c.map_or("none", |c| c.as_str());
     (
         String::from_utf8(result.payload).unwrap(),
-        [status(result.completeness), status(planned.completeness)],
+        [result.completeness, planned.completeness],
     )
+}
+
+// The clean comparison controls still exclude a datatype reason. OWL 2 QL adds its
+// consistency reason, which also makes a count provisional.
+fn clean_comparison(
+    regime: &str,
+    query: &str,
+    claims: &[Option<nrese_sparql::Completeness>; 2],
+) -> bool {
+    claims.iter().all(|claim| {
+        claim.as_ref().is_some_and(|status| {
+            if regime != "owl2-ql" {
+                return status.as_str() == "complete";
+            }
+            let count = query.contains("COUNT(");
+            status.as_str() == if count { "unsound" } else { "sound-only" }
+                && status.reasons.len() == if count { 2 } else { 1 }
+                && status
+                    .reasons
+                    .iter()
+                    .any(|reason| reason.source == "consistency")
+                && (!count
+                    || status
+                        .reasons
+                        .iter()
+                        .any(|reason| reason.text.contains("over answers that may be missing")))
+        })
+    })
 }
 
 /// Each case's wrong row is returned and labelled `unsound`; what else happens, as text.
@@ -2049,9 +2087,9 @@ fn comparing_iris_or_strings_by_term_leaves_an_answer_complete() {
     let mut wrong = Vec::new();
     for (regime, store) in PROMISING {
         for (data, read, right) in cases {
-            let (rows, status) = answer(&store(data), read);
+            let (rows, status) = answer_claims(&store(data), read);
             eprintln!("{regime}, {read}: {rows} {status:?}");
-            if !right(&rows) || status != ["complete"; 2] {
+            if !right(&rows) || !clean_comparison(regime, read, &status) {
                 wrong.push(format!("{regime}, {read}: {rows} {status:?}"));
             }
         }
@@ -2189,9 +2227,9 @@ fn a_plain_string_asked_where_one_is_stored_stays_complete() {
     let mut wrong = Vec::new();
     for (regime, store) in PROMISING {
         for read in NAMES_REX {
-            let (rows, status) = answer(&store(data), read);
+            let (rows, status) = answer_claims(&store(data), read);
             eprintln!("{regime}, {read}: {rows} {status:?}");
-            if !rows.contains("example.com/a\"") || status != ["complete"; 2] {
+            if !rows.contains("example.com/a\"") || !clean_comparison(regime, read, &status) {
                 wrong.push(format!("{regime}, {read}: {rows} {status:?}"));
             }
         }
@@ -2262,10 +2300,10 @@ fn a_join_at_the_start_of_a_path_without_a_reversed_step_stays_complete() {
     let read = "SELECT ?x ?y { ?z :knows+ ?x . ?z :knows+ ?y FILTER(?x != ?y) }";
     let mut wrong = Vec::new();
     for (regime, store) in PROMISING {
-        let (rows, status) = answer(&store(data), read);
+        let (rows, status) = answer_claims(&store(data), read);
         eprintln!("{regime}: {rows} {status:?}");
         let pair = rows.contains("example.com/a\"") && rows.contains("example.com/b\"");
-        if !pair || status != ["complete"; 2] {
+        if !pair || !clean_comparison(regime, read, &status) {
             wrong.push(format!("{regime}: {rows} {status:?}"));
         }
     }
@@ -2374,9 +2412,9 @@ fn a_paths_end_over_iris_stays_complete_beside_a_number() {
     for (regime, store) in PROMISING {
         let store = store(data);
         for (read, right) in cases {
-            let (rows, status) = answer(&store, read);
+            let (rows, status) = answer_claims(&store, read);
             eprintln!("{regime}, {read}: {rows} {status:?}");
-            if !right(&rows) || status != ["complete"; 2] {
+            if !right(&rows) || !clean_comparison(regime, read, &status) {
                 wrong.push(format!("{regime}, {read}: {rows} {status:?}"));
             }
         }
