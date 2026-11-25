@@ -473,15 +473,15 @@ fn pairs<T: Copy>(v: &[T]) -> impl Iterator<Item = (T, T)> + '_ {
 
 /// A copy of `premise` for tests to extend: compilation scratch, reserved from the
 /// request's envelope before it is made; `Unknown` where the envelope has no room.
-fn copy(
-    premise: &Ontology,
-    budget: &Budget,
-) -> Result<(Ontology, nrese_dl::memory::Scratch), Entailed> {
+fn copy(premise: &Ontology, budget: &Budget) -> Result<(Ontology, CopyScratch), Entailed> {
     let mut scratch = nrese_dl::memory::Scratch::new(budget.memory.as_ref());
     scratch
         .charge(|| nrese_dl::memory::ontology_bytes(premise))
         .map_err(|_| Entailed::Unknown(nrese_dl::memory::EXHAUSTED.to_owned()))?;
-    Ok((premise.clone(), scratch))
+    let o = premise.clone();
+    #[cfg(test)]
+    let scratch = CopyScratch::copy(scratch, &o);
+    Ok((o, scratch))
 }
 
 /// Whether `premise` (consistent) entails `axiom`, an axiom over `premise`'s interners.
@@ -641,8 +641,6 @@ fn import_into(
     deadline: Deadline,
 ) -> Result<PreparedCheck, Entailed> {
     let (o, copy_scratch) = copy(premise, budget)?;
-    #[cfg(test)]
-    let copy_scratch = CopyScratch::copy(copy_scratch, &o);
     let mut prepared = PreparedCheck {
         o,
         axioms: Vec::new(),

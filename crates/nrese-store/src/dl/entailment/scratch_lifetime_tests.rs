@@ -141,6 +141,8 @@ fn scratch_outlives_private_storage() {
         ImportRefusal,
         EntailmentCompletion,
         JointMemoRefusal,
+        ScalarAxiom,
+        ScalarNonempty,
     }
 
     const N: usize = 262_144;
@@ -151,7 +153,13 @@ fn scratch_outlives_private_storage() {
         sources: vec![Vec::new(); N],
         ..Ontology::default()
     };
-    premise.classes.intern(ClassExpr::Class(2));
+    let class = intern(&mut premise, ClassExpr::Class(2));
+    let scalar_premise = Ontology {
+        axioms: premise.axioms[..1].to_vec(),
+        sources: vec![Vec::new()],
+        classes: premise.classes.clone(),
+        ..Ontology::default()
+    };
 
     let empty = Ontology::default();
     let mut conclusion = Ontology::default();
@@ -174,6 +182,8 @@ fn scratch_outlives_private_storage() {
         (Exit::ImportRefusal, Payload::Copy),
         (Exit::EntailmentCompletion, Payload::Copy),
         (Exit::JointMemoRefusal, Payload::Joint),
+        (Exit::ScalarAxiom, Payload::Copy),
+        (Exit::ScalarNonempty, Payload::Copy),
     ] {
         let parent = SharedBudget::new(128 << 20);
         let sibling = Envelope::exact(None, Some(parent.clone()));
@@ -209,11 +219,23 @@ fn scratch_outlives_private_storage() {
                 test_hooks::MEMBERSHIP_ENTRY.replace(None);
                 result.err().expect("memo charge must refuse")
             }
+            Exit::ScalarAxiom => entails_within(
+                &scalar_premise,
+                &conclusion.axioms[0],
+                &[100, 101, 102],
+                &budget,
+                deadline,
+            ),
+            Exit::ScalarNonempty => nonempty_within(&scalar_premise, class, &budget, deadline),
         };
-        if case == Exit::EntailmentCompletion {
-            assert_eq!(answer, Entailed::Yes, "{case:?}");
-        } else {
-            assert_eq!(answer, Entailed::from(Stopped::Memory), "{case:?}");
+        match case {
+            Exit::EntailmentCompletion => assert_eq!(answer, Entailed::Yes, "{case:?}"),
+            Exit::ImportRefusal | Exit::JointMemoRefusal => {
+                assert_eq!(answer, Entailed::from(Stopped::Memory), "{case:?}");
+            }
+            Exit::ScalarAxiom | Exit::ScalarNonempty => {
+                assert_ne!(answer, Entailed::from(Stopped::Memory), "{case:?}");
+            }
         }
         let watch = WATCH.replace(None).unwrap();
         assert!(watch.registered, "{case:?}: storage watch must run");
