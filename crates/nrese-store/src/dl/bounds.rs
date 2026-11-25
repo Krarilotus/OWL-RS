@@ -1342,13 +1342,16 @@ pub(crate) fn holds_ill_typed(store: &StoreService, snapshot: &Snapshot) -> Opti
     Some(found.is_some())
 }
 
-/// [`holds_ill_typed`] of what the commit `tx` publishes, from its base's literal
-/// (`dl::query::ill_typed_after`), found on this need where it wasn't.
-pub(crate) fn holds_ill_typed_after(store: &StoreService, tx: &Transaction<'_>) -> Option<bool> {
+/// The literal `tx` leaves, starting from its base's witness. The gate's stop can leave it undecided.
+pub(crate) fn find_ill_typed_after(
+    store: &StoreService,
+    tx: &Transaction<'_>,
+    stopped: &dyn Fn() -> bool,
+) -> crate::service::IllTyped {
     let memory = store.memory_stop();
-    let stop = || memory.exceeded();
+    let stop = || stopped() || memory.exceeded();
     let base = crate::service::Certificate::of(tx.base())?.ill_typed(tx.base(), &stop)?;
-    Some(super::query::ill_typed_after(tx, base, &stop)?.is_some())
+    super::query::ill_typed_after(tx, base, &stop)
 }
 
 /// U1 compiled and evaluated afresh over `snapshot` (or, with the kinds it was decided on,
