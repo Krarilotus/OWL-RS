@@ -201,8 +201,9 @@ fn consistency_known(store: &StoreService, snapshot: &Snapshot, view: &View) -> 
             consistency,
             ..
         }) if revision == snapshot.revision() => Some(consistency.verdict),
-        _ if view.proves_consistency => Some(Verdict::Consistent),
-        _ if !(view.rules && super::bounds::rules_prove(snapshot)) => None,
+        _ if !(view.proves_consistency || view.rules && super::bounds::rules_prove(snapshot)) => {
+            None
+        }
         _ => Some(match super::bounds::holds_ill_typed(store, snapshot) {
             Some(false) => Verdict::Consistent,
             Some(true) => Verdict::Unknown(gate::ILL_TYPED.to_owned()),

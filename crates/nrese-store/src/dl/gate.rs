@@ -38,6 +38,7 @@ use crate::{RejectKind, StoreService};
 pub(crate) struct Gate {
     pub checked: Checked,
     pub reject: Option<crate::MutationReject>,
+    pub record_verdict: bool,
 }
 
 /// Runs `check` with a [`Cancel`] that fires when `cancelled` does (a cancelled commit).
@@ -110,13 +111,12 @@ fn budget_of(
     }
 }
 
-/// Why the data's consistency is unknown where the RL rules prove it but an ill-typed literal
-/// is held ([`super::bounds::holds_ill_typed`]).
+/// Why a proof with no clash still leaves consistency unknown when an ill-typed literal is held.
 pub(crate) const ILL_TYPED: &str =
-    "the rules find no clash, but the data hold an ill-typed literal, which OWL 2 doesn't admit";
+    "no clash is found, but the data hold an ill-typed literal, which OWL 2 doesn't admit";
 
 /// Checks the state `tx` would commit. Where U1 after the commit proves it consistent
-/// ([`super::bounds::Preparation`]), nothing more runs: the cost of the U1's change.
+/// ([`super::bounds::Preparation`]), the cost is U1's change and the ill-typed witness search.
 /// Otherwise O(asserted statements) for reading the ontology (unless the preparation
 /// read it), plus the engine's work.
 pub(crate) fn check_commit(
@@ -129,6 +129,7 @@ pub(crate) fn check_commit(
     memory: &nrese_exec::Envelope,
 ) -> Gate {
     let deadline = Deadline::after(store.config().dl.timeout);
+    let rules = matches!(preparation.prepared, super::bounds::Prepared::Rules(_));
     if store.config().dl.consistency == DlConsistency::Off {
         return Gate {
             checked: Checked {
@@ -137,24 +138,23 @@ pub(crate) fn check_commit(
                 elapsed: Duration::ZERO,
             },
             reject: None,
+            record_verdict: !rules || preparation.proves_consistency,
         };
     }
     // On the RL route in quarantine, or on a base nobody vouched for, the rules prove nothing,
     // and their gate has admitted the commit on its own facts, as off the route: no DL check.
-    let rules = matches!(preparation.prepared, super::bounds::Prepared::Rules(_));
     if preparation.proves_consistency || rules {
         let ill_typed = match preparation.proves_consistency {
             true => super::bounds::holds_ill_typed_after(store, tx),
-            false => Some(false),
+            false => None,
         };
         // A search that stopped decides nothing: no verdict is recorded for the revision, as
         // for an unproved base, and its reads search again (`dl::query::consistency_known`).
-        preparation.proves_consistency &= ill_typed.is_some();
         let unknown = |why: &str| Verdict::Unknown(why.to_owned());
         let verdict = match (preparation.proves_consistency, ill_typed) {
             (true, Some(true)) => unknown(ILL_TYPED),
-            (true, _) => Verdict::Consistent,
-            (false, None) => unknown(super::query::UNCHECKED),
+            (true, Some(false)) => Verdict::Consistent,
+            (true, None) => unknown(super::query::UNCHECKED),
             (false, _) => unknown("the rules assessed no clean closure at the base"),
         };
         return Gate {
@@ -164,6 +164,7 @@ pub(crate) fn check_commit(
                 elapsed: Duration::ZERO,
             },
             reject: None,
+            record_verdict: ill_typed.is_some(),
         };
     }
     cancellable(&|| cancelled() || deadline.passed(), |cancel| {
@@ -234,6 +235,7 @@ fn check_with_budget(
                 elapsed: started.elapsed(),
             },
             reject: None,
+            record_verdict: true,
         };
     }
     // The check's memory: the request's envelope, its reading of the ontology included.
@@ -253,6 +255,7 @@ fn check_with_budget(
                             elapsed: started.elapsed(),
                         },
                         reject: None,
+                        record_verdict: true,
                     };
                 }
             }
@@ -269,6 +272,7 @@ fn check_with_budget(
         return Gate {
             checked,
             reject: None,
+            record_verdict: true,
         };
     }
     // Inconsistent after the commit: rejected unless it was so before (quarantine).
@@ -290,6 +294,7 @@ fn check_with_budget(
         return Gate {
             checked,
             reject: None,
+            record_verdict: true,
         };
     }
     rejection(
@@ -369,6 +374,7 @@ fn rejection(
     Gate {
         checked,
         reject: Some(reject),
+        record_verdict: true,
     }
 }
 
