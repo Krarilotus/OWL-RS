@@ -756,3 +756,64 @@ fn wide_payloads_are_charged_before_they_are_copied() {
         ));
     }
 }
+
+fn long_blanks(count: usize, label_len: usize) -> Vec<Triple> {
+    let rdf_type = nrese_rdf::vocab::rdf::TYPE.into_owned();
+    let p = iri("p");
+    let a = iri("a");
+    let mut triples = Vec::with_capacity(count + 1);
+    triples.push(Triple::new(
+        p.clone(),
+        rdf_type,
+        nrese_rdf::NamedNode::new_unchecked(format!("{OWL}ObjectProperty")),
+    ));
+    let pad = "x".repeat(label_len);
+    for i in 0..count {
+        let blank = BlankNode::new_unchecked(format!("b{i:04}_{pad}"));
+        triples.push(Triple::new(blank, p.clone(), a.clone()));
+    }
+    triples
+}
+
+/// Spec (contracts.md, Memory): fresh-blank renaming storage is charged to the request's
+/// memory envelope before retention, so distinct long blank labels cannot grow an uncharged
+/// map past a tight envelope; a small control with one-attachment assertions is admitted.
+#[test]
+fn fresh_blank_storage_is_charged_before_retention() {
+    use super::blank_test_hooks;
+
+    let many = long_blanks(256, 2_048);
+    let small = long_blanks(4, 16);
+
+    // Tight envelope: room for the tiny CLASH premise, far below 256 * 2 KiB of blank labels.
+    let (tight_store, _pipeline) = clash_store(DlConfig::default(), 96 << 10);
+    blank_test_hooks::reset();
+    let refused = tight_store.entails_dl(&many).unwrap();
+    let (held, charged, uncharged) = blank_test_hooks::snapshot();
+    assert!(
+        matches!(&refused.answer, Entailed::Unknown(why) if why.contains("memory")),
+        "tight envelope must refuse with memory Unknown: {refused:?}"
+    );
+    assert!(!refused.holds());
+    assert_eq!(
+        uncharged, 0,
+        "renaming storage grew uncharged: held={held}, charged={charged}"
+    );
+
+    // Small admitted control with generous envelope.
+    let (ok_store, _ok_pipeline) = clash_store(DlConfig::default(), 64 << 20);
+    blank_test_hooks::reset();
+    let admitted = ok_store.entails_dl(&small).unwrap();
+    let (ctrl_held, ctrl_charged, ctrl_uncharged) = blank_test_hooks::snapshot();
+    assert_eq!(
+        admitted.answer,
+        Entailed::Yes,
+        "small control: {admitted:?}"
+    );
+    assert!(admitted.holds());
+    assert_eq!(admitted.premise, crate::dl::Verdict::Inconsistent);
+    assert_eq!(
+        ctrl_uncharged, 0,
+        "small control renaming storage uncharged: held={ctrl_held}, charged={ctrl_charged}"
+    );
+}

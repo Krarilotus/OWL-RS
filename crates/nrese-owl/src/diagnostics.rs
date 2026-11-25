@@ -643,6 +643,8 @@ fn uses_any<'a>(
         if !seen.insert(id) {
             continue;
         }
+        #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+        NON_SIMPLE_EXPANSIONS.with(|c| c.set(c.get() + 1));
         if let Some(found) = needing.get(&id) {
             return Some(found);
         }
@@ -658,6 +660,17 @@ fn uses_any<'a>(
         }
     }
     None
+}
+
+#[cfg(any(test, all(feature = "witness", debug_assertions)))]
+thread_local! {
+    static NON_SIMPLE_EXPANSIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Class-expression expansions made by the non-simple-property check on this thread.
+#[cfg(any(test, all(feature = "witness", debug_assertions)))]
+pub fn non_simple_expansions() -> u64 {
+    NON_SIMPLE_EXPANSIONS.with(std::cell::Cell::get)
 }
 
 /// Whether an IRI is of the reserved vocabulary (`rdf:`, `rdfs:`, `xsd:`, `owl:`) and not

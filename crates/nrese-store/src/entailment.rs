@@ -700,10 +700,52 @@ fn fresh_blank(
             .is_none()
         {
             blanks.insert(blank.as_str().to_owned(), cand.clone());
+            #[cfg(test)]
+            {
+                let held: usize = blanks.capacity()
+                    * (std::mem::size_of::<(String, nrese_rdf::BlankNode)>() + 1)
+                    + blanks
+                        .iter()
+                        .map(|(k, v)| k.capacity() + v.as_str().len())
+                        .sum::<usize>();
+                blank_test_hooks::record(held, 0);
+            }
             return Some(cand);
         }
     }
     unreachable!()
+}
+
+#[cfg(test)]
+mod blank_test_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static MAX_UNCHARGED: Cell<usize> = const { Cell::new(0) };
+        static MAX_HELD: Cell<usize> = const { Cell::new(0) };
+        static MAX_CHARGED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn reset() {
+        MAX_UNCHARGED.with(|c| c.set(0));
+        MAX_HELD.with(|c| c.set(0));
+        MAX_CHARGED.with(|c| c.set(0));
+    }
+
+    pub(crate) fn record(held: usize, charged: usize) {
+        let uncharged = held.saturating_sub(charged);
+        MAX_UNCHARGED.with(|c| c.set(c.get().max(uncharged)));
+        MAX_HELD.with(|c| c.set(c.get().max(held)));
+        MAX_CHARGED.with(|c| c.set(c.get().max(charged)));
+    }
+
+    pub(crate) fn snapshot() -> (usize, usize, usize) {
+        (
+            MAX_HELD.with(Cell::get),
+            MAX_CHARGED.with(Cell::get),
+            MAX_UNCHARGED.with(Cell::get),
+        )
+    }
 }
 
 #[cfg(test)]

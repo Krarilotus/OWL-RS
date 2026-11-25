@@ -689,7 +689,10 @@ pub(crate) fn admit_and_prepare(
     let (extra_len, total) = (extra.len(), p_axioms.len() + extra.len());
     charge(&mut js, total * (size_of::<Axiom>() + size_of::<Origin>()))?;
     let (mut joint, mut origin) = (Vec::with_capacity(total), Vec::with_capacity(total));
+    #[cfg(not(test))]
     let mut p_it = p_axioms.into_iter().peekable();
+    #[cfg(test)]
+    let mut p_it = test_hooks::track_axioms(p_axioms).peekable();
     let mut c_it = extra.into_iter().peekable();
     while p_it.peek().is_some() || c_it.peek().is_some() {
         tick(&mut work, 1, deadline)?;
@@ -751,6 +754,14 @@ pub(crate) fn admit_and_prepare(
     }
 
     let (mut restored, mut axioms) = (Vec::with_capacity(premise.axioms.len()), already);
+    #[cfg(test)]
+    test_hooks::on_restore(
+        o.axioms.capacity() * size_of::<Axiom>()
+            + restored.capacity() * size_of::<Axiom>()
+            + p_sources.capacity() * size_of::<Vec<nrese_owl::Source>>()
+            + origin.capacity() * size_of::<Origin>(),
+        budget.memory.as_ref().map_or(0, |e| e.used()),
+    );
     axioms.reserve(extra_len);
     for (a, from) in take(&mut o.axioms).into_iter().zip(origin) {
         match from {
@@ -825,6 +836,45 @@ pub(crate) mod test_hooks {
         pub(crate) static IMPORT_VISIT: RefCell<Option<VisitHook>> = const { RefCell::new(None) };
         pub(crate) static IMPORT_ENTRY: RefCell<Option<EntryHook>> = const { RefCell::new(None) };
         pub(crate) static IMPORT_CLONED_OPERANDS: Cell<usize> = const { Cell::new(0) };
+        static LIVE_MERGE_BYTES: Cell<usize> = const { Cell::new(0) };
+        static RESTORE_PEAK: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
+    }
+
+    pub(crate) struct TrackedAxioms {
+        inner: std::vec::IntoIter<crate::dl::entailment::Axiom>,
+        bytes: usize,
+    }
+
+    impl Iterator for TrackedAxioms {
+        type Item = crate::dl::entailment::Axiom;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.inner.next()
+        }
+    }
+
+    impl Drop for TrackedAxioms {
+        fn drop(&mut self) {
+            LIVE_MERGE_BYTES.with(|c| c.set(c.get().saturating_sub(self.bytes)));
+        }
+    }
+
+    pub(crate) fn track_axioms(v: Vec<crate::dl::entailment::Axiom>) -> TrackedAxioms {
+        let bytes = v.capacity() * std::mem::size_of::<crate::dl::entailment::Axiom>();
+        LIVE_MERGE_BYTES.with(|c| c.set(c.get() + bytes));
+        TrackedAxioms {
+            inner: v.into_iter(),
+            bytes,
+        }
+    }
+
+    pub(crate) fn on_restore(other_live_bytes: usize, reserved_bytes: usize) {
+        let total = LIVE_MERGE_BYTES.with(Cell::get) + other_live_bytes;
+        RESTORE_PEAK.with(|slot| slot.set(Some((total, reserved_bytes))));
+    }
+
+    pub(crate) fn take_restore_peak() -> Option<(usize, usize)> {
+        RESTORE_PEAK.with(Cell::take)
     }
 
     pub(crate) fn visit() {
@@ -882,5 +932,224 @@ mod import_tests {
             import.axiom(&union).ok(),
             Some(Axiom::DisjointUnion(to_c, vec![to_a, to_b]))
         );
+    }
+
+    struct StubTerms;
+
+    impl Terms for StubTerms {
+        fn kind(&self, _term: u64) -> nrese_owl::TermKind {
+            nrese_owl::TermKind::Iri
+        }
+        fn lexical(&self, _term: u64) -> Option<String> {
+            None
+        }
+        fn iri(&self, _iri: &str) -> Option<u64> {
+            None
+        }
+        fn datatype(&self, _term: u64) -> Option<String> {
+            None
+        }
+        fn iri_text(&self, _term: u64) -> Option<String> {
+            None
+        }
+    }
+
+    fn test_budget(memory: Option<nrese_exec::Envelope>) -> Budget {
+        Budget {
+            timeout: None,
+            memory_bytes: None,
+            memory,
+            workers: nrese_exec::workers::Workers::serial(),
+            cancel: None,
+            max_nodes: None,
+            max_branch_points: None,
+            max_merges: None,
+            max_join: None,
+            explanation_tests: None,
+        }
+    }
+
+    fn shared_class_fixture(k: usize, n: usize, with_needing: bool) -> (Ontology, Ontology) {
+        let mut premise = Ontology::default();
+        premise.axioms.push(Axiom::ObjectCharacteristic(
+            Characteristic::Transitive,
+            ObjProp::Named(1),
+        ));
+        premise.sources.push(Vec::new());
+        if with_needing {
+            premise
+                .classes
+                .intern(ClassExpr::HasSelf(ObjProp::Named(1)));
+        }
+
+        let mut conclusion = Ontology::default();
+        let mut cur = ExprId(conclusion.classes.intern(ClassExpr::Class(100)));
+        for _ in 0..n {
+            cur = ExprId(
+                conclusion
+                    .classes
+                    .intern(ClassExpr::Some(ObjProp::Named(2), cur)),
+            );
+        }
+        let root = cur;
+        for i in 0..k {
+            let sub = ExprId(
+                conclusion
+                    .classes
+                    .intern(ClassExpr::Class(1_000 + i as u64)),
+            );
+            conclusion.axioms.push(Axiom::SubClassOf(sub, root));
+            conclusion.sources.push(Vec::new());
+        }
+        conclusion.axioms.sort_unstable();
+        (premise, conclusion)
+    }
+
+    /// Spec (contracts.md, Cancellation and Work admission; Structural Specification §11.2):
+    /// the joint non-simple-property check expands each shared class expression at most once
+    /// across axioms, so work stays linear when K and N both double, and an already-passed
+    /// deadline at membership entry stops with a typed time Unknown before the walk.
+    #[test]
+    fn joint_membership_bounds_shared_class_work() {
+        use std::time::Duration;
+
+        let terms = StubTerms;
+        let name = |t: u64| format!("t{t}");
+        let budget = test_budget(None);
+        let generous = Deadline::after(Some(Duration::from_secs(60)));
+
+        // Without cardinalities or self restrictions: generous deadline admits both sizes,
+        // and expansions stay within a linear bound in K + N.
+        for (k, n) in [(64usize, 64usize), (128, 128)] {
+            let (premise, conclusion) = shared_class_fixture(k, n, false);
+            let before = nrese_owl::diagnostics::non_simple_expansions();
+            let res = admit_and_prepare(&premise, &conclusion, &terms, &name, &budget, generous);
+            let expansions = nrese_owl::diagnostics::non_simple_expansions() - before;
+            assert!(res.is_ok(), "generous control ({k}, {n}) must admit");
+            let bound = 4 * (k + n) as u64;
+            assert!(
+                expansions <= bound,
+                "shared class walk ({k}, {n}) expanded {expansions} nodes (bound {bound})"
+            );
+        }
+
+        // With an unused self-restriction on the non-simple property so the memoised walk runs:
+        // doubling both K and N grows expansions linearly (at most 2.5x), not quadratically (4x).
+        let mut counts = Vec::new();
+        for (k, n) in [(64usize, 64usize), (128, 128)] {
+            let (premise, conclusion) = shared_class_fixture(k, n, true);
+            let before = nrese_owl::diagnostics::non_simple_expansions();
+            let res = admit_and_prepare(&premise, &conclusion, &terms, &name, &budget, generous);
+            let expansions = nrese_owl::diagnostics::non_simple_expansions() - before;
+            assert!(
+                res.is_ok(),
+                "non-empty needing control ({k}, {n}) must admit"
+            );
+            let bound = 2 * (k + n) as u64 + 16;
+            assert!(
+                expansions > 0 && expansions <= bound,
+                "memoised walk ({k}, {n}) expanded {expansions} nodes (bound {bound})"
+            );
+            counts.push(expansions);
+        }
+        assert!(
+            counts[1] * 2 <= counts[0] * 5,
+            "doubling K and N grew expansions super-linearly: {counts:?}"
+        );
+
+        // Deadline already passed at membership entry: stops with typed time Unknown before walk.
+        let (premise, conclusion) = shared_class_fixture(64, 64, true);
+        let expired = Deadline::after(Some(Duration::ZERO));
+        let before = nrese_owl::diagnostics::non_simple_expansions();
+        let late = admit_and_prepare(&premise, &conclusion, &terms, &name, &budget, expired);
+        let after = nrese_owl::diagnostics::non_simple_expansions() - before;
+        match late {
+            Err(Entailed::Unknown(why)) => {
+                assert_eq!(
+                    Limit::named_in(&why),
+                    Some(Limit::Time),
+                    "expected typed time Unknown, got: {why}"
+                );
+            }
+            other => panic!(
+                "expected time Unknown at membership entry, got {}",
+                match other {
+                    Ok(_) => "Ok(PreparedCheck)".to_owned(),
+                    Err(e) => format!("Err({e:?})"),
+                }
+            ),
+        }
+        assert_eq!(after, 0, "walk must not run past an expired deadline");
+    }
+
+    /// Spec (contracts.md, Memory): restoring the premise axioms after the joint check must
+    /// not hold three premise-sized axiom buffers against two reservations; without a cap,
+    /// restored axioms and sources preserve their exact order.
+    #[test]
+    fn restoration_respects_the_joint_envelope() {
+        const N: usize = 262_144;
+        let mut premise = Ontology::default();
+        premise.axioms.reserve_exact(N);
+        premise.sources.reserve_exact(N);
+        for i in 0..N as u64 {
+            premise
+                .axioms
+                .push(Axiom::ObjectPropertyAssertion(1, 10 + i, 10 + i));
+            premise.sources.push(Vec::new());
+        }
+        premise.axioms.sort_unstable();
+
+        let mut conclusion = Ontology::default();
+        conclusion
+            .axioms
+            .push(Axiom::ObjectPropertyAssertion(1, 1, 2));
+        conclusion.sources.push(Vec::new());
+
+        let terms = StubTerms;
+        let name = |t: u64| format!("t{t}");
+        let generous = Deadline::after(Some(std::time::Duration::from_secs(60)));
+
+        // Envelope sized between the two-buffer and three-buffer peaks.
+        let two_buffers = nrese_dl::memory::ontology_bytes(&premise)
+            + nrese_dl::memory::ontology_bytes(&conclusion) * 2
+            + (N + 1) * (size_of::<Axiom>() + size_of::<Origin>())
+            + 65_536;
+        let env = nrese_exec::Envelope::exact(Some(two_buffers), None);
+        let budget = test_budget(Some(env));
+
+        let _ = test_hooks::take_restore_peak();
+        let res = admit_and_prepare(&premise, &conclusion, &terms, &name, &budget, generous);
+        match res {
+            Ok(_) => {
+                let (live, reserved) =
+                    test_hooks::take_restore_peak().expect("restore hook must run");
+                assert!(
+                    live <= reserved && live <= two_buffers,
+                    "restore held {live} bytes across live vectors against {reserved} reserved (envelope {two_buffers})"
+                );
+            }
+            Err(Entailed::Unknown(why)) => {
+                assert_eq!(
+                    Limit::named_in(&why),
+                    Some(Limit::Envelope),
+                    "expected memory Unknown, got: {why}"
+                );
+            }
+            Err(other) => panic!("unexpected admission error: {other:?}"),
+        }
+
+        // No-cap control: restored axioms and sources match the premise in order.
+        let prepared = admit_and_prepare(
+            &premise,
+            &conclusion,
+            &terms,
+            &name,
+            &test_budget(None),
+            generous,
+        )
+        .expect("no-cap control");
+        assert_eq!(prepared.o.axioms, premise.axioms);
+        assert_eq!(prepared.o.sources, premise.sources);
+        assert_eq!(prepared.axioms, conclusion.axioms);
     }
 }

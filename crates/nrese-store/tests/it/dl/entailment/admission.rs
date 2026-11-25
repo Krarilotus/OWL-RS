@@ -325,3 +325,128 @@ fn the_joint_union_keeps_premise_and_conclusion_apart() {
         Entailed::No,
     );
 }
+
+/// Spec (Structural Specification §11.2, Table 5): `owl:topDataProperty` is forbidden
+/// outside the superproperty position of `SubDataPropertyOf`, including on a cold store
+/// before any write or rematerialisation; a plain class declaration is admissible.
+#[test]
+fn joint_membership_uses_builtin_names_on_a_cold_store() {
+    let bad = turtle("owl:topDataProperty a owl:DatatypeProperty .");
+    let store = nrese_store::StoreService::new(nrese_store::StoreConfig::in_memory()).unwrap();
+    assert_eq!(store.current_revision(), 0);
+    assert_eq!(store.engine_stats().quads, 0);
+    let cold = store.entails_dl(&bad).unwrap();
+    assert!(
+        matches!(&cold.answer, Entailed::Unknown(_)),
+        "cold store must reject owl:topDataProperty declaration: {cold:?}"
+    );
+    assert!(!cold.holds());
+
+    // Warm repeat: system vocabulary is now interned in the store's snapshot.
+    let warm = store.entails_dl(&bad).unwrap();
+    assert!(
+        matches!(&warm.answer, Entailed::Unknown(_)),
+        "warm store must reject owl:topDataProperty declaration: {warm:?}"
+    );
+    assert!(!warm.holds());
+
+    // Positive control on a fresh cold store: a plain class declaration is admitted.
+    let fresh = nrese_store::StoreService::new(nrese_store::StoreConfig::in_memory()).unwrap();
+    let control = fresh.entails_dl(&turtle(":C a owl:Class .")).unwrap();
+    assert_eq!(control.answer, Entailed::Yes, "control: {control:?}");
+    assert!(control.holds());
+}
+
+/// Spec (Structural Specification §§11.1–11.2): `owl:bottomObjectProperty` is non-simple,
+/// so declaring it functional lies outside OWL 2 DL on both cold and warm requests;
+/// declaring it an object property is admissible.
+#[test]
+fn joint_membership_keeps_builtins_on_the_first_empty_store_request() {
+    let store = nrese_store::StoreService::new(nrese_store::StoreConfig::in_memory()).unwrap();
+    let bad = turtle("owl:bottomObjectProperty a owl:FunctionalProperty .");
+    let cold = store.entails_dl(&bad).unwrap();
+    let warm = store.entails_dl(&bad).unwrap();
+    assert!(
+        matches!(&cold.answer, Entailed::Unknown(_)),
+        "cold: {cold:?}"
+    );
+    assert!(
+        matches!(&warm.answer, Entailed::Unknown(_)),
+        "warm: {warm:?}"
+    );
+    assert!(!cold.holds());
+    assert!(!warm.holds());
+
+    // Positive control on a fresh cold store: object-property declaration is admitted.
+    let fresh = nrese_store::StoreService::new(nrese_store::StoreConfig::in_memory()).unwrap();
+    let ok = turtle("owl:bottomObjectProperty a owl:ObjectProperty .");
+    let cold_ok = fresh.entails_dl(&ok).unwrap();
+    let warm_ok = fresh.entails_dl(&ok).unwrap();
+    assert_eq!(cold_ok.answer, Entailed::Yes, "cold control: {cold_ok:?}");
+    assert_eq!(warm_ok.answer, Entailed::Yes, "warm control: {warm_ok:?}");
+    assert!(cold_ok.holds());
+    assert!(warm_ok.holds());
+}
+
+/// Spec (OWL 2 Structural Specification; RDF 1.2 triple terms): OWL 2 defines no reading
+/// for RDF triple terms, so a conclusion carrying a triple term (even wrapping a premise
+/// blank label) is answered Unknown before renaming or interning; a string label is admitted.
+#[test]
+fn a_conclusion_triple_term_cannot_reuse_a_premise_blank() {
+    use nrese_rdf::{BlankNode, NamedNode, Term, Triple};
+
+    let dl = preloaded(&format!(
+        "{CLASH_DECLARATIONS} {INCONSISTENT} :p a owl:ObjectProperty . _:b :p :x ."
+    ));
+    let nested = Triple::new(
+        BlankNode::new_unchecked("b"),
+        NamedNode::new_unchecked("http://example.com/p"),
+        NamedNode::new_unchecked("http://example.com/x"),
+    );
+    let conclusion = [Triple::new(
+        NamedNode::new_unchecked("http://example.com/a"),
+        NamedNode::new_unchecked("http://www.w3.org/2000/01/rdf-schema#label"),
+        Term::Triple(Box::new(nested)),
+    )];
+    let result = dl.store().entails_dl(&conclusion).expect("entails_dl");
+    assert!(
+        matches!(&result.answer, Entailed::Unknown(why) if why.contains("triple term")),
+        "triple term must answer typed Unknown: {result:?}"
+    );
+    assert!(!result.holds());
+    assert_eq!(result.premise.as_str(), "inconsistent");
+    let third = dl.store().entails(rules(&dl), &conclusion);
+    assert!(
+        matches!(&third, Err(StoreError::Undecided(why)) if why.starts_with(DL_PREFIX)),
+        "third encoding must be Undecided: {third:?}"
+    );
+
+    // Control: an ordinary string label over the same inconsistent premise is admitted.
+    let ok = check_encodings(&dl, ":a rdfs:label \"plain\" .", "entailed", true)
+        .expect("string label control");
+    assert_eq!(ok.premise.as_str(), "inconsistent");
+}
+
+/// Spec (Structural Specification §11.2): a conclusion using an anonymous individual in a
+/// `hasValue` restriction withholds vacuous entailment over an inconsistent premise, while
+/// a named filler or a premise-only anonymous filler is admitted.
+#[test]
+fn a_conclusions_anonymous_has_value_over_an_inconsistent_premise_is_unknown() {
+    let clash = format!("{CLASH_DECLARATIONS} {INCONSISTENT}");
+    let dl = unchecked(&clash);
+    let anon = ":p a owl:ObjectProperty . :x a [ a owl:Restriction ; owl:onProperty :p ; owl:hasValue _:b ] .";
+    let named = ":p a owl:ObjectProperty . :x a [ a owl:Restriction ; owl:onProperty :p ; owl:hasValue :n ] .";
+
+    let blocked = check_encodings(&dl, anon, "unknown", true).expect("anonymous hasValue");
+    assert_eq!(blocked.premise.as_str(), "inconsistent");
+    let control = check_encodings(&dl, named, "entailed", true).expect("named filler control");
+    assert_eq!(control.premise.as_str(), "inconsistent");
+
+    // Premise-only anonymous hasValue over the inconsistent premise still admits a named conclusion.
+    let dl_premise_anon = unchecked(&format!(
+        "{clash} :p a owl:ObjectProperty . :z a [ a owl:Restriction ; owl:onProperty :p ; owl:hasValue _:p ] ."
+    ));
+    let allowed = check_encodings(&dl_premise_anon, ":y a :Q .", "entailed", true)
+        .expect("premise-only anonymous hasValue control");
+    assert_eq!(allowed.premise.as_str(), "inconsistent");
+}
