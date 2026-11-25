@@ -25,12 +25,18 @@ UNITS = 8
 SIGMA = 0.01
 
 
-def measured_passes(contrasts, baseline=10.123):
+def measured_passes(contrasts, baseline=10.123, round_number=0):
     def records_of(side, n):
         contrast = contrasts[(n - 1) // (2 * len(SIDES))] if side == "cand" else 0
         return [record(samples={"q06": [baseline * math.exp(contrast)]})]
 
-    return passes(records_of, blocks=len(contrasts), sides=SIDES)
+    timed = passes(records_of, blocks=len(contrasts), sides=SIDES)
+    for p in timed:
+        report = p["report"]
+        for row in [report, *report["records"]]:
+            for key in ("started_ns", "finished_ns"):
+                row[key] += round_number * 1_000_000
+    return timed
 
 
 def summary(contrasts, family=(MEASURED,), floor=0.0, baseline=10.123, **kw):
@@ -213,21 +219,33 @@ class LandingWords(unittest.TestCase):
         self.assertGreaterEqual(power, 0.90)
         self.assertLess(reference_power(percent - 0.01), 0.90)
 
+    # Spec: fix pass 2 G3 and design D4 say the sensitivity accounts for the step
+    # a loss needs to exceed before it can screen. At the stated loss, clearing
+    # the step alone must have at least the target per-round power.
+    def test_counter_step_limits_sensitivity(self):
+        contrasts = [0.02 + 0.0005 * i for i in (-4, -3, -2, -1, 1, 2, 3, 4)]
+        report = summary(contrasts, FAMILY, baseline=0.103)
+        reading = gate_module.dimension_in(report, "base", CASE, "time/q06")
+        percent = float(lines_for(report)["sensitivity"].split()[0])
+        loss = math.log1p(percent / 100)
+        step = math.log1p(reading["step"] / reading["base"])
+        mean_se = reading["sample_sd"] / math.sqrt(reading["units"])
+        power_upper_bound = 0.5 * math.erfc((step - loss) / (mean_se * math.sqrt(2)))
+        print(f"Counter-step sensitivity {percent:.2f} % loss, step-pass power {power_upper_bound:.4%}", flush=True)
+        self.assertGreaterEqual(power_upper_bound, 0.90)
+
 
 class LandingReport(unittest.TestCase):
     def report(self, root, contrasts, round_number=0, first=None, reuse_pass=None, fleet_host=None):
         passes_dir = root / "passes"
         passes_dir.mkdir(parents=True, exist_ok=True)
-        for p in measured_passes(contrasts):
+        for p in measured_passes(contrasts, round_number=round_number):
             p["report"]["timing_inputs"] = {"overlay": None, "floor": None}
             if fleet_host is None:
                 p["report"]["machine"].pop("fleet_host")
             elif p["n"] == 1:
                 p["report"]["machine"]["fleet_host"] = fleet_host
             p["report"]["machine"]["overlay"] = None
-            for row in [p["report"], *p["report"]["records"]]:
-                for key in ("started_ns", "finished_ns"):
-                    row[key] += round_number * 1_000_000
             path = passes_dir / p["path"]
             reading = json.loads(reuse_pass.read_bytes()) if reuse_pass and path.name == reuse_pass.name else p["report"]
             path.write_text(json.dumps(reading, indent=2 if reuse_pass else None), encoding="utf-8")
@@ -279,7 +297,7 @@ class LandingReport(unittest.TestCase):
                 "candidate": {"name": "cand", "revision": "d" * 40},
                 "baselines": {"base": "a" * 40},
                 "host": ["other-host"],
-                "family": FAMILY[:-1],
+                "lines": {h: row for h, row in first["lines"].items() if h != FAMILY[-1]},
             }.items():
                 with self.subTest(field=field):
                     path.write_text(json.dumps({**first, field: other}), encoding="utf-8")
@@ -287,6 +305,60 @@ class LandingReport(unittest.TestCase):
                     self.assertIn("round 1", error)
                     self.assertIn("does not match", error)
                     self.assertFalse((root / ("other-" + field) / "release-gate.json").exists())
+
+    def pair_report(self, round_number, change=None, **plan):
+        timed = measured_passes([0.05 + i * 0.001 for i in range(UNITS)], round_number=round_number)
+        if change:
+            change(timed)
+        return run_gate(timed, sides=SIDES, require=("base",),
+                        context={**CONTEXT, "round": round_number}, **plan)
+
+    # Spec: fix pass 2 G1 and design D1–D3 say a planned dimension unread in
+    # round 2 remains in the family and cannot invalidate the same-plan pair.
+    def test_matching_plans_pair_when_a_dimension_is_unread_in_round_two(self):
+        def measure_q07(timed):
+            for p in timed:
+                p["report"]["records"][0]["samples"]["q07"] = [10.123]
+
+        catalog = [{"name": CASE, "metric": "fixture", "sweep": [["q06"], ["q07"]]}]
+        first = self.pair_report(0, measure_q07, catalog=catalog)
+        second = self.pair_report(1, catalog=catalog)
+        try:
+            confirmed = gate_module.landing_pair(first, second)["confirmed"]
+        except ValueError as error:
+            confirmed = str(error)
+        self.assertEqual(confirmed, [MEASURED])
+        self.assertIn(f"base|{CASE}|time/q07", first["family"])
+        self.assertNotIn(f"base|{CASE}|time/q07", second["family"])
+
+    # Spec: fix pass 2 G2 and design D3 say a CPU policy change during either
+    # round makes the pair ineligible for confirmation.
+    def test_cpu_policy_change_refuses_the_pair(self):
+        def change_governor(timed):
+            timed[0]["report"].update(host_state={"frequency": {"governor": "performance"}},
+                                      host_state_finished={"frequency": {"governor": "powersave"}})
+
+        for changed in (0, 1):
+            with self.subTest(round=changed + 1):
+                first, second = [self.pair_report(k, change_governor if k == changed else None, family=[MEASURED])
+                                 for k in (0, 1)]
+                with self.assertRaisesRegex(ValueError, "host provenance"):
+                    gate_module.landing_pair(first, second)
+
+    # Spec: fix pass 2 G4 and design D3 say a rebuilt side with different binary
+    # contents cannot confirm a loss against readings from the original binary.
+    def test_different_verified_binaries_refuse_the_pair(self):
+        def rebuild_candidate(timed):
+            for p in timed:
+                if p["side"] == "cand":
+                    for key in ("binaries", "binaries_finished"):
+                        p["report"][key]["sha256"] = {"release/examples/perf_lab": "f" * 64}
+
+        first = self.pair_report(0, family=[MEASURED])
+        second = self.pair_report(1, rebuild_candidate, family=[MEASURED])
+        with self.assertRaisesRegex(ValueError, "binary"):
+            gate_module.landing_pair(first, second)
+        self.assertEqual((first["errors"], second["errors"]), ([], []))
 
     # Spec: fix pass 1 F3 and design D3 say even one reused pass makes a pair
     # ineligible for confirmation, including a copy written with different formatting.
