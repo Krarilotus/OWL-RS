@@ -1323,14 +1323,12 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> ViewEnd {
     ViewEnd::Kept(view)
 }
 
-/// Whether the RL rules prove `snapshot`'s data consistent: its version's certificate says
-/// they assessed this revision, as the rebuild that assessed it installed it or a gated commit
-/// carried it from its base (`tx.vouch`), and found no violation. No certificate (data loaded
-/// past the gates, a replica, a commit that didn't maintain the closure) or violations, decided
-/// or not, prove nothing. A field read of the version, no lock. Where they prove it, an
-/// ill-typed literal still makes it unknown ([`holds_ill_typed`]).
+/// The RL rules prove consistency only on a vouched DL version with a consistent assessment.
+/// An ill-typed literal can still make the DL verdict unknown ([`holds_ill_typed`]).
 pub(crate) fn rules_prove(snapshot: &Snapshot) -> bool {
-    crate::service::Certificate::of(snapshot).is_some_and(|c| c.dl && c.state.violations == 0)
+    use crate::service::Certificate;
+    Certificate::of(snapshot).is_some_and(|c| c.dl)
+        && Certificate::assessment(snapshot, false).rules == crate::ConsistencyStatus::Consistent
 }
 
 /// Whether `snapshot`'s version holds an ill-typed literal, which OWL 2 doesn't admit; `None`

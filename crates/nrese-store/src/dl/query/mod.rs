@@ -949,8 +949,8 @@ fn lowerings(
     }
     // From the snapshot as given: a restricted reader's is dropped below.
     let quarantined = snapshot
-        .and_then(crate::service::Certificate::of)
-        .is_some_and(|c| c.state.violations > 0);
+        .filter(|s| crate::service::Certificate::of(s).is_some())
+        .is_some_and(|s| crate::service::Certificate::assessment(s, false).held);
     let given = snapshot;
     let snapshot = snapshot.filter(|_| access.is_none());
     let typed = |predicate: &Option<String>| {
