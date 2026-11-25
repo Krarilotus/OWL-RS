@@ -41,6 +41,7 @@ pub use mapping::{
     BUILTIN_ANNOTATIONS, BuiltinProperties, DECLARATION_KINDS, Ontology, Source, Statement,
     TermKind, Terms, is_shacl_property, may_name_annotation, read, read_beside, shacl_properties,
 };
+pub use membership::membership;
 pub use model::{
     Axiom, Characteristic, ClassExpr, DataRange, DataTerms, EntityKind, ExprId, Interner, Literal,
     ObjProp, RangeId, Term,

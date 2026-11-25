@@ -309,7 +309,9 @@ pub(crate) fn complete(ontology: &mut Ontology, terms: &dyn Terms, membership: b
         .chain(in_expressions(ontology))
         .filter(|&t| terms.kind(t) == TermKind::Blank)
         .collect();
-    crate::diagnostics::check_global_restrictions(ontology, membership);
+    let mut found = Vec::new();
+    crate::diagnostics::check_global_restrictions(ontology, membership, &mut found);
+    ontology.diagnostics.extend(found);
     // An unused structure that is also an individual: an equality the rules derive may give
     // it a second structure's statements (`Reader::reads_more`).
     for d in &mut ontology.diagnostics {

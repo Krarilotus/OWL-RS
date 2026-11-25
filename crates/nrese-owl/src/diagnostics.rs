@@ -387,18 +387,20 @@ impl Diagnostic {
 /// §11.1): a chain's or a transitive property's superproperty, and
 /// `owl:topObjectProperty` and `owl:bottomObjectProperty`. The bottom seed belongs to
 /// the stored ontology's membership check.
-pub(crate) fn check_global_restrictions(ontology: &mut Ontology, membership: bool) {
+pub(crate) fn check_global_restrictions(
+    ontology: &Ontology,
+    membership: bool,
+    out: &mut Vec<Diagnostic>,
+) {
     if let Some((lower, upper)) = impossible_role_order(ontology) {
-        ontology
-            .diagnostics
-            .push(Diagnostic::IrregularPropertyHierarchy { lower, upper });
+        out.push(Diagnostic::IrregularPropertyHierarchy { lower, upper });
     }
     // Nominals and `hasValue` take named individuals only (§11.2).
     let anonymous: BTreeSet<Term> = crate::mapping::in_expressions(ontology)
         .filter(|t| ontology.anonymous.contains(t))
         .collect();
     for node in anonymous {
-        ontology.diagnostics.push(Diagnostic::AnonymousIndividual {
+        out.push(Diagnostic::AnonymousIndividual {
             node,
             what: "a blank node in oneOf or hasValue",
             axioms: [None; 2],
@@ -505,7 +507,7 @@ pub(crate) fn check_global_restrictions(ontology: &mut Ontology, membership: boo
             }
         }
     }
-    ontology.diagnostics.extend(found);
+    out.extend(found);
 }
 
 /// The first impossible pair in the least strict order required by §11.2.

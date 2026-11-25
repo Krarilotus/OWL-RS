@@ -2,7 +2,23 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::{Axiom, DataRange, Diagnostic, Ontology, RangeId, Term, Terms};
+use crate::{Axiom, DataRange, Diagnostic, Ontology, RangeId, Term, Terms, Treatment};
+
+/// Runs OWL 2 DL membership and typing checks over `ontology`, returning
+/// findings without mutating it.
+pub fn membership(ontology: &Ontology, terms: &dyn Terms) -> Vec<Diagnostic> {
+    let mut found = Vec::new();
+    crate::diagnostics::check_global_restrictions(ontology, true, &mut found);
+    let (two_kinds, more) = crate::typing::check(ontology, Some(terms));
+    found.extend(more);
+    found.extend(two_kinds.into_iter().map(|t| Diagnostic::TwoKinds {
+        term: t.term,
+        kinds: t.kinds,
+        by_axiom: t.by_axiom,
+        treatment: Treatment::Fatal,
+    }));
+    found
+}
 
 pub(crate) struct Membership<'a> {
     ontology: &'a Ontology,
