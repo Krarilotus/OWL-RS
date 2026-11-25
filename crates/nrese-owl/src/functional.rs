@@ -86,6 +86,21 @@ struct Functional<'a> {
     name: &'a dyn Fn(Term) -> String,
 }
 
+/// A class expression or a data range, as [`Functional::print`] prints it.
+#[derive(Clone, Copy)]
+enum Part {
+    Class(ExprId),
+    Range(RangeId),
+}
+
+/// A part's text ([`Functional::shape`]): whole; up to its one operand; or up to its set of
+/// operands, which print in text order.
+enum Shape {
+    Text(String),
+    Unary(String, Part),
+    Set(&'static str, Vec<Part>),
+}
+
 impl Functional<'_> {
     fn n(&self, term: Term) -> String {
         (self.name)(term)
@@ -115,42 +130,7 @@ impl Functional<'_> {
     }
 
     fn c(&self, id: ExprId) -> String {
-        match self.ontology.class(id) {
-            ClassExpr::Class(t) => self.n(*t),
-            ClassExpr::Thing => "owl:Thing".to_owned(),
-            ClassExpr::Nothing => "owl:Nothing".to_owned(),
-            ClassExpr::And(xs) => format!("ObjectIntersectionOf({})", self.cs(xs)),
-            ClassExpr::Or(xs) => format!("ObjectUnionOf({})", self.cs(xs)),
-            ClassExpr::Not(x) => format!("ObjectComplementOf({})", self.c(*x)),
-            ClassExpr::OneOf(xs) => format!("ObjectOneOf({})", self.terms(xs)),
-            ClassExpr::Some(p, x) => format!("ObjectSomeValuesFrom({} {})", self.p(*p), self.c(*x)),
-            ClassExpr::All(p, x) => format!("ObjectAllValuesFrom({} {})", self.p(*p), self.c(*x)),
-            ClassExpr::HasValue(p, a) => format!("ObjectHasValue({} {})", self.p(*p), self.n(*a)),
-            ClassExpr::HasSelf(p) => format!("ObjectHasSelf({})", self.p(*p)),
-            ClassExpr::Min(n, p, x) => {
-                format!("ObjectMinCardinality({n} {} {})", self.p(*p), self.c(*x))
-            }
-            ClassExpr::Max(n, p, x) => {
-                format!("ObjectMaxCardinality({n} {} {})", self.p(*p), self.c(*x))
-            }
-            ClassExpr::Exact(n, p, x) => {
-                format!("ObjectExactCardinality({n} {} {})", self.p(*p), self.c(*x))
-            }
-            ClassExpr::DataSome(p, r) => {
-                format!("DataSomeValuesFrom({} {})", self.n(*p), self.r(*r))
-            }
-            ClassExpr::DataAll(p, r) => format!("DataAllValuesFrom({} {})", self.n(*p), self.r(*r)),
-            ClassExpr::DataHasValue(p, v) => format!("DataHasValue({} {})", self.n(*p), self.n(*v)),
-            ClassExpr::DataMin(n, p, r) => {
-                format!("DataMinCardinality({n} {} {})", self.n(*p), self.r(*r))
-            }
-            ClassExpr::DataMax(n, p, r) => {
-                format!("DataMaxCardinality({n} {} {})", self.n(*p), self.r(*r))
-            }
-            ClassExpr::DataExact(n, p, r) => {
-                format!("DataExactCardinality({n} {} {})", self.n(*p), self.r(*r))
-            }
-        }
+        self.print(Part::Class(id))
     }
 
     /// Operands in a stable order: by their text (ids differ between readings).
@@ -161,14 +141,121 @@ impl Functional<'_> {
     }
 
     fn r(&self, id: RangeId) -> String {
+        self.print(Part::Range(id))
+    }
+
+    /// `part` printed with a stack of its own (the nesting depth is no call depth): a single
+    /// operand straight into its parent's text, each operand of a set into a text of its
+    /// own, the set's in text order once all are printed ([`Self::cs`]).
+    fn print(&self, part: Part) -> String {
+        enum Task {
+            Print(Part),
+            Text(&'static str),
+            Member(Part),
+            Join(usize),
+        }
+        let mut texts = vec![String::new()];
+        let mut tasks = vec![Task::Print(part)];
+        while let Some(task) = tasks.pop() {
+            let text = texts.last_mut().expect("a text to print into");
+            match task {
+                Task::Print(part) => match self.shape(part) {
+                    Shape::Text(t) => text.push_str(&t),
+                    Shape::Unary(before, operand) => {
+                        text.push_str(&before);
+                        tasks.extend([Task::Text(")"), Task::Print(operand)]);
+                    }
+                    Shape::Set(before, operands) => {
+                        text.push_str(before);
+                        tasks.extend([Task::Text(")"), Task::Join(operands.len())]);
+                        tasks.extend(operands.into_iter().rev().map(Task::Member));
+                    }
+                },
+                Task::Text(t) => text.push_str(t),
+                Task::Member(part) => {
+                    texts.push(String::new());
+                    tasks.push(Task::Print(part));
+                }
+                Task::Join(n) => {
+                    let mut members = texts.split_off(texts.len() - n);
+                    members.sort();
+                    let text = texts.last_mut().expect("the set's text");
+                    text.push_str(&members.join(" "));
+                }
+            }
+        }
+        texts.pop().expect("the printed text")
+    }
+
+    /// How `part` prints: whole, or up to its class or range operands, each closed by `)`.
+    fn shape(&self, part: Part) -> Shape {
+        let (c, r) = (Part::Class, Part::Range);
+        let id = match part {
+            Part::Class(id) => id,
+            Part::Range(id) => return self.range_shape(id),
+        };
+        match self.ontology.class(id) {
+            ClassExpr::Class(t) => Shape::Text(self.n(*t)),
+            ClassExpr::Thing => Shape::Text("owl:Thing".to_owned()),
+            ClassExpr::Nothing => Shape::Text("owl:Nothing".to_owned()),
+            ClassExpr::And(xs) => {
+                Shape::Set("ObjectIntersectionOf(", xs.iter().map(|&x| c(x)).collect())
+            }
+            ClassExpr::Or(xs) => Shape::Set("ObjectUnionOf(", xs.iter().map(|&x| c(x)).collect()),
+            ClassExpr::Not(x) => Shape::Unary("ObjectComplementOf(".to_owned(), c(*x)),
+            ClassExpr::OneOf(xs) => Shape::Text(format!("ObjectOneOf({})", self.terms(xs))),
+            ClassExpr::Some(p, x) => {
+                Shape::Unary(format!("ObjectSomeValuesFrom({} ", self.p(*p)), c(*x))
+            }
+            ClassExpr::All(p, x) => {
+                Shape::Unary(format!("ObjectAllValuesFrom({} ", self.p(*p)), c(*x))
+            }
+            ClassExpr::HasValue(p, a) => {
+                Shape::Text(format!("ObjectHasValue({} {})", self.p(*p), self.n(*a)))
+            }
+            ClassExpr::HasSelf(p) => Shape::Text(format!("ObjectHasSelf({})", self.p(*p))),
+            ClassExpr::Min(n, p, x) => {
+                Shape::Unary(format!("ObjectMinCardinality({n} {} ", self.p(*p)), c(*x))
+            }
+            ClassExpr::Max(n, p, x) => {
+                Shape::Unary(format!("ObjectMaxCardinality({n} {} ", self.p(*p)), c(*x))
+            }
+            ClassExpr::Exact(n, p, x) => {
+                Shape::Unary(format!("ObjectExactCardinality({n} {} ", self.p(*p)), c(*x))
+            }
+            ClassExpr::DataSome(p, x) => {
+                Shape::Unary(format!("DataSomeValuesFrom({} ", self.n(*p)), r(*x))
+            }
+            ClassExpr::DataAll(p, x) => {
+                Shape::Unary(format!("DataAllValuesFrom({} ", self.n(*p)), r(*x))
+            }
+            ClassExpr::DataHasValue(p, v) => {
+                Shape::Text(format!("DataHasValue({} {})", self.n(*p), self.n(*v)))
+            }
+            ClassExpr::DataMin(n, p, x) => {
+                Shape::Unary(format!("DataMinCardinality({n} {} ", self.n(*p)), r(*x))
+            }
+            ClassExpr::DataMax(n, p, x) => {
+                Shape::Unary(format!("DataMaxCardinality({n} {} ", self.n(*p)), r(*x))
+            }
+            ClassExpr::DataExact(n, p, x) => {
+                Shape::Unary(format!("DataExactCardinality({n} {} ", self.n(*p)), r(*x))
+            }
+        }
+    }
+
+    fn range_shape(&self, id: RangeId) -> Shape {
+        let r = Part::Range;
         match self.ontology.range(id) {
-            DataRange::Literal => "rdfs:Literal".to_owned(),
-            DataRange::Datatype(t) => self.n(*t),
-            DataRange::And(xs) => format!("DataIntersectionOf({})", self.rs(xs)),
-            DataRange::Or(xs) => format!("DataUnionOf({})", self.rs(xs)),
-            DataRange::Not(x) => format!("DataComplementOf({})", self.r(*x)),
-            DataRange::OneOf(xs) => format!("DataOneOf({})", self.terms(xs)),
-            DataRange::Restriction(d, facets) => format!(
+            DataRange::Literal => Shape::Text("rdfs:Literal".to_owned()),
+            DataRange::Datatype(t) => Shape::Text(self.n(*t)),
+            DataRange::And(xs) => {
+                Shape::Set("DataIntersectionOf(", xs.iter().map(|&x| r(x)).collect())
+            }
+            DataRange::Or(xs) => Shape::Set("DataUnionOf(", xs.iter().map(|&x| r(x)).collect()),
+            DataRange::Not(x) => Shape::Unary("DataComplementOf(".to_owned(), r(*x)),
+            DataRange::OneOf(xs) => Shape::Text(format!("DataOneOf({})", self.terms(xs))),
+            DataRange::Restriction(d, facets) => Shape::Text(format!(
                 "DatatypeRestriction({} {})",
                 self.n(*d),
                 facets
@@ -176,14 +263,8 @@ impl Functional<'_> {
                     .map(|&(f, v)| format!("{} {}", self.n(f), self.n(v)))
                     .collect::<Vec<_>>()
                     .join(" ")
-            ),
+            )),
         }
-    }
-
-    fn rs(&self, xs: &[RangeId]) -> String {
-        let mut parts: Vec<String> = xs.iter().map(|&x| self.r(x)).collect();
-        parts.sort();
-        parts.join(" ")
     }
 
     fn rule(&self, rule: &crate::rules::Rule) -> String {

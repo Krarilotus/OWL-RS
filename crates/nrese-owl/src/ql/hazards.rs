@@ -216,7 +216,18 @@ struct Collect<'a> {
 }
 
 impl Collect<'_> {
+    /// Walked with a stack of its own (the nesting depth is no call depth): each
+    /// expression's hazards, then its operands', from the left.
     fn walk(&mut self, e: ExprId, place: Place) {
+        let mut stack = vec![(e, place)];
+        while let Some((e, place)) = stack.pop() {
+            self.walk_one(e, place, &mut stack);
+        }
+    }
+
+    /// One expression of [`Self::walk`]: its own hazards, and its operands onto `stack`,
+    /// the first on top.
+    fn walk_one(&mut self, e: ExprId, place: Place, stack: &mut Vec<(ExprId, Place)>) {
         let o = self.o;
         let partial = |c: &mut Self| {
             if let Place::Right(Some(role)) = place {
@@ -236,9 +247,7 @@ impl Collect<'_> {
                 } else {
                     place
                 };
-                for &p in parts {
-                    self.walk(p, inner);
-                }
+                stack.extend(parts.iter().rev().map(|&p| (p, inner)));
             }
             ClassExpr::Or(parts) => {
                 partial(self);
@@ -247,13 +256,11 @@ impl Collect<'_> {
                 } else {
                     place
                 };
-                for &p in parts {
-                    self.walk(p, inner);
-                }
+                stack.extend(parts.iter().rev().map(|&p| (p, inner)));
             }
             ClassExpr::Not(inner) => {
                 partial(self);
-                self.walk(*inner, Place::Left);
+                stack.push((*inner, Place::Left));
             }
             ClassExpr::OneOf(_) => partial(self),
             // On the left, `≥ 0 R.C` is `⊤` and `≥ n R.C` for n ≥ 2 isn't read (`Tbox`'s
@@ -262,7 +269,7 @@ impl Collect<'_> {
             ClassExpr::Min(n, p, f) if *n != 1 && matches!(place, Place::LeftTop | Place::Left) => {
                 if *n >= 2 || place == Place::Left {
                     self.found.push(Hazard::LeftMinimum(p.named()));
-                    self.walk(*f, Place::Left);
+                    stack.push((*f, Place::Left));
                 }
             }
             ClassExpr::Some(p, f) | ClassExpr::Min(_, p, f) => {
@@ -271,9 +278,9 @@ impl Collect<'_> {
                     Place::LeftTop if thing => {}
                     Place::LeftTop | Place::Left => {
                         self.found.push(Hazard::LeftExistential(p.named()));
-                        self.walk(*f, Place::Left);
+                        stack.push((*f, Place::Left));
                     }
-                    Place::Right(_) => self.walk(*f, Place::Right(Some(p.named()))),
+                    Place::Right(_) => stack.push((*f, Place::Right(Some(p.named())))),
                 }
             }
             ClassExpr::Exact(_, p, f) | ClassExpr::Max(_, p, f) => {
@@ -283,12 +290,12 @@ impl Collect<'_> {
                 let mut counted = Vec::new();
                 terms(o, *f, &mut counted);
                 self.counted.extend(counted.into_iter().map(|t| (t, h)));
-                self.walk(*f, Place::Left);
+                stack.push((*f, Place::Left));
             }
             ClassExpr::All(p, f) => {
                 partial(self);
                 self.found.push(Hazard::Universal(p.named()));
-                self.walk(*f, Place::Left);
+                stack.push((*f, Place::Left));
             }
             ClassExpr::HasValue(p, _) => {
                 partial(self);
@@ -319,32 +326,32 @@ impl Collect<'_> {
     }
 }
 
-/// The named classes and properties of an expression.
+/// The named classes and properties of an expression, in the order of a walk from the
+/// left, with a stack of its own (the nesting depth is no call depth).
 fn terms(o: &Ontology, e: ExprId, out: &mut Vec<Term>) {
-    match o.class(e) {
-        ClassExpr::Class(c) => out.push(*c),
-        ClassExpr::Thing | ClassExpr::Nothing | ClassExpr::OneOf(_) => {}
-        ClassExpr::And(parts) | ClassExpr::Or(parts) => {
-            for &p in parts {
-                terms(o, p, out);
+    let mut stack = vec![e];
+    while let Some(e) = stack.pop() {
+        match o.class(e) {
+            ClassExpr::Class(c) => out.push(*c),
+            ClassExpr::Thing | ClassExpr::Nothing | ClassExpr::OneOf(_) => {}
+            ClassExpr::And(parts) | ClassExpr::Or(parts) => stack.extend(parts.iter().rev()),
+            ClassExpr::Not(inner) => stack.push(*inner),
+            ClassExpr::Some(p, f)
+            | ClassExpr::All(p, f)
+            | ClassExpr::Min(_, p, f)
+            | ClassExpr::Max(_, p, f)
+            | ClassExpr::Exact(_, p, f) => {
+                out.push(p.named());
+                stack.push(*f);
             }
+            ClassExpr::HasValue(p, _) | ClassExpr::HasSelf(p) => out.push(p.named()),
+            ClassExpr::DataSome(p, _)
+            | ClassExpr::DataAll(p, _)
+            | ClassExpr::DataHasValue(p, _)
+            | ClassExpr::DataMin(_, p, _)
+            | ClassExpr::DataMax(_, p, _)
+            | ClassExpr::DataExact(_, p, _) => out.push(*p),
         }
-        ClassExpr::Not(inner) => terms(o, *inner, out),
-        ClassExpr::Some(p, f)
-        | ClassExpr::All(p, f)
-        | ClassExpr::Min(_, p, f)
-        | ClassExpr::Max(_, p, f)
-        | ClassExpr::Exact(_, p, f) => {
-            out.push(p.named());
-            terms(o, *f, out);
-        }
-        ClassExpr::HasValue(p, _) | ClassExpr::HasSelf(p) => out.push(p.named()),
-        ClassExpr::DataSome(p, _)
-        | ClassExpr::DataAll(p, _)
-        | ClassExpr::DataHasValue(p, _)
-        | ClassExpr::DataMin(_, p, _)
-        | ClassExpr::DataMax(_, p, _)
-        | ClassExpr::DataExact(_, p, _) => out.push(*p),
     }
 }
 
@@ -865,19 +872,20 @@ fn open_axiom(
 /// it: no membership of its classes, no edge of its properties. Conservative: a part that
 /// is negative or bounded above may hold without either.
 fn needs_no_term(o: &Ontology, e: ExprId) -> bool {
-    match o.class(e) {
+    use crate::walk::Holds::{All, Any, Is};
+    crate::walk::holds(e, (), |e, ()| match o.class(e) {
         ClassExpr::Thing
         | ClassExpr::Not(_)
         | ClassExpr::All(..)
         | ClassExpr::Max(..)
         | ClassExpr::DataAll(..)
-        | ClassExpr::DataMax(..) => true,
+        | ClassExpr::DataMax(..) => Is(true),
         ClassExpr::Min(n, ..)
         | ClassExpr::Exact(n, ..)
         | ClassExpr::DataMin(n, ..)
-        | ClassExpr::DataExact(n, ..) => *n == 0,
-        ClassExpr::And(parts) => parts.iter().all(|&p| needs_no_term(o, p)),
-        ClassExpr::Or(parts) => parts.iter().any(|&p| needs_no_term(o, p)),
+        | ClassExpr::DataExact(n, ..) => Is(*n == 0),
+        ClassExpr::And(parts) => All(parts, ()),
+        ClassExpr::Or(parts) => Any(parts, ()),
         ClassExpr::Nothing
         | ClassExpr::Class(_)
         | ClassExpr::OneOf(_)
@@ -885,29 +893,31 @@ fn needs_no_term(o: &Ontology, e: ExprId) -> bool {
         | ClassExpr::HasValue(..)
         | ClassExpr::HasSelf(_)
         | ClassExpr::DataSome(..)
-        | ClassExpr::DataHasValue(..) => false,
-    }
+        | ClassExpr::DataHasValue(..) => Is(false),
+    })
 }
 
 /// Whether the TBox reads left side `e` as `⊤` (`Tbox`'s left sides: `⊤`, `≥ 0 R.C`, and a
 /// union with such a part).
 fn read_as_top(o: &Ontology, e: ExprId) -> bool {
-    match o.class(e) {
-        ClassExpr::Thing | ClassExpr::Min(0, ..) => true,
-        ClassExpr::Or(parts) => parts.iter().any(|&p| read_as_top(o, p)),
-        _ => false,
-    }
+    use crate::walk::Holds::{Any, Is};
+    crate::walk::holds(e, (), |e, ()| match o.class(e) {
+        ClassExpr::Thing | ClassExpr::Min(0, ..) => Is(true),
+        ClassExpr::Or(parts) => Any(parts, ()),
+        _ => Is(false),
+    })
 }
 
 /// Whether the TBox reads right side `e` whole: no hazard in it, and no union, enumeration
 /// or complement outside an existential.
 fn read_on_right(o: &Ontology, e: ExprId) -> bool {
     fn plain(o: &Ontology, e: ExprId) -> bool {
-        match o.class(e) {
-            ClassExpr::Or(_) | ClassExpr::OneOf(_) | ClassExpr::Not(_) => false,
-            ClassExpr::And(parts) => parts.iter().all(|&p| plain(o, p)),
-            _ => true,
-        }
+        use crate::walk::Holds::{All, Is};
+        crate::walk::holds(e, (), |e, ()| match o.class(e) {
+            ClassExpr::Or(_) | ClassExpr::OneOf(_) | ClassExpr::Not(_) => Is(false),
+            ClassExpr::And(parts) => All(parts, ()),
+            _ => Is(true),
+        })
     }
     let mut collect = Collect {
         o,
@@ -918,15 +928,22 @@ fn read_on_right(o: &Ontology, e: ExprId) -> bool {
     collect.found.is_empty() && plain(o, e)
 }
 
-/// An individual of an enumeration in `e` outside an existential, if there is one.
+/// An individual of an enumeration in `e` outside an existential, if there is one: the
+/// first from the left, found with a stack of its own (the nesting depth is no call depth).
 fn enumerated(o: &Ontology, e: ExprId) -> Option<Term> {
-    match o.class(e) {
-        ClassExpr::OneOf(individuals) => individuals.first().copied(),
-        ClassExpr::And(parts) | ClassExpr::Or(parts) => {
-            parts.iter().find_map(|&p| enumerated(o, p))
+    let mut stack = vec![e];
+    while let Some(e) = stack.pop() {
+        match o.class(e) {
+            ClassExpr::OneOf(individuals) => {
+                if let Some(&individual) = individuals.first() {
+                    return Some(individual);
+                }
+            }
+            ClassExpr::And(parts) | ClassExpr::Or(parts) => stack.extend(parts.iter().rev()),
+            _ => {}
         }
-        _ => None,
     }
+    None
 }
 
 /// The roles of the existentials (`∃`, `≥ n`) in an expression ([`generated`]).
@@ -954,7 +971,7 @@ fn existential_roles(o: &Ontology, e: ExprId, out: &mut Vec<Term>) {
 /// role no individual is made for, never miss one. Under a bound, whose filler is read both
 /// ways, each (expression, polarity) is walked once, so nested bounds don't double the walk
 /// at each level; elsewhere the walk follows the expression as before and allocates
-/// nothing (#155's count: a set per walk cost 3.9 % of a compile over 1,000 asserted
+/// only its stack (#155's count: a set per walk cost 3.9 % of a compile over 1,000 asserted
 /// restrictions). A successor's filler terms are still collected per restriction that
 /// makes one.
 fn generated(
@@ -978,75 +995,73 @@ fn nnf(
     mut fillers: Option<&mut Vec<Term>>,
 ) {
     use ClassExpr as C;
-    if bounded && !seen.insert((e, positive)) {
-        return;
-    }
-    // An object restriction: its role and filler, whether it makes a successor, and
-    // whether its filler (`inside`) or the filler's complement (`outside`) holds of one.
-    let (p, f, makes, inside, outside) = match (o.class(e), positive) {
-        (
-            C::Thing
-            | C::Nothing
-            | C::Class(_)
-            | C::OneOf(_)
-            | C::HasValue(..)
-            | C::HasSelf(_)
-            | C::DataHasValue(..),
-            _,
-        ) => return,
-        (C::And(parts) | C::Or(parts), _) => {
-            for &part in parts {
-                nnf(
-                    o,
-                    part,
-                    positive,
-                    bounded,
-                    seen,
-                    roles,
-                    fillers.as_deref_mut(),
-                );
+    // Its own stack, operands from the left (the nesting depth is no call depth).
+    let mut stack = vec![(e, positive, bounded)];
+    while let Some((e, positive, bounded)) = stack.pop() {
+        if bounded && !seen.insert((e, positive)) {
+            continue;
+        }
+        // An object restriction: its role and filler, whether it makes a successor, and
+        // whether its filler (`inside`) or the filler's complement (`outside`) holds of one.
+        let (p, f, makes, inside, outside) = match (o.class(e), positive) {
+            (
+                C::Thing
+                | C::Nothing
+                | C::Class(_)
+                | C::OneOf(_)
+                | C::HasValue(..)
+                | C::HasSelf(_)
+                | C::DataHasValue(..),
+                _,
+            ) => continue,
+            (C::And(parts) | C::Or(parts), _) => {
+                stack.extend(parts.iter().rev().map(|&part| (part, positive, bounded)));
+                continue;
             }
-            return;
-        }
-        (C::Not(inner), _) => return nnf(o, *inner, !positive, bounded, seen, roles, fillers),
-        (C::DataSome(p, _), true)
-        | (C::DataAll(p, _), false)
-        | (C::DataMax(_, p, _), false)
-        | (C::DataExact(_, p, _), false) => {
-            roles.push(*p);
-            return;
-        }
-        (C::DataMin(n, p, _) | C::DataExact(n, p, _), true) => {
-            if *n >= 1 {
+            (C::Not(inner), _) => {
+                stack.push((*inner, !positive, bounded));
+                continue;
+            }
+            (C::DataSome(p, _), true)
+            | (C::DataAll(p, _), false)
+            | (C::DataMax(_, p, _), false)
+            | (C::DataExact(_, p, _), false) => {
                 roles.push(*p);
+                continue;
             }
-            return;
+            (C::DataMin(n, p, _) | C::DataExact(n, p, _), true) => {
+                if *n >= 1 {
+                    roles.push(*p);
+                }
+                continue;
+            }
+            (C::DataSome(..), false)
+            | (C::DataAll(..), true)
+            | (C::DataMin(..), false)
+            | (C::DataMax(..), true) => continue,
+            (C::Some(p, f), true) => (p, f, true, true, false),
+            (C::Some(p, f), false) => (p, f, false, false, true),
+            (C::All(p, f), true) => (p, f, false, true, false),
+            (C::All(p, f), false) => (p, f, true, false, true),
+            (C::Min(n, p, f), true) => (p, f, *n >= 1, true, false),
+            (C::Min(_, p, f), false) | (C::Max(_, p, f), true) => (p, f, false, true, true),
+            (C::Max(_, p, f), false) => (p, f, true, true, false),
+            (C::Exact(n, p, f), true) => (p, f, *n >= 1, true, true),
+            (C::Exact(_, p, f), false) => (p, f, true, true, true),
+        };
+        if makes {
+            roles.push(p.named());
+            if let Some(fillers) = fillers.as_deref_mut() {
+                terms(o, *f, fillers);
+            }
         }
-        (C::DataSome(..), false)
-        | (C::DataAll(..), true)
-        | (C::DataMin(..), false)
-        | (C::DataMax(..), true) => return,
-        (C::Some(p, f), true) => (p, f, true, true, false),
-        (C::Some(p, f), false) => (p, f, false, false, true),
-        (C::All(p, f), true) => (p, f, false, true, false),
-        (C::All(p, f), false) => (p, f, true, false, true),
-        (C::Min(n, p, f), true) => (p, f, *n >= 1, true, false),
-        (C::Min(_, p, f), false) | (C::Max(_, p, f), true) => (p, f, false, true, true),
-        (C::Max(_, p, f), false) => (p, f, true, true, false),
-        (C::Exact(n, p, f), true) => (p, f, *n >= 1, true, true),
-        (C::Exact(_, p, f), false) => (p, f, true, true, true),
-    };
-    if makes {
-        roles.push(p.named());
-        if let Some(fillers) = fillers.as_deref_mut() {
-            terms(o, *f, fillers);
+        let bounded = bounded || (inside && outside);
+        // The filler's complement after the filler itself.
+        if outside {
+            stack.push((*f, false, bounded));
         }
-    }
-    let bounded = bounded || (inside && outside);
-    if inside {
-        nnf(o, *f, true, bounded, seen, roles, fillers.as_deref_mut());
-    }
-    if outside {
-        nnf(o, *f, false, bounded, seen, roles, fillers);
+        if inside {
+            stack.push((*f, true, bounded));
+        }
     }
 }
