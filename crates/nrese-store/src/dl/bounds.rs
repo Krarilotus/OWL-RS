@@ -32,7 +32,7 @@ use nrese_reasoner::eval::Stop;
 use nrese_reasoner::ir::Triple;
 
 use super::source;
-use super::upper::{Change, GaveUp, Upper};
+use super::upper::{Change, GaveUp, ProgramFacts, Upper};
 use crate::StoreService;
 
 #[cfg(test)]
@@ -59,6 +59,8 @@ mod shapes_tests;
 /// work, for the store whose bounds it names.
 #[cfg(test)]
 pub(crate) mod seam {
+    use std::cell::RefCell;
+    use std::sync::Arc;
     use std::sync::Mutex;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +73,8 @@ pub(crate) mod seam {
         BuildDeadline,
         /// The TBox's taxonomy for a read, not begun.
         Taxonomy,
+        /// A read filtered the program facts and has yet to recheck the revision.
+        Eligible,
         /// A revision's read view, not begun.
         View,
         /// A commit's ontology read again, not begun.
@@ -80,6 +84,42 @@ pub(crate) mod seam {
     type Hook = Box<dyn FnOnce() + Send>;
     /// One hook a store and point: tests running at once, each on its own store, keep theirs.
     static HOOKS: Mutex<Vec<(usize, Point, Hook)>> = Mutex::new(Vec::new());
+
+    struct Probes {
+        store: Arc<super::StoreService>,
+        total: usize,
+        locked: usize,
+    }
+
+    thread_local! {
+        static PROBES: RefCell<Option<Probes>> = const { RefCell::new(None) };
+    }
+
+    /// Counts the read's probes on this thread, and which found its store's state locked.
+    pub(super) fn count_probes(
+        store: &Arc<super::StoreService>,
+        read: impl FnOnce(),
+    ) -> (usize, usize) {
+        PROBES.set(Some(Probes {
+            store: Arc::clone(store),
+            total: 0,
+            locked: 0,
+        }));
+        read();
+        let probes = PROBES.take().unwrap();
+        (probes.total, probes.locked)
+    }
+
+    pub(super) fn snapshot_probe() {
+        PROBES.with_borrow_mut(|probes| {
+            if let Some(probes) = probes {
+                probes.total += 1;
+                if probes.store.dl().bounds.state.try_lock().is_err() {
+                    probes.locked += 1;
+                }
+            }
+        });
+    }
 
     fn key(bounds: &super::Bounds) -> usize {
         std::ptr::from_ref(bounds) as usize
@@ -111,8 +151,8 @@ pub(crate) mod seam {
 struct State {
     revision: u64,
     /// Shared only with the commit computing its change ([`prepare`]), which lets go
-    /// before [`install`] changes it in place: a read takes what it needs of U1 under the
-    /// bounds' state, never keeping it.
+    /// before [`install`] changes it in place. A read keeps only the immutable
+    /// [`ProgramFacts`] while filtering outside the lock.
     upper: Result<Arc<Upper>, GaveUp>,
     /// How U1 got to this revision: `delta` (the delta executor), `rebuilt` (compiled
     /// and evaluated afresh on commit), `read` (afresh for a query), `kept` (U1 gave up
@@ -1001,6 +1041,8 @@ fn held_by_lower(
 }
 
 fn in_view(view: &Snapshot, [s, p, o]: Triple) -> bool {
+    #[cfg(test)]
+    seam::snapshot_probe();
     view.quads_for_pattern_in(
         ReadModel::Materialised,
         &nrese_engine::QuadPattern {
@@ -1204,7 +1246,7 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> ViewEnd {
         }
     };
     drop(stale);
-    // The bounds' U1 at the revision: its compilation, route, `rdf:type`, taxonomy.
+    // The bounds' U1 at the revision: its compilation, route, program facts and taxonomy.
     let found = {
         let state = lock(&bounds.state);
         match state.as_ref() {
@@ -1214,6 +1256,7 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> ViewEnd {
                 s.kinds.is_some(),
                 s.upper.as_ref().ok().map(|u| u.program.names.rdf_type),
                 s.taxonomy.clone(),
+                s.upper.as_deref().ok().map(|u| Arc::clone(u.facts())),
             )),
             _ => None,
         }
@@ -1225,7 +1268,7 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> ViewEnd {
         super::lower::memberships(snapshot, taxonomy, rdf_type, kept).ok()
     };
     let parts = match found {
-        Some((compiled, rules, rdf_type, kept_taxonomy)) => {
+        Some((compiled, rules, rdf_type, kept_taxonomy, facts)) => {
             let lower = match rdf_type {
                 Some(rdf_type) if !rules => {
                     // Held, with its charge, while its memberships are read.
@@ -1236,9 +1279,11 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> ViewEnd {
                 _ => Some(ChargedVec::new(Arc::clone(kept))),
             };
             match lower {
-                // Serial: what the view takes of U1, under the state (a commit's install
-                // may change U1 in place once it is let go).
                 Some(lower) => {
+                    let eligible = facts.and_then(|facts| eligible_facts(snapshot, &facts, kept));
+                    #[cfg(test)]
+                    seam::at(bounds, seam::Point::Eligible);
+                    // The stack may have moved on while the program facts were filtered.
                     let state = lock(&bounds.state);
                     let Some(s) = state
                         .as_ref()
@@ -1252,6 +1297,7 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> ViewEnd {
                         s.upper.as_deref(),
                         s.kinds.is_some(),
                         &lower,
+                        eligible,
                         kept,
                     )
                 }
@@ -1282,8 +1328,13 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> ViewEnd {
                 }
                 _ => Some(ChargedVec::new(Arc::clone(kept))),
             };
-            let parts = lower
-                .and_then(|lower| parts(snapshot, revision, upper.as_ref(), rules, &lower, kept));
+            let parts = lower.and_then(|lower| {
+                let upper = upper.as_ref();
+                let eligible = upper
+                    .ok()
+                    .and_then(|u| eligible_facts(snapshot, u.facts(), kept));
+                parts(snapshot, revision, upper, rules, &lower, eligible, kept)
+            });
             // A U1 a budget refused is not kept: the next read builds it again.
             let refused_upper = upper.as_ref().is_err_and(|g| g.refused);
             keep &= !refused_upper;
@@ -1589,10 +1640,29 @@ fn assemble(snapshot: &Snapshot, parts: Parts, kept: &Arc<nrese_exec::Budget>) -
     (view, true)
 }
 
-/// What a view of `revision` takes of U1 and of L's memberships `lower` (sorted, each once):
-/// serial, nothing waited for (U1-I): one pass over U1's facts, each with the searches of
-/// [`held_by_lower`], then one over the members of the gap signature's classes. Its copies
-/// are charged to `kept` as they grow (SYN-61); `None` where it can't take them.
+/// The program facts the stack and snapshot don't already supply, for this revision.
+fn eligible_facts(
+    snapshot: &Snapshot,
+    facts: &ProgramFacts,
+    kept: &Arc<nrese_exec::Budget>,
+) -> Option<ChargedVec<Triple>> {
+    let mut eligible = ChargedVec::new(Arc::clone(kept));
+    let ProgramFacts { triples, classes } = facts;
+    for &t in triples {
+        // The stack already holds the representative form of facts that touch a class.
+        if t.into_iter().any(|id| classes.class_of(id).is_some()) || in_view(snapshot, t) {
+            continue;
+        }
+        eligible.push(t).ok()?;
+    }
+    Some(eligible)
+}
+
+/// What a view of `revision` takes of U1 and of L's memberships `lower` (sorted, each once).
+/// [`eligible_facts`] filters the program facts before the maintained read rechecks the
+/// revision. Here one serial pass over the stack and eligible facts checks [`held_by_lower`],
+/// then a pass over the gap signature's class members expands it (U1-I). Copies are charged
+/// to `kept` as they grow (SYN-61). Returns `None` where they don't fit.
 ///
 /// Each structure's form in subject, predicate and class object:
 /// - `lower`, L's memberships beyond the RL closure: as derived, by member.
@@ -1614,6 +1684,7 @@ fn parts(
     upper: Result<&Upper, &GaveUp>,
     rules: bool,
     lower: &[Triple],
+    eligible: Option<ChargedVec<Triple>>,
     kept: &Arc<nrese_exec::Budget>,
 ) -> Option<Parts> {
     let empty = || ChargedVec::new(Arc::clone(kept));
@@ -1664,6 +1735,7 @@ fn parts(
             });
         }
     };
+    let eligible = eligible?;
     let rdf_type = upper.program.names.rdf_type;
     let clash = upper.program.names.clash;
     let encode = |[s, p, o]: Triple| {
@@ -1723,11 +1795,12 @@ fn parts(
             Some(over)
         }
     };
-    let mut triples = ChargedVec::with_capacity(Arc::clone(kept), upper.stack.len()).ok()?;
-    for [s, p, o] in upper.stack.iter() {
+    let capacity = upper.stack.len().checked_add(eligible.len())?;
+    let mut triples = ChargedVec::with_capacity(Arc::clone(kept), capacity).ok()?;
+    let mut take = |[s, p, o]: Triple| {
         // L's memberships from the taxonomy are certain: no gap.
         if held_by_lower(lower, classes, [s, p, o]) {
-            continue;
+            return Some(());
         }
         for t in [s, p, o] {
             if upper.is_internal(t) {
@@ -1735,7 +1808,7 @@ fn parts(
             }
         }
         if p == clash {
-            continue;
+            return Some(());
         }
         // By representative here; by member once every fact is seen ([`by_member`]).
         if p == rdf_type {
@@ -1749,8 +1822,12 @@ fn parts(
                 view.named_gap_predicates.insert(p);
             }
         }
-        triples.push(encode([s, p, o])).ok()?;
+        triples.push(encode([s, p, o])).ok()
+    };
+    for t in upper.stack.iter().chain(eligible.iter().copied()) {
+        take(t)?;
     }
+    drop(eligible);
     for signature in [
         &mut view.gap_classes,
         &mut view.gap_predicates,
