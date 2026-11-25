@@ -616,8 +616,8 @@ fn tick(work: &mut u64, units: u64, deadline: Deadline) -> Result<(), Stopped> {
 /// A premise copy and imported conclusion axioms ready for entailment testing.
 pub(crate) struct PreparedCheck {
     o: Ontology,
-    _copy_scratch: Scratch,
     axioms: Vec<Axiom>,
+    _copy_scratch: Scratch,
 }
 
 #[derive(Clone, Copy)]
@@ -672,13 +672,13 @@ pub(crate) fn admit_and_prepare(
     budget: &Budget,
     deadline: Deadline,
 ) -> Result<PreparedCheck, Entailed> {
+    let mut js = Scratch::new(budget.memory.as_ref());
     let mut prepared = import_into(premise, conclusion, budget, deadline)?;
     let o = &mut prepared.o;
     let mut imported = take(&mut prepared.axioms);
     imported.sort_unstable();
     imported.dedup();
 
-    let mut js = Scratch::new(budget.memory.as_ref());
     charge(&mut js, imported.len() * size_of::<Axiom>())?;
     let (mut extra, mut already, mut work) = (Vec::with_capacity(imported.len()), Vec::new(), 0u64);
     for a in imported {

@@ -465,11 +465,7 @@ pub(crate) fn check_global_restrictions(
         }
     }
     let mut found = Vec::new();
-    let mut memo = (!needing.is_empty()).then(|| vec![UNSEEN; ontology.classes.len()]);
-    #[cfg(any(test, all(feature = "witness", debug_assertions)))]
-    if let Some(m) = memo.as_ref() {
-        record_non_simple_scratch(m.capacity() * std::mem::size_of::<u32>());
-    }
+    let memo = (!needing.is_empty()).then(|| build_non_simple_memo(ontology, &needing));
     for (index, axiom) in ontology.axioms.iter().enumerate() {
         let direct = match axiom {
             Axiom::ObjectCharacteristic(
@@ -501,9 +497,9 @@ pub(crate) fn check_global_restrictions(
             });
             continue;
         }
-        if let Some(memo) = memo.as_deref_mut() {
+        if let Some(memo) = memo.as_deref() {
             for expr in expressions_of(axiom) {
-                if let Some((property, what)) = uses_any(ontology, expr, &needing, memo) {
+                if let Some(&(property, what)) = needing.get(&memo[expr as usize]) {
                     found.push(Diagnostic::NonSimpleProperty {
                         property,
                         axiom: index,
@@ -638,12 +634,11 @@ fn push_expressions(axiom: &Axiom, out: &mut Vec<u32>) {
     }
 }
 
-const UNSEEN: u32 = u32::MAX;
-const CLEAN: u32 = u32::MAX - 1;
+const CLEAN: u32 = u32::MAX;
 
-/// Bytes for the non-simple-property memo table and traversal stack over `classes` expressions.
+/// Bytes for the non-simple-property memo table over `classes` expressions.
 pub fn non_simple_memo_bytes(classes: usize) -> usize {
-    classes.saturating_mul(std::mem::size_of::<u32>() + std::mem::size_of::<(u32, bool)>())
+    classes.saturating_mul(std::mem::size_of::<u32>())
 }
 
 fn class_children(expr: &ClassExpr) -> &[crate::ExprId] {
@@ -659,48 +654,32 @@ fn class_children(expr: &ClassExpr) -> &[crate::ExprId] {
     }
 }
 
-/// The first expression in `id`'s subexpressions that `needing` names, memoised across axioms.
-// Acyclic: Interner::intern is append-only and immutable (model.rs:211-219), and the RDF
-// reader guards against cyclic blank-node class expressions (mapping.rs:1205-1210).
-fn uses_any(
+/// First non-simple-property expression reachable from each interned class, filled bottom-up.
+// Child-before-parent: Interner::intern is append-only and immutable (model.rs:211-219), the RDF
+// reader guards against cycles (mapping.rs:1205-1210), and the importer interns children first.
+fn build_non_simple_memo(
     ontology: &Ontology,
-    id: u32,
     needing: &HashMap<u32, (Term, &'static str)>,
-    memo: &mut [u32],
-) -> Option<(Term, &'static str)> {
-    let mut stack = vec![(id, false)];
-    while let Some((cur, post)) = stack.pop() {
-        if post {
-            memo[cur as usize] = class_children(ontology.classes.get(cur))
+) -> Vec<u32> {
+    let n = ontology.classes.len();
+    let mut memo = vec![CLEAN; n];
+    #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+    record_non_simple_scratch(memo.capacity() * std::mem::size_of::<u32>());
+    for id in 0..n as u32 {
+        #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+        NON_SIMPLE_EXPANSIONS.with(|c| c.set(c.get() + 1));
+        memo[id as usize] = if needing.contains_key(&id) {
+            id
+        } else {
+            class_children(ontology.classes.get(id))
                 .iter()
                 .rev()
                 .map(|c| memo[c.0 as usize])
-                .find(|&h| h < CLEAN)
-                .unwrap_or(CLEAN);
-            continue;
-        }
-        if memo[cur as usize] != UNSEEN {
-            continue;
-        }
-        #[cfg(any(test, all(feature = "witness", debug_assertions)))]
-        NON_SIMPLE_EXPANSIONS.with(|c| c.set(c.get() + 1));
-        if needing.contains_key(&cur) {
-            memo[cur as usize] = cur;
-            continue;
-        }
-        memo[cur as usize] = CLEAN;
-        let kids = class_children(ontology.classes.get(cur));
-        if !kids.is_empty() {
-            stack.push((cur, true));
-            stack.extend(kids.iter().map(|c| (c.0, false)));
-            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
-            record_non_simple_scratch(
-                memo.len() * std::mem::size_of::<u32>()
-                    + stack.capacity() * std::mem::size_of::<(u32, bool)>(),
-            );
-        }
+                .find(|&h| h != CLEAN)
+                .unwrap_or(CLEAN)
+        };
     }
-    needing.get(&memo[id as usize]).copied()
+    memo
 }
 
 #[cfg(any(test, all(feature = "witness", debug_assertions)))]

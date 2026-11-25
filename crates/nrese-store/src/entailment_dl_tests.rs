@@ -501,9 +501,9 @@ fn import_stops_at_the_deadline() {
     use crate::dl::entailment::test_hooks::IMPORT_VISIT;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    // Leave time to read 10,000 axioms in a debug build. Two poll intervals
-    // still take at least 8,192 ms of seam delay.
-    let timeout = Duration::from_secs(5);
+    // Leave generous time to read 10,000 axioms under parallel debug load; the first
+    // import visit sleeps just past the deadline so the next poll interval stops it.
+    let timeout = Duration::from_secs(15);
     let conclusion = many_restrictions(10_000);
     let (store, _pipeline) = clash_store(
         DlConfig {
@@ -519,9 +519,14 @@ fn import_stops_at_the_deadline() {
     let f = Arc::clone(&first_before);
     IMPORT_VISIT.replace(Some(Box::new(move || {
         if v.fetch_add(1, Ordering::Relaxed) == 0 {
-            f.store(started.elapsed() < timeout, Ordering::Relaxed);
+            let elapsed = started.elapsed();
+            f.store(elapsed < timeout, Ordering::Relaxed);
+            std::thread::sleep(
+                timeout
+                    .saturating_sub(elapsed)
+                    .saturating_add(Duration::from_millis(50)),
+            );
         }
-        std::thread::sleep(Duration::from_millis(1));
     })));
     let result = store.entails_dl(&conclusion).unwrap();
     IMPORT_VISIT.replace(None);
@@ -846,8 +851,8 @@ fn fresh_blank_peak_covers_live_candidate() {
     let tight_limit = 2 * L + (64 << 10);
     let tight_env = Envelope::exact(Some(tight_limit), None);
     let tx = crate::dl::source::private_over(store.engine(), &snapshot, Arc::new(tight_env.part()));
-    let mut blanks = HashMap::new();
     let mut scratch = Scratch::new(Some(&tight_env));
+    let mut blanks = super::new_blank_map(1, &mut scratch).expect("table fits");
     let mut probes = 0u64;
     match super::fresh_blank(
         &tx,
@@ -875,8 +880,8 @@ fn fresh_blank_peak_covers_live_candidate() {
     let roomy_limit = 4 * L + (64 << 10);
     let roomy_env = Envelope::exact(Some(roomy_limit), None);
     let tx = crate::dl::source::private_over(store.engine(), &snapshot, Arc::new(roomy_env.part()));
-    let mut blanks = HashMap::new();
     let mut scratch = Scratch::new(Some(&roomy_env));
+    let mut blanks = super::new_blank_map(1, &mut scratch).expect("table fits");
     let first = super::fresh_blank(
         &tx,
         &mut blanks,

@@ -535,50 +535,65 @@ impl StoreService {
                 premise: checked.verdict,
             });
         }
+        let reply = |premise, answer| Ok(DlEntailment { answer, premise });
         if conclusion
             .iter()
             .any(|t| matches!(t.object, Term::Triple(_)))
         {
-            return Ok(DlEntailment {
-                answer: Entailed::Unknown(
+            return reply(
+                checked.verdict,
+                Entailed::Unknown(
                     "the conclusion holds a triple term, which OWL 2 doesn't define".to_owned(),
                 ),
-                premise: checked.verdict,
-            });
+            );
         }
         // The OWL vocabulary and the fresh names are system vocabulary, shared (dictionary
         // lifecycle V1); the conclusion's terms are the request's own, in a private
         // vocabulary charged to its envelope, past the premise's ids.
         source::intern_system_vocabulary(self.engine())?;
         let tx = source::private_over(self.engine(), snapshot, Arc::new(memory.part()));
-        let (mut blanks, mut probes, mut late) = (std::collections::HashMap::new(), 0u64, false);
+        let blank_positions = conclusion.iter().fold(0usize, |n, t| {
+            n + usize::from(matches!(t.subject, NamedOrBlankNode::BlankNode(_)))
+                + usize::from(matches!(t.object, Term::BlankNode(_)))
+        });
         let mut blank_scratch = nrese_dl::memory::Scratch::new(Some(&memory));
+        let Ok(mut blanks) = new_blank_map(blank_positions, &mut blank_scratch) else {
+            return reply(
+                checked.verdict,
+                Entailed::Unknown(format!(
+                    "the conclusion: {}",
+                    source::refused("the conclusion")
+                )),
+            );
+        };
+        let (mut probes, mut late) = (0u64, false);
         let mut id = |t: Term| -> nrese_engine::EngineResult<u64> {
             if late {
                 return Ok(0);
             }
             let t = match t {
                 Term::BlankNode(b) => {
-                    match fresh_blank(
+                    let Some(mapped) = fresh_blank(
                         &tx,
                         &mut blanks,
                         &mut blank_scratch,
                         &mut probes,
                         deadline,
                         &b,
-                    )? {
-                        Some(mapped) => Term::BlankNode(mapped),
-                        None => {
-                            late = true;
-                            return Ok(0);
-                        }
-                    }
+                    )?
+                    else {
+                        late = true;
+                        return Ok(0);
+                    };
+                    Term::BlankNode(mapped)
                 }
                 other => other,
             };
             let raw = tx.try_intern(t.as_ref())?.raw();
             if let Term::BlankNode(b) = t {
-                blank_scratch.release(b.as_str().len());
+                let len = b.as_str().len();
+                drop(b);
+                blank_scratch.release(len);
             }
             Ok(raw)
         };
@@ -602,12 +617,10 @@ impl StoreService {
         drop(blanks);
         drop(blank_scratch);
         if late {
-            return Ok(DlEntailment {
-                answer: Entailed::Unknown(
-                    nrese_dl::limits::Limit::Time.reached("the deadline passed"),
-                ),
-                premise: checked.verdict,
-            });
+            return reply(
+                checked.verdict,
+                Entailed::Unknown(nrese_dl::limits::Limit::Time.reached("the deadline passed")),
+            );
         }
         // Undecided where the envelope can't take the conclusion's terms, as the premise's.
         let Ok(statements) = statements else {
@@ -664,12 +677,7 @@ impl StoreService {
         }
         let prepared = match admit_and_prepare(&premise, &read, &terms, &name, &budget, deadline) {
             Ok(prepared) => prepared,
-            Err(answer) => {
-                return Ok(DlEntailment {
-                    answer,
-                    premise: checked.verdict,
-                });
-            }
+            Err(answer) => return reply(checked.verdict, answer),
         };
         // Admitted: an inconsistent premise has no model, so it entails the conclusion.
         if inconsistent {
@@ -701,6 +709,19 @@ impl StoreService {
     }
 }
 
+fn new_blank_map(
+    cap: usize,
+    scratch: &mut nrese_dl::memory::Scratch,
+) -> nrese_engine::EngineResult<std::collections::HashMap<String, nrese_rdf::BlankNode>> {
+    if cap > 0 {
+        let raw = cap.saturating_mul(8).div_ceil(7).max(4);
+        let buckets = raw.checked_next_power_of_two().unwrap_or(usize::MAX);
+        let slot = std::mem::size_of::<(String, nrese_rdf::BlankNode)>() + 1;
+        scratch.charge(|| buckets.saturating_mul(slot).saturating_add(32))?;
+    }
+    Ok(std::collections::HashMap::with_capacity(cap))
+}
+
 fn fresh_blank(
     tx: &nrese_engine::PrivateTransaction<'_>,
     blanks: &mut std::collections::HashMap<String, nrese_rdf::BlankNode>,
@@ -713,19 +734,7 @@ fn fresh_blank(
         scratch.charge(|| existing.as_str().len())?;
         return Ok(Some(existing.clone()));
     }
-    let slot = std::mem::size_of::<(String, nrese_rdf::BlankNode)>() + 1;
-    let table = |n: usize| match n {
-        0 => 0,
-        _ => n
-            .saturating_mul(8)
-            .div_ceil(7)
-            .max(4)
-            .next_power_of_two()
-            .saturating_mul(slot),
-    };
-    let growth = table(blanks.len() + 1).saturating_sub(table(blanks.len()));
-    let strings = blank.as_str().len().saturating_mul(3).saturating_add(64);
-    scratch.charge(|| growth + strings)?;
+    scratch.charge(|| blank.as_str().len().saturating_mul(3).saturating_add(64))?;
     for k in 0u64.. {
         *probes = probes.saturating_add(1);
         if *probes >= 4_096 {
