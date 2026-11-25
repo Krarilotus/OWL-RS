@@ -473,15 +473,21 @@ fn pairs<T: Copy>(v: &[T]) -> impl Iterator<Item = (T, T)> + '_ {
 
 /// A copy of `premise` for tests to extend: compilation scratch, reserved from the
 /// request's envelope before it is made; `Unknown` where the envelope has no room.
-fn copy(premise: &Ontology, budget: &Budget) -> Result<(Ontology, CopyScratch), Entailed> {
-    let mut scratch = nrese_dl::memory::Scratch::new(budget.memory.as_ref());
+struct PremiseCopy {
+    // Fields drop in declaration order. Free the ontology before releasing its charge.
+    o: Ontology,
+    scratch: CopyScratch,
+}
+
+fn copy(premise: &Ontology, budget: &Budget) -> Result<PremiseCopy, Entailed> {
+    let mut scratch = Scratch::new(budget.memory.as_ref());
     scratch
         .charge(|| nrese_dl::memory::ontology_bytes(premise))
         .map_err(|_| Entailed::Unknown(nrese_dl::memory::EXHAUSTED.to_owned()))?;
     let o = premise.clone();
     #[cfg(test)]
     let scratch = CopyScratch::copy(scratch, &o);
-    Ok((o, scratch))
+    Ok(PremiseCopy { o, scratch })
 }
 
 /// Whether `premise` (consistent) entails `axiom`, an axiom over `premise`'s interners.
@@ -504,11 +510,12 @@ pub(crate) fn entails_within(
     budget: &Budget,
     deadline: Deadline,
 ) -> Entailed {
-    let (mut o, _scratch) = match copy(premise, budget) {
+    let mut copied = match copy(premise, budget) {
         Ok(copy) => copy,
         Err(unknown) => return unknown,
     };
-    let tests = match negations(&mut o, axiom, fresh) {
+    let o = &mut copied.o;
+    let tests = match negations(o, axiom, fresh) {
         Ok(tests) => tests,
         Err(why) => return Entailed::Unknown(why),
     };
@@ -529,7 +536,7 @@ pub(crate) fn entails_within(
             o.axioms.push(a);
             o.sources.push(Vec::new());
         }
-        let found = match consistency::check(&o, &budget.remaining(deadline)).verdict {
+        let found = match consistency::check(o, &budget.remaining(deadline)).verdict {
             Verdict::Inconsistent => Entailed::Yes,
             Verdict::Consistent => Entailed::No,
             Verdict::Unknown(why) => Entailed::Unknown(why),
@@ -555,14 +562,15 @@ pub(crate) fn nonempty_within(
     budget: &Budget,
     deadline: Deadline,
 ) -> Entailed {
-    let (mut o, _scratch) = match copy(premise, budget) {
+    let mut copied = match copy(premise, budget) {
         Ok(copy) => copy,
         Err(unknown) => return unknown,
     };
-    let nothing = intern(&mut o, ClassExpr::Nothing);
+    let o = &mut copied.o;
+    let nothing = intern(o, ClassExpr::Nothing);
     o.axioms.push(Axiom::SubClassOf(class, nothing));
     o.sources.push(Vec::new());
-    match consistency::check(&o, &budget.remaining(deadline)).verdict {
+    match consistency::check(o, &budget.remaining(deadline)).verdict {
         Verdict::Inconsistent => Entailed::Yes,
         Verdict::Consistent => Entailed::No,
         Verdict::Unknown(why) => Entailed::Unknown(why),
@@ -622,10 +630,9 @@ fn tick(work: &mut u64, units: u64, deadline: Deadline) -> Result<(), Stopped> {
 
 /// A premise copy and imported conclusion axioms ready for entailment testing.
 pub(crate) struct PreparedCheck {
-    o: Ontology,
+    // The copy's reservation also covers these axioms.
     axioms: Vec<Axiom>,
-    // Fields drop in declaration order. Keep the reservation through both payloads.
-    copy_scratch: CopyScratch,
+    premise: PremiseCopy,
 }
 
 #[derive(Clone, Copy)]
@@ -640,19 +647,14 @@ fn import_into(
     budget: &Budget,
     deadline: Deadline,
 ) -> Result<PreparedCheck, Entailed> {
-    let (o, copy_scratch) = copy(premise, budget)?;
-    let mut prepared = PreparedCheck {
-        o,
-        axioms: Vec::new(),
-        copy_scratch,
-    };
+    let mut premise = copy(premise, budget)?;
     #[cfg(test)]
     let _entry_guard = test_hooks::on_entry(budget.memory.as_ref());
     let mut memo_scratch = Scratch::new(budget.memory.as_ref());
     let mut import = Import::new(
         conclusion,
-        &mut prepared.o,
-        &mut prepared.copy_scratch,
+        &mut premise.o,
+        &mut premise.scratch,
         &mut memo_scratch,
         deadline,
     )?;
@@ -662,13 +664,13 @@ fn import_into(
     b.bottom_object = b.bottom_object.or(cb.bottom_object);
     b.top_data = b.top_data.or(cb.top_data);
     b.bottom_data = b.bottom_data.or(cb.bottom_data);
-    prepared.axioms = Vec::with_capacity(conclusion.axioms.len());
+    let mut axioms = Vec::with_capacity(conclusion.axioms.len());
     for a in &conclusion.axioms {
-        prepared.axioms.push(import.axiom(a)?);
+        axioms.push(import.axiom(a)?);
     }
     drop(import);
     drop(memo_scratch);
-    Ok(prepared)
+    Ok(PreparedCheck { axioms, premise })
 }
 
 /// Copies `premise` once, imports `conclusion` once, checks OWL 2 DL membership over the
@@ -686,7 +688,7 @@ pub(crate) fn admit_and_prepare(
     let js = scratch_lifetime_tests::ObservedScratch::joint(js);
     let mut js = js;
     let mut prepared = import_into(premise, conclusion, budget, deadline)?;
-    let o = &mut prepared.o;
+    let o = &mut prepared.premise.o;
     let mut imported = take(&mut prepared.axioms);
     imported.sort_unstable();
     imported.dedup();
@@ -834,10 +836,11 @@ pub(crate) fn entails_prepared_within(
         .into_iter()
         .map(Test::Axiom)
         .collect();
-    let compiled = Batch::new(&mut prepared.o, &tests, budget.memory.as_ref());
+    let o = &mut prepared.premise.o;
+    let compiled = Batch::new(o, &tests, budget.memory.as_ref());
     let mut answer = Entailed::Yes;
     for (index, test) in tests.iter().enumerate() {
-        answer = answer.and(compiled.check(index, test, &prepared.o, fresh, budget, deadline));
+        answer = answer.and(compiled.check(index, test, o, fresh, budget, deadline));
         if answer == Entailed::No {
             break;
         }
@@ -1182,8 +1185,8 @@ mod import_tests {
             generous,
         )
         .expect("no-cap control");
-        assert_eq!(prepared.o.axioms, premise.axioms);
-        assert_eq!(prepared.o.sources, premise.sources);
+        assert_eq!(prepared.premise.o.axioms, premise.axioms);
+        assert_eq!(prepared.premise.o.sources, premise.sources);
         assert_eq!(prepared.axioms, conclusion.axioms);
     }
 
