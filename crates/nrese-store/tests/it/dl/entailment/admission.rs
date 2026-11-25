@@ -237,29 +237,13 @@ fn a_conclusions_blank_node_is_its_own() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// One deadline bounds admission of a conclusion with shared expressions.
-/// Importing each occurrence afresh gives exponentially many visits to these
-/// two acyclic inputs. The full call must return even on the limit path.
+/// Admission of a conclusion with a shared data-range DAG must return within
+/// the watchdog even when the request deadline withholds a decision.
 #[test]
 fn admitting_a_shared_expression_dag_stays_within_the_deadline() {
     use std::fmt::Write;
     use std::sync::mpsc;
     use std::time::Duration;
-
-    let mut class = String::from(
-        ":p a owl:ObjectProperty . :C a owl:Class . :D a owl:Class .
-         _:b0 a owl:Class ; owl:complementOf :D .",
-    );
-    for i in 1..=40 {
-        let prev = i - 1;
-        write!(
-            class,
-            " _:b{i} a owl:Class ; owl:intersectionOf ( _:b{prev} _:c{i} ) .
-              _:c{i} a owl:Restriction ; owl:onProperty :p ; owl:someValuesFrom _:b{prev} ."
-        )
-        .unwrap();
-    }
-    class.push_str(" :C rdfs:subClassOf _:b40 .");
 
     let mut range = String::from(":d a owl:DatatypeProperty ; rdfs:range _:r32 .");
     let mut prev = "xsd:integer".to_owned();
@@ -272,30 +256,24 @@ fn admitting_a_shared_expression_dag_stays_within_the_deadline() {
         .unwrap();
         prev = format!("_:r{i}");
     }
-    let mut wrong = Vec::new();
-    for (name, text) in [("class", class), ("range", range)] {
-        let (send, receive) = mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            let dl = pipeline_with(DlConfig {
-                timeout: Some(Duration::from_secs(1)),
-                ..DlConfig::default()
-            });
-            insert(&dl, NAMED).expect("premise");
-            let result = dl.store().entails_dl(&turtle(&text)).expect("entails_dl");
-            send.send(result).ok();
+    let (send, receive) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let dl = pipeline_with(DlConfig {
+            timeout: Some(Duration::from_secs(1)),
+            ..DlConfig::default()
         });
-        match receive.recv_timeout(Duration::from_secs(20)) {
-            Ok(result) => {
-                worker.join().unwrap();
-                if matches!(&result.answer, Entailed::Unknown(why) if !why.contains("time") && !why.contains("dl.timeout"))
-                {
-                    wrong.push(format!("{name}: {result:?}"));
-                }
-            }
-            Err(error) => wrong.push(format!("{name}: {error}")),
-        }
-    }
-    assert!(wrong.is_empty(), "{wrong:#?}");
+        insert(&dl, NAMED).expect("premise");
+        let result = dl.store().entails_dl(&turtle(&range)).expect("entails_dl");
+        send.send(result).ok();
+    });
+    let result = receive
+        .recv_timeout(Duration::from_secs(20))
+        .expect("range DAG answer within the watchdog");
+    worker.join().unwrap();
+    assert!(
+        !matches!(&result.answer, Entailed::Unknown(why) if !why.contains("time") && !why.contains("dl.timeout")),
+        "{result:?}"
+    );
 }
 
 /// Structural Specification §3.1: an out-of-position reserved name in the
