@@ -86,6 +86,45 @@ fn canonical(facts: &[[String; 3]]) -> Vec<([String; 3], usize)> {
 
 const DELETE: &str = "PREFIX : <urn:test:> DELETE DATA { :a0 a :A . :a1 a :A . :a2 a :A . }";
 
+/// A maintained read doesn't hold the bounds state across probes of its snapshot.
+#[test]
+fn program_fact_snapshot_probes_leave_the_bounds_state_unlocked() {
+    use std::fmt::Write as _;
+
+    const MEMBERS: usize = 128;
+    let (store, pipeline) = pipeline();
+    let mut data = String::from(
+        "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+         INSERT DATA { :M a owl:Class .",
+    );
+    for i in 0..MEMBERS {
+        write!(
+            data,
+            " :m{i} a :M , [ owl:complementOf [ owl:complementOf :M ] ] ."
+        )
+        .unwrap();
+    }
+    data.push('}');
+    update(&pipeline, &data);
+    let before = report(&store);
+    update(&pipeline, "PREFIX : <urn:test:> INSERT DATA { :a0 a :F . }");
+
+    let (total, locked) = seam::count_probes(&store, || {
+        let after = report(&store);
+        assert!(after.revision > before.revision, "{after:?}");
+        assert_eq!(after.last, "delta", "{after:?}");
+        assert_eq!(after.unavailable, None, "{after:?}");
+    });
+    assert!(
+        total >= MEMBERS,
+        "the read made only {total} snapshot probes"
+    );
+    assert_eq!(
+        locked, 0,
+        "snapshot probes with the bounds state locked, of {total}"
+    );
+}
+
 /// A read of the revision U1 and its view describe gets that view while a commit computes
 /// its change of U1: it waits for no lock the change holds.
 #[test]

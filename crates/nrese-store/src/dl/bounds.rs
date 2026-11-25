@@ -59,6 +59,8 @@ mod shapes_tests;
 /// work, for the store whose bounds it names.
 #[cfg(test)]
 pub(crate) mod seam {
+    use std::cell::RefCell;
+    use std::sync::Arc;
     use std::sync::Mutex;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +82,42 @@ pub(crate) mod seam {
     type Hook = Box<dyn FnOnce() + Send>;
     /// One hook a store and point: tests running at once, each on its own store, keep theirs.
     static HOOKS: Mutex<Vec<(usize, Point, Hook)>> = Mutex::new(Vec::new());
+
+    struct Probes {
+        store: Arc<super::StoreService>,
+        total: usize,
+        locked: usize,
+    }
+
+    thread_local! {
+        static PROBES: RefCell<Option<Probes>> = const { RefCell::new(None) };
+    }
+
+    /// Counts the read's probes on this thread, and which found its store's state locked.
+    pub(super) fn count_probes(
+        store: &Arc<super::StoreService>,
+        read: impl FnOnce(),
+    ) -> (usize, usize) {
+        PROBES.set(Some(Probes {
+            store: Arc::clone(store),
+            total: 0,
+            locked: 0,
+        }));
+        read();
+        let probes = PROBES.take().unwrap();
+        (probes.total, probes.locked)
+    }
+
+    pub(super) fn snapshot_probe() {
+        PROBES.with_borrow_mut(|probes| {
+            if let Some(probes) = probes {
+                probes.total += 1;
+                if probes.store.dl().bounds.state.try_lock().is_err() {
+                    probes.locked += 1;
+                }
+            }
+        });
+    }
 
     fn key(bounds: &super::Bounds) -> usize {
         std::ptr::from_ref(bounds) as usize
@@ -1001,6 +1039,8 @@ fn held_by_lower(
 }
 
 fn in_view(view: &Snapshot, [s, p, o]: Triple) -> bool {
+    #[cfg(test)]
+    seam::snapshot_probe();
     view.quads_for_pattern_in(
         ReadModel::Materialised,
         &nrese_engine::QuadPattern {
