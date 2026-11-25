@@ -114,7 +114,10 @@ impl Preparation {
         let outcome = handoff.wait_stopped(&stop);
         let build = match outcome {
             Some(Handoff::Joined(build)) => build,
-            Some(Handoff::Failed) => return Err(abandoned()),
+            Some(Handoff::Failed) => {
+                store.engine().check_writable()?;
+                return Err(abandoned());
+            }
             Some(Handoff::Covered | Handoff::Retired) | None => return Ok(()),
         };
         match build.join(None, &stop) {
@@ -149,7 +152,8 @@ impl Preparation {
             let Some((key, current)) = self.with_store(|store| {
                 (
                     ground_key(&store.engine().snapshot()),
-                    requested || store.reasoning_is_current(rules),
+                    store.engine().check_writable().is_ok()
+                        && (requested || store.reasoning_is_current(rules)),
                 )
             }) else {
                 break;
@@ -197,7 +201,8 @@ impl Preparation {
         let rules = self.rules.as_ref().expect("preparation requires rules");
         let mut pin = |store: &StoreService| {
             let tx = store.engine().transaction_if_idle().ok_or(None)?;
-            if *self.retired.lock()
+            if store.engine().check_writable().is_err()
+                || *self.retired.lock()
                 || !store.reasoning_is_current_held(tx.writer().expect("writer"), rules)
             {
                 return Err(Some(End::Later));

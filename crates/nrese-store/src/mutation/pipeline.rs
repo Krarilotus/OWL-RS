@@ -90,6 +90,7 @@ impl MutationPipeline {
             _ if self.store.config().replica || self.is_retired() => 0,
             None => 0,
             Some(rules) if !self.store.reasoning_is_current(rules) => 1,
+            _ if self.store.engine().check_writable().is_err() => 1,
             _ if prep.covers(key) => 2,
             _ if *prep.failed.lock() == Some(key) => 3,
             _ => 1,
@@ -243,10 +244,14 @@ impl MutationPipeline {
                 continue;
             }
             let entry = preparation.entry.lock();
-            if cached(&entry, ground_key(tx.base())).is_some()
-                || self.store.config().replica
-                || rayon::current_thread_index().is_some()
-            {
+            let covered = cached(&entry, ground_key(tx.base())).is_some();
+            if !covered {
+                self.store
+                    .engine()
+                    .check_writable()
+                    .map_err(|error| store_error(error.into()))?;
+            }
+            if covered || self.store.config().replica || rayon::current_thread_index().is_some() {
                 break (tx, Some(entry));
             }
             drop(entry);

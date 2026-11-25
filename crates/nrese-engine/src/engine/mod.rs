@@ -1249,6 +1249,11 @@ impl Engine {
         self.inner.shared.versions.load().reading
     }
 
+    /// Refuses if the WAL is poisoned and the store must reopen before it can write.
+    pub fn check_writable(&self) -> EngineResult<()> {
+        self.inner.shared.acknowledge_unchanged()
+    }
+
     /// Starts a transaction, waiting for the writer slot. Dropping it without
     /// [`commit`](Transaction::commit) aborts it.
     ///
