@@ -110,6 +110,11 @@ pub(crate) fn ontology_at(
     drop(cache.take());
     let held = read_ontology(store, snapshot)?;
     *cache = Some((snapshot.revision(), Arc::clone(&held)));
+    drop(cache);
+    store
+        .dl()
+        .bounds
+        .publish_anonymous(snapshot.revision(), held.value());
     Ok(held)
 }
 
@@ -500,13 +505,6 @@ pub(crate) fn mark(
         completeness.unsound("dl", reason);
     }
     let snapshot = at.snapshot();
-    if !matches!(at, Revision::Pending { .. })
-        && let Some(text) = store.dl().bounds.anonymous(snapshot.revision())
-    {
-        completeness
-            .reasons
-            .push(nrese_sparql::completeness::Reason { source: "dl", text });
-    }
     let held = |iri: &str| {
         let Some(t) = snapshot.lookup(NamedNodeRef::new_unchecked(iri).into()) else {
             return false;
@@ -540,6 +538,13 @@ pub(crate) fn mark(
                  individual named only in a query is unsettled, so an answer may be missing"
             ),
         );
+    }
+    if !matches!(at, Revision::Pending { .. })
+        && let Some(text) = store.dl().bounds.anonymous(snapshot.revision())
+    {
+        completeness
+            .reasons
+            .push(nrese_sparql::completeness::Reason { source: "dl", text });
     }
 }
 

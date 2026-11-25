@@ -403,6 +403,11 @@ impl Bounds {
             .and_then(|(_, note)| note.clone())
     }
 
+    pub(super) fn publish_anonymous(&self, revision: u64, ontology: &Ontology) {
+        let report = anonymous_report(ontology);
+        lock(&self.state).record_anonymous(revision, Some(report));
+    }
+
     /// Whether the commit `tx` keeps the RL route its base is on ([`route_kept`]), by the kinds
     /// kept at the base's revision; taken under the state, checked without it.
     pub(crate) fn keeps_route(&self, tx: &Transaction<'_>, lists_left_out: bool) -> bool {
