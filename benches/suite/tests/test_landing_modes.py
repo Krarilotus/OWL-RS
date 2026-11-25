@@ -263,9 +263,9 @@ class LandingRoundJob(PlanningFixtures):
                 self.write_passes(out / "passes", second_contrasts, round_number=1, fault=fault)
             if action == "report":
                 with patch.dict(os.environ, env):
-                    _, _, error = self.report(out, argv[3], argv[6:], Path(argv[5]))
-                if error:
-                    raise subprocess.CalledProcessError(1, argv, stderr=error)
+                    code, _, error = self.report(out, argv[3], argv[6:], Path(argv[5]))
+                if code:
+                    raise subprocess.CalledProcessError(code, argv, stderr=error)
             return subprocess.CompletedProcess(argv, 0)
 
         with patch.dict(os.environ, {**job["env"], "FLEET_OUT": str(root)}):
@@ -281,9 +281,10 @@ class LandingRoundJob(PlanningFixtures):
                         code, _, _ = command(*step[2:])
         return code, first, json.loads(first_path.read_bytes()), seen, timed_steps(job), timed_step
 
-    # Spec: design §3 D3, fix pass 1 R1/R4/R5, and fix pass 2 H1. A screen runs exactly the named cases and uses the
+    # Spec: design §3 D3, fix pass 1 R1/R4/R5, fix pass 2 H1, and fix pass 3 J1.
+    # A screen runs exactly the named cases and uses the
     # first report's harness. A bad second round leaves the first word standing, and cleanup comes last.
-    # Missing declared evidence refuses publication, and a confirmed fixture has no evidence errors.
+    # Missing declared evidence refuses publication. A completed confirmation exits 0 and has no evidence errors.
     def test_last_step_with_cleared_and_screened_reports(self):
         runs = [(CALM, None, "cleared"), (LOSS, None, "confirmed loss"),
                 (LOSS, "schedule", "needs a second round"), (LOSS, "provenance", "needs a second round"),
@@ -340,6 +341,7 @@ class ShellReport(unittest.TestCase):
             "benches/fast/release_gate.py": b"""
 import argparse
 import json
+import os
 from pathlib import Path
 
 p = argparse.ArgumentParser()
@@ -348,8 +350,11 @@ for flag in ("round-one", "family", "json", "out"):
 args, _ = p.parse_known_args()
 first = json.loads(args.round_one.read_bytes())
 family = json.loads(args.family.read_bytes())
-args.json.write_text(json.dumps({"word": first["word"], "family": family["family"]}), encoding="utf-8")
+args.json.write_text(json.dumps({"word": first["word"], "family": family["family"],
+                                 "errors": first.get("errors", [])}), encoding="utf-8")
 args.out.write_text(first["word"], encoding="utf-8")
+out = Path(os.environ["FLEET_OUT"])
+print("published while reporting:", *(out.joinpath("release-gate." + ext).exists() for ext in ("json", "md")))
 raise SystemExit(first.get("exit", 0))
 """,
         }
@@ -387,12 +392,33 @@ raise SystemExit(first.get("exit", 0))
     def test_relative_round_one_path_is_anchored_to_the_launcher(self):
         first = self.repo / "first" / "release-gate.json"
         first.parent.mkdir()
-        first.write_text('{"word":"needs a second round","exit":1}', encoding="utf-8")
+        first.write_text('{"word":"needs a second round"}', encoding="utf-8")
         (first.parent / "plan.json").write_text(self.plan, encoding="utf-8")
         result = self.run_report(first.relative_to(self.repo).as_posix())
         self.assertTrue(self.json_out.is_file(), result.stdout + result.stderr)
         self.assertEqual(result.returncode, 0)
-        self.assertEqual(json.loads(self.json_out.read_bytes()), {"word": "needs a second round", "family": [MEASURED]})
+        self.assertEqual(json.loads(self.json_out.read_bytes()),
+                         {"word": "needs a second round", "family": [MEASURED], "errors": []})
+        self.assertEqual(self.md_out.read_text(encoding="utf-8"), "needs a second round")
+
+    # Spec: fix pass 3 J2. An absolute first-round symlink uses the plan beside the link.
+    def test_absolute_round_one_symlink_uses_the_plan_beside_the_link(self):
+        target = self.repo / "evidence" / "release-gate.json"
+        link = self.repo / "handoff" / "release-gate.json"
+        target.parent.mkdir()
+        link.parent.mkdir()
+        target.write_text('{"word":"needs a second round"}', encoding="utf-8")
+        try:
+            link.symlink_to(target)
+        except OSError as error:
+            if getattr(error, "winerror", None) != 1314:
+                raise
+            self.skipTest("this Windows account cannot create symbolic links")
+        (link.parent / "plan.json").write_text(self.plan, encoding="utf-8")
+        result = self.run_report(link.as_posix())
+        self.assertTrue(self.json_out.is_file(), (self.out / "report.log").read_text(encoding="utf-8"))
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(json.loads(self.json_out.read_bytes())["family"], [MEASURED])
 
     # Spec: fix pass 2 H3. A first-round path resolving to the output is refused with both files intact.
     def test_round_one_and_output_alias_preserves_the_existing_report(self):
@@ -406,14 +432,21 @@ raise SystemExit(first.get("exit", 0))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("output", result.stdout + result.stderr)
 
-    # Spec: fix pass 2 H1. A fatal reporter exit must not leave an accepted report, even if it wrote files first.
+    # Spec: fix pass 3 J1. Even if a paired reporter writes both files, a nonzero exit or
+    # nonempty evidence errors leave neither file published and the staging place removed.
     def test_fatal_reporter_exit_leaves_no_paired_output(self):
         first = self.repo / "release-gate.json"
-        first.write_text('{"word":"needs a second round","exit":2}', encoding="utf-8")
         (first.parent / "plan.json").write_text(self.plan, encoding="utf-8")
-        result = self.run_report(first.as_posix())
-        self.assertEqual((self.json_out.exists(), self.md_out.exists()), (False, False), result.stdout + result.stderr)
-        self.assertNotEqual(result.returncode, 0)
+        for status, errors in [(2, []), (1, []), (1, ["missing q07"]), (0, ["missing q07"])]:
+            with self.subTest(status=status, errors=errors):
+                first.write_text(json.dumps({"word": "confirmed loss", "exit": status, "errors": errors}),
+                                 encoding="utf-8")
+                result = self.run_report(first.as_posix())
+                self.assertEqual((result.returncode != 0, self.json_out.exists(), self.md_out.exists()),
+                                 (True, False, False), result.stdout + result.stderr)
+                self.assertFalse(any(path.is_dir() for path in self.out.iterdir()))
+                self.assertIn("published while reporting: False False",
+                              (self.out / "report.log").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
