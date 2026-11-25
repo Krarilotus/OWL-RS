@@ -541,3 +541,44 @@ pub(crate) fn entails_ontology_within(
     }
     answer
 }
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+
+    /// Structural Specification §2.3: set-valued axiom operands remain sorted
+    /// and unique after remapping into the premise's expression interner.
+    #[test]
+    fn import_keeps_set_operands_canonical() {
+        let mut from = Ontology::default();
+        let from_b = ExprId(from.classes.intern(ClassExpr::Class(20)));
+        let from_a = ExprId(from.classes.intern(ClassExpr::Class(10)));
+        let from_c = ExprId(from.classes.intern(ClassExpr::Class(30)));
+        let eq = Axiom::EquivalentClasses(vec![from_b, from_a]);
+        let disj = Axiom::DisjointClasses(vec![from_b, from_a]);
+        let union = Axiom::DisjointUnion(from_c, vec![from_b, from_a]);
+
+        let mut to = Ontology::default();
+        let to_a = ExprId(to.classes.intern(ClassExpr::Class(10)));
+        let to_b = ExprId(to.classes.intern(ClassExpr::Class(20)));
+        let to_c = ExprId(to.classes.intern(ClassExpr::Class(30)));
+        assert!(to_a < to_b);
+
+        let mut import = Import {
+            from: &from,
+            to: &mut to,
+        };
+        assert_eq!(
+            import.axiom(&eq),
+            Axiom::EquivalentClasses(vec![to_a, to_b])
+        );
+        assert_eq!(
+            import.axiom(&disj),
+            Axiom::DisjointClasses(vec![to_a, to_b])
+        );
+        assert_eq!(
+            import.axiom(&union),
+            Axiom::DisjointUnion(to_c, vec![to_a, to_b])
+        );
+    }
+}

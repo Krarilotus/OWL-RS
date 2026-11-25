@@ -7,6 +7,11 @@ use super::{PREFIXES, insert, pipeline};
 const FIXED_PREDICATE: &str = ":p a owl:ObjectProperty . :x a owl:NamedIndividual ; :p :y .
     :y a owl:NamedIndividual .";
 const FIXED_READ: &str = "ASK { :x :p ?o }";
+const ANONYMOUS_TREE_AND_SCHEMA: &str =
+    ":q a owl:ObjectProperty . :z a owl:NamedIndividual . _:b :q :y, :z .
+     :A a owl:Class ; rdfs:subClassOf [
+         a owl:Restriction ; owl:onProperty :q ; owl:someValuesFrom :B
+     ] . :B a owl:Class .";
 
 fn preloaded(data: &str) -> nrese_store::MutationPipeline {
     let dl = pipeline();
@@ -197,17 +202,8 @@ fn an_anonymous_report_names_the_revision_that_was_read() {
         consistency: DlConsistency::Off,
         ..DlConfig::default()
     });
-    let first = insert(
-        &dl,
-        &format!(
-            "{FIXED_PREDICATE} :q a owl:ObjectProperty . :z a owl:NamedIndividual .
-             _:b :q :y, :z .
-             :A a owl:Class ; rdfs:subClassOf [
-                 a owl:Restriction ; owl:onProperty :q ; owl:someValuesFrom :B
-             ] . :B a owl:Class ."
-        ),
-    )
-    .expect("admitted");
+    let data = format!("{FIXED_PREDICATE} {ANONYMOUS_TREE_AND_SCHEMA}");
+    let first = insert(&dl, &data).expect("admitted");
     let report = |revision| {
         assert_eq!(dl.store().current_revision(), revision);
         let (answers, status) = query(&dl, FIXED_READ);
@@ -217,6 +213,10 @@ fn an_anonymous_report_names_the_revision_that_was_read() {
             .into_iter()
             .find(|reason| reason.contains("anonymous tree has no root"))
     };
+    assert!(
+        report(first).is_some(),
+        "warm the first revision's taxonomy"
+    );
     let named = insert(&dl, ":x :p :z .").expect("named assertion");
     assert!(named > first);
     assert_eq!(dl.store().dl_bounds().last, "delta");
@@ -235,6 +235,57 @@ fn an_anonymous_report_names_the_revision_that_was_read() {
     assert!(cleared > schema);
     assert_eq!(dl.store().dl_bounds().last, "rebuilt");
     assert_eq!(report(cleared), None);
+}
+
+/// An anonymous-tree report is evidence from the ontology read that established
+/// it. A committed query that needs the full ontology refreshes this evidence,
+/// both while building the taxonomy and while checking an absent individual.
+#[test]
+fn a_committed_full_read_refreshes_the_carried_anonymous_report() {
+    use nrese_store::{DlConfig, DlConsistency};
+
+    let mut wrong = Vec::new();
+    for warm in [false, true] {
+        let dl = super::pipeline_with(DlConfig {
+            consistency: DlConsistency::Off,
+            ..DlConfig::default()
+        });
+        let first = insert(
+            &dl,
+            &format!("{FIXED_PREDICATE} {ANONYMOUS_TREE_AND_SCHEMA}"),
+        )
+        .expect("premise");
+        if warm {
+            let (answers, _) = query(&dl, FIXED_READ);
+            assert_eq!(answers, ["true"]);
+        }
+        let second = insert(&dl, ":x :p :z .").expect("named assertion");
+        assert!(second > first);
+        let (answers, status) = query(&dl, FIXED_READ);
+        assert_eq!(answers, ["true"]);
+        let check = |status: &super::Status, revision| {
+            let suffix = format!("as of revision {revision}");
+            status.reasons().iter().any(|reason| {
+                reason.contains("anonymous tree has no root") && reason.ends_with(&suffix)
+            })
+        };
+        if warm {
+            assert!(check(&status, first), "{status:?}");
+            let (answers, status) = query(&dl, "ASK { :missing :p ?o }");
+            assert_eq!(answers, ["false"]);
+            if !check(&status, second) {
+                wrong.push(("absent individual", second, status));
+            }
+            let (answers, status) = query(&dl, FIXED_READ);
+            assert_eq!(answers, ["true"]);
+            if !check(&status, second) {
+                wrong.push(("next fixed read", second, status));
+            }
+        } else if !check(&status, second) {
+            wrong.push(("cold taxonomy", second, status));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// OWL 2 Mapping to RDF Graphs Table 12: one member cannot form a data
