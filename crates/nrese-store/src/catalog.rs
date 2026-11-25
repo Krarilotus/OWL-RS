@@ -293,7 +293,7 @@ pub struct Repository {
 impl Repository {
     fn new(pipeline: MutationPipeline, settings: RepositorySettings) -> Self {
         Self {
-            pipeline: PipelineSlot(Arc::new(RwLock::new(Arc::new(pipeline)))),
+            pipeline: PipelineSlot(Arc::new(RwLock::new(pipeline.prepare_from_start()))),
             settings: Arc::new(RwLock::new(settings)),
             lifecycle: Arc::default(),
         }
@@ -846,10 +846,9 @@ impl Catalog {
             // the new ones.
             previous.retire();
             let restore = || {
-                *repository.pipeline.0.write() = Arc::new(MutationPipeline::new(
-                    Arc::clone(&store),
-                    Arc::clone(previous.reasoner()),
-                ));
+                *repository.pipeline.0.write() =
+                    MutationPipeline::new(Arc::clone(&store), Arc::clone(previous.reasoner()))
+                        .prepare_from_start();
             };
             // Back to the old reasoning after the new inferences were published: they are
             // recomputed under it before its write path is published again. If that fails
@@ -883,7 +882,7 @@ impl Catalog {
                 Err((error, false)) => return Err(roll_back(error)),
             }
             effective.apply(&store);
-            Some(Arc::new(MutationPipeline::new(store, Arc::new(reasoner))))
+            Some(MutationPipeline::new(store, Arc::new(reasoner)).prepare_from_start())
         } else {
             persist().map_err(|(error, _)| error)?;
             effective.apply(repository.pipeline.read().store());
@@ -1457,6 +1456,56 @@ mod tests {
         assert!(changed.is_err(), "the change wasn't refused");
         assert_eq!(mode, "rdfs", "the old reasoning isn't the repository's");
         assert_eq!(got, rdfs, "the old reasoning's answers");
+        let restored = std::sync::Arc::clone(&*repository.pipeline.read());
+        let before = restored.write_program_metrics();
+        let refused = restored.execute_update_str(SAME_DOG);
+        let after = restored.write_program_metrics();
+        println!(
+            "poisoned WAL, write program before and after the refusal: {before:?} -> {after:?}"
+        );
+        assert_eq!([before, after], [(1, 0, 0); 2]);
+        assert!(
+            matches!(
+                &refused,
+                Err(crate::MutationError::Store {
+                    source: crate::StoreError::Engine(nrese_engine::EngineError::WalPoisoned),
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+        drop((restored, repository, store, catalog));
+
+        let catalog = Catalog::open(
+            compact_store(dir.path()),
+            nrese_reasoner::ReasonerService::new(nrese_reasoner::ReasonerConfig::default()),
+        )
+        .unwrap();
+        let repository = catalog.get(DEFAULT_REPOSITORY).unwrap();
+        let reopened = repository.pipeline.read();
+        assert_eq!(
+            animals(reopened.store()),
+            rdfs,
+            "the reopened store uses the old rules"
+        );
+        commit(&reopened, SAME_DOG);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let (phase, builds, commit_groundings) = reopened.write_program_metrics();
+            assert_ne!(phase, 3, "the reopened writer's preparation failed");
+            assert!(builds <= 1, "the reopened writer retried preparation");
+            assert_eq!(commit_groundings, 0);
+            if (phase, builds) == (2, 1) {
+                break;
+            }
+            assert!(std::time::Instant::now() < until, "restored write program");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(
+            animals(reopened.store()),
+            rdfs,
+            "the reopened writer uses the old rules"
+        );
     }
 
     /// The same failure in a store whose reasoning is configured, not changed (the server's

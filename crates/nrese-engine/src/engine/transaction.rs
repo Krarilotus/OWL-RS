@@ -991,6 +991,7 @@ impl Inner {
                 0
             }
         };
+        shared.versions.notify();
         // What the commit touched, where reader-scoped searches keep corpora: under the
         // writer slot (steps are recorded in commit order), after the publication's locks.
         // A search of the new version meanwhile finds no step and walks.

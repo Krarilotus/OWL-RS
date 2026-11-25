@@ -13,8 +13,12 @@ pub(crate) mod command;
 mod error;
 pub(crate) mod evidence;
 mod pipeline;
+mod prepare;
 mod record;
 mod ticket;
+#[cfg(any(test, feature = "fault-points"))]
+#[path = "prepare_hooks.rs"]
+pub mod write_program_hooks;
 
 pub use attribution::{RejectAttribution, RejectAttributionCandidate};
 pub use command::{

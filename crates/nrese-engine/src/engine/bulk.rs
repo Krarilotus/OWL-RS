@@ -574,8 +574,10 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
         next.committed_micros = stamp.take(shared).0;
         let next = Version::new(watch, next);
         drop(current);
-        let _compaction = shared.versions.compaction_slot.lock();
+        let compaction = shared.versions.compaction_slot.lock();
         shared.versions.install(next);
+        drop(compaction);
+        shared.versions.notify();
         return Ok(());
     };
     // The checkpoint image's version: an unpublished snapshot's, never installed. The one
@@ -657,6 +659,7 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
     release_covered(&mut wal, durable.root(), revision);
     drop(wal);
     drop(compaction);
+    shared.versions.notify();
     if let Some(base) = base
         && let Err(error) = shared.dictionary.rebase(base)
     {
@@ -791,6 +794,7 @@ fn publish_streamed(
     release_covered(&mut wal, durable.root(), revision);
     drop(wal);
     drop(compaction);
+    shared.versions.notify();
     if let Err(error) = shared.dictionary.rebase(base) {
         tracing::warn!(%error, "checkpoint dictionary not mapped; it stays in memory");
     }

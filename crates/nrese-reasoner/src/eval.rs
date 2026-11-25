@@ -1621,6 +1621,7 @@ pub struct OperationStop<'a> {
     memory: MemoryPoll<'a>,
     /// The operation's own memory limit's room, beside the process's ([`Self::within`]).
     room: Option<MemoryRoom<'a>>,
+    groundings: Option<&'a std::sync::atomic::AtomicU64>,
     /// 0: not fired; else what fired it ([`OperationStop::fired`]).
     fired: std::sync::atomic::AtomicU8,
 }
@@ -1637,6 +1638,7 @@ impl<'a> OperationStop<'a> {
             caller,
             memory,
             room: None,
+            groundings: None,
             fired: std::sync::atomic::AtomicU8::new(0),
         }
     }
@@ -1647,6 +1649,18 @@ impl<'a> OperationStop<'a> {
         Self {
             room: Some(room),
             ..self
+        }
+    }
+
+    /// Count whole-store groundings performed on behalf of this operation.
+    pub fn counting_groundings(mut self, counter: &'a std::sync::atomic::AtomicU64) -> Self {
+        self.groundings = Some(counter);
+        self
+    }
+
+    pub(crate) fn count_grounding(&self) {
+        if let Some(counter) = self.groundings {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -2542,6 +2556,13 @@ impl std::fmt::Debug for GroundProgram {
 }
 
 impl GroundProgram {
+    #[cfg(test)]
+    pub(crate) fn operand_templates(&self) -> Option<&[(Rule, Vec<Triple>)]> {
+        self.list_operands
+            .as_ref()
+            .map(|ops| ops.templates.as_slice())
+    }
+
     /// Files one ground fact rule; returns its index if it is new and has a body.
     pub fn add(&mut self, rule: Rule) -> Option<usize> {
         self.add_with(rule, Vec::new(), None, None)
