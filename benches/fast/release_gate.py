@@ -176,7 +176,8 @@ def fleet_host_errors(passes: list[dict], host: str) -> list[str]:
     return out
 
 
-def provenance_errors(passes: list[dict], sides: dict[str, str], harness: str, planned: list[str]) -> list[str]:
+def provenance_errors(passes: list[dict], sides: dict[str, str], harness: str, planned: list[str],
+                      *, host_errors: list[str] | None = None) -> list[str]:
     """What each pass must say about itself: complete, one repetition of exactly the planned
     cases, the clean harness revision at start and end, its side's verified binaries (the same
     in every pass of the side), the same prepared data unchanged, one host and configuration."""
@@ -243,7 +244,10 @@ def provenance_errors(passes: list[dict], sides: dict[str, str], harness: str, p
     if len(prepared) > 1:
         errors.append("the passes read different prepared data")
     if len(identities) > 1:
-        errors.append("not one host and configuration: " + " | ".join(sorted(identities)))
+        error = "not one host and configuration: " + " | ".join(sorted(identities))
+        errors.append(error)
+        if host_errors is not None:
+            host_errors.append(error)
     return errors
 
 
@@ -1178,6 +1182,7 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
         if same is not None:
             aliases[s] = same
     context = dict(context or {})
+    ordered_passes = sorted(passes, key=lambda p: p["n"])
     summary = {"candidate": {"name": candidate, "revision": sides[candidate]},
                "baselines": {s: sides[s] for s in baselines}, "harness": harness,
                "policy": {"alpha": gatestats.ALPHA, "pair_weights": gatestats.PAIR_WEIGHTS,
@@ -1186,7 +1191,7 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
                           "floor": (floor or {}).get("source")},
                "passes": [{"n": p["n"], "side": p["side"], "file": p["path"], "block": p["report"].get("block"),
                            "run": p["report"].get("run"), "layout": p["report"].get("layout")}
-                          for p in sorted(passes, key=lambda p: p["n"])],
+                          for p in ordered_passes],
                "diagnostic": diagnostic or min_blocks < CAMPAIGN_BLOCKS, "required": required,
                "context": context, "flagged": [], "other_blocking": [], "pvalues": {}, "resolution": {}, "emerged": [],
                "not_run": not_run, "elsewhere": elsewhere, "errors": list(timing_errors or ()),
@@ -1204,7 +1209,8 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
     # Fail closed: a part that timed nothing (no pass, or none that planned a case) passes nothing.
     if not planned:
         summary["errors"].append(f"nothing timed: {len(passes)} passes, none planned a case")
-    summary["errors"] += provenance_errors(passes, sides, harness, planned)
+    host_provenance: list[str] = []
+    summary["errors"] += provenance_errors(passes, sides, harness, planned, host_errors=host_provenance)
     # Sides that ran one build compare nothing (D16-593): a round of a build against itself reads "no
     # loss". Sides of one revision are declared identical (an A-A' control; a confirmation's main that
     # is its base); any other two must differ, layout by layout. Per build, not per case: a case one
@@ -1217,7 +1223,9 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
                 hashes.setdefault(p["side"], built.get("sha256"))
         identical = {frozenset((s, t)) for s in hashes for t in hashes if s != t and sides.get(s) == sides.get(t)}
         summary["errors"] += [f"layout {layout}: {e}" if layout > 1 else e for e in manifest.one_binary(hashes, identical)]
-    summary["errors"] += fleet_host_errors(passes, str(context.get("host") or ""))
+    fleet_errors = fleet_host_errors(passes, str(context.get("host") or ""))
+    summary["errors"] += fleet_errors
+    host_provenance += fleet_errors
     host_errors, summary["host_notes"] = host_states(passes)
     summary["errors"] += host_errors
     summary["host"] = sorted({(p["report"].get("machine") or {}).get("host") for p in passes}, key=str)
@@ -1309,9 +1317,19 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
     summary["passed"] = (not summary["diagnostic"] and not summary["errors"] and not summary["blocking"]
                          and not summary["flagged"] and not summary["emerged"]
                          and not any(set(v.split(", ")) & BAR_OUTCOMES for v in summary["known_issues"].values()))
-    landing_family = family if family is not None else declared
-    summary["lines"] = {h: landing_dimension(summary, h, len(landing_family)) for h in landing_family}
-    summary.update(gatestats.landing_words(landing_family, landing_pvalues(summary)))
+    landing_family = family
+    if landing_family is None and planned:
+        selected = [c for c in catalog or [] if c["name"] in planned and "metric" in c]
+        if {c["name"] for c in selected} == set(planned):
+            landing_family = family_of(selected, planned, tuple(baselines))
+    if landing_family is not None:
+        summary["lines"] = {h: landing_dimension(summary, h, len(landing_family)) for h in landing_family}
+        summary.update(gatestats.landing_words(landing_family, landing_pvalues(summary)))
+        summary["host_provenance_errors"] = host_provenance
+        for entry, p in zip(summary["passes"], ordered_passes):
+            # The same pass keeps its identity if copied, renamed, or re-encoded as JSON.
+            content = json.dumps(p["report"], sort_keys=True, separators=(",", ":")).encode("utf-8")
+            entry["sha256"] = hashlib.sha256(content).hexdigest()
     return summary
 
 
@@ -1327,6 +1345,13 @@ def landing_pvalues(summary: dict) -> dict[str, float]:
     return {h: entry["p"] for h, entry in summary["lines"].items()}
 
 
+def landing_pass_hashes(summary: dict, round_number: int) -> set[str]:
+    hashes = [p.get("sha256") for p in summary.get("passes") or []]
+    if not hashes or any(not isinstance(h, str) or not re.fullmatch(r"[0-9a-f]{64}", h) for h in hashes):
+        raise ValueError(f"round {round_number} has no complete pass identities")
+    return set(hashes)
+
+
 def landing_pair(first: dict, second: dict) -> dict:
     """Combine the landing-timing words only, using the first report's frozen family."""
     first_context, second_context = first.get("context") or {}, second["context"]
@@ -1338,15 +1363,20 @@ def landing_pair(first: dict, second: dict) -> dict:
     first_host, second_host = first_context.get("host") or "", second_context.get("host") or ""
     if first_host != second_host or (not second_host and not any(second["host"])):
         raise ValueError("round 1 report: host does not match round 2 or is unknown")
-    second_p = landing_pvalues(second)
     try:
         first_p = landing_pvalues(first)
+        second_p = landing_pvalues(second)
     except (AttributeError, KeyError, TypeError) as error:
-        raise ValueError("round 1 report has no landing timing readings") from error
+        raise ValueError("the two reports need landing timing readings from a planned family") from error
     if first_p.keys() != second_p.keys():
         raise ValueError("round 1 report: planned family does not match round 2")
     if any(not number(p) or not 0 <= p <= 1 for p in first_p.values()):
         raise ValueError("round 1 report has invalid landing timing p-values")
+    for k, report in enumerate((first, second), 1):
+        if report.get("host_provenance_errors") != []:
+            raise ValueError(f"round {k} has a host provenance error or no host provenance record")
+    if landing_pass_hashes(first, 1) & landing_pass_hashes(second, 2):
+        raise ValueError("the rounds share a pass")
     return gatestats.landing_words(list(second_p), first_p, second_p)
 
 
@@ -1375,7 +1405,8 @@ def render(summary: dict, first: dict | None = None) -> str:
     verdict_ = "PASSED" if summary["passed"] else ("DIAGNOSTIC ONLY, not a release verdict" if summary["diagnostic"]
                                                    else "NOT PASSED on its own (verdict combines the rounds)")
     blocks = sorted({p["block"] for p in summary["passes"] if p.get("block") is not None}, key=str)
-    lines = landing_opening(summary, first) if "word" in summary else []
+    landing = "word" in summary
+    lines = landing_opening(summary, first) if landing else []
     lines += [f"# Release gate round {summary['context'].get('round', 0)}: {c['name']} {c['revision']}", "",
              f"Against {', '.join(f'{s} {r}' for s, r in summary['baselines'].items())}; harness {summary['harness']}; "
              f"host {', '.join(map(str, summary['host']))}; {len(blocks)} blocks, {len(summary['passes'])} side-runs."
@@ -1384,7 +1415,7 @@ def render(summary: dict, first: dict | None = None) -> str:
              f"**{verdict_}.** Each declared hypothesis (case x series or metric x baseline: {len(summary['family'])}) "
              "gets a one-sided p-value of a loss from its block contrasts (layouts the outer unit); a loss counts "
              f"when two consecutive rounds show it and Holm over the family rejects at {gatestats.ALPHA} "
-             "(benches/PROTOCOL.md §5).", ""]
+             "(benches/PROTOCOL.md §5)." + ("" if landing else " Flagged here: due for confirmation."), ""]
     if summary["errors"]:
         lines += ["## The passes don't qualify", ""] + [f"- {e}" for e in summary["errors"]] + [""]
     floor = summary["policy"].get("floor")
@@ -1397,7 +1428,8 @@ def render(summary: dict, first: dict | None = None) -> str:
         lines += [f"- {line}" for line in summary.get("inputs", [])] + [""]
     lines += ["## Blocking (not statistical)", ""] + ([f"- {b}" for b in summary["blocking"]] or ["- nothing"]) + [""]
     if summary["flagged"]:
-        lines += ["## nominal p below 0.05: not findings", "",
+        heading = "nominal p below 0.05: not findings" if landing else "Flagged: a loss shown this round, a confirmation due"
+        lines += [f"## {heading}", "",
                   "| baseline | case / dimension | ratio | interval | p | units |", "|---|---|---|---|---|---|"]
         for f in sorted(summary["flagged"], key=lambda f: f["p"]):
             ci = f"{f['ci'][0]:.4f}-{f['ci'][1]:.4f}" if f.get("ci") else "-"

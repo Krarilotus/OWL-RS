@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import itertools
 import math
-import random
 import statistics
 from functools import lru_cache
 
@@ -198,7 +197,9 @@ def rejectable(p: float, m: int, alpha: float = ALPHA) -> bool:
 LANDING_SCREEN = 0.10
 CLEARANCE_PERCENT = 3.0
 ROUND_POWER = 0.90
-SENSITIVITY_DRAWS = 10_000
+# Positive nodes and paired weights of the eight-point Gauss–Legendre rule.
+GAUSS_LEGENDRE_8 = ((0.1834346424956498, 0.3626837833783620), (0.5255324099163290, 0.3137066458778873),
+                    (0.7966664774136267, 0.2223810344533745), (0.9602898564975363, 0.1012285362903763))
 
 
 def landing_words(family: list[str], first: dict[str, float], second: dict[str, float] | None = None) -> dict:
@@ -219,22 +220,46 @@ def landing_words(family: list[str], first: dict[str, float], second: dict[str, 
     return result
 
 
-@lru_cache(maxsize=16)
-def _normal_mean_and_sd(df: int) -> list[tuple[float, float]]:
-    """Independent standardized mean and sample sd draws for normal units."""
-    rng = random.Random(513)
-    return [(rng.gauss(0, 1), math.sqrt(rng.gammavariate(df / 2, 2) / df))
-            for _ in range(SENSITIVITY_DRAWS)]
-
-
 @lru_cache(maxsize=256)
 def _sensitivity_shift(n: int, m: int, relative_floor: float) -> float:
-    """Smallest standardized mean shift that rejects in 90 % of simulated rounds."""
-    critical = t_ppf(1 - ALPHA * PAIR_WEIGHTS[0] / m, n - 1)
-    # Invert each simulated test at its own clamped sd, then take the empirical quantile.
-    # The shift is in standard errors of the true mean, before clamping.
-    shifts = sorted(critical * max(sd, relative_floor) - mean for mean, sd in _normal_mean_and_sd(n - 1))
-    return shifts[math.ceil(ROUND_POWER * len(shifts)) - 1]
+    """Find the shift reaching 90 % power by integrating over the sample sd."""
+    df = n - 1
+    critical = t_ppf(1 - ALPHA * PAIR_WEIGHTS[0] / m, df)
+    root_df, mode = math.sqrt(df), math.sqrt(df - 1)
+    # sqrt(df) * sample_sd / true_sd follows chi(df) and is independent of the mean.
+    # Integrate in x = chi - mode. The chi log-density has curvature at most -1,
+    # so its mass beyond 12 from the mode is below floating-point precision.
+    low, high = max(-mode, -12.0), 12.0
+    clamp = min(high, max(low, root_df * relative_floor - mode))
+    # Split at the clamp's kink. Limit each interval's change in the normal CDF
+    # argument to two, even for a large family or few units.
+    width = min(1.0, 2 * root_df / critical)
+    terms = []
+    for a, b in ((low, clamp), (clamp, high)):
+        count = math.ceil((b - a) / width)
+        if not count:
+            continue
+        half = (b - a) / (2 * count)
+        for i in range(count):
+            centre = a + (2 * i + 1) * half
+            for node, weight in GAUSS_LEGENDRE_8:
+                for x in (centre - half * node, centre + half * node):
+                    log_density = (df - 1) * math.log1p(x / mode) - mode * x - x * x / 2
+                    sd = (mode + x) / root_df
+                    terms.append((critical * max(sd, relative_floor), half * weight * math.exp(log_density)))
+    # The chi density's normalization cancels. Conditional rejection probability
+    # is half erfc((threshold - shift) / sqrt(2)).
+    target = 2 * ROUND_POWER * math.fsum(w for _, w in terms)
+    lo, hi = 0.0, max(t for t, _ in terms) + 2.0
+    inv_sqrt_two = math.sqrt(0.5)
+    for _ in range(40):
+        mid = (lo + hi) / 2
+        mass = math.fsum(w * math.erfc((t - mid) * inv_sqrt_two) for t, w in terms)
+        if mass >= target:
+            hi = mid
+        else:
+            lo = mid
+    return hi
 
 
 def landing_lines(reading: dict | None, m: int, p: float | None, *, below_step: bool = False) -> dict:
@@ -246,7 +271,8 @@ def landing_lines(reading: dict | None, m: int, p: float | None, *, below_step: 
     floor = reading.get("floor", 0.0)  # loss_test has already scaled it to the units.
     sd = max(reading["sample_sd"], floor)
     discrete = reading["distinct_units"] < 4
-    if below_step or reading.get("below_resolution"):
+    below_step = below_step or reading.get("below_resolution", False)
+    if below_step:
         out["clearance"] = "not resolved to 3 % (below the counter's step)"
     elif sd == 0:
         out["clearance"] = "not resolved: no spread"
@@ -257,8 +283,8 @@ def landing_lines(reading: dict | None, m: int, p: float | None, *, below_step: 
         upper = _ceil_percent(log_upper)
         out["clearance"] = (f"not resolved to 3 % ({upper:.2f} %)" if upper > CLEARANCE_PERCENT
                             else f"no loss above {upper:.2f} % shown")
-    if p is not None and sd > 0 and not discrete:
-        # Use the effective spread as the true sd estimate, and clamp each simulated sample too.
+    if p is not None and sd > 0 and not discrete and not below_step:
+        # Use the effective spread as the true sd estimate, with the same floor in the test.
         shift = _sensitivity_shift(n, m, floor / sd) * sd / math.sqrt(n)
         percent = _ceil_percent(shift)
         two_round_power = 2 * ROUND_POWER - 1
