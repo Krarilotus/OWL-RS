@@ -214,7 +214,7 @@ fn an_inconsistency_owl2_ql_states_is_found() {
 /// Spec (module docs): as [`an_inconsistency_owl2_ql_states_is_found`], for n-ary
 /// `DisjointClasses` and `DisjointObjectProperties` (Direct Semantics Tables 5 and 6).
 #[test]
-#[ignore = "owl2-ql doesn't check n-ary disjointness yet: its list rules come after the list module's rework"]
+#[ignore = "known open fault, run by the nightly tier: scripts/lib/known-faults.tsv"]
 fn an_n_ary_disjointness_owl2_ql_states_is_found() {
     found_inconsistent(ReasoningMode::Owl2Ql, &N_ARY_CLASHES);
 }

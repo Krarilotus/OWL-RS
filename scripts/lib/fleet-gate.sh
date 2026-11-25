@@ -12,7 +12,8 @@
 # target and lock of its own on the host, so it never waits behind a push gate. Sized by measurement
 # (1 to 5 minutes a changed crate on a warm target): est_min 10, a step deadline of 30 minutes. Never
 # a merge gate: it lands nothing.
-# MODE nightly (LIST empty): the same, for scripts/check.sh nightly: gate-job.sh mode nightly, every
+# MODE nightly (LIST empty): first a job of its own for the outside check (below), then the same, for
+# scripts/check.sh nightly: gate-job.sh mode nightly, every
 # test in its full form, in push's worktree, target and lock on the host (one build for both; a push
 # gate there waits for it), of push's fleet kind, placed by the fleet as push's is. Sized by measurement
 # (below). Never a merge gate: it lands nothing.
@@ -142,7 +143,9 @@ trap 'rm -f "$job"' EXIT
 # gate HOSTS: one gate job (on one of HOSTS, if any), followed to its end; sets verdict, log, host.
 gate() {
   {
-    echo "id = $(q "gate-$mode-${tree:0:10}-$(date +%s)")"
+    # The first job's id at the outside check's second (below); a re-check's at its own.
+    echo "id = $(q "gate-$mode-${tree:0:10}-${stamp:-$(date +%s)}")"
+    stamp=""
     echo 'group = "gate"'
     # The fleet refuses the same job again after a failure it diagnosed as the job's own. A rerun
     # for a cause outside the tree says what was repaired, with its evidence (NRESE_GATE_REPAIR).
@@ -241,6 +244,63 @@ EOF
   )
   case $verdict in passed* | failed*) ;; *) no_verdict "its result doesn't count: ${verdict#invalid }" ;; esac
 }
+
+# The nightly run's outside check (scripts/check.sh nightly-outside), a job of its own: it starts
+# containers, which the gate's own job never may. Submitted before the nightly run, and never followed:
+# its verdict and counts are its own results (gate.json, tier nightly-outside, as a gate job's; check.log;
+# outside/outside.json), and the nightly run's doesn't wait for them. Its id is the nightly run's with
+# -outside after the tier, at the same second. Its hosts: the private overlay's [fleet] gate_outside
+# (benches/suite/suitekit/hosts.py fleet), or NRESE_GATE_OUTSIDE_HOSTS; with neither it isn't submitted,
+# and the run says so. NRESE_GATE_NO_OUTSIDE: not submitted.
+stamp=$(date +%s)
+outside_hosts=""
+if [ "$mode" = nightly ] && [ -z "${NRESE_GATE_NO_OUTSIDE:-}" ]; then
+  outside_hosts=${NRESE_GATE_OUTSIDE_HOSTS:-$(fleet_hosts gate_outside 2> /dev/null)}
+  for target in $outside_hosts; do
+    [[ $target =~ ^[A-Za-z0-9_.-]+$ ]] || no_verdict "invalid outside check host"
+  done
+  [ -n "$outside_hosts" ] || fleet_say "the outside check wasn't submitted: no hosts for it (the private" \
+    "overlay's [fleet] gate_outside, or NRESE_GATE_OUTSIDE_HOSTS); the nightly run goes on without it"
+fi
+if [ -n "$outside_hosts" ]; then
+  {
+    echo "id = $(q "gate-nightly-outside-${tree:0:10}-$stamp")"
+    echo 'group = "gate"'
+    echo 'kind = "owlrs.any"'
+    echo "priority = $priority"
+    echo 'priority_reason = "the nightly run'"'"'s outside check (scripts/check.sh nightly-outside); it lands nothing"'
+    # Measured (22 Nov 2026, 6 cores): 3,000 cases in 7 min, a cold release build in 6; the step's own
+    # deadline is 30 minutes for both blocks (scripts/check.sh).
+    echo 'est_min = 20'
+    echo 'step_deadline_min = 40'
+    # Pinned, as the fleet allows nothing else: its containers start inside outside.sh, out of the
+    # fleet's sight, which a host with a memory envelope never admits (a container there must show its
+    # cap in the step itself). A host joins gate_outside once it has Docker, can build images and has no
+    # envelope.
+    echo 'pin_reason = "Docker containers the fleet cannot see: only hosts without a memory envelope admit them"'
+    printf 'steps = [["bash", "scripts/lib/outside-job.sh", %s, %s, %s]]\n' \
+      "$(q "$tree")" "$(q "$list_hash")" "$(q "$identity")"
+    echo '[env]'
+    echo 'NRESE_ON_BUILD_HOST = "1"'
+    echo 'CARGO_BUILD_JOBS = "6"'
+    echo '[requires]'
+    echo 'os = "linux"'
+    echo 'roles = ["test"]'
+    echo 'has = ["docker", "docker-build"]'
+    echo 'cores = 6'
+    echo 'ram_gb = 12'
+    printf 'hosts = [%s]\n' "$(for target in $outside_hosts; do printf '%s, ' "$(q "$target")"; done | sed 's/, $//')"
+    echo '[[inputs]]'
+    echo 'name = "checkout"'
+    echo "source = { git = $(q "$(fleet_repo)"), rev = $(q "$commit") }"
+  } > "$job"
+  if fleet_submit "$job"; then
+    fleet_say "submitted, the nightly run's outside check; its verdict is its own (fleet results $fleet_id)"
+  else
+    fleet_say "the outside check wasn't submitted: the nightly run goes on without it"
+  fi
+  fleet_id=""
+fi
 
 gate "${NRESE_GATE_HOSTS:-}"
 first=$fleet_id first_host=$host recheck=""

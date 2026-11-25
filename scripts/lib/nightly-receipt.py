@@ -5,7 +5,8 @@
 DIR holds inventory.json, the tree's every workspace test, #[ignore]d ones marked (cargo nextest list
 --message-format json, written before any test ran, no filter applied), and STEP.junit.xml, nextest's
 JUnit report of each step (none: that step's tests have no outcome). SELECTION is what the step was told to run: `not-ignored`, every test not
-#[ignore]d, or `exact:BINARY_ID/NAME`, the one test so named.
+#[ignore]d, `exact:BINARY_ID/NAME`, the one test so named, or `known`, the known open faults of
+scripts/lib/known-faults.tsv (each an #[ignore]d test of the inventory).
 
 Writes DIR/receipt.json: the fields of the gate's CheckReceipt (benches/fast/release_gate.py: kind,
 commit, tree, dirty, identity, host, job, attempt; from RECEIPT_* in the environment), each step as a
@@ -14,7 +15,9 @@ passed, failed, or skipped with its reason (an #[ignore]d test no step selected:
 it). It is complete only when every test a step selected has exactly one outcome, run (passed or failed:
 a selected test reported skipped never ran), every test not #[ignore]d has one, and every outcome names
 a test of the inventory. A test a step reports skipped without selecting it is no outcome of that step.
-A failed test is an outcome, which its own step fails on.
+A failed test is an outcome, which its own step fails on. A known open fault that fails is
+`known-open-fault`, counted (`known_open_faults`) and named (`known_open_fault_list`) apart; one that
+passes leaves the receipt not complete: the fault no longer reproduces, and its line goes.
 
 Exit: 0 complete, 1 not (each reason on stderr, `receipt: ...`), 2 a usage error.
 """
@@ -36,6 +39,9 @@ inventory = {(binary, name): bool(case.get("ignored"))
              for binary, suite in suites.items() for name, case in suite["testcases"].items()}
 if not inventory:
     errors.append("the inventory lists no test")
+# The known open faults, id ("<binary id> <name>") -> what is wrong (known-faults.tsv).
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "known-faults.tsv"), encoding="utf-8") as f:
+    known = dict(line.rstrip("\r\n").split("\t", 1) for line in f if line.strip() and not line.startswith("#"))
 
 for arg in sys.argv[2:]:
     step, selection = arg.split("=", 1)
@@ -44,6 +50,10 @@ for arg in sys.argv[2:]:
     elif selection.startswith("exact:") and "/" in selection:
         want = {tuple(selection[len("exact:"):].split("/", 1))}
         errors += [f"{step}: selects {' '.join(k)}, which the inventory doesn't list" for k in want - inventory.keys()]
+    elif selection == "known":
+        want = {tuple(k.split(" ", 1)) for k in known}
+        errors += [f"{step}: the known open fault {' '.join(k)} is no #[ignore]d test of the inventory"
+                   for k in sorted(want) if not inventory.get(k)]
     else:
         sys.exit(f"receipt: {step}: no such selection {selection!r}")
     selected |= want
@@ -75,6 +85,11 @@ for arg in sys.argv[2:]:
                 errors.append(f"{step}: {' '.join(key)} was selected, but reported skipped: it never ran")
             else:
                 outcome = {"outcome": "passed"}
+            if selection == "known" and key in want and outcome["outcome"] == "failed":
+                outcome = {"outcome": "known-open-fault", "about": known[" ".join(key)]}
+            elif selection == "known" and key in want and outcome["outcome"] == "passed":
+                errors.append(f"{step}: known fault no longer reproduces: {' '.join(key)} passed; "
+                              "remove its line from scripts/lib/known-faults.tsv")
             if key in cases:
                 errors.append(f"{step}: a second outcome for {' '.join(key)} (first in {cases[key]['step']})")
             elif key not in want:
@@ -99,6 +114,9 @@ receipt = {
     "host": e.get("RECEIPT_HOST", ""), "job": e.get("RECEIPT_JOB", ""), "attempt": e.get("RECEIPT_ATTEMPT", ""),
     "units": units, "complete": not errors, "errors": errors,
     "counts": dict(Counter(c["outcome"] for c in cases.values())),
+    "known_open_faults": sum(c["outcome"] == "known-open-fault" for c in cases.values()),
+    "known_open_fault_list": [{"id": f"{b} {n}", "about": c["about"]} for (b, n), c in sorted(cases.items())
+                              if c["outcome"] == "known-open-fault"],
     "cases": [{"id": f"{b} {n}", **cases[(b, n)]} for b, n in sorted(cases)],
 }
 with open(os.path.join(out, "receipt.json"), "w", encoding="utf-8") as f:
@@ -107,5 +125,8 @@ for message in errors[:40]:
     print(f"receipt: {message}", file=sys.stderr)
 if len(errors) > 40:
     print(f"receipt: ... and {len(errors) - 40} more (receipt.json)", file=sys.stderr)
+print(f"receipt: known open faults: {receipt['known_open_faults']}")
+for fault in receipt["known_open_fault_list"]:
+    print(f"receipt: known open fault: {fault['id']}: {fault['about']}")
 print(f"receipt: {len(inventory)} tests listed; {receipt['counts']}; {'complete' if not errors else 'NOT complete'}")
 sys.exit(1 if errors else 0)

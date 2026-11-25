@@ -1,0 +1,12 @@
+# Known open faults: tests that state the right behaviour and fail while the fault is there.
+# Each one is #[ignore]d, so no other tier runs it. The nightly tier (scripts/check.sh nightly) runs
+# them alone, by exact name. Its receipt (scripts/lib/nightly-receipt.py) reads a failure as a known
+# open fault, counted and named on its own line. A pass is red, "known fault no longer reproduces":
+# the fix removes its line here. A test missing from here, or one not #[ignore]d, fails as any other.
+# A cut that claims full correctness needs this list empty (benches/fast/release_gate.py verdict
+# --full-correctness).
+# Rust tests only: an outside check's difference (scripts/check.sh nightly-outside) is never listed, it is red until fixed.
+# One line each: the test (binary id, a space, its path in the binary), a tab, what is wrong.
+nrese-store::rule_table_oracle cells::irreflexive_same_as_is_inconsistent	Declaring owl:sameAs an owl:IrreflexiveProperty is accepted, though every term is the same as itself, so the data have no model.
+nrese-store::rule_table_oracle cells::functional_literal_equality_reaches_later_writes	A functional property's two forms of one value (an integer and a decimal) are equated within a commit, but not carried into a later one (docs/limits.md#two-spellings-across-commits).
+nrese-store::it ql_consistency_tests::an_n_ary_disjointness_owl2_ql_states_is_found	Under owl2-ql, a clash of an n-ary owl:AllDisjointClasses or owl:AllDisjointProperties isn't found: the commit is applied and the store reads consistent.
