@@ -31,7 +31,7 @@ use nrese_sparql_syntax::algebra::{
 };
 use nrese_sparql_syntax::term::{GroundTerm, NamedNodePattern, TermPattern, TriplePattern};
 
-use super::{OWL, RDF, RDFS, SnapshotTerms, iri, schema_statements};
+use super::{OWL, RDF, RDFS, iri, read_schema, schema_statements};
 use crate::results::QueryEvaluationError;
 use crate::view::ReadView;
 
@@ -88,9 +88,10 @@ pub fn print<V: ReadView>(
     let snapshot = view.evaluation_snapshot()?;
     let snapshot: &Snapshot = &snapshot;
     let statements = schema_statements(snapshot, &|_| true);
-    let ontology = nrese_owl::read(&statements, &SnapshotTerms(snapshot));
+    let closure = Closure { lists: true };
+    let ontology = read_schema(snapshot, &statements, closure);
     let thing = iri(snapshot, OWL, "Thing").map(TermId::raw);
-    let tbox = Tbox::compile(&ontology, Closure { lists: true }, thing);
+    let tbox = Tbox::compile(&ontology, closure, thing);
     let name = |t: u64| match snapshot.decode(TermId::from_raw(t)) {
         Some(term) => term.to_string(),
         None => format!("term {t}"),

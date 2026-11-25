@@ -28,6 +28,7 @@ mod outside;
 mod plans;
 mod premise;
 mod queries;
+mod repeated_list_member;
 mod representatives;
 mod reserved_names;
 mod review;

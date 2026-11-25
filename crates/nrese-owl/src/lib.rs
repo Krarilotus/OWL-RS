@@ -38,11 +38,12 @@ pub use diagnostics::{Diagnostic, Strict, Treatment, Treatments};
 pub use functional::{iri_text, literal_text};
 pub use mapping::{
     BUILTIN_ANNOTATIONS, BuiltinProperties, DECLARATION_KINDS, Ontology, Source, Statement,
-    TermKind, Terms, is_shacl_property, may_name_annotation, read, read_beside, shacl_properties,
+    TermKind, Terms, is_shacl_property, may_name_annotation, read, read_beside,
+    read_with_disjoint_reading, shacl_properties,
 };
 pub use model::{
-    Axiom, Characteristic, ClassExpr, DataRange, DataTerms, EntityKind, ExprId, Interner, Literal,
-    ObjProp, RangeId, Term,
+    Axiom, Characteristic, ClassExpr, DataRange, DataTerms, DisjointReading, EntityKind, ExprId,
+    Interner, Literal, ObjProp, RangeId, Term,
 };
 pub use normalise::{Options, normalise, normalise_with};
 pub use ofn::{Document, FunctionalReader, Intern, read_functional};
