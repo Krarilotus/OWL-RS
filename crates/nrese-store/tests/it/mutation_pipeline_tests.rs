@@ -534,10 +534,7 @@ fn reasoning_state_tracks_whether_inferences_are_current() {
     }
     let store = StoreService::new(config.clone()).expect("reopen");
     assert!(current(&store));
-    assert_eq!(
-        store.consistency(),
-        nrese_store::ConsistencyStatus::Consistent
-    );
+    assert_eq!(store.consistency(), nrese_store::ConsistencyStatus::Unknown);
     // OWL 2 Profiles §4.3: the inferred subclass membership, 32 datatype declarations,
     // 11 annotation property and class declarations, and five distinct scm-cls rows.
     assert_eq!(store.clear_inferred().expect("clear"), 1 + 32 + 11 + 5);

@@ -36,17 +36,6 @@ pub struct ReasoningState {
     /// is current only for data that doesn't equate `rdf:nil` with another term, so only a
     /// store whose data does rebuilds, once.
     pub nil_lists: bool,
-    /// The rules equate a literal with another term, a fact no store holds, so statements
-    /// written since lack its copies (`nrese_reasoner::engine::Closure::literal_equality`):
-    /// reads of typed values aren't `complete` (`dl::query::withhold`). Set by a
-    /// rematerialisation as its closure tells or by a commit that derives one. A
-    /// certificate also sets it when literal equality is unknown. Never written.
-    pub(crate) literal_equality: bool,
-    /// An open without a rematerialisation leaves literal equality unknown. Certification
-    /// clears this uncertainty only for a matching program that cannot equate literals.
-    /// Otherwise, no reader's view can settle it and every reader's reads of literals are
-    /// withheld, a reader by support's too (`dl::query::withhold`).
-    pub(crate) literal_equality_unknown: bool,
 }
 
 /// Whether the stored data is consistent under the configured ruleset.
@@ -189,8 +178,6 @@ impl ReasoningState {
             undecided: None,
             compact_equality,
             nil_lists: !compact_equality,
-            literal_equality: false,
-            literal_equality_unknown: false,
         }
     }
 
@@ -271,8 +258,6 @@ impl ReasoningState {
             undecided: None,
             compact_equality,
             nil_lists,
-            literal_equality: false,
-            literal_equality_unknown: false,
         })
     }
 }
