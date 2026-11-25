@@ -109,15 +109,14 @@ impl WhyUndecided {
 }
 
 /// The fingerprint of `program` as the store runs it: leaving out unnamed classes'
-/// memberships is another closure. Its value changed when the program, not a rule's name,
-/// came to say whether those classes' members are things: every closure an older
-/// build left out memberships in is rebuilt once.
+/// memberships is another closure. Bump its fingerprint when membership maintenance
+/// changes so older closures that hide unnamed classes rebuild once.
 pub(crate) fn fingerprint(
     program: &RuleProgram,
     hide_unnamed_classes: bool,
     compact_equality: bool,
 ) -> u64 {
-    const HIDDEN_UNNAMED_CLASSES: u64 = 0x5717_c1a5_5e5f_0008;
+    const HIDDEN_UNNAMED_CLASSES: u64 = 0x5717_c1a5_5e5f_0009;
     // Another form of the stack, not another closure; still not interchangeable.
     const COMPACT_EQUALITY: u64 = 0x0e9a_11c0_3a5c_0b02;
     program.fingerprint()
@@ -268,6 +267,23 @@ mod tests {
     use nrese_reasoner::rulesets::Ruleset;
 
     use super::*;
+
+    /// Spec: a certificate from before hidden membership withdrawal requires a rebuild
+    /// in skip mode. Certificates for the same rules in derive mode stay current.
+    #[test]
+    fn earlier_certificates_are_stale_only_for_hidden_unnamed_classes() {
+        let program = RuleProgram::builtin(Ruleset::Owl2Rl);
+        let old = ReasoningState {
+            fingerprint: program.fingerprint(),
+            ..ReasoningState::of(&program, 0)
+        };
+        let old_hidden = ReasoningState {
+            fingerprint: old.fingerprint ^ 0x5717_c1a5_5e5f_0008,
+            ..old.clone()
+        };
+        assert!(!old_hidden.is_current_with(&program, true, false, || false));
+        assert!(old.is_current_for(&program));
+    }
 
     #[test]
     fn state_round_trips_and_old_markers_are_not_current() {

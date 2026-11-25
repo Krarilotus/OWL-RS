@@ -280,6 +280,7 @@ fn failed_revalidation_leaves_the_next_commit_to_rebuild_in_preflight() {
     fail_revalidation(&pipeline);
     assert!(store.reasoning_state().is_none());
     assert!(!store.reasoning_is_current(Ruleset::Owl2Rl));
+    assert_eq!(pipeline.write_program_metrics().0, 1);
     let current = Arc::new(Mutex::new(None));
     let (reader, result) = (Arc::clone(&store), Arc::clone(&current));
     hooks::AFTER_PREFLIGHT.set(Some(Box::new(move || {

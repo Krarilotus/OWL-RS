@@ -46,6 +46,26 @@ impl Predicates {
         let to = self.index(to);
         Some([(CHAIN | from, CHAIN | to), (KEY | from, KEY | to)])
     }
+
+    #[cfg(test)]
+    pub(crate) fn by_cell(&self) -> (Vec<u64>, impl Fn(u64) -> u64) {
+        let mut cells: Vec<_> = self.0.iter().flat_map(|indices| indices.iter()).collect();
+        cells.sort_unstable_by_key(|(cell, _)| **cell);
+        let mut canonical = vec![0; cells.len()];
+        for (rank, (_, index)) in cells.iter().enumerate() {
+            canonical[**index as usize] = rank as u64;
+        }
+        let names = cells.into_iter().map(|(cell, _)| *cell).collect();
+        (names, move |predicate| {
+            const PAYLOAD: u64 = (1 << PAYLOAD_BITS) - 1;
+            let kind = predicate & !PAYLOAD;
+            if matches!(kind, CHAIN | KEY) {
+                kind | canonical[(predicate & PAYLOAD) as usize]
+            } else {
+                predicate
+            }
+        })
+    }
 }
 
 /// The fixed-arity unfolding of an accepting cell graph. A rest to nil can

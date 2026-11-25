@@ -523,6 +523,24 @@ fn a_change_whose_recomputation_fails_after_publishing_restores_the_old_closure(
         Some(RepositorySettings::default())
     );
     assert!(!derived(), "the failed change left its inferences");
+    let restored = catalog.get("probe").unwrap();
+    let writer = restored.pipeline.read();
+    writer
+        .execute_update_str("INSERT DATA { <urn:restored> a <urn:C> }")
+        .unwrap();
+    assert_eq!(writer.write_program_metrics(), (0, 0, 0));
+    let after = |class| {
+        writer
+            .store()
+            .execute_query_str(&format!("ASK {{ <urn:restored> a <urn:{class}> }}"))
+            .unwrap()
+            .payload
+    };
+    let boolean = |class| {
+        serde_json::from_slice::<serde_json::Value>(&after(class)).unwrap()["boolean"].clone()
+    };
+    assert_eq!(boolean("C"), true);
+    assert_eq!(boolean("D"), false);
 }
 
 /// When the old closure can't be restored either (both reasonings need the marker), the

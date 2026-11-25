@@ -3072,6 +3072,7 @@ impl StoreService {
         // From here the new inferences are published: a failure says so.
         self.record_reasoning(finished.writer(), &state)
             .map_err(|error| crate::StoreError::InferencesNotRecorded(Box::new(error)))?;
+        self.engine.notify_publication();
         drop(finished);
         if let Some(why) = undecided {
             let text = why.text(violations);

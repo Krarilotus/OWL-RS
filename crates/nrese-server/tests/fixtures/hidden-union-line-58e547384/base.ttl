@@ -1,0 +1,7 @@
+@prefix ex: <http://example.org/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+_:u owl:unionOf (ex:A ex:B) .
+ex:k ex:consumer _:u .
+ex:y a ex:A ; ex:note ex:kept .
+ex:A rdfs:subClassOf ex:C .

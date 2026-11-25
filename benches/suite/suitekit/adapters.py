@@ -505,8 +505,32 @@ class Nrese(Adapter):
         spec = self.spec(ctx, ctx.name("serve"), store, [], env)
         spec.port = port
         base = ctx.runtime.url(spec)
-        return self.start(ctx, spec, Endpoint(f"{base}/dataset/query", f"{base}/dataset/update",
-                                              ready=f"{base}/readyz"))
+        endpoint = self.start(ctx, spec, Endpoint(f"{base}/dataset/query", f"{base}/dataset/update",
+                                                ready=f"{base}/readyz"))
+        if not ctx.dry:
+            self.wait_write_program(base, max(ctx.timeout_s, 1800))
+        return endpoint
+
+    def wait_write_program(self, base: str, timeout_s: float) -> None:
+        """Wait for preparation before timing requests. Older binaries omit the metric."""
+        deadline = time.monotonic() + timeout_s
+        present = False
+        while (left := deadline - time.monotonic()) > 0:
+            try:
+                with urllib.request.urlopen(f"{base}/metrics", timeout=min(2.0, left)) as response:
+                    metrics = response.read().decode("utf-8", "replace")
+            except urllib.error.HTTPError as error:
+                if error.code == 404 and not present:
+                    return
+                raise
+            present |= "nrese_write_program_state" in metrics
+            phase = re.search(r'^nrese_write_program_state\{repository="nrese"\} ([0123])$', metrics, re.M)
+            if not present or (phase and phase[1] in "02"):
+                return
+            if not phase or phase[1] == "3":
+                raise RuntimeError(f"{self.key}: write program preparation failed or has no valid state")
+            time.sleep(min(0.3, max(0, deadline - time.monotonic())))
+        raise RuntimeError(f"{self.key}: write program preparation did not finish within {timeout_s:g} s")
 
     def version(self, ctx, endpoint):
         if endpoint is None or ctx.dry:
