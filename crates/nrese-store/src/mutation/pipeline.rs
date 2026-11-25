@@ -15,7 +15,7 @@ use crate::config::{GateSeverity, ShaclGate};
 use crate::delta::MutationDeltaPreview;
 use crate::error::StoreError;
 use crate::graph_store::{GraphDeleteReport, GraphTarget, GraphWriteReport, GraphWriteRequest};
-use crate::service::StoreService;
+use crate::service::{Certificate, StoreService};
 use crate::update::{SparqlUpdateRequest, UpdateExecutionReport};
 
 #[cfg(test)]
@@ -430,7 +430,7 @@ impl MutationPipeline {
                     evidence::Draft {
                         kind: undecided.map_or(RejectKind::Inconsistent, |why| {
                             self.store
-                                .dispose(why, Route::Commit)
+                                .dispose(Route::Commit(why))
                                 .refusal()
                                 .expect("an unsettled DL clash is refused")
                         }),
@@ -446,19 +446,22 @@ impl MutationPipeline {
                 });
                 return Err(MutationError::Rejected(Box::new(reject)));
             }
-            let ql_witness = (self.reasoner.config().mode()
-                == nrese_reasoner::ReasoningMode::Owl2Ql)
-                .then(|| crate::dl::bounds::find_ill_typed_after(&self.store, &tx, &stop));
-            if ql_witness == Some(Some(None))
+            let ql_witness = if Certificate::of(tx.base()).is_some_and(Certificate::uses_owl2_ql)
                 && let Some(kind) = self
                     .store
-                    .dispose(WhyUndecided::NoQlDecider, Route::Commit)
+                    .dispose(Route::Commit(WhyUndecided::NoQlDecider))
                     .refusal()
             {
-                ticket.claim_error()?;
-                let view = evidence::EvidenceView::new(&requester.read, &tx);
-                return Err(MutationError::Rejected(Box::new(view.no_ql_decider(kind))));
-            }
+                let found = crate::dl::bounds::find_ill_typed_after(&self.store, &tx, &stop);
+                if found == Some(None) {
+                    ticket.claim_error()?;
+                    let view = evidence::EvidenceView::new(&requester.read, &tx);
+                    return Err(MutationError::Rejected(Box::new(view.no_ql_decider(kind))));
+                }
+                Some(found)
+            } else {
+                None
+            };
             self.record_run(ReasoningRunRecord::from_report(
                 &materialisation,
                 None,

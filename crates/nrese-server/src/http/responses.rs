@@ -21,7 +21,7 @@ pub struct ReadyResponse {
     pub status: &'static str,
     /// `consistent`, `inconsistent`, `undecided` or `unknown` (no current assessment).
     pub consistency: &'static str,
-    /// Consistency violations in the materialised data, when inconsistent or undecided.
+    /// Violations found by the materialisation rules, when reported.
     pub violations: Option<usize>,
     /// When undecided: why, and the ways out.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -220,13 +220,17 @@ pub struct AdminRestoreResponse {
 /// Public readiness has no dataset diagnostics, even when authentication is off.
 pub fn build_readiness_response(state: &AppState) -> StatusResponse {
     StatusResponse {
-        status: if !state.is_started() {
-            "starting"
-        } else if state.is_quarantined() {
-            "quarantined"
-        } else {
-            "ready"
-        },
+        status: readiness_status(state.is_started(), || state.is_quarantined()),
+    }
+}
+
+fn readiness_status(started: bool, quarantined: impl FnOnce() -> bool) -> &'static str {
+    if !started {
+        "starting"
+    } else if quarantined() {
+        "quarantined"
+    } else {
+        "ready"
     }
 }
 
@@ -242,10 +246,10 @@ pub fn build_ready_response(
         .map_err(|error| ApiError::internal(error.to_string()))?;
     let posture = state.runtime_posture();
 
-    let (consistency, undecided) = state.store().undecided_report();
+    let (consistency, undecided, quarantined) = state.store().undecided_report();
     let shacl = state.store().shacl_gate_state();
     Ok(ReadyResponse {
-        status: build_readiness_response(state).status,
+        status: readiness_status(state.is_started(), || quarantined),
         consistency: consistency.as_str(),
         violations: match consistency {
             nrese_store::ConsistencyStatus::Inconsistent { violations } => Some(violations),

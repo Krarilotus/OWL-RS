@@ -3,7 +3,7 @@ use axum::http::{Method, Request, StatusCode};
 use nrese_reasoner::{ReasonerConfig, ReasoningMode};
 use nrese_server::config::ServerConfig;
 use nrese_server::policy::PolicyConfig;
-use nrese_store::StoreConfig;
+use nrese_store::{StoreConfig, UndecidedPolicy};
 use serde_json::{Value, json};
 use tower::util::ServiceExt;
 
@@ -226,6 +226,41 @@ async fn rebuild_and_reopen_preserve_the_verdict() -> TestResult {
         header
     );
     Ok(())
+}
+
+// Spec. Opening a clean store under refuse quarantines its published undecided verdict.
+#[tokio::test]
+async fn reopening_a_marked_store_under_refuse_quarantines_it() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let marked = app(
+        StoreConfig::on_disk(directory.path()),
+        ReasoningMode::Owl2Ql,
+    )?;
+    assert_eq!(
+        post(&marked, DATA, TURTLE, FIXTURE).await?.status,
+        StatusCode::NO_CONTENT
+    );
+    drop(marked);
+
+    let reopened = app(
+        StoreConfig {
+            gates_undecided: UndecidedPolicy::Refuse,
+            ..StoreConfig::on_disk(directory.path())
+        },
+        ReasoningMode::Owl2Ql,
+    )?;
+    let ready = get(&reopened, READY).await?;
+    assert_eq!(
+        ready.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        ready.body
+    );
+    assert_eq!(ready.json()?["status"], "quarantined");
+    let info = get(&reopened, INFO).await?.json()?;
+    assert_eq!(info["consistency"], "undecided", "{info}");
+    assert_eq!(info["undecided"]["disposition"], "quarantined");
+    assert_refused(&post(&reopened, DATA, TURTLE, "<urn:ex:d> a <urn:ex:Person> .").await?)
 }
 
 // Spec. A bulk load in mark mode records the same report as an ordinary write.

@@ -11,6 +11,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::reject_view::RejectExplanationView;
+use nrese_store::service::UndecidedReason;
 use nrese_store::{MutationReject, RejectKind, ShaclRefusal, UndecidedCause};
 
 #[derive(Clone, Debug, Error)]
@@ -175,13 +176,8 @@ impl IntoResponse for ApiError {
                 detail,
                 reasoner_reject: *reject,
                 shacl: shacl.as_deref().map(crate::http::refusal_json),
-                undecided: (kind == RejectKind::Undecided(UndecidedCause::NoDecider)).then_some(
-                    UndecidedRefusal {
-                        gate: "consistency",
-                        causes: ["no-decider"],
-                        decided_by: "owl2-dl",
-                    },
-                ),
+                undecided: (kind == RejectKind::Undecided(UndecidedCause::NoDecider))
+                    .then_some(UndecidedReason::NO_DECIDER),
             };
             return match shacl.as_deref() {
                 Some(refusal) => shacl_problem(body, refusal),
@@ -463,14 +459,7 @@ struct ProblemJson<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     shacl: Option<crate::http::RefusalJson<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    undecided: Option<UndecidedRefusal>,
-}
-
-#[derive(Debug, Serialize)]
-struct UndecidedRefusal {
-    gate: &'static str,
-    causes: [&'static str; 1],
-    decided_by: &'static str,
+    undecided: Option<UndecidedReason>,
 }
 
 #[cfg(test)]

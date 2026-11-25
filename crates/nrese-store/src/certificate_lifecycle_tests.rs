@@ -1197,6 +1197,41 @@ fn an_ill_typed_search_stopped_before_it_starts_keeps_nothing_and_the_next_need_
 }
 
 /// A stopped ill-typed search proves nothing even when the rules have found no clash.
+/// Under QL's refuse policy that leaves the write accepted, with consistency unknown.
+#[test]
+fn a_stopped_ql_literal_check_leaves_the_write_accepted_under_refuse() {
+    let store = Arc::new(
+        StoreService::new(StoreConfig {
+            gates_undecided: crate::UndecidedPolicy::Refuse,
+            ..StoreConfig::in_memory()
+        })
+        .expect("store")
+        .with_capacity(counted),
+    );
+    let ql = pipeline(&store, ReasoningMode::Owl2Ql);
+    load(&store, DATA);
+    store.rematerialise(Ruleset::Owl2Ql).expect("reasoned");
+    let before = store.current_revision();
+
+    // Let the rules use memory first. The candidate's literal check then cannot get a reading.
+    hooks::AFTER_PREFLIGHT.set(Some(Box::new(|| READINGS.set(Some(1)))));
+    let written = ql.execute_update_str(&format!("{PREFIXES}INSERT DATA {{ :fido a :Dog }}"));
+    hooks::AFTER_PREFLIGHT.set(None);
+    let status = store.consistency();
+    READINGS.set(None);
+
+    assert!(
+        written.is_ok(),
+        "the interrupted check refused: {written:?}"
+    );
+    assert!(
+        store.current_revision() > before,
+        "the write didn't publish"
+    );
+    assert_eq!(status, crate::ConsistencyStatus::Unknown);
+}
+
+/// A stopped ill-typed search proves nothing even when the rules have found no clash.
 #[test]
 fn an_ill_typed_search_stopped_at_a_dl_commit_records_no_verdict_and_the_next_read_searches() {
     check_stopped_dl_commit(DATA, 1, "rules");
@@ -1405,7 +1440,7 @@ fn an_ill_typed_consistency_reading_decides_from_one_observation() {
     store.use_dl(false, false);
     assert_eq!(store.current_revision(), snapshot.revision());
     assert_eq!(
-        (store.consistency_at(&snapshot), store.consistency()),
+        (store.consistency_at(&snapshot, None), store.consistency()),
         (Unknown, Consistent)
     );
 }

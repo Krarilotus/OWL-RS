@@ -1182,9 +1182,9 @@ fn conditions(
     });
     use crate::{ConsistencyStatus::Undecided, WhyUndecided::NoQlDecider};
     if completeness.regime == Some(Owl2Ql)
-        && found == Some(Some(None))
+        && found.is_some()
         && matches!(
-            store.consistency_at(snapshot),
+            store.consistency_at(snapshot, found),
             Undecided {
                 why: NoQlDecider,
                 ..

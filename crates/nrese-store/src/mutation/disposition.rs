@@ -18,7 +18,8 @@ impl UndecidedPolicy {
 }
 
 pub(crate) enum Route {
-    Commit,
+    Commit(WhyUndecided),
+    /// The published OWL 2 QL verdict. For OWL 2 DL the record's hold decides quarantine.
     Published,
 }
 
@@ -47,16 +48,16 @@ impl Disposition {
 }
 
 impl StoreService {
-    pub(crate) fn dispose(&self, why: WhyUndecided, route: Route) -> Disposition {
+    pub(crate) fn dispose(&self, route: Route) -> Disposition {
         use Route::{Commit, Published};
         use UndecidedPolicy::{Mark, Refuse};
         use WhyUndecided::NoQlDecider;
 
-        match (why, self.config().gates_undecided, route) {
-            (NoQlDecider, Mark, _) => Disposition::Marked,
-            (NoQlDecider, Refuse, Commit) => Disposition::Refused(UndecidedCause::NoDecider),
-            (_, _, Commit) => Disposition::Refused(UndecidedCause::ReadsDifferently),
-            (_, _, Published) => Disposition::Quarantined,
+        match (route, self.config().gates_undecided) {
+            (Commit(NoQlDecider) | Published, Mark) => Disposition::Marked,
+            (Commit(NoQlDecider), Refuse) => Disposition::Refused(UndecidedCause::NoDecider),
+            (Commit(_), _) => Disposition::Refused(UndecidedCause::ReadsDifferently),
+            (Published, Refuse) => Disposition::Quarantined,
         }
     }
 }

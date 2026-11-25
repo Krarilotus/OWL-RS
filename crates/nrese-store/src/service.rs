@@ -247,14 +247,29 @@ type Ql = Option<std::sync::Arc<nrese_sparql::ql::QlRewriting>>;
 /// The whole-store explanation of an undecided OWL 2 QL verdict.
 #[derive(Debug, serde::Serialize)]
 pub struct UndecidedReport {
-    pub gate: &'static str,
     pub disposition: &'static str,
+    #[serde(flatten)]
+    pub reason: UndecidedReason,
+}
+
+/// The explanation shared by a published verdict and a refusal.
+#[derive(Debug, serde::Serialize)]
+pub struct UndecidedReason {
+    pub gate: &'static str,
     pub causes: [&'static str; 1],
     pub decided_by: &'static str,
 }
 
+impl UndecidedReason {
+    pub const NO_DECIDER: Self = Self {
+        gate: "consistency",
+        causes: ["no-decider"],
+        decided_by: "owl2-dl",
+    };
+}
+
 impl Certificate {
-    fn uses_owl2_ql(&self) -> bool {
+    pub(crate) fn uses_owl2_ql(&self) -> bool {
         self.state.ruleset.split('+').next() == Some("owl2-ql")
     }
 
@@ -932,18 +947,25 @@ impl StoreService {
     /// first need, stopped ([`Certificate::ill_typed`]). A clean OWL 2 QL assessment
     /// remains undecided until a consistency check can decide it.
     pub fn consistency(&self) -> crate::ConsistencyStatus {
-        self.consistency_at(&self.engine.snapshot())
+        self.consistency_at(&self.engine.snapshot(), None)
     }
 
-    /// [`Self::consistency`] of `snapshot`'s version.
-    pub(crate) fn consistency_at(&self, snapshot: &Snapshot) -> crate::ConsistencyStatus {
+    /// [`Self::consistency`] of `snapshot`'s version, reusing its literal check when supplied.
+    pub(crate) fn consistency_at(
+        &self,
+        snapshot: &Snapshot,
+        witness: Option<IllTyped>,
+    ) -> crate::ConsistencyStatus {
         use crate::ConsistencyStatus::{Consistent, Undecided, Unknown};
         let status = Certificate::assessment(snapshot, self.config.replica).rules;
         let Some(certificate) = Certificate::of(snapshot).filter(|_| status == Consistent) else {
             return status;
         };
-        let memory = self.memory_stop();
-        match certificate.ill_typed(snapshot, &|| memory.exceeded()) {
+        let found = witness.unwrap_or_else(|| {
+            let memory = self.memory_stop();
+            certificate.ill_typed(snapshot, &|| memory.exceeded())
+        });
+        match found {
             Some(None) if certificate.uses_owl2_ql() => Undecided {
                 violations: 0,
                 why: crate::WhyUndecided::NoQlDecider,
@@ -953,24 +975,26 @@ impl StoreService {
         }
     }
 
-    /// The whole-store verdict and the disposition of an undecided OWL 2 QL assessment.
-    pub fn undecided_report(&self) -> (crate::ConsistencyStatus, Option<UndecidedReport>) {
+    /// The verdict, its OWL 2 QL explanation when available, and quarantine on one snapshot.
+    pub fn undecided_report(&self) -> (crate::ConsistencyStatus, Option<UndecidedReport>, bool) {
         use crate::{ConsistencyStatus::Undecided, WhyUndecided::NoQlDecider};
-        let status = self.consistency();
+        let snapshot = self.engine.snapshot();
+        let status = self.consistency_at(&snapshot, None);
+        let mut quarantined = Certificate::assessment(&snapshot, self.config.replica).held;
         let report = match status {
             Undecided {
                 why: NoQlDecider, ..
-            } => Some(UndecidedReport {
-                gate: "consistency",
-                disposition: self
-                    .dispose(NoQlDecider, Route::Published)
-                    .published_status(),
-                causes: ["no-decider"],
-                decided_by: "owl2-dl",
-            }),
+            } => {
+                let disposition = self.dispose(Route::Published);
+                quarantined |= disposition == Disposition::Quarantined;
+                Some(UndecidedReport {
+                    disposition: disposition.published_status(),
+                    reason: UndecidedReason::NO_DECIDER,
+                })
+            }
             _ => None,
         };
-        (status, report)
+        (status, report, quarantined)
     }
 
     /// Whether the store is in quarantine, readable and repairable but not ready: the current
@@ -981,14 +1005,14 @@ impl StoreService {
         let snapshot = self.engine.snapshot();
         Certificate::assessment(&snapshot, self.config.replica).held
             || (Certificate::of(&snapshot).is_some_and(Certificate::uses_owl2_ql)
+                && self.dispose(Route::Published) == Disposition::Quarantined
                 && matches!(
-                    self.consistency_at(&snapshot),
+                    self.consistency_at(&snapshot, None),
                     Undecided {
                         why: NoQlDecider,
                         ..
                     }
-                )
-                && self.dispose(NoQlDecider, Route::Published) == Disposition::Quarantined)
+                ))
     }
 
     /// Whether the certificate covers `program` for a holder of the writer slot: no write can

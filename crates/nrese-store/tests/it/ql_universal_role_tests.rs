@@ -21,7 +21,7 @@ enum Expected {
     FalseWithConsistencyReason,
     TrueOrIncomplete,
     Incomplete,
-    /// A `SELECT` with no row, or one not told `complete`.
+    /// A `SELECT` with no row, or one with the rewriter's reason.
     NoRowOrIncomplete,
 }
 
@@ -146,30 +146,36 @@ fn reads_of_universal_roles() {
                 .unwrap();
             let value: Value = serde_json::from_slice(&result.payload).unwrap();
             let answer = value["boolean"].as_bool();
-            let complete = result.completeness.as_ref().map(|status| status.complete);
+            let rewriter_reason = result.completeness.as_ref().is_some_and(|status| {
+                status.reasons.iter().any(|reason| {
+                    reason.source == "ql"
+                        && !reason.text.contains("over answers that may be missing")
+                })
+            });
             let correct = match expected {
                 True => answer == Some(true),
                 False => answer == Some(false),
                 FalseWithConsistencyReason => {
                     answer == Some(false)
-                        && result.completeness.is_some_and(|status| {
+                        && result.completeness.as_ref().is_some_and(|status| {
                             status.as_str() == "sound-only"
                                 && status.reasons.len() == 1
                                 && status.reasons[0].source == "consistency"
                         })
                 }
-                TrueOrIncomplete => answer == Some(true) || complete == Some(false),
-                Incomplete => complete == Some(false),
+                TrueOrIncomplete => answer == Some(true) || rewriter_reason,
+                Incomplete => rewriter_reason,
                 NoRowOrIncomplete => {
                     value["results"]["bindings"]
                         .as_array()
                         .is_some_and(|rows| rows.is_empty())
-                        || complete == Some(false)
+                        || rewriter_reason
                 }
             };
             if !correct {
                 failures.push(format!(
-                    "{name}, {route}: expected {expected:?}, got {value}, complete={complete:?}"
+                    "{name}, {route}: expected {expected:?}, got {value}, {:?}",
+                    result.completeness
                 ));
             }
         }

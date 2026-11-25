@@ -190,7 +190,7 @@ fn answer_claims(
 }
 
 // The clean comparison controls still exclude a datatype reason. OWL 2 QL adds its
-// consistency reason, which also makes a count provisional.
+// consistency reason, which also makes a count or negation provisional.
 fn clean_comparison(
     regime: &str,
     query: &str,
@@ -201,18 +201,18 @@ fn clean_comparison(
             if regime != "owl2-ql" {
                 return status.as_str() == "complete";
             }
-            let count = query.contains("COUNT(");
-            status.as_str() == if count { "unsound" } else { "sound-only" }
-                && status.reasons.len() == if count { 2 } else { 1 }
+            let operator = query.contains("COUNT(") || query.contains("NOT EXISTS");
+            status.as_str() == if operator { "unsound" } else { "sound-only" }
+                && status.reasons.len() == if operator { 2 } else { 1 }
                 && status
                     .reasons
                     .iter()
                     .any(|reason| reason.source == "consistency")
-                && (!count
-                    || status
-                        .reasons
-                        .iter()
-                        .any(|reason| reason.text.contains("over answers that may be missing")))
+                && (!operator
+                    || status.reasons.iter().any(|reason| {
+                        reason.source == "ql"
+                            && reason.text.contains("over answers that may be missing")
+                    }))
         })
     })
 }
@@ -348,27 +348,28 @@ fn only_user_predicates_and_classes_can_be_complete() {
             "SELECT ?p { :ann ?p :rex }",
             "SELECT ?c { :rex a ?c }",
         ] {
-            let status = answer(store, denied).1;
-            if status.contains(&"complete") {
+            let status = answer_claims(store, denied).1;
+            if !status.iter().all(|claim| {
+                claim.as_ref().is_some_and(|claim| {
+                    !claim.complete
+                        && (name != "owl2-ql"
+                            || claim.reasons.iter().any(|reason| reason.source == "ql"))
+                })
+            }) {
                 all.push(format!("{name}: {denied}: {status:?}"));
             }
         }
         for guard in ["ASK { :ann :owns :rex }", "SELECT ?x { ?x a :Animal }"] {
-            let status = answer(store, guard).1;
-            let expected = if name == "owl2-ql" {
-                "sound-only"
-            } else {
-                "complete"
-            };
-            if status != [expected; 2] {
+            let status = answer_claims(store, guard).1;
+            if !clean_comparison(name, guard, &status) {
                 all.push(format!("{name}: guard {guard}: {status:?}"));
             }
         }
     }
     let store = closure(DATA, Ruleset::Owl2Ql, QlRewritingMode::Auto);
     let guard = "SELECT ?x { ?x a :Animal FILTER NOT EXISTS { ?x a :Dog } }";
-    let status = answer(&store, guard).1;
-    if status != ["unsound"; 2] {
+    let status = answer_claims(&store, guard).1;
+    if !clean_comparison("owl2-ql", guard, &status) {
         all.push(format!("owl2-ql: guard {guard}: {status:?}"));
     }
     assert!(all.is_empty(), "{all:#?}");
@@ -1682,14 +1683,9 @@ fn a_typed_constant_no_pattern_matches_leaves_an_answer_complete() {
         "SELECT ?v (1 AS ?k) { ?v :age ?a }",
     ] {
         for (regime, store) in [("owl2-dl", owl2_dl(data)), ("owl2-ql", ql(data))] {
-            let (rows, status) = answer(&store, read);
+            let (rows, status) = answer_claims(&store, read);
             eprintln!("{regime} {read}: {rows} {status:?}");
-            let expected = if regime == "owl2-ql" {
-                "sound-only"
-            } else {
-                "complete"
-            };
-            if !rows.contains("example.com/a0") || status != [expected; 2] {
+            if !rows.contains("example.com/a0") || !clean_comparison(regime, read, &status) {
                 wrong.push(format!("{regime} {read}: {rows} {status:?}"));
             }
         }
@@ -2128,9 +2124,9 @@ fn owl2_ql_keeps_complete_over_undeclared_properties_of_iris_or_strings() {
     ];
     let mut wrong = Vec::new();
     for (data, read, right) in cases {
-        let (rows, status) = answer(&store(data), read);
+        let (rows, status) = answer_claims(&store(data), read);
         eprintln!("{read}: {rows} {status:?}");
-        if !right(&rows) || status != ["sound-only"; 2] {
+        if !right(&rows) || !clean_comparison("owl2-ql", read, &status) {
             wrong.push(format!("{read}: {rows} {status:?}"));
         }
     }

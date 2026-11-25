@@ -20,6 +20,7 @@ const PREFIXES: &str = "PREFIX : <http://example.com/> \
 enum ReadClaim {
     Complete,
     OnlyConsistency,
+    RewriterReason,
     Other,
 }
 
@@ -69,6 +70,9 @@ fn ask(
         {
             ReadClaim::OnlyConsistency
         }
+        Some(status) if status.reasons.iter().any(|reason| reason.source == "ql") => {
+            ReadClaim::RewriterReason
+        }
         _ => ReadClaim::Other,
     };
     Some((text.contains("\"boolean\":true"), claim))
@@ -97,7 +101,7 @@ const INTERSECTION: &str = ":x a [ a owl:Class ; owl:intersectionOf ( :A :B ) ] 
 fn an_asserted_intersection_is_not_told_complete_without_its_members() {
     for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
         each(ReasoningMode::Owl2Ql, ql, INTERSECTION, ":x a :A", |o| {
-            o.is_some_and(|(answer, claim)| answer || claim != ReadClaim::Complete)
+            o.is_some_and(|(answer, claim)| answer || claim == ReadClaim::RewriterReason)
         });
     }
 }
@@ -155,7 +159,7 @@ fn such_an_assertion_takes_complete_from_every_read() {
         QlRewritingMode::Auto,
         &data,
         ":y a :E",
-        |o| o == Some((true, ReadClaim::Other)),
+        |o| o == Some((true, ReadClaim::RewriterReason)),
     );
 }
 
@@ -170,7 +174,7 @@ fn an_asserted_maximum_of_none_is_not_told_complete() {
                 :x :p :y . :D a owl:Class .";
     for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
         each(ReasoningMode::Owl2Ql, ql, data, ":x a :D", |o| {
-            o.is_none_or(|(answer, claim)| answer || claim != ReadClaim::Complete)
+            o.is_none_or(|(answer, claim)| answer || claim == ReadClaim::RewriterReason)
         });
     }
 }
