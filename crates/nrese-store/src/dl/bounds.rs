@@ -176,6 +176,8 @@ struct State {
 struct Slot {
     current: Option<State>,
     floor: u64,
+    // The report survives a U1 eviction or a commit that did not read the ontology.
+    anonymous: Option<(u64, Option<String>)>,
 }
 
 impl std::ops::Deref for Slot {
@@ -186,6 +188,21 @@ impl std::ops::Deref for Slot {
 }
 
 impl Slot {
+    fn record_anonymous(&mut self, revision: u64, read: Option<Option<String>>) {
+        if self
+            .anonymous
+            .as_ref()
+            .is_some_and(|(at, _)| *at > revision || (*at == revision && read.is_none()))
+        {
+            return;
+        }
+        let note = match read {
+            Some(note) => note.map(|text| format!("{text} as of revision {revision}")),
+            None => self.anonymous.take().and_then(|(_, note)| note),
+        };
+        self.anonymous = Some((revision, note));
+    }
+
     fn get_mut(&mut self) -> Option<&mut State> {
         self.current.as_mut()
     }
@@ -416,6 +433,14 @@ impl Bounds {
     pub(crate) fn kept(&self) -> &Arc<nrese_exec::Budget> {
         self.kept
             .get_or_init(|| Arc::new(nrese_exec::Budget::unlimited()))
+    }
+
+    pub(super) fn anonymous(&self, revision: u64) -> Option<String> {
+        lock(&self.state)
+            .anonymous
+            .as_ref()
+            .filter(|(at, _)| *at == revision)
+            .and_then(|(_, note)| note.clone())
     }
 
     /// Whether the commit `tx` keeps the RL route its base is on ([`route_kept`]), by the kinds
@@ -706,6 +731,8 @@ pub(crate) enum Prepared {
 /// consistency.
 pub(crate) struct Preparation {
     base: u64,
+    // A full read with no finding replaces an earlier note; no read keeps it.
+    anonymous: Option<Option<String>>,
     pub prepared: Prepared,
     /// U1 after the commit proves the data consistent (or, on the RL route, the RL
     /// rules do: [`Preparation::decided_by`]; only where they assessed the base's own
@@ -717,6 +744,16 @@ pub(crate) struct Preparation {
     /// The ontology the commit leaves, where the preparation had to read it (for the
     /// consistency check, which then needn't read it again).
     pub ontology: Option<Ontology>,
+}
+
+impl Preparation {
+    pub(crate) fn record_gate_anonymous(&mut self) {
+        if self.anonymous.is_none()
+            && let Some(ontology) = &self.ontology
+        {
+            self.anonymous = Some(anonymous_report(ontology));
+        }
+    }
 }
 
 /// Prepares U1 for the commit `tx` (after the RL reasoning applied its changes): the
@@ -762,6 +799,7 @@ pub(crate) fn prepare(
             prepared: Prepared::Rules(Arc::clone(kinds)),
             proves_consistency: rules_prove(tx.base()),
             decided_by: "rules",
+            anonymous: None,
             ontology: None,
         };
     }
@@ -793,6 +831,7 @@ pub(crate) fn prepare(
                                 && upper.reads_every_value(&change)
                                 && upper.clashes_after(&change) == 0,
                             prepared: Prepared::Delta(Box::new(change)),
+                            anonymous: None,
                             ontology: None,
                         };
                     }
@@ -806,6 +845,7 @@ pub(crate) fn prepare(
                             ))),
                             decided_by: "upper-bound",
                             proves_consistency: false,
+                            anonymous: None,
                             ontology: None,
                         };
                     }
@@ -819,6 +859,7 @@ pub(crate) fn prepare(
                     prepared: Prepared::Unavailable,
                     decided_by: "upper-bound",
                     proves_consistency: false,
+                    anonymous: None,
                     ontology: None,
                 };
             }
@@ -838,9 +879,11 @@ pub(crate) fn prepare(
             ))))),
             decided_by: "upper-bound",
             proves_consistency: false,
+            anonymous: None,
             ontology: None,
         };
     };
+    let anonymous = Some(anonymous_report(&ontology));
     if routed_to_rules(&ontology) && !lists_left_out {
         // The RL gate that ran before has decided the commit's consistency.
         let lookup = |iri: &str| tx.lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into());
@@ -849,6 +892,7 @@ pub(crate) fn prepare(
             prepared: Prepared::Rules(Kinds::of(&ontology, &lookup)),
             proves_consistency: rules_prove(tx.base()),
             decided_by: "rules",
+            anonymous,
             ontology: None,
         };
     }
@@ -867,6 +911,7 @@ pub(crate) fn prepare(
         decided_by: "upper-bound",
         proves_consistency: upper.as_ref().is_ok_and(Upper::proves_consistency),
         prepared: Prepared::Rebuilt(Box::new(upper)),
+        anonymous,
         ontology: Some(ontology),
     }
 }
@@ -1060,6 +1105,9 @@ fn in_view(view: &Snapshot, [s, p, o]: Triple) -> bool {
 pub(crate) fn install(store: &StoreService, preparation: Preparation, revision: u64) {
     let bounds = &store.dl().bounds;
     let mut state = lock(&bounds.state);
+    if revision != preparation.base {
+        state.record_anonymous(revision, preparation.anonymous);
+    }
     match preparation.prepared {
         // Refused for memory: not kept, so a read of the revision builds it again (SYN-61);
         // the generation it would have replaced is superseded, and goes with its charge.
@@ -1314,7 +1362,7 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> ViewEnd {
             // lets it go only when the taxonomy below reads this revision's, after the build
             // has read in its room (N1).
             store.dl().query_ontology.evict_below(revision);
-            let (upper, kinds) = afresh(store, snapshot);
+            let (upper, kinds, anonymous) = afresh(store, snapshot);
             let rules = kinds.is_some();
             let compiled = bounds.compiled();
             let taxonomy = match &upper {
@@ -1338,6 +1386,8 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> ViewEnd {
             // A U1 a budget refused is not kept: the next read builds it again.
             let refused_upper = upper.as_ref().is_err_and(|g| g.refused);
             keep &= !refused_upper;
+            let mut slot = lock(&bounds.state);
+            slot.record_anonymous(revision, anonymous);
             if !refused_upper {
                 let last = match rules {
                     true => "rules",
@@ -1351,7 +1401,7 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> ViewEnd {
                     taxonomy: taxonomy.and_then(Result::ok),
                     kinds,
                 };
-                publish(&mut lock(&bounds.state), state);
+                publish(&mut slot, state);
             }
             parts
         }
@@ -1402,31 +1452,47 @@ pub(crate) fn holds_ill_typed_after(store: &StoreService, tx: &Transaction<'_>) 
     Some(super::query::ill_typed_after(tx, base, &stop)?.is_some())
 }
 
+fn anonymous_report(ontology: &Ontology) -> Option<String> {
+    ontology
+        .diagnostics
+        .iter()
+        .find(|d| {
+            matches!(d, nrese_owl::Diagnostic::AnonymousIndividual { axioms, .. } if axioms.iter().any(Option::is_some))
+        })
+        .map(|d| d.describe(&super::consistency::nameless))
+}
+
+type Rebuilt = (
+    Result<Upper, GaveUp>,
+    Option<Arc<Kinds>>,
+    Option<Option<String>>,
+);
+
 /// U1 compiled and evaluated afresh over `snapshot` (or, with the kinds it was decided on,
 /// the RL route's place).
-fn afresh(
-    store: &StoreService,
-    snapshot: &Snapshot,
-) -> (Result<Upper, GaveUp>, Option<Arc<Kinds>>) {
+fn afresh(store: &StoreService, snapshot: &Snapshot) -> Rebuilt {
     let replica = store.dl().replica();
     // U1's names are system vocabulary: the bounds keep them for every later read, so they
     // take shared ids (dictionary lifecycle V1), never a request's private ones.
+    let refused = |what| (Err(GaveUp::refused(source::refused(what))), None, None);
     if !replica && source::intern_system_vocabulary(store.engine()).is_err() {
-        return (
-            Err(GaveUp::refused(source::refused("the vocabulary"))),
-            None,
-        );
+        return refused("the vocabulary");
     }
     let latest = store.engine().snapshot();
     let kept = Arc::clone(store.dl().bounds.kept());
     let ontology = match source::read_snapshot(snapshot, kept, &store.config().dl.treatments) {
         Ok(ontology) => ontology,
-        Err(_) => return (Err(GaveUp::refused(source::refused("the revision"))), None),
+        Err(_) => return refused("the revision"),
     };
+    let anonymous = Some(anonymous_report(&ontology));
     if routed_to_rules(&ontology) && !store.lists_left_out(snapshot) {
         let lookup =
             |iri: &str| snapshot.lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into());
-        return (Err(not_compiled()), Some(Kinds::of(&ontology, &lookup)));
+        return (
+            Err(not_compiled()),
+            Some(Kinds::of(&ontology, &lookup)),
+            anonymous,
+        );
     }
     let normalised = nrese_owl::normalise(&ontology);
     let deadline = Deadline::after(store.config().dl.timeout);
@@ -1454,7 +1520,7 @@ fn afresh(
     let kept = store.dl().bounds.kept();
     let upper = Upper::build(&ontology, &normalised, snapshot, &resolve, &stop, kept)
         .map_err(|gave_up| gave_up.by_memory(&memory_hit));
-    (upper, None)
+    (upper, None, anonymous)
 }
 
 /// A taxonomy for a read: kept, with its charge, or (`Err`) one only this read uses, never

@@ -465,6 +465,7 @@ impl MutationPipeline {
                 // delta, its base's record (the delta keeps what the reader reads); else no
                 // record, never "nothing".
                 let name = |t| crate::dl::consistency::named(&tx, t);
+                bounds.record_gate_anonymous();
                 let read = bounds
                     .ontology
                     .take()

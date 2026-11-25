@@ -23,6 +23,7 @@ mod keys;
 mod left_out;
 mod left_out_words;
 mod long_chain;
+mod membership;
 mod mode;
 mod model_labels;
 mod outside;

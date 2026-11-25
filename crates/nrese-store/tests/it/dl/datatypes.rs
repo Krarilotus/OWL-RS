@@ -5,8 +5,8 @@
 //! meaning. So where its values or lexical forms could decide a clash, the store can't back
 //! `consistent`: it isn't told so, and no read over it is told complete, on any route; the RL
 //! rules' route is complete only for OWL 2 RL, whose datatypes are the map's (OWL 2 Profiles
-//! §4.2.1). Told as before: a value nothing reads, `xsd:dateTime`, and a datatype of the user's
-//! own (§5.2 allows it, and nothing fixes its values, so no clash is missed).
+//! §4.2.1). A literal that nothing reads can leave the verdict intact. A named datatype used
+//! as a range must meet the datatype restriction of OWL 2 Structural Specification §11.2.
 
 use nrese_store::{MutationError, MutationPipeline};
 
@@ -184,8 +184,12 @@ fn a_datatype_outside_the_map_where_its_values_decide_a_clash_is_not_told_consis
     );
 }
 
+/// OWL 2 Structural Specification §11.2 requires each datatype to be
+/// `rdfs:Literal`, in the OWL 2 datatype map, or defined by exactly one
+/// `DatatypeDefinition`. The undefined range leaves consistency unknown and
+/// the read incomplete. The two permitted ranges admit their values and give complete reads.
 #[test]
-fn the_maps_datatypes_a_value_nothing_reads_and_a_users_datatype_are_told_as_before() {
+fn datatype_ranges_must_be_built_in_or_defined_once() {
     const DATE_TIME: &str = r#":a :born "2020-01-01T00:00:00Z"^^xsd:dateTime ."#;
     const DATE_TIME_RANGE: &str = ":born a owl:DatatypeProperty ; rdfs:range xsd:dateTime .";
     let cells: Vec<(&str, Vec<&str>, &[&str])> = vec![
@@ -223,12 +227,12 @@ fn the_maps_datatypes_a_value_nothing_reads_and_a_users_datatype_are_told_as_bef
             NOTHING_READS,
         ),
         (
-            "a datatype of the user's own under its range",
+            "an undefined datatype under its range",
             vec![
                 ":myType a rdfs:Datatype . :born a owl:DatatypeProperty ; rdfs:range :myType .",
                 r#":a :born "x"^^:myType ."#,
             ],
-            RULES,
+            NOT_TOLD,
         ),
     ];
     judge(
@@ -237,6 +241,20 @@ fn the_maps_datatypes_a_value_nothing_reads_and_a_users_datatype_are_told_as_bef
             .map(|(name, parts, want)| (name, told_after(name, &parts), want))
             .collect(),
     );
+    for (name, data) in [
+        (
+            "a datatype defined once",
+            r#":myType a rdfs:Datatype ; owl:equivalentClass xsd:string .
+               :born a owl:DatatypeProperty ; rdfs:range :myType . :a :born "x" ."#,
+        ),
+        (
+            "a datatype in the OWL 2 datatype map",
+            ":born a owl:DatatypeProperty ; rdfs:range xsd:integer . :a :born 5 .",
+        ),
+    ] {
+        let got = told_after(name, &[data]);
+        assert!(got.ends_with(" consistent; read complete"), "{name}: {got}");
+    }
 }
 
 /// A commit that adds only a value on a data property the RL route already knows keeps the
