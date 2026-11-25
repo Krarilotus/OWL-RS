@@ -799,17 +799,6 @@ fn a_repair_commit_in_quarantine_establishes_no_consistency_it_did_not_check() {
     cells.finish();
 }
 
-/// A store in `dir` holding `data` (Turtle over [`PREFIXES`]'s names), reasoned under OWL 2
-/// RL, its memory read through [`capacity`].
-fn reasoned(dir: &Path, data: &str) -> Arc<StoreService> {
-    let store = StoreService::new(StoreConfig::on_disk(dir))
-        .expect("store")
-        .with_capacity(capacity);
-    load(&store, data);
-    store.rematerialise(Ruleset::Owl2Rl).expect("reasoned");
-    Arc::new(store)
-}
-
 /// A change of a repository's reasoning (`Catalog::change`) rebuilds its inferences under the
 /// new rules before its new write path registers them. A reader of every graph between the
 /// rebuild's publication and that registration is told `not-certified`: the closure published
