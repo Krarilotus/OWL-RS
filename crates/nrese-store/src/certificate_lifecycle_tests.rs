@@ -1294,22 +1294,35 @@ fn an_ill_typed_search_stopped_before_it_starts_keeps_nothing_and_the_next_need_
     );
 }
 
-/// Under `owl2-dl`, a commit whose search for an ill-typed literal stops (the memory readable
-/// for its reasoning, the first reading after its preflight, and unreadable from its DL gate
-/// on) decides nothing: no verdict is recorded at its revision. With the memory readable
-/// again, the next read searches, finds none, and is `complete` and `consistent`; recorded as
-/// found, the revision would stay withheld.
+/// A stopped ill-typed search proves nothing even when the rules have found no clash.
 #[test]
 fn an_ill_typed_search_stopped_at_a_dl_commit_records_no_verdict_and_the_next_read_searches() {
+    check_stopped_dl_commit(DATA, 1, "rules");
+}
+
+/// A stopped ill-typed search proves nothing even when U1 has found no clash.
+#[test]
+fn an_ill_typed_search_stopped_at_an_upper_bound_commit_leaves_the_verdict_for_the_next_read() {
+    check_stopped_dl_commit(
+        &format!("{DATA} :A rdfs:subClassOf [ owl:unionOf ( :B :C ) ] . :rex a :A ."),
+        2,
+        "delta",
+    );
+}
+
+/// Let the reasoning and bounds finish, then stop the commit's witness search. The revision
+/// has no verdict. Once memory is readable, its next read searches and is complete and consistent.
+fn check_stopped_dl_commit(data: &str, readings: u32, route: &str) {
     let store = StoreService::new(StoreConfig::in_memory())
         .expect("store")
         .with_capacity(counted);
     let store = Arc::new(store);
     let dl = pipeline(&store, ReasoningMode::Owl2Dl);
-    commit(&dl, DATA);
-    hooks::AFTER_PREFLIGHT.set(Some(Box::new(|| READINGS.set(Some(1)))));
+    commit(&dl, data);
+    hooks::AFTER_PREFLIGHT.set(Some(Box::new(move || READINGS.set(Some(readings)))));
     commit(&dl, ":fido a :Dog .");
     READINGS.set(None);
+    assert_eq!(store.dl_bounds().last, route);
     let at = store.current_revision();
     let recorded = (store.dl().status()).filter(|s| s.revision == at);
     assert!(

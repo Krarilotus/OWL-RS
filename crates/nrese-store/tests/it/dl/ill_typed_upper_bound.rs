@@ -1,6 +1,6 @@
 use nrese_store::{ConsistencyStatus, MutationPipeline};
 
-use super::{PREFIXES, insert, pipeline, queries::query};
+use super::{PREFIXES, Status, insert, pipeline, queries::query};
 use crate::support::load_past_the_pipeline;
 
 const OFF_RULES: &str = ":A rdfs:subClassOf [ owl:unionOf ( :B :C ) ] .";
@@ -18,9 +18,13 @@ fn rebuilt(data: &str) -> MutationPipeline {
 /// An ill-typed datatype-map literal is unsatisfiable (OWL 2 Structural Specification
 /// §5.7 and RDF 1.1 Semantics §7.2). The store must withhold consistency and completeness
 /// while it holds one, including for a read of a named class with no range or datatype test.
-fn check(name: &str, dl: &MutationPipeline, ill_typed: bool, rules: bool) {
+fn check(name: &str, dl: &MutationPipeline, ill_typed: bool, write_engine: Option<&str>) -> Status {
     let store = dl.store();
     let recorded = store.dl().status();
+    if let Some(engine) = write_engine {
+        let status = recorded.as_ref().expect("the write's DL verdict");
+        assert_eq!(status.consistency.engine, engine, "{name}: {status:?}");
+    }
     let (rows, read) = query(dl, "SELECT ?x WHERE { ?x a :U }");
     let verdict = recorded.or_else(|| store.dl().status()).map(|status| {
         (
@@ -31,7 +35,7 @@ fn check(name: &str, dl: &MutationPipeline, ill_typed: bool, rules: bool) {
     let consistency = store.consistency();
     let bounds = store.dl_bounds();
     assert_eq!(rows, ["a"], "{name}");
-    assert_eq!(bounds.last == "rules", rules, "{name}: {bounds:?}");
+    assert_eq!(bounds.last == "rules", write_engine == Some("rules"));
     let (literals, _) = query(
         dl,
         "SELECT ?x WHERE { :a :d ?x . FILTER(DATATYPE(?x) = xsd:integer) }",
@@ -65,13 +69,14 @@ fn check(name: &str, dl: &MutationPipeline, ill_typed: bool, rules: bool) {
             "{name}: the same store is consistent without the literal"
         );
     }
+    read
 }
 
 #[test]
 fn an_ill_typed_literal_withholds_the_word_after_a_write() {
     let dl = pipeline();
     insert(&dl, &format!("{OFF_RULES} {MARKER} {ILL_TYPED}")).expect("write applies");
-    check("write", &dl, true, false);
+    check("write", &dl, true, Some("upper-bound"));
 }
 
 #[test]
@@ -83,33 +88,39 @@ fn an_ill_typed_literal_withholds_the_word_after_a_tableau_check() {
         &format!("{OFF_RULES} :a a :A . :B owl:disjointWith :C . {MARKER} {ILL_TYPED}"),
     )
     .expect("write applies");
-    let status = dl.store().dl().status().expect("the write's DL verdict");
-    assert_eq!(status.consistency.engine, "hypertableau", "{status:?}");
-    check("tableau", &dl, true, false);
+    check("tableau", &dl, true, Some("hypertableau"));
 }
 
 #[test]
 fn an_ill_typed_literal_withholds_the_word_after_a_rebuild() {
     let dl = rebuilt(&format!("{OFF_RULES} {MARKER} {ILL_TYPED}"));
-    check("rebuild", &dl, true, false);
+    let read = check("rebuild", &dl, true, None);
+    let reasons = read.reasons();
+    assert!(
+        reasons.iter().any(|reason| {
+            reason.starts_with("the data's consistency under OWL 2 DL isn't known")
+                && reason.contains("ill-typed literal")
+        }),
+        "the read must withhold its DL verdict because of the literal: {reasons:?}"
+    );
 }
 
 #[test]
 fn the_write_without_the_literal_is_consistent() {
     let dl = pipeline();
     insert(&dl, &format!("{OFF_RULES} {MARKER}")).expect("write applies");
-    check("clean-write", &dl, false, false);
+    check("clean-write", &dl, false, Some("upper-bound"));
 }
 
 #[test]
 fn the_rebuild_without_the_literal_is_consistent() {
     let dl = rebuilt(&format!("{OFF_RULES} {MARKER}"));
-    check("clean-rebuild", &dl, false, false);
+    check("clean-rebuild", &dl, false, None);
 }
 
 #[test]
 fn the_rules_route_withholds_the_word_for_the_same_literal() {
     let dl = pipeline();
     insert(&dl, &format!("{MARKER} {ILL_TYPED}")).expect("write applies");
-    check("rules", &dl, true, true);
+    check("rules", &dl, true, Some("rules"));
 }

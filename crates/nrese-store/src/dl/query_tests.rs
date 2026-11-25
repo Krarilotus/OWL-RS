@@ -1,5 +1,6 @@
 use super::*;
 use nrese_dl::limits::Deadline;
+use nrese_reasoner::rulesets::Ruleset;
 
 /// The check tier (`NRESE_CHECK_TIER`): `landing` (the default) or `nightly`.
 pub(crate) fn nightly() -> bool {
@@ -253,6 +254,7 @@ fn expired_consistency_keeps_request_timeout_out_of_shared_status() {
 #[test]
 fn an_upper_bound_proof_survives_expiry_but_not_request_cancellation() {
     let store = StoreService::new(crate::StoreConfig::in_memory()).unwrap();
+    store.rematerialise(Ruleset::Owl2Rl).unwrap();
     let snapshot = store.read_snapshot(None).unwrap();
     let mut view = unproved_view(&snapshot);
     view.proves_consistency = true;
