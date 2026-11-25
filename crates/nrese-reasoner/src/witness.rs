@@ -12,6 +12,8 @@ pub(crate) enum Site {
     /// Maintenance's lookups of a fact in the state before its transaction
     /// (`EngineBase::known_before`).
     KnownBefore,
+    /// Program axioms examined by an asserted scan.
+    AssertedAxiom,
     /// Candidates a morsel's keep looks at (`Store::retain_new`).
     RetainStep,
     /// Job constructions started (`Job::new`).

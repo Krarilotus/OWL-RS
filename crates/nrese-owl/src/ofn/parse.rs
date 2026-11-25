@@ -8,11 +8,11 @@ use std::rc::Rc;
 use super::lex::{Lexer, Tok, position};
 use super::{Document, Intern, Model};
 use crate::diagnostics::Diagnostic;
-use crate::model::Disjoint;
 use crate::model::{
     Axiom, Characteristic, ClassExpr, DataRange, EntityKind, ExprId, ObjProp, RangeId, Term,
     canonical,
 };
+use crate::model::{Disjoint, DisjointReading};
 use crate::rules::{Atom, DArg, IArg, Rule};
 use crate::vocab::{OWL, RDF, RDFS, XSD};
 
@@ -772,7 +772,12 @@ impl<'t, 'm> Parser<'t, 'm> {
     /// name in its place, all of them left out with it (`diagnostics::reserved_in`).
     fn disjoint(&mut self, d: Disjoint) -> R<()> {
         self.close()?;
-        let (axioms, repeated) = d.axioms(&mut self.model.classes, &mut self.model.ranges);
+        let model = &mut self.model;
+        let (axioms, repeated) = d.axioms(
+            &mut model.classes,
+            &mut model.ranges,
+            DisjointReading::Canonical,
+        );
         if repeated {
             self.model.diagnostics.push(Diagnostic::RepeatedOperand);
             let terms: &dyn crate::mapping::Terms = &*self.terms;

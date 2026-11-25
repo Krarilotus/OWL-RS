@@ -102,7 +102,7 @@ fn an_inconsistent_premise_entails_everything() {
 }
 
 /// A store holding [`INCONSISTENT`], committed with the DL check off.
-fn unchecked_inconsistent() -> nrese_store::MutationPipeline {
+pub(super) fn unchecked_inconsistent() -> nrese_store::MutationPipeline {
     let dl = super::pipeline_with(nrese_store::DlConfig {
         consistency: nrese_store::DlConsistency::Off,
         ..nrese_store::DlConfig::default()

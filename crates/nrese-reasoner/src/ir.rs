@@ -249,6 +249,34 @@ impl ListPairs {
             .copied()
             .filter(|&member| self.together(member, member))
     }
+
+    /// Project the index and add self-pairs created by merging distinct written operands.
+    pub(crate) fn project(
+        &mut self,
+        representative: &dyn Fn(u64) -> u64,
+        repeats: &mut std::collections::HashSet<u64>,
+        stop: &dyn Fn() -> bool,
+    ) {
+        let mut projected = std::collections::BTreeMap::<_, Vec<_>>::new();
+        for (member, positions) in std::mem::take(&mut self.positions) {
+            let id = representative(member);
+            let prior = projected.entry(id).or_default();
+            if !repeats.contains(&id)
+                && positions.iter().any(|&x| {
+                    prior
+                        .iter()
+                        .any(|&y| stop() || self.reaches(x, y) || self.reaches(y, x))
+                })
+            {
+                repeats.insert(id);
+            }
+            if stop() {
+                return;
+            }
+            prior.extend(positions);
+        }
+        self.positions = projected;
+    }
 }
 
 impl ListIndex {
