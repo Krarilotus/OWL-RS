@@ -144,11 +144,13 @@ fn scratch_outlives_private_storage() {
     }
 
     const N: usize = 262_144;
-    let mut premise = Ontology::default();
-    premise.axioms = (0..N as u64)
-        .map(|i| Axiom::ObjectPropertyAssertion(1, 10 + i, 10 + i))
-        .collect();
-    premise.sources.resize_with(N, Vec::new);
+    let mut premise = Ontology {
+        axioms: (0..N as u64)
+            .map(|i| Axiom::ObjectPropertyAssertion(1, 10 + i, 10 + i))
+            .collect(),
+        sources: vec![Vec::new(); N],
+        ..Ontology::default()
+    };
     premise.classes.intern(ClassExpr::Class(2));
 
     let empty = Ontology::default();
