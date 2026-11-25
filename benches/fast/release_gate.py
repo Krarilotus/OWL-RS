@@ -52,6 +52,8 @@ from suitekit.checkout import STORED_OBJECTS, checkout_differs  # noqa: E402,F40
 
 CAMPAIGN_BLOCKS = 2  # blocks a round at least (each: every case on every side, twice, as a palindrome)
 LANDING_BLOCKS = 8
+# A complete pair exits zero even when it records a release verdict failure.
+PAIRED_REPORT_VERSION = 1
 LANDING_CASES = ("load-entities", "load-threads", "q-snowflake", "q-star", "op-group", "commits-plain",
                  "commits-rdfs", "custom-tc", "rl-single-thread", "rl-clique", "ql-lubm10", "dl-pipeline",
                  "shacl-lubm", "deletes-tail", "writes-under-readers")
@@ -3969,8 +3971,11 @@ def main() -> int:
         summary["host_notes"] = [*summary.get("host_notes", []), *notes]
         prepared = {(p["report"].get("prepared") or {}).get("manifest_sha256") for p in passes}
         summary["prepared_manifest"] = sorted(map(str, prepared))
-        # The part's run this report is of: the newest attempt record beside the report.
-        record, _ = newest_attempt(args.json.parent, "timed") if args.json else (None, None)
+        record = None
+        if args.json:
+            # A paired report is staged away from its results and their attempt records.
+            results = args.passes.parent if first is not None else args.json.parent
+            record, _ = newest_attempt(results, "timed")
         summary["attempt"] = record["attempt"] if record else None
         text = render(summary, first)
         print(text)
@@ -4175,9 +4180,10 @@ def main() -> int:
             print("no product change: nothing to time")
             return 0
         harness = rev(args.harness or candidate)
-        if args.mode == "C" and git_line(args.checkout, "grep", "-q", "-F", "-e", 'summary["landing"] =',
+        if args.mode == "C" and git_line(args.checkout, "grep", "-qE", "-e",
+                                         f"^PAIRED_REPORT_VERSION = {PAIRED_REPORT_VERSION}$",
                                          harness, "--", "benches/fast/release_gate.py") is None:
-            p.error(f"mode C requires a harness that marks landing reports: {harness}")
+            p.error(f"mode C requires a harness with paired report version {PAIRED_REPORT_VERSION}: {harness}")
         main_side = rev(args.main or (args.base if args.mode else MAIN))
         # The harness's calibration, and batched timing only where every side's perf lab batches.
         shown = subprocess.run(["git", "-C", args.checkout, "show", f"{harness}:benches/fast/measure.toml"],

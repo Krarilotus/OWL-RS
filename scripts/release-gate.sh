@@ -780,11 +780,13 @@ report)
       rm -f "$OUT/release-gate.json" "$OUT/release-gate.md"
       exit 1
     fi
+    log "paired report published ($OUT/release-gate.md)"
   elif [ "$code" -gt 1 ]; then
     rm -f "$OUT/release-gate.json" "$OUT/release-gate.md"
     exit "$code"
+  else
+    log "timed part: $( [ $code -eq 0 ] && echo passed || echo 'not passed') ($OUT/release-gate.md)"
   fi
-  log "timed part: $( [ $code -eq 0 ] && echo passed || echo 'not passed') ($OUT/release-gate.md)"
   # For an ordinary round, exit 1 with a completed report is a judged result.
   [ -f "$OUT/release-gate.json" ] || exit 1
   ;;
