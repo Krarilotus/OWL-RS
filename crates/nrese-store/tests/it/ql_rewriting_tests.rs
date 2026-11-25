@@ -1223,7 +1223,7 @@ fn owl_thing_on_the_left_answers_for_every_individual() {
         owl:someValuesFrom owl:Thing ] .";
     let edge = ":a0 :P0 :a1 .";
     let data = ":D a owl:DatatypeProperty . :a0 :D \"3\" .";
-    let ask = |store: &StoreService, query: &str| -> (String, String) {
+    let ask = |store: &StoreService, query: &str| {
         let result = store
             .execute_query(&SparqlQueryRequest::all(query))
             .unwrap_or_else(|e| panic!("{query}: {e}"));
