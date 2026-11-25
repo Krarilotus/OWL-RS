@@ -20,6 +20,13 @@ use super::consistency::{self, Budget, Verdict};
 
 mod batch;
 pub(crate) use batch::{Batch, Test, compile};
+#[cfg(test)]
+pub(crate) mod scratch_lifetime_tests;
+
+#[cfg(test)]
+use scratch_lifetime_tests::ObservedScratch as CopyScratch;
+#[cfg(not(test))]
+type CopyScratch = Scratch;
 
 /// Whether an axiom (or every axiom of a set) is entailed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -617,7 +624,7 @@ fn tick(work: &mut u64, units: u64, deadline: Deadline) -> Result<(), Stopped> {
 pub(crate) struct PreparedCheck {
     o: Ontology,
     axioms: Vec<Axiom>,
-    _copy_scratch: Scratch,
+    _copy_scratch: CopyScratch,
 }
 
 #[derive(Clone, Copy)]
@@ -632,7 +639,10 @@ fn import_into(
     budget: &Budget,
     deadline: Deadline,
 ) -> Result<PreparedCheck, Entailed> {
-    let (mut o, mut copy_scratch) = copy(premise, budget)?;
+    let (mut o, copy_scratch) = copy(premise, budget)?;
+    #[cfg(test)]
+    let copy_scratch = CopyScratch::copy(copy_scratch, &o);
+    let mut copy_scratch = copy_scratch;
     #[cfg(test)]
     let _entry_guard = test_hooks::on_entry(budget.memory.as_ref());
     let mut memo_scratch = Scratch::new(budget.memory.as_ref());
@@ -672,7 +682,10 @@ pub(crate) fn admit_and_prepare(
     budget: &Budget,
     deadline: Deadline,
 ) -> Result<PreparedCheck, Entailed> {
-    let mut js = Scratch::new(budget.memory.as_ref());
+    let js = Scratch::new(budget.memory.as_ref());
+    #[cfg(test)]
+    let js = scratch_lifetime_tests::ObservedScratch::joint(js);
+    let mut js = js;
     let mut prepared = import_into(premise, conclusion, budget, deadline)?;
     let o = &mut prepared.o;
     let mut imported = take(&mut prepared.axioms);
@@ -740,6 +753,8 @@ pub(crate) fn admit_and_prepare(
     if deadline.passed() {
         return Err(Stopped::Time.into());
     }
+    #[cfg(test)]
+    scratch_lifetime_tests::watch_joint(o);
     #[cfg(test)]
     let _membership_guard = test_hooks::on_membership(budget.memory.as_ref());
     let memo_bytes = nrese_owl::diagnostics::non_simple_memo_bytes(o.classes.len());
@@ -954,7 +969,7 @@ mod import_tests {
         );
     }
 
-    struct StubTerms;
+    pub(super) struct StubTerms;
 
     impl Terms for StubTerms {
         fn kind(&self, _term: u64) -> nrese_owl::TermKind {
@@ -974,7 +989,7 @@ mod import_tests {
         }
     }
 
-    fn test_budget(memory: Option<nrese_exec::Envelope>) -> Budget {
+    pub(super) fn test_budget(memory: Option<nrese_exec::Envelope>) -> Budget {
         Budget {
             timeout: None,
             memory_bytes: None,
