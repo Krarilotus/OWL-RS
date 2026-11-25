@@ -643,7 +643,7 @@ fn import_into(
         &mut memo_scratch,
         deadline,
     )?;
-    o.data.extend(&conclusion.data);
+    import.to.data.extend(&conclusion.data);
     let mut axioms = Vec::with_capacity(conclusion.axioms.len());
     for a in &conclusion.axioms {
         axioms.push(import.axiom(a)?);
@@ -730,6 +730,7 @@ pub(crate) fn admit_and_prepare(
     let findings = nrese_owl::membership(o, terms);
     let blocks_j = |d: &Diagnostic| match *d {
         Diagnostic::AnonymousIndividual { node, axioms, .. } => {
+            // Fresh blank identities make a witnessless finding on a conclusion blank its own.
             axioms
                 .iter()
                 .flatten()
@@ -867,7 +868,9 @@ mod import_tests {
         assert!(to_a < to_b);
 
         let (mut cs, mut ms) = (Scratch::default(), Scratch::default());
-        let mut import = Import::new(&from, &mut to, &mut cs, &mut ms, Deadline::none()).unwrap();
+        let mut import = Import::new(&from, &mut to, &mut cs, &mut ms, Deadline::after(None))
+            .map_err(Entailed::from)
+            .expect("unbounded import");
         assert_eq!(
             import.axiom(&eq).ok(),
             Some(Axiom::EquivalentClasses(vec![to_a, to_b]))
