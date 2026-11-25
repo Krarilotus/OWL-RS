@@ -100,20 +100,8 @@ pub struct StoreService {
     /// Whether the reasoning state file may exist (see [`Self::reasoning_state`]); saves a
     /// file-system call per write once it is gone.
     marker: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// The reasoning state recorded this process (also for in-memory stores, which have no
-    /// file).
-    materialised: std::sync::Arc<std::sync::Mutex<Option<crate::ReasoningState>>>,
-    /// Odd from a commit on a store in quarantine, which keeps no assessment of its
-    /// consistency, until a rematerialisation records one ([`Self::is_quarantined`]); it only
-    /// rises, so two equal readings saw no such commit or recording between them. In memory
-    /// only: that commit removes the marker first, so a reopen rebuilds.
-    pub(crate) unassessed: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Shared by the store's clones: a clone with its own record would never see a commit's mark.
     pub(crate) lists: std::sync::Arc<crate::reasoning::ListsKept>,
-    /// The certificate's epoch, a sequence lock over its changes ([`Self::certificate_epoch`]):
-    /// odd while one is in progress (under the writer slot, [`CertificateTransition`]), even
-    /// once it is settled in memory and on disk.
-    certificate_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// When queries are rewritten for OWL 2 QL ([`StoreConfig::ql_rewriting`], or the
     /// repository's own, [`Self::set_ql_rewriting`]).
     ql_mode: std::sync::Arc<std::sync::RwLock<crate::QlRewritingMode>>,
@@ -149,23 +137,31 @@ pub struct StoreService {
 /// The file recording what the inferred stack is exact for ([`crate::reasoning_state`]).
 pub(crate) const REASONING_MARKER: &str = "reasoning.state";
 
-/// A change of the reasoning certificate in progress
-/// ([`StoreService::certificate_epoch`]): made odd by its start, the epoch is even again when
-/// this drops, the change settled or failed, on every way out (`?` and unwinding included).
-struct CertificateTransition<'a>(&'a std::sync::atomic::AtomicU64);
-
-impl Drop for CertificateTransition<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-/// What the writer slot's holder vouched for a version ([`nrese_engine::Certificate`]):
-/// everything a read of it needs from the reasoning, immutable, held with the snapshot, so
-/// a read is judged by its own version's and never by a later one's.
+/// What the store knows about a version's reasoning, published with it in the engine's slot
+/// ([`nrese_engine::Certificate`]). Readers access it through [`Certificate::record`].
 pub(crate) struct Certificate {
-    /// What the inferred stack is exact for.
+    /// What the inferred stack is exact for, where [`Self::exact`].
     pub(crate) state: crate::ReasoningState,
+    /// `state` describes this version's inferred stack: a rebuild's, the open's from its
+    /// marker, a maintained commit's. False on a record that only carries a hold
+    /// ([`StoreService::withheld`]).
+    pub(crate) exact: bool,
+    /// The store vouches for the rows ([`StoreService::vouches`]): exact, not a replica, and
+    /// made by the rules registered (or, with none registered, as the marker says).
+    pub(crate) vouched: bool,
+    /// The rules registered made the stack (`ReasoningState::made_by`): only then is `state`'s
+    /// violation count the rules' word for this version.
+    checked: bool,
+    /// A rebuild in this process supplied the assessment, even without registered rules.
+    rebuilt_here: bool,
+    /// The rules assessed this version's whole closure: a rebuild, the open, a commit outside
+    /// quarantine. A commit in quarantine checks only its own facts.
+    pub(crate) assessed: bool,
+    /// The rules' hold: a check found a clash, and no later check of the rules cleared it.
+    /// Carried by every record until a rebuild assesses the version again; readiness reads it.
+    pub(crate) held: bool,
+    /// Whether the rules equated a literal with another term in this version.
+    pub(crate) literal: Literal,
     /// The QL rewriting its queries get, the same object a commit that maintains the closure
     /// notes its memberships in and vouches with.
     pub(crate) ql: Ql,
@@ -182,6 +178,63 @@ pub(crate) struct Certificate {
 /// A version's ill-typed literal, if any: `None` until a search ends.
 pub(crate) type IllTyped = Option<Option<nrese_engine::TermId>>;
 
+/// Whether the rules equated a literal with another term ([`Certificate::literal`]): reads of
+/// typed values aren't `complete` unless it is `Clear` (`dl::query::withhold`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Literal {
+    /// A rebuild or the matching registered rules establish that none were equated.
+    Clear,
+    /// A rebuild or a commit derived one.
+    Set,
+    /// Opened from a marker, under rules that may equate literals.
+    Unknown,
+}
+
+/// What [`Certificate::record`] answers of a version: every verdict a reader gives of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Assessment {
+    /// The rules' word: `Unknown` where no record vouched under the rules registered assessed
+    /// the version, or on a replica.
+    pub(crate) rules: crate::ConsistencyStatus,
+    /// The rules' hold: the store isn't ready.
+    pub(crate) held: bool,
+    /// The rules assessed the whole version. Held and not assessed (a commit in quarantine
+    /// before its revalidation, an invalidation): nothing may be answered by the rules.
+    pub(crate) assessed: bool,
+}
+
+/// What a reader answering by the rules may take as the premise ([`Assessment::premise`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Premise {
+    /// The rules' word, as `rules` says it.
+    Word,
+    /// Held without the rules' word, the whole version assessed (a bare open over a marker
+    /// with violations): inconsistent.
+    HeldInconsistent,
+    /// Held and not assessed: no answer by the rules.
+    Unassessed,
+}
+
+impl Assessment {
+    /// What a reader answering by the rules takes as its premise.
+    pub(crate) fn premise(&self) -> Premise {
+        match (self.held, self.rules, self.assessed) {
+            (true, crate::ConsistencyStatus::Unknown, false) => Premise::Unassessed,
+            (true, crate::ConsistencyStatus::Unknown, true) => Premise::HeldInconsistent,
+            _ => Premise::Word,
+        }
+    }
+}
+
+/// What a new exact record says beside its state ([`StoreService::certificate`]).
+struct Facts {
+    literal: Literal,
+    held: bool,
+    assessed: bool,
+    checked: bool,
+    rebuilt_here: bool,
+}
+
 /// What a read inside a transaction lacks ([`StoreService::assess`]), under `owl2-dl` with
 /// [`CLOSURE`]; and where its operations may delete, [`DELETES`].
 const PENDING: &str = "a read inside a transaction: its pending operations aren't reasoned over \
@@ -195,21 +248,57 @@ const DELETES: &str = "the pending operations may delete statements whose infere
 type Ql = Option<std::sync::Arc<nrese_sparql::ql::QlRewriting>>;
 
 impl Certificate {
-    /// `snapshot`'s, if it has one of this type; any other reads as none.
-    pub(crate) fn of(snapshot: &Snapshot) -> Option<&Self> {
+    /// The one place that decides what a version is told: `snapshot`'s record, if it has one
+    /// of this type (a pending snapshot carries its base's; a withheld view none). Every reader
+    /// of a verdict or of "certified" goes through it; [`Self::for_rows`] reads the slot too,
+    /// for how rows are produced only.
+    pub(crate) fn record(snapshot: &Snapshot) -> Option<&Self> {
         snapshot.certificate()?.downcast_ref()
     }
 
-    /// The one `snapshot`'s rows are produced under ([`Snapshot::certificate_for_rows`]).
+    /// `snapshot`'s record where the store vouches for its rows; any other reads as none.
+    pub(crate) fn of(snapshot: &Snapshot) -> Option<&Self> {
+        Self::record(snapshot).filter(|c| c.vouched)
+    }
+
+    /// The one `snapshot`'s rows are produced under ([`Snapshot::certificate_for_rows`]),
+    /// vouched.
     pub(crate) fn for_rows(snapshot: &Snapshot) -> Option<&Self> {
-        snapshot.certificate_for_rows()?.downcast_ref()
+        let rows = snapshot.certificate_for_rows()?.downcast_ref::<Self>()?;
+        rows.vouched.then_some(rows)
+    }
+
+    /// Every verdict of `snapshot`'s version, from its record alone: the rules' word only from
+    /// an exact record the rules registered checked, assessed whole; the hold from any record;
+    /// neither on a replica, which reasons nothing (its own `owl2-dl` checks stay its own).
+    pub(crate) fn assessment(snapshot: &Snapshot, replica: bool) -> Assessment {
+        let Some(record) = Self::record(snapshot) else {
+            let rules = crate::ConsistencyStatus::Unknown;
+            return Assessment {
+                rules,
+                held: false,
+                assessed: false,
+            };
+        };
+        let word = !replica && record.exact && record.checked && record.assessed;
+        Assessment {
+            rules: match word {
+                true => record.state.consistency(),
+                false => crate::ConsistencyStatus::Unknown,
+            },
+            held: !replica && record.held,
+            assessed: record.assessed,
+        }
     }
 
     /// Whether `snapshot` was never reasoned over: no inferred statement, no certificate (not
     /// even one a withheld view keeps for its rows), and no rules in place (`rules`). Anything
     /// else without a certificate is a stack nothing vouches for.
     pub(crate) fn bare(snapshot: &Snapshot, rules: bool) -> bool {
-        snapshot.len_in(ReadModel::Inferred) == 0 && !rules && Self::for_rows(snapshot).is_none()
+        snapshot.len_in(ReadModel::Inferred) == 0
+            && !rules
+            && Self::record(snapshot).is_none()
+            && Self::for_rows(snapshot).is_none()
     }
 
     /// Whether `snapshot` reads under `owl2-dl`, and whether user rules run with it: as its
@@ -440,10 +529,7 @@ impl StoreService {
             preloaded_ontology,
             marker: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             unavailable,
-            materialised: std::sync::Arc::default(),
-            unassessed: std::sync::Arc::default(),
             lists: Default::default(),
-            certificate_epoch: std::sync::Arc::default(),
             ql_mode: std::sync::Arc::new(std::sync::RwLock::new(ql_mode)),
             outside_profile: std::sync::Arc::new(std::sync::RwLock::new(outside_profile)),
             last_materialisation: std::sync::Arc::default(),
@@ -471,12 +557,13 @@ impl StoreService {
         let tx = service.engine.transaction();
         let writer = tx.writer().expect("a transaction holds the writer slot");
         if service.engine.snapshot().revision() != before {
-            service.invalidate_held(writer)?;
+            service.forget_marker(writer)?;
         }
-        if let Some(state) = service.recorded_reasoning_state() {
-            // The reading isn't on disk: the certified stack's is installed before the store
-            // is anyone's, with its certificate. Without one the stack is read as stored.
-            service.certify(&tx, state);
+        // The marker, read once, here: the open's record. The reading isn't on disk: the
+        // certified stack's is installed before the store is anyone's, with its record. The
+        // marker doesn't record whether the rules equated two literals.
+        if let Some(state) = service.marker_state() {
+            service.certify(&tx, state, Literal::Unknown);
         }
         drop(tx);
         service.refresh_kept_shapes(&service.engine.snapshot(), &StopSource::none());
@@ -484,40 +571,121 @@ impl StoreService {
         Ok(service)
     }
 
-    /// Installs `state`'s certificate on the current version under `tx`'s writer slot, with
-    /// the certified stack's reading: the open, and a change of the QL setting or the mode,
-    /// whose new certificate keeps the current one's QL schema where its closure is the same,
-    /// and its mark of a literal equality ([`Self::with_literal_equality`]), on the state kept
-    /// in memory too: a version made without a certificate (rules other than its own) keeps
-    /// it for the next.
-    fn certify(&self, tx: &nrese_engine::Transaction<'_>, mut state: crate::ReasoningState) {
+    /// Installs a record of `state` on the current version under `tx`'s writer slot, with the
+    /// certified stack's reading: the open, from its marker, and [`Self::recertify`]. It keeps
+    /// the current record's QL schema where its closure is the same, its hold, and whether the
+    /// rules assessed it; a literal mark `Unknown` since the open is `Clear` where the rules
+    /// registered made the stack and can't equate literals.
+    fn certify(
+        &self,
+        tx: &nrese_engine::Transaction<'_>,
+        state: crate::ReasoningState,
+        literal: Literal,
+    ) {
         let writer = tx.writer().expect("a transaction holds the writer slot");
-        let base = Certificate::of(tx.base());
-        if base.is_some_and(|c| c.state.literal_equality && !c.state.literal_equality_unknown) {
-            state.literal_equality = true;
-        }
-        // Keep the observed mark and the marker's uncertainty independent. A later
-        // certificate can reconsider the uncertainty under the rules registered then.
-        self.materialised
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get_or_insert_with(|| state.clone())
-            .literal_equality |= state.literal_equality;
-        if state.literal_equality_unknown {
-            let cannot_equate = self.supports.rules().is_some_and(|program| {
-                // Defence in depth: vouches also checks the fingerprint under
-                // this writer slot before the certificate is published.
-                state.made_by(&program, self.config.hide_unnamed_classes)
-                    && !program.may_equate_literals()
-                    && state.ruleset == program.name()
+        let base = Certificate::record(tx.base()).filter(|c| c.exact);
+        let hide = self.config.hide_unnamed_classes;
+        let registered = self.supports.rules();
+        let rebuilt_here = base.is_some_and(|c| c.rebuilt_here);
+        let checked = registered
+            .as_ref()
+            .map_or(rebuilt_here, |p| state.made_by(p, hide));
+        let cannot_equate = checked
+            && registered.as_ref().is_some_and(|program| {
+                !program.may_equate_literals() && state.ruleset == program.name()
             });
-            state.literal_equality_unknown = !cannot_equate;
-            state.literal_equality |= state.literal_equality_unknown;
-        }
+        let facts = Facts {
+            literal: match literal {
+                Literal::Unknown if cannot_equate => Literal::Clear,
+                Literal::Clear if !rebuilt_here && !cannot_equate => Literal::Unknown,
+                literal => literal,
+            },
+            held: base.map_or(state.violations > 0, |c| c.held),
+            assessed: base.is_none_or(|c| c.assessed),
+            checked,
+            rebuilt_here,
+        };
         let kept = base.and_then(|c| c.ql.clone());
         let reading = self.note_equality(writer, &state);
-        let certificate = self.vouches(&state).then(|| self.certificate(state, kept));
-        tx.install(reading, certificate);
+        tx.install(reading, Some(self.certificate(state, kept, facts)));
+    }
+
+    /// The current record made again under the settings now (a registration, the QL setting,
+    /// the mode), `edit` applied to its state: nothing where no record describes the stack.
+    fn recertify(
+        &self,
+        tx: &nrese_engine::Transaction<'_>,
+        edit: impl FnOnce(&mut crate::ReasoningState),
+    ) {
+        let Some(base) = Certificate::record(tx.base()).filter(|c| c.exact) else {
+            return;
+        };
+        let (mut state, literal) = (base.state.clone(), base.literal);
+        edit(&mut state);
+        self.certify(tx, state, literal);
+    }
+
+    /// The record a maintained commit `tx` publishes, from its base's: the same stack's state,
+    /// QL schema and settings; its literal mark `Set` where the commit derived a literal
+    /// equality; its ill-typed literal judged for `tx` (`dl::query::ill_typed_after`, under the
+    /// memory stop) where the base's is found; assessed where the base isn't held (a commit in
+    /// quarantine checks only its own facts: the hold carried, not assessed). `None` where no
+    /// record describes the base's stack.
+    pub(crate) fn successor(
+        &self,
+        tx: &nrese_engine::Transaction<'_>,
+        literal_equality: bool,
+    ) -> Option<nrese_engine::Certificate> {
+        let base = Certificate::record(tx.base()).filter(|c| c.exact)?;
+        let cell = *base.ill_typed.lock().unwrap_or_else(|p| p.into_inner());
+        let ill_typed = if crate::dl::query::keeps_ill_typed(base.dl, &base.state.ruleset) {
+            let memory = self.memory_stop();
+            cell.and_then(|cell| crate::dl::query::ill_typed_after(tx, cell, &|| memory.exceeded()))
+        } else {
+            cell
+        };
+        Some(std::sync::Arc::new(Certificate {
+            state: base.state.clone(),
+            ql: base.ql.clone(),
+            equality_closed: base.equality_closed,
+            dl: base.dl,
+            user_rules: base.user_rules,
+            ill_typed: std::sync::Mutex::new(ill_typed),
+            exact: true,
+            vouched: base.vouched,
+            checked: base.checked,
+            rebuilt_here: base.rebuilt_here,
+            assessed: !base.held,
+            held: base.held,
+            literal: if literal_equality {
+                Literal::Set
+            } else {
+                base.literal
+            },
+        }))
+    }
+
+    /// The record a publication that doesn't maintain the inferences carries, by a holder of
+    /// the writer slot: no row vouched for, no verdict, the current record's hold kept; `None`
+    /// where there is no hold to keep.
+    fn withheld(&self, _writer: nrese_engine::WriterHeld<'_>) -> Option<nrese_engine::Certificate> {
+        let current = self.engine.snapshot();
+        let base = Certificate::record(&current).filter(|c| c.held)?;
+        Some(std::sync::Arc::new(Certificate {
+            state: base.state.clone(),
+            ql: None,
+            equality_closed: false,
+            dl: base.dl,
+            user_rules: base.user_rules,
+            ill_typed: Default::default(),
+            exact: false,
+            vouched: false,
+            checked: false,
+            rebuilt_here: false,
+            assessed: false,
+            held: true,
+            literal: Literal::Unknown,
+        }))
     }
 
     /// Whether the store vouches for the stack `state` records: never on a replica (its reads
@@ -532,19 +700,31 @@ impl StoreService {
         !self.config.replica && self.supports.vouches_for(state, hide)
     }
 
-    /// `state`'s certificate under the store's settings now; `kept`, the QL schema to keep
-    /// if its closure is the one `state` calls for. Whether the recorded reasoning closes
-    /// the data under `owl:sameAs` (a ruleset with the equality rules): queries may then
-    /// rely on it. Its ill-typed literal isn't looked for until a need asks
+    /// `state`'s record of an exact stack under the store's settings now, with `facts`; `kept`,
+    /// the QL schema to keep if its closure is the one `state` calls for. Whether the recorded
+    /// reasoning closes the data under `owl:sameAs` (a ruleset with the equality rules):
+    /// queries may then rely on it. Its ill-typed literal isn't looked for until a need asks
     /// ([`Certificate::ill_typed`]).
-    fn certificate(&self, state: crate::ReasoningState, kept: Ql) -> nrese_engine::Certificate {
+    fn certificate(
+        &self,
+        state: crate::ReasoningState,
+        kept: Ql,
+        facts: Facts,
+    ) -> nrese_engine::Certificate {
         std::sync::Arc::new(Certificate {
             ql: self.ql_for(&state, kept),
             equality_closed: nrese_reasoner::RuleProgram::closes_equality(&state.ruleset),
             dl: self.dl.active(),
             user_rules: self.dl.user_rules(),
+            vouched: self.vouches(&state),
             state,
             ill_typed: Default::default(),
+            exact: true,
+            checked: facts.checked,
+            rebuilt_here: facts.rebuilt_here,
+            assessed: facts.assessed,
+            held: facts.held,
+            literal: facts.literal,
         })
     }
 
@@ -671,11 +851,9 @@ impl StoreService {
     pub fn set_ql_rewriting(&self, mode: crate::QlRewritingMode) {
         let tx = self.engine.transaction();
         *self.ql_mode.write().unwrap_or_else(|p| p.into_inner()) = mode;
-        if let Some(state) = self.recorded_reasoning_state() {
-            #[cfg(test)]
-            hooks::run(&hooks::AFTER_QL_READ);
-            self.certify(&tx, state);
-        }
+        #[cfg(test)]
+        hooks::run(&hooks::AFTER_QL_READ);
+        self.recertify(&tx, |_| {});
     }
 
     /// The store's namespace prefixes ([`crate::namespaces`]).
@@ -716,109 +894,56 @@ impl StoreService {
         (self.config.mode == StoreMode::OnDisk).then(|| self.config.data_dir.join(REASONING_MARKER))
     }
 
-    /// What the inferred stack is exact for, as recorded by the last
-    /// [`Self::rematerialise`] and kept by reasoner-v2 commits since; `None` if unknown
-    /// (never materialised, or a write that didn't maintain the inferences).
+    /// The marker's state ([`crate::ReasoningState::from_text`]); read by the open only.
+    fn marker_state(&self) -> Option<crate::ReasoningState> {
+        let text = std::fs::read_to_string(self.marker_path()?).ok()?;
+        crate::ReasoningState::from_text(&text)
+    }
+
+    /// What the inferred stack is exact for, as the current version's record says
+    /// ([`Certificate::exact`]); `None` if unknown (never materialised, or a write that didn't
+    /// maintain the inferences), and for a commit in quarantine until its revalidation's
+    /// rebuild assesses the version (held, not assessed): the next commit rebuilds first.
     pub fn reasoning_state(&self) -> Option<crate::ReasoningState> {
-        self.recorded_reasoning_state().map(|mut state| {
-            state.literal_equality |= state.literal_equality_unknown;
-            state
-        })
+        let snapshot = self.engine.snapshot();
+        Self::reasoning_state_at(&snapshot).cloned()
     }
 
-    /// The observed literal-equality mark and the uncertainty of a marker read are
-    /// kept separately until certification.
-    fn recorded_reasoning_state(&self) -> Option<crate::ReasoningState> {
-        if let Some(state) = &*self.materialised.lock().unwrap_or_else(|p| p.into_inner()) {
-            return Some(state.clone());
-        }
-        let path = self.marker_path()?;
-        let text = std::fs::read_to_string(path).ok()?;
-        // Read from disk, the state is one opened without a rebuild, the open's own or a later
-        // read's. The marker doesn't record whether the rules equated two literals, and no
-        // reading of the stored statements can tell (a closure stored over representatives
-        // keeps one of equal values). Certification can narrow this only when the
-        // registered rules made the closure and cannot equate literals.
-        crate::ReasoningState::from_text(&text).map(|state| crate::ReasoningState {
-            literal_equality_unknown: true,
-            ..state
-        })
+    fn reasoning_state_at(snapshot: &Snapshot) -> Option<&crate::ReasoningState> {
+        Certificate::record(snapshot)
+            .filter(|c| c.exact && c.assessed)
+            .map(|c| &c.state)
     }
 
-    /// Whether the data is consistent under the recorded reasoning (see
-    /// [`crate::reasoning_state`] for the quarantine this reports). `Unknown` on a replica:
-    /// it reasons nothing, and its primary's records don't say ([`crate::StoreConfig::replica`]).
-    /// Under `owl2-dl` or `owl2-ql` (a program on it), `Unknown` where no certificate vouches
-    /// for the current version (other rules made the closure, or the mode came after it), whatever
-    /// is recorded; and for no clash where the version holds an ill-typed literal, which OWL 2
-    /// doesn't admit, or the search for one, on this first need, stopped
-    /// ([`Certificate::ill_typed`]). Decided from one observation: the version with its
-    /// certificate, the recorded assessment, the mode and the rules registered, taken with no
-    /// certificate change, publication or registration between them (the certificate epoch, the
-    /// version and the registration's generation the same after as before); else taken again
-    /// once, else `Unknown`.
+    /// Whether the data is consistent under the rules, as the current version's record says
+    /// ([`Certificate::assessment`]; see [`crate::reasoning_state`] for the quarantine this
+    /// reports). `Unknown` on a replica, and where no record the rules registered checked
+    /// assessed the version. Under `owl2-dl` or `owl2-ql`, also for no clash where the version
+    /// holds an ill-typed literal, which OWL 2 doesn't admit, or the search for one, on this
+    /// first need, stopped ([`Certificate::ill_typed`]).
     pub fn consistency(&self) -> crate::ConsistencyStatus {
+        self.consistency_at(&self.engine.snapshot())
+    }
+
+    /// [`Self::consistency`] of `snapshot`'s version.
+    pub(crate) fn consistency_at(&self, snapshot: &Snapshot) -> crate::ConsistencyStatus {
         use crate::ConsistencyStatus::{Consistent, Unknown};
-        for _ in 0..2 {
-            let (epoch, rules) = (self.certificate_epoch(), self.supports.epoch());
-            let snapshot = self.engine.snapshot();
-            let recorded = self.reasoning_state().filter(|_| !self.config.replica);
-            #[cfg(test)]
-            hooks::run(&hooks::BETWEEN_CONSISTENCY_READS);
-            let (dl, registered) = (self.dl.active(), self.supports.rules());
-            let same = epoch % 2 == 0 && epoch == self.certificate_epoch();
-            let same = same && rules == self.supports.epoch();
-            if !(same && self.engine.snapshot().same_version(&snapshot)) {
-                continue;
-            }
-            let status = recorded.as_ref().map_or(Unknown, |s| s.consistency());
-            let Some(certificate) = Certificate::of(&snapshot) else {
-                let name = registered.map(|r| r.name()).or(recorded.map(|s| s.ruleset));
-                let keeps = dl || name.is_some_and(|n| crate::dl::query::keeps_ill_typed(dl, &n));
-                return if keeps { Unknown } else { status };
-            };
-            let memory = self.memory_stop();
-            return match certificate.ill_typed(&snapshot, &|| memory.exceeded()) {
-                Some(None) => status,
-                _ if matches!(status, Consistent) => Unknown,
-                _ => status,
-            };
+        let status = Certificate::assessment(snapshot, self.config.replica).rules;
+        let Some(certificate) = Certificate::of(snapshot).filter(|_| status == Consistent) else {
+            return status;
+        };
+        let memory = self.memory_stop();
+        match certificate.ill_typed(snapshot, &|| memory.exceeded()) {
+            Some(None) => status,
+            _ => Unknown,
         }
-        Unknown
     }
 
-    /// [`Self::consistency`] as the recorded reasoning alone says it: what a commit's own
-    /// checks and the quarantine rely on (`MutationPipeline`, [`Self::is_quarantined`]), which
-    /// an ill-typed literal doesn't change.
-    pub(crate) fn recorded_consistency(&self) -> crate::ConsistencyStatus {
-        self.reasoning_state()
-            .filter(|_| !self.config.replica)
-            .map_or(crate::ConsistencyStatus::Unknown, |state| {
-                state.consistency()
-            })
-    }
-
-    /// Whether the store is in quarantine, readable and repairable but not ready: its data
-    /// inconsistent, or its rules' violations undecided, under the recorded reasoning; or,
-    /// since a commit on a store in quarantine, its consistency not assessed again.
-    ///
-    /// The mark, the assessment, the mark again, in that order. A commit in quarantine
-    /// raises the mark before it removes the assessment, so an assessment read as removed
-    /// comes with a mark read as raised; a recording clears the mark after it records, so a
-    /// mark read as cleared comes with the assessment recorded. A mark that moved between the
-    /// two readings is answered as quarantine, as the reading may have straddled the start or
-    /// the end of one; it may also have seen one already finished, and answers quarantine
-    /// then too.
+    /// Whether the store is in quarantine, readable and repairable but not ready: the current
+    /// version's record holds the rules' hold ([`Certificate::held`]), set by a check that
+    /// found a clash and carried until a rebuild assesses the data again.
     pub fn is_quarantined(&self) -> bool {
-        use crate::ConsistencyStatus::{Inconsistent, Undecided};
-        let mark = self.unassessed.load(std::sync::atomic::Ordering::Acquire);
-        #[cfg(test)]
-        hooks::run(&hooks::BETWEEN_QUARANTINE_READS);
-        let recorded = self.recorded_consistency();
-        let assessed = matches!(recorded, Inconsistent { .. } | Undecided { .. });
-        assessed
-            || mark % 2 == 1
-            || mark != self.unassessed.load(std::sync::atomic::Ordering::Acquire)
+        Certificate::assessment(&self.engine.snapshot(), self.config.replica).held
     }
 
     /// Whether the certificate covers `program` for a holder of the writer slot: no write can
@@ -832,61 +957,39 @@ impl StoreService {
         self.reasoning_is_current(program)
     }
 
-    /// The certificate's epoch, a sequence lock over its changes. Odd: a change is in progress,
-    /// and what a reader sees of the certificate (in memory or on disk) may be the old one; it
-    /// takes nothing then. Even and the same before and after a reader's reads: no change
-    /// began meanwhile, so the certificate it checked covers every snapshot those reads took
-    /// (every commit in between maintained the closure). Each change runs its whole course,
-    /// marker included, inside one [`CertificateTransition`], before the commit it precedes.
-    pub(crate) fn certificate_epoch(&self) -> u64 {
-        self.certificate_epoch
-            .load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// Starts a change of the certificate, under the writer slot: the epoch is odd until the
-    /// returned transition drops, on every way out of the change.
-    fn certificate_transition(
-        &self,
-        _writer: nrese_engine::WriterHeld<'_>,
-    ) -> CertificateTransition<'_> {
-        let before = self
-            .certificate_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        debug_assert!(
-            before.is_multiple_of(2),
-            "one change of the certificate at a time"
-        );
-        CertificateTransition(&self.certificate_epoch)
-    }
-
     /// Forgets what the inferred stack is exact for, taking the writer slot to do so: no
     /// rematerialisation certifies it meanwhile. Never call it under the slot (it isn't
     /// reentrant): a holder calls `Self::invalidate_held`.
     pub fn invalidate_reasoning(&self) -> StoreResult<()> {
         let tx = self.engine.transaction();
         let writer = tx.writer().expect("a transaction holds the writer slot");
-        // The stack stays, read as it was, and no version published from now on vouches.
+        // The stack stays, read as it was; the version vouches for nothing, its hold kept.
         let state = self.reasoning_state();
         let reading = state.and_then(|s| self.note_equality(writer, &s));
-        self.invalidate_held(writer)?;
-        tx.install(reading, None);
+        let withheld = self.invalidate_held(writer)?;
+        tx.install(reading, withheld);
         Ok(())
     }
 
-    /// [`Self::invalidate_reasoning`] by a holder of the writer slot, before a commit that
-    /// doesn't maintain the inferences: the certificate changes only between commits (the Q06
-    /// remainder's invariant C), so no rematerialisation can certify data this write changes.
-    pub(crate) fn invalidate_held(&self, writer: nrese_engine::WriterHeld<'_>) -> StoreResult<()> {
-        use std::sync::atomic::Ordering;
-        // Before the commit it precedes, until the marker is settled: no reader takes the old
-        // certificate for the data this write changes.
-        let _transition = self.certificate_transition(writer);
+    /// [`Self::invalidate_reasoning`] by a holder of the writer slot, before a publication that
+    /// doesn't maintain the inferences: the marker goes first ([`Self::forget_marker`]), then
+    /// the record that publication is to carry ([`Self::withheld`]) is returned. The record
+    /// changes only with a publication, so no reader takes the old one for changed data.
+    pub(crate) fn invalidate_held(
+        &self,
+        writer: nrese_engine::WriterHeld<'_>,
+    ) -> StoreResult<Option<nrese_engine::Certificate>> {
         #[cfg(test)]
         hooks::run(&hooks::INSIDE_INVALIDATION);
-        // The marker first, the certificate in memory once it is gone: a removal that fails
-        // fails the write before it changes anything, and leaves the certificate whole (its QL
-        // rewriting and equality setting included) over the data it was computed for. Until
-        // the write publishes, that is the data readers see.
+        self.forget_marker(writer)?;
+        Ok(self.withheld(writer))
+    }
+
+    /// Removes the marker durably, by a holder of the writer slot: a removal that fails fails
+    /// the write before it changes anything, and leaves the current record over the data it
+    /// was computed for.
+    pub(crate) fn forget_marker(&self, _writer: nrese_engine::WriterHeld<'_>) -> StoreResult<()> {
+        use std::sync::atomic::Ordering;
         if self.marker.load(Ordering::Acquire)
             && let Some(path) = self.marker_path()
         {
@@ -898,99 +1001,18 @@ impl StoreService {
             crate::metadata::remove(&path).map_err(crate::error::StoreError::Io)?;
         }
         self.marker.store(false, Ordering::Release);
-        *self.materialised.lock().unwrap_or_else(|p| p.into_inner()) = None;
         Ok(())
     }
 
-    /// `certificate` with its state marked as the rules equating a literal with another term
-    /// ([`crate::ReasoningState::literal_equality`]), for the version of a commit that derived
-    /// such a fact; the same object where it is marked already or isn't this store's. The
-    /// state kept in memory is marked too ([`Self::mark_literal_equality`]), for a version
-    /// with no certificate; a certificate made again takes the mark from either
-    /// ([`Self::certify`]). The marker on disk doesn't record literal equality.
-    pub(crate) fn with_literal_equality(
-        certificate: nrese_engine::Certificate,
-    ) -> nrese_engine::Certificate {
-        Self::with_state(certificate, |held, ill_typed| {
-            let state = crate::ReasoningState {
-                literal_equality: true,
-                ..held.state.clone()
-            };
-            (!held.state.literal_equality).then_some((state, ill_typed))
-        })
-    }
-
-    /// `certificate` with the state and the ill-typed literal's cell `change` makes of it and
-    /// its cell's value, where it makes them; the same object where it makes none or the
-    /// certificate isn't this store's: the one rebuild of each mark a commit's version takes
-    /// ([`Self::with_literal_equality`], [`Self::with_ill_typed`]).
-    fn with_state(
-        certificate: nrese_engine::Certificate,
-        change: impl FnOnce(&Certificate, IllTyped) -> Option<(crate::ReasoningState, IllTyped)>,
-    ) -> nrese_engine::Certificate {
-        let Some(held) = certificate.downcast_ref::<Certificate>() else {
-            return certificate;
-        };
-        let cell = *held.ill_typed.lock().unwrap_or_else(|p| p.into_inner());
-        let Some((state, ill_typed)) = change(held, cell) else {
-            return certificate;
-        };
-        std::sync::Arc::new(Certificate {
-            state,
-            ql: held.ql.clone(),
-            equality_closed: held.equality_closed,
-            dl: held.dl,
-            user_rules: held.user_rules,
-            ill_typed: std::sync::Mutex::new(ill_typed),
-        })
-    }
-
-    /// `certificate` with the ill-typed literal ([`Certificate::ill_typed`]) of what the
-    /// maintained commit `tx` publishes, where its base's is found (`dl::query::ill_typed_after`,
-    /// under the memory stop); else its own cell, unset. The same object where that is the
-    /// base's, or the certificate isn't this store's or keeps none
-    /// ([`crate::dl::query::keeps_ill_typed`]).
-    pub(crate) fn with_ill_typed(
-        &self,
-        certificate: nrese_engine::Certificate,
-        tx: &nrese_engine::Transaction<'_>,
-    ) -> nrese_engine::Certificate {
-        let keeps = |c: &Certificate| crate::dl::query::keeps_ill_typed(c.dl, &c.state.ruleset);
-        if !certificate.downcast_ref::<Certificate>().is_some_and(keeps) {
-            return certificate;
-        }
-        let memory = self.memory_stop();
-        let stop = || memory.exceeded();
-        Self::with_state(certificate, |held, base| {
-            let found = base.and_then(|base| crate::dl::query::ill_typed_after(tx, base, &stop));
-            (base.is_none() || found != base).then(|| (held.state.clone(), found))
-        })
-    }
-
-    /// Marks the state kept in memory as the rules equating a literal with another term, by a
-    /// holder of the writer slot before a maintained commit that derived such a fact: a
-    /// version made while no certificate is in place (rules other than the stack's
-    /// registered, [`Self::use_reasoning_rules`]) has none to carry the mark, and the
-    /// certificate made again reads the kept state ([`Self::certify`]). A commit that then
-    /// fails leaves the mark: the word is withheld until a rematerialisation, never given
-    /// wrongly.
-    pub(crate) fn mark_literal_equality(&self, _writer: nrese_engine::WriterHeld<'_>) {
-        let mut kept = self.materialised.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(kept) = kept.as_mut() {
-            kept.literal_equality = true;
-        }
-    }
-
-    /// Certifies `state` for the inferred stack just published, still under the writer slot
-    /// of its publication ([`nrese_engine::Finished`]): no other write comes between them.
+    /// Writes the marker for the inferred stack just published with `state`'s record, still
+    /// under the writer slot of its publication ([`nrese_engine::Finished`]): no other write
+    /// comes between them.
     fn record_reasoning(
         &self,
-        writer: nrese_engine::WriterHeld<'_>,
-        state: crate::ReasoningState,
+        _writer: nrese_engine::WriterHeld<'_>,
+        state: &crate::ReasoningState,
     ) -> StoreResult<()> {
-        let _transition = self.certificate_transition(writer);
         let text = state.to_text();
-        *self.materialised.lock().unwrap_or_else(|p| p.into_inner()) = Some(state);
         let Some(path) = self.marker_path() else {
             return Ok(());
         };
@@ -1006,10 +1028,11 @@ impl StoreService {
         Ok(())
     }
 
-    /// Empties the inferred stack (reasoning switched off), forgetting the marker.
+    /// Empties the inferred stack (reasoning switched off), forgetting the marker. The rules
+    /// no longer run, so their hold goes with the record.
     pub fn clear_inferred(&self) -> StoreResult<u64> {
         let rematerialisation = self.engine.rematerialisation();
-        self.invalidate_held(rematerialisation.writer())?;
+        self.forget_marker(rematerialisation.writer())?;
         #[cfg(test)]
         hooks::run(&hooks::BEFORE_CLEAR_PUBLICATION);
         // An empty stack is read as stored, installed even where it was empty already.
@@ -1293,44 +1316,33 @@ impl StoreService {
     /// rematerialisation running meanwhile, and must not be called by a holder of the slot.
     pub fn use_reasoning_rules(&self, rules: Option<nrese_reasoner::RuleProgram>) {
         let tx = self.engine.transaction();
-        // One change of the certificate (its epoch odd) from the registration to the
-        // certificate made under it: no reading takes the new rules with the old certificate.
-        let _transition = self.certificate_transition(tx.writer().expect("the writer slot"));
+        // The record made under the new rules is installed before the slot goes back; a
+        // reader judges each version by its own record.
         self.supports.use_rules(rules);
         #[cfg(test)]
         hooks::run(&hooks::AFTER_RULES_REGISTERED);
-        if let Some(state) = self.recorded_reasoning_state() {
-            self.certify(&tx, state);
-        }
+        self.recertify(&tx, |_| {});
     }
 
     /// Switches the `owl2-dl` mode's work on or off ([`crate::dl`]): the mutation
     /// pipeline running the reasoner's `owl2-dl` mode registers it, and whether user rules
     /// run with it.
     pub fn use_dl(&self, active: bool, user_rules: bool) {
-        // Under the writer slot, as every change of the certificate's QL schema; and a change
-        // of the certificate (its epoch odd through it): a check that read the mode before
-        // it sees the epoch move.
+        // The writer slot covers the mode change and installation of its record.
         let tx = self.engine.transaction();
-        let _transition =
-            self.certificate_transition(tx.writer().expect("a transaction holds the writer slot"));
         self.dl.set_active(active, user_rules);
-        // A state with violations (read at open, or recorded before): whether `owl2-dl`
-        // decides them, derived under the mode now set (`ReasoningState::undecided`).
-        if let Some(mut state) = self.recorded_reasoning_state().filter(|s| s.violations > 0) {
-            let treatments = &self.config.dl.treatments;
-            state.undecided = active
-                .then(|| self.dl.undecided(&self.engine.snapshot(), treatments))
-                .flatten();
-            *self.materialised.lock().unwrap_or_else(|p| p.into_inner()) = Some(state);
-        }
-        // The certificate with the mode's route: on, no QL rewriting (the bounds give the
-        // answers through existentials, see `ql_for`); off, the rewriting the closure and the
-        // setting call for, whatever came first (a change from `owl2-dl` to `owl2-rl` sets
-        // its QL rewriting before its write path, which switches the bounds off, exists).
-        if let Some(state) = self.recorded_reasoning_state() {
-            self.certify(&tx, state);
-        }
+        // The record with the mode's route: on, no QL rewriting (the bounds give the answers
+        // through existentials, see `ql_for`); off, the rewriting the closure and the setting
+        // call for, whatever came first. A state with violations: whether `owl2-dl` decides
+        // them, derived under the mode now set (`ReasoningState::undecided`).
+        let treatments = &self.config.dl.treatments;
+        self.recertify(&tx, |state| {
+            if state.violations > 0 {
+                state.undecided = active
+                    .then(|| self.dl.undecided(tx.base(), treatments))
+                    .flatten();
+            }
+        });
     }
 
     /// The `owl2-dl` mode's state.
@@ -2583,10 +2595,14 @@ impl StoreService {
         requester: &crate::Requester,
     ) -> StoreResult<MutationCommitReport> {
         let mut tx = self.engine.transaction();
-        self.invalidate_held(tx.writer().expect("a transaction holds the writer slot"))?;
+        let withheld =
+            self.invalidate_held(tx.writer().expect("a transaction holds the writer slot"))?;
         let cancellation = CancellationToken::new();
         let context = self.update_context(self.envelope(None), &cancellation);
         let report = command.apply(&mut tx, requester, &context)?;
+        if let Some(withheld) = withheld {
+            tx.vouch(withheld);
+        }
         let summary = tx.commit()?;
         #[cfg(test)]
         hooks::run(&hooks::AFTER_WRITE_PUBLICATION);
@@ -2646,7 +2662,8 @@ impl StoreService {
     ) -> StoreResult<BulkLoadReport> {
         let invalid = request.invalid.unwrap_or(self.config.invalid_statements);
         // Cleared under the load's writer slot, before it commits (invariant C).
-        let invalidate = |writer: nrese_engine::WriterHeld<'_>| self.invalidate_held(writer);
+        let invalidate =
+            |writer: nrese_engine::WriterHeld<'_>| self.invalidate_held(writer).map(drop);
         let loaded = bulk_load(
             &self.engine,
             request,
@@ -2673,12 +2690,13 @@ impl StoreService {
     /// Whether the inferred stack is `program`'s closure as this store computes it.
     pub fn reasoning_is_current(&self, program: impl Into<nrese_reasoner::RuleProgram>) -> bool {
         let program = program.into();
-        self.reasoning_state().is_some_and(|state| {
+        let snapshot = self.engine.snapshot();
+        Self::reasoning_state_at(&snapshot).is_some_and(|state| {
             state.is_current_with(
                 &program,
                 self.config.hide_unnamed_classes,
                 self.config.equality_compact,
-                || crate::reasoning_state::nil_equated(&self.engine.snapshot()),
+                || crate::reasoning_state::nil_equated(&snapshot),
             )
         })
     }
@@ -3012,10 +3030,10 @@ impl StoreService {
         if stop() {
             return Err(stopped(nrese_reasoner::delta::Interrupted::default()));
         }
-        // The certificate of the closure about to be replaced goes first, durably: a stop or
-        // a failed certificate between the publication and the new certificate must not leave
-        // the old one describing the new closure after a start.
-        self.invalidate_held(rematerialisation.writer())?;
+        // The marker of the closure about to be replaced goes first, durably: a stop or a
+        // failed marker write between the publication and the new marker must not leave the
+        // old one describing the new closure after a start.
+        self.forget_marker(rematerialisation.writer())?;
         // Where asked, what the reasoner freed goes back before the inferred stack, the
         // heap's peak, is built (as between the reasoner's rounds).
         nrese_engine::memory::release_between_rounds();
@@ -3029,7 +3047,6 @@ impl StoreService {
         // publication that fails installs nothing, so there is nothing to put back.
         let state = crate::ReasoningState {
             undecided,
-            literal_equality: closure.literal_equality,
             ..crate::ReasoningState::of_with(
                 rules,
                 self.config.hide_unnamed_classes,
@@ -3037,21 +3054,35 @@ impl StoreService {
                 violations,
             )
         };
+        let literal = match closure.literal_equality {
+            true => Literal::Set,
+            false => Literal::Clear,
+        };
+        // The whole closure assessed: the hold set by a clash, cleared by none; the rules' word
+        // where the rules registered (or, with none, this rebuild's) made it.
+        let hide = self.config.hide_unnamed_classes;
+        let checked = self
+            .supports
+            .rules()
+            .is_none_or(|p| state.made_by(&p, hide));
+        let facts = Facts {
+            literal,
+            held: violations > 0,
+            assessed: true,
+            checked,
+            rebuilt_here: true,
+        };
         let reading = program.stored_equality();
-        let vouched = self.vouches(&state);
-        let certificate = vouched.then(|| self.certificate(state.clone(), None));
-        let finished = rematerialisation.finish_held(closure.inferred, reading, certificate)?;
+        let record = self.certificate(state.clone(), None, facts);
+        let finished = rematerialisation.finish_held(closure.inferred, reading, Some(record))?;
         let summary = finished.summary();
         nrese_exec::heap::phase("store: done");
         nrese_engine::memory::release_all();
         #[cfg(test)]
         hooks::run(&hooks::AFTER_PUBLICATION);
         // From here the new inferences are published: a failure says so.
-        self.record_reasoning(finished.writer(), state)
+        self.record_reasoning(finished.writer(), &state)
             .map_err(|error| crate::StoreError::InferencesNotRecorded(Box::new(error)))?;
-        // Under the writer slot: no commit raises the mark between the reading and the rise.
-        let mark = self.unassessed.load(std::sync::atomic::Ordering::Relaxed);
-        (self.unassessed).fetch_add(mark % 2, std::sync::atomic::Ordering::Release);
         drop(finished);
         if let Some(why) = undecided {
             let text = why.text(violations);
@@ -3307,8 +3338,7 @@ pub(crate) mod hooks {
         /// An `owl2-dl` entailment check has checked the premise and is about to test the
         /// conclusion.
         pub(crate) static AFTER_DL_PREMISE: Hook = const { RefCell::new(None) };
-        /// An invalidation of the certificate has begun its change of the epoch, and the old
-        /// certificate is still in place.
+        /// Invalidation is about to remove the marker. The old record is still published.
         pub(crate) static INSIDE_INVALIDATION: Hook = const { RefCell::new(None) };
         /// What a read reads is fixed and its status is still to come: an `owl2-dl` query has
         /// decided its answers, or another read has taken its snapshot.
@@ -3320,11 +3350,6 @@ pub(crate) mod hooks {
         pub(crate) static BEFORE_CLEAR_PUBLICATION: Hook = const { RefCell::new(None) };
         /// A reasoning commit in quarantine has published and is about to revalidate.
         pub(crate) static BEFORE_REVALIDATION: Hook = const { RefCell::new(None) };
-        /// A quarantine reading has read the mark and is about to read the assessment.
-        pub(crate) static BETWEEN_QUARANTINE_READS: Hook = const { RefCell::new(None) };
-        /// A consistency reading has taken its version and assessment and is about to read
-        /// the mode and the rules.
-        pub(crate) static BETWEEN_CONSISTENCY_READS: Hook = const { RefCell::new(None) };
         /// A registration of rules has registered them and is about to certify under them.
         pub(crate) static AFTER_RULES_REGISTERED: Hook = const { RefCell::new(None) };
     }
@@ -3491,11 +3516,11 @@ mod certificate_tests {
             .unwrap();
         let existential = format!("ASK {{ <{EX}a> <{EX}p> ?o }}");
         assert!(ask(&store, &existential), "the rewriting answers it");
-        // The certificate as recorded: an open sets the literal-equality flag, which the marker
-        // doesn't hold (`ReasoningState::literal_equality`).
         let recorded = |store: &StoreService| store.reasoning_state().map(|s| s.to_text());
-        let certified = (recorded(&store), store.consistency(), marker());
-        assert!(certified.0.is_some() && certified.2.is_some(), "certified");
+        let state = recorded(&store);
+        let saved = marker();
+        let consistency = store.consistency();
+        assert!(state.is_some() && saved.is_some(), "setup: certified");
         crate::metadata::tests::FAIL_REMOVE.set(true);
         let failed = store.bulk_load(&crate::BulkLoadRequest {
             files: vec![more],
@@ -3508,7 +3533,7 @@ mod certificate_tests {
         if failed.is_ok() {
             wrong.push("the load succeeded without clearing the certificate".to_owned());
         }
-        let mut unchanged = |store: &StoreService, when: &str| {
+        let mut unchanged = |store: &StoreService, when: &str, verdict| {
             let seen = [
                 (ask(store, &existential), "the existential's answer"),
                 (
@@ -3516,7 +3541,7 @@ mod certificate_tests {
                     "nothing published",
                 ),
                 (
-                    (recorded(store), store.consistency(), marker()) == certified,
+                    recorded(store) == state && store.consistency() == verdict && marker() == saved,
                     "the certificate and its marker",
                 ),
             ];
@@ -3526,10 +3551,10 @@ mod certificate_tests {
                 }
             }
         };
-        unchanged(&store, "in process");
+        unchanged(&store, "in process", consistency);
         drop(store);
         let store = StoreService::new(config()).unwrap();
-        unchanged(&store, "after a reopen");
+        unchanged(&store, "after a reopen", crate::ConsistencyStatus::Unknown);
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
@@ -3716,10 +3741,9 @@ mod certificate_tests {
         );
     }
 
-    /// Spec: an open certificate transition refuses without waiting;
-    /// once settled and certified, the RDFS subclass conclusion still holds.
+    /// An entailment started during invalidation still answers the published RDFS closure.
     #[test]
-    fn an_entailment_refuses_an_open_certificate_transition_without_waiting() {
+    fn an_entailment_takes_the_published_record_during_invalidation() {
         let dir = tempfile::tempdir().unwrap();
         let both = dir.path().join("both.nt");
         std::fs::write(&both, format!("{A_C}{C_D}")).unwrap();
@@ -3734,13 +3758,10 @@ mod certificate_tests {
         let racer = store.clone();
         let during = conclusion.clone();
         hooks::INSIDE_INVALIDATION.set(Some(Box::new(move || {
-            // Synchronous: the transition cannot settle until this call returns.
-            // The fleet red's external timeout witnesses the old unbounded loop.
-            assert!(matches!(
-                racer.entails(rdfs(), &during),
-                Err(crate::StoreError::Configuration(message))
-                    if message == "the inferred statements aren't rdfs's closure: rematerialise first"
-            ));
+            assert_eq!(
+                racer.entails(rdfs(), &during).unwrap(),
+                crate::Entailment::Entailed
+            );
         })));
         store.invalidate_reasoning().unwrap();
         store.rematerialise(rdfs()).unwrap();
@@ -3750,11 +3771,9 @@ mod certificate_tests {
         );
     }
 
-    /// Spec: a certificate changed during reads refuses even when
-    /// the replacement is certified, instead of retrying to an answer; the refusal says to ask
-    /// again (undecided), as the closure may be certified already.
+    /// A positive entailment reads its pinned closure across another rebuild at the same revision.
     #[test]
-    fn an_entailment_refuses_a_certificate_changed_during_its_reads() {
+    fn an_entailment_keeps_its_closure_across_a_same_revision_rebuild() {
         let dir = tempfile::tempdir().unwrap();
         let both = dir.path().join("both.nt");
         std::fs::write(&both, format!("{A_C}{C_D}")).unwrap();
@@ -3771,11 +3790,10 @@ mod certificate_tests {
             nrese_rdf::vocab::rdf::TYPE.into_owned(),
             nrese_rdf::NamedNode::new_unchecked("http://example.com/D"),
         )];
-        assert!(matches!(
-            store.entails(rdfs(), &conclusion),
-            Err(crate::StoreError::Undecided(message))
-                if message == "the data changed during the entailment check: ask again"
-        ));
+        assert_eq!(
+            store.entails(rdfs(), &conclusion).unwrap(),
+            crate::Entailment::Entailed
+        );
         assert_eq!(
             store.entails(rdfs(), &conclusion).unwrap(),
             crate::Entailment::Entailed
@@ -3911,22 +3929,22 @@ mod marker_tests {
             store.rematerialise(&program).unwrap();
         }
         let store = StoreService::new(config()).unwrap();
-        let flags = || {
-            super::Certificate::of(&store.engine().snapshot())
-                .map(|c| (c.state.literal_equality, c.state.literal_equality_unknown))
-        };
-        let unknown = flags();
+        let literal = || super::Certificate::of(&store.engine().snapshot()).map(|c| c.literal);
+        let unknown = literal();
+        assert_eq!(store.consistency(), crate::ConsistencyStatus::Unknown);
         store.use_reasoning_rules(Some(program.clone().with_named_keys(true)));
-        let mismatch = flags();
+        let mismatch = literal();
         store.use_reasoning_rules(Some(program));
-        assert_eq!(flags(), Some((false, false)));
-        assert_eq!(unknown, Some((true, true)));
+        assert_eq!(literal(), Some(super::Literal::Clear));
+        assert_eq!(store.consistency(), crate::ConsistencyStatus::Consistent);
+        assert_eq!(unknown, Some(super::Literal::Unknown));
         assert_eq!(
             mismatch, None,
             "vouches rejects a certificate for a different fingerprint"
         );
         store.use_reasoning_rules(None);
-        assert_eq!(flags(), Some((true, true)));
+        assert_eq!(literal(), Some(super::Literal::Unknown));
+        assert_eq!(store.consistency(), crate::ConsistencyStatus::Unknown);
     }
 
     /// A reasoning marker whose publication failed after its rename is still cleared by the
@@ -3989,13 +4007,9 @@ mod marker_tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
-    /// A marker read from disk while no state is kept in memory (an open whose own read of it
-    /// failed, read again later) is a store opened without a rebuild: whether the rules
-    /// equated two literals is unknown, and a certificate made from it (a registration of
-    /// rules, as every pipeline's, or a change of the QL setting) withholds a read of
-    /// literals. Under `owl2-rl` with the rewriting, a string value is `complete` after its
-    /// rebuild; with the kept state gone, the state read from the marker carries both flags,
-    /// and the read isn't `complete` under the certificate made from it.
+    /// A reopened OWL 2 RL store knows its closure but cannot certify that its rules
+    /// derived no literal equality. A literal read is complete after a rebuild and
+    /// sound-only after a reopen, including after the rules register.
     #[test]
     fn a_marker_read_from_disk_counts_a_literal_equality_as_unknown() {
         use nrese_reasoner::rulesets::Ruleset;
@@ -4006,11 +4020,11 @@ mod marker_tests {
             "<http://example.com/a> <http://example.com/p> \"Rex\" .\n",
         )
         .unwrap();
-        let store = StoreService::new(StoreConfig {
+        let config = StoreConfig {
             ql_rewriting: crate::QlRewritingMode::On,
             ..StoreConfig::on_disk(dir.path().join("store"))
-        })
-        .unwrap();
+        };
+        let store = StoreService::new(config.clone()).unwrap();
         store
             .bulk_load(&crate::BulkLoadRequest {
                 files: vec![data],
@@ -4032,12 +4046,11 @@ mod marker_tests {
         };
         let (rebuilt, reasons) = word(&store);
         assert_eq!(rebuilt, "complete", "the setup, rebuilt: {reasons:?}");
-        // The trace of an open whose read of the marker failed: no state kept in memory.
-        *store.materialised.lock().unwrap() = None;
-        let read = store.reasoning_state().expect("the marker is on disk");
-        assert!(
-            read.literal_equality && read.literal_equality_unknown,
-            "the state read from the marker: {read:?}"
+        drop(store);
+        let store = StoreService::new(config).unwrap();
+        assert_eq!(
+            super::Certificate::of(&store.engine().snapshot()).map(|c| c.literal),
+            Some(super::Literal::Unknown)
         );
         store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
         // Certified, so `sound-only` (the closure alone), not `not-certified` or none.

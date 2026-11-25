@@ -1529,10 +1529,11 @@ mod tests {
             rematerialised.is_err(),
             "the rematerialisation wasn't refused"
         );
-        assert!(
-            store.reasoning_state().is_none(),
-            "a certificate after the failure"
+        assert_eq!(
+            store.reasoning_state().map(|s| s.ruleset),
+            Some("rdfs".to_owned())
         );
+        assert!(!store.reasoning_is_current(&program));
         assert!(
             extra.is_empty(),
             "answers the configured rules don't entail: {extra:?}"

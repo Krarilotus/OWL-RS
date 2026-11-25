@@ -1001,7 +1001,7 @@ fn annotation_rule(
 }
 
 /// Why a read of literals may miss rows while the rules equate a literal with another
-/// term ([`crate::ReasoningState::literal_equality`]).
+/// term ([`crate::service::Literal::Set`]).
 const LITERAL_EQUALITY: &str = "the rules equate two literals as one value (an owl:sameAs \
                                 between literals, which no store can hold), so a statement \
                                 of one may lack its copy with the other";
@@ -1013,7 +1013,7 @@ const LITERAL_EQUALITY_UNTOLD: &str = "the rules may equate two literals as one 
                                        so a statement of one may lack its copy with the other: \
                                        a reader of some graphs isn't told whether they do";
 
-/// [`LITERAL_EQUALITY`] where it is unknown ([`crate::ReasoningState::literal_equality_unknown`]),
+/// [`LITERAL_EQUALITY`] where it is unknown ([`crate::service::Literal::Unknown`]),
 /// told every reader alike.
 const LITERAL_EQUALITY_UNKNOWN: &str = "the store was opened without a rebuild of its \
                                         inferences, so its rules may have equated two literals \
@@ -1120,7 +1120,7 @@ fn conditions(
     if !matches!(completeness.regime, Some(Owl2Dl | Owl2Ql | Owl2Rl)) {
         return false;
     }
-    let state = certificate.map(|c| &c.state);
+    use crate::service::Literal;
     let access = reads.access.as_deref();
     let literals = |predicate: &Option<String>| match predicate {
         Some(p) => (snapshot.lookup(NamedNodeRef::new_unchecked(p).into()))
@@ -1128,11 +1128,11 @@ fn conditions(
         None => holds_literals(snapshot, None, access),
     };
     let read = reads.predicates.get_or_init(|| predicates(query));
-    let told = state.and_then(|state| match access {
-        _ if state.literal_equality_unknown => Some(LITERAL_EQUALITY_UNKNOWN),
-        None => state.literal_equality.then_some(LITERAL_EQUALITY),
+    let told = certificate.and_then(|c| match access {
+        _ if c.literal == Literal::Unknown => Some(LITERAL_EQUALITY_UNKNOWN),
+        None => (c.literal == Literal::Set).then_some(LITERAL_EQUALITY),
         Some(access) if access.inferred_by_support => {
-            (may_equate_literals(snapshot, access, state)).then_some(LITERAL_EQUALITY_UNTOLD)
+            (may_equate_literals(snapshot, access, &c.state)).then_some(LITERAL_EQUALITY_UNTOLD)
         }
         Some(_) => None,
     });
