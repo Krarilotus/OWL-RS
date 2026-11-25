@@ -3089,8 +3089,8 @@ def case_seconds(measure: dict | None, case: str) -> float | None:
 
 
 def product_changed(checkout: str, base: str, candidate: str) -> bool:
-    diff = subprocess.run(["git", "-C", checkout, "diff", "--name-only", "-z", "--no-renames", base, candidate, "--"],
-                          capture_output=True, timeout=60)
+    argv = ["git", "-C", checkout, "diff", "--name-only", "-z", "--no-renames", base, candidate, "--"]
+    diff = hosts_registry.launch(subprocess.run, argv, capture_output=True, timeout=60)
     if diff.returncode:
         raise SystemExit(f"landing timing could not diff {base} against {candidate}")
     source_dirs = (b"src", b"examples")
@@ -3367,12 +3367,12 @@ def landing_round_two(out: Path) -> None:
     gate_ = ["bash", "scripts/release-gate.sh"]
     revs = {"cand": first["candidate"]["revision"], **first["baselines"]}
     harness = first["harness"]
-    subprocess.run([*gate_, "plan-cases", ",".join(cases)], env=env, check=True)
+    hosts_registry.launch(subprocess.run, [*gate_, "plan-cases", ",".join(cases)], environ=env, check=True)
     for n in range(1, LANDING_BLOCKS + 1):
-        subprocess.run(block_step(gate_, n, harness, 1, None, revs), env=env, check=True)
+        hosts_registry.launch(subprocess.run, block_step(gate_, n, harness, 1, None, revs), environ=env, check=True)
 
-    subprocess.run([*gate_, "report", harness, "--round-one", str(output),
-                    *(f"{side}={rev}" for side, rev in revs.items())], env=env, check=True)
+    hosts_registry.launch(subprocess.run, [*gate_, "report", harness, "--round-one", str(output),
+                                         *(f"{side}={rev}" for side, rev in revs.items())], environ=env, check=True)
     paired = json.loads((second / "release-gate.json").read_text(encoding="utf-8"))
     # A compatible harness can predate the completed-evidence check in its reporter.
     if paired["errors"]:
@@ -3905,7 +3905,7 @@ def main() -> int:
         except (OSError, ValueError, subprocess.CalledProcessError) as error:
             p.error(f"landing round 2: {error}")
         finally:
-            cleanup = subprocess.run(["bash", "scripts/release-gate.sh", "clean"], check=False)
+            cleanup = hosts_registry.launch(subprocess.run, ["bash", "scripts/release-gate.sh", "clean"], check=False)
         return cleanup.returncode
     if args.command == "report":
         sides = pairs(args.side, "--side")

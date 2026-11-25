@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_landing_timing import CASE, MEASURED, SIDES  # noqa: E402
+from test_release_acceptance import attempt_record, write_attempts  # noqa: E402
 from test_release_gate import HARNESS, REVS, gate_module, passes, record  # noqa: E402
 
 LANDING = {"load-entities", "load-threads", "q-snowflake", "q-star", "op-group", "commits-plain",
@@ -38,6 +39,10 @@ def command(*args):
 
 def timed_steps(job):
     return [s for s in job["steps"] if s[:3] == [*GATE, "block"]]
+
+
+def record_timed_attempt(where, attempt="a" * 32):
+    write_attempts(where, "timed", [attempt_record("timed", attempt, "t")])
 
 
 def git_fixture(root, *args):
@@ -156,12 +161,15 @@ class LandingPlans(PlanningFixtures):
             commit_fixture(root)
             refuses(self.cli_plan(checkout=root, harness="HEAD^"))
 
-        landed = "8664708d869cfc9119a96b28bb2321fb82e68525"
+        git = ["git", "-C", str(gate_module.ROOT)]
+        history = subprocess.run([*git, "log", "--first-parent", "-1", "--format=%H^", "-S", "PAIRED_REPORT_VERSION = ",
+                                  "--", "benches/fast/release_gate.py"], capture_output=True, text=True, timeout=60)
+        before_version = history.stdout.strip()
         # The synthetic harness above also covers checkouts without the historical object.
-        if subprocess.run(["git", "-C", str(gate_module.ROOT), "cat-file", "-e", landed],
-                          capture_output=True).returncode == 0:
-            with self.subTest(harness=landed):
-                refuses(self.cli_plan("Cargo.lock", harness=landed))
+        if before_version and subprocess.run([*git, "cat-file", "-e", before_version],
+                                             capture_output=True, timeout=60).returncode == 0:
+            with self.subTest(harness=before_version):
+                refuses(self.cli_plan("Cargo.lock", harness=before_version))
 
     # Spec: fix pass 2 H5. The leading space in a Git filename is significant, so " Cargo.lock" plans nothing.
     def test_git_filename_with_a_leading_space_is_not_the_lockfile(self):
@@ -275,7 +283,7 @@ class LandingRoundJob(PlanningFixtures):
         if fault == "missing evidence":
             family.append(f"base|{CASE}|time/q07")
         (root / "plan.json").write_text(json.dumps({"run": [CASE, OTHER], "family": family}), encoding="utf-8")
-        gate_module.attempt_record("timed", root)
+        record_timed_attempt(root)
         seen = []
         real_run = gate_module.subprocess.run
 
@@ -360,10 +368,11 @@ class LandingRoundJob(PlanningFixtures):
             stage = second / ".paired-report-test"
             self.write_passes(first / "passes", LOSS)
             (first / "plan.json").write_text(json.dumps({"family": [MEASURED]}), encoding="utf-8")
-            gate_module.attempt_record("timed", first)
+            record_timed_attempt(first)
             self.report(first, HARNESS, sides)
             self.write_passes(second / "passes", LOSS, round_number=1)
-            attempt = gate_module.attempt_record("timed", second)
+            attempt = "b" * 32
+            record_timed_attempt(second, attempt)
             stage.mkdir()
             code, _, error = self.report(second, HARNESS, sides, first / "release-gate.json", output=stage)
             report = json.loads((stage / "release-gate.json").read_bytes())
