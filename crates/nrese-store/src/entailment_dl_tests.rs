@@ -817,3 +817,129 @@ fn fresh_blank_storage_is_charged_before_retention() {
         "small control renaming storage uncharged: held={ctrl_held}, charged={ctrl_charged}"
     );
 }
+
+/// Spec (contracts.md, Memory): fresh-blank renaming must cover the simultaneous peak of
+/// the owned map key, cached mapped value, and live returned candidate on both insertion
+/// and cache-hit reuse, refusing before allocation when the remaining envelope is too small.
+#[test]
+fn fresh_blank_peak_covers_live_candidate() {
+    use nrese_dl::limits::Deadline;
+    use nrese_dl::memory::Scratch;
+    use nrese_exec::{Envelope, Reservation};
+    use std::collections::HashMap;
+
+    const L: usize = 256 << 10;
+    let label = BlankNode::new_unchecked("a".repeat(L));
+    let store = StoreService::new(StoreConfig::in_memory()).unwrap();
+    let snapshot = store.engine().snapshot();
+
+    let live_peak = |blanks: &HashMap<String, BlankNode>, returned: &BlankNode| -> usize {
+        blanks.capacity() * (std::mem::size_of::<(String, BlankNode)>() + 1)
+            + blanks
+                .iter()
+                .map(|(k, v)| k.capacity() + v.as_str().len())
+                .sum::<usize>()
+            + returned.as_str().len()
+    };
+
+    // Tight cell: remaining envelope 2L + 64 KiB cannot hold key + cached value + returned candidate (3L).
+    let tight_limit = 2 * L + (64 << 10);
+    let tight_env = Envelope::exact(Some(tight_limit), None);
+    let tx = crate::dl::source::private_over(store.engine(), &snapshot, Arc::new(tight_env.part()));
+    let mut blanks = HashMap::new();
+    let mut scratch = Scratch::new(Some(&tight_env));
+    let mut probes = 0u64;
+    match super::fresh_blank(
+        &tx,
+        &mut blanks,
+        &mut scratch,
+        &mut probes,
+        Deadline::NONE,
+        &label,
+    ) {
+        Err(nrese_engine::EngineError::MemoryLimit(_)) => {
+            assert!(blanks.is_empty(), "refused insert must not retain entry");
+        }
+        Ok(Some(cand)) => {
+            let peak = live_peak(&blanks, &cand);
+            assert!(
+                peak <= scratch.bytes() && peak <= tight_limit,
+                "live peak {peak} exceeded reservation {} (envelope {tight_limit})",
+                scratch.bytes()
+            );
+        }
+        other => panic!("unexpected tight fresh_blank result: {other:?}"),
+    }
+
+    // Roomy control and repeated-label hit (both tight and roomy reuse).
+    let roomy_limit = 4 * L + (64 << 10);
+    let roomy_env = Envelope::exact(Some(roomy_limit), None);
+    let tx = crate::dl::source::private_over(store.engine(), &snapshot, Arc::new(roomy_env.part()));
+    let mut blanks = HashMap::new();
+    let mut scratch = Scratch::new(Some(&roomy_env));
+    let first = super::fresh_blank(
+        &tx,
+        &mut blanks,
+        &mut scratch,
+        &mut probes,
+        Deadline::NONE,
+        &label,
+    )
+    .expect("roomy insert")
+    .expect("no deadline");
+    let first_peak = live_peak(&blanks, &first);
+    assert!(
+        first_peak <= scratch.bytes() && first_peak <= roomy_limit,
+        "roomy insert peak {first_peak} exceeded reservation {} (limit {roomy_limit})",
+        scratch.bytes()
+    );
+    let first_len = first.as_str().len();
+    drop(first);
+    scratch.release(first_len);
+
+    // Cache hit with less remaining headroom than one cloned candidate must refuse before cloning.
+    let mut drain = Reservation::new(roomy_env.clone());
+    let leave = 64 << 10;
+    drain
+        .charge(roomy_env.remaining().saturating_sub(leave))
+        .expect("drain headroom");
+    match super::fresh_blank(
+        &tx,
+        &mut blanks,
+        &mut scratch,
+        &mut probes,
+        Deadline::NONE,
+        &label,
+    ) {
+        Err(nrese_engine::EngineError::MemoryLimit(_)) => {}
+        Ok(Some(hit)) => {
+            let peak = live_peak(&blanks, &hit);
+            assert!(
+                peak <= scratch.bytes(),
+                "tight cache-hit peak {peak} exceeded reservation {}",
+                scratch.bytes()
+            );
+        }
+        other => panic!("unexpected tight cache-hit result: {other:?}"),
+    }
+    drop(drain);
+
+    // Roomy cache hit succeeds, stays within its reservation, and returns the cached blank.
+    let second = super::fresh_blank(
+        &tx,
+        &mut blanks,
+        &mut scratch,
+        &mut probes,
+        Deadline::NONE,
+        &label,
+    )
+    .expect("roomy cache hit")
+    .expect("no deadline");
+    let hit_peak = live_peak(&blanks, &second);
+    assert!(
+        hit_peak <= scratch.bytes() && hit_peak <= roomy_limit,
+        "roomy cache-hit peak {hit_peak} exceeded reservation {} (limit {roomy_limit})",
+        scratch.bytes()
+    );
+    assert_eq!(blanks.get(label.as_str()), Some(&second));
+}

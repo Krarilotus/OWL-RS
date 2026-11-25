@@ -740,6 +740,8 @@ pub(crate) fn admit_and_prepare(
     if deadline.passed() {
         return Err(Stopped::Time.into());
     }
+    #[cfg(test)]
+    let _membership_guard = test_hooks::on_membership(budget.memory.as_ref());
     let findings = nrese_owl::membership(o, terms);
     let blocks_j = |d: &Diagnostic| match *d {
         Diagnostic::AnonymousIndividual { node, axioms, .. } => {
@@ -845,6 +847,7 @@ pub(crate) mod test_hooks {
     thread_local! {
         pub(crate) static IMPORT_VISIT: RefCell<Option<VisitHook>> = const { RefCell::new(None) };
         pub(crate) static IMPORT_ENTRY: RefCell<Option<EntryHook>> = const { RefCell::new(None) };
+        pub(crate) static MEMBERSHIP_ENTRY: RefCell<Option<EntryHook>> = const { RefCell::new(None) };
         pub(crate) static IMPORT_CLONED_OPERANDS: Cell<usize> = const { Cell::new(0) };
         static LIVE_MERGE_BYTES: Cell<usize> = const { Cell::new(0) };
         static RESTORE_PEAK: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
@@ -897,6 +900,10 @@ pub(crate) mod test_hooks {
 
     pub(crate) fn on_entry(envelope: Option<&Envelope>) -> Option<Reservation<Envelope>> {
         IMPORT_ENTRY.with(|slot| slot.borrow().as_ref().and_then(|f| f(envelope)))
+    }
+
+    pub(crate) fn on_membership(envelope: Option<&Envelope>) -> Option<Reservation<Envelope>> {
+        MEMBERSHIP_ENTRY.with(|slot| slot.borrow().as_ref().and_then(|f| f(envelope)))
     }
 
     pub(crate) fn record_clone(operands: usize) {
@@ -1161,5 +1168,101 @@ mod import_tests {
         assert_eq!(prepared.o.axioms, premise.axioms);
         assert_eq!(prepared.o.sources, premise.sources);
         assert_eq!(prepared.axioms, conclusion.axioms);
+    }
+
+    /// Spec (contracts.md, Memory; Structural Specification §11.2): the joint membership
+    /// check reserves its non-simple-property memo and stack from the request envelope before
+    /// allocating them, answering a typed memory Unknown under a tight envelope while a roomy
+    /// envelope reports the non-simple-property violation.
+    #[test]
+    fn joint_membership_reserves_its_non_simple_memo() {
+        use nrese_exec::{Envelope, Reservation};
+        use std::time::Duration;
+
+        const CLASSES: usize = 262_144;
+        let mut premise = Ontology::default();
+        for i in 0..CLASSES as u64 {
+            premise.classes.intern(ClassExpr::Class(100 + i));
+        }
+        premise.axioms.push(Axiom::ObjectCharacteristic(
+            Characteristic::Transitive,
+            ObjProp::Named(1),
+        ));
+        premise.sources.push(Vec::new());
+
+        let mut conclusion = Ontology::default();
+        let c = ExprId(conclusion.classes.intern(ClassExpr::Class(1)));
+        let has_self = ExprId(
+            conclusion
+                .classes
+                .intern(ClassExpr::HasSelf(ObjProp::Named(1))),
+        );
+        conclusion.axioms.push(Axiom::SubClassOf(c, has_self));
+        conclusion.sources.push(Vec::new());
+
+        let terms = StubTerms;
+        let name = |t: u64| format!("t{t}");
+        let generous = Deadline::after(Some(Duration::from_secs(60)));
+
+        // Tight cell: leave 256 KiB at membership entry, far below a 262,144-class memo.
+        let tight_env = Envelope::exact(Some(128 << 20), None);
+        test_hooks::MEMBERSHIP_ENTRY.replace(Some(Box::new(|envelope| {
+            let env = envelope.expect("bounded envelope");
+            let take = env.remaining().saturating_sub(256 << 10);
+            let mut held = Reservation::new(env.clone());
+            held.charge(take).expect("tighten membership headroom");
+            Some(held)
+        })));
+        let tight = admit_and_prepare(
+            &premise,
+            &conclusion,
+            &terms,
+            &name,
+            &test_budget(Some(tight_env)),
+            generous,
+        );
+        test_hooks::MEMBERSHIP_ENTRY.replace(None);
+        match tight {
+            Err(Entailed::Unknown(why)) => {
+                assert_eq!(
+                    Limit::named_in(&why),
+                    Some(Limit::Envelope),
+                    "tight memo headroom must answer typed memory Unknown, got: {why}"
+                );
+            }
+            other => panic!(
+                "expected memory Unknown on tight memo headroom, got {}",
+                match other {
+                    Ok(_) => "Ok(PreparedCheck)".to_owned(),
+                    Err(e) => format!("Err({e:?})"),
+                }
+            ),
+        }
+
+        // Roomy control: reports the non-simple-property finding.
+        let roomy_env = Envelope::exact(Some(128 << 20), None);
+        let roomy = admit_and_prepare(
+            &premise,
+            &conclusion,
+            &terms,
+            &name,
+            &test_budget(Some(roomy_env)),
+            generous,
+        );
+        match roomy {
+            Err(Entailed::Unknown(why)) => {
+                assert!(
+                    why.contains("a non-simple property in a self restriction"),
+                    "roomy control must report non-simple restriction, got: {why}"
+                );
+            }
+            other => panic!(
+                "expected non-simple Unknown on roomy envelope, got {}",
+                match other {
+                    Ok(_) => "Ok(PreparedCheck)".to_owned(),
+                    Err(e) => format!("Err({e:?})"),
+                }
+            ),
+        }
     }
 }

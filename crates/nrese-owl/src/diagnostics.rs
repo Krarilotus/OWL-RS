@@ -966,3 +966,91 @@ fn entities_of<'w>(
     }
     (out, ind)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::ExprId;
+
+    /// Spec (Structural Specification §11.2): memoising non-simple-property reachability
+    /// preserves the right-to-left witness choice across set operands for every axiom sharing
+    /// the expression; a single matching child reports that child's property and reason.
+    #[test]
+    fn non_simple_memo_preserves_first_finding() {
+        let mut o = Ontology::default();
+        let thing = ExprId(o.classes.intern(ClassExpr::Thing));
+        let self_p = ExprId(o.classes.intern(ClassExpr::HasSelf(ObjProp::Named(1))));
+        let max_q = ExprId(
+            o.classes
+                .intern(ClassExpr::Max(1, ObjProp::Named(2), thing)),
+        );
+        let both = ExprId(o.classes.intern(ClassExpr::And(vec![self_p, max_q])));
+        let c1 = ExprId(o.classes.intern(ClassExpr::Class(10)));
+        let c2 = ExprId(o.classes.intern(ClassExpr::Class(11)));
+        o.axioms = vec![
+            Axiom::ObjectCharacteristic(Characteristic::Transitive, ObjProp::Named(1)),
+            Axiom::ObjectCharacteristic(Characteristic::Transitive, ObjProp::Named(2)),
+            Axiom::SubClassOf(c1, both),
+            Axiom::SubClassOf(c2, both),
+        ];
+        o.axioms.sort_unstable();
+        let expected_indices: Vec<usize> = o
+            .axioms
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| matches!(a, Axiom::SubClassOf(..)).then_some(i))
+            .collect();
+        assert_eq!(expected_indices.len(), 2);
+
+        let mut out = Vec::new();
+        check_global_restrictions(&o, true, &mut out);
+        let hits: Vec<_> = out
+            .iter()
+            .filter_map(|d| match *d {
+                Diagnostic::NonSimpleProperty {
+                    property,
+                    axiom,
+                    what,
+                } => Some((property, axiom, what)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            hits,
+            expected_indices
+                .into_iter()
+                .map(|idx| (2, idx, "a cardinality restriction"))
+                .collect::<Vec<_>>()
+        );
+
+        // One-child control: reports the sole matching child's property and reason.
+        let mut single = Ontology::default();
+        let only_p = ExprId(single.classes.intern(ClassExpr::HasSelf(ObjProp::Named(1))));
+        let wrap = ExprId(single.classes.intern(ClassExpr::Not(only_p)));
+        let c = ExprId(single.classes.intern(ClassExpr::Class(10)));
+        single.axioms = vec![
+            Axiom::ObjectCharacteristic(Characteristic::Transitive, ObjProp::Named(1)),
+            Axiom::SubClassOf(c, wrap),
+        ];
+        single.axioms.sort_unstable();
+        let sub_idx = single
+            .axioms
+            .iter()
+            .position(|a| matches!(a, Axiom::SubClassOf(..)))
+            .unwrap();
+        let mut single_out = Vec::new();
+        check_global_restrictions(&single, true, &mut single_out);
+        let single_hits: Vec<_> = single_out
+            .iter()
+            .filter_map(|d| match *d {
+                Diagnostic::NonSimpleProperty {
+                    property,
+                    axiom,
+                    what,
+                } => Some((property, axiom, what)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(single_hits, vec![(1, sub_idx, "a self restriction")]);
+    }
+}
