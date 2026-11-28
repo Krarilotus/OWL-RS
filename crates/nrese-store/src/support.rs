@@ -2349,7 +2349,13 @@ impl Supports {
 
     /// The rules registered here ([`Self::use_rules`]), if any.
     pub(crate) fn rules(&self) -> Option<RuleProgram> {
-        self.state().generation.rules.clone()
+        self.generation_now().0
+    }
+
+    /// The registered rules and the epoch that identifies them, read under one lock.
+    pub(crate) fn generation_now(&self) -> (Option<RuleProgram>, u64) {
+        let state = self.state();
+        (state.generation.rules.clone(), state.generation.epoch)
     }
 
     /// Whether rules were ever registered here ([`Self::use_rules`]): a reasoner maintains,

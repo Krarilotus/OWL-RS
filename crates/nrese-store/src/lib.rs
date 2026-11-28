@@ -36,6 +36,8 @@ mod loader;
 mod metadata;
 pub mod mutation;
 pub mod namespaces;
+#[cfg(test)]
+mod pending_declarations_tests;
 mod process_settings;
 #[cfg(test)]
 mod process_settings_tests;
