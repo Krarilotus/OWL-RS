@@ -74,8 +74,12 @@ pub(crate) mod seam {
         BuildDeadline,
         /// The TBox's taxonomy for a read, not begun.
         Taxonomy,
-        /// A read filtered the program facts and has yet to recheck the revision.
+        /// A read has pinned the publication's upper bound.
         Eligible,
+        /// A commit built the next eligible set and is about to build the stack.
+        StageStack,
+        /// A commit finished the stack build attempt.
+        StackAttempted,
         /// A revision's read view, not begun.
         View,
         /// A commit's ontology read again, not begun.
@@ -969,6 +973,8 @@ pub(crate) fn prepare(
                                     &pending,
                                     store.dl().bounds.kept(),
                                     compacted,
+                                    #[cfg(test)]
+                                    &store.dl().bounds,
                                 )
                                 .map(Some)
                         });

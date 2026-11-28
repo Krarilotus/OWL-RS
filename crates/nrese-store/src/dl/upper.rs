@@ -60,7 +60,7 @@ fn pattern([s, p, o]: [Option<u64>; 3]) -> QuadPattern {
 /// it, U1 would miss what such an equality entails and stop being an upper bound. A
 /// literal whose value can't be read (ill-typed, outside the map, beyond the value spaces)
 /// is its own, and U1 then proves no consistency: an equal value written otherwise would be
-/// a join it misses ([`Upper::proves_consistency`], [`Upper::reads_every_value`]).
+/// a join it misses ([`UpperVersion::proves_consistency`]).
 /// Representatives are ids the store has already: nothing is interned (replicas too).
 #[derive(Debug, Default)]
 pub(crate) struct Values {
@@ -905,6 +905,7 @@ impl Upper {
         view: &Snapshot,
         budget: &Arc<nrese_exec::Budget>,
         compacted: Option<(TripleVersion, TripleVersion)>,
+        #[cfg(test)] bounds: &super::bounds::Bounds,
     ) -> Result<(UpperVersion, Change), GaveUp> {
         let mut candidates = nrese_exec::ChargedVec::new(Arc::clone(budget));
         for t in changed.filter(|t| self.facts.triples.contains(t)) {
@@ -925,6 +926,8 @@ impl Upper {
         let (stack, eligible) =
             compacted.unwrap_or_else(|| (self.stack.clone(), self.eligible.clone()));
         let eligible = advance(&eligible, &inserts, &deletes)?;
+        #[cfg(test)]
+        super::bounds::seam::at(bounds, super::bounds::seam::Point::StageStack);
 
         change.moved.append(&mut change.remove);
         change.moved.sort_unstable();
@@ -935,7 +938,10 @@ impl Upper {
             .moved
             .retain(|&t| stack.contains(t) && change.insert.binary_search(&t).is_err());
         change.insert.retain(|&t| !stack.contains(t));
-        let stack = advance(&stack, &change.insert, &change.moved)?;
+        let stack = advance(&stack, &change.insert, &change.moved);
+        #[cfg(test)]
+        super::bounds::seam::at(bounds, super::bounds::seam::Point::StackAttempted);
+        let stack = stack?;
         let version = UpperVersion {
             program: Arc::clone(&self.program),
             facts: Arc::clone(&self.facts),

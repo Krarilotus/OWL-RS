@@ -342,6 +342,56 @@ fn a_named_graph_assertion_suppresses_the_program_fact_in_the_default_graph() {
     assert_eq!(bindings(), expected);
 }
 
+/// Part B T5. A replacement and its rematerialisation use their own program facts
+/// while a reader still holds the previous publication.
+#[test]
+fn a_bulk_replacement_builds_eligibility_for_its_own_revision() {
+    let (store, pipeline) = pipeline();
+    update(
+        &pipeline,
+        "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+        INSERT DATA { :i0 a owl:NamedIndividual ,
+            [ owl:complementOf [ owl:complementOf :A ] ] }",
+    );
+    let old = store.engine().snapshot();
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("replacement.ttl");
+    std::fs::write(
+        &file,
+        "@prefix : <urn:test:> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         :After a owl:Class . :i0 a owl:NamedIndividual ,
+              [ owl:complementOf [ owl:complementOf :After ] ] .",
+    )
+    .unwrap();
+    store
+        .bulk_load(&crate::BulkLoadRequest {
+            files: vec![file],
+            replace: true,
+            graph: crate::GraphTarget::DefaultGraph,
+            invalid: None,
+        })
+        .unwrap();
+    let program = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl)
+        .materialised_program()
+        .unwrap();
+    store.rematerialise(program).unwrap();
+    let (current, latest) = view(&store);
+    let old_read = view_until(&store, &old, None, None).unwrap().unwrap();
+    let id = |iri: &str| {
+        current
+            .lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into())
+            .or_else(|| old.lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into()))
+            .unwrap()
+            .raw()
+    };
+    let fact = |class| [id("urn:test:i0"), id(RDF_TYPE), id(class)];
+    let old_upper = old_read.upper.as_ref().expect("retained upper bound");
+    let latest_upper = latest.upper.as_ref().expect("replacement upper bound");
+    assert!(in_view(old_upper, fact("urn:test:A")));
+    assert!(!in_view(latest_upper, fact("urn:test:A")));
+    assert!(in_view(latest_upper, fact("urn:test:After")));
+}
+
 /// Part B T6. Repeated publishers cannot force a diagnostic to restart its pinned read.
 #[test]
 fn a_writer_cannot_keep_restarting_a_latest_view() {

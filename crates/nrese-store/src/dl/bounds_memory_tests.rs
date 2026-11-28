@@ -83,6 +83,71 @@ fn an_upper_bound_refused_for_memory_is_built_once_memory_is_free() {
     assert!(after.upper_facts > 0, "{after:?}");
 }
 
+/// Contract §4.3c R4. A refusal after eligibility was staged leaves both of
+/// the old reader's versions usable and publishes U1 unavailable for the commit.
+#[test]
+fn a_successor_that_really_does_not_fit_drops_u1() {
+    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    let store = Arc::new(
+        StoreService::new(StoreConfig {
+            total_query_memory_bytes: 1 << 29,
+            ..StoreConfig::in_memory()
+        })
+        .unwrap(),
+    );
+    let pipeline = crate::MutationPipeline::new(
+        Arc::clone(&store),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Dl,
+        ))),
+    );
+    pipeline.execute_update_str(&members(32)).unwrap();
+    pipeline
+        .execute_update_str(
+            "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+         INSERT DATA { :x a owl:NamedIndividual ,
+          [ owl:complementOf [ owl:complementOf :A ] ] }",
+        )
+        .unwrap();
+    let before = store.engine().snapshot();
+    let upper = ReadBasis::upper(&before).unwrap().upper.unwrap();
+    let id = |iri| {
+        before
+            .lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into())
+            .unwrap()
+            .raw()
+    };
+    let x = id("urn:test:x");
+    let fact = [x, id(RDF_TYPE), id("urn:test:A")];
+    assert!(upper.eligible.contains(fact));
+    let count = upper.stack.len();
+    let held = Arc::new(Mutex::new(None));
+    let charge = Arc::clone(&held);
+    let writer = Arc::clone(&store);
+    seam::set(&store.dl().bounds, seam::Point::StageStack, move || {
+        *lock(&charge) = Some(squeeze(&writer, 0));
+    });
+    seam::set(&store.dl().bounds, seam::Point::StackAttempted, move || {
+        drop(
+            lock(&held)
+                .take()
+                .expect("the stack was built with no room"),
+        );
+    });
+    pipeline
+        .execute_update_str("PREFIX : <urn:test:> INSERT DATA { :x a :A . :fresh a :A }")
+        .unwrap();
+    let current = store.engine().snapshot();
+    assert!(current.revision() > before.revision());
+    assert!(in_view(&current, fact));
+    let published = ReadBasis::upper(&current).unwrap();
+    assert!(published.upper.is_err_and(|g| g.refused));
+    assert!(upper.eligible.contains(fact));
+    assert_eq!(upper.stack.len(), count);
+    let pinned = view_until(&store, &before, None, None).unwrap().unwrap();
+    assert!(in_view(pinned.upper.as_ref().unwrap(), fact));
+}
+
 /// What the bounds keep is charged while kept (SYN-61): the query-ontology cache's ontology
 /// among it, beside U1's stack, so the charge is at least both.
 #[test]

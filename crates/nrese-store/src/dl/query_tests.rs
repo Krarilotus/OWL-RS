@@ -1438,6 +1438,42 @@ fn a_consistency_check_records_what_the_premise_tells() {
     assert!(told.is_some(), "a committed read is told it");
 }
 
+/// Slice 2, D16-1291. An omission belongs to the publication whose ontology tells it.
+#[test]
+fn an_omission_record_follows_the_publication_that_read_it() {
+    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    let store = Arc::new(StoreService::new(crate::StoreConfig::in_memory()).unwrap());
+    let pipeline = crate::MutationPipeline::new(
+        Arc::clone(&store),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Dl,
+        ))),
+    );
+    commit(&pipeline, &format!("INSERT DATA {{ {OFF_ROUTE} }}"));
+    let clean = store.engine().snapshot();
+    commit(
+        &pipeline,
+        "INSERT DATA {
+        :C a owl:Class . :p rdfs:domain :C . :a :p \"x\" . :b :p :c .
+    }",
+    );
+    let omitted = store.engine().snapshot();
+    commit(&pipeline, "DELETE DATA { :a :p \"x\" . }");
+    let repaired = store.engine().snapshot();
+    ONTOLOGY_PASSES.set(0);
+    assert!(reads_differently(&store, Revision::Committed(&clean)).is_none());
+    assert!(
+        reads_differently(&store, Revision::Committed(&omitted))
+            .is_some_and(|why| why.contains("two kinds"))
+    );
+    assert!(reads_differently(&store, Revision::Committed(&repaired)).is_none());
+    assert_eq!(
+        ONTOLOGY_PASSES.get(),
+        0,
+        "the publications carry their own records"
+    );
+}
+
 const PREF_LABEL: &str = "<http://www.w3.org/2004/02/skos/core#prefLabel>";
 
 /// A store with an annotation-property axiom of each kind (a domain, a range, a
