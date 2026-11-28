@@ -49,6 +49,69 @@ fn pending_fixture() -> MutationPipeline {
     pipeline
 }
 
+// Spec: docs/ops/http-api.md:107. EXPLAIN and the plan carry the same bare complete
+// claim that the query sends for an asserted-only read.
+#[test]
+fn read_basis_explanations_carry_the_asserted_reads_claim() {
+    let pipeline = pipeline(ReasoningMode::Owl2Rl, ":alice :p :value .");
+    let store = pipeline.store();
+    let mut request = SparqlQueryRequest::all(format!("{PREFIXES} ASK {{ :alice :p :value }}"));
+    request.read_model = Some(crate::ReadModel::Asserted);
+    let prepared = store.prepare_query(&request).expect("prepare asserted ASK");
+    let cancel = CancellationToken::new();
+    let explained = store.explain_query(&prepared, &cancel).expect("explain");
+    let planned = store.plan_query(&prepared, &cancel).expect("plan");
+    for (route, assessment) in [
+        ("explain", explained.completeness),
+        ("plan", planned.completeness),
+    ] {
+        assert_eq!(
+            assessment.as_ref().map(|c| c.header()).as_deref(),
+            Some("complete"),
+            "{route}"
+        );
+    }
+}
+
+// Spec: docs/spec/reasoning-semantics.md §OWL 2 DL. An uncertified bulk load
+// gives asserted rows under DL without certifying the answers or accepting exact.
+#[test]
+fn read_basis_dl_bulk_load_without_rules_is_not_certified() {
+    let store = StoreService::new(StoreConfig::in_memory()).expect("store");
+    store.use_dl(true, false);
+    let dir = tempfile::tempdir().expect("load directory");
+    let file = dir.path().join("data.nt");
+    std::fs::write(
+        &file,
+        "<http://example.com/alice> <http://example.com/p> <http://example.com/value> .\n",
+    )
+    .expect("write input");
+    store
+        .bulk_load(&crate::BulkLoadRequest {
+            files: vec![file],
+            replace: false,
+            graph: crate::GraphTarget::DefaultGraph,
+            invalid: None,
+        })
+        .expect("bulk load");
+    let mut read = SparqlQueryRequest::all(format!("{PREFIXES} ASK {{ :alice :p :value }}"));
+    let answer = store.execute_query(&read).expect("DL query");
+    let rows: serde_json::Value = serde_json::from_slice(&answer.payload).expect("ASK JSON");
+    assert_eq!(rows["boolean"], true);
+    read.dl_answers = Some(crate::DlAnswers::Exact);
+    let exact = store.execute_query(&read);
+    assert_eq!(
+        answer.completeness.as_ref().map(|c| c.as_str()),
+        Some("not-certified"),
+        "exact accepted the uncertified read: {}",
+        exact.is_ok(),
+    );
+    assert!(matches!(
+        exact,
+        Err(StoreError::Incomplete(ref e)) if e.status.as_str() == "not-certified"
+    ));
+}
+
 // Spec: docs/spec/02-storage-and-transactions.md:24 and docs/spec/reasoning-semantics.md:95.
 // A declaration rebuild uses the committed base's program. Declaring the property to be an
 // annotation removes its domain inference even if the registered program is cleared meanwhile.

@@ -1169,9 +1169,41 @@ async fn hidden_reader_gets_scoped_assertions_under_compact_equality() -> TestRe
     )
     .await?;
     assert_eq!(reply.rows(), bindings(&[P]));
-    // Spec: docs/spec/reasoning-semantics.md:86 and :141. The authorised asserted-only
-    // merge carries an unqualified complete header even when asked for scoped inference.
-    assert_eq!(reply.completeness.as_deref(), Some("complete"), "{reply:?}");
+    // Spec: docs/ops/http-api.md:94 and docs/limits.md:531. The scoped read is
+    // not-certified, even when permissions limit it to the asserted merge.
+    assert_eq!(
+        reply.completeness.as_deref(),
+        Some("not-certified"),
+        "{reply:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn exact_refuses_scoped_assertions_for_a_hidden_reader() -> TestResult {
+    // Spec: docs/ops/http-api.md:94 and docs/limits.md:531. The scoped asserted
+    // merge cannot be certified, so an OWL 2 DL exact request is refused.
+    let app = test_app_with_store_config(
+        StoreConfig::in_memory(),
+        policy_of(&POLICY.replace("inferred = \"supported\"", "inferred = \"hidden\""))?,
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Dl),
+    )?;
+    insert(&app, G1_FACT).await?;
+    let reply = select(
+        &app,
+        READER,
+        "?inference-scope=dataset&dl-answers=exact",
+        "?s",
+        G1,
+        "{ ?s ex:p ex:b }",
+    )
+    .await?;
+    assert_eq!(reply.code, StatusCode::UNPROCESSABLE_ENTITY, "{reply:?}");
+    assert_eq!(
+        reply.completeness.as_deref(),
+        Some("not-certified"),
+        "{reply:?}"
+    );
     Ok(())
 }
 
