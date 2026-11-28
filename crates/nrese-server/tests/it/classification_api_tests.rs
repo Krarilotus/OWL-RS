@@ -227,11 +227,20 @@ async fn every_form_states_the_verdict_or_its_absence() -> Result<(), Box<dyn st
                 status == "complete",
                 "{name} {route}"
             );
+            if consistency == "inconsistent" {
+                let reason = json["consistency_reason"].as_str().expect("clash reason");
+                assert!(reason.contains("inconsistent"), "{reason}");
+                assert!(header.contains(reason), "{header}");
+            }
             if name == "declared" {
                 let mut head = get_at(route, "application/json")?;
                 *head.method_mut() = Method::HEAD;
                 let head = app.clone().oneshot(head).await?;
                 assert_eq!(head.status(), StatusCode::OK, "{route}");
+                assert!(
+                    !head.headers().contains_key("nrese-completeness"),
+                    "{route}"
+                );
                 assert!(body_text(head).await?.is_empty());
             }
             if (&json["consistent"], &json["consistency"])
@@ -263,7 +272,14 @@ async fn every_form_states_the_verdict_or_its_absence() -> Result<(), Box<dyn st
                 .map(str::to_owned);
             let triples = body_text(response).await?;
             let body_ok = match consistency {
-                "inconsistent" => triples == INCONSISTENCY,
+                "inconsistent" => {
+                    let mut lines = triples.split_inclusive('\n');
+                    lines.next() == Some(INCONSISTENCY)
+                        && lines.next().is_some_and(|line| {
+                            line.starts_with("# ") && line.contains("inconsistent")
+                        })
+                        && lines.next().is_none()
+                }
                 _ => !triples.contains("owl#Nothing"),
             };
             if !body_ok {
@@ -272,6 +288,7 @@ async fn every_form_states_the_verdict_or_its_absence() -> Result<(), Box<dyn st
             let marked = header.as_deref().is_some_and(|h| {
                 h.split(';').next() == Some(status)
                     && (status == "complete" || h.contains("consistency not decided"))
+                    && (consistency != "inconsistent" || h.contains("consistency:"))
             });
             if !marked {
                 wrong.push(format!(

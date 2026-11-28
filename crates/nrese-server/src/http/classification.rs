@@ -59,6 +59,16 @@ fn triples_head(claim: &nrese_store::Claim) -> String {
     text
 }
 
+fn incomplete_reasons(claim: &nrese_store::Claim) -> Vec<&str> {
+    let consistency = claim.consistency_reason();
+    claim
+        .reasons
+        .iter()
+        .map(|reason| reason.text.as_str())
+        .filter(|reason| Some(*reason) != consistency)
+        .collect()
+}
+
 /// Whether the client asked for N-Triples.
 fn wants_triples(headers: &HeaderMap) -> bool {
     let accept = headers
@@ -158,9 +168,10 @@ pub async fn classify(
         "profile": "OWL 2 DL",
         "engine": report.engine,
         "complete": status.complete,
-        "incomplete": status.reasons.iter().map(|reason| &reason.text).collect::<Vec<_>>(),
+        "incomplete": incomplete_reasons(status),
         "consistent": consistent,
         "consistency": consistency,
+        "consistency_reason": status.consistency_reason(),
         "micros": report.micros,
         "subsumptions": report.subsumptions,
         "unsatisfiable": report.unsatisfiable,
@@ -213,9 +224,10 @@ pub async fn realise(
         "profile": "OWL 2 DL",
         "engine": report.engine,
         "complete": status.complete,
-        "incomplete": status.reasons.iter().map(|reason| &reason.text).collect::<Vec<_>>(),
+        "incomplete": incomplete_reasons(status),
         "consistent": consistent,
         "consistency": consistency,
+        "consistency_reason": status.consistency_reason(),
         "micros": report.micros,
         "types": types,
     });
