@@ -153,6 +153,12 @@ pub(crate) enum RulesEntailment {
 impl StoreService {
     pub(crate) fn assess(&self, at: Revision<'_>, evidence: Evidence<'_>) -> Claim {
         let snapshot = at.snapshot();
+        let query = match &evidence {
+            Evidence::Query { prepared, .. } | Evidence::DlQuery { prepared, .. } => {
+                Some(prepared.reads())
+            }
+            _ => None,
+        };
         let mut entailment = None;
         let mut dl_answer = None;
         let mut header_cache = None;
@@ -271,13 +277,22 @@ impl StoreService {
         if clash {
             claim.consistency = base.rules;
         }
-        if base.held {
-            claim.lower("consistency", QUARANTINE);
+        let consistency_reason = if base.held {
+            Some(QUARANTINE)
         } else if clash || matches!(claim.dl_verdict, Some(Verdict::Inconsistent)) {
-            claim.lower("consistency", CLASH);
+            Some(CLASH)
+        } else {
+            None
+        };
+        if let Some(reason) = consistency_reason {
+            let newly_incomplete = claim.complete;
+            claim.lower("consistency", reason);
+            if newly_incomplete && let Some(query) = query {
+                crate::dl::query::negation_rule(&mut claim.status, query, "consistency");
+            }
         }
         if let Some(cache) = header_cache {
-            cache.push(match claim.consistency_reason() {
+            cache.push(match consistency_reason {
                 Some(QUARANTINE) => 2,
                 Some(_) => 1,
                 None => 0,

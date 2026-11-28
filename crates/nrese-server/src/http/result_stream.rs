@@ -774,7 +774,13 @@ mod tests {
     async fn a_late_error_precedes_the_terminal_trailer() {
         use http_body_util::BodyExt;
 
-        for version in [Version::HTTP_11, Version::HTTP_2] {
+        for (version, reader) in [
+            (Version::HTTP_11, Reader::Every),
+            (Version::HTTP_11, Reader::Restricted),
+            (Version::HTTP_2, Reader::Every),
+            (Version::HTTP_2, Reader::Restricted),
+            (Version::HTTP_10, Reader::Every),
+        ] {
             for succeeds in [false, true] {
                 let response = answering(
                     version,
@@ -782,7 +788,7 @@ mod tests {
                         Pace::Total(Instant::now() + Duration::from_secs(30)),
                         CancellationToken::new(),
                         Envelope::unlimited,
-                        Reader::Every,
+                        reader,
                         "text/plain",
                         "timeout",
                         move |writer| {
@@ -799,20 +805,26 @@ mod tests {
                         },
                     ),
                 )
-                .await
-                .unwrap();
-                let mut body = response.into_body();
+                .await;
+                if version == Version::HTTP_10 && !succeeds {
+                    assert_eq!(
+                        response.unwrap_err().into_response().status(),
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    );
+                    continue;
+                }
+                let mut body = response.unwrap().into_body();
                 let data = body.frame().await.unwrap().unwrap().into_data().unwrap();
                 assert_eq!(data.len(), CHUNK_BYTES);
-                let terminal = body.frame().await.unwrap();
+                let terminal = body.frame().await;
                 if succeeds {
                     assert_eq!(
-                        terminal.unwrap().into_trailers().unwrap()["x-result-checksum"],
+                        terminal.unwrap().unwrap().into_trailers().unwrap()["x-result-checksum"],
                         "check"
                     );
                 } else {
                     assert!(
-                        terminal.is_err(),
+                        terminal.is_some_and(|frame| frame.is_err()),
                         "{version:?}: failure was framed as success"
                     );
                 }

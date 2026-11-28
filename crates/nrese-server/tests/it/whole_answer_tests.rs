@@ -64,6 +64,7 @@ async fn an_http10_answer_is_sent_whole_and_its_memory_released() -> Result<(), 
     let before = held(&store);
     let response = app.oneshot(query_request(Version::HTTP_10)?).await?;
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["nrese-completeness"], "complete");
     assert_eq!(
         response.headers().get(header::CONTENT_LENGTH),
         Some(&WHOLE.into())
@@ -602,6 +603,11 @@ async fn the_same_answer_whole(uri: &str) -> Result<(), Box<dyn Error>> {
     let whole = app.oneshot(get(Version::HTTP_10)?).await?;
     assert_eq!(streamed.status(), StatusCode::OK, "{uri}");
     assert_eq!(whole.status(), StatusCode::OK, "{uri}");
+    assert!(
+        !streamed.headers().contains_key("nrese-completeness"),
+        "{uri}"
+    );
+    assert!(!whole.headers().contains_key("nrese-completeness"), "{uri}");
     let length = whole.headers().get(header::CONTENT_LENGTH).cloned();
     let streamed = to_bytes(streamed.into_body(), usize::MAX).await?;
     let whole = to_bytes(whole.into_body(), usize::MAX).await?;
@@ -707,6 +713,10 @@ async fn an_http10_replication_image_arrives_with_its_length() -> Result<(), Box
             .then(|| value.trim().to_owned())
     });
     assert!(!body.is_empty());
+    assert!(
+        !head.to_ascii_lowercase().contains("nrese-completeness:"),
+        "{head}"
+    );
     assert_eq!(length, Some(body.len().to_string()), "{head}");
     Ok(())
 }
