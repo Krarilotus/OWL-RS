@@ -283,18 +283,42 @@ fn filter_only_comparisons_leave_spelling_unmarked() {
 /// The named graph sees the predicate's class under canonical answers.
 #[test]
 fn canonical_named_graph_accounts_for_a_literal_predicate_range() {
+    use nrese_engine::{EncodedQuad, EncodedTriple};
+    use nrese_rdf::{
+        Literal, NamedNodeRef,
+        vocab::{owl, xsd},
+    };
     for canonical in [false, true] {
-        let store = Arc::new(
-            StoreService::new(StoreConfig {
-                equality_compact: true,
-                equality_canonical_answers: canonical,
-                ..StoreConfig::in_memory()
-            })
-            .unwrap(),
-        );
-        let writes = pipeline(&store, ReasoningMode::Owl2Rl);
-        commit(&writes, "GRAPH :g { :s :rep 7, 7.0 . }");
-        commit(&writes, ":alias owl:sameAs :rep .");
+        let store = StoreService::new(StoreConfig {
+            equality_compact: true,
+            equality_canonical_answers: canonical,
+            ..StoreConfig::in_memory()
+        })
+        .unwrap();
+        store.rematerialise(Ruleset::Owl2Rl).unwrap();
+        // Supply a compact version whose only literal statements are in the named graph.
+        let mut tx = store.engine.transaction();
+        let iri = |name| tx.intern(NamedNodeRef::new_unchecked(name).into());
+        let representative = iri("http://example.com/rep");
+        let alias = iri("http://example.com/alias");
+        let subject = iri("http://example.com/s");
+        let graph = iri("http://example.com/g");
+        let same_as = tx.intern(owl::SAME_AS.into());
+        for value in [
+            Literal::new_typed_literal("7", xsd::INTEGER),
+            Literal::new_typed_literal("7.0", xsd::DECIMAL),
+        ] {
+            let object = tx.intern(value.as_ref().into());
+            tx.insert_encoded(EncodedQuad::new(subject, representative, object, graph));
+        }
+        tx.insert_inferred(EncodedTriple {
+            subject: alias,
+            predicate: same_as,
+            object: representative,
+        });
+        tx.read_equality_as(Some(same_as));
+        tx.vouch(tx.base().certificate().unwrap().clone());
+        tx.commit().unwrap();
         let (values, claim) = spelling_answer(
             &store,
             "SELECT DISTINCT ?o { GRAPH ?g { :s :alias ?o } }",
@@ -309,12 +333,20 @@ fn canonical_named_graph_accounts_for_a_literal_predicate_range() {
                 Vec::new()
             }
         );
-        assert_eq!(
-            header.contains("literal evidence could not be checked")
-                || header.contains("two spellings of one value"),
-            canonical,
-            "the named graph's canonical read needs spelling evidence: {header}"
-        );
+        assert_eq!(claim.regime, Some(nrese_sparql::Regime::Owl2Rl));
+        let marked = header.contains("literal evidence could not be checked")
+            || header.contains("two spellings of one value");
+        if canonical {
+            assert!(
+                marked,
+                "the named graph's canonical read needs spelling evidence: {header}"
+            );
+        } else {
+            assert!(
+                !marked,
+                "the named graph's strict read retains its predicate: {header}"
+            );
+        }
     }
 }
 
