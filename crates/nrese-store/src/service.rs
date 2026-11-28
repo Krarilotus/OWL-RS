@@ -2237,6 +2237,8 @@ impl StoreService {
             // is made once (`pending_snapshot_within`'s memo).
             let budget = std::sync::Arc::new(memory.part());
             let mut tx = self.engine.speculative(std::sync::Arc::clone(&budget));
+            #[cfg(test)]
+            hooks::run(&hooks::AFTER_PENDING_BASE);
             let context = self.update_context(memory.clone(), cancellation);
             let requester = crate::Requester::new(scope.clone(), crate::WriteScope::All);
             crate::statements::apply_statements(
@@ -3490,6 +3492,7 @@ pub(crate) mod hooks {
         pub(crate) static BEFORE_PENDING_GENERATION: Hook = const { RefCell::new(None) };
         /// A transaction's read has captured the generation for its pending view.
         pub(crate) static AFTER_PENDING_GENERATION: Hook = const { RefCell::new(None) };
+        pub(crate) static AFTER_PENDING_BASE: Hook = const { RefCell::new(None) };
     }
 
     pub(crate) fn run(hook: &'static LocalKey<Hook>) {
@@ -4321,6 +4324,10 @@ mod context_tests {
 #[cfg(test)]
 #[path = "certificate_lifecycle_tests.rs"]
 mod certificate_lifecycle_tests;
+
+#[cfg(test)]
+#[path = "read_basis_tests.rs"]
+mod read_basis_tests;
 
 #[cfg(test)]
 #[path = "run_envelope_tests.rs"]
