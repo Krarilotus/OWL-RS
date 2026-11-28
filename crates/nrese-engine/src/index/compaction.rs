@@ -10,7 +10,7 @@
 //! commit (microseconds to a few milliseconds); larger ones go to the engine's background
 //! compactor, so commit latency never includes a rewrite of the base run.
 
-use std::ops::Range;
+use std::ops::{Deref, Range};
 use std::sync::Arc;
 
 use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
@@ -19,6 +19,7 @@ use super::Layout;
 use super::merge::{SignedMerge, scan_bytes};
 use super::run::{PermutationRun, Run, build_all};
 use crate::quad::{Key, Permutation};
+use crate::term::ChargedArc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionPolicy {
@@ -46,7 +47,7 @@ pub(crate) struct CompactionPlan {
 
 impl CompactionPolicy {
     /// The window of runs (a suffix of `runs`) that should be merged, if any.
-    pub(crate) fn plan(&self, runs: &[Arc<Run>]) -> Option<CompactionPlan> {
+    pub(crate) fn plan(&self, runs: &[impl Deref<Target = Run>]) -> Option<CompactionPlan> {
         let newest = runs.len().checked_sub(1)?;
         let mut start = newest;
         let mut entries = runs[newest].entries();
@@ -83,7 +84,7 @@ pub(crate) fn merge_runs(runs: &[Arc<Run>]) -> Run {
 }
 
 fn signed_entries(
-    runs: &[Arc<Run>],
+    runs: &[impl Deref<Target = Run>],
     permutation: Permutation,
 ) -> impl Iterator<Item = (Key, bool)> {
     let parts = runs.iter().map(|run| {
@@ -97,9 +98,9 @@ fn signed_entries(
 
 /// The same signed merge, charged to the budget for a derived triple index.
 pub(super) fn merge_triples(
-    runs: &[Arc<Run>],
+    runs: &[ChargedArc<Run>],
     budget: &Arc<Budget>,
-) -> Result<Run, BudgetExceeded> {
+) -> Result<Option<ChargedArc<Run>>, BudgetExceeded> {
     let mut held = Reservation::new(Arc::clone(budget));
     let mut perms: [PermutationRun; Permutation::COUNT] = Default::default();
     let layout = Layout::DefaultGraph;
@@ -113,7 +114,7 @@ pub(super) fn merge_triples(
         drop(scratch);
         // Both signs cancel in every permutation if they cancel in the first.
         if entries.is_empty() {
-            return Ok(Run::from_permutations(layout, perms));
+            return Ok(None);
         }
         let (entries, scratch) = entries.into_parts();
         perms[p as usize] = PermutationRun::from_sorted_within(entries, &mut held, false)?;
@@ -121,7 +122,7 @@ pub(super) fn merge_triples(
     }
     let mut run = Run::from_permutations(layout, perms);
     run.keep_triples(budget, &mut held)?;
-    Ok(run)
+    ChargedArc::new(run, budget).map(Some)
 }
 
 #[cfg(test)]

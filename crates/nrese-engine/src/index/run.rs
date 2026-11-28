@@ -391,7 +391,6 @@ impl Run {
                 }
             }
         }
-        held.charge(size_of::<Self>() + 2 * size_of::<usize>())?;
         let (counts, charge) = counts.into_parts();
         held.absorb(charge);
         self.triples = Some((
@@ -414,7 +413,7 @@ impl Run {
     #[cfg(test)]
     pub(super) fn triple_overhead(&self) -> usize {
         let (counts, _) = self.triples.as_ref().unwrap();
-        counts.capacity() * size_of::<(u64, i64)>() + size_of::<Self>() + 2 * size_of::<usize>()
+        counts.capacity() * size_of::<(u64, i64)>() + crate::term::ChargedArc::<Self>::COST
     }
 
     pub(crate) fn layout(&self) -> Layout {

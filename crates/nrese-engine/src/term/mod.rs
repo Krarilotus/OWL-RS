@@ -9,6 +9,7 @@
 //! different terms and get different ids). See ADR-0002.
 
 mod charged;
+pub(crate) use charged::ChargedArc;
 pub(crate) mod derived;
 pub(crate) mod dictionary;
 pub(crate) mod hash;

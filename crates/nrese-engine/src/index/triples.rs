@@ -5,6 +5,7 @@ use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
 use super::compaction::merge_triples;
 use super::{CompactionPolicy, IndexVersion, Layout, Run};
 use crate::quad::{AccessPlan, EncodedQuad, QuadPattern};
+use crate::term::ChargedArc;
 use crate::{Stopped, TermId, Visitor};
 
 type Triple = [u64; 3];
@@ -13,17 +14,18 @@ type Pattern = [Option<u64>; 3];
 /// An immutable version of a set of encoded triples. Clones share their list, and versions
 /// share any runs they have in common. All retained storage is charged once.
 #[derive(Debug, Clone)]
-pub struct TripleVersion(Arc<Storage>);
+pub struct TripleVersion(ChargedArc<Storage>);
+
+type TripleIndex = IndexVersion<ChargedArc<Run>>;
 
 #[derive(Debug)]
 struct Storage {
-    index: IndexVersion,
+    index: TripleIndex,
     budget: Arc<Budget>,
-    /// Released after the list it covers.
-    _held: Reservation,
 }
 
-const ARC_HEADER: usize = 2 * size_of::<usize>();
+const VERSION_BYTES: usize = ChargedArc::<Storage>::COST + 2 * size_of::<usize>();
+const RUN_REF_BYTES: usize = size_of::<ChargedArc<Run>>();
 const INLINE_RUN_LIMIT: usize = 2;
 
 impl TripleVersion {
@@ -32,8 +34,6 @@ impl TripleVersion {
         triples: impl IntoIterator<Item = Triple>,
         budget: &Arc<Budget>,
     ) -> Result<Self, BudgetExceeded> {
-        let mut held = Reservation::new(Arc::clone(budget));
-        held.charge(size_of::<Storage>() + 2 * ARC_HEADER)?;
         let mut quads = ChargedVec::new(Arc::clone(budget));
         for triple in triples {
             quads.push(quad(triple))?;
@@ -41,23 +41,17 @@ impl TripleVersion {
         quads.sort_unstable();
         let (mut quads, scratch) = quads.into_parts();
         quads.dedup();
-        let empty = IndexVersion::empty(Layout::DefaultGraph);
-        let index = if quads.is_empty() {
-            empty
-        } else {
-            held.charge(2 * size_of::<Arc<Run>>())?;
-            let run = Self::delta(&quads, &[], budget)?;
-            let index = empty.with_run(run);
-            held.release(size_of::<Arc<Run>>());
-            index
-        };
+        let len = quads.len() as u64;
+        let run = (!quads.is_empty())
+            .then(|| Self::delta(&quads, &[], budget))
+            .transpose()?;
         drop(quads);
         drop(scratch);
-        Ok(Self(Arc::new(Storage {
-            index,
-            budget: Arc::clone(budget),
-            _held: held,
-        })))
+        Self::with_index(budget, usize::from(run.is_some()), || TripleIndex {
+            layout: Layout::DefaultGraph,
+            len,
+            runs: run.into_iter().collect(),
+        })
     }
 
     /// Appends an exact delta to this version. Both slices must be strictly ascending;
@@ -83,35 +77,39 @@ impl TripleVersion {
         };
         let (inserts, deletes) = (quads(inserts)?, quads(deletes)?);
         let run = Self::delta(&inserts, &deletes, budget)?;
-        self.with_index(self.0.index.runs.len() + 1, || self.0.index.with_run(run))
+        let index = &self.0.index;
+        Self::with_index(budget, index.runs.len() + 1, || index.with_run_ref(run))
     }
 
     fn delta(
         inserts: &[EncodedQuad],
         deletes: &[EncodedQuad],
         budget: &Arc<Budget>,
-    ) -> Result<Run, BudgetExceeded> {
+    ) -> Result<ChargedArc<Run>, BudgetExceeded> {
         let mut built =
             Run::from_delta_within_parallel(Layout::DefaultGraph, inserts, deletes, budget)?;
         built.0.keep_triples(budget, &mut built.1)?;
-        Ok(built.0)
+        ChargedArc::new(built.0, budget)
     }
 
     fn with_index(
-        &self,
-        max_runs: usize,
-        build: impl FnOnce() -> IndexVersion,
+        budget: &Arc<Budget>,
+        run_count: usize,
+        build: impl FnOnce() -> TripleIndex,
     ) -> Result<Self, BudgetExceeded> {
-        let budget = Arc::clone(&self.0.budget);
-        let mut held = Reservation::new(Arc::clone(&budget));
-        held.charge(size_of::<Storage>() + 2 * ARC_HEADER + 2 * size_of::<Arc<Run>>() * max_runs)?;
+        let mut held = Reservation::new(Arc::clone(budget));
+        // The list's working buffer may overlap its shared allocation during collection.
+        held.charge(VERSION_BYTES + 2 * RUN_REF_BYTES * run_count)?;
         let index = build();
-        held.release(size_of::<Arc<Run>>() * (2 * max_runs - index.runs.len()));
-        Ok(Self(Arc::new(Storage {
-            index,
-            budget,
-            _held: held,
-        })))
+        debug_assert_eq!(index.runs.len(), run_count);
+        held.release(RUN_REF_BYTES * run_count);
+        Ok(Self(ChargedArc::with_reserved(
+            Storage {
+                index,
+                budget: Arc::clone(budget),
+            },
+            held,
+        )))
     }
 
     /// Builds one compaction of this version. The returned operation splices the result
@@ -149,10 +147,11 @@ impl TripleVersion {
             if !index.retains(&captured.0.index, window.clone()) {
                 return Ok(None);
             }
-            let len = index.runs.len() - window.len() + usize::from(merged.entries() != 0);
-            current
-                .with_index(len, || index.with_compacted(window, merged))
-                .map(Some)
+            let run_count = index.runs.len() - window.len() + usize::from(merged.is_some());
+            Self::with_index(&current.0.budget, run_count, || {
+                index.with_compacted_ref(window, merged)
+            })
+            .map(Some)
         }))
     }
 
@@ -304,7 +303,8 @@ mod tests {
         assert_eq!(
             budget.used(),
             original
-                + latest.0._held.bytes()
+                + VERSION_BYTES
+                + RUN_REF_BYTES * latest.0.index.runs.len()
                 + latest.0.index.runs[0].memory_bytes() as usize
                 + latest.0.index.runs[0].triple_overhead()
         );

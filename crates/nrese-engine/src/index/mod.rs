@@ -27,7 +27,7 @@ mod merge;
 pub(crate) mod run;
 mod triples;
 
-use std::ops::Range;
+use std::ops::{Deref, Range};
 use std::sync::Arc;
 
 use rayon::prelude::*;
@@ -257,9 +257,9 @@ const _: () =
     assert!(size_of::<Part<'static>>() <= size_of::<ChargedVec<(u64, i64), &'static Budget>>());
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct IndexVersion {
+pub(crate) struct IndexVersion<R = Arc<Run>> {
     layout: Layout,
-    runs: Arc<[Arc<Run>]>,
+    runs: Arc<[R]>,
     len: u64,
 }
 
@@ -315,15 +315,6 @@ impl IndexVersion {
     /// A version holding exactly the (deduplicated) `quads` in one base run.
     pub(crate) fn from_quads(layout: Layout, quads: Vec<EncodedQuad>) -> Self {
         Self::empty(layout).with_run(Run::from_quads(layout, quads))
-    }
-
-    /// Number of visible quads. O(1).
-    pub(crate) fn len(&self) -> u64 {
-        self.len
-    }
-
-    pub(crate) fn layout(&self) -> Layout {
-        self.layout
     }
 
     /// The layout `self` takes with the delta `inserts` and `deletes`: the quad layout once a
@@ -501,8 +492,19 @@ impl IndexVersion {
             len: self.len,
         }
     }
+}
 
-    pub(crate) fn runs(&self) -> &[Arc<Run>] {
+impl<R: Deref<Target = Run>> IndexVersion<R> {
+    /// Number of visible quads. O(1).
+    pub(crate) fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub(crate) fn layout(&self) -> Layout {
+        self.layout
+    }
+
+    pub(crate) fn runs(&self) -> &[R] {
         &self.runs
     }
 
@@ -1197,7 +1199,9 @@ impl IndexVersion {
             plan.exclude_default_graph,
         )
     }
+}
 
+impl IndexVersion {
     /// `self` with `extra` on top, for reading only: their signs add to the stack's, so
     /// together they must leave each quad at 0 or 1 ([`crate::InferredMask`]).
     pub(crate) fn with_runs(&self, extra: &[Arc<Run>]) -> Self {
@@ -1217,17 +1221,7 @@ impl IndexVersion {
         if run.entries() == 0 {
             return self.clone();
         }
-        debug_assert_eq!(run.layout(), self.layout, "run built for another stack");
-        let len = self
-            .len
-            .checked_add_signed(run.net())
-            .expect("exact delta can't make the quad count negative");
-        let runs = self.runs.iter().cloned().chain([Arc::new(run)]).collect();
-        Self {
-            layout: self.layout,
-            runs,
-            len,
-        }
+        self.with_run_ref(Arc::new(run))
     }
 
     /// A new version where the first `covered` runs are replaced by the runs of `base`, which
@@ -1250,10 +1244,29 @@ impl IndexVersion {
     /// A new version where the runs in `window` are replaced by `merged`, which must be
     /// [`compaction::merge_runs`] of exactly those runs.
     pub(crate) fn with_compacted(&self, window: Range<usize>, merged: Run) -> Self {
+        self.with_compacted_ref(window, (merged.entries() > 0).then(|| Arc::new(merged)))
+    }
+}
+
+impl<R: Clone + Deref<Target = Run>> IndexVersion<R> {
+    fn with_run_ref(&self, run: R) -> Self {
+        debug_assert_eq!(run.layout(), self.layout, "run built for another stack");
+        let len = self
+            .len
+            .checked_add_signed(run.net())
+            .expect("exact delta can't make the quad count negative");
+        Self {
+            layout: self.layout,
+            runs: self.runs.iter().cloned().chain([run]).collect(),
+            len,
+        }
+    }
+
+    fn with_compacted_ref(&self, window: Range<usize>, merged: Option<R>) -> Self {
         let runs = self.runs[..window.start]
             .iter()
             .cloned()
-            .chain((merged.entries() > 0).then(|| Arc::new(merged)))
+            .chain(merged)
             .chain(self.runs[window.end..].iter().cloned())
             .collect();
         Self {
@@ -1269,7 +1282,7 @@ impl IndexVersion {
             && window.all(|i| {
                 self.runs
                     .get(i)
-                    .is_some_and(|run| Arc::ptr_eq(run, &captured.runs[i]))
+                    .is_some_and(|run| std::ptr::eq(&**run, &*captured.runs[i]))
             })
     }
 }
