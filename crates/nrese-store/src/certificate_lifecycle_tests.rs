@@ -321,7 +321,7 @@ fn a_withheld_view_keeps_its_committed_bases_dl_route() {
                 .with_inferred_mask(
                     &nrese_engine::InferredMask::default(),
                     false,
-                    &nrese_exec::Budget::unlimited(),
+                    &Arc::new(nrese_exec::Budget::unlimited()),
                 )
                 .unwrap()
                 .unwrap();

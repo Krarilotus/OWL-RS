@@ -37,10 +37,19 @@ const ENTAILED: &str = "ASK { ex:a ex:q ex:b }";
 #[tokio::test]
 async fn a_clash_and_a_query_reason_are_reported_together() -> TestResult {
     let store = nrese_store::StoreService::new(StoreConfig::in_memory())?;
-    store.update_str_ungated(
-        "PREFIX owl: <http://www.w3.org/2002/07/owl#> PREFIX : <urn:clash:>
-         INSERT DATA { :A owl:disjointWith :B . :a a :A, :B }",
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("clash.ttl");
+    std::fs::write(
+        &path,
+        "@prefix owl: <http://www.w3.org/2002/07/owl#> . @prefix : <urn:clash:> .
+         :A owl:disjointWith :B . :a a :A, :B .",
     )?;
+    store.bulk_load(&nrese_store::BulkLoadRequest {
+        files: vec![path],
+        replace: false,
+        graph: nrese_store::GraphTarget::DefaultGraph,
+        invalid: None,
+    })?;
     let reasoner = ReasonerConfig::for_mode(ReasoningMode::Owl2Ql);
     store.rematerialise(reasoner.materialised_program().unwrap())?;
     let app = crate::support::test_app_with_store(store, Default::default(), reasoner)?;
