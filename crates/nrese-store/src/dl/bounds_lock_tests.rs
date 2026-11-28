@@ -315,6 +315,32 @@ fn eligible_program_facts_follow_the_published_revision() {
                 rebuilt.eligible.scan([None; 3]).collect::<Vec<_>>(),
                 "a sameAs member's retraction must keep the fresh eligible set",
             );
+            // Commits with classes rebuild the root. Exercise the eligibility stage on the
+            // same retraction directly so it must enforce the build's class exclusion too.
+            assert!(rebuilt.classes().class_of(target[0]).is_some());
+            assert!(
+                rebuilt
+                    .program
+                    .facts
+                    .iter()
+                    .any(|(fact, _)| *fact == target)
+            );
+            let bounds = &store.dl().bounds;
+            let (staged, _) = rebuilt
+                .stage(
+                    Change::default(),
+                    [target].into_iter(),
+                    &snapshot,
+                    bounds.kept(),
+                    None,
+                    bounds,
+                )
+                .unwrap();
+            assert_eq!(
+                staged.eligible.scan([None; 3]).collect::<Vec<_>>(),
+                rebuilt.eligible.scan([None; 3]).collect::<Vec<_>>(),
+                "staging the retraction must also exclude the equality member",
+            );
         }
         (snapshot, materialised, eligible)
     });
