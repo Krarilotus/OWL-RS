@@ -453,6 +453,7 @@ pub(super) fn typed_constant(query: &Query) -> Option<String> {
 /// the snapshot read, so a variable's IRIs-only ends, `rdf:type`'s too, mark nothing). One
 /// walk, once per query ([`Reads`]). Every operator and term form is named in its matches,
 /// so a new one doesn't compile until it is said whether it compares terms.
+#[derive(Debug, Clone)]
 pub(super) struct SpellingComparisons {
     pub(super) terms: Vec<(String, Vec<Option<String>>)>,
     pub(super) values: bool,
