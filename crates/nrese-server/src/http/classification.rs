@@ -11,7 +11,7 @@
 //! JSON's `outside_profile`, and a comment line first in N-Triples say so.
 
 use axum::body::Body;
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use nrese_reasoner::eval::Stop;
 use nrese_sparql::Outside;

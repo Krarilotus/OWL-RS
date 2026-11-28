@@ -3254,7 +3254,8 @@ fn a_rewritten_read_that_may_return_a_copied_annotation_is_unsound() {
         let token = nrese_store::CancellationToken::new();
         let explain = store.explain_query(&prepared, &token).unwrap().completeness;
         let plan = store.plan_query(&prepared, &token).unwrap().completeness;
-        let header = |s: Option<Completeness>| s.map_or_else(|| "none".to_owned(), |s| s.header());
+        let header =
+            |s: Option<nrese_store::Claim>| s.map_or_else(|| "none".to_owned(), |s| s.header());
         for (path, status) in [
             ("run", run),
             ("explain", header(explain)),
