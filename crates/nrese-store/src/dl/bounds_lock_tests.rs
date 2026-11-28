@@ -12,6 +12,7 @@ use super::*;
 use crate::{
     MutationCommand, MutationPipeline, MutationTicket, Requester, SparqlUpdateRequest, StoreConfig,
 };
+use nrese_engine::QuadPattern;
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
 
 /// Not OWL 2 RL (an existential on the right), so U1 is compiled; a few classes, so the
@@ -126,9 +127,9 @@ fn program_fact_snapshot_probes_leave_the_bounds_state_unlocked() {
     );
 }
 
-/// A view can't use an older U1's facts with a newer compilation of its stack.
+/// Contract §4.3c R3. A held publication reads its own program across a rebuild.
 #[test]
-fn a_rebuild_during_fact_probes_does_not_mix_revisions() {
+fn a_rebuild_after_the_version_is_taken_does_not_mix_revisions() {
     let (store, pipeline) = pipeline();
     update(
         &pipeline,
@@ -140,7 +141,6 @@ fn a_rebuild_during_fact_probes_does_not_mix_revisions() {
     );
     let old = store.engine().snapshot();
     seam::set(&store.dl().bounds, Point::Eligible, move || {
-        assert!(pipeline.store().dl().bounds.state.try_lock().is_ok());
         update(
             &pipeline,
             "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#>
@@ -150,7 +150,11 @@ fn a_rebuild_during_fact_probes_does_not_mix_revisions() {
         );
     });
 
-    let old_read = view_until(&store, &old, None, None);
+    let old_read = view_until(&store, &old, None, None)
+        .expect("read attempted")
+        .expect("held publication has its upper bound");
+    let old_upper = old_read.upper.as_ref().expect("old U1");
+    assert_eq!(old_read.revision, old.revision());
     let (current, latest) = view(&store);
     assert!(
         current.revision() > old.revision(),
@@ -167,13 +171,77 @@ fn a_rebuild_during_fact_probes_does_not_mix_revisions() {
     let rdf_type = id(RDF_TYPE);
     assert_eq!(
         (
-            matches!(old_read, Some(Err(Missing::Later))),
+            in_view(old_upper, [x, rdf_type, id("urn:test:Before")]),
+            in_view(old_upper, [x, rdf_type, id("urn:test:After")]),
             in_view(upper, [x, rdf_type, id("urn:test:Before")]),
             in_view(upper, [x, rdf_type, id("urn:test:After")]),
         ),
-        (true, false, true),
-        "the previous read must yield to the rebuild and the new view use the new facts"
+        (true, false, false, true),
+        "each publication uses its own compiled program"
     );
+}
+
+/// Contract §4.3c R1 and §7 A1. A fact added and then removed stays visible only
+/// to the reader that pinned the intermediate publication.
+#[test]
+fn installing_a_delta_preserves_the_readers_stack() {
+    let (store, pipeline) = pipeline();
+    let before = store.engine().snapshot();
+    update(&pipeline, "PREFIX : <urn:test:> INSERT DATA { :i0 a :A }");
+    let intermediate = store.engine().snapshot();
+    update(&pipeline, "PREFIX : <urn:test:> DELETE DATA { :i0 a :A }");
+    let after = store.engine().snapshot();
+    let term = |iri| intermediate.lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into());
+    let pattern = QuadPattern {
+        subject: term("urn:test:i0"),
+        predicate: term("urn:test:p"),
+        ..QuadPattern::all()
+    };
+    assert!(pattern.subject.is_some() && pattern.predicate.is_some());
+    for (snapshot, present) in [(&before, false), (&intermediate, true), (&after, false)] {
+        let view = view_until(&store, snapshot, None, None)
+            .expect("read attempted")
+            .expect("held publication has its upper bound");
+        assert_eq!(view.revision, snapshot.revision());
+        let upper = view.upper.as_ref().expect("U1");
+        let found = upper
+            .quads_for_pattern_in(ReadModel::Materialised, &pattern)
+            .next();
+        assert_eq!(found.is_some(), present, "revision {}", snapshot.revision());
+    }
+}
+
+/// Contract §4.2 and §7 A3. Run 4's SELECT keeps the same complete answer when an unrelated
+/// commit publishes after it has taken its snapshot.
+#[test]
+fn an_unrelated_commit_keeps_the_pinned_query_complete() {
+    let (store, pipeline) = pipeline();
+    update(
+        &pipeline,
+        "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+         INSERT DATA {
+           :i0 a owl:NamedIndividual , [ owl:complementOf [ owl:complementOf :A ] ] .
+         }",
+    );
+    seam::set(&store.dl().bounds, Point::Eligible, move || {
+        update(
+            &pipeline,
+            "PREFIX : <urn:test:> INSERT DATA { :unrelated a :F }",
+        );
+    });
+    let request = crate::SparqlQueryRequest::all(
+        "PREFIX : <urn:test:> SELECT ?x WHERE { ?x a :A . FILTER(sameTerm(?x, :i0)) }",
+    );
+    let result = store.execute_query(&request).expect("product read");
+    let payload: serde_json::Value = serde_json::from_slice(&result.payload).expect("SELECT JSON");
+    let claim = result.completeness.expect("DL claim");
+    assert_eq!(
+        payload["results"]["bindings"],
+        serde_json::json!([{"x":{"type":"uri","value":"urn:test:i0"}}]),
+        "{}",
+        claim.header(),
+    );
+    assert!(claim.complete, "{}", claim.header());
 }
 
 /// A read of the revision U1 and its view describe gets that view while a commit computes
