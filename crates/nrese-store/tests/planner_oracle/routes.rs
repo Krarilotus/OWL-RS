@@ -6,16 +6,16 @@ use nrese_rdf::Term;
 use nrese_rdf_io::{RdfFormat, RdfParser};
 use nrese_reasoner::rulesets::Ruleset;
 use nrese_sparql::{
-    Explanation, QueryEvaluationError, QueryOptions, QueryResults, ServiceCall, ServiceClient,
-    ServiceResults, Services, evaluate_query,
+    QueryEvaluationError, QueryOptions, QueryResults, ServiceCall, ServiceClient, ServiceResults,
+    Services, evaluate_query,
 };
 use nrese_sparql_results::{
     QueryResultsFormat, QueryResultsParser, ReaderQueryResultsParserOutput,
 };
 use nrese_sparql_syntax::SparqlParser;
 use nrese_store::{
-    BulkLoadRequest, CancellationToken, GraphTarget, InvalidStatements, QlRewritingMode,
-    SparqlQueryRequest, StoreConfig, StoreService,
+    BulkLoadRequest, CancellationToken, Explanation, GraphTarget, InvalidStatements,
+    QlRewritingMode, SparqlQueryRequest, StoreConfig, StoreService,
 };
 
 use crate::generator::Case;

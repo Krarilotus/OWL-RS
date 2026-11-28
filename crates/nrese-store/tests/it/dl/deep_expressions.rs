@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
-use nrese_sparql::{Completeness, GraphAccess};
+use nrese_sparql::GraphAccess;
+use nrese_store::Claim;
 use nrese_store::dl::entailment::Entailed;
 use nrese_store::{
     MutationCommand, MutationError, MutationPipeline, MutationTicket, ReadScope, Requester,
@@ -156,7 +157,7 @@ fn profile_pipeline(mode: ReasoningMode) -> MutationPipeline {
     MutationPipeline::new(Arc::new(store), Arc::new(reasoner))
 }
 
-fn ask(store: &StoreService, pattern: &str) -> (bool, Option<Completeness>) {
+fn ask(store: &StoreService, pattern: &str) -> (bool, Option<Claim>) {
     let request = SparqlQueryRequest::all(format!("{PREFIXES}ASK {{ {pattern} }}"));
     let result = store.execute_query(&request).expect("query");
     let json: serde_json::Value = serde_json::from_slice(&result.payload).expect("JSON result");
@@ -168,7 +169,7 @@ fn ask(store: &StoreService, pattern: &str) -> (bool, Option<Completeness>) {
 
 /// The membership answer under `owl2-dl` with what its status says and what decided it,
 /// after a later read of an asserted statement shows the store still answers.
-fn dl_membership(dl: &MutationPipeline) -> (Vec<String>, Completeness, Vec<&'static str>) {
+fn dl_membership(dl: &MutationPipeline) -> (Vec<String>, Claim, Vec<&'static str>) {
     let asserted = query(dl, &format!("ASK {{ {DECLARED_INDIVIDUAL} }}"));
     assert_eq!(asserted.0, ["true"]);
     let (answer, status) = query(dl, &format!("ASK {{ {MEMBERSHIP} }}"));

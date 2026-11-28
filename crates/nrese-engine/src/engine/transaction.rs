@@ -110,6 +110,11 @@ impl<'e> Transaction<'e> {
         }
     }
 
+    /// Replaces the version's certificate without changing its equality reading.
+    pub fn install_certificate(&self, certificate: super::Certificate) {
+        self.install(self.reading(), Some(certificate));
+    }
+
     /// The commit publishes `certificate` with its version, for statements whose closure
     /// it maintained; without this it publishes none.
     pub fn vouch(&mut self, certificate: super::Certificate) {

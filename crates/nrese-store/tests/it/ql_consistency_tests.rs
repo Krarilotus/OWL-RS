@@ -161,7 +161,10 @@ fn read(store: &StoreService, question: &str) -> String {
         .filter(|c| !c.is_whitespace())
         .collect::<String>()
         .contains("\"boolean\":true");
-    let word = result.completeness.unwrap_or_default().as_str();
+    let word = result
+        .completeness
+        .as_ref()
+        .map_or("complete", |claim| claim.as_str());
     format!("{answer}, {word}")
 }
 

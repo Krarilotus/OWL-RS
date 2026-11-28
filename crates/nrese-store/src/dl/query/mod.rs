@@ -58,10 +58,7 @@ pub(crate) use exact::{Ids, ground_axiom};
 /// bounds' budget while kept (SYN-61); and the mark it gave a committed revision
 /// ([`reads_differently`]), so reads at that revision one after another pass over it once.
 #[derive(Debug, Default)]
-pub(crate) struct OntologyCache(
-    std::sync::Mutex<Option<(u64, KeptOntology)>>,
-    std::sync::Mutex<Option<(u64, Option<String>)>>,
-);
+pub(crate) struct OntologyCache(std::sync::Mutex<Option<(u64, KeptOntology)>>);
 
 impl OntologyCache {
     /// Lets the cache's entry go if it is of a revision below `revision`, so that its charge
@@ -197,11 +194,15 @@ fn consistency_at(
     if memory.refused() {
         return checked.verdict;
     }
-    store.dl().record(DlStatus {
+    let status = DlStatus {
         revision: snapshot.revision(),
         consistency: checked.clone(),
         left_out: Some(left_out(ontology.value(), &consistency::nameless)),
-    });
+    };
+    crate::service::ReadBasis::record_dl(snapshot, status.clone());
+    if snapshot.same_version(&store.engine().snapshot()) {
+        store.dl().record(status);
+    }
     checked.verdict
 }
 
@@ -210,12 +211,8 @@ fn consistency_at(
 /// there where it holds an ill-typed literal ([`gate::ILL_TYPED`]) or the search for one stopped
 /// ([`UNCHECKED`], never recorded: a later read searches again).
 fn consistency_known(store: &StoreService, snapshot: &Snapshot, view: &View) -> Option<Verdict> {
-    match store.dl().status() {
-        Some(DlStatus {
-            revision,
-            consistency,
-            ..
-        }) if revision == snapshot.revision() => Some(consistency.verdict),
+    match crate::service::ReadBasis::dl_status(snapshot) {
+        Some(status) => Some(status.consistency.verdict),
         _ if !(view.proves_consistency || view.rules && super::bounds::rules_prove(snapshot)) => {
             None
         }
@@ -329,17 +326,24 @@ impl Status {
 /// sound-only ([`DEADLINE`]) where the request's time was up instead.
 pub(crate) fn plan_status(
     store: &StoreService,
-    snapshot: &Snapshot,
+    read: Revision<'_>,
     prepared: &PreparedQuery,
     cancellation: &CancellationToken,
-) -> StoreResult<Completeness> {
+) -> StoreResult<crate::Claim> {
     let analysis = analyse(prepared.query());
-    let decided = decided(store, snapshot, prepared, cancellation)?;
+    let decided = decided(store, read.snapshot(), prepared, cancellation)?;
     let completeness = match decided.as_ref() {
         Ok(at) => plan_status_built(store, prepared, &analysis, at).completeness,
         Err(why) => fallback(prepared, why).completeness,
     };
-    Ok(composed(store, prepared, snapshot, &decided, completeness))
+    Ok(composed(
+        store,
+        prepared,
+        read,
+        &decided,
+        completeness,
+        None,
+    ))
 }
 
 /// The status when the DL bounds view isn't used ([`PART`], [`LATER`], [`DEADLINE`]): `why`,
@@ -459,14 +463,20 @@ fn deadline_of(store: &StoreService, prepared: &PreparedQuery) -> Deadline {
 fn composed(
     store: &StoreService,
     prepared: &PreparedQuery,
-    snapshot: &Snapshot,
+    read: Revision<'_>,
     decided: &Decided,
     status: Completeness,
-) -> Completeness {
-    let committed = Revision::Committed(snapshot);
-    let at = decided.as_ref().map_or(committed, Revision::Decided);
-    let assessed = store.assess(prepared, at, Some(status));
-    assessed.unwrap_or_else(Completeness::not_certified)
+    cache: Option<(DlAnswers, &mut Vec<u8>)>,
+) -> crate::Claim {
+    let at = decided.as_ref().map_or(read, Revision::Decided);
+    store.assess(
+        at,
+        crate::service::Evidence::DlQuery {
+            prepared,
+            route: status,
+            cache,
+        },
+    )
 }
 
 /// The data a status is composed for ([`mark`]): the view the answers were decided on, or
@@ -476,7 +486,12 @@ fn composed(
 pub(crate) enum Revision<'a> {
     Decided(&'a (Snapshot, Arc<View>)),
     Committed(&'a Snapshot),
+    View {
+        base: &'a Snapshot,
+        snapshot: &'a Snapshot,
+    },
     Pending {
+        base: &'a Snapshot,
         snapshot: &'a Snapshot,
         /// Whether one of the operations may delete.
         deletes: bool,
@@ -490,7 +505,16 @@ impl Revision<'_> {
     pub(crate) fn snapshot(&self) -> &Snapshot {
         match self {
             Revision::Decided((snapshot, _)) => snapshot,
-            Revision::Committed(snapshot) | Revision::Pending { snapshot, .. } => snapshot,
+            Revision::Committed(snapshot)
+            | Revision::View { snapshot, .. }
+            | Revision::Pending { snapshot, .. } => snapshot,
+        }
+    }
+
+    pub(crate) fn base(&self) -> &Snapshot {
+        match self {
+            Revision::View { base, .. } | Revision::Pending { base, .. } => base,
+            _ => self.snapshot(),
         }
     }
 }
@@ -618,7 +642,7 @@ fn reads_differently(store: &StoreService, at: Revision<'_>) -> Option<String> {
     let (snapshot, pending, keeps_record) = match at {
         Revision::Decided((_, view)) if view.rules => return None,
         Revision::Decided((snapshot, _)) => (snapshot, false, true),
-        Revision::Committed(snapshot) => (snapshot, false, true),
+        Revision::Committed(snapshot) | Revision::View { snapshot, .. } => (snapshot, false, true),
         Revision::Pending {
             snapshot,
             keeps_record,
@@ -628,9 +652,7 @@ fn reads_differently(store: &StoreService, at: Revision<'_>) -> Option<String> {
     // Named where its commit wrote it: only a reader of every graph is given the status this
     // reason is in (`status_for_its_reader`, service.rs). U1's proof of consistency is no
     // record: it says nothing of what the rules read beyond the ontology (an unused structure).
-    let left_out = (store.dl().status())
-        .filter(|s| s.revision == snapshot.revision())
-        .and_then(|s| s.left_out);
+    let left_out = crate::service::ReadBasis::dl_status(snapshot).and_then(|s| s.left_out);
     // A pending read's record is its base's: one that tells nothing says nothing of pending
     // changes that may change what the reader reads (a node typed the ontology reads its
     // statements otherwise, a literal gives an object property a second kind), so it reads
@@ -641,13 +663,10 @@ fn reads_differently(store: &StoreService, at: Revision<'_>) -> Option<String> {
         (Some(None), Some(None)) if keeps_record => return None,
         _ => {}
     }
-    let marked = &store.dl().query_ontology.1;
-    let marked = || marked.lock().unwrap_or_else(|p| p.into_inner());
-    if !pending
-        && let Some((revision, why)) = &*marked()
-        && *revision == snapshot.revision()
-    {
-        return why.clone();
+    let basis = crate::service::ReadBasis::of(snapshot).filter(|_| !pending);
+    let marked = || basis.map(|basis| basis.omission.lock().unwrap_or_else(|p| p.into_inner()));
+    if let Some(why) = marked().and_then(|mark| mark.clone()) {
+        return why;
     }
     #[cfg(test)]
     cancellation_tests::ONTOLOGY_PASSES.set(cancellation_tests::ONTOLOGY_PASSES.get() + 1);
@@ -660,8 +679,8 @@ fn reads_differently(store: &StoreService, at: Revision<'_>) -> Option<String> {
         ));
     };
     let why = by_ontology(snapshot, ontology.value());
-    if !pending {
-        *marked() = Some((snapshot.revision(), why.clone()));
+    if let Some(mut mark) = marked() {
+        *mark = Some(why.clone());
     }
     why
 }
@@ -1646,13 +1665,15 @@ fn plan_status_built(
 /// engines.
 pub(crate) fn answer(
     store: &StoreService,
-    snapshot: &Snapshot,
+    at: Revision<'_>,
     prepared: &PreparedQuery,
     cancellation: &CancellationToken,
     memory: &nrese_exec::Envelope,
     mode: DlAnswers,
-) -> StoreResult<Outcome> {
+    cache: Option<&mut Vec<u8>>,
+) -> StoreResult<Outcome<crate::Claim>> {
     cancellation.check()?;
+    let snapshot = at.snapshot();
     let analysis = analyse(prepared.query());
     // One view for the answers and their status: a commit in between changes neither.
     let decided = decided(store, snapshot, prepared, cancellation)?;
@@ -1669,8 +1690,7 @@ pub(crate) fn answer(
     // An ASK the store answered `true` misses nothing, so nothing every name could add changes
     // it: it isn't put to the element. One answered `false` is, as is one streamed.
     let held = matches!(&outcome, Outcome::Answers(Answers::Boolean(true), ..));
-    let (Outcome::Stream(status, _, detail) | Outcome::Answers(_, status, detail)) = &mut outcome;
-    *status = composed(store, prepared, snapshot, &decided, status.clone());
+    let (Outcome::Stream(status, _, _) | Outcome::Answers(_, status, _)) = &mut outcome;
     if status.complete
         && !held
         && let Ok((_, view)) = &decided
@@ -1681,8 +1701,20 @@ pub(crate) fn answer(
     }
     // A cancellation while the element was posed is the read's, not a reason.
     cancellation.check()?;
-    refuse_unless_complete(mode, status, || detail.unresolved.clone())?;
-    Ok(outcome)
+    let assess = |status, detail: &DlDetail, cache| {
+        let claim = composed(store, prepared, at, &decided, status, cache);
+        refuse_unless_complete(mode, &claim, || detail.unresolved.clone())?;
+        StoreResult::Ok(claim)
+    };
+    Ok(match outcome {
+        Outcome::Stream(status, read, detail) => {
+            let cache = cache.map(|key| (mode, key));
+            Outcome::Stream(assess(status, &detail, cache)?, read, detail)
+        }
+        Outcome::Answers(answers, status, detail) => {
+            Outcome::Answers(answers, assess(status, &detail, None)?, detail)
+        }
+    })
 }
 
 /// The one rule of exact answers: under [`DlAnswers::Exact`] an answer whose `status` isn't
@@ -1691,13 +1723,17 @@ pub(crate) fn answer(
 /// (`StoreService::refuse_exact`), ask it.
 pub(crate) fn refuse_unless_complete(
     mode: DlAnswers,
-    status: &Completeness,
+    status: &crate::Claim,
     unresolved: impl FnOnce() -> Vec<String>,
 ) -> StoreResult<()> {
     if mode == DlAnswers::Exact && !status.complete {
         return Err(StoreError::Incomplete(Box::new(crate::IncompleteAnswer {
             status: status.clone(),
-            unresolved: unresolved(),
+            unresolved: if status.certification_withheld {
+                Vec::new()
+            } else {
+                unresolved()
+            },
         })));
     }
     Ok(())
@@ -1713,10 +1749,10 @@ mod envelope_tests;
 
 /// How a query is answered: over the lower bound as it streams (its status known before
 /// it runs), or with answers collected and completed through the bounds.
-pub(crate) enum Outcome {
+pub(crate) enum Outcome<C = Completeness> {
     /// Streamed over what [`Read`] says.
-    Stream(Completeness, Read, DlDetail),
-    Answers(Answers, Completeness, DlDetail),
+    Stream(C, Read, DlDetail),
+    Answers(Answers, C, DlDetail),
 }
 
 /// What a streamed answer reads: the revision its status was decided on, never a later

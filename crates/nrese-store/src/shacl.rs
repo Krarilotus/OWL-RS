@@ -869,6 +869,10 @@ impl StoreService {
     /// what is kept: it never compiles, and never waits for a compilation.
     pub fn shacl_gate_state(&self) -> ShaclGateState {
         let view = self.engine().snapshot();
+        self.shacl_gate_state_at(&view)
+    }
+
+    pub(crate) fn shacl_gate_state_at(&self, view: &nrese_engine::Snapshot) -> ShaclGateState {
         let cell = view
             .watched()
             .expect("the store registered its shapes graph");

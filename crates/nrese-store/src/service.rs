@@ -26,6 +26,11 @@ use crate::update::{SparqlUpdateRequest, UpdateExecutionReport};
 /// ([`StoreService::run_query_reporting`]).
 pub type StatusHeader = Option<std::sync::Arc<str>>;
 
+#[path = "read_claim.rs"]
+mod claim;
+pub use claim::Claim;
+pub(crate) use claim::{Evidence, RulesEntailment};
+
 /// One run of a prepared query, opened by the store that runs it ([`StoreService::open_run`]),
 /// with the memory envelope everything of the run draws on: its evaluations, retained results
 /// and DL tasks, and what its transport holds of its output (an answer held whole,
@@ -49,7 +54,7 @@ impl QueryRun {
         self,
         cancellation: &CancellationToken,
         out: impl std::io::Write,
-        report: impl FnOnce(Option<nrese_sparql::Completeness>, StatusHeader) -> Option<String>,
+        report: impl FnOnce(Claim, StatusHeader) -> Option<String>,
     ) -> StoreResult<()> {
         self.store
             .run_reporting(&self.prepared, &self.memory, cancellation, out, report)
@@ -62,7 +67,7 @@ impl QueryRun {
         pending: &crate::StatementsRequest,
         cancellation: &CancellationToken,
         out: impl std::io::Write,
-        report: impl FnOnce(Option<nrese_sparql::Completeness>, StatusHeader) -> Option<String>,
+        report: impl FnOnce(Claim, StatusHeader) -> Option<String>,
     ) -> StoreResult<()> {
         let (prepared, memory) = (&self.prepared, &self.memory);
         self.store
@@ -158,7 +163,7 @@ pub(crate) struct Certificate {
     pub(crate) state: crate::ReasoningState,
     /// The state describes the stack of this version.
     pub(crate) exact: bool,
-    /// The store vouches for the rows ([`StoreService::vouches`]): exact, not a replica, and
+    /// The store vouches for the rows: exact, not a replica, and
     /// made by the rules registered (or, with none registered, as the marker says).
     vouched: bool,
     /// The rules registered made the stack (`ReasoningState::made_by`): only then is `state`'s
@@ -183,6 +188,36 @@ pub(crate) struct Certificate {
     /// Its version's ill-typed literal ([`Self::ill_typed`]): unset until a need finds it, never
     /// at the open; a cell of its own, or one found for the same statements.
     pub(crate) ill_typed: std::sync::Mutex<IllTyped>,
+}
+
+/// Evidence owned by the published version. The engine attaches it with the stacks, including
+/// when a settings change replaces the version at the same revision.
+pub(crate) struct ReadBasis {
+    certificate: Option<Certificate>,
+    pub(crate) generation: crate::support::Generation,
+    dl_route: (bool, bool),
+    dl_status: std::sync::Mutex<Option<crate::dl::DlStatus>>,
+    pub(crate) omission: std::sync::Mutex<Option<Option<String>>>,
+}
+
+impl ReadBasis {
+    pub(crate) fn of(snapshot: &Snapshot) -> Option<&Self> {
+        snapshot.certificate()?.downcast_ref()
+    }
+
+    pub(crate) fn dl_status(snapshot: &Snapshot) -> Option<crate::dl::DlStatus> {
+        Self::of(snapshot)?
+            .dl_status
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn record_dl(snapshot: &Snapshot, status: crate::dl::DlStatus) {
+        if let Some(basis) = Self::of(snapshot) {
+            *basis.dl_status.lock().unwrap_or_else(|p| p.into_inner()) = Some(status);
+        }
+    }
 }
 
 /// A version's ill-typed literal, if any: `None` until a search ends.
@@ -265,6 +300,28 @@ pub struct UndecidedReport {
     pub reason: UndecidedReason,
 }
 
+/// The facts and claim reported by repository information.
+pub struct PublicationReport {
+    pub claim: Claim,
+    pub undecided: Option<UndecidedReport>,
+    pub quarantined: bool,
+    pub revision: u64,
+    pub stats: StoreStats,
+    pub shacl: crate::shacl::ShaclGateState,
+    pub dl_mode: bool,
+    pub dl_engine: &'static str,
+}
+
+/// The justifications found over one publication and the store's assessment of the result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatementJustification {
+    pub mode: crate::reasoning::JustificationMode,
+    pub sets: Vec<Vec<crate::reasoning::JustifiedStatement>>,
+    pub complete: bool,
+    pub verified: Option<bool>,
+    pub claim: Claim,
+}
+
 /// The explanation shared by a published verdict and a refusal.
 #[derive(Debug, serde::Serialize)]
 pub struct UndecidedReason {
@@ -289,7 +346,7 @@ impl Certificate {
     /// The version's reasoning record. A pending snapshot carries its base's record.
     /// A withheld view has only the certificate for producing rows ([`Self::for_rows`]).
     pub(crate) fn record(snapshot: &Snapshot) -> Option<&Self> {
-        snapshot.certificate()?.downcast_ref()
+        ReadBasis::of(snapshot)?.certificate.as_ref()
     }
 
     /// `snapshot`'s record where the store vouches for its rows; any other reads as none.
@@ -300,7 +357,11 @@ impl Certificate {
     /// The one `snapshot`'s rows are produced under ([`Snapshot::certificate_for_rows`]),
     /// vouched.
     pub(crate) fn for_rows(snapshot: &Snapshot) -> Option<&Self> {
-        let rows = snapshot.certificate_for_rows()?.downcast_ref::<Self>()?;
+        let rows = snapshot
+            .certificate_for_rows()?
+            .downcast_ref::<ReadBasis>()?
+            .certificate
+            .as_ref()?;
         rows.vouched.then_some(rows)
     }
 
@@ -339,7 +400,10 @@ impl Certificate {
     /// certificate for rows says, else as the mode `dl` is now (a read without one is told
     /// `not-certified` all the same).
     pub(crate) fn route(snapshot: &Snapshot, dl: &crate::dl::Dl) -> (bool, bool) {
-        Self::for_rows(snapshot).map_or((dl.active(), dl.user_rules()), |c| (c.dl, c.user_rules))
+        ReadBasis::of(snapshot)
+            .map(|basis| basis.dl_route)
+            .or_else(|| Self::for_rows(snapshot).map(|c| (c.dl, c.user_rules)))
+            .unwrap_or_else(|| (dl.active(), dl.user_rules()))
     }
 
     /// The ill-typed literal `data`, this certificate's version, holds: found once, on the first
@@ -598,8 +662,10 @@ impl StoreService {
         // The marker, read once, here: the open's record. The reading isn't on disk: the
         // certified stack's is installed before the store is anyone's, with its record. The
         // marker doesn't record whether the rules equated two literals.
-        if let Some(state) = service.marker_state() {
-            service.certify(&tx, state, Literal::Unknown);
+        let generation = service.supports.generation();
+        match service.marker_state() {
+            Some(state) => service.certify(&tx, state, Literal::Unknown, generation),
+            None => tx.install(None, Some(service.read_basis(None, generation))),
         }
         drop(tx);
         service.refresh_kept_shapes(&service.engine.snapshot(), &StopSource::none());
@@ -608,24 +674,23 @@ impl StoreService {
     }
 
     /// Installs the state and reading under the writer slot. Recertification carries the
-    /// hold, assessment and reusable QL schema. Marker-only literal certainty requires
+    /// hold and assessment. Marker-only literal certainty requires
     /// matching registered rules that cannot equate literals.
     fn certify(
         &self,
         tx: &nrese_engine::Transaction<'_>,
         state: crate::ReasoningState,
         literal: Literal,
+        generation: crate::support::Generation,
     ) {
         let writer = tx.writer().expect("a transaction holds the writer slot");
         let base = Certificate::record(tx.base()).filter(|c| c.exact);
         let hide = self.config.hide_unnamed_classes;
-        let registered = self.supports.rules();
+        let registered = generation.rules.as_ref();
         let rebuilt_here = base.is_some_and(|c| c.rebuilt_here);
-        let checked = registered
-            .as_ref()
-            .map_or(rebuilt_here, |p| state.made_by(p, hide));
+        let checked = registered.map_or(rebuilt_here, |p| state.made_by(p, hide));
         let cannot_equate = checked
-            && registered.as_ref().is_some_and(|program| {
+            && registered.is_some_and(|program| {
                 !program.may_equate_literals() && state.ruleset == program.name()
             });
         let facts = Facts {
@@ -639,9 +704,12 @@ impl StoreService {
             checked,
             rebuilt_here,
         };
-        let kept = base.and_then(|c| c.ql.clone());
         let reading = self.note_equality(writer, &state);
-        tx.install(reading, Some(self.certificate(state, kept, facts)));
+        let certificate = self.certificate(state, facts, &generation);
+        tx.install(
+            reading,
+            Some(self.read_basis(Some(certificate), generation)),
+        );
     }
 
     /// The current record made again under the settings now (a registration, the QL setting,
@@ -649,18 +717,21 @@ impl StoreService {
     fn recertify(
         &self,
         tx: &nrese_engine::Transaction<'_>,
+        generation: crate::support::Generation,
         edit: impl FnOnce(&mut crate::ReasoningState),
     ) {
-        let Some(base) = Certificate::record(tx.base()).filter(|c| c.exact) else {
+        let record = Certificate::record(tx.base());
+        let Some(base) = record.filter(|c| c.exact) else {
+            tx.install_certificate(self.read_basis(Self::without_verdict(record), generation));
             return;
         };
         let (mut state, literal) = (base.state.clone(), base.literal);
         edit(&mut state);
-        self.certify(tx, state, literal);
+        self.certify(tx, state, literal, generation);
     }
 
-    /// The record a maintained commit `tx` publishes, from its base's: the same stack's state,
-    /// QL schema and settings; its literal mark `Set` where the commit derived a literal
+    /// The record a maintained commit `tx` publishes, from its base's: the same stack's state
+    /// and settings, with its own rewriting; its literal mark `Set` where the commit derived a literal
     /// equality; the gate's ill-typed witness, or its own search under the memory stop where
     /// the gate didn't search and the base's witness is known; assessed where the base isn't
     /// held (a commit in quarantine checks only its own facts: the hold carried, not assessed).
@@ -670,8 +741,15 @@ impl StoreService {
         tx: &nrese_engine::Transaction<'_>,
         literal_equality: bool,
         witness: Option<IllTyped>,
+        dl_status: Option<crate::dl::DlStatus>,
     ) -> Option<nrese_engine::Certificate> {
-        let base = Certificate::record(tx.base()).filter(|c| c.exact)?;
+        let basis = ReadBasis::of(tx.base())?;
+        let record = basis.certificate.as_ref();
+        let Some(base) = record.filter(|c| c.exact) else {
+            let next = self.read_basis(Self::without_verdict(record), basis.generation.clone());
+            *next.dl_status.lock().unwrap_or_else(|p| p.into_inner()) = dl_status;
+            return Some(next);
+        };
         let cell = *base.ill_typed.lock().unwrap_or_else(|p| p.into_inner());
         let ill_typed = if crate::dl::query::keeps_ill_typed(base.dl, &base.state.ruleset) {
             witness.unwrap_or_else(|| {
@@ -683,9 +761,12 @@ impl StoreService {
         } else {
             cell
         };
-        Some(std::sync::Arc::new(Certificate {
+        let certificate = Certificate {
             state: base.state.clone(),
-            ql: base.ql.clone(),
+            ql: base
+                .ql
+                .as_ref()
+                .map(|ql| std::sync::Arc::new(nrese_sparql::ql::QlRewriting::new(ql.closure()))),
             equality_closed: base.equality_closed,
             dl: base.dl,
             user_rules: base.user_rules,
@@ -701,7 +782,10 @@ impl StoreService {
             } else {
                 base.literal
             },
-        }))
+        };
+        let next = self.read_basis(Some(certificate), basis.generation.clone());
+        *next.dl_status.lock().unwrap_or_else(|p| p.into_inner()) = dl_status;
+        Some(next)
     }
 
     /// The record a publication that doesn't maintain the inferences carries, by a holder of
@@ -709,8 +793,13 @@ impl StoreService {
     /// where there is no hold to keep.
     fn withheld(&self, _writer: nrese_engine::WriterHeld<'_>) -> Option<nrese_engine::Certificate> {
         let current = self.engine.snapshot();
-        let base = Certificate::record(&current).filter(|c| c.held)?;
-        Some(std::sync::Arc::new(Certificate {
+        let certificate = Self::without_verdict(Certificate::record(&current));
+        Some(self.read_basis(certificate, self.supports.generation()))
+    }
+
+    fn without_verdict(record: Option<&Certificate>) -> Option<Certificate> {
+        let base = record.filter(|c| c.held)?;
+        Some(Certificate {
             state: base.state.clone(),
             ql: None,
             equality_closed: false,
@@ -724,7 +813,7 @@ impl StoreService {
             assessed: false,
             held: true,
             literal: Literal::Unknown,
-        }))
+        })
     }
 
     /// Whether the store vouches for the stack `state` records: never on a replica (its reads
@@ -734,28 +823,43 @@ impl StoreService {
     /// `not-certified` until it is rebuilt. A reader of some graphs who sees inferences is
     /// refused with no rules registered all the same: the view of what its graphs support
     /// needs rules to be made at all.
-    fn vouches(&self, state: &crate::ReasoningState) -> bool {
-        let hide = self.config.hide_unnamed_classes;
-        !self.config.replica && self.supports.vouches_for(state, hide)
+    fn read_basis(
+        &self,
+        certificate: Option<Certificate>,
+        generation: crate::support::Generation,
+    ) -> std::sync::Arc<ReadBasis> {
+        std::sync::Arc::new(ReadBasis {
+            certificate,
+            generation,
+            dl_route: (self.dl.active(), self.dl.user_rules()),
+            dl_status: Default::default(),
+            omission: Default::default(),
+        })
     }
 
-    /// `state`'s record of an exact stack under the store's settings now, with `facts`; `kept`,
-    /// the QL schema to keep if its closure is the one `state` calls for. Whether the recorded
+    /// A publication made without running the rules carries the current generation and mode
+    /// and gives no verdict about the state of its closure. Called under the writer slot.
+    pub(crate) fn unreasoned_basis(&self) -> nrese_engine::Certificate {
+        self.read_basis(None, self.supports.generation())
+    }
+
+    /// `state`'s record of an exact stack under the store's settings now, with `facts`. Whether the recorded
     /// reasoning closes the data under `owl:sameAs` (a ruleset with the equality rules):
     /// queries may then rely on it. Its ill-typed literal isn't looked for until a need asks
     /// ([`Certificate::ill_typed`]).
     fn certificate(
         &self,
         state: crate::ReasoningState,
-        kept: Ql,
         facts: Facts,
-    ) -> nrese_engine::Certificate {
-        std::sync::Arc::new(Certificate {
-            ql: self.ql_for(&state, kept),
+        generation: &crate::support::Generation,
+    ) -> Certificate {
+        Certificate {
+            ql: self.ql_for(&state),
             equality_closed: nrese_reasoner::RuleProgram::closes_equality(&state.ruleset),
             dl: self.dl.active(),
             user_rules: self.dl.user_rules(),
-            vouched: self.vouches(&state),
+            vouched: !self.config.replica
+                && generation.vouches_for(&state, self.config.hide_unnamed_classes),
             state,
             ill_typed: Default::default(),
             exact: true,
@@ -764,7 +868,7 @@ impl StoreService {
             assessed: facts.assessed,
             held: facts.held,
             literal: facts.literal,
-        })
+        }
     }
 
     /// How the certified stack is read: a stack kept over representatives
@@ -790,7 +894,7 @@ impl StoreService {
     /// ql-rewriting.md §4): `owl2-ql` and `owl2-rl` make the data H-complete, `owl2-rl`
     /// with its list rules; the others don't close inverses or the domains of restrictions.
     /// Under `owl2-dl` the bounds give those answers ([`crate::dl`]): no rewriting.
-    fn ql_for(&self, state: &crate::ReasoningState, kept: Ql) -> Ql {
+    fn ql_for(&self, state: &crate::ReasoningState) -> Ql {
         use nrese_sparql::ql::{Closure, QlRewriting};
         let closure = match state.ruleset.as_str() {
             "owl2-rl" => Some(Closure { lists: true }),
@@ -799,9 +903,7 @@ impl StoreService {
         };
         let closure =
             closure.filter(|_| self.ql_rewriting().applies_to(&state.ruleset) && !self.dl.active());
-        // The same closure keeps its compiled schema.
-        kept.filter(|q| Some(q.closure()) == closure)
-            .or_else(|| closure.map(|closure| std::sync::Arc::new(QlRewriting::new(closure))))
+        closure.map(|closure| std::sync::Arc::new(QlRewriting::new(closure)))
     }
 
     /// When queries are rewritten for OWL 2 QL.
@@ -892,7 +994,7 @@ impl StoreService {
         *self.ql_mode.write().unwrap_or_else(|p| p.into_inner()) = mode;
         #[cfg(test)]
         hooks::run(&hooks::AFTER_QL_READ);
-        self.recertify(&tx, |_| {});
+        self.recertify(&tx, self.supports.generation(), |_| {});
     }
 
     /// The store's namespace prefixes ([`crate::namespaces`]).
@@ -962,7 +1064,9 @@ impl StoreService {
     /// first need, stopped ([`Certificate::ill_typed`]). A clean OWL 2 QL assessment
     /// remains undecided until a consistency check can decide it.
     pub fn consistency(&self) -> crate::ConsistencyStatus {
-        self.consistency_at(&self.engine.snapshot(), None)
+        let snapshot = self.engine.snapshot();
+        self.assess(Revision::Committed(&snapshot), Evidence::Publication(None))
+            .consistency()
     }
 
     /// [`Self::consistency`] of `snapshot`'s version, reusing its literal check when supplied.
@@ -992,11 +1096,20 @@ impl StoreService {
 
     /// The verdict, its OWL 2 QL explanation when available, and quarantine on one snapshot.
     pub fn undecided_report(&self) -> (crate::ConsistencyStatus, Option<UndecidedReport>, bool) {
-        use crate::{ConsistencyStatus::Undecided, WhyUndecided::NoQlDecider};
         let snapshot = self.engine.snapshot();
-        let status = self.consistency_at(&snapshot, None);
-        let mut quarantined = Certificate::assessment(&snapshot, self.config.replica).held;
-        let report = match status {
+        let claim = self.assess(Revision::Committed(&snapshot), Evidence::Publication(None));
+        let (report, quarantined) = self.disposition_at(&snapshot, &claim);
+        (claim.consistency(), report, quarantined)
+    }
+
+    fn disposition_at(
+        &self,
+        snapshot: &Snapshot,
+        claim: &Claim,
+    ) -> (Option<UndecidedReport>, bool) {
+        use crate::{ConsistencyStatus::Undecided, WhyUndecided::NoQlDecider};
+        let mut quarantined = Certificate::assessment(snapshot, self.config.replica).held;
+        let report = match claim.consistency() {
             Undecided {
                 why: NoQlDecider, ..
             } => {
@@ -1009,25 +1122,52 @@ impl StoreService {
             }
             _ => None,
         };
-        (status, report, quarantined)
+        (report, quarantined)
     }
 
     /// Whether the store is in quarantine, readable and repairable but not ready: the current
     /// version's record holds a rules clash, or the consistency policy quarantines its
     /// undecided OWL 2 QL verdict.
     pub fn is_quarantined(&self) -> bool {
-        use crate::{ConsistencyStatus::Undecided, WhyUndecided::NoQlDecider};
         let snapshot = self.engine.snapshot();
         Certificate::assessment(&snapshot, self.config.replica).held
             || (Certificate::of(&snapshot).is_some_and(Certificate::uses_owl2_ql)
                 && self.dispose(Route::Published) == Disposition::Quarantined
                 && matches!(
-                    self.consistency_at(&snapshot, None),
-                    Undecided {
-                        why: NoQlDecider,
+                    self.assess(Revision::Committed(&snapshot), Evidence::Publication(None))
+                        .consistency(),
+                    crate::ConsistencyStatus::Undecided {
+                        why: crate::WhyUndecided::NoQlDecider,
                         ..
                     }
                 ))
+    }
+
+    /// The answer and metadata for repository information, from a single held publication.
+    pub fn publication_report(&self) -> PublicationReport {
+        let snapshot = self.engine.snapshot();
+        #[cfg(test)]
+        hooks::run(&hooks::AFTER_DECIDED);
+        let dl_mode = Certificate::route(&snapshot, &self.dl).0;
+        let dl = dl_mode.then(|| ReadBasis::dl_status(&snapshot)).flatten();
+        let verdict = dl.as_ref().map(|status| status.consistency.verdict.clone());
+        let claim = self.assess(
+            Revision::Committed(&snapshot),
+            Evidence::Publication(verdict),
+        );
+        let (undecided, quarantined) = self.disposition_at(&snapshot, &claim);
+        PublicationReport {
+            claim,
+            undecided,
+            quarantined,
+            revision: snapshot.revision(),
+            stats: collect_stats(&snapshot),
+            shacl: self.shacl_gate_state_at(&snapshot),
+            dl_mode,
+            dl_engine: dl
+                .as_ref()
+                .map_or("none", |status| status.consistency.engine),
+        }
     }
 
     /// Whether the certificate covers `program` for a holder of the writer slot: no write can
@@ -1121,7 +1261,8 @@ impl StoreService {
         #[cfg(test)]
         hooks::run(&hooks::BEFORE_CLEAR_PUBLICATION);
         // An empty stack is read as stored, installed even where it was empty already.
-        let finished = rematerialisation.finish_held(Vec::new(), None, None)?;
+        let basis = self.read_basis(None, self.supports.generation());
+        let finished = rematerialisation.finish_held(Vec::new(), None, Some(basis))?;
         Ok(finished.summary().inferred_deleted)
     }
 
@@ -1337,24 +1478,24 @@ impl StoreService {
 
     fn query_view(
         &self,
+        base: &Snapshot,
         prepared: &PreparedQuery,
         memory: &nrese_exec::Envelope,
         cancel: &CancellationToken,
     ) -> StoreResult<Snapshot> {
-        let snapshot = self.engine.snapshot();
         let Some(scope) = &prepared.inference_scope else {
-            return self.view_of(&snapshot, prepared.access(), memory, Some(cancel));
+            return self.view_of(base, prepared.access(), memory, Some(cancel));
         };
         let view = self
             .reading(Some(scope), memory, Some(cancel))
             .expect("the dataset's selector requests inferred statements")
-            .scoped(
-                &snapshot,
-                prepared.read_model(),
-                prepared.access().is_some(),
-            )?;
-        self.refuse_exact(prepared, &snapshot, || {
-            self.status_outside_dl(prepared, None, Revision::Committed(&view))
+            .scoped(base, prepared.read_model(), prepared.access().is_some())?;
+        self.refuse_exact(prepared, base, || {
+            let at = Revision::View {
+                base,
+                snapshot: &view,
+            };
+            self.status_outside_dl(prepared, None, at, None)
         })?;
         Ok(view)
     }
@@ -1394,7 +1535,7 @@ impl StoreService {
 
     /// The rules the inferred stack is maintained with (reasoner v2; `None`: none), for
     /// the support graph sets of [`Self::read_snapshot`]. The mutation pipeline registers
-    /// its own. What the store vouches for follows them (`Self::vouches`): a stack other
+    /// its own. What the store vouches for follows them: a stack other
     /// rules made is read as stored and told `not-certified` until it is rebuilt; with `None`
     /// after a registration it is told what its marker says again. Taken under the writer
     /// slot, as every change of the certificate: it waits for a write, a bulk load or a
@@ -1403,10 +1544,11 @@ impl StoreService {
         let tx = self.engine.transaction();
         // The record made under the new rules is installed before the slot goes back; a
         // reader judges each version by its own record.
-        self.supports.use_rules(rules);
+        let generation = self.supports.generation().with_rules(rules);
         #[cfg(test)]
         hooks::run(&hooks::AFTER_RULES_REGISTERED);
-        self.recertify(&tx, |_| {});
+        self.recertify(&tx, generation.clone(), |_| {});
+        self.supports.set_generation(generation);
     }
 
     /// Switches the `owl2-dl` mode's work on or off ([`crate::dl`]): the mutation
@@ -1421,7 +1563,7 @@ impl StoreService {
         // call for, whatever came first. A state with violations: whether `owl2-dl` decides
         // them, derived under the mode now set (`ReasoningState::undecided`).
         let treatments = &self.config.dl.treatments;
-        self.recertify(&tx, |state| {
+        self.recertify(&tx, self.supports.generation(), |state| {
             if state.violations > 0 {
                 state.undecided = active
                     .then(|| self.dl.undecided(tx.base(), treatments))
@@ -1462,7 +1604,7 @@ impl StoreService {
             &cancellation,
             &mut payload,
             |status, _| {
-                completeness = status;
+                completeness = Some(status);
                 None
             },
         )?;
@@ -1470,8 +1612,10 @@ impl StoreService {
             kind: prepared.kind(),
             media_type: prepared.media_type(),
             payload,
-            ql,
-            completeness,
+            ql: ql
+                .zip(completeness.as_ref())
+                .map(|(report, claim)| ql_claim(report, claim)),
+            completeness: completeness.and_then(Claim::into_report),
         })
     }
 
@@ -1606,11 +1750,13 @@ impl StoreService {
         prepared: &PreparedQuery,
         cancellation: &CancellationToken,
         out: impl std::io::Write,
-        report: impl FnOnce(Option<nrese_sparql::Completeness>, StatusHeader) -> Option<String>,
+        report: impl FnOnce(Option<Claim>, StatusHeader) -> Option<String>,
     ) -> StoreResult<()> {
         let memory = self.settings.query_envelope(prepared);
-        self.run_reporting(prepared, &memory, cancellation, out, report)
-            .map(|_| ())
+        self.run_reporting(prepared, &memory, cancellation, out, |claim, kept| {
+            report(claim.into_report(), kept)
+        })
+        .map(|_| ())
     }
 
     /// [`Self::run_query`] with the answers' status and, under `owl2-dl`, what decided it
@@ -1622,11 +1768,11 @@ impl StoreService {
         prepared: &PreparedQuery,
         cancellation: &CancellationToken,
         out: impl std::io::Write,
-    ) -> StoreResult<Option<(nrese_sparql::Completeness, crate::dl::DlDetail)>> {
+    ) -> StoreResult<Option<(Claim, crate::dl::DlDetail)>> {
         let mut status = None;
         let memory = self.settings.query_envelope(prepared);
         let (detail, _) = self.run_reporting(prepared, &memory, cancellation, out, |s, _| {
-            status = s;
+            status = s.into_report();
             None
         })?;
         Ok(status.map(|s| (s, detail.unwrap_or_default())))
@@ -1640,13 +1786,12 @@ impl StoreService {
         memory: &nrese_exec::Envelope,
         cancellation: &CancellationToken,
         out: impl std::io::Write,
-        report: impl FnOnce(Option<nrese_sparql::Completeness>, StatusHeader) -> Option<String>,
+        report: impl FnOnce(Claim, StatusHeader) -> Option<String>,
     ) -> StoreResult<(
         Option<crate::dl::DlDetail>,
         Option<nrese_sparql::ql::QlReport>,
     )> {
         let run = self.run_reporting_whole(prepared, memory, cancellation, out, report);
-        let run = run.map_err(|error| refusal_for_its_reader(prepared, error));
         for_its_reader(prepared, crate::EntryPoint::Run, run, |_| {})
     }
 
@@ -1656,7 +1801,7 @@ impl StoreService {
         memory: &nrese_exec::Envelope,
         cancellation: &CancellationToken,
         out: impl std::io::Write,
-        report: impl FnOnce(Option<nrese_sparql::Completeness>, StatusHeader) -> Option<String>,
+        report: impl FnOnce(Claim, StatusHeader) -> Option<String>,
     ) -> StoreResult<(
         Option<crate::dl::DlDetail>,
         Option<nrese_sparql::ql::QlReport>,
@@ -1668,13 +1813,27 @@ impl StoreService {
         // draws from it.
         let memory = memory.clone();
         // One snapshot the route, the answers and their status are all of (T3, N5).
-        let snapshot = self.query_view(prepared, &memory, cancellation)?;
+        let base = self.engine.snapshot();
+        let snapshot = self.query_view(&base, prepared, &memory, cancellation)?;
+        let at = Revision::View {
+            base: &base,
+            snapshot: &snapshot,
+        };
         prepared.announce_on(&snapshot);
-        if let Some(mode) = self.dl_mode(prepared, &snapshot) {
+        if let Some(mode) = self.dl_mode(prepared, &base) {
             use crate::dl::query::{Outcome, Read};
-            let detail = match answer(self, &snapshot, prepared, cancellation, &memory, mode)? {
+            let mut context = Vec::new();
+            let detail = match answer(
+                self,
+                at,
+                prepared,
+                cancellation,
+                &memory,
+                mode,
+                Some(&mut context),
+            )? {
                 Outcome::Answers(answers, status, detail) => {
-                    report(self.told(prepared, Some(status), false), None);
+                    report(status, None);
                     crate::query_executor::write_answers(prepared, answers, cancellation, out)?;
                     detail
                 }
@@ -1685,7 +1844,6 @@ impl StoreService {
                     let snapshot = match read {
                         Read::Lower(snapshot) | Read::At(snapshot) => snapshot,
                     };
-                    let context = dl_context(mode, &status);
                     run_query(
                         &snapshot,
                         prepared,
@@ -1693,10 +1851,7 @@ impl StoreService {
                         cancellation,
                         &memory,
                         out,
-                        |_| {
-                            let told = self.told(prepared, Some(status), false);
-                            (context, move |kept| report(told, kept))
-                        },
+                        |_| (context, move |kept| report(status, kept)),
                     )?;
                     detail
                 }
@@ -1705,10 +1860,9 @@ impl StoreService {
         }
         #[cfg(test)]
         hooks::run(&hooks::AFTER_DECIDED);
-        let at = Revision::Committed(&snapshot);
-        let status = || self.status_outside_dl(prepared, None, at);
+        let status = || self.status_outside_dl(prepared, None, at, None);
         if prepared.inference_scope.is_none() {
-            self.refuse_exact(prepared, &snapshot, status)?;
+            self.refuse_exact(prepared, &base, status)?;
         }
         // Set where the status is decided, before the answer, a cached one too.
         let mut withheld = true;
@@ -1722,12 +1876,10 @@ impl StoreService {
             |mut ql| {
                 self.certify_ql(ql.as_deref_mut(), prepared, &snapshot);
                 let ql = ql.as_deref();
-                let status = self.status_outside_dl(prepared, ql, at);
-                // The cache's context is the whole assessment, not what the reader is told.
-                let context = context_outside_dl(status.as_ref(), ql.is_some());
-                let told = self.told(prepared, status, ql.is_some());
-                withheld = withholds_report(prepared, told.as_ref());
-                (context, move |kept| report(told, kept))
+                let mut context = Vec::new();
+                let claim = self.status_outside_dl(prepared, ql, at, Some(&mut context));
+                withheld = withholds_report(prepared, &claim);
+                (context, move |kept| report(claim, kept))
             },
         )?;
         Ok((None, ql.filter(|_| !withheld)))
@@ -1742,16 +1894,21 @@ impl StoreService {
         prepared: &PreparedQuery,
         ql: Option<&nrese_sparql::ql::QlReport>,
         at: Revision<'_>,
-    ) -> Option<nrese_sparql::Completeness> {
-        if prepared.inference_scope.is_some() {
-            return (!Certificate::bare(at.snapshot(), false))
-                .then(nrese_sparql::Completeness::not_certified);
-        }
+        cache: Option<&mut Vec<u8>>,
+    ) -> Claim {
         let route = match ql {
             Some(ql) => Some(ql.completeness.clone()),
             None => self.status_without_dl_at(prepared, at),
         };
-        self.assess(prepared, at, route)
+        self.assess(
+            at,
+            Evidence::Query {
+                prepared,
+                route,
+                rewritten: ql.is_some(),
+                cache,
+            },
+        )
     }
 
     /// The one composition of a read's status (T3), on the snapshot `at` it read, after the
@@ -1764,19 +1921,25 @@ impl StoreService {
     /// inferences rest on. Under `owl2-dl` the question-only
     /// individuals ([`crate::dl::query::mark`]); then the negation rule again, over all that
     /// was taken away.
-    pub(crate) fn assess(
+    fn compose_query_status(
         &self,
         prepared: &PreparedQuery,
         at: Revision<'_>,
         route: Option<nrese_sparql::Completeness>,
     ) -> Option<nrese_sparql::Completeness> {
+        let snapshot = at.snapshot();
+        if prepared.inference_scope.is_some() {
+            return (!Certificate::bare(snapshot, false))
+                .then(nrese_sparql::Completeness::not_certified);
+        }
         if prepared.read_model() == ReadModel::Asserted {
             return None;
         }
-        let snapshot = at.snapshot();
-        let unpublished = matches!(at, Revision::Committed(_)) && snapshot.shared_state().is_none();
+        let unpublished = matches!(at, Revision::Committed(_) | Revision::View { .. })
+            && snapshot.shared_state().is_none();
         let Some(certificate) = Certificate::of(snapshot).filter(|_| !unpublished) else {
-            let bare = Certificate::bare(snapshot, self.supports.has_rules());
+            let ever = ReadBasis::of(at.base()).is_some_and(|basis| basis.generation.ever);
+            let bare = Certificate::bare(snapshot, ever);
             return (!bare).then(nrese_sparql::Completeness::not_certified);
         };
         let mut status = route?;
@@ -1821,27 +1984,22 @@ impl StoreService {
     /// told it (`status_for_its_reader`), but where reasoning is on a reader by support is told
     /// `not-certified` whatever its read tells: its status is its view's, known only as the read
     /// runs. The read's status is the authority; `not-certified` here says nothing of the data.
-    pub fn status_without_dl(
-        &self,
-        prepared: &PreparedQuery,
-    ) -> Option<nrese_sparql::Completeness> {
+    pub fn status_without_dl(&self, prepared: &PreparedQuery) -> Option<Claim> {
         let snapshot = self.engine.snapshot();
-        let status = self.status_outside_dl(prepared, None, Revision::Committed(&snapshot));
-        let reasoned = !Certificate::bare(&snapshot, self.supports.has_rules());
+        let ever = ReadBasis::of(&snapshot).is_some_and(|basis| basis.generation.ever);
+        let reasoned = !Certificate::bare(&snapshot, ever);
+        let at = Revision::Committed(&snapshot);
         if reasoned && prepared.access().is_some_and(|a| a.inferred_by_support) {
-            return Some(nrese_sparql::Completeness::not_certified());
+            return Some(self.assess(
+                at,
+                Evidence::Service {
+                    status: nrese_sparql::Completeness::not_certified(),
+                    verdict: None,
+                },
+            ));
         }
-        self.told(prepared, status, false)
-    }
-
-    /// [`status_for_its_reader`] under this store's equality.
-    fn told(
-        &self,
-        prepared: &PreparedQuery,
-        status: Option<nrese_sparql::Completeness>,
-        rewritten: bool,
-    ) -> Option<nrese_sparql::Completeness> {
-        status_for_its_reader(prepared, status, rewritten, self.config.equality_compact)
+        self.status_outside_dl(prepared, None, at, None)
+            .into_report()
     }
 
     /// [`Self::status_without_dl`] of a read of the data `at`.
@@ -1907,15 +2065,13 @@ impl StoreService {
         &self,
         prepared: &PreparedQuery,
         at: &Snapshot,
-        status: impl FnOnce() -> Option<nrese_sparql::Completeness>,
+        status: impl FnOnce() -> Claim,
     ) -> StoreResult<()> {
         let mode = prepared.dl_answers().unwrap_or(self.config.dl.answers);
         if !Certificate::route(at, &self.dl).0 || mode != crate::DlAnswers::Exact {
             return Ok(());
         }
-        status().map_or(Ok(()), |status| {
-            crate::dl::query::refuse_unless_complete(mode, &status, Vec::new)
-        })
+        crate::dl::query::refuse_unless_complete(mode, &status(), Vec::new)
     }
 
     /// What every query gets from the store.
@@ -1972,12 +2128,6 @@ impl StoreService {
                 explanation.steps.clear();
                 explanation.rewrites.clear();
                 explanation.decoded = 0;
-                certification_for_its_reader(
-                    prepared,
-                    &mut explanation.completeness,
-                    &mut explanation.ql,
-                    self.config.equality_compact,
-                );
             },
         )
     }
@@ -1992,36 +2142,54 @@ impl StoreService {
             .running
             .register(prepared.text(), prepared.origin(), cancellation);
         let memory = memory.clone();
-        let snapshot = self.query_view(prepared, &memory, cancellation)?;
+        let base = self.engine.snapshot();
+        let snapshot = self.query_view(&base, prepared, &memory, cancellation)?;
+        let at = Revision::View {
+            base: &base,
+            snapshot: &snapshot,
+        };
         #[cfg(test)]
         hooks::run(&hooks::AFTER_DECIDED);
         let mut explanation =
             explain_prepared(&snapshot, prepared, &self.settings, cancellation, &memory)?;
         self.certify_ql(explanation.ql.as_mut(), prepared, &snapshot);
-        if let Some(mode) = self.dl_mode(prepared, &snapshot) {
+        let claim = if let Some(mode) = self.dl_mode(prepared, &base) {
             // The status as the query would answer, never failing for it.
             let mode = match mode {
                 crate::DlAnswers::Exact => crate::DlAnswers::CertainWhereComplete,
                 other => other,
             };
-            let answered = answer(self, &snapshot, prepared, cancellation, &memory, mode)?;
+            let answered = answer(self, at, prepared, cancellation, &memory, mode, None)?;
             let (status, detail) = match answered {
                 crate::dl::query::Outcome::Answers(_, status, detail)
                 | crate::dl::query::Outcome::Stream(status, _, detail) => (status, detail),
             };
-            explanation.completeness = Some(status);
             explanation.decided_by = detail.paths;
             explanation.candidates = Some(nrese_sparql::Candidates {
                 proved: detail.proved,
                 refuted: detail.refuted,
                 refuted_by_labels: detail.refuted_by_labels,
             });
+            status
         } else {
-            let at = Revision::Committed(&snapshot);
-            explanation.completeness =
-                self.status_outside_dl(prepared, explanation.ql.as_ref(), at);
-        }
-        Ok(explanation)
+            self.status_outside_dl(prepared, explanation.ql.as_ref(), at, None)
+        };
+        let ql = explanation
+            .ql
+            .filter(|_| !withholds_report(prepared, &claim))
+            .map(|report| ql_claim(report, &claim));
+        Ok(nrese_sparql::Explanation {
+            executor: explanation.executor,
+            rewrites: explanation.rewrites,
+            steps: explanation.steps,
+            rows: explanation.rows,
+            decoded: explanation.decoded,
+            micros: explanation.micros,
+            ql,
+            completeness: Some(claim),
+            decided_by: explanation.decided_by,
+            candidates: explanation.candidates,
+        })
     }
 
     /// The plan `prepared` would run as, each node with its estimated rows, without
@@ -2052,12 +2220,6 @@ impl StoreService {
             |planned| {
                 planned.steps.clear();
                 planned.rewrites.clear();
-                certification_for_its_reader(
-                    prepared,
-                    &mut planned.completeness,
-                    &mut planned.ql,
-                    self.config.equality_compact,
-                );
             },
         )
     }
@@ -2069,18 +2231,31 @@ impl StoreService {
         cancellation: &CancellationToken,
     ) -> StoreResult<crate::PlannedQuery> {
         let memory = memory.clone();
-        let snapshot = self.query_view(prepared, &memory, cancellation)?;
+        let base = self.engine.snapshot();
+        let snapshot = self.query_view(&base, prepared, &memory, cancellation)?;
+        let at = Revision::View {
+            base: &base,
+            snapshot: &snapshot,
+        };
         #[cfg(test)]
         hooks::run(&hooks::AFTER_DECIDED);
         let mut planned =
             plan_prepared(&snapshot, prepared, &self.settings, cancellation, &memory)?;
         self.certify_ql(planned.ql.as_mut(), prepared, &snapshot);
-        let at = Revision::Committed(&snapshot);
-        planned.completeness = match self.dl_mode(prepared, &snapshot) {
-            Some(_) => Some(plan_status(self, &snapshot, prepared, cancellation)?),
-            None => self.status_outside_dl(prepared, planned.ql.as_ref(), at),
+        let claim = match self.dl_mode(prepared, &base) {
+            Some(_) => plan_status(self, at, prepared, cancellation)?,
+            None => self.status_outside_dl(prepared, planned.ql.as_ref(), at, None),
         };
-        Ok(planned)
+        let ql = planned
+            .ql
+            .filter(|_| !withholds_report(prepared, &claim))
+            .map(|report| ql_claim(report, &claim));
+        Ok(nrese_sparql::PlannedQuery {
+            rewrites: planned.rewrites,
+            steps: planned.steps,
+            ql,
+            completeness: Some(claim),
+        })
     }
 
     /// Bytes the running queries have reserved now, the most reserved at once, and the
@@ -2101,20 +2276,23 @@ impl StoreService {
         &self,
         query: &str,
         form: nrese_sparql::ql::PrintForm,
-    ) -> StoreResult<nrese_sparql::ql::Printed> {
+    ) -> StoreResult<nrese_sparql::ql::Printed<Claim>> {
+        use nrese_sparql::ql::Printed;
         let query = nrese_sparql::compat::parse_query(query, None)?;
         let snapshot = self.engine.snapshot();
-        let mut printed = nrese_sparql::ql::print(&snapshot, &query, form)?;
-        // The status this store gives the same answers ([`Self::status_outside_dl`]): its
-        // regime, as the rewriting's run sets it for the RL closure, and its composition, the
-        // list mark included.
-        if let nrese_sparql::ql::Printed::Query { completeness, .. } = &mut printed {
-            completeness.regime = Some(nrese_sparql::Regime::Owl2Rl);
-            let reads = crate::dl::query::Reads::default();
-            let query = (&query, &reads);
-            crate::dl::query::certify_report(Some(completeness), query, Some(&snapshot), self);
-        }
-        Ok(printed)
+        Ok(match nrese_sparql::ql::print(&snapshot, &query, form)? {
+            Printed::NotExpressible(reasons) => Printed::NotExpressible(reasons),
+            Printed::Query { text, completeness } => Printed::Query {
+                text,
+                completeness: self.assess(
+                    Revision::Committed(&snapshot),
+                    Evidence::Printed {
+                        query: &query,
+                        status: completeness,
+                    },
+                ),
+            },
+        })
     }
 
     /// A query over every graph (the server's own work, tests).
@@ -2188,9 +2366,8 @@ impl StoreService {
     /// ([`crate::sessions`]); `scope` is the reader's, by which the operations were scoped.
     /// What the operations' replay and the reader's view read and build is charged to
     /// `memory`, the reading query's envelope ([`Self::read_snapshot_within`]).
-    /// When pending declarations need rebuilding, they use the rules captured at the start of
-    /// that attempt. A fresh restricted view is rebuilt once if the rules epoch differs from
-    /// the captured epoch. A second mismatch returns `Unavailable::OtherProgram`.
+    /// A pending declaration rebuild and the reader's access view use this transaction's
+    /// committed base and its published rules.
     fn with_pending<T>(
         &self,
         pending: &crate::StatementsRequest,
@@ -2199,7 +2376,14 @@ impl StoreService {
         cancellation: &CancellationToken,
         read: impl FnOnce(&nrese_engine::Snapshot) -> StoreResult<T>,
     ) -> StoreResult<T> {
-        self.with_pending_record(pending, scope, memory, cancellation, |view, _| read(view))
+        self.with_pending_record(
+            self.engine.snapshot(),
+            pending,
+            scope,
+            memory,
+            cancellation,
+            |view, _| read(view),
+        )
     }
 
     /// [`Self::with_pending`], handing `read` too whether the operations keep their base's
@@ -2207,91 +2391,73 @@ impl StoreService {
     /// session's view as the view is.
     fn with_pending_record<T>(
         &self,
+        base: Snapshot,
         pending: &crate::StatementsRequest,
         scope: &crate::ReadScope,
         memory: &nrese_exec::Envelope,
         cancellation: &CancellationToken,
         read: impl FnOnce(&nrese_engine::Snapshot, bool) -> StoreResult<T>,
     ) -> StoreResult<T> {
-        #[cfg(test)]
-        hooks::run(&hooks::BEFORE_PENDING_GENERATION);
-        let mut retried = false;
-        loop {
-            // Capture the rules for declaration rebuilding with the epoch that keys this view.
-            // A view can only be kept under the epoch read before it was made.
-            let (rules, epoch) = self.supports.generation_now();
-            #[cfg(test)]
-            hooks::run(&hooks::AFTER_PENDING_GENERATION);
-            if let Some((view, keeps_record)) =
-                self.sessions
-                    .view(&self.engine.snapshot(), scope, pending, epoch)
-            {
-                return read(&view, keeps_record);
-            }
-            // Never committed: no writer slot, so other clients commit meanwhile. The operations
-            // read as the reader may; what they change is checked at the commit (the view is
-            // the reader's own, and shows the graphs it may read only). A private transaction
-            // (dictionary lifecycle V1): the operations' own terms and pending changes are charged
-            // to the reading query's envelope, and none enters the dictionary; the commit replays
-            // the operations, never these ids. One budget for the request, so its pending snapshot
-            // is made once (`pending_snapshot_within`'s memo).
-            let budget = std::sync::Arc::new(memory.part());
-            let mut tx = self.engine.speculative(std::sync::Arc::clone(&budget));
-            let context = self.update_context(memory.clone(), cancellation);
-            let requester = crate::Requester::new(scope.clone(), crate::WriteScope::All);
-            crate::statements::apply_statements(
-                &mut tx,
-                pending,
-                &requester,
-                &budget,
-                &mut |tx, request| {
-                    crate::mutation::command::apply_sparql_update(tx, request, &requester, &context)
-                },
-            )
-            .map_err(crate::StoreError::refusal_within)?;
-            self.rebuild_pending_declarations(&mut tx, rules, &budget, cancellation)?;
-            let keeps_record = self.dl().bounds.keeps_record(&tx);
-            let reading = self.reading(scope.access(), memory, Some(cancellation));
-            let restricted = reading.is_some();
-            let view = match reading {
-                Some(reading) => reading.pending(&tx, &budget)?,
-                // Operations that touch no input of the list scan (a list fact; under compact
-                // equality, any) leave out the lists their base does (a reader's own view, above,
-                // may drop equality's copies of list cells: it scans).
-                None => {
-                    use crate::reasoning::Program;
-                    let view = tx.pending_snapshot_within(&budget)?;
-                    if !Program::touches_a_list(&view, tx.inserted().chain(tx.deleted())) {
-                        self.lists.own(&view, || false);
-                    }
-                    view
-                }
-            };
-            let current = self.supports.epoch();
-            if restricted && current != epoch {
-                // The support view reads the live rules. Discard the attempt if it could
-                // have combined that view with a declaration rebuild under other rules.
-                if retried {
-                    return Err(crate::support::Unavailable::OtherProgram(self.dl.replica()).into());
-                }
-                retried = true;
-                continue;
-            }
-            self.sessions.keep_view(
-                tx.base().clone(),
-                scope,
-                pending,
-                (view.clone(), keeps_record),
-                epoch,
-                current,
-            );
+        let generation = ReadBasis::of(&base).map(|basis| &basis.generation);
+        let epoch = generation.map_or(0, |generation| generation.epoch);
+        if let Some((view, keeps_record)) = self.sessions.view(&base, scope, pending, epoch) {
             return read(&view, keeps_record);
         }
+        // Never committed: no writer slot, so other clients commit meanwhile. The operations
+        // read as the reader may; what they change is checked at the commit (the view is
+        // the reader's own, and shows the graphs it may read only). A private transaction
+        // (dictionary lifecycle V1): the operations' own terms and pending changes are charged
+        // to the reading query's envelope, and none enters the dictionary; the commit replays
+        // the operations, never these ids. One budget for the request, so its pending snapshot
+        // is made once (`pending_snapshot_within`'s memo).
+        let budget = std::sync::Arc::new(memory.part());
+        let mut tx = self
+            .engine
+            .speculative_over(&base, std::sync::Arc::clone(&budget))?;
+        #[cfg(test)]
+        hooks::run(&hooks::AFTER_PENDING_BASE);
+        let context = self.update_context(memory.clone(), cancellation);
+        let requester = crate::Requester::new(scope.clone(), crate::WriteScope::All);
+        crate::statements::apply_statements(
+            &mut tx,
+            pending,
+            &requester,
+            &budget,
+            &mut |tx, request| {
+                crate::mutation::command::apply_sparql_update(tx, request, &requester, &context)
+            },
+        )
+        .map_err(crate::StoreError::refusal_within)?;
+        let rules = generation.and_then(|generation| generation.rules.clone());
+        self.rebuild_pending_declarations(&mut tx, rules, &budget, cancellation)?;
+        let keeps_record = self.dl().bounds.keeps_record(&tx);
+        let view = match self.reading(scope.access(), memory, Some(cancellation)) {
+            Some(reading) => reading.pending(&tx, &budget)?,
+            // Operations that touch no input of the list scan (a list fact; under compact
+            // equality, any) leave out the lists their base does (a reader's own view, above,
+            // may drop equality's copies of list cells: it scans).
+            None => {
+                use crate::reasoning::Program;
+                let view = tx.pending_snapshot_within(&budget)?;
+                if !Program::touches_a_list(&view, tx.inserted().chain(tx.deleted())) {
+                    self.lists.own(&view, || false);
+                }
+                view
+            }
+        };
+        self.sessions.keep_view(
+            tx.base().clone(),
+            scope,
+            pending,
+            (view.clone(), keeps_record),
+            epoch,
+            ReadBasis::of(&self.engine.snapshot()).map_or(0, |basis| basis.generation.epoch),
+        );
+        read(&view, keeps_record)
     }
 
     /// A pending change that changes the set of annotation properties rebuilds `tx`'s
-    /// inferred stack over its pending state using `rules`, captured as this attempt of the
-    /// read started.
+    /// inferred stack over its pending state using the rules published with its base.
     /// Other pending changes read the committed inferred stack until commit.
     fn rebuild_pending_declarations(
         &self,
@@ -2356,10 +2522,17 @@ impl StoreService {
         prepared: &PreparedQuery,
         cancellation: &CancellationToken,
         out: impl std::io::Write,
-        report: impl FnOnce(Option<nrese_sparql::Completeness>, StatusHeader) -> Option<String>,
+        report: impl FnOnce(Option<Claim>, StatusHeader) -> Option<String>,
     ) -> StoreResult<()> {
         let memory = self.settings.query_envelope(prepared);
-        self.run_pending_reporting(pending, prepared, &memory, cancellation, out, report)
+        self.run_pending_reporting(
+            pending,
+            prepared,
+            &memory,
+            cancellation,
+            out,
+            |claim, kept| report(claim.into_report(), kept),
+        )
     }
 
     /// [`Self::run_query_pending_reporting`] in the envelope `memory`.
@@ -2370,7 +2543,7 @@ impl StoreService {
         memory: &nrese_exec::Envelope,
         cancellation: &CancellationToken,
         out: impl std::io::Write,
-        report: impl FnOnce(Option<nrese_sparql::Completeness>, StatusHeader) -> Option<String>,
+        report: impl FnOnce(Claim, StatusHeader) -> Option<String>,
     ) -> StoreResult<()> {
         if pending.ops.is_empty() {
             return self
@@ -2391,13 +2564,14 @@ impl StoreService {
         let memory = memory.clone();
         // Announced on the committed view, as outside a transaction: what the transaction
         // asserts itself isn't (a refused view is told as the run's refusal is).
-        let latest = &self.engine.snapshot();
-        let committed = self.view_of(latest, prepared.access(), &memory, Some(cancellation));
+        let latest = self.engine.snapshot();
+        let committed = self.view_of(&latest, prepared.access(), &memory, Some(cancellation));
         if let Err(error) = committed.map(|view| prepared.announce_on(&view)) {
-            let run = Err(refusal_for_its_reader(prepared, error));
+            let run = Err(error);
             return for_its_reader(prepared, crate::EntryPoint::RunPending, run, |_| {});
         }
         let run = self.with_pending_record(
+            latest.clone(),
             pending,
             &scope,
             &memory,
@@ -2406,12 +2580,13 @@ impl StoreService {
                 // The status the answers carry, of the pending state `at` they are read from.
                 // Under `owl2-dl` the QL rewriting doesn't run: the status needs no report.
                 let at = Revision::Pending {
+                    base: &latest,
                     snapshot,
                     deletes,
                     keeps_record,
                 };
-                let status = || self.status_outside_dl(prepared, None, at);
-                self.refuse_exact(prepared, snapshot, status)?;
+                let status = || self.status_outside_dl(prepared, None, at, None);
+                self.refuse_exact(prepared, &latest, status)?;
                 run_query(
                     snapshot,
                     prepared,
@@ -2423,15 +2598,14 @@ impl StoreService {
                         // A transaction's pending state: never answered from the cache.
                         self.certify_ql(ql.as_deref_mut(), prepared, snapshot);
                         let ql = ql.as_deref();
-                        let status = self.status_outside_dl(prepared, ql, at);
-                        report(self.told(prepared, status, ql.is_some()), None);
+                        let status = self.status_outside_dl(prepared, ql, at, None);
+                        report(status, None);
                         (Vec::new(), |_| None)
                     },
                 )
                 .map(|_| ())
             },
         );
-        let run = run.map_err(|error| refusal_for_its_reader(prepared, error));
         for_its_reader(prepared, crate::EntryPoint::RunPending, run, |_| {})
     }
 
@@ -2634,7 +2808,9 @@ impl StoreService {
             self.invalidate_reasoning()?;
         }
         let before = self.current_revision();
-        let applied = self.engine.apply_log(frames, expected, stop);
+        let applied = self
+            .engine
+            .apply_log_with_certificate(frames, expected, stop, || Some(self.unreasoned_basis()));
         #[cfg(test)]
         hooks::run(&hooks::AFTER_WRITE_PUBLICATION);
         let view = self.engine.snapshot();
@@ -2907,7 +3083,7 @@ impl StoreService {
         scope: &crate::ReadScope,
         statement: [nrese_rdf::TermRef<'_>; 3],
         mode: crate::reasoning::JustificationMode,
-    ) -> StoreResult<Option<crate::reasoning::JustificationAnswer>> {
+    ) -> StoreResult<Option<StatementJustification>> {
         let whole = self.justify_statement_whole(program.into(), scope, statement, mode);
         scope.told(crate::EntryPoint::JustifyStatement, whole)
     }
@@ -2918,21 +3094,45 @@ impl StoreService {
         scope: &crate::ReadScope,
         statement: [nrese_rdf::TermRef<'_>; 3],
         mode: crate::reasoning::JustificationMode,
-    ) -> StoreResult<Option<crate::reasoning::JustificationAnswer>> {
+    ) -> StoreResult<Option<StatementJustification>> {
         let snapshot = self.engine.snapshot();
         // Admitted before anything of it is read, as [`Self::explain_statement_whole`].
         let envelope = self.settings.envelope(None);
         self.view_of(&snapshot, scope.access(), &envelope, None)?;
+        let regime = nrese_sparql::Regime::of_ruleset(&program.name());
         let program = self.bound_program(&snapshot, program)?;
         let Some(fact) = Self::fact_of(&snapshot, statement) else {
             return Ok(None);
         };
         let justify = |readable| {
-            self.proof_within(|stop| {
+            let found = self.proof_within(|stop| {
                 nrese_reasoner::engine::justify_fact_until(
                     &program, &snapshot, fact, mode, readable, stop,
                 )
-            })
+            })?;
+            Ok(found.map(|answer| {
+                let mut status = nrese_sparql::Completeness::under(regime);
+                if !answer.complete {
+                    status.incomplete(
+                        "rules",
+                        "the search could not finish enumerating justifications".to_owned(),
+                    );
+                }
+                let claim = self.assess(
+                    Revision::Committed(&snapshot),
+                    Evidence::Service {
+                        status,
+                        verdict: None,
+                    },
+                );
+                StatementJustification {
+                    mode: answer.mode,
+                    sets: answer.sets,
+                    complete: claim.complete,
+                    verified: answer.verified,
+                    claim,
+                }
+            }))
         };
         let crate::ReadScope::Graphs(access) = scope else {
             return justify(None);
@@ -3089,7 +3289,7 @@ impl StoreService {
     /// change of rules; commits keep it current afterwards. Register `program` as well
     /// ([`Self::use_reasoning_rules`]; the mutation pipeline registers its own): while the
     /// rules in place aren't the ones the stack was made with, the new stack isn't certified
-    /// (`Self::vouches`) and readers of some graphs who see inferred statements are refused
+    /// and readers of some graphs who see inferred statements are refused
     /// until the store is rematerialised under the rules in place. A store used
     /// as a library that rematerialises with no reasoner registered (no pipeline) reads a
     /// later version without inferred statements or certificate as one no reasoning can
@@ -3206,7 +3406,9 @@ impl StoreService {
             rebuilt_here: true,
         };
         let reading = program.stored_equality();
-        let record = self.certificate(state.clone(), None, facts);
+        let generation = self.supports.generation();
+        let certificate = self.certificate(state.clone(), facts, &generation);
+        let record = self.read_basis(Some(certificate), generation);
         let finished = rematerialisation.finish_held(closure.inferred, reading, Some(record))?;
         let summary = finished.summary();
         nrese_exec::heap::phase("store: done");
@@ -3323,40 +3525,27 @@ fn status_for_its_reader(
     }
 }
 
-/// An exact answer's refusal as its reader may be told it: its status through
-/// [`status_for_its_reader`], its unresolved candidates only where that is the status.
-fn refusal_for_its_reader(prepared: &PreparedQuery, error: crate::StoreError) -> crate::StoreError {
-    let crate::StoreError::Incomplete(mut answer) = error else {
-        return error;
-    };
-    // An exact answer is refused under `owl2-dl` alone: told as every `owl2-dl` status is.
-    let told = status_for_its_reader(prepared, Some(answer.status.clone()), false, false);
-    if let Some(told) = told.filter(|told| *told != answer.status) {
-        answer.status = told;
-        answer.unresolved.clear();
-    }
-    crate::StoreError::Incomplete(answer)
-}
-
-/// [`status_for_its_reader`] for an answer that carries the rewriting's report too, as an
-/// EXPLAIN does: the status as its reader is told it, and no report where that is withheld.
-fn certification_for_its_reader(
-    prepared: &PreparedQuery,
-    completeness: &mut Option<nrese_sparql::Completeness>,
-    ql: &mut Option<nrese_sparql::ql::QlReport>,
-    compact: bool,
-) {
-    *completeness = status_for_its_reader(prepared, completeness.take(), ql.is_some(), compact);
-    if withholds_report(prepared, completeness.as_ref()) {
-        *ql = None;
+fn ql_claim(
+    report: nrese_sparql::ql::QlReport,
+    claim: &Claim,
+) -> nrese_sparql::ql::QlReport<Claim> {
+    nrese_sparql::ql::QlReport {
+        patterns: report.patterns,
+        realised: report.realised,
+        checks: report.checks,
+        witnesses: report.witnesses,
+        branches: report.branches,
+        atoms: report.atoms,
+        limits: report.limits,
+        completeness: claim.clone(),
     }
 }
 
 /// Whether `prepared`'s reader, told `told`, is shown no report of the rewriting: where its
 /// assessment is withheld ([`withholds_certification`]), and where its status is. Rows a
 /// withheld view's rewriting gives stand; its report, a claim, doesn't.
-fn withholds_report(prepared: &PreparedQuery, told: Option<&nrese_sparql::Completeness>) -> bool {
-    withholds_certification(prepared) || told.is_some_and(|c| c.certification_withheld)
+fn withholds_report(prepared: &PreparedQuery, told: &Claim) -> bool {
+    withholds_certification(prepared) || told.certification_withheld
 }
 
 /// Whether `prepared`'s reader is told no assessment of the rewriting, neither its status
@@ -3413,7 +3602,7 @@ fn context_outside_dl(status: Option<&nrese_sparql::Completeness>, rewritten: bo
 /// operators those chose, their rows, the dictionary work they report, their times) and its
 /// rewrites (an estimate decides some, as eager aggregation), all read from statistics and
 /// scans of every graph, and its QL rewriting's status and report where they would read
-/// the schema of every graph ([`certification_for_its_reader`]); and a memory refusal goes
+/// the schema of every graph; a memory refusal goes
 /// through the scope's boundary ([`crate::ReadScope::told`]) as `entry`'s.
 fn for_its_reader<T>(
     prepared: &PreparedQuery,
@@ -3484,12 +3673,10 @@ pub(crate) mod hooks {
         pub(crate) static BEFORE_CLEAR_PUBLICATION: Hook = const { RefCell::new(None) };
         /// A reasoning commit in quarantine has published and is about to revalidate.
         pub(crate) static BEFORE_REVALIDATION: Hook = const { RefCell::new(None) };
-        /// A registration of rules has registered them and is about to certify under them.
+        /// A registration has prepared a new rule generation and is about to publish it.
         pub(crate) static AFTER_RULES_REGISTERED: Hook = const { RefCell::new(None) };
-        /// A transaction's read is about to capture its first pending generation.
-        pub(crate) static BEFORE_PENDING_GENERATION: Hook = const { RefCell::new(None) };
-        /// A transaction's read has captured the generation for its pending view.
-        pub(crate) static AFTER_PENDING_GENERATION: Hook = const { RefCell::new(None) };
+        /// A pending read has pinned its base and will rebuild declarations under that program.
+        pub(crate) static AFTER_PENDING_BASE: Hook = const { RefCell::new(None) };
     }
 
     pub(crate) fn run(hook: &'static LocalKey<Hook>) {
@@ -4321,6 +4508,10 @@ mod context_tests {
 #[cfg(test)]
 #[path = "certificate_lifecycle_tests.rs"]
 mod certificate_lifecycle_tests;
+
+#[cfg(test)]
+#[path = "read_basis_tests.rs"]
+mod read_basis_tests;
 
 #[cfg(test)]
 #[path = "run_envelope_tests.rs"]

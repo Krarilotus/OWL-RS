@@ -139,7 +139,7 @@ fn ql_stage(
     // Nothing to rewrite and nothing to report: the pattern stays unread. Asserted
     // existentials have anonymous individuals with nothing to rewrite (design §7).
     if tbox.is_empty() && !tbox.has_concerns() {
-        let mut report = crate::ql::QlReport::default();
+        let mut report = crate::ql::QlReport::<crate::Completeness>::default();
         report.completeness.regime = Some(regime);
         return (None, Some(report));
     }

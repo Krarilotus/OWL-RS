@@ -150,10 +150,10 @@ pub struct SerializedQueryResult {
     /// What the OWL 2 QL rewriting did and whether the answers are complete; `None` where
     /// it doesn't apply, or where its reader is told no assessment of it (a reader of some
     /// graphs who sees every inference).
-    pub ql: Option<nrese_sparql::ql::QlReport>,
+    pub ql: Option<nrese_sparql::ql::QlReport<crate::Claim>>,
     /// Whether the answers are complete, where a reasoning path can leave some out (the
     /// status [`crate::StoreService::run_query_reporting`] reports; `not-certified` for
     /// that reader where the rewriting ran, and for any reader of some graphs under
     /// `owl2-dl`).
-    pub completeness: Option<nrese_sparql::Completeness>,
+    pub completeness: Option<crate::Claim>,
 }

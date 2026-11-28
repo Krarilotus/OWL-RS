@@ -496,12 +496,11 @@ impl MutationPipeline {
                     .ontology
                     .take()
                     .map(|o| crate::dl::query::left_out(&o, &name));
-                let base = tx.base().revision();
                 let record = read.or_else(|| match &bounds.prepared {
                     crate::dl::bounds::Prepared::Rules(_) => Some(None),
-                    crate::dl::bounds::Prepared::Delta(_) => (self.store.dl().status())
-                        .filter(|s| s.revision == base)
-                        .and_then(|s| s.left_out),
+                    crate::dl::bounds::Prepared::Delta(_) => {
+                        crate::service::ReadBasis::dl_status(tx.base()).and_then(|s| s.left_out)
+                    }
                     crate::dl::bounds::Prepared::Rebuilt(_)
                     | crate::dl::bounds::Prepared::Unavailable => None,
                 });
@@ -531,7 +530,16 @@ impl MutationPipeline {
             // judge it under the writer slot before taking the commit's rights.
             let witness =
                 ql_witness.or_else(|| dl.as_ref().and_then(|(gate, _, _)| gate.ill_typed));
-            let certificate = self.store.successor(&tx, literal_equality, witness);
+            let dl_status = dl.as_ref().and_then(|(gate, _, left_out)| {
+                gate.record_verdict.then(|| crate::dl::DlStatus {
+                    revision: tx.base().revision() + 1,
+                    consistency: gate.checked.clone(),
+                    left_out: left_out.clone(),
+                })
+            });
+            let certificate = self
+                .store
+                .successor(&tx, literal_equality, witness, dl_status);
             if !ticket.begin_commit() {
                 return Err(MutationError::Cancelled);
             }
@@ -540,11 +548,6 @@ impl MutationPipeline {
             let supports = self.store.supports();
             let touched = supports.wants_commits().then(|| supports.touched(&tx));
             let before = tx.base().revision();
-            // The commit maintained the closure: its version carries its base's certificate,
-            // the same object. With the rewriting on, that certificate's QL schema notes what
-            // the commit changes of individuals' memberships of class expressions, before the
-            // commit publishes.
-            let ql = crate::service::Certificate::of(tx.base()).and_then(|c| c.ql.clone());
             // Its rights hold from here through the publication (contracts.md, lock order).
             let rights = ticket.hold_rights()?;
             // In quarantine (the base's record holds the rules' hold) the commit checks only its
@@ -562,10 +565,7 @@ impl MutationPipeline {
                 tx.keep_watched(Arc::new(crate::shacl::ShapesCounted(Ok(shapes))));
             }
             let tagging = preparation.tagging.lock();
-            let committed = match ql {
-                Some(ql) => publishing(ticket, report, tx, |tx| ql.commit(tx)),
-                None => publishing(ticket, report, tx, |tx| tx.commit()),
-            };
+            let committed = publishing(ticket, report, tx, |tx| tx.commit());
             drop(tagging);
             #[cfg(test)]
             if committed.is_err() {
@@ -647,6 +647,7 @@ impl MutationPipeline {
             return Err(MutationError::Cancelled);
         }
         let rights = ticket.hold_rights()?;
+        tx.vouch(self.store.unreasoned_basis());
         if let Some(shapes) = shapes {
             tx.keep_watched(Arc::new(crate::shacl::ShapesCounted(Ok(shapes))));
         }

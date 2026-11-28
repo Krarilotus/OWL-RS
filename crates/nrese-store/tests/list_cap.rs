@@ -800,7 +800,8 @@ fn a_clash_a_later_write_gives_through_a_list_past_the_cap_is_refused() {
 /// over any other store. Spec: OWL 2 Profiles §4.3, `prp-fp` (Table 5) and `eq-diff1` (Table
 /// 4): `ex:a` and `ex:b` have different values (`ex:m1 owl:differentFrom ex:m2`) of a
 /// functional property, so `ex:a owl:sameAs ex:b` is inconsistent and `ex:a
-/// owl:differentFrom ex:b` is entailed; `ex:a owl:differentFrom ex:m1` is not (the control).
+/// owl:differentFrom ex:b` is entailed. Under the read-boundary contract §4.5 the
+/// rules leave the control `ex:a owl:differentFrom ex:m1` undecided without a refutation.
 /// The store also holds the intersection of seven aliased classes, past the cap. In every
 /// equality mode.
 #[test]
@@ -833,7 +834,8 @@ fn a_difference_over_a_store_with_a_list_past_the_cap_is_decided_by_refutation()
             wrong.push(format!("{mode}: a differentFrom b: {entailed:?}"));
         }
         let control = store.entails(program(), &different("a", "m1"));
-        if !matches!(control, Ok(Entailment::NotEntailed)) {
+        if !matches!(&control, Err(nrese_store::StoreError::Undecided(why)) if why.contains("did not refute"))
+        {
             wrong.push(format!("{mode}: a differentFrom m1: {control:?}"));
         }
     }

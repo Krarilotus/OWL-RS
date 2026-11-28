@@ -652,6 +652,17 @@ async fn scoped_rows_and_explanations_are_not_certified() -> TestResult {
         explain.json()["completeness"]["status"],
         plan.json()["completeness"]["status"]
     );
+    // Spec: docs/spec/reasoning-semantics.md:86 and :141. A scoped view carries no
+    // whole-store regime, bounds, or reasons across any representation.
+    for reply in [&explain, &plan] {
+        let body = reply.json();
+        let claim = &body["completeness"];
+        assert_eq!(claim["status"], "not-certified");
+        assert_eq!(claim["complete"], false);
+        assert_eq!(claim["sound"], false);
+        assert_eq!(claim["reasons"], serde_json::json!([]));
+        assert!(claim["regime"].is_null() && claim["bounds"].is_null() && body["ql"].is_null());
+    }
     Ok(())
 }
 
@@ -1158,6 +1169,41 @@ async fn hidden_reader_gets_scoped_assertions_under_compact_equality() -> TestRe
     )
     .await?;
     assert_eq!(reply.rows(), bindings(&[P]));
+    // Spec: docs/ops/http-api.md:94 and docs/limits.md:531. The scoped read is
+    // not-certified, even when permissions limit it to the asserted merge.
+    assert_eq!(
+        reply.completeness.as_deref(),
+        Some("not-certified"),
+        "{reply:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn exact_refuses_scoped_assertions_for_a_hidden_reader() -> TestResult {
+    // Spec: docs/ops/http-api.md:94 and docs/limits.md:531. The scoped asserted
+    // merge cannot be certified, so an OWL 2 DL exact request is refused.
+    let app = test_app_with_store_config(
+        StoreConfig::in_memory(),
+        policy_of(&POLICY.replace("inferred = \"supported\"", "inferred = \"hidden\""))?,
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Dl),
+    )?;
+    insert(&app, G1_FACT).await?;
+    let reply = select(
+        &app,
+        READER,
+        "?inference-scope=dataset&dl-answers=exact",
+        "?s",
+        G1,
+        "{ ?s ex:p ex:b }",
+    )
+    .await?;
+    assert_eq!(reply.code, StatusCode::UNPROCESSABLE_ENTITY, "{reply:?}");
+    assert_eq!(
+        reply.completeness.as_deref(),
+        Some("not-certified"),
+        "{reply:?}"
+    );
     Ok(())
 }
 

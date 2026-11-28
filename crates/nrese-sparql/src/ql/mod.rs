@@ -190,7 +190,7 @@ const LIST_IRIS: [&str; LISTS.len()] = {
 
 /// What the QL rewriting did to one query (EXPLAIN, and with every answer).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct QlReport {
+pub struct QlReport<C = crate::Completeness> {
     /// Basic graph patterns rewritten.
     pub patterns: usize,
     /// Tree witnesses not folded: the data has their tree wherever they would fold, so
@@ -207,7 +207,7 @@ pub struct QlReport {
     /// The bounds reached ([`Limits`]): those patterns ran as written.
     pub limits: Vec<&'static str>,
     /// Whether answers through anonymous individuals may be missing (reasons from `ql`).
-    pub completeness: crate::Completeness,
+    pub completeness: C,
 }
 
 /// A store's QL rewriting: what its closure applies, the bounds, and the schema compiled

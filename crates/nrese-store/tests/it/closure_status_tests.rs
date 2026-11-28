@@ -173,10 +173,7 @@ fn answer(store: &StoreService, query: &str) -> (String, [&'static str; 2]) {
     )
 }
 
-fn answer_claims(
-    store: &StoreService,
-    query: &str,
-) -> (String, [Option<nrese_sparql::Completeness>; 2]) {
+fn answer_claims(store: &StoreService, query: &str) -> (String, [Option<nrese_store::Claim>; 2]) {
     let request = SparqlQueryRequest::all(format!("{PREFIXES}{RDF}{query}"));
     let result = store.execute_query(&request).expect("answered");
     let prepared = store.prepare_query(&request).expect("prepared");
@@ -191,11 +188,7 @@ fn answer_claims(
 
 // The clean comparison controls still exclude a datatype reason. OWL 2 QL adds its
 // consistency reason, which also makes a count or negation provisional.
-fn clean_comparison(
-    regime: &str,
-    query: &str,
-    claims: &[Option<nrese_sparql::Completeness>; 2],
-) -> bool {
+fn clean_comparison(regime: &str, query: &str, claims: &[Option<nrese_store::Claim>; 2]) -> bool {
     claims.iter().all(|claim| {
         claim.as_ref().is_some_and(|status| {
             if regime != "owl2-ql" {
@@ -683,8 +676,8 @@ fn only_operators_that_can_make_a_row_wrong_label_a_dl_answer_unsound() {
 /// `print-query --schema` loads them, with no rematerialisation and so no certificate.
 #[test]
 fn every_place_gives_a_query_the_answers_status() {
-    use nrese_sparql::Completeness;
     use nrese_sparql::ql::{PrintForm, Printed};
+    use nrese_store::Claim;
     // Each read with the answer every store must give, where the rule fixes it: a denied
     // read is `sound-only` everywhere, and `unsound` under NOT EXISTS. Those must print.
     let reads = [
@@ -759,13 +752,15 @@ fn every_place_gives_a_query_the_answers_status() {
             false,
         ),
     ];
-    fn report(r: &Option<nrese_sparql::ql::QlReport>) -> Option<&nrese_sparql::Completeness> {
+    fn report(
+        r: &Option<nrese_sparql::ql::QlReport<nrese_store::Claim>>,
+    ) -> Option<&nrese_store::Claim> {
         r.as_ref().map(|r| &r.completeness)
     }
-    let name = |c: Option<&Completeness>| c.map_or("none", |c| c.as_str());
+    let name = |c: Option<&Claim>| c.map_or("none", |c| c.as_str());
     // `not-certified` claims nothing, so it is never above.
     let order = ["not-certified", "unsound", "sound-only", "complete"];
-    let rank = |c: Option<&Completeness>| order.iter().position(|r| *r == name(c));
+    let rank = |c: Option<&Claim>| order.iter().position(|r| *r == name(c));
     let cancel = CancellationToken::new();
     let mut wrong = Vec::new();
     for (store_name, store, prints) in stores {
@@ -879,10 +874,7 @@ fn every_place_gives_a_query_the_answers_status() {
 
 /// The status of `request`'s refusal under exact answers (the 422 problem document's),
 /// if it is refused.
-fn refusal(
-    store: &StoreService,
-    request: &SparqlQueryRequest,
-) -> Option<nrese_sparql::Completeness> {
+fn refusal(store: &StoreService, request: &SparqlQueryRequest) -> Option<nrese_store::Claim> {
     let mut exact = request.clone();
     exact.dl_answers = Some(nrese_store::DlAnswers::Exact);
     match store.execute_query(&exact) {
@@ -1822,7 +1814,7 @@ fn places(
     ql: QlRewritingMode,
 ) -> (String, String, [&'static str; 4], bool) {
     let request = SparqlQueryRequest::all(format!("{PREFIXES}{read}"));
-    let name = |c: Option<&nrese_sparql::Completeness>| c.map_or("none", |c| c.as_str());
+    let name = |c: Option<&nrese_store::Claim>| c.map_or("none", |c| c.as_str());
     let store = closure(data, Ruleset::Owl2Rl, ql);
     let run = store.execute_query(&request).expect("answered");
     let prepared = store.prepare_query(&request).expect("prepared");
@@ -2161,7 +2153,7 @@ fn a_prepared_query_is_marked_by_what_its_property_holds_at_each_run() {
             .plan_query(&prepared, &CancellationToken::new())
             .expect("planned")
             .completeness;
-        let name = |c: Option<nrese_sparql::Completeness>| c.map_or("none", |c| c.as_str());
+        let name = |c: Option<nrese_store::Claim>| c.map_or("none", |c| c.as_str());
         let status = [name(run), name(plan)];
         eprintln!("{label}: {status:?}");
         status
@@ -2453,12 +2445,13 @@ fn a_zero_length_paths_ends_can_be_data_values() {
 fn a_readers_status_doesnt_follow_what_they_cant_read() {
     use std::sync::Arc;
 
-    use nrese_sparql::{Completeness, GraphAccess};
+    use nrese_sparql::GraphAccess;
+    use nrese_store::Claim;
     use nrese_store::{ReadScope, SparqlUpdateRequest};
 
     use crate::support::Writes;
 
-    let said = |c: Option<&Completeness>| {
+    let said = |c: Option<&Claim>| {
         c.map_or("none".to_owned(), |c| {
             let reasons: Vec<_> = c.reasons.iter().map(ToString::to_string).collect();
             format!("{} {reasons:?}", c.header())

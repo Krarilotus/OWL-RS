@@ -14,7 +14,8 @@ use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use nrese_reasoner::eval::Stop;
-use nrese_sparql::{Completeness, Outside, Regime};
+use nrese_sparql::Outside;
+use nrese_store::Claim;
 use nrese_store::dl::Verdict;
 
 use crate::error::ApiError;
@@ -25,19 +26,6 @@ const SUB_CLASS_OF: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
 const THING: &str = "http://www.w3.org/2002/07/owl#Thing";
 const NOTHING: &str = "http://www.w3.org/2002/07/owl#Nothing";
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
-
-/// The answer's status under OWL 2 DL: what it lists is entailed either way, so it is
-/// sound; complete only without reasons, of which the store's report lists an undecided
-/// consistency's (`nrese_store::ClassificationReport::incomplete`). Marked where a
-/// procedure outside OWL 2 DL answered.
-fn completeness(incomplete: &[String], outside: Option<Outside>) -> Completeness {
-    let mut status = Completeness::under(Regime::Owl2Dl);
-    for why in incomplete {
-        status.incomplete("dl", why.clone());
-    }
-    status.outside = outside;
-    status
-}
 
 /// The N-Triples form's first line where a procedure outside OWL 2 DL answered.
 fn outside_comment(outside: &Outside) -> String {
@@ -101,7 +89,7 @@ fn respond(
     triples: bool,
     text: String,
     json: serde_json::Value,
-    status: &Completeness,
+    status: &Claim,
 ) -> Result<Response, ApiError> {
     let (media_type, body) = if triples {
         ("application/n-triples", text.into_bytes())
@@ -119,11 +107,7 @@ fn respond(
         .into_response();
     // As a query's answers carry it (`http::sparql`), readable across origins too.
     let headers = response.headers_mut();
-    headers.insert(
-        COMPLETENESS,
-        HeaderValue::from_str(&status.header())
-            .unwrap_or_else(|_| HeaderValue::from_static(status.as_str())),
-    );
+    headers.insert(COMPLETENESS, super::sparql::claim_header(status));
     headers.append(
         header::ACCESS_CONTROL_EXPOSE_HEADERS,
         HeaderValue::from_static(COMPLETENESS),
@@ -144,32 +128,33 @@ pub async fn classify(
         move |stop| store.classify_until(&scope, stop),
     )
     .await?;
-    let status = completeness(&report.incomplete, report.outside.clone());
+    let status = &report.claim;
+    let verdict = status.dl_verdict().expect("classification assessment");
     // Only the form asked for is built: each holds about as much memory as the answer (D16-700).
     if wants_triples(headers) {
         #[cfg(test)]
         tests::built(true);
-        let mut text = report
+        let mut text = status
             .outside
             .as_ref()
             .map_or_else(String::new, outside_comment);
-        text.push_str(&triples_head(&report.consistency));
+        text.push_str(&triples_head(verdict));
         for (sub, sup) in &report.subsumptions {
             text.push_str(&format!("<{sub}> <{SUB_CLASS_OF}> <{sup}> .\n"));
         }
         for class in &report.unsatisfiable {
             text.push_str(&format!("<{class}> <{SUB_CLASS_OF}> <{NOTHING}> .\n"));
         }
-        return respond(true, text, serde_json::Value::Null, &status);
+        return respond(true, text, serde_json::Value::Null, status);
     }
     #[cfg(test)]
     tests::built(false);
-    let (consistent, consistency) = verdict_json(&report.consistency);
+    let (consistent, consistency) = verdict_json(verdict);
     let mut json = serde_json::json!({
         "profile": "OWL 2 DL",
         "engine": report.engine,
-        "complete": report.complete(),
-        "incomplete": report.incomplete,
+        "complete": status.complete,
+        "incomplete": status.reasons.iter().map(|reason| &reason.text).collect::<Vec<_>>(),
         "consistent": consistent,
         "consistency": consistency,
         "micros": report.micros,
@@ -177,7 +162,7 @@ pub async fn classify(
         "unsatisfiable": report.unsatisfiable,
         "equivalent_to_thing": report.equivalent_to_thing,
     });
-    if let Some(outside) = &report.outside {
+    if let Some(outside) = &status.outside {
         json["outside_profile"] = serde_json::json!({
             "what": outside.what,
             "by": outside.by,
@@ -185,7 +170,7 @@ pub async fn classify(
             "not_guaranteed": outside.not_guaranteed,
         });
     }
-    respond(false, String::new(), json, &status)
+    respond(false, String::new(), json, status)
 }
 
 pub async fn realise(
@@ -199,17 +184,18 @@ pub async fn realise(
         store.realise_until(&scope, stop)
     })
     .await?;
-    let status = completeness(&report.incomplete, None);
+    let status = &report.claim;
+    let verdict = status.dl_verdict().expect("realisation assessment");
     if wants_triples(headers) {
         #[cfg(test)]
         tests::built(true);
-        let mut text = triples_head(&report.consistency);
+        let mut text = triples_head(verdict);
         for (individual, types) in &report.types {
             for class in types {
                 text.push_str(&format!("<{individual}> <{RDF_TYPE}> <{class}> .\n"));
             }
         }
-        return respond(true, text, serde_json::Value::Null, &status);
+        return respond(true, text, serde_json::Value::Null, status);
     }
     #[cfg(test)]
     tests::built(false);
@@ -218,18 +204,18 @@ pub async fn realise(
         .iter()
         .map(|(individual, types)| (individual.clone(), serde_json::json!(types)))
         .collect();
-    let (consistent, consistency) = verdict_json(&report.consistency);
+    let (consistent, consistency) = verdict_json(verdict);
     let json = serde_json::json!({
         "profile": "OWL 2 DL",
         "engine": report.engine,
-        "complete": report.complete(),
-        "incomplete": report.incomplete,
+        "complete": status.complete,
+        "incomplete": status.reasons.iter().map(|reason| &reason.text).collect::<Vec<_>>(),
         "consistent": consistent,
         "consistency": consistency,
         "micros": report.micros,
         "types": types,
     });
-    respond(false, String::new(), json, &status)
+    respond(false, String::new(), json, status)
 }
 
 #[cfg(test)]

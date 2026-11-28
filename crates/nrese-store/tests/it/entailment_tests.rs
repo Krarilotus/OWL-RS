@@ -79,21 +79,22 @@ fn difference_is_decided_by_refutation() {
         entails(&store, ":b owl:differentFrom :a ."),
         Entailment::Entailed
     );
-    assert_eq!(
-        entails(&store, ":a owl:differentFrom :m1 ."),
-        Entailment::NotEntailed
-    );
+    // Spec: read-boundary contract §4.5. Failure to refute the opposite is undecided.
+    assert!(matches!(
+        store.entails(Ruleset::Owl2Rl, &turtle(":a owl:differentFrom :m1 .")),
+        Err(nrese_store::StoreError::Undecided(why)) if why.contains("did not refute")
+    ));
     assert_eq!(
         entails(&store, "[] a owl:AllDifferent ; owl:members ( :a :b ) ."),
         Entailment::Entailed
     );
-    assert_eq!(
-        entails(
-            &store,
-            "[] a owl:AllDifferent ; owl:members ( :a :b :m1 ) ."
+    assert!(matches!(
+        store.entails(
+            Ruleset::Owl2Rl,
+            &turtle("[] a owl:AllDifferent ; owl:members ( :a :b :m1 ) .")
         ),
-        Entailment::NotEntailed
-    );
+        Err(nrese_store::StoreError::Undecided(why)) if why.contains("did not refute")
+    ));
 }
 
 #[test]
@@ -106,10 +107,14 @@ fn complements_and_negative_assertions_are_decided_by_refutation() {
         entails(&store, ":stewie a [ owl:complementOf :Girl ] ."),
         Entailment::Entailed
     );
-    assert_eq!(
-        entails(&store, ":stewie a [ owl:complementOf :Boy ] ."),
-        Entailment::NotEntailed
-    );
+    // Spec: read-boundary contract §4.5. Failure to refute the opposite is undecided.
+    assert!(matches!(
+        store.entails(
+            Ruleset::Owl2Rl,
+            &turtle(":stewie a [ owl:complementOf :Boy ] .")
+        ),
+        Err(nrese_store::StoreError::Undecided(why)) if why.contains("did not refute")
+    ));
     assert_eq!(
         entails(
             &store,

@@ -1975,12 +1975,28 @@ pub struct SupportStatistics {
 /// still in place (the epoch unchanged): a computation that outlives a change of the rules
 /// answers its own read by the rules it began with, and leaves the state of the new ones.
 #[derive(Debug, Clone, Default)]
-struct Generation {
-    rules: Option<RuleProgram>,
-    epoch: u64,
+pub(crate) struct Generation {
+    pub(crate) rules: Option<RuleProgram>,
+    pub(crate) epoch: u64,
     /// Whether rules were registered in this generation or any before it: clearing them
-    /// doesn't lower it ([`Supports::has_rules`]).
-    ever: bool,
+    /// doesn't lower it.
+    pub(crate) ever: bool,
+}
+
+impl Generation {
+    pub(crate) fn with_rules(self, rules: Option<RuleProgram>) -> Self {
+        Self {
+            ever: self.ever || rules.is_some(),
+            epoch: self.epoch + 1,
+            rules,
+        }
+    }
+
+    pub(crate) fn vouches_for(&self, state: &crate::ReasoningState, hide: bool) -> bool {
+        self.rules
+            .as_ref()
+            .is_none_or(|rules| state.made_by(rules, hide))
+    }
 }
 
 /// Whether `snapshot`'s certificate was made with other rules than `generation`'s (they were
@@ -1988,7 +2004,7 @@ struct Generation {
 /// kept, its certificate gone: nothing vouches for it); `hide`: unnamed classes' memberships
 /// left out ([`Compilation::hide_unnamed_classes`]). No rules registered count as other rules
 /// here: a view of the inferences a reader's graphs support needs rules to be made at all, so
-/// that reader is refused while the store's label goes by its marker ([`Supports::vouches_for`]).
+/// that reader is refused while the store's label goes by its marker ([`Generation::vouches_for`]).
 fn made_with_other_rules(generation: &Generation, snapshot: &Snapshot, hide: bool) -> bool {
     let rules = generation.rules.as_ref();
     match crate::service::Certificate::of(snapshot) {
@@ -2167,7 +2183,7 @@ impl Reading {
         snapshot: &Snapshot,
         class_only: bool,
     ) -> Result<Snapshot, Unavailable> {
-        let generation = self.supports.state().generation.clone();
+        let generation = self.supports.generation_at(snapshot);
         if made_with_other_rules(&generation, snapshot, self.compilation.hide_unnamed_classes) {
             return Err(Unavailable::OtherProgram(self.compilation.replica));
         }
@@ -2202,7 +2218,7 @@ impl Reading {
     ) -> crate::StoreResult<Snapshot> {
         use crate::{StoreError, service::Certificate};
         use nrese_sparql::QueryEvaluationError::ScopedInferenceUnavailable;
-        let generation = self.supports.state().generation.clone();
+        let generation = self.supports.generation_at(snapshot);
         let replica = self.compilation.replica;
         if !replica && Certificate::bare(snapshot, generation.rules.is_some()) {
             return Ok(snapshot.clone());
@@ -2330,45 +2346,28 @@ impl Supports {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn use_rules(&self, rules: Option<RuleProgram>) {
-        // Sets and views of other rules are stale, and so is what is being computed under
-        // them: the rules and their state change together.
-        let mut state = self.state();
-        let epoch = state.generation.epoch + 1;
-        let ever = state.generation.ever || rules.is_some();
-        *state = State::new(&self.kept, Generation { rules, epoch, ever });
+        self.set_generation(self.generation().with_rules(rules));
     }
 
-    /// Whether the store may vouch for the stack `state` records under the rules registered
-    /// here: they made it ([`crate::ReasoningState::made_by`]), or none are registered and its
-    /// label goes by its marker, naming the marker's rules. A reader of some graphs who sees
-    /// inferences is refused with none registered all the same ([`made_with_other_rules`]).
-    pub(crate) fn vouches_for(&self, state: &crate::ReasoningState, hide: bool) -> bool {
-        (self.state().generation.rules.as_ref()).is_none_or(|rules| state.made_by(rules, hide))
+    /// Switch the support caches to the generation the store has just published.
+    pub(crate) fn set_generation(&self, generation: Generation) {
+        *self.state() = State::new(&self.kept, generation);
+    }
+
+    pub(crate) fn generation(&self) -> Generation {
+        self.state().generation.clone()
+    }
+
+    fn generation_at(&self, snapshot: &Snapshot) -> Generation {
+        crate::service::ReadBasis::of(snapshot)
+            .map_or_else(Generation::default, |basis| basis.generation.clone())
     }
 
     /// The rules registered here ([`Self::use_rules`]), if any.
     pub(crate) fn rules(&self) -> Option<RuleProgram> {
-        self.generation_now().0
-    }
-
-    /// The registered rules and the epoch that identifies them, read under one lock.
-    pub(crate) fn generation_now(&self) -> (Option<RuleProgram>, u64) {
-        let state = self.state();
-        (state.generation.rules.clone(), state.generation.epoch)
-    }
-
-    /// Whether rules were ever registered here ([`Self::use_rules`]): a reasoner maintains,
-    /// or maintained, the stack. Clearing the rules doesn't lower it; a store opened again
-    /// starts without it.
-    pub(crate) fn has_rules(&self) -> bool {
-        self.state().generation.ever
-    }
-
-    /// How many times the rules were set ([`Self::use_rules`]): what a read decided under
-    /// them, a session's kept view included ([`crate::sessions`]), holds while it is the same.
-    pub(crate) fn epoch(&self) -> u64 {
-        self.state().generation.epoch
+        self.state().generation.rules.clone()
     }
 
     /// Whether readers used sets since the rules were set.
@@ -2540,26 +2539,37 @@ impl Supports {
     ) -> Result<Snapshot, Unavailable> {
         let (cell, rederiving, view, generation) = {
             let mut state = self.state();
-            let generation = state.generation.clone();
+            let generation = self.generation_at(snapshot);
             // A view under other rules than its certificate's would show what they derive,
             // which a graph the reader can't read may decide: refused, nothing kept. Asked
             // again here, of the rules the view is made with.
             if made_with_other_rules(&generation, snapshot, compilation.hide_unnamed_classes) {
                 return Err(Unavailable::OtherProgram(compilation.replica));
             }
-            let (_, cell, rederiving, views) = state.latest_for(snapshot, &self.kept)?;
-            let view = match views.iter().find(|(seen, _)| **seen == **access) {
-                Some((_, view)) => view.clone(),
-                None => {
-                    if views.len() >= VIEWS {
-                        without_first(views);
+            if generation.epoch != state.generation.epoch {
+                // During registration, or on a held version, the cache tracks other rules.
+                // Compute with the publication's rules and keep the cells only for this read.
+                (
+                    Shared::new(Slot::default(), &self.kept)?,
+                    Shared::new(Slot::default(), &self.kept)?,
+                    Shared::new(Slot::default(), &self.kept)?,
+                    generation,
+                )
+            } else {
+                let (_, cell, rederiving, views) = state.latest_for(snapshot, &self.kept)?;
+                let view = match views.iter().find(|(seen, _)| **seen == **access) {
+                    Some((_, view)) => view.clone(),
+                    None => {
+                        if views.len() >= VIEWS {
+                            without_first(views);
+                        }
+                        let view = Shared::new(Slot::default(), &self.kept)?;
+                        views.push((Arc::clone(access), view.clone()))?;
+                        view
                     }
-                    let view = Shared::new(Slot::default(), &self.kept)?;
-                    views.push((Arc::clone(access), view.clone()))?;
-                    view
-                }
-            };
-            (cell.clone(), rederiving.clone(), view, generation)
+                };
+                (cell.clone(), rederiving.clone(), view, generation)
+            }
         };
         let working = Work {
             budget: Arc::new(memory.part()),

@@ -53,7 +53,7 @@ struct View {
     /// Whose: the operations read as the reader may.
     scope: ReadScope,
     /// The rules its inferred statements were decided under: how many times the store's
-    /// rules had been set when its read began ([`crate::support::Supports::epoch`]).
+    /// rules had been set when its base was published.
     epoch: u64,
     snapshot: Snapshot,
     /// Whether the operations keep their base's record of what the reader left out

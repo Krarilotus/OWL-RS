@@ -287,7 +287,7 @@ fn timed(
     text: &str,
 ) -> (
     usize,
-    Option<(nrese_sparql::Completeness, nrese_store::DlDetail)>,
+    Option<(nrese_store::Claim, nrese_store::DlDetail)>,
     Duration,
 ) {
     let store = pipeline.store();

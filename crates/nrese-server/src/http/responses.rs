@@ -93,8 +93,7 @@ pub struct DlReady {
     pub reason: Option<String>,
     /// The engine that decided: `context-core`, `hypertableau`, or `none`.
     pub engine: &'static str,
-    /// The revision it was checked at (older than `revision` after a write past the
-    /// pipeline).
+    /// The publication's revision where the check ran.
     pub revision: Option<u64>,
 }
 
@@ -240,16 +239,11 @@ pub fn build_ready_response(
     identity: &crate::auth::Identity,
 ) -> Result<ReadyResponse, ApiError> {
     super::guard::whole_read_scope(state.access_view(identity))?;
-    let stats = state
-        .store()
-        .stats()
-        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let publication = state.store().publication_report();
+    let consistency = publication.claim.consistency();
     let posture = state.runtime_posture();
-
-    let (consistency, undecided, quarantined) = state.store().undecided_report();
-    let shacl = state.store().shacl_gate_state();
     Ok(ReadyResponse {
-        status: readiness_status(state.is_started(), || quarantined),
+        status: readiness_status(state.is_started(), || publication.quarantined),
         consistency: consistency.as_str(),
         violations: match consistency {
             nrese_store::ConsistencyStatus::Inconsistent { violations } => Some(violations),
@@ -266,10 +260,10 @@ pub fn build_ready_response(
             }
             _ => None,
         },
-        undecided,
-        revision: shacl.view_revision,
-        quad_count: stats.quad_count as u64,
-        named_graph_count: stats.named_graph_count,
+        undecided: publication.undecided,
+        revision: publication.revision,
+        quad_count: publication.stats.quad_count as u64,
+        named_graph_count: publication.stats.named_graph_count,
         ontology_path: state
             .store()
             .preloaded_ontology_path()
@@ -281,16 +275,14 @@ pub fn build_ready_response(
         reasoning_profile: posture.reasoning_profile,
         reasoning_read_model: posture.reasoning_read_model,
         reasoning_semantic_tier: posture.reasoning_semantic_tier,
-        dl: state
-            .store()
-            .dl()
-            .active()
-            .then(|| match state.store().dl().status() {
-                Some(status) => DlReady {
-                    consistency: status.consistency.verdict.as_str(),
-                    reason: status.consistency.verdict.reason().map(str::to_owned),
-                    engine: status.consistency.engine,
-                    revision: Some(status.revision),
+        dl: publication
+            .dl_mode
+            .then(|| match publication.claim.dl_verdict() {
+                Some(verdict) => DlReady {
+                    consistency: verdict.as_str(),
+                    reason: verdict.reason().map(str::to_owned),
+                    engine: publication.dl_engine,
+                    revision: Some(publication.revision),
                 },
                 None => DlReady {
                     consistency: "unknown",
@@ -299,7 +291,7 @@ pub fn build_ready_response(
                     revision: None,
                 },
             }),
-        shacl: shacl.into(),
+        shacl: publication.shacl.into(),
         degraded: state.degraded(),
     })
 }

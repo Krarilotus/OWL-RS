@@ -133,7 +133,12 @@ async fn inconsistent_data_is_quarantined_but_readable_and_repairable()
     assert_eq!(public, serde_json::json!({"status": "quarantined"}));
     let info = app.clone().oneshot(get("/dataset/info")).await?;
     assert_eq!(info.status(), StatusCode::OK);
-    assert!(body_text(info).await?.contains("\"violations\":1"));
+    let info: serde_json::Value = serde_json::from_str(&body_text(info).await?)?;
+    assert_eq!(info["violations"], 1);
+    // Spec: docs/spec/reasoning-semantics.md:166. Information and readiness agree on
+    // disposition while the store keeps the inconsistent publication.
+    assert_eq!(info["consistency"], "inconsistent");
+    assert_eq!(info["status"], public["status"]);
 
     let query = format!("/dataset/query?query=ASK%20%7B%20%3C{EX}x%3E%20%3Fp%20%3Fo%20%7D");
     let answer = app.clone().oneshot(get(&query)).await?;
@@ -144,8 +149,13 @@ async fn inconsistent_data_is_quarantined_but_readable_and_repairable()
         .oneshot(update(&format!("DELETE DATA {{ <{EX}x> a <{EX}B> }}")))
         .await?;
     assert!(repair.status().is_success(), "{}", repair.status());
-    let ready = app.oneshot(get("/readyz")).await?;
+    let ready = app.clone().oneshot(get("/readyz")).await?;
     assert_eq!(ready.status(), StatusCode::OK);
+    let latest = app.oneshot(get("/dataset/info")).await?;
+    let latest: serde_json::Value = serde_json::from_str(&body_text(latest).await?)?;
+    assert_eq!(latest["consistency"], "consistent");
+    assert_eq!(latest["status"], "ready");
+    assert!(latest["revision"].as_u64() > info["revision"].as_u64());
     Ok(())
 }
 

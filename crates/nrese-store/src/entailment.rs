@@ -9,6 +9,7 @@
 //! - **Negative statements** the rules never derive are decided by refutation: their
 //!   opposite is added in a speculative transaction (never committed), the reasoner
 //!   maintains the closure over it, and a violated consistency rule refutes the opposite.
+//!   Where the rules cannot refute it, the negative statement is undecided.
 //!   The forms recognised:
 //!   - `a owl:differentFrom b`, by adding `a owl:sameAs b`;
 //!   - `owl:AllDifferent` with `owl:members` or `owl:distinctMembers`, each pair so;
@@ -16,10 +17,9 @@
 //!   - an `owl:NegativePropertyAssertion`, by adding the assertion.
 //! - **An inconsistent premise** entails everything.
 //!
-//! The answer is sound; it is complete as far as the rules are for the premise (OWL 2 RL
-//! premises and the forms above). A conclusion outside them may be entailed although the
-//! answer is no, except under `owl2-dl`. There none of the above applies, as the closure
-//! proves nothing under the Direct Semantics (an annotation property's domain puts its
+//! A failed positive lookup only decides entailment where the rules are complete for the
+//! premise and conclusion. Under `owl2-dl` the closure does not prove entailment under
+//! the Direct Semantics (an annotation property's domain puts its
 //! subjects in the closure, for one): the DL engines decide the whole conclusion
 //! ([`StoreService::entails_dl`]), an [`StoreError::Undecided`] error where they can't,
 //! within one `dl.timeout` from the call. A store whose rules' consistency is undecided
@@ -39,7 +39,7 @@ use nrese_sparql::{QueryOptions, QueryResults};
 use nrese_sparql_syntax::SparqlParser;
 
 use crate::error::{StoreError, StoreResult};
-use crate::service::{Certificate, Premise, StoreService};
+use crate::service::{Certificate, Evidence, Premise, RulesEntailment, StoreService};
 
 /// Why a conclusion is entailed, or that it isn't.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,7 +48,7 @@ pub enum Entailment {
     InconsistentPremise,
     /// Every statement is in the closure, and every negative one was refuted.
     Entailed,
-    /// Some statement is neither in the closure nor refuted.
+    /// The route has evidence against entailment.
     NotEntailed,
 }
 
@@ -128,24 +128,31 @@ impl StoreService {
         premise: Premise,
     ) -> StoreResult<Entailment> {
         let consistency = Certificate::assessment(at, self.config().replica).rules;
-        // Not known to entail everything, nor not to: no answer.
-        if let crate::ConsistencyStatus::Undecided { violations, why } = consistency {
-            return Err(StoreError::Undecided(why.text(violations)));
-        }
         // Under owl2-dl the closure is no proof, its inconsistency included: the DL engines
         // decide, the premise's consistency too.
-        if let Some(deadline) = dl {
-            return self.decided_by_dl(at, conclusion, deadline);
-        }
-        if premise == Premise::HeldInconsistent
+        let decided = crate::dl::query::Revision::Committed(at);
+        let rules = if let crate::ConsistencyStatus::Undecided { violations, why } = consistency {
+            RulesEntailment::Undecided(why.text(violations))
+        } else if let Some(deadline) = dl {
+            let evidence = self.entails_dl_at(at, conclusion, deadline)?;
+            return self
+                .assess(
+                    decided,
+                    Evidence::DlEntailment {
+                        premise: evidence.premise,
+                        answer: &evidence.answer,
+                    },
+                )
+                .entailment();
+        } else if premise == Premise::HeldInconsistent
             || matches!(consistency, crate::ConsistencyStatus::Inconsistent { .. })
         {
-            return Ok(Entailment::InconsistentPremise);
-        }
-        match self.shown_by_rules(at, program, &split(conclusion))? {
-            true => Ok(Entailment::Entailed),
-            false => Ok(Entailment::NotEntailed),
-        }
+            RulesEntailment::InconsistentPremise
+        } else {
+            self.shown_by_rules(at, program, &split(conclusion))?
+        };
+        self.assess(decided, Evidence::RulesEntailment(rules))
+            .entailment()
     }
 
     /// Whether the closure at `at` holds every positive statement and the rules refute every
@@ -155,40 +162,21 @@ impl StoreService {
         at: &Snapshot,
         program: &RuleProgram,
         split: &Split,
-    ) -> StoreResult<bool> {
+    ) -> StoreResult<RulesEntailment> {
         let asked = split.positive.is_empty() || self.ask(at, &split.positive)?;
         #[cfg(test)]
         crate::service::hooks::run(&crate::service::hooks::BETWEEN_ENTAILMENT_HALVES);
         if !asked {
-            return Ok(false);
+            return Ok(RulesEntailment::Closure(false));
         }
         for opposite in &split.refutations {
             if !self.refutes(at, program, opposite)? {
-                return Ok(false);
+                return Ok(RulesEntailment::Undecided(
+                    "the rules did not refute the opposite of the conclusion".to_owned(),
+                ));
             }
         }
-        Ok(true)
-    }
-
-    /// [`Self::entails_dl`]'s answer at `at` before `deadline`, as an [`Entailment`];
-    /// undecided where it is unknown.
-    fn decided_by_dl(
-        &self,
-        at: &Snapshot,
-        conclusion: &[Triple],
-        deadline: Deadline,
-    ) -> StoreResult<Entailment> {
-        let decided = self.entails_dl_at(at, conclusion, deadline)?;
-        match (decided.premise, decided.answer) {
-            (crate::dl::Verdict::Inconsistent, crate::dl::entailment::Entailed::Yes) => {
-                Ok(Entailment::InconsistentPremise)
-            }
-            (_, crate::dl::entailment::Entailed::Yes) => Ok(Entailment::Entailed),
-            (_, crate::dl::entailment::Entailed::No) => Ok(Entailment::NotEntailed),
-            (_, crate::dl::entailment::Entailed::Unknown(why)) => {
-                Err(StoreError::Undecided(format!("under OWL 2 DL: {why}")))
-            }
-        }
+        Ok(RulesEntailment::Closure(true))
     }
 
     /// Whether the materialised data at `at` matches `pattern`, blank nodes read as variables.
@@ -224,6 +212,8 @@ impl StoreService {
         // form, so the rule constants this compiles still enter the dictionary.
         #[allow(clippy::disallowed_methods)]
         let mut tx = self.engine().speculative_shared();
+        // The pinned program and verdict belong to `at`; the speculative read needs
+        // the same data and equality reading, which a metadata-only reinstall keeps.
         if tx.base().identity() != at.identity() {
             return Err(StoreError::Undecided(CHANGED.to_owned()));
         }
@@ -437,6 +427,12 @@ pub struct DlEntailment {
     pub answer: crate::dl::entailment::Entailed,
     /// The premise's consistency, as evidence: it decides nothing about an unread conclusion.
     pub premise: crate::dl::Verdict,
+    pub claim: crate::Claim,
+}
+
+struct DlEvidence {
+    answer: crate::dl::entailment::Entailed,
+    premise: crate::dl::Verdict,
 }
 
 impl DlEntailment {
@@ -455,7 +451,20 @@ impl StoreService {
     /// or one left undecided at the deadline, is `unknown`. Reads only; never commits.
     pub fn entails_dl(&self, conclusion: &[Triple]) -> StoreResult<DlEntailment> {
         let deadline = Deadline::after(self.config().dl.timeout);
-        self.entails_dl_at(&self.engine().snapshot(), conclusion, deadline)
+        let snapshot = self.engine().snapshot();
+        let DlEvidence { answer, premise } = self.entails_dl_at(&snapshot, conclusion, deadline)?;
+        let claim = self.assess(
+            crate::dl::query::Revision::Committed(&snapshot),
+            Evidence::DlEntailment {
+                premise,
+                answer: &answer,
+            },
+        );
+        Ok(DlEntailment {
+            answer: claim.dl_answer().expect("DL entailment assessment").clone(),
+            premise: claim.dl_verdict().expect("DL premise assessment").clone(),
+            claim,
+        })
     }
 
     /// [`Self::entails_dl`] over the asserted statements at `snapshot`, before `deadline`: past
@@ -465,14 +474,14 @@ impl StoreService {
         snapshot: &Snapshot,
         conclusion: &[Triple],
         deadline: Deadline,
-    ) -> StoreResult<DlEntailment> {
+    ) -> StoreResult<DlEvidence> {
         use crate::dl::{Verdict, entailment::Entailed};
         let decided = self.entails_dl_read(snapshot, conclusion, deadline)?;
         if !deadline.passed() {
             return Ok(decided);
         }
         let late = || nrese_dl::limits::Limit::Time.reached("the deadline passed");
-        Ok(DlEntailment {
+        Ok(DlEvidence {
             answer: match decided.answer {
                 Entailed::Unknown(why) => Entailed::Unknown(why),
                 _ => Entailed::Unknown(late()),
@@ -490,7 +499,7 @@ impl StoreService {
         snapshot: &Snapshot,
         conclusion: &[Triple],
         deadline: Deadline,
-    ) -> StoreResult<DlEntailment> {
+    ) -> StoreResult<DlEvidence> {
         use crate::dl::entailment::{Entailed, admit_and_prepare, entails_prepared_within};
         use crate::dl::{Verdict, consistency, gate, source};
         use nrese_rdf::{NamedNodeRef, NamedOrBlankNode};
@@ -507,7 +516,7 @@ impl StoreService {
             source::read_premise(snapshot, memory.clone(), treatments, true)
         else {
             let why = source::refused("the premise");
-            return Ok(DlEntailment {
+            return Ok(DlEvidence {
                 answer: Entailed::Unknown(format!("the premise: {why}")),
                 premise: Verdict::Unknown(why),
             });
@@ -516,7 +525,7 @@ impl StoreService {
         let checked = consistency::check(&premise, &budget.remaining(deadline));
         if let Verdict::Unknown(why) = &checked.verdict {
             let answer = Entailed::Unknown(format!("the premise: {why}"));
-            return Ok(DlEntailment {
+            return Ok(DlEvidence {
                 answer,
                 premise: checked.verdict,
             });
@@ -528,12 +537,12 @@ impl StoreService {
         // never begun past the deadline: the read has none and scans the premise for SHACL.
         if inconsistent && deadline.passed() {
             let late = nrese_dl::limits::Limit::Time.reached("the deadline passed");
-            return Ok(DlEntailment {
+            return Ok(DlEvidence {
                 answer: Entailed::Unknown(late),
                 premise: checked.verdict,
             });
         }
-        let reply = |premise, answer| Ok(DlEntailment { answer, premise });
+        let reply = |premise, answer| Ok(DlEvidence { answer, premise });
         if conclusion
             .iter()
             .any(|t| matches!(t.object, Term::Triple(_)))
@@ -622,7 +631,7 @@ impl StoreService {
         }
         // Undecided where the envelope can't take the conclusion's terms, as the premise's.
         let Ok(statements) = statements else {
-            return Ok(DlEntailment {
+            return Ok(DlEvidence {
                 answer: Entailed::Unknown(format!(
                     "the conclusion: {}",
                     source::refused("the conclusion")
@@ -653,7 +662,7 @@ impl StoreService {
         // Named by the conclusion's IRIs and literals, as the requester wrote them; its blank
         // nodes, relabelled here, by none.
         if let Some(diagnostic) = read.diagnostics.iter().find(|d| d.is_fatal()) {
-            return Ok(DlEntailment {
+            return Ok(DlEvidence {
                 answer: Entailed::Unknown(format!(
                     "the conclusion isn't well-formed OWL 2 DL: {}",
                     diagnostic.describe(&name)
@@ -665,7 +674,7 @@ impl StoreService {
             let obj = nrese_engine::TermId::from_raw(s.triple[2]);
             crate::dl::query::is_ill_typed(obj, &decode).then_some(s.triple[2])
         }) {
-            return Ok(DlEntailment {
+            return Ok(DlEvidence {
                 answer: Entailed::Unknown(format!(
                     "the conclusion isn't well-formed OWL 2 DL: ill-typed literal: {}",
                     name(bad)
@@ -679,7 +688,7 @@ impl StoreService {
         };
         // Admitted: an inconsistent premise has no model, so it entails the conclusion.
         if inconsistent {
-            return Ok(DlEntailment {
+            return Ok(DlEvidence {
                 answer: Entailed::Yes,
                 premise: checked.verdict,
             });
@@ -694,7 +703,7 @@ impl StoreService {
             })
             .collect();
         let fresh = fresh?;
-        Ok(DlEntailment {
+        Ok(DlEvidence {
             answer: entails_prepared_within(
                 prepared,
                 !read.anonymous.is_empty(),

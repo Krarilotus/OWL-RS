@@ -9,7 +9,8 @@
 use std::sync::Arc;
 
 use nrese_reasoner::{ReasonerConfig, ReasoningMode};
-use nrese_sparql::{Completeness, GraphAccess};
+use nrese_sparql::GraphAccess;
+use nrese_store::Claim;
 use nrese_store::{
     CancellationToken, MutationPipeline, ReadScope, SparqlQueryRequest, StatementOp, StoreConfig,
     StoreService,
@@ -20,7 +21,7 @@ use super::{PREFIXES, insert, pipeline, pipeline_of};
 
 /// `q` (with [`PREFIXES`]) on `store` for a reader of every graph: its answer as written
 /// (results JSON, or the described graph) and its status.
-fn told(store: &StoreService, q: &str) -> (String, Completeness) {
+fn told(store: &StoreService, q: &str) -> (String, Claim) {
     let request = SparqlQueryRequest::all(format!("{PREFIXES}{q}"));
     let prepared = store.prepare_query(&request).expect("prepared");
     let mut out = Vec::new();
@@ -43,7 +44,7 @@ fn kinds() -> MutationPipeline {
 }
 
 /// Each `(read, status)` whose status isn't `unsound`, as a line.
-fn not_unsound<'a>(told: impl IntoIterator<Item = (&'a str, Completeness)>) -> Vec<String> {
+fn not_unsound<'a>(told: impl IntoIterator<Item = (&'a str, Claim)>) -> Vec<String> {
     told.into_iter()
         .filter(|(_, status)| status.as_str() != "unsound")
         .map(|(read, status)| format!("{read}: {}", status.header()))

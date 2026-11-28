@@ -301,6 +301,11 @@ async fn refused(
     let got = format!("{label}: got {code}, NRESE-Completeness {status:?}, body {body}");
     assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{got}");
     assert_eq!(
+        status.as_ref().and_then(|value| value.to_str().ok()),
+        Some(without),
+        "{got}"
+    );
+    assert_eq!(
         media.as_ref().and_then(|m| m.to_str().ok()),
         Some("application/problem+json"),
         "{got}"

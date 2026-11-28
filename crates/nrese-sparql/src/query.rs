@@ -265,7 +265,7 @@ pub struct PlanStep {
 
 /// How a query ran ([`explain_query`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Explanation {
+pub struct Explanation<C = crate::Completeness> {
     /// `native`: the executor (one; the field stays for the report's format).
     pub executor: &'static str,
     /// The rewrites that changed the query before it ran, in the order applied:
@@ -281,10 +281,10 @@ pub struct Explanation {
     pub micros: u64,
     /// What the OWL 2 QL rewriting did, and whether the answers are complete; `None` where
     /// it doesn't apply.
-    pub ql: Option<crate::ql::QlReport>,
+    pub ql: Option<crate::ql::QlReport<C>>,
     /// Whether the answers are complete, where a reasoning path can leave some out: the
     /// status the answers carry (set by the store: QL's, the DL bounds', a closure's).
-    pub completeness: Option<crate::completeness::Completeness>,
+    pub completeness: Option<C>,
     /// What decided the status (the DL bounds' paths: `closed-predicates`,
     /// `skolem-only-gap`, `bounds-equal`, `exact-ground-entailment`,
     /// `exact-internalisable-cq`).
@@ -345,14 +345,14 @@ pub struct PlannedStep {
 
 /// The plan a query would run as ([`plan_query`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlannedQuery {
+pub struct PlannedQuery<C = crate::Completeness> {
     /// The rewrites that changed the query, in the order applied (as in [`Explanation`]).
     pub rewrites: Vec<&'static str>,
     pub steps: Vec<PlannedStep>,
     /// As in [`Explanation`].
-    pub ql: Option<crate::ql::QlReport>,
+    pub ql: Option<crate::ql::QlReport<C>>,
     /// What the store can say about completeness before running (set by the store).
-    pub completeness: Option<crate::completeness::Completeness>,
+    pub completeness: Option<C>,
 }
 
 /// The plan `query` would run as on `view`, after the rewrites, each node with an estimate

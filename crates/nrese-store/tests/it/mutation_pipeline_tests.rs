@@ -2064,7 +2064,7 @@ fn a_pending_fact_through_an_alias_of_has_key_keeps_the_transaction_status() {
     assert_pending_key(status.as_ref());
 }
 
-fn assert_pending_key(status: Option<&nrese_sparql::Completeness>) {
+fn assert_pending_key(status: Option<&nrese_store::Claim>) {
     assert!(
         status.is_some_and(|c| c.sound
             && !c.complete
@@ -2100,8 +2100,8 @@ fn alias_of_has_key(
     compact: bool,
 ) -> (
     String,
-    Option<nrese_sparql::Completeness>,
-    Option<nrese_sparql::Completeness>,
+    Option<nrese_store::Claim>,
+    Option<nrese_store::Claim>,
 ) {
     let store = Arc::new(
         StoreService::new(nrese_store::StoreConfig {
@@ -2232,7 +2232,7 @@ fn pending_status(
     store: &StoreService,
     request: nrese_store::SparqlQueryRequest,
     update: &str,
-) -> Option<nrese_sparql::Completeness> {
+) -> Option<nrese_store::Claim> {
     let prepared = store.prepare_query(&request).expect("prepared");
     let ops = vec![nrese_store::StatementOp::Update(SparqlUpdateRequest::new(
         update.to_owned(),
@@ -2255,7 +2255,7 @@ fn pending_status(
 }
 
 /// Not `complete`, for a list axiom left out.
-fn list_left_out(status: &nrese_sparql::Completeness) -> bool {
+fn list_left_out(status: &nrese_store::Claim) -> bool {
     !status.complete && (status.reasons.iter()).any(|r| r.text.contains("list axiom"))
 }
 
@@ -2462,7 +2462,7 @@ fn a_negation_over_a_long_list_uses_the_entailed_blocker() {
             let prepared = store.prepare_query(&request).expect("prepared");
             let token = nrese_store::CancellationToken::new();
             let planned = store.plan_query(&prepared, &token).expect("planned");
-            let label = |c: Option<&nrese_sparql::Completeness>| c.map(|c| c.as_str());
+            let label = |c: Option<&nrese_store::Claim>| c.map(|c| c.as_str());
             let labels = [
                 label(answer.completeness.as_ref()),
                 label(answer.ql.as_ref().map(|r| &r.completeness)),
@@ -2535,7 +2535,7 @@ fn each_operator_over_a_long_chain_is_complete_on_every_surface() {
         let token = nrese_store::CancellationToken::new();
         let planned = store.plan_query(&prepared, &token).expect("planned");
         let explained = store.explain_query(&prepared, &token).expect("explained");
-        let label = |c: Option<&nrese_sparql::Completeness>| c.map(|c| c.as_str());
+        let label = |c: Option<&nrese_store::Claim>| c.map(|c| c.as_str());
         let labels = [
             label(answer.completeness.as_ref()),
             label(answer.ql.as_ref().map(|r| &r.completeness)),

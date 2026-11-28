@@ -51,11 +51,12 @@ fn lower_true_ask_evaluates_once_and_delivers_that_result() {
     crate::query_executor::BOUND_EVALUATIONS.with(|n| n.set(0));
     let outcome = answer(
         &store,
-        &store.engine().snapshot(),
+        Revision::Committed(&store.engine().snapshot()),
         &prepared,
         &CancellationToken::new(),
         &nrese_exec::Envelope::unlimited(),
         DlAnswers::Exact,
+        None,
     )
     .unwrap();
     let Outcome::Answers(answers @ Answers::Boolean(true), status, detail) = outcome else {
@@ -316,11 +317,12 @@ fn cancellation_takes_precedence_over_partial_answers_and_incompleteness() {
         assert!(matches!(
             answer(
                 &store,
-                &store.engine().snapshot(),
+                Revision::Committed(&store.engine().snapshot()),
                 &prepared,
                 &token,
                 &nrese_exec::Envelope::unlimited(),
                 mode,
+                None,
             ),
             Err(StoreError::SparqlEvaluation(
                 nrese_sparql::QueryEvaluationError::Cancelled
@@ -349,11 +351,12 @@ fn a_cancellation_while_the_element_is_posed_is_the_reads() {
         crate::service::hooks::BEFORE_STAND_IN.set(Some(Box::new(move || cancel.cancel())));
         let outcome = answer(
             &store,
-            &store.engine().snapshot(),
+            Revision::Committed(&store.engine().snapshot()),
             &prepared,
             &token,
             &nrese_exec::Envelope::unlimited(),
             mode,
+            None,
         )
         .err();
         assert!(
@@ -495,11 +498,7 @@ fn racing(
 }
 
 /// `query` over [`racing`]`(first, then)`, run: the answer and its status.
-fn decided_then(
-    first: &str,
-    then: &'static str,
-    query: &str,
-) -> (String, nrese_sparql::Completeness) {
+fn decided_then(first: &str, then: &'static str, query: &str) -> (String, crate::Claim) {
     let (store, ran) = racing(first, then);
     let prepared = store
         .prepare_query(&crate::SparqlQueryRequest::all(format!(
@@ -661,7 +660,9 @@ fn an_ontology_read_refused_at_its_budget_leaves_the_answers_unsound() {
     crate::service::hooks::AFTER_DECIDED.set(Some(Box::new(move || {
         drop(cache.dl().query_ontology.0.lock().unwrap().take());
         // Nor the mark the control's read kept for the revision.
-        drop(cache.dl().query_ontology.1.lock().unwrap().take());
+        let snapshot = cache.engine().snapshot();
+        let basis = crate::service::ReadBasis::of(&snapshot).expect("published basis");
+        drop(basis.omission.lock().unwrap().take());
         let rest = budget.remaining();
         budget.charge(rest).unwrap();
         held.set(rest);
@@ -750,6 +751,7 @@ fn marks_and_passes(
         let marks = status
             .expect("a status")
             .reasons
+            .clone()
             .into_iter()
             .filter(|r| r.text.contains(ONLY))
             .map(|r| r.text)
@@ -879,8 +881,8 @@ fn a_deleted_triple_a_surviving_reification_names_is_told_as_a_fresh_read_tells_
             let request = crate::SparqlQueryRequest::all(ask.clone());
             store.prepare_query(&request).unwrap()
         };
-        let marks = |status: Option<nrese_sparql::Completeness>| -> Vec<String> {
-            let reasons = status.expect("a status").reasons.into_iter();
+        let marks = |status: Option<crate::Claim>| -> Vec<String> {
+            let reasons = status.expect("a status").reasons.clone().into_iter();
             reasons
                 .filter(|r| r.text.contains(ONLY))
                 .map(|r| r.text)
@@ -968,7 +970,7 @@ fn a_reinserted_triple_a_surviving_reification_names_is_told_as_a_fresh_read_tel
                     None
                 });
             read.unwrap();
-            let reasons = status.expect("a status").reasons.into_iter();
+            let reasons = status.expect("a status").reasons.clone().into_iter();
             reasons
                 .filter(|r| r.text.contains(ONLY))
                 .map(|r| r.text)
@@ -1323,6 +1325,7 @@ fn a_pending_read_takes_its_bases_record_only_for_changes_on_the_list() {
             ));
         }
         let at = |keeps_record| Revision::Pending {
+            base: &snapshot,
             snapshot: &pending,
             deletes: !deleted.is_empty(),
             keeps_record,
@@ -1396,7 +1399,9 @@ fn committed_reads_without_a_record_pass_over_the_ontology_at_most_once() {
 #[test]
 fn a_consistency_check_records_what_the_premise_tells() {
     use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
-    let store = Arc::new(StoreService::new(crate::StoreConfig::in_memory()).unwrap());
+    let dir = tempfile::tempdir().expect("store directory");
+    let config = crate::StoreConfig::on_disk(dir.path());
+    let store = Arc::new(StoreService::new(config.clone()).unwrap());
     let pipeline = crate::MutationPipeline::new(
         Arc::clone(&store),
         Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
@@ -1408,8 +1413,12 @@ fn a_consistency_check_records_what_the_premise_tells() {
         &pipeline,
         &format!("INSERT DATA {{ {OFF_ROUTE}{two_kinds} }}"),
     );
-    *store.dl().status.lock().unwrap() = None;
+    drop(pipeline);
+    drop(store);
+    let store = StoreService::new(config).expect("reopen store");
+    store.use_dl(true, false);
     let snapshot = store.engine().snapshot();
+    assert!(crate::service::ReadBasis::dl_status(&snapshot).is_none());
     let _ = consistency_at(
         &store,
         &snapshot,
@@ -1418,7 +1427,9 @@ fn a_consistency_check_records_what_the_premise_tells() {
         Deadline::after(store.config().dl.timeout),
         &nrese_exec::Envelope::unlimited(),
     );
-    let recorded = store.dl().status().expect("a record").left_out;
+    let recorded = crate::service::ReadBasis::dl_status(&snapshot)
+        .expect("a record")
+        .left_out;
     assert!(
         matches!(&recorded, Some(Some(why)) if why.contains("two kinds")),
         "the record names the two kinds: {recorded:?}"
@@ -1718,6 +1729,7 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
         let keeps_record = store.dl().bounds.keeps_record(&tx);
         keeping += usize::from(keeps_record);
         let at = Revision::Pending {
+            base: &snapshot,
             snapshot: &pending,
             deletes: true,
             keeps_record,
@@ -1948,6 +1960,7 @@ fn a_kept_record_marks_a_pending_read_as_its_own_ontology_does() {
             let pending = tx.pending_snapshot().unwrap();
             let keeps_record = store.dl().bounds.keeps_record(&tx);
             let at = |keeps_record| Revision::Pending {
+                base: &snapshot,
                 snapshot: &pending,
                 deletes: !removed.is_empty(),
                 keeps_record,
@@ -2104,10 +2117,7 @@ fn unions_store_of(dl: crate::DlConfig, data: &str) -> Arc<StoreService> {
 }
 
 /// A read's answers' bytes and its status with what decided it.
-type Read = (
-    Vec<u8>,
-    Option<(nrese_sparql::Completeness, crate::dl::DlDetail)>,
-);
+type Read = (Vec<u8>, Option<(crate::Claim, crate::dl::DlDetail)>);
 
 /// `SELECT ?x { ?x a :U0 }` over `store` within `memory` bytes.
 fn unions_read(store: &StoreService, memory: Option<usize>) -> crate::StoreResult<Read> {
@@ -2247,8 +2257,7 @@ fn without_model_labels_a_read_is_decided_by_its_tests_alone() {
     let ((off_status, off_detail), (on_status, on_detail)) =
         (off_status.unwrap(), on_status.unwrap());
     println!("off {off_status:?} {off_detail:?}; on {on_status:?} {on_detail:?}");
-    let bounds =
-        |s: &nrese_sparql::Completeness| s.bounds.map(|b| (b.lower, b.upper, b.unresolved));
+    let bounds = |s: &crate::Claim| s.bounds.map(|b| (b.lower, b.upper, b.unresolved));
     assert_eq!(bounds(&off_status), Some((12, 24, 8)));
     assert_eq!(
         (
@@ -2443,8 +2452,7 @@ fn a_read_past_its_requests_deadline_is_told_incomplete_with_its_rows() {
     let (rows, (status, detail)) = read(Some(std::time::Instant::now()));
     let (free_rows, (free, free_detail)) = read(None);
     println!("passed {status:?} {detail:?}; no deadline {free:?} {free_detail:?}");
-    let bounds =
-        |s: &nrese_sparql::Completeness| s.bounds.map(|b| (b.lower, b.upper, b.unresolved));
+    let bounds = |s: &crate::Claim| s.bounds.map(|b| (b.lower, b.upper, b.unresolved));
     let counts = |d: &crate::dl::DlDetail| (d.proved, d.refuted);
     assert_eq!(
         (bounds(&status), counts(&detail), status.complete),
@@ -2471,11 +2479,12 @@ fn an_operators_cancel_is_an_error_past_the_deadline_too() {
         crate::service::hooks::AFTER_DECIDED.set(Some(Box::new(move || cancel.cancel())));
         let outcome = answer(
             &store,
-            &store.engine().snapshot(),
+            Revision::Committed(&store.engine().snapshot()),
             &prepared,
             &token,
             &nrese_exec::Envelope::unlimited(),
             DlAnswers::default(),
+            None,
         )
         .err();
         assert!(
@@ -2652,7 +2661,7 @@ fn promoted_store(model_labels: bool) -> Arc<StoreService> {
 }
 
 /// [`promoted_store`]'s read with the labels on and no memory limit: what decided it, its status.
-fn promoted_read() -> (crate::dl::DlDetail, nrese_sparql::Completeness) {
+fn promoted_read() -> (crate::dl::DlDetail, crate::Claim) {
     let (_, status) = unions_read_of(&promoted_store(true), PROMOTED, None).unwrap();
     let (status, detail) = status.expect("a status");
     println!("{status:?} {detail:?}");

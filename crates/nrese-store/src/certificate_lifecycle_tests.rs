@@ -77,7 +77,7 @@ fn class(header: &str) -> &str {
     header.split(';').next().unwrap_or(header)
 }
 
-fn header(status: Option<nrese_sparql::Completeness>) -> String {
+fn header(status: Option<crate::Claim>) -> String {
     status.map_or_else(|| "none".to_owned(), |s| s.header())
 }
 
@@ -501,7 +501,11 @@ fn a_version_no_one_published_read_without_its_operations_is_not_certified() {
         &crate::ReadScope::of(None),
         &memory,
         &cancel,
-        |snapshot| Ok(store.status_outside_dl(&prepared, None, Revision::Committed(snapshot))),
+        |snapshot| {
+            Ok(store
+                .status_outside_dl(&prepared, None, Revision::Committed(snapshot), None)
+                .into_report())
+        },
     );
     match private {
         Ok(got) => cells.class("row 14 a private version", &header(got), "not-certified"),
@@ -522,7 +526,11 @@ fn a_version_no_one_published_read_without_its_operations_is_not_certified() {
         &restricted,
         &memory,
         &cancel,
-        |snapshot| Ok(store.status_outside_dl(&prepared, None, Revision::Committed(snapshot))),
+        |snapshot| {
+            Ok(store
+                .status_outside_dl(&prepared, None, Revision::Committed(snapshot), None)
+                .into_report())
+        },
     );
     match private {
         Ok(got) => cells.class(
@@ -542,8 +550,13 @@ fn a_version_no_one_published_read_without_its_operations_is_not_certified() {
     ) {
         Ok(()) => {
             let snapshot = tx.pending_snapshot();
-            let got = store.status_outside_dl(&prepared, None, Revision::Committed(&snapshot));
-            cells.class("row 14 a pending version", &header(got), "not-certified");
+            let got =
+                store.status_outside_dl(&prepared, None, Revision::Committed(&snapshot), None);
+            cells.class(
+                "row 14 a pending version",
+                &header(got.into_report()),
+                "not-certified",
+            );
         }
         Err(error) => cells.unmet("row 14 a pending version", &error.to_string()),
     }
@@ -1527,7 +1540,7 @@ fn a_commit_in_quarantine_that_equates_two_literals_is_never_told_complete() {
     const INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
     const DECIMAL: &str = "http://www.w3.org/2001/XMLSchema#decimal";
     const EQUALITY: &str = "an owl:sameAs between literals";
-    type Answer = (Vec<(String, String)>, Option<nrese_sparql::Completeness>);
+    type Answer = (Vec<(String, String)>, Option<crate::Claim>);
     /// A store in `dir` holding `data` and `:a a owl:Nothing`, reasoned under OWL 2 RL with the
     /// QL rewriting on: inconsistent, so in quarantine.
     fn quarantined(dir: &Path, data: &str) -> Arc<StoreService> {
@@ -1554,7 +1567,7 @@ fn a_commit_in_quarantine_that_equates_two_literals_is_never_told_complete() {
         (values, answer.completeness)
     }
     /// The status's word and its reasons, for the cell's line.
-    fn said(status: &Option<nrese_sparql::Completeness>) -> String {
+    fn said(status: &Option<crate::Claim>) -> String {
         let reasons: Vec<&str> = (status.iter())
             .flat_map(|s| s.reasons.iter().map(|r| r.text.as_str()))
             .collect();
@@ -1564,7 +1577,7 @@ fn a_commit_in_quarantine_that_equates_two_literals_is_never_told_complete() {
         )
     }
     /// `sound-only`, naming the equality.
-    fn withheld(status: &Option<nrese_sparql::Completeness>) -> bool {
+    fn withheld(status: &Option<crate::Claim>) -> bool {
         status.as_ref().is_some_and(|s| {
             s.as_str() == "sound-only" && s.reasons.iter().any(|r| r.text.contains(EQUALITY))
         })
@@ -1686,8 +1699,7 @@ fn a_commit_in_quarantine_that_equates_two_literals_is_never_told_complete() {
                 |word| word == "inconsistent" && store.is_quarantined(),
                 "inconsistent and held",
             );
-            let complete =
-                |s: &Option<nrese_sparql::Completeness>| s.as_ref().is_some_and(|s| s.complete);
+            let complete = |s: &Option<crate::Claim>| s.as_ref().is_some_and(|s| s.complete);
             cells.check(
                 &format!("{name} | the status"),
                 &said(&status),

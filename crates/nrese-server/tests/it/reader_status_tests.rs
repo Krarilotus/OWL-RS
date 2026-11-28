@@ -167,8 +167,25 @@ async fn ask(app: &Router, roles: &[&str], route: Route) -> TestResult<Told> {
     };
     let uri = format!("/dataset/query?explain={explain}");
     let explain = send(app, roles, Method::POST, &uri, query).await?;
-    let (explanation, _) = read(explain).await?;
+    let (explanation, header) = read(explain).await?;
     let c = &explanation["completeness"];
+    // Spec: docs/spec/reasoning-semantics.md:86. A plan's header, body and nested QL
+    // report describe the same read and expose the same reasoning regime and status.
+    assert_eq!(
+        header.split(';').next(),
+        c["status"].as_str(),
+        "{explanation}"
+    );
+    let regime = header
+        .split("; ")
+        .find_map(|field| field.strip_prefix("regime="));
+    assert_eq!(regime, c["regime"].as_str(), "{explanation}");
+    if let Some(ql) = explanation.get("ql").filter(|report| !report.is_null()) {
+        assert_eq!(ql["completeness"], c["status"]);
+        for field in ["sound", "complete", "reasons"] {
+            assert_eq!(ql[field], c[field], "QL report differs on {field}");
+        }
+    }
     let bare = c["regime"].is_null() && c["reasons"].as_array().is_some_and(Vec::is_empty);
     let status =
         c["status"].as_str().unwrap_or_default().to_owned() + if bare { "" } else { "; …" };
