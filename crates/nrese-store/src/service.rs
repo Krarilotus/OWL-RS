@@ -1648,6 +1648,13 @@ impl StoreService {
         crate::dl::bounds::upper_facts(self, afresh)
     }
 
+    /// Stack and eligible program facts from the same U1, for integration tests.
+    #[cfg(feature = "fault-points")]
+    #[doc(hidden)]
+    pub fn dl_upper_partitions_for_test(&self, afresh: bool) -> Option<[Vec<[String; 3]>; 2]> {
+        crate::dl::bounds::upper_partitions(self, afresh)
+    }
+
     pub fn execute_query(
         &self,
         request: &SparqlQueryRequest,

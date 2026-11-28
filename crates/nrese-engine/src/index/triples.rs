@@ -169,30 +169,15 @@ impl TripleVersion {
     /// Builds one compaction of this version. The returned operation splices the result
     /// into a current version if the inputs still match, preserving any later appends.
     ///
-    /// A writer using `inline_only` takes small windows and caps the list at two runs.
+    /// The writer takes small windows and caps the list at two runs.
     /// While the background owner holds its two input runs, a third run is allowed and
     /// the writer merges only the tail after the owner's window. If that merge cannot
     /// be charged, the writer can refuse the staged version and keep the old readers' runs.
     pub fn compact(
         &self,
         policy: CompactionPolicy,
-        inline_only: bool,
     ) -> CompactionResult<impl FnOnce(&Self) -> CompactionResult<Self> + Send + use<>> {
         let runs = &self.0.index.runs;
-        if !inline_only {
-            let Some(plan) = policy.plan(runs) else {
-                return Ok(None);
-            };
-            let pin = (plan.window.end <= INLINE_RUN_LIMIT)
-                .then(|| CompactionPin::new(&runs[plan.window.end - 1]));
-            return TripleCompaction {
-                captured: self.clone(),
-                window: plan.window,
-                pin,
-            }
-            .build()
-            .map(Some);
-        }
         let floor = runs
             .iter()
             .rposition(|run| run.compactions().load(Relaxed) != 0)
@@ -360,10 +345,11 @@ mod tests {
         let budget = Arc::new(Budget::unlimited());
         let pinned = base(&budget).successor(&[T], &[]).unwrap();
         let current = pinned.successor(&[], &[A, T]).unwrap();
-        let compact = current
-            .compact(CompactionPolicy::default(), false)
-            .unwrap()
-            .unwrap();
+        let policy = CompactionPolicy {
+            inline_entry_limit: 0,
+            ..Default::default()
+        };
+        let compact = current.compact(policy).unwrap().expect("forced suffix");
         let latest = compact(&current).unwrap().unwrap();
         assert_eq!((latest.contains(A), latest.contains(T)), (false, false));
         assert_eq!((pinned.contains(A), pinned.contains(T)), (true, true));
@@ -389,7 +375,7 @@ mod tests {
             fanout: 128,
             ..CompactionPolicy::default()
         };
-        let splice = current.compact(policy, false).unwrap().unwrap();
+        let splice = current.plan_compaction(policy).unwrap().build().unwrap();
         let latest = splice(&current).unwrap().unwrap();
         drop(current);
         assert_eq!(
@@ -425,7 +411,7 @@ mod tests {
             assert_eq!(latest.count_predicate(P + 1), 1);
             assert_eq!(pinned.count_predicate(P), facts.len());
             let compact = latest
-                .compact(policy, true)
+                .compact(policy)
                 .unwrap()
                 .expect("the writer enforces the cap");
             latest = compact(&latest).unwrap().unwrap();
@@ -446,7 +432,7 @@ mod tests {
         let next = pinned.successor(&[last], &[]).unwrap();
         assert!(!next.needs_compaction(policy));
         let compact = next
-            .compact(policy, true)
+            .compact(policy)
             .unwrap()
             .expect("the cap selects a suffix");
         let next = compact(&next).unwrap().unwrap();
@@ -484,13 +470,13 @@ mod tests {
     #[test]
     fn triple_compaction_splices_into_the_version_with_a_later_append() {
         let budget = Arc::new(Budget::unlimited());
-        let old = base(&budget).successor(&[T], &[]).unwrap();
+        let old = TripleVersion::build([A, T], &budget).unwrap();
         let captured = old.successor(&[], &[T]).unwrap();
-        let splice = captured
-            .compact(CompactionPolicy::default(), false)
-            .unwrap()
+        let plan = captured
+            .plan_compaction(CompactionPolicy::default())
             .unwrap();
         let current = captured.successor(&[Z], &[]).unwrap();
+        let splice = plan.build().unwrap();
         let latest = splice(&current).unwrap().unwrap();
         assert!(latest.contains(Z), "compaction dropped the later append");
         assert!(!latest.contains(T));
@@ -511,18 +497,18 @@ mod tests {
             .unwrap()
             .successor(&[T], &[])
             .unwrap();
-        let splice = old.compact(policy, false).unwrap().unwrap();
+        let plan = old.plan_compaction(policy).unwrap();
         let mut current = old.clone();
         for s in 200..210 {
             current = current.successor(&[[s, P, 1]], &[]).unwrap();
-            if let Some(compact) = current.compact(policy, true).unwrap() {
+            if let Some(compact) = current.compact(policy).unwrap() {
                 current = compact(&current).unwrap().unwrap();
             }
+            assert!(current.0.index.runs.len() <= 3);
         }
-        let latest = splice(&current)
+        let latest = plan.build().unwrap()(&current)
             .unwrap()
             .expect("writer compaction kept the owner's runs");
-        assert!(current.0.index.runs.len() <= 3);
         assert!(latest.0.index.runs.len() <= 2);
         assert_eq!(
             latest.scan(PREDICATE).collect::<Vec<_>>(),

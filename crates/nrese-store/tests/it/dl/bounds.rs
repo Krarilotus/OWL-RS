@@ -36,6 +36,36 @@ fn canonical(facts: &[[String; 3]]) -> Vec<([String; 3], usize)> {
     out.into_iter().collect()
 }
 
+fn assert_matches_fresh(store: &nrese_store::StoreService, context: impl std::fmt::Display) {
+    let [stack, eligible] = store.dl_upper_partitions_for_test(false).expect("U1");
+    let [fresh_stack, fresh_eligible] =
+        store.dl_upper_partitions_for_test(true).expect("U1 afresh");
+    assert_eq!(
+        canonical(&stack),
+        canonical(&fresh_stack),
+        "{context}: stack facts"
+    );
+    assert_eq!(
+        canonical(&eligible),
+        canonical(&fresh_eligible),
+        "{context}: eligible program facts"
+    );
+}
+
+/// Exercise a program fact leaving and re-entering eligibility as its assertion comes and goes.
+fn check_eligible_assertion(pipeline: &nrese_store::MutationPipeline) {
+    insert(
+        pipeline,
+        ":Mark a owl:Class . :marked a owl:NamedIndividual ,
+        [ owl:complementOf [ owl:complementOf :Mark ] ] .",
+    )
+    .expect("eligible program fact");
+    insert(pipeline, ":marked a :Mark .").expect("assertion");
+    assert_matches_fresh(pipeline.store(), "asserted program fact");
+    update(pipeline, "DELETE DATA { :marked a :Mark }").expect("retraction");
+    assert_matches_fresh(pipeline.store(), "retracted program fact");
+}
+
 #[test]
 fn the_maintained_upper_bound_is_the_one_evaluated_afresh() {
     let classes = ["Person", "Man", "Woman", "Parent"];
@@ -46,6 +76,9 @@ fn the_maintained_upper_bound_is_the_one_evaluated_afresh() {
             ..nrese_store::DlConfig::default()
         });
         insert(&dl, SCHEMA).expect("schema");
+        if seed == 0 {
+            check_eligible_assertion(&dl);
+        }
         let mut rng = Rng::new(seed);
         let mut asserted: Vec<String> = Vec::new();
         for step in 0..12 {
@@ -66,13 +99,7 @@ fn the_maintained_upper_bound_is_the_one_evaluated_afresh() {
                 insert(&dl, &fact).expect("insert");
                 asserted.push(fact);
             }
-            let maintained = dl.store().dl_upper_facts(false).expect("U1");
-            let afresh = dl.store().dl_upper_facts(true).expect("U1 afresh");
-            assert_eq!(
-                canonical(&maintained),
-                canonical(&afresh),
-                "seed {seed}, step {step}"
-            );
+            assert_matches_fresh(dl.store(), format_args!("seed {seed}, step {step}"));
             assert_eq!(
                 dl.store().dl_bounds().last,
                 "delta",
@@ -103,6 +130,9 @@ fn the_upper_bound_with_equality_classes_is_the_one_evaluated_afresh() {
             ..nrese_store::DlConfig::default()
         });
         insert(&dl, EQUALITY).expect("schema");
+        if seed == 0 {
+            check_eligible_assertion(&dl);
+        }
         let mut rng = Rng::new(seed);
         let mut asserted: Vec<String> = Vec::new();
         for step in 0..10 {
@@ -120,13 +150,7 @@ fn the_upper_bound_with_equality_classes_is_the_one_evaluated_afresh() {
                 insert(&dl, &fact).expect("insert");
                 asserted.push(fact);
             }
-            let maintained = dl.store().dl_upper_facts(false).expect("U1");
-            let afresh = dl.store().dl_upper_facts(true).expect("U1 afresh");
-            assert_eq!(
-                canonical(&maintained),
-                canonical(&afresh),
-                "seed {seed}, step {step}"
-            );
+            assert_matches_fresh(dl.store(), format_args!("seed {seed}, step {step}"));
             match dl.store().dl_bounds().last {
                 "delta" => by_delta += 1,
                 _ => with_classes += 1,

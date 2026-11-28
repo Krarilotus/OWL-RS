@@ -422,6 +422,14 @@ impl Change {
     pub fn merges(&self) -> bool {
         self.merges
     }
+
+    #[cfg(test)]
+    pub(super) fn inserting(fact: Triple) -> Self {
+        Self {
+            insert: vec![fact],
+            ..Self::default()
+        }
+    }
 }
 
 /// Why U1 isn't available: its evaluation ran out of its budget, or (`refused`) memory
@@ -991,7 +999,7 @@ fn advance(
         .successor(inserts, deletes)
         .map_err(facts_refused)?;
     if let Some(splice) = version
-        .compact(nrese_engine::CompactionPolicy::default(), true)
+        .compact(nrese_engine::CompactionPolicy::default())
         .map_err(facts_refused)?
     {
         return Ok(splice(&version)

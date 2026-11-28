@@ -50,12 +50,13 @@ fn the_runs_hold_nothing_beyond_their_charge() {
 
             stack = stack.successor(&moved, &[]).unwrap();
             eligible = eligible.successor(&[], &moved).unwrap();
-            let compact = stack.compact(policy, true).unwrap().expect("third run");
+            let compact = stack.compact(policy).unwrap().expect("third run");
             stack = compact(&stack).unwrap().expect("matching stack");
             let compact = eligible
-                .compact(policy, false)
-                .unwrap()
-                .expect("two equal-sized eligible runs");
+                .plan_compaction(policy)
+                .expect("two equal-sized eligible runs")
+                .build()
+                .unwrap();
             eligible = compact(&eligible).unwrap().expect("matching eligible set");
 
             assert_eq!(stack.len(), facts.len());
@@ -69,9 +70,10 @@ fn the_runs_hold_nothing_beyond_their_charge() {
             for base in [&stack, &held_eligible] {
                 let staged = base.successor(&[extra], &[]).unwrap();
                 let compact = staged
-                    .compact(keep, false)
-                    .unwrap()
-                    .expect("a nonempty merge");
+                    .plan_compaction(keep)
+                    .expect("a nonempty merge")
+                    .build()
+                    .unwrap();
                 let compacted = compact(&staged).unwrap().expect("matching runs");
                 assert_eq!(compacted.len(), base.len() + 1);
                 assert!(compacted.contains(extra));

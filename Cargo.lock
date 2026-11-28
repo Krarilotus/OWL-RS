@@ -1392,6 +1392,7 @@ dependencies = [
  "nrese-sparql",
  "nrese-sparql-results",
  "nrese-sparql-syntax",
+ "nrese-store",
  "nrese-xsd",
  "parking_lot",
  "rayon",

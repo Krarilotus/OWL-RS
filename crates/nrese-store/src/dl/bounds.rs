@@ -2049,53 +2049,61 @@ pub(crate) fn report(store: &StoreService) -> BoundsReport {
     }
 }
 
-/// U1's facts beyond L at the latest revision, as N-Triples terms, sorted: as
-/// maintained, or with `afresh` evaluated anew (not installed). `None` if U1 isn't
-/// available. For the differential tests of the maintenance.
-pub(crate) fn upper_facts(store: &StoreService, afresh: bool) -> Option<Vec<[String; 3]>> {
-    let snapshot = store.engine().snapshot();
-    let facts: Vec<Triple> = if afresh {
-        // Shared ids, as `afresh`'s (dictionary lifecycle V1): the decoder below, taken
-        // after the build, reads them.
-        let replica = store.dl().replica();
-        if !replica {
-            source::intern_system_vocabulary(store.engine()).ok()?;
-        }
-        let engine = store.engine();
-        let latest = engine.snapshot();
-        let kept = Arc::clone(store.dl().bounds.kept());
-        let ontology =
-            source::read_snapshot(&snapshot, kept, &store.config().dl.treatments).ok()?;
-        let normalised = nrese_owl::normalise(&ontology);
-        let memory = store.memory_stop();
-        let deadline = Deadline::after(store.config().dl.timeout);
-        let stop = || deadline.passed() || memory.exceeded();
-        let upper = Upper::build(
-            &ontology,
-            &normalised,
-            &snapshot,
-            &|t| source::resolve_system(replica, engine, &latest, t),
-            &stop,
-            store.dl().bounds.kept(),
-        )
-        .ok()?;
-        upper.stack.scan([None; 3]).collect()
-    } else {
+fn diagnostic_upper(store: &StoreService, afresh: bool) -> Option<UpperVersion> {
+    if !afresh {
         let (snapshot, _) = view(store);
-        ReadBasis::upper(&snapshot)?
-            .upper
-            .ok()?
-            .stack
-            .scan([None; 3])
-            .collect()
-    };
-    let decoder = store.engine().snapshot();
+        return ReadBasis::upper(&snapshot)?.upper.ok();
+    }
+    let snapshot = store.engine().snapshot();
+    // Shared ids (dictionary lifecycle V1): a decoder taken after the build reads them.
+    let replica = store.dl().replica();
+    let engine = store.engine();
+    if !replica {
+        source::intern_system_vocabulary(engine).ok()?;
+    }
+    let latest = engine.snapshot();
+    let kept = store.dl().bounds.kept();
+    let ontology =
+        source::read_snapshot(&snapshot, Arc::clone(kept), &store.config().dl.treatments).ok()?;
+    let normalised = nrese_owl::normalise(&ontology);
+    let memory = store.memory_stop();
+    let deadline = Deadline::after(store.config().dl.timeout);
+    let stop = || deadline.passed() || memory.exceeded();
+    Upper::build(
+        &ontology,
+        &normalised,
+        &snapshot,
+        &|t| source::resolve_system(replica, engine, &latest, t),
+        &stop,
+        kept,
+    )
+    .ok()
+    .map(|upper| upper.version)
+}
+
+fn decoded_facts(decoder: &Snapshot, facts: &TripleVersion) -> Vec<[String; 3]> {
     let decode = |t: u64| {
         decoder
             .decode(TermId::from_raw(t))
             .map_or_else(|| format!("#{t}"), |term| term.to_string())
     };
-    let mut out: Vec<[String; 3]> = facts.into_iter().map(|t| t.map(decode)).collect();
+    let mut out: Vec<_> = facts.scan([None; 3]).map(|t| t.map(decode)).collect();
     out.sort();
-    Some(out)
+    out
+}
+
+/// U1's stack facts as sorted N-Triples terms, maintained or freshly evaluated.
+pub(crate) fn upper_facts(store: &StoreService, afresh: bool) -> Option<Vec<[String; 3]>> {
+    let upper = diagnostic_upper(store, afresh)?;
+    Some(decoded_facts(&store.engine().snapshot(), &upper.stack))
+}
+
+#[cfg(feature = "fault-points")]
+pub(crate) fn upper_partitions(
+    store: &StoreService,
+    afresh: bool,
+) -> Option<[Vec<[String; 3]>; 2]> {
+    let upper = diagnostic_upper(store, afresh)?;
+    let decoder = store.engine().snapshot();
+    Some([&upper.stack, &upper.eligible].map(|part| decoded_facts(&decoder, part)))
 }

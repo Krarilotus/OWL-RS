@@ -362,6 +362,66 @@ fn eligible_program_facts_follow_the_published_revision() {
     }
 }
 
+/// R1. A stack insertion can change eligibility even when the fact itself was not
+/// in the materialised delta. Compare the staged move with a full evaluation.
+#[test]
+fn staging_a_program_fact_on_the_stack_removes_its_eligibility() {
+    const PREFIX: &str = "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>";
+    let (store, pipeline) = pipeline();
+    update(
+        &pipeline,
+        &format!(
+            "{PREFIX} INSERT DATA {{
+            :C rdfs:subClassOf :M . :M a owl:Class .
+            :x a owl:NamedIndividual , [ owl:complementOf [ owl:complementOf :M ] ] .
+        }}"
+        ),
+    );
+    let before = store.engine().snapshot();
+    let root = afresh(&store, &before).0.unwrap();
+    let id = |iri| {
+        before
+            .lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into())
+            .unwrap()
+            .raw()
+    };
+    let fact = [id("urn:test:x"), id(RDF_TYPE), id("urn:test:M")];
+    assert!(root.eligible.contains(fact));
+
+    // Give the fresh evaluation a rule derivation in place of the program fact.
+    // The ungated write leaves that derivation for U1 to make beyond L.
+    store
+        .update_str_ungated(&format!(
+            "{PREFIX}
+            DELETE {{ :x a ?outer . ?outer owl:complementOf ?inner . ?inner owl:complementOf :M }}
+            INSERT {{ :x a :C }}
+            WHERE {{ :x a ?outer . ?outer owl:complementOf ?inner . ?inner owl:complementOf :M }}"
+        ))
+        .unwrap();
+    let snapshot = store.engine().snapshot();
+    let fresh = afresh(&store, &snapshot).0.unwrap();
+    assert!(!in_view(&snapshot, fact));
+    assert!(fresh.stack.contains(fact));
+    let bounds = &store.dl().bounds;
+    let (staged, _) = root
+        .stage(
+            Change::inserting(fact),
+            std::iter::empty(),
+            &snapshot,
+            bounds.kept(),
+            None,
+            bounds,
+        )
+        .unwrap();
+    assert!(staged.stack.contains(fact));
+    assert_eq!(
+        staged.eligible.scan([None; 3]).collect::<Vec<_>>(),
+        fresh.eligible.scan([None; 3]).collect::<Vec<_>>(),
+        "a fact staged on the stack must leave the eligible set",
+    );
+}
+
 /// Contract §4.2 and §4.3c R3. A publication that has no U1 cannot supply the next delta's root.
 #[test]
 fn a_commit_rebuilds_after_a_same_revision_reinstall_without_u1() {
