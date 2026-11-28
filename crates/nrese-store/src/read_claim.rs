@@ -5,6 +5,11 @@ use crate::ConsistencyStatus;
 use crate::dl::{Verdict, query::Revision};
 use crate::entailment::Entailment;
 
+const QUARANTINE: &str = "the store is in quarantine (the consistency rules found violations and \
+                          have not found the data clean since), and as inconsistent data entail \
+                          every answer, no read is certified complete until it leaves";
+const CLASH: &str = "the data is inconsistent, so it entails every answer";
+
 /// The store's assessment of an answer, composed once from the publication and its route.
 /// A route supplies evidence ([`Completeness`]); only `StoreService::assess` issues a claim.
 ///
@@ -13,6 +18,13 @@ use crate::entailment::Entailment;
 /// use nrese_store::Claim;
 /// fn issue_without_assessment(evidence: Completeness) -> Claim {
 ///     evidence.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use nrese_store::Claim;
+/// fn raise(mut claim: Claim) {
+///     claim.complete = true;
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +46,41 @@ impl std::ops::Deref for Claim {
 }
 
 impl Claim {
+    fn lower(&mut self, source: &'static str, reason: &str) {
+        self.reported = true;
+        self.status.complete = false;
+        if !self
+            .status
+            .reasons
+            .iter()
+            .any(|r| r.source == source && r.text == reason)
+        {
+            self.status.reasons.insert(
+                0,
+                nrese_sparql::completeness::Reason {
+                    source,
+                    text: reason.to_owned(),
+                },
+            );
+        }
+    }
+
+    /// The producer failed before its response started. Delivery can lower a claim
+    /// it already received, without changing what the read found or hiding a clash.
+    pub fn after_failed_delivery(mut self) -> Self {
+        self.lower("delivery", "the result was not delivered");
+        self
+    }
+
+    /// The non-disclosing reason for a clash or a quarantine on this read's publication.
+    pub fn consistency_reason(&self) -> Option<&str> {
+        self.status
+            .reasons
+            .iter()
+            .find(|r| r.source == "consistency" && matches!(r.text.as_str(), QUARANTINE | CLASH))
+            .map(|r| r.text.as_str())
+    }
+
     /// The rules' consistency assessment of the publication.
     pub fn consistency(&self) -> ConsistencyStatus {
         self.consistency
@@ -108,6 +155,7 @@ impl StoreService {
         let snapshot = at.snapshot();
         let mut entailment = None;
         let mut dl_answer = None;
+        let mut header_cache = None;
         let (status, consistency, dl_verdict) = match evidence {
             Evidence::Query {
                 prepared,
@@ -118,6 +166,7 @@ impl StoreService {
                 let status = self.compose_query_status(prepared, at, route);
                 if let Some(cache) = cache {
                     *cache = context_outside_dl(status.as_ref(), rewritten);
+                    header_cache = Some(cache);
                 }
                 let told = status_for_its_reader(
                     prepared,
@@ -137,6 +186,7 @@ impl StoreService {
                     .unwrap_or_else(Completeness::not_certified);
                 if let Some((mode, cache)) = cache {
                     *cache = dl_context(mode, &status);
+                    header_cache = Some(cache);
                 }
                 let told = status_for_its_reader(
                     prepared,
@@ -208,13 +258,31 @@ impl StoreService {
                 (Some(status), ConsistencyStatus::Unknown, Some(premise))
             }
         };
-        Claim {
+        let mut claim = Claim {
             reported: status.is_some(),
             status: status.unwrap_or_default(),
             consistency,
             dl_verdict,
             entailment,
             dl_answer,
+        };
+        let base = super::Certificate::assessment(at.base(), self.config.replica);
+        let clash = matches!(base.rules, ConsistencyStatus::Inconsistent { .. });
+        if clash {
+            claim.consistency = base.rules;
         }
+        if base.held {
+            claim.lower("consistency", QUARANTINE);
+        } else if clash || matches!(claim.dl_verdict, Some(Verdict::Inconsistent)) {
+            claim.lower("consistency", CLASH);
+        }
+        if let Some(cache) = header_cache {
+            cache.push(match claim.consistency_reason() {
+                Some(QUARANTINE) => 2,
+                Some(_) => 1,
+                None => 0,
+            });
+        }
+        claim
     }
 }

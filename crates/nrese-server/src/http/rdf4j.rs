@@ -462,13 +462,17 @@ async fn statements(
     pending: Option<StatementsRequest>,
     access: &AccessView,
 ) -> Result<Response, ApiError> {
+    let scope = access.read_scope();
+    let reader = super::result_stream::Reader::of(&scope);
+    if let Some(response) = reader.refuse_unframed() {
+        return Ok(response);
+    }
     state.ensure_serving()?;
     let pairs = pairs(&raw)?;
     let pattern = pattern(&pairs)?;
     let (media_type, format) = negotiated(header_value_str(headers.get(header::ACCEPT)), GRAPHS)?;
     let store = state.store();
-    let (scope, infer) = (access.read_scope(), infer(&pairs));
-    let reader = super::result_stream::Reader::of(&scope);
+    let infer = infer(&pairs);
     // Streamed as read: a whole repository in constant memory, for as long as the client
     // keeps reading (over HTTP/1.0 held whole: `result_stream`).
     let pace = super::result_stream::Pace::stalled_after(state.policy().timeouts.graph_read);

@@ -828,21 +828,14 @@ const SPELLING: &str = "a stored value written another way doesn't match it, tho
 const COMPARED: &str = "two spellings of one value are two terms to the store, which compares \
                         terms, though OWL 2 compares values";
 
-/// Why a read of a store in quarantine (its certificate's violations) may miss rows: fixed
-/// words, nothing of the clash, for a reader of some graphs too (`/readyz` tells anyone).
-const QUARANTINE: &str = "the store is in quarantine (the consistency rules found violations and \
-                          have not found the data clean since), and as inconsistent data entail \
-                          every answer, no read is certified complete until it leaves";
-
 /// The one rule of every path's status under an OWL 2 regime, composed last onto it (by
 /// both DL entry points, [`plan_status`] and [`answer`], after the bounds; over a ruleset's
 /// closure, with or without the QL rewriting): each step only lowers what the status
 /// asserts. Under `rdfs` and `custom` the regime is the closure's own: what it lacks isn't
 /// entailed. A read [`denied`] names misses rows, and so does
 /// a typed constant ([`typed_constant`]); a data value compared by term ([`compared_values`])
-/// through a property that holds a literal other than a string, in `snapshot` (the data
-/// read; unknown, or read for a restricted reader: every property), can give wrong rows;
-/// a store in quarantine may miss rows ([`QUARANTINE`]), whoever reads it;
+/// through a property that holds a literal other than a string in the data read can give
+/// wrong rows;
 /// and where rows may be missing, an operator
 /// under which a missing row can make a returned one wrong ([`negation`]) makes the answers
 /// unsound. Each from `source`.
@@ -912,9 +905,7 @@ pub(crate) struct Reads {
     compared: std::sync::OnceLock<Vec<(String, Vec<Option<String>>)>>,
     /// [`predicates`]', for [`annotation_rule`].
     predicates: std::sync::OnceLock<Vec<Option<String>>>,
-    /// The reader's graphs, where their view is restricted: [`certify`] then takes every
-    /// property to hold values other than strings, so the status doesn't follow what hidden
-    /// graphs hold, and reads triple terms in their graphs alone.
+    /// The reader's graphs, where their view is restricted.
     access: Option<std::sync::Arc<nrese_sparql::GraphAccess>>,
 }
 
@@ -982,28 +973,31 @@ fn lowerings(
     if let Some(reason) = constant {
         completeness.incomplete(source, reason.clone());
     }
-    // From the snapshot as given: a restricted reader's is dropped below.
-    let quarantined = snapshot
-        .filter(|s| crate::service::Certificate::of(s).is_some())
-        .is_some_and(|s| crate::service::Certificate::assessment(s, false).held);
-    let given = snapshot;
-    let snapshot = snapshot.filter(|_| access.is_none());
     let typed = |predicate: &Option<String>| {
-        snapshot.is_none_or(|s| match predicate {
-            Some(p) => s
-                .lookup(NamedNodeRef::new_unchecked(p).into())
-                .is_some_and(|p| s.holds_typed_literals(ReadModel::Materialised, Some(p))),
-            None => s.holds_typed_literals(ReadModel::Materialised, None),
+        snapshot.is_some_and(|s| {
+            let predicate = match predicate {
+                Some(iri) => match s.lookup(NamedNodeRef::new_unchecked(iri).into()) {
+                    Some(id) => Some(id),
+                    None => return false,
+                },
+                None => None,
+            };
+            match access {
+                None => s.holds_typed_literals(ReadModel::Materialised, predicate, |_| true),
+                Some(access) => {
+                    s.holds_typed_literals(ReadModel::Asserted, predicate, |g| {
+                        access.allows_id(s, g)
+                    }) || (access.inferred
+                        && s.holds_typed_literals(ReadModel::Inferred, predicate, |_| true))
+                }
+            }
         })
     };
     let compared = reads.compared.get_or_init(|| compared_values(query));
     if let Some((what, _)) = compared.iter().find(|(_, by)| by.iter().any(typed)) {
         completeness.incomplete(source, format!("the query compares {what}: {COMPARED}"));
     }
-    if quarantined && completeness.complete {
-        completeness.incomplete(source, QUARANTINE.to_owned());
-    }
-    annotation_rule(completeness, (query, reads), source, given);
+    annotation_rule(completeness, (query, reads), source, snapshot);
     true
 }
 

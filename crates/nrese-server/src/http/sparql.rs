@@ -1,6 +1,6 @@
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use nrese_store::{
     CancellationToken, GraphResultFormat, MutationCommand, QueryResultKind, SolutionsResultFormat,
     SparqlQueryRequest, SparqlUpdateRequest, StoreError,
@@ -39,6 +39,10 @@ pub async fn execute_query_in(
     accept: Option<&str>,
     pending: Option<nrese_store::StatementsRequest>,
 ) -> Result<Response, ApiError> {
+    let reader = Reader::of(&nrese_store::ReadScope::of(operation.access.clone()));
+    if let Some(response) = reader.refuse_unframed() {
+        return Ok(response);
+    }
     state.ensure_serving()?;
     let policy = state.policy().clone();
     policy.enforce_query_bytes(operation.query.len())?;
@@ -55,7 +59,6 @@ pub async fn execute_query_in(
     }
     let origin = operation.origin.clone();
     let mut request = build_query_request(operation);
-    let reader = Reader::of(&request.scope);
     let memory = policy.limits.max_query_memory_bytes;
     request.memory_limit = (memory > 0).then_some(memory);
     let at = deadline.into_std();
@@ -89,17 +92,17 @@ pub async fn execute_query_in(
     // a run that reported nothing sends none (SYN-72). Its text is kept with a cached
     // answer and sent again with it: the same status for every request of its key.
     use axum::http::HeaderValue;
-    let status: std::sync::Arc<std::sync::Mutex<Option<HeaderValue>>> = Default::default();
+    let status: std::sync::Arc<std::sync::Mutex<_>> = Default::default();
     let slot = std::sync::Arc::clone(&status);
     let report = move |r: nrese_store::Claim, kept: Option<std::sync::Arc<str>>| {
         let made = kept.is_none().then(|| r.header());
         let text = kept.as_deref().or(made.as_deref()).unwrap_or_default();
         let value =
             HeaderValue::from_str(text).unwrap_or_else(|_| HeaderValue::from_static(r.as_str()));
-        *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(value);
+        *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some((r, value));
         made
     };
-    let mut response = stream_blocking(
+    let streamed = stream_blocking(
         Pace::Total(deadline),
         cancellation,
         move || memory,
@@ -142,17 +145,25 @@ pub async fn execute_query_in(
             .map_err(|error| refused(out, error))
         },
     )
-    .await?;
+    .await;
+    let reported = status.lock().unwrap_or_else(|p| p.into_inner()).take();
+    let (mut response, reported) = match (streamed, reported) {
+        (Ok(response), reported) => (response, reported.map(|(_, value)| value)),
+        (Err(error), Some((claim, _))) => (
+            error.into_response(),
+            Some(claim_header(&claim.after_failed_delivery())),
+        ),
+        (Err(error), None) => return Err(error),
+    };
     // The run decided the announcement on what its reader reads before its first byte, which
     // `stream_blocking` waits for: the media type is the run's (its place among the headers kept).
-    if explain == Explain::No {
+    if response.status().is_success() && explain == Explain::No {
         let announcement = prepared.media_type();
         let parameters = announcement.find(';').map_or("", |i| &announcement[i..]);
         let media_type = HeaderValue::from_str(&format!("{media_type}{parameters}"))
             .map_err(|error| ApiError::internal(error.to_string()))?;
         response.headers_mut().insert(CONTENT_TYPE, media_type);
     }
-    let reported = status.lock().unwrap_or_else(|p| p.into_inner()).take();
     if let Some(value) = reported {
         let headers = response.headers_mut();
         headers.insert(COMPLETENESS, value);
@@ -187,6 +198,7 @@ fn completeness_json(
     };
     serde_json::json!({
         "status": c.as_str(),
+        "consistency": c.consistency().as_str(),
         "regime": c.regime.map(|r| r.as_str()),
         "sound": c.sound,
         "complete": c.complete,
@@ -247,6 +259,7 @@ fn ql_json(report: Option<&nrese_sparql::ql::QlReport<nrese_store::Claim>>) -> s
     report.map_or(serde_json::Value::Null, |r| {
         serde_json::json!({
             "completeness": r.completeness.as_str(),
+            "consistency": r.completeness.consistency().as_str(),
             "sound": r.completeness.sound,
             "complete": r.completeness.complete,
             "reasons": r

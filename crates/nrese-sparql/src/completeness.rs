@@ -290,9 +290,6 @@ impl Completeness {
     /// `; outside="…"; by=…` where a procedure outside the profile answered and
     /// `; lower=…; upper=…; unresolved=…` where bounds are known.
     pub fn header(&self) -> String {
-        if self.certification_withheld {
-            return "not-certified".to_owned();
-        }
         let mut out = self.as_str().to_owned();
         if let Some(regime) = self.regime {
             out.push_str("; regime=");

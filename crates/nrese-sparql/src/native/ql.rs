@@ -856,7 +856,8 @@ impl Rewriter<'_> {
         let snapshot = self.snapshot;
         let rewritten = |n: &NamedNode| {
             let id = snapshot.lookup(n.as_ref().into()).map(TermId::raw);
-            id.is_some_and(|t| tbox.rewrites_term(t) || tbox.concern(t).is_some())
+            tbox.global_hazard().is_some()
+                || id.is_some_and(|t| tbox.rewrites_term(t) || tbox.concern(t).is_some())
         };
         let mut hit: Option<String> = None;
         let mut look = |n: Node<'_>| {
@@ -951,9 +952,9 @@ impl Rewriter<'_> {
             // predicate (`search::names_search`).
             let predicate = match &triple.predicate {
                 NamedNodePattern::NamedNode(p) if super::search::names_search(p.as_str()) => None,
-                NamedNodePattern::NamedNode(p) => {
-                    self.snapshot.lookup(p.as_ref().into()).map(TermId::raw)
-                }
+                // As for classes, a schema-wide concern applies even if the property
+                // has no dictionary id in this version.
+                NamedNodePattern::NamedNode(p) => Some(self.constant(Term::NamedNode(p.clone()))),
                 NamedNodePattern::Variable(_) => None,
             };
             let atom = match (s, predicate, o) {

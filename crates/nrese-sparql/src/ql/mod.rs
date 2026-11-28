@@ -518,7 +518,7 @@ impl QlRewriting {
             thing,
             core,
             equality,
-        } = Schema::of(snapshot);
+        } = Schema::of(snapshot, access);
         let asserted = snapshot.asserted_identity();
         // An entry of this reader whose core and view mode are this snapshot's, with notes
         // from its memberships' asserted state to this one: its memberships are brought
@@ -600,7 +600,7 @@ impl QlRewriting {
         if let Some(tbox) = exact(&mine.entries.lock().unwrap_or_else(|p| p.into_inner())) {
             return tbox;
         }
-        let schema = Schema::of(snapshot);
+        let schema = Schema::of(snapshot, access);
         let (expressions, members) = fresh_members(snapshot, &schema.core, access);
         let kept = mine
             .entries
@@ -842,13 +842,13 @@ struct Schema {
 }
 
 impl Schema {
-    fn of(snapshot: &Snapshot) -> Self {
+    fn of(snapshot: &Snapshot, access: Option<&GraphAccess>) -> Self {
         Self {
             thing: snapshot
                 .lookup(nrese_rdf::vocab::owl::THING.into())
                 .map(TermId::raw),
             core: read_core(snapshot),
-            equality: has_equality(snapshot),
+            equality: has_equality(snapshot, access),
         }
     }
 
@@ -962,12 +962,8 @@ fn reader_core(
         .collect()
 }
 
-/// Whether the snapshot asserts an equality of individuals (`owl:sameAs`), in any graph:
-/// one probe. The TBox learns only that ([`Tbox::with_equality`]), never which statement:
-/// no name reaches a reader who can't read its graph, and no sampled
-/// statement the mapping may leave out stands for the rest. Fail-closed for readers
-/// who see only some graphs.
-fn has_equality(snapshot: &Snapshot) -> bool {
+/// Whether the schema's readable graphs assert an equality of individuals (`owl:sameAs`).
+fn has_equality(snapshot: &Snapshot, access: Option<&GraphAccess>) -> bool {
     iri(snapshot, OWL, "sameAs").is_some_and(|same_as| {
         snapshot
             .quads_for_pattern_in(
@@ -979,8 +975,7 @@ fn has_equality(snapshot: &Snapshot) -> bool {
                     graph: GraphSelector::Any,
                 },
             )
-            .next()
-            .is_some()
+            .any(|quad| access.is_none_or(|a| a.allows_id(snapshot, quad.graph)))
     })
 }
 

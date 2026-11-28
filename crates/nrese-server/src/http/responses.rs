@@ -258,7 +258,7 @@ pub fn build_ready_response(
             nrese_store::ConsistencyStatus::Undecided { violations, why } => {
                 Some(why.text(violations))
             }
-            _ => None,
+            _ => publication.claim.consistency_reason().map(str::to_owned),
         },
         undecided: publication.undecided,
         revision: publication.revision,

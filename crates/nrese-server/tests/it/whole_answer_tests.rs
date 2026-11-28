@@ -86,6 +86,9 @@ async fn an_http10_answer_past_its_envelope_is_refused_and_its_memory_released()
     let before = held(&store);
     let response = app.oneshot(query_request(Version::HTTP_10)?).await?;
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let claim = response.headers()["nrese-completeness"].to_str()?;
+    assert_eq!(claim.split(';').next(), Some("sound-only"));
+    assert!(claim.contains("the result was not delivered"), "{claim}");
     let problem: serde_json::Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await?)?;
     assert_eq!(
@@ -299,8 +302,9 @@ impl Ask<'_> {
     }
 
     /// The same request as raw HTTP/1.0 bytes for `host`.
-    fn raw(&self, host: std::net::SocketAddr) -> Vec<u8> {
+    fn raw(&self, host: std::net::SocketAddr, malformed: bool) -> Vec<u8> {
         let (method, accept, body) = match self.query {
+            true if malformed => ("POST", "text/csv", "SELECT ?".to_owned()),
             true => ("POST", "text/csv", query()),
             false => ("GET", "application/n-triples", String::new()),
         };
@@ -397,9 +401,16 @@ async fn restricted_http10_refuses_before_evaluation_on_every_streamed_route()
     for hidden_bytes in [0, SHARED - before] {
         let hidden = store.envelope(None);
         hidden.charge(hidden_bytes)?;
-        for (route, ask) in routes(&["nrese.read", "public"], "/dataset/query?explain=true") {
+        let routes = routes(&["nrese.read", "public"], "/dataset/query?explain=true");
+        // A version refusal is determined before even trying to prepare the query.
+        let malformed = ("a malformed query", routes[0].1);
+        for ((route, ask), bad_query) in routes
+            .into_iter()
+            .map(|route| (route, false))
+            .chain(std::iter::once((malformed, true)))
+        {
             let mut client = TcpStream::connect(addr).await?;
-            client.write_all(&ask.raw(addr)).await?;
+            client.write_all(&ask.raw(addr, bad_query)).await?;
             let mut response = Vec::new();
             tokio::time::timeout(HANG, client.read_to_end(&mut response)).await??;
             let split = response
