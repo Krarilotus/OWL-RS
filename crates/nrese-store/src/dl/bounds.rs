@@ -1230,7 +1230,8 @@ pub(crate) fn view_until(
     deadline: Option<std::time::Instant>,
     stop: Option<&dyn Fn() -> bool>,
 ) -> Option<Result<Arc<View>, Missing>> {
-    let bounds = &store.dl().bounds;
+    let published = crate::service::ReadBasis::of(snapshot).and_then(|basis| basis.dl.upgrade());
+    let bounds = &published.as_deref().unwrap_or_else(|| store.dl()).bounds;
     let revision = snapshot.revision();
     let cached = || {
         lock(&bounds.view)

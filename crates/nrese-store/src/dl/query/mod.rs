@@ -58,10 +58,7 @@ pub(crate) use exact::{Ids, ground_axiom};
 /// bounds' budget while kept (SYN-61); and the mark it gave a committed revision
 /// ([`reads_differently`]), so reads at that revision one after another pass over it once.
 #[derive(Debug, Default)]
-pub(crate) struct OntologyCache(
-    std::sync::Mutex<Option<(u64, KeptOntology)>>,
-    std::sync::Mutex<Option<(u64, Option<String>)>>,
-);
+pub(crate) struct OntologyCache(std::sync::Mutex<Option<(u64, KeptOntology)>>);
 
 impl OntologyCache {
     /// Lets the cache's entry go if it is of a revision below `revision`, so that its charge
@@ -197,11 +194,15 @@ fn consistency_at(
     if memory.refused() {
         return checked.verdict;
     }
-    store.dl().record(DlStatus {
+    let status = DlStatus {
         revision: snapshot.revision(),
         consistency: checked.clone(),
         left_out: Some(left_out(ontology.value(), &consistency::nameless)),
-    });
+    };
+    crate::service::ReadBasis::record_dl(snapshot, status.clone());
+    if snapshot.same_version(&store.engine().snapshot()) {
+        store.dl().record(status);
+    }
     checked.verdict
 }
 
@@ -210,12 +211,8 @@ fn consistency_at(
 /// there where it holds an ill-typed literal ([`gate::ILL_TYPED`]) or the search for one stopped
 /// ([`UNCHECKED`], never recorded: a later read searches again).
 fn consistency_known(store: &StoreService, snapshot: &Snapshot, view: &View) -> Option<Verdict> {
-    match store.dl().status() {
-        Some(DlStatus {
-            revision,
-            consistency,
-            ..
-        }) if revision == snapshot.revision() => Some(consistency.verdict),
+    match crate::service::ReadBasis::dl_status(snapshot) {
+        Some(status) => Some(status.consistency.verdict),
         _ if !(view.proves_consistency || view.rules && super::bounds::rules_prove(snapshot)) => {
             None
         }
@@ -628,9 +625,7 @@ fn reads_differently(store: &StoreService, at: Revision<'_>) -> Option<String> {
     // Named where its commit wrote it: only a reader of every graph is given the status this
     // reason is in (`status_for_its_reader`, service.rs). U1's proof of consistency is no
     // record: it says nothing of what the rules read beyond the ontology (an unused structure).
-    let left_out = (store.dl().status())
-        .filter(|s| s.revision == snapshot.revision())
-        .and_then(|s| s.left_out);
+    let left_out = crate::service::ReadBasis::dl_status(snapshot).and_then(|s| s.left_out);
     // A pending read's record is its base's: one that tells nothing says nothing of pending
     // changes that may change what the reader reads (a node typed the ontology reads its
     // statements otherwise, a literal gives an object property a second kind), so it reads
@@ -641,13 +636,10 @@ fn reads_differently(store: &StoreService, at: Revision<'_>) -> Option<String> {
         (Some(None), Some(None)) if keeps_record => return None,
         _ => {}
     }
-    let marked = &store.dl().query_ontology.1;
-    let marked = || marked.lock().unwrap_or_else(|p| p.into_inner());
-    if !pending
-        && let Some((revision, why)) = &*marked()
-        && *revision == snapshot.revision()
-    {
-        return why.clone();
+    let basis = crate::service::ReadBasis::of(snapshot).filter(|_| !pending);
+    let marked = || basis.map(|basis| basis.omission.lock().unwrap_or_else(|p| p.into_inner()));
+    if let Some(why) = marked().and_then(|mark| mark.clone()) {
+        return why;
     }
     #[cfg(test)]
     cancellation_tests::ONTOLOGY_PASSES.set(cancellation_tests::ONTOLOGY_PASSES.get() + 1);
@@ -660,8 +652,8 @@ fn reads_differently(store: &StoreService, at: Revision<'_>) -> Option<String> {
         ));
     };
     let why = by_ontology(snapshot, ontology.value());
-    if !pending {
-        *marked() = Some((snapshot.revision(), why.clone()));
+    if let Some(mut mark) = marked() {
+        *mark = Some(why.clone());
     }
     why
 }

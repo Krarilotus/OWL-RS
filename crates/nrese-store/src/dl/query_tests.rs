@@ -661,7 +661,9 @@ fn an_ontology_read_refused_at_its_budget_leaves_the_answers_unsound() {
     crate::service::hooks::AFTER_DECIDED.set(Some(Box::new(move || {
         drop(cache.dl().query_ontology.0.lock().unwrap().take());
         // Nor the mark the control's read kept for the revision.
-        drop(cache.dl().query_ontology.1.lock().unwrap().take());
+        let snapshot = cache.engine().snapshot();
+        let basis = crate::service::ReadBasis::of(&snapshot).expect("published basis");
+        drop(basis.omission.lock().unwrap().take());
         let rest = budget.remaining();
         budget.charge(rest).unwrap();
         held.set(rest);

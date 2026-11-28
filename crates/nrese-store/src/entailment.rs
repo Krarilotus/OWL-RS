@@ -164,7 +164,9 @@ impl StoreService {
         }
         for opposite in &split.refutations {
             if !self.refutes(at, program, opposite)? {
-                return Ok(false);
+                return Err(StoreError::Undecided(
+                    "the rules did not refute the opposite of the conclusion".to_owned(),
+                ));
             }
         }
         Ok(true)

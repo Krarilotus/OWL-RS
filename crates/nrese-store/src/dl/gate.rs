@@ -185,14 +185,9 @@ pub(crate) fn check_commit(
 /// What the commit changes, where the revision before was consistent and it changes
 /// assertions only: the individuals its added statements mention (empty: it only
 /// removes). `None` otherwise.
-fn assertion_change(store: &StoreService, tx: &Transaction<'_>) -> Option<HashSet<u64>> {
-    let before = tx.base().revision();
-    match store.dl().status() {
-        Some(DlStatus {
-            revision,
-            consistency,
-            ..
-        }) if revision == before && consistency.verdict == Verdict::Consistent => {}
+fn assertion_change(tx: &Transaction<'_>) -> Option<HashSet<u64>> {
+    match crate::service::ReadBasis::dl_status(tx.base()) {
+        Some(DlStatus { consistency, .. }) if consistency.verdict == Verdict::Consistent => {}
         _ => return None,
     }
     let mut touched = HashSet::new();
@@ -228,7 +223,7 @@ fn check_with_budget(
     // Only where U1's delta found every property's kind kept is the schema the reading gives
     // as it was, which both of `assertion_change`'s uses assume.
     let delta = matches!(preparation.prepared, super::bounds::Prepared::Delta(_));
-    let change = delta.then(|| assertion_change(store, tx)).flatten();
+    let change = delta.then(|| assertion_change(tx)).flatten();
     if change.as_ref().is_some_and(HashSet::is_empty) {
         return Gate {
             checked: Checked {
@@ -291,14 +286,9 @@ fn check_with_budget(
         };
     }
     // Inconsistent after the commit: rejected unless it was so before (quarantine).
-    let before = tx.base().revision();
     let treatments = &store.config().dl.treatments;
-    let was_inconsistent = match store.dl().status() {
-        Some(DlStatus {
-            revision,
-            consistency,
-            ..
-        }) if revision == before => consistency.verdict == Verdict::Inconsistent,
+    let was_inconsistent = match crate::service::ReadBasis::dl_status(tx.base()) {
+        Some(DlStatus { consistency, .. }) => consistency.verdict == Verdict::Inconsistent,
         // Unread, as undecided: not known to have been inconsistent, so rejected.
         _ => source::read_snapshot(tx.base(), memory, treatments).is_ok_and(|ontology| {
             let checked = consistency::check(&ontology, &operation.remaining(deadline));
