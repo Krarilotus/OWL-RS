@@ -10,6 +10,7 @@ use crate::{Stopped, TermId, Visitor};
 
 type Triple = [u64; 3];
 type Pattern = [Option<u64>; 3];
+type CompactionResult<T> = Result<Option<T>, BudgetExceeded>;
 
 /// An immutable version of a set of encoded triples. Clones share their list, and versions
 /// share any runs they have in common. All retained storage is charged once.
@@ -122,10 +123,7 @@ impl TripleVersion {
         &self,
         policy: CompactionPolicy,
         inline_only: bool,
-    ) -> Result<
-        Option<impl FnOnce(&Self) -> Result<Option<Self>, BudgetExceeded> + Send + use<>>,
-        BudgetExceeded,
-    > {
+    ) -> CompactionResult<impl FnOnce(&Self) -> CompactionResult<Self> + Send + use<>> {
         let runs = &self.0.index.runs;
         let sized = policy
             .plan(runs)
