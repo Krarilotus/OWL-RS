@@ -2439,8 +2439,7 @@ impl StoreService {
     }
 
     /// A pending change that changes the set of annotation properties rebuilds `tx`'s
-    /// inferred stack over its pending state using `rules`, captured as this attempt of the
-    /// read started.
+    /// inferred stack over its pending state using the rules published with its base.
     /// Other pending changes read the committed inferred stack until commit.
     fn rebuild_pending_declarations(
         &self,
