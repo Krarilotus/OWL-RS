@@ -111,14 +111,16 @@ pub(super) fn merge_triples(
             entries.push(entry)?;
         }
         drop(scratch);
+        // Both signs cancel in every permutation if they cancel in the first.
+        if entries.is_empty() {
+            return Ok(Run::from_permutations(layout, perms));
+        }
         let (entries, scratch) = entries.into_parts();
         perms[p as usize] = PermutationRun::from_sorted_within(entries, &mut held, false)?;
         drop(scratch);
     }
     let mut run = Run::from_permutations(layout, perms);
-    if run.entries() != 0 {
-        run.keep_triples(budget, &mut held)?;
-    }
+    run.keep_triples(budget, &mut held)?;
     Ok(run)
 }
 

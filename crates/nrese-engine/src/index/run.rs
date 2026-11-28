@@ -15,7 +15,7 @@ use rayon::prelude::*;
 
 use super::Layout;
 use super::derive::Ordered;
-use super::keys::PackedKeys;
+use super::keys::{BLOCK, PackedKeys};
 use crate::quad::{EncodedQuad, Key, Permutation};
 
 /// Deltas at least this large are sorted with all of the layout's permutations in parallel.
@@ -372,11 +372,23 @@ impl Run {
     ) -> Result<(), nrese_exec::BudgetExceeded> {
         let mut counts = nrese_exec::ChargedVec::new(std::sync::Arc::clone(budget));
         let pos = self.permutation(Permutation::Posg);
-        for (i, [predicate, ..]) in pos.keys.iter().enumerate() {
-            let sign = if pos.is_tombstone(i) { -1 } else { 1 };
-            match counts.last_mut() {
-                Some((p, count)) if *p == predicate => *count += sign,
-                _ => counts.push((predicate, sign))?,
+        let len = pos.keys.len();
+        {
+            // The summary only needs the predicate column, one block at a time.
+            let capacity = len.min(BLOCK);
+            let mut scratch = nrese_exec::Reservation::new(Arc::clone(budget));
+            scratch.charge(capacity * size_of::<u64>())?;
+            let mut predicates = [Vec::with_capacity(capacity)];
+            for start in (0..len).step_by(BLOCK) {
+                pos.keys
+                    .decode_columns(start, (start + BLOCK).min(len), &[0], &mut predicates);
+                for (i, predicate) in predicates[0].drain(..).enumerate() {
+                    let sign = if pos.is_tombstone(start + i) { -1 } else { 1 };
+                    match counts.last_mut() {
+                        Some((p, count)) if *p == predicate => *count += sign,
+                        _ => counts.push((predicate, sign))?,
+                    }
+                }
             }
         }
         held.charge(size_of::<Self>() + 2 * size_of::<usize>())?;
