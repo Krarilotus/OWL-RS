@@ -439,13 +439,12 @@ pub(super) fn typed_constant(query: &Query) -> Option<String> {
     })
 }
 
-/// The data values `query` compares by term: each variable (or blank node, which a path's
-/// sequence makes) at the object end of two or more patterns or paths (or at the start of a
-/// path that can match zero steps), or of one and bound by `VALUES` or `BIND` (a join), or
+/// The data values `query` compares by term: each variable or blank node shared across
+/// pattern positions, or used once and bound by `VALUES` or `BIND` (a join), or
 /// at one that a `DISTINCT` or `REDUCED` returns by its own projection, `GROUP BY` groups or
 /// a `DISTINCT` aggregate reads (or an alias `(?n AS ?m)` of one under `DISTINCT` or `GROUP
-/// BY`, which the walk meets first); the nodes inside and at the start of a path with a
-/// reversed step; and each string constant at an object end (a stored `"Rex"^^xsd:token` is
+/// BY`, which the walk meets first); nodes read through a reversed or zero-step path;
+/// and each string constant at an object end (a stored `"Rex"^^xsd:token` is
 /// `"Rex"` to OWL 2). What it is, and the predicates it is read through: a pattern's, or a
 /// path's own (`None`, any: a variable predicate, a negated set, or a path that can match
 /// zero steps, whose ends are every term of the graph). The store compares terms, the regime

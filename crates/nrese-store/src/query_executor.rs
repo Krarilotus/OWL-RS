@@ -330,6 +330,19 @@ impl PreparedQuery {
         )
     }
 
+    pub(crate) fn canonical_equality_in_scope(
+        &self,
+        snapshot: &nrese_engine::Snapshot,
+        union_default_graph: bool,
+    ) -> bool {
+        nrese_sparql::dataset::canonical_equality_in_scope(
+            snapshot,
+            union_default_graph,
+            self.dataset.as_ref(),
+            self.query.dataset(),
+        )
+    }
+
     /// Explanation when the query's dataset omits the store's default graph from its default
     /// graph, tailored to the read model so compatibility `GRAPH` aliases and inferred-only
     /// reads are never misdescribed as asserted-only answers.

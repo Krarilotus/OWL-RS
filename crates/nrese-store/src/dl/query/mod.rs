@@ -942,6 +942,16 @@ impl Reads {
             ..Self::default()
         }
     }
+
+    fn spelling_comparisons(&self, query: &Query) -> &SpellingComparisons {
+        self.compared.get_or_init(|| compared_values(query))
+    }
+
+    pub(crate) fn compares_objects(&self, query: &Query) -> bool {
+        self.spelling_comparisons(query)
+            .iter()
+            .any(|(_, predicates)| !predicates.is_empty())
+    }
 }
 
 /// [`certify_closure`], on the bounds' path where `bounds` (what [`denied`] allows there).
@@ -1015,7 +1025,7 @@ fn spelling_reason(
     snapshot: Option<&Snapshot>,
     canonical: bool,
 ) -> Option<String> {
-    let compared = reads.compared.get_or_init(|| compared_values(query));
+    let compared = reads.spelling_comparisons(query);
     let (what, _) = compared.first()?;
     let unchecked = |what: &str| {
         format!(

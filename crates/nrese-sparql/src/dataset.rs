@@ -95,6 +95,12 @@ pub(crate) enum DefaultGraph {
     Empty,
 }
 
+impl DefaultGraph {
+    pub(crate) fn canonical_equality_in_scope(&self) -> bool {
+        matches!(self, Self::Store | Self::Merge(None))
+    }
+}
+
 /// The graphs of a merged default graph that isn't every graph: the listed ones (several
 /// `FROM`), or every graph but the listed ones (SHACL's data graph, without the shapes).
 /// Each list is sorted and holds a graph once.
@@ -166,6 +172,19 @@ pub fn omits_store_default_graph(
             .excluded_default_graphs()
             .is_some_and(|left_out| left_out.iter().any(names_it)),
     }
+}
+
+/// Whether the default graph of an unrestricted dataset can use canonical equality.
+/// Resolve graph names against the read's view, since an absent graph contributes nothing.
+pub fn canonical_equality_in_scope(
+    view: &impl ReadView,
+    union_default_graph: bool,
+    protocol: Option<&QueryDatasetSpecification>,
+    own: Option<&QueryDataset>,
+) -> bool {
+    ResolvedDataset::resolve(view, union_default_graph, protocol, own)
+        .default
+        .canonical_equality_in_scope()
 }
 
 /// What a query reads (SPARQL 1.1 §13.2): its default graph, and the graphs `GRAPH` may

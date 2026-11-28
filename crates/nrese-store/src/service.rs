@@ -2043,7 +2043,7 @@ impl StoreService {
                 "dl",
                 decided,
                 Some(at.snapshot()),
-                self.canonical_spelling_read(prepared),
+                self.canonical_spelling_read(prepared, snapshot),
             );
         }
         let rules = if certificate.dl { "dl" } else { "rules" };
@@ -2110,7 +2110,7 @@ impl StoreService {
                 prepared.reads(),
                 "dl",
                 Some(at.snapshot()),
-                self.canonical_spelling_read(prepared),
+                self.canonical_spelling_read(prepared, at.snapshot()),
             );
             return Some(status);
         }
@@ -2131,7 +2131,7 @@ impl StoreService {
             prepared.reads(),
             "rules",
             Some(at.snapshot()),
-            self.canonical_spelling_read(prepared),
+            self.canonical_spelling_read(prepared, at.snapshot()),
         );
         Some(status)
     }
@@ -3291,20 +3291,33 @@ impl StoreService {
         prepared: &PreparedQuery,
         snapshot: &nrese_engine::Snapshot,
     ) {
-        let completeness = ql.map(|r| &mut r.completeness);
+        let Some(ql) = ql else { return };
         crate::dl::query::certify_report(
-            completeness,
+            Some(&mut ql.completeness),
             prepared.reads(),
             Some(snapshot),
-            self.canonical_spelling_read(prepared),
+            self.canonical_spelling_read(prepared, snapshot),
             self,
         );
     }
 
-    fn canonical_spelling_read(&self, prepared: &PreparedQuery) -> bool {
-        self.settings.equality_canonical
-            && prepared.read_model() != ReadModel::Asserted
-            && !prepared.omits_default_graph()
+    fn canonical_spelling_read(
+        &self,
+        prepared: &PreparedQuery,
+        snapshot: &nrese_engine::Snapshot,
+    ) -> bool {
+        if !self.settings.equality_canonical
+            || prepared.read_model() == ReadModel::Asserted
+            || prepared.access().is_some()
+        {
+            return false;
+        }
+        let (query, reads) = prepared.reads();
+        // Scoped inference has its own inferred layer and keeps the unchecked reason.
+        reads.compares_objects(query)
+            && (prepared.inference_scope.is_some()
+                || prepared
+                    .canonical_equality_in_scope(snapshot, self.settings.union_default_graph))
     }
 
     /// A statement by the snapshot's ids; `None` if a term isn't in the store.
