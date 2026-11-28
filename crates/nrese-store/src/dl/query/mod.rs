@@ -855,8 +855,16 @@ pub(crate) fn certify_closure(
     (query, reads): (&Query, &Reads),
     source: &'static str,
     snapshot: Option<&Snapshot>,
+    canonical: bool,
 ) {
-    certify(completeness, (query, reads), source, false, snapshot);
+    certify(
+        completeness,
+        (query, reads),
+        source,
+        false,
+        snapshot,
+        canonical,
+    );
 }
 
 /// The QL rewriting's own report as it leaves nrese-sparql (run, EXPLAIN, plan and the printed
@@ -871,12 +879,13 @@ pub(crate) fn certify_report(
     completeness: Option<&mut Completeness>,
     query: (&Query, &Reads),
     snapshot: Option<&Snapshot>,
+    canonical: bool,
     store: &StoreService,
 ) {
     let Some(completeness) = completeness else {
         return;
     };
-    if !lowerings(completeness, query, "ql", false, snapshot) {
+    if !lowerings(completeness, query, "ql", false, snapshot, canonical) {
         return;
     }
     let rl = completeness.regime == Some(nrese_sparql::Regime::Owl2Rl);
@@ -942,8 +951,9 @@ pub(crate) fn certify(
     source: &'static str,
     bounds: bool,
     snapshot: Option<&Snapshot>,
+    canonical: bool,
 ) {
-    if lowerings(completeness, query, source, bounds, snapshot) {
+    if lowerings(completeness, query, source, bounds, snapshot, canonical) {
         negation_rule(completeness, query, source);
     }
 }
@@ -956,6 +966,7 @@ fn lowerings(
     source: &'static str,
     bounds: bool,
     snapshot: Option<&Snapshot>,
+    canonical: bool,
 ) -> bool {
     use nrese_sparql::Regime::{Owl2Dl, Owl2Ql, Owl2Rl};
     if !matches!(completeness.regime, Some(Owl2Dl | Owl2Ql | Owl2Rl)) {
@@ -989,32 +1000,32 @@ fn lowerings(
     if let Some(reason) = constant {
         completeness.incomplete(source, reason.clone());
     }
-    if let Some(reason) = spelling_reason(query, reads, snapshot) {
+    if let Some(reason) = spelling_reason(query, reads, snapshot, canonical) {
         completeness.incomplete(source, reason);
     }
     annotation_rule(completeness, (query, reads), source, snapshot);
     true
 }
 
-/// The query establishes which positions can bind a literal before we consult the store.
-/// A reader of some graphs gets the same unchecked reason for that shape for every dataset.
-fn spelling_reason(query: &Query, reads: &Reads, snapshot: Option<&Snapshot>) -> Option<String> {
+/// A comparison is checked against its read's equality before seeking stored literals.
+/// A restricted comparison gets its reason from the query alone.
+fn spelling_reason(
+    query: &Query,
+    reads: &Reads,
+    snapshot: Option<&Snapshot>,
+    canonical: bool,
+) -> Option<String> {
     let compared = reads.compared.get_or_init(|| compared_values(query));
-    let what = compared
-        .terms
-        .first()
-        .map(|(what, _)| what.as_str())
-        .or(compared.values.then_some("values"))?;
-    let unchecked = || {
+    let (what, _) = compared.first()?;
+    let unchecked = |what: &str| {
         format!(
             "the query compares {what}: literal evidence could not be checked over the data read"
         )
     };
     let Some(snapshot) = snapshot.filter(|_| reads.access.is_none()) else {
-        return Some(unchecked());
+        return Some(unchecked(what));
     };
-    // The snapshot caches the classes for its own expansion. Literal aliases defeat a
-    // test of the stored kinds even when the operator already compares values.
+    // A literal alias can reach any compared end. Use the read's own class cache.
     let classes = (reads.model != ReadModel::Asserted)
         .then(|| snapshot.equality_classes())
         .flatten();
@@ -1022,69 +1033,90 @@ fn spelling_reason(query: &Query, reads: &Reads, snapshot: Option<&Snapshot>) ->
         .as_ref()
         .is_some_and(|classes| classes.relate_literals())
     {
-        return Some(unchecked());
+        return Some(unchecked(what));
     }
+    let canonical = canonical && classes.as_ref().is_some_and(|classes| !classes.is_empty());
     let stored = classes.as_ref().map(|_| snapshot.stored());
     let stored = stored.as_ref().unwrap_or(snapshot);
-    compared.terms.iter().find_map(|(what, by)| {
-        by.iter()
-            .any(|p| {
-                let predicate = match p {
-                    Some(p) => match stored.lookup(NamedNodeRef::new_unchecked(p).into()) {
-                        Some(id) => Some(id),
-                        None => return false,
-                    },
-                    None => None,
-                };
-                let canonical =
-                    predicate.map(|p| classes.as_ref().map_or(p, |c| c.representative(p)));
-                stored_spelling_evidence(stored, reads.model, predicate, canonical)
-            })
-            .then(|| format!("the query compares {what}: {COMPARED}"))
-    })
+    for (what, by) in compared {
+        for p in by {
+            // Canonical reads can rename assertions in named graphs. Their evidence
+            // cannot be read from an unexpanded seek over the stored predicate alone.
+            if canonical {
+                return Some(unchecked(what));
+            }
+            let predicate = match p {
+                Some(p) => match stored.lookup(NamedNodeRef::new_unchecked(p).into()) {
+                    Some(id) => Some(id),
+                    None => continue,
+                },
+                None => None,
+            };
+            let representative =
+                predicate.map(|p| classes.as_ref().map_or(p, |c| c.representative(p)));
+            match stored_spelling_evidence(stored, reads.model, predicate, representative) {
+                Some(false) => {}
+                Some(true) => return Some(format!("the query compares {what}: {COMPARED}")),
+                None => return Some(unchecked(what)),
+            }
+        }
+    }
+    None
 }
 
 fn stored_spelling_evidence(
     stored: &Snapshot,
     model: ReadModel,
     predicate: Option<TermId>,
-    canonical: Option<TermId>,
-) -> bool {
-    if predicate == canonical || model == ReadModel::Asserted {
-        return stored.holds_typed_literals(model, predicate);
+    representative: Option<TermId>,
+) -> Option<bool> {
+    if predicate == representative || model == ReadModel::Asserted {
+        return typed_literals_in(stored, model, predicate, false);
     }
     if model == ReadModel::Inferred {
-        return stored.holds_typed_literals(model, canonical);
+        return typed_literals_in(stored, model, representative, false);
     }
-    if stored.holds_typed_literals(ReadModel::Asserted, predicate)
-        || stored.holds_typed_literals(ReadModel::Inferred, canonical)
+    if typed_literals_in(stored, ReadModel::Asserted, predicate, false)?
+        || typed_literals_in(stored, ReadModel::Inferred, representative, false)?
     {
-        return true;
+        return Some(true);
     }
     // An alias also reads assertions under its representative in the default graph.
-    // Named graphs keep their own predicate names.
+    // In a strict read, named graphs keep their own predicate names.
+    typed_literals_in(stored, ReadModel::Asserted, representative, true)
+}
+
+fn typed_literals_in(
+    stored: &Snapshot,
+    model: ReadModel,
+    predicate: Option<TermId>,
+    default_only: bool,
+) -> Option<bool> {
     use nrese_engine::TermKind::{DateTime, DerivedInteger, Integer, TypedLiteral};
-    let pattern = QuadPattern {
-        predicate: canonical,
-        ..QuadPattern::in_graph(TermId::DEFAULT_GRAPH)
+    use nrese_engine::quad::Permutation::{Gpos, Ospg, Posg};
+    let (mut pattern, order) = if default_only {
+        (QuadPattern::in_graph(TermId::DEFAULT_GRAPH), Gpos)
+    } else {
+        (QuadPattern::all(), predicate.map_or(Ospg, |_| Posg))
     };
-    [
+    pattern.predicate = predicate;
+    for (first, last) in [
         (Integer, DateTime),
         (TypedLiteral, TypedLiteral),
         (DerivedInteger, DerivedInteger),
-    ]
-    .into_iter()
-    .any(|(first, last)| {
-        stored
-            .scan_range_in(
-                ReadModel::Asserted,
-                &pattern,
-                nrese_engine::quad::Permutation::Gpos,
-                TermId::kind_range(first).0,
-                TermId::kind_range(last).1,
-            )
-            .is_none_or(|mut quads| quads.next().is_some())
-    })
+    ] {
+        let mut quads = stored.scan_range_in(
+            model,
+            &pattern,
+            order,
+            TermId::kind_range(first).0,
+            TermId::kind_range(last).1,
+        )?;
+        if quads.next().is_some() {
+            return Some(true);
+        }
+    }
+    Some(false)
 }
 
 /// Where the status speaks of the OWL 2 Direct Semantics (`owl2-dl`, or the QL rewriting's,

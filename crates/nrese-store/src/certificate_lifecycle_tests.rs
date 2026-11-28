@@ -545,7 +545,7 @@ fn unchecked_spelling_evidence_lowers_a_value_comparison() {
     ))
     .unwrap();
     let mut status = nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Rl);
-    crate::dl::query::certify_closure(&mut status, prepared.reads(), "rules", None);
+    crate::dl::query::certify_closure(&mut status, prepared.reads(), "rules", None, false);
     let header = status.header();
     assert!(
         header.contains("literal evidence could not be checked"),

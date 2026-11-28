@@ -449,15 +449,10 @@ pub(super) fn typed_constant(query: &Query) -> Option<String> {
 /// `"Rex"` to OWL 2). What it is, and the predicates it is read through: a pattern's, or a
 /// path's own (`None`, any: a variable predicate, a negated set, or a path that can match
 /// zero steps, whose ends are every term of the graph). The store compares terms, the regime
-/// values; whether a value read there has another spelling is the data's ([`certify`] asks
-/// the snapshot read, so a variable's IRIs-only ends, `rdf:type`'s too, mark nothing). One
-/// walk, once per query ([`Reads`]). Every operator and term form is named in its matches,
-/// so a new one doesn't compile until it is said whether it compares terms.
-#[derive(Debug, Clone)]
-pub(super) struct SpellingComparisons {
-    pub(super) terms: Vec<(String, Vec<Option<String>>)>,
-    pub(super) values: bool,
-}
+/// values. Every compared end counts for equality and restricted reads. Only ends
+/// that can hold a stored literal carry predicates. A FILTER that compares values
+/// does so by value and adds no spelling comparison. One walk per query ([`Reads`]).
+pub(super) type SpellingComparisons = Vec<(String, Vec<Option<String>>)>;
 
 pub(super) fn compared_values(query: &Query) -> SpellingComparisons {
     use nrese_sparql_syntax::algebra::{AggregateExpression::*, Expression};
@@ -465,21 +460,26 @@ pub(super) fn compared_values(query: &Query) -> SpellingComparisons {
         (HashMap::<_, Vec<_>>::new(), HashSet::new(), HashSet::new());
     let (mut distinct, mut all, mut marks) = (false, false, Vec::new());
     let mut deduped = HashSet::new();
-    let mut value_inputs = HashSet::new();
     pattern_of(query).find(&mut |node| {
         let mut end = |t: &TermPattern, p: Vec<Option<String>>| match t {
             TermPattern::Variable(v) => ends.entry(v.as_str().to_owned()).or_default().push(p),
             TermPattern::BlankNode(b) => ends.entry(b.to_string()).or_default().push(p),
-            TermPattern::Literal(l) if l.is_plain() => marks.push((format!("the string {l}"), p)),
+            TermPattern::Literal(l) if l.is_plain() && !p.is_empty() => {
+                marks.push((format!("the string {l}"), p))
+            }
             // A name, a typed constant ([`typed_constant`]'s) or a quoted triple: no value
             // compared here.
             TermPattern::NamedNode(_) | TermPattern::Literal(_) | TermPattern::Triple(_) => {}
         };
         match node {
             Node::Pattern(GraphPattern::Bgp { patterns }) => {
-                patterns
-                    .iter()
-                    .for_each(|t| end(&t.object, vec![pattern_reads(t).0]));
+                for t in patterns {
+                    end(&t.subject, Vec::new());
+                    if let NamedNodePattern::Variable(v) = &t.predicate {
+                        end(&TermPattern::Variable(v.clone()), Vec::new());
+                    }
+                    end(&t.object, vec![pattern_reads(t).0]);
+                }
             }
             Node::Pattern(GraphPattern::Path {
                 subject,
@@ -489,16 +489,31 @@ pub(super) fn compared_values(query: &Query) -> SpellingComparisons {
                 let mut reads = Vec::new();
                 path_reads(path, &mut reads);
                 let mut through: Vec<_> = reads.into_iter().map(|(p, _)| p).collect();
-                if zero(path) {
+                let can_stop_at_start = zero(path);
+                let can_step_back = reversed(path);
+                if can_stop_at_start {
                     through = vec![None];
-                    end(subject, through.clone());
                 }
+                end(
+                    subject,
+                    if can_stop_at_start || can_step_back {
+                        through.clone()
+                    } else {
+                        Vec::new()
+                    },
+                );
                 end(object, through.clone());
-                if reversed(path) {
+                if can_stop_at_start {
+                    marks.push(("a path that can match zero steps".to_owned(), through));
+                } else if can_step_back {
                     let what = "a node inside or at the start of a path with a reversed step";
                     marks.push((what.to_owned(), through));
                 }
             }
+            Node::Pattern(GraphPattern::Graph {
+                name: NamedNodePattern::Variable(v),
+                ..
+            }) => end(&TermPattern::Variable(v.clone()), Vec::new()),
             Node::Pattern(GraphPattern::Values { variables, .. }) => {
                 bound.extend(variables.iter().map(|v| v.as_str().to_owned()));
             }
@@ -536,17 +551,7 @@ pub(super) fn compared_values(query: &Query) -> SpellingComparisons {
                     }
                 }
             }
-            // Value comparisons handle spelling themselves, but an expanded equality
-            // class can supply literal aliases that the stored evidence cannot describe.
-            Node::Expression(
-                comparison @ (Expression::Equal(..)
-                | Expression::Greater(..)
-                | Expression::GreaterOrEqual(..)
-                | Expression::Less(..)
-                | Expression::LessOrEqual(..)
-                | Expression::In(..)),
-            ) => variables_of(comparison, &mut value_inputs),
-            // These compare terms only at the ends recorded above (a join, LATERAL, OPTIONAL,
+            // These compare terms at the ends recorded above (a join, LATERAL, OPTIONAL,
             // MINUS: on shared variables), by value (FILTER, `=`, IN, a left join's condition,
             // ORDER BY; `sameTerm` by term, as it means to), or not at all (UNION, GRAPH, a
             // projection, which DISTINCT reads above, a slice; SERVICE's are the remote's).
@@ -567,7 +572,6 @@ pub(super) fn compared_values(query: &Query) -> SpellingComparisons {
         }
         false
     });
-    let values = value_inputs.iter().any(|v| ends.contains_key(v));
     let mut compared: Vec<_> = ends
         .into_iter()
         .filter_map(|(v, through)| {
@@ -585,10 +589,7 @@ pub(super) fn compared_values(query: &Query) -> SpellingComparisons {
         .collect();
     compared.extend(marks);
     compared.sort();
-    SpellingComparisons {
-        terms: compared,
-        values,
-    }
+    compared
 }
 
 /// Whether `path` can match zero steps (`*`, `?`, a sequence of such, an alternative with

@@ -243,6 +243,7 @@ impl StoreService {
                     Some(&mut status),
                     (query, &reads),
                     Some(snapshot),
+                    false,
                     self,
                 );
                 (Some(status), ConsistencyStatus::Unknown, None)

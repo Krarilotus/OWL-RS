@@ -2037,7 +2037,14 @@ impl StoreService {
         if matches!(at, Revision::Pending { .. }) {
             crate::dl::query::negation_rule(&mut status, reads, source);
         } else if certificate.dl {
-            crate::dl::query::certify(&mut status, reads, "dl", decided, Some(at.snapshot()));
+            crate::dl::query::certify(
+                &mut status,
+                reads,
+                "dl",
+                decided,
+                Some(at.snapshot()),
+                self.canonical_spelling_read(prepared),
+            );
         }
         let rules = if certificate.dl { "dl" } else { "rules" };
         crate::dl::query::withhold(&mut status, reads, rules, (snapshot, certificate), self);
@@ -2098,7 +2105,13 @@ impl StoreService {
                         .to_owned(),
                 );
             }
-            certify_closure(&mut status, prepared.reads(), "dl", Some(at.snapshot()));
+            certify_closure(
+                &mut status,
+                prepared.reads(),
+                "dl",
+                Some(at.snapshot()),
+                self.canonical_spelling_read(prepared),
+            );
             return Some(status);
         }
         let ruleset = certificate.state.ruleset.clone();
@@ -2113,7 +2126,13 @@ impl StoreService {
             ),
         };
         status.incomplete("rules", reason);
-        certify_closure(&mut status, prepared.reads(), "rules", Some(at.snapshot()));
+        certify_closure(
+            &mut status,
+            prepared.reads(),
+            "rules",
+            Some(at.snapshot()),
+            self.canonical_spelling_read(prepared),
+        );
         Some(status)
     }
 
@@ -3273,7 +3292,19 @@ impl StoreService {
         snapshot: &nrese_engine::Snapshot,
     ) {
         let completeness = ql.map(|r| &mut r.completeness);
-        crate::dl::query::certify_report(completeness, prepared.reads(), Some(snapshot), self);
+        crate::dl::query::certify_report(
+            completeness,
+            prepared.reads(),
+            Some(snapshot),
+            self.canonical_spelling_read(prepared),
+            self,
+        );
+    }
+
+    fn canonical_spelling_read(&self, prepared: &PreparedQuery) -> bool {
+        self.settings.equality_canonical
+            && prepared.read_model() != ReadModel::Asserted
+            && !prepared.omits_default_graph()
     }
 
     /// A statement by the snapshot's ids; `None` if a term isn't in the store.

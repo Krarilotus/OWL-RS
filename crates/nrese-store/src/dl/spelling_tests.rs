@@ -44,7 +44,7 @@ fn spelling_evidence_follows_aliases_in_the_default_graph_only() {
     let prepared = query(OBJECTS, None);
     let (query, reads) = prepared.reads();
     let named_only = engine.snapshot();
-    assert!(spelling_reason(query, reads, Some(&named_only)).is_none());
+    assert!(spelling_reason(query, reads, Some(&named_only), false).is_none());
 
     let mut tx = engine.transaction();
     tx.insert_encoded(EncodedQuad::new(
@@ -56,11 +56,11 @@ fn spelling_evidence_follows_aliases_in_the_default_graph_only() {
     tx.commit().unwrap();
     let default = engine.snapshot();
     assert!(
-        spelling_reason(query, reads, Some(&default))
+        spelling_reason(query, reads, Some(&default), false)
             .unwrap()
             .contains("two spellings of one value")
     );
-    assert!(spelling_reason(query, reads, Some(&named_only)).is_none());
+    assert!(spelling_reason(query, reads, Some(&named_only), false).is_none());
 }
 
 /// A reader of some graphs gets the same structural, unchecked reason whether or not
@@ -92,7 +92,7 @@ fn a_restricted_spelling_reason_does_not_inspect_hidden_data() {
         }),
     );
     let (query, reads) = prepared.reads();
-    let claim = |snapshot: &Snapshot| spelling_reason(query, reads, Some(snapshot));
+    let claim = |snapshot: &Snapshot| spelling_reason(query, reads, Some(snapshot), false);
     #[cfg(debug_assertions)]
     let witnesses = || {
         use nrese_engine::witness::{Site, get};
@@ -152,9 +152,9 @@ fn spelling_evidence_for_a_subject_join_depends_on_literal_aliases() {
     let join = "SELECT ?s { ?s <urn:p> ?o ; <urn:q> ?v }";
     let prepared = query(join, None);
     let (query_ast, reads) = prepared.reads();
-    assert!(spelling_reason(query_ast, reads, Some(&before_alias)).is_none());
+    assert!(spelling_reason(query_ast, reads, Some(&before_alias), false).is_none());
     assert!(
-        spelling_reason(query_ast, reads, Some(&after_alias))
+        spelling_reason(query_ast, reads, Some(&after_alias), false)
             .is_some_and(|reason| reason.contains("literal evidence could not be checked")),
         "a literal alias must mark the subject join"
     );
@@ -167,7 +167,7 @@ fn spelling_evidence_for_a_subject_join_depends_on_literal_aliases() {
     );
     let (query_ast, reads) = restricted.reads();
     assert!(
-        spelling_reason(query_ast, reads, Some(&before_alias))
+        spelling_reason(query_ast, reads, Some(&before_alias), false)
             .is_some_and(|reason| reason.contains("literal evidence could not be checked")),
         "restricted readers get the same reason for any subject join"
     );
@@ -206,7 +206,7 @@ fn spelling_evidence_seeks_an_inferred_predicates_representative() {
         let prepared = PreparedQuery::parse(&request).unwrap();
         let (query, reads) = prepared.reads();
         assert!(
-            spelling_reason(query, reads, Some(&snapshot))
+            spelling_reason(query, reads, Some(&snapshot), false)
                 .is_some_and(|reason| reason.contains("two spellings of one value")),
             "{model:?} must check the representative in the inferred stack"
         );
@@ -246,7 +246,7 @@ fn spelling_evidence_seeks_the_compared_predicate() {
     let prepared = query(OBJECTS, None);
     let (query, reads) = prepared.reads();
     let before = get(Site::ScanSteps);
-    assert!(spelling_reason(query, reads, Some(&snapshot)).is_none());
+    assert!(spelling_reason(query, reads, Some(&snapshot), false).is_none());
     let steps = get(Site::ScanSteps) - before;
     assert!(
         steps <= 3,
