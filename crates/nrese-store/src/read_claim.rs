@@ -2,13 +2,19 @@ use nrese_sparql::Completeness;
 
 use super::{PreparedQuery, StoreService, context_outside_dl, dl_context, status_for_its_reader};
 use crate::ConsistencyStatus;
-use crate::dl::{Verdict, query::Revision};
+use crate::dl::{
+    Verdict,
+    query::{DL_CLASH, Revision},
+};
 use crate::entailment::Entailment;
 
 const QUARANTINE: &str = "the store is in quarantine (the consistency rules found violations and \
                           have not found the data clean since), and as inconsistent data entail \
                           every answer, no read is certified complete until it leaves";
 const CLASH: &str = "the data is inconsistent, so it entails every answer";
+const RULES_HOLD: &str =
+    "the store is in quarantine after the materialisation rules found consistency violations";
+const RULES_CLASH: &str = "the materialisation rules found a consistency clash";
 
 /// The store's assessment of an answer, composed once from the publication and its route.
 /// A route supplies evidence ([`Completeness`]); only `StoreService::assess` issues a claim.
@@ -53,20 +59,23 @@ impl Claim {
 
     fn note(&mut self, source: &'static str, reason: &str) {
         self.reported = true;
-        if !self
+        // Keep the primary reason for an undecided answer, with room for the
+        // mandatory reason among the first entries that the header can show.
+        let at = usize::from(!self.status.reasons.is_empty());
+        let reason = match self
             .status
             .reasons
             .iter()
-            .any(|r| r.source == source && r.text == reason)
+            .position(|r| r.source == source && r.text == reason)
         {
-            self.status.reasons.insert(
-                0,
-                nrese_sparql::completeness::Reason {
-                    source,
-                    text: reason.to_owned(),
-                },
-            );
-        }
+            Some(current) if current <= at => return,
+            Some(current) => self.status.reasons.remove(current),
+            None => nrese_sparql::completeness::Reason {
+                source,
+                text: reason.to_owned(),
+            },
+        };
+        self.status.reasons.insert(at, reason);
     }
 
     /// The producer failed before its response started. Delivery can lower a claim
@@ -81,7 +90,12 @@ impl Claim {
         self.status
             .reasons
             .iter()
-            .find(|r| r.source == "consistency" && matches!(r.text.as_str(), QUARANTINE | CLASH))
+            .find(|r| {
+                matches!(
+                    r.text.as_str(),
+                    QUARANTINE | CLASH | RULES_HOLD | RULES_CLASH | DL_CLASH
+                )
+            })
             .map(|r| r.text.as_str())
     }
 
@@ -125,6 +139,7 @@ pub(crate) enum Evidence<'a> {
     DlQuery {
         prepared: &'a PreparedQuery,
         route: Completeness,
+        verdict: Option<Verdict>,
         cache: Option<(crate::DlAnswers, &'a mut Vec<u8>)>,
     },
     Service {
@@ -158,6 +173,7 @@ impl StoreService {
     pub(crate) fn assess(&self, at: Revision<'_>, evidence: Evidence<'_>) -> Claim {
         let snapshot = at.snapshot();
         let printing = matches!(&evidence, Evidence::Printed { .. });
+        let dl_query = matches!(&evidence, Evidence::DlQuery { .. });
         let query = match &evidence {
             Evidence::Query { prepared, .. } | Evidence::DlQuery { prepared, .. } => {
                 Some(prepared.reads())
@@ -190,6 +206,7 @@ impl StoreService {
             Evidence::DlQuery {
                 prepared,
                 route,
+                verdict,
                 cache,
             } => {
                 let status = self
@@ -205,7 +222,8 @@ impl StoreService {
                     false,
                     self.config.equality_compact,
                 );
-                (told, ConsistencyStatus::Unknown, None)
+                let verdict = verdict.filter(|_| prepared.access().is_none());
+                (told, ConsistencyStatus::Unknown, verdict)
             }
             Evidence::Service { status, verdict } => {
                 (Some(status), ConsistencyStatus::Unknown, verdict)
@@ -282,29 +300,42 @@ impl StoreService {
         if clash {
             claim.consistency = base.rules;
         }
-        let consistency_reason = if base.held {
+        let dl_clash = matches!(claim.dl_verdict, Some(Verdict::Inconsistent));
+        let consistency_reason = if dl_query && dl_clash {
+            Some(DL_CLASH)
+        } else if dl_query && clash {
+            Some(if base.held { RULES_HOLD } else { RULES_CLASH })
+        } else if base.held {
             Some(QUARANTINE)
-        } else if clash || matches!(claim.dl_verdict, Some(Verdict::Inconsistent)) {
+        } else if clash || dl_clash {
             Some(CLASH)
         } else {
             None
         };
         if let Some(reason) = consistency_reason {
+            let source = if reason == DL_CLASH {
+                "dl"
+            } else {
+                "consistency"
+            };
             // A clash can leave query rows missing. It can also be the complete
             // answer of a service that decides whether the ontology has a model.
             if printing || query.is_some() {
                 let newly_incomplete = claim.complete;
-                claim.lower("consistency", reason);
+                claim.lower(source, reason);
                 if newly_incomplete && let Some(query) = query {
                     crate::dl::query::negation_rule(&mut claim.status, query, "consistency");
                 }
             } else {
-                claim.note("consistency", reason);
+                claim.note(source, reason);
             }
         }
         if let Some(cache) = header_cache {
             cache.push(match consistency_reason {
                 Some(QUARANTINE) => 2,
+                Some(RULES_HOLD) => 3,
+                Some(RULES_CLASH) => 4,
+                Some(DL_CLASH) => 5,
                 Some(_) => 1,
                 None => 0,
             });

@@ -254,16 +254,12 @@ pub fn build_ready_response(
             }
             _ => None,
         },
-        consistency_reason: publication
-            .claim
-            .consistency_reason()
-            .map(str::to_owned)
-            .or_else(|| match consistency {
-                nrese_store::ConsistencyStatus::Undecided { violations, why } => {
-                    Some(why.text(violations))
-                }
-                _ => None,
-            }),
+        consistency_reason: match consistency {
+            nrese_store::ConsistencyStatus::Undecided { violations, why } => {
+                Some(why.text(violations))
+            }
+            _ => publication.claim.consistency_reason().map(str::to_owned),
+        },
         undecided: publication.undecided,
         revision: publication.revision,
         quad_count: publication.stats.quad_count as u64,

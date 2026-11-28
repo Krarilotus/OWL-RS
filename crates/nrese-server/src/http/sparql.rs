@@ -196,9 +196,8 @@ fn completeness_json(
     let Some(c) = status else {
         return serde_json::Value::Null;
     };
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "status": c.as_str(),
-        "consistency": c.consistency().as_str(),
         "regime": c.regime.map(|r| r.as_str()),
         "sound": c.sound,
         "complete": c.complete,
@@ -213,7 +212,14 @@ fn completeness_json(
             "unresolved": b.unresolved,
         })),
         "decided_by": decided_by,
-    })
+    });
+    let consistency = c.dl_verdict().map(|verdict| verdict.as_str()).or_else(|| {
+        (c.regime != Some(nrese_sparql::Regime::Owl2Dl)).then(|| c.consistency().as_str())
+    });
+    if let Some(word) = consistency.filter(|word| *word != "unknown") {
+        body["consistency"] = serde_json::json!(word);
+    }
+    body
 }
 
 /// The JSON form of an EXPLAIN: the executor, the rewrites that changed the query, totals,
@@ -257,9 +263,8 @@ fn explanation_json(explanation: &nrese_store::Explanation) -> serde_json::Value
 /// doesn't apply).
 fn ql_json(report: Option<&nrese_sparql::ql::QlReport<nrese_store::Claim>>) -> serde_json::Value {
     report.map_or(serde_json::Value::Null, |r| {
-        serde_json::json!({
+        let mut body = serde_json::json!({
             "completeness": r.completeness.as_str(),
-            "consistency": r.completeness.consistency().as_str(),
             "sound": r.completeness.sound,
             "complete": r.completeness.complete,
             "reasons": r
@@ -274,7 +279,11 @@ fn ql_json(report: Option<&nrese_sparql::ql::QlReport<nrese_store::Claim>>) -> s
             "branches": r.branches,
             "atoms": r.atoms,
             "limits": r.limits,
-        })
+        });
+        if r.completeness.consistency() != nrese_store::ConsistencyStatus::Unknown {
+            body["consistency"] = serde_json::json!(r.completeness.consistency().as_str());
+        }
+        body
     })
 }
 

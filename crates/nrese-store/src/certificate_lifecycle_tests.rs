@@ -253,11 +253,7 @@ fn ql_reasons_match_a_fresh_store_after_the_property_axiom_is_deleted() {
 #[test]
 fn a_query_on_an_inconsistent_ql_publication_reports_the_clash() {
     let store = StoreService::new(StoreConfig::in_memory()).unwrap();
-    store
-        .update_str_ungated(&format!(
-            "{PREFIXES} INSERT DATA {{ :A owl:disjointWith :B . :a a :A, :B }}"
-        ))
-        .unwrap();
+    load(&store, ":A owl:disjointWith :B . :a a :A, :B .");
     store
         .rematerialise(
             ReasonerConfig::for_mode(ReasoningMode::Owl2Ql)

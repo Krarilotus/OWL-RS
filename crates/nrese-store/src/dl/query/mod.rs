@@ -225,17 +225,18 @@ fn consistency_known(store: &StoreService, snapshot: &Snapshot, view: &View) -> 
 }
 
 /// Why an answer isn't complete for the data's consistency, if it isn't.
-fn consistency_reason(verdict: Verdict) -> Option<String> {
+fn consistency_reason(verdict: &Verdict) -> Option<String> {
     match verdict {
         Verdict::Consistent => None,
-        Verdict::Inconsistent => {
-            Some("the data is inconsistent under OWL 2 DL, so it entails every answer".to_owned())
-        }
+        Verdict::Inconsistent => Some(DL_CLASH.to_owned()),
         Verdict::Unknown(why) => Some(format!(
             "the data's consistency under OWL 2 DL isn't known ({why})"
         )),
     }
 }
+
+pub(crate) const DL_CLASH: &str =
+    "the data is inconsistent under OWL 2 DL, so it entails every answer";
 
 /// The rules run over the RL closure only (DL-safe in effect: their variables bind to the
 /// store's terms), never over what OWL 2 DL entails beyond it nor over U1: a conclusion
@@ -260,6 +261,7 @@ struct Counts {
 #[derive(Debug)]
 struct Status {
     completeness: Completeness,
+    verdict: Option<Verdict>,
     detail: DlDetail,
 }
 
@@ -267,6 +269,7 @@ impl Default for Status {
     fn default() -> Self {
         Self {
             completeness: Completeness::under(nrese_sparql::Regime::Owl2Dl),
+            verdict: None,
             detail: DlDetail::default(),
         }
     }
@@ -285,6 +288,13 @@ impl Status {
 
     fn add(&mut self, reason: String) {
         self.completeness.incomplete("dl", reason);
+    }
+
+    fn set_verdict(&mut self, verdict: Verdict) {
+        if let Some(why) = consistency_reason(&verdict) {
+            self.add(why);
+        }
+        self.verdict = Some(verdict);
     }
 
     /// Names an unresolved candidate (the first [`super::UNRESOLVED_SHOWN`]).
@@ -312,11 +322,11 @@ impl Status {
     }
 
     fn stream(self, read: Read) -> Outcome {
-        Outcome::Stream(self.completeness, read, self.detail)
+        Outcome::Stream((self.completeness, self.verdict), read, self.detail)
     }
 
     fn answers(self, answers: Answers) -> Outcome {
-        Outcome::Answers(answers, self.completeness, self.detail)
+        Outcome::Answers(answers, (self.completeness, self.verdict), self.detail)
     }
 }
 
@@ -332,16 +342,16 @@ pub(crate) fn plan_status(
 ) -> StoreResult<crate::Claim> {
     let analysis = analyse(prepared.query());
     let decided = decided(store, read.snapshot(), prepared, cancellation)?;
-    let completeness = match decided.as_ref() {
-        Ok(at) => plan_status_built(store, prepared, &analysis, at).completeness,
-        Err(why) => fallback(prepared, why).completeness,
+    let status = match decided.as_ref() {
+        Ok(at) => plan_status_built(store, prepared, &analysis, at),
+        Err(why) => fallback(prepared, why),
     };
     Ok(composed(
         store,
         prepared,
         read,
         &decided,
-        completeness,
+        (status.completeness, status.verdict),
         None,
     ))
 }
@@ -458,7 +468,7 @@ fn composed(
     prepared: &PreparedQuery,
     read: Revision<'_>,
     decided: &Decided,
-    status: Completeness,
+    (route, verdict): (Completeness, Option<Verdict>),
     cache: Option<(DlAnswers, &mut Vec<u8>)>,
 ) -> crate::Claim {
     let at = decided.as_ref().map_or(read, Revision::Decided);
@@ -466,7 +476,8 @@ fn composed(
         at,
         crate::service::Evidence::DlQuery {
             prepared,
-            route: status,
+            route,
+            verdict,
             cache,
         },
     )
@@ -1605,15 +1616,13 @@ fn plan_status_built(
     // What the run adds whatever path decides ([`decide_answers`]); a consistency the run
     // would check is not known yet.
     let mut status = Status::complete();
-    let consistency = match consistency_known(store, snapshot, view) {
-        Some(known) => consistency_reason(known),
-        None => Some(
+    if let Some(known) = consistency_known(store, snapshot, view) {
+        status.set_verdict(known);
+    } else {
+        status.add(
             "the data's consistency under OWL 2 DL isn't checked yet: decided when it runs"
                 .to_owned(),
-        ),
-    };
-    if let Some(why) = consistency {
-        status.add(why);
+        );
     }
     if crate::service::Certificate::route(snapshot, store.dl()).1 {
         status.add(USER_RULES.to_owned());
@@ -1677,7 +1686,7 @@ pub(crate) fn answer(
     // An ASK the store answered `true` misses nothing, so nothing every name could add changes
     // it: it isn't put to the element. One answered `false` is, as is one streamed.
     let held = matches!(&outcome, Outcome::Answers(Answers::Boolean(true), ..));
-    let (Outcome::Stream(status, _, _) | Outcome::Answers(_, status, _)) = &mut outcome;
+    let (Outcome::Stream((status, _), _, _) | Outcome::Answers(_, (status, _), _)) = &mut outcome;
     if status.complete
         && !held
         && let Ok((_, view)) = &decided
@@ -1736,7 +1745,7 @@ mod envelope_tests;
 
 /// How a query is answered: over the lower bound as it streams (its status known before
 /// it runs), or with answers collected and completed through the bounds.
-pub(crate) enum Outcome<C = Completeness> {
+pub(crate) enum Outcome<C = (Completeness, Option<Verdict>)> {
     /// Streamed over what [`Read`] says.
     Stream(C, Read, DlDetail),
     Answers(Answers, C, DlDetail),
@@ -1777,9 +1786,7 @@ fn decide_answers(
         None => Verdict::Unknown("not certified".to_owned()),
     };
     cancellation.check()?;
-    if let Some(why) = consistency_reason(consistency) {
-        status.add(why);
-    }
+    status.set_verdict(consistency);
     if crate::service::Certificate::route(snapshot, store.dl()).1 {
         status.add(USER_RULES.to_owned());
     }
