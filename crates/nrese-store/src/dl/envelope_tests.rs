@@ -74,11 +74,12 @@ fn run(store: &StoreService, memory: &Envelope) -> End {
         .unwrap();
     let end = match answer(
         store,
-        &store.engine().snapshot(),
+        Revision::Committed(&store.engine().snapshot()),
         &prepared,
         &CancellationToken::new(),
         memory,
         DlAnswers::CertainWhereComplete,
+        None,
     ) {
         Err(error) => {
             assert!(error.is_memory_limit(), "{error}");
