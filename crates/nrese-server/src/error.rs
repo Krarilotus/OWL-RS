@@ -301,7 +301,7 @@ fn reject_label(kind: RejectKind) -> (&'static str, &'static str) {
 fn incomplete_answer(answer: &nrese_store::IncompleteAnswer) -> Response {
     let status = StatusCode::UNPROCESSABLE_ENTITY;
     let completeness = &answer.status;
-    problem(
+    let mut response = problem(
         status,
         &serde_json::json!({
             "type": "https://nrese.dev/problems/incomplete-answer",
@@ -323,7 +323,12 @@ fn incomplete_answer(answer: &nrese_store::IncompleteAnswer) -> Response {
             })),
             "unresolved": answer.unresolved,
         }),
-    )
+    );
+    response.headers_mut().insert(
+        crate::http::COMPLETENESS,
+        crate::http::claim_header(completeness),
+    );
+    response
 }
 
 /// Marks an error status whose body must stay as written: the plain-text profile for

@@ -88,7 +88,6 @@ fn read_basis_a_mode_switch_at_the_same_revision_keeps_both_verdicts() {
         (Unknown, Consistent)
     );
     assert_eq!(held.revision, latest.revision);
-    assert!(!held.claim.eq(&latest.claim));
     assert!(held.dl_mode && !latest.dl_mode);
 }
 

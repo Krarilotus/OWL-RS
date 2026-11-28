@@ -171,6 +171,12 @@ pub async fn execute_query_in(
 /// (docs/design/ql-rewriting.md §7).
 pub const COMPLETENESS: &str = "nrese-completeness";
 
+pub(crate) fn claim_header(claim: &nrese_store::Claim) -> axum::http::HeaderValue {
+    use axum::http::HeaderValue;
+    HeaderValue::from_str(&claim.header())
+        .unwrap_or_else(|_| HeaderValue::from_static(claim.as_str()))
+}
+
 /// The JSON form of the claim also used for the header, with the bounds' counts and paths.
 fn completeness_json(
     status: Option<&nrese_store::Claim>,

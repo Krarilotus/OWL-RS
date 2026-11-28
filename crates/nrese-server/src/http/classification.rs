@@ -11,7 +11,7 @@
 //! JSON's `outside_profile`, and a comment line first in N-Triples say so.
 
 use axum::body::Body;
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use nrese_reasoner::eval::Stop;
 use nrese_sparql::Outside;
@@ -107,11 +107,7 @@ fn respond(
         .into_response();
     // As a query's answers carry it (`http::sparql`), readable across origins too.
     let headers = response.headers_mut();
-    headers.insert(
-        COMPLETENESS,
-        HeaderValue::from_str(&status.header())
-            .unwrap_or_else(|_| HeaderValue::from_static(status.as_str())),
-    );
+    headers.insert(COMPLETENESS, super::sparql::claim_header(status));
     headers.append(
         header::ACCESS_CONTROL_EXPOSE_HEADERS,
         HeaderValue::from_static(COMPLETENESS),

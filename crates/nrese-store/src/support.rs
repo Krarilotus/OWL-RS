@@ -1979,7 +1979,7 @@ pub(crate) struct Generation {
     pub(crate) rules: Option<RuleProgram>,
     pub(crate) epoch: u64,
     /// Whether rules were registered in this generation or any before it: clearing them
-    /// doesn't lower it ([`Supports::has_rules`]).
+    /// doesn't lower it.
     pub(crate) ever: bool,
 }
 
@@ -2368,13 +2368,6 @@ impl Supports {
     /// The rules registered here ([`Self::use_rules`]), if any.
     pub(crate) fn rules(&self) -> Option<RuleProgram> {
         self.state().generation.rules.clone()
-    }
-
-    /// Whether rules were ever registered here ([`Self::use_rules`]): a reasoner maintains,
-    /// or maintained, the stack. Clearing the rules doesn't lower it; a store opened again
-    /// starts without it.
-    pub(crate) fn has_rules(&self) -> bool {
-        self.state().generation.ever
     }
 
     /// Whether readers used sets since the rules were set.

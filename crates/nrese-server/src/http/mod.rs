@@ -32,6 +32,7 @@ mod routes;
 mod service_description;
 mod shacl;
 mod sparql;
+pub(crate) use sparql::{COMPLETENESS, claim_header};
 mod tell;
 
 pub use result_stream::MAX_BUFFERED_OUTPUT_BYTES;

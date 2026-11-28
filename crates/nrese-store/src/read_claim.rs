@@ -22,6 +22,7 @@ pub struct Claim {
     consistency: ConsistencyStatus,
     dl_verdict: Option<Verdict>,
     entailment: Option<Entailment>,
+    dl_answer: Option<crate::dl::entailment::Entailed>,
 }
 
 impl std::ops::Deref for Claim {
@@ -62,6 +63,10 @@ impl Claim {
                 .map_or("entailment was not decided", |reason| reason.text.as_str());
             crate::StoreError::Undecided(why.to_owned())
         })
+    }
+
+    pub(crate) fn dl_answer(&self) -> Option<&crate::dl::entailment::Entailed> {
+        self.dl_answer.as_ref()
     }
 
     pub(super) fn cache_status(&self) -> Option<&Completeness> {
@@ -106,6 +111,7 @@ impl StoreService {
     pub(crate) fn assess(&self, at: Revision<'_>, evidence: Evidence<'_>) -> Claim {
         let snapshot = at.snapshot();
         let mut entailment = None;
+        let mut dl_answer = None;
         let (status, consistency, dl_verdict) = match evidence {
             Evidence::Query {
                 prepared,
@@ -179,6 +185,7 @@ impl StoreService {
                         None
                     }
                 };
+                dl_answer = Some(answer.clone());
                 (Some(status), ConsistencyStatus::Unknown, Some(premise))
             }
         };
@@ -188,6 +195,7 @@ impl StoreService {
             consistency,
             dl_verdict,
             entailment,
+            dl_answer,
         }
     }
 }

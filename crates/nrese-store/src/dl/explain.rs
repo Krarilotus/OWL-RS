@@ -224,6 +224,7 @@ pub struct DlExplanation {
     pub verified: bool,
     pub tests: usize,
     pub micros: u64,
+    pub claim: crate::Claim,
 }
 
 /// The justification's axioms with their sources, decoded: each triple of an axiom's RDF
@@ -254,8 +255,6 @@ pub(crate) fn explained(
     justification.axioms.iter().map(|&i| explain(i)).collect()
 }
 
-/// An explanation OWL 2 DL didn't decide, for `why`: an answer that can't be proven
-/// complete, never "doesn't hold".
 impl crate::StoreService {
     /// Why the statement `subject predicate object` holds under OWL 2 DL: a minimal set
     /// of the asserted ontology's axioms entailing it, with where each was read from
@@ -349,12 +348,27 @@ impl crate::StoreService {
                 .decode(TermId::from_raw(t))
                 .map_or_else(|| format!("#{t}"), |term| term.to_string())
         };
+        let mut status = nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Dl);
+        if !justification.minimal || !justification.verified {
+            status.incomplete(
+                "dl",
+                "the proof search stopped before proving minimality and verification".to_owned(),
+            );
+        }
+        let claim = self.assess(
+            super::query::Revision::Committed(&snapshot),
+            crate::service::Evidence::Service {
+                status,
+                verdict: None,
+            },
+        );
         Ok(Some(DlExplanation {
             axioms: explained(&ontology, &justification, &decode, &snapshot),
             minimal: justification.minimal,
             verified: justification.verified,
             tests: justification.tests,
             micros: started.elapsed().as_micros() as u64,
+            claim,
         }))
     }
 }

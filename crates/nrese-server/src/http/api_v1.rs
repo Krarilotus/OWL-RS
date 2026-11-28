@@ -577,7 +577,12 @@ pub async fn explain(
         .map_err(|error| ApiError::internal(error.to_string()))?
         .map_err(|error| super::sparql::map_query_error(&state.policy(), error))?
         .ok_or_else(|| ApiError::not_found("the statement doesn't hold"))?;
-        return Ok(Json(Justified::from(answer)).into_response());
+        let claim = super::sparql::claim_header(&answer.claim);
+        let mut response = Json(Justified::from(answer)).into_response();
+        response
+            .headers_mut()
+            .insert(super::sparql::COMPLETENESS, claim);
+        return Ok(response);
     }
     let dl = state.store().dl().active();
     let found = tokio::task::spawn_blocking(move || {
@@ -590,7 +595,7 @@ pub async fn explain(
             // incomplete answer where that isn't decided.
             None if dl => store
                 .explain_dl(&scope, statement)
-                .map(|found| found.map(|e| (Vec::new(), Some(DlJustified::from(e))))),
+                .map(|found| found.map(|e| (Vec::new(), Some(e)))),
             None => Ok(None),
         }
     })
@@ -599,6 +604,9 @@ pub async fn explain(
     .map_err(|error| super::sparql::map_query_error(&state.policy(), error))?
     .ok_or_else(|| ApiError::not_found("the statement doesn't hold"))?;
     let (steps, owl2_dl) = found;
+    let claim = owl2_dl
+        .as_ref()
+        .map(|explanation| super::sparql::claim_header(&explanation.claim));
     let steps: Vec<ExplanationStep> = steps
         .into_iter()
         .map(|step| ExplanationStep {
@@ -610,7 +618,17 @@ pub async fn explain(
             premises: step.premises,
         })
         .collect();
-    Ok(Json(Explanation { steps, owl2_dl }).into_response())
+    let mut response = Json(Explanation {
+        steps,
+        owl2_dl: owl2_dl.map(DlJustified::from),
+    })
+    .into_response();
+    if let Some(claim) = claim {
+        response
+            .headers_mut()
+            .insert(super::sparql::COMPLETENESS, claim);
+    }
+    Ok(response)
 }
 
 /// The justifications of a statement (`explain?justifications=...`).
@@ -644,8 +662,8 @@ struct JustifiedStatement {
     origin: &'static str,
 }
 
-impl From<nrese_store::reasoning::JustificationAnswer> for Justified {
-    fn from(answer: nrese_store::reasoning::JustificationAnswer) -> Self {
+impl From<nrese_store::service::StatementJustification> for Justified {
+    fn from(answer: nrese_store::service::StatementJustification) -> Self {
         use nrese_store::reasoning::JustificationMode;
         let convert =
             |set: Vec<nrese_store::reasoning::JustifiedStatement>| -> Vec<JustifiedStatement> {
@@ -674,7 +692,7 @@ impl From<nrese_store::reasoning::JustificationAnswer> for Justified {
             mode,
             statements: single.then(|| sets.pop().unwrap_or_default()),
             justifications: (!single).then_some(sets),
-            complete: answer.complete,
+            complete: answer.claim.complete,
             verified: answer.verified,
         }
     }

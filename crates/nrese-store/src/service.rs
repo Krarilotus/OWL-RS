@@ -313,6 +313,16 @@ pub struct PublicationReport {
     pub dl_engine: &'static str,
 }
 
+/// The justifications found over one publication and the store's assessment of the result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatementJustification {
+    pub mode: crate::reasoning::JustificationMode,
+    pub sets: Vec<Vec<crate::reasoning::JustifiedStatement>>,
+    pub complete: bool,
+    pub verified: Option<bool>,
+    pub claim: Claim,
+}
+
 /// The explanation shared by a published verdict and a refusal.
 #[derive(Debug, serde::Serialize)]
 pub struct UndecidedReason {
@@ -713,10 +723,7 @@ impl StoreService {
     ) {
         let record = Certificate::record(tx.base());
         let Some(base) = record.filter(|c| c.exact) else {
-            tx.install(
-                None,
-                Some(self.read_basis(Self::without_verdict(record), generation)),
-            );
+            tx.install_certificate(self.read_basis(Self::without_verdict(record), generation));
             return;
         };
         let (mut state, literal) = (base.state.clone(), base.literal);
@@ -3050,7 +3057,7 @@ impl StoreService {
         scope: &crate::ReadScope,
         statement: [nrese_rdf::TermRef<'_>; 3],
         mode: crate::reasoning::JustificationMode,
-    ) -> StoreResult<Option<crate::reasoning::JustificationAnswer>> {
+    ) -> StoreResult<Option<StatementJustification>> {
         let whole = self.justify_statement_whole(program.into(), scope, statement, mode);
         scope.told(crate::EntryPoint::JustifyStatement, whole)
     }
@@ -3061,21 +3068,45 @@ impl StoreService {
         scope: &crate::ReadScope,
         statement: [nrese_rdf::TermRef<'_>; 3],
         mode: crate::reasoning::JustificationMode,
-    ) -> StoreResult<Option<crate::reasoning::JustificationAnswer>> {
+    ) -> StoreResult<Option<StatementJustification>> {
         let snapshot = self.engine.snapshot();
         // Admitted before anything of it is read, as [`Self::explain_statement_whole`].
         let envelope = self.settings.envelope(None);
         self.view_of(&snapshot, scope.access(), &envelope, None)?;
+        let regime = nrese_sparql::Regime::of_ruleset(&program.name());
         let program = self.bound_program(&snapshot, program)?;
         let Some(fact) = Self::fact_of(&snapshot, statement) else {
             return Ok(None);
         };
         let justify = |readable| {
-            self.proof_within(|stop| {
+            let found = self.proof_within(|stop| {
                 nrese_reasoner::engine::justify_fact_until(
                     &program, &snapshot, fact, mode, readable, stop,
                 )
-            })
+            })?;
+            Ok(found.map(|answer| {
+                let mut status = nrese_sparql::Completeness::under(regime);
+                if !answer.complete {
+                    status.incomplete(
+                        "rules",
+                        "the search could not finish enumerating justifications".to_owned(),
+                    );
+                }
+                let claim = self.assess(
+                    Revision::Committed(&snapshot),
+                    Evidence::Service {
+                        status,
+                        verdict: None,
+                    },
+                );
+                StatementJustification {
+                    mode: answer.mode,
+                    sets: answer.sets,
+                    complete: claim.complete,
+                    verified: answer.verified,
+                    claim,
+                }
+            }))
         };
         let crate::ReadScope::Graphs(access) = scope else {
             return justify(None);
