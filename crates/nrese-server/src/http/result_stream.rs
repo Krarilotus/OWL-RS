@@ -113,16 +113,20 @@ impl Reader {
     /// Check the protocol using only the grant, before opening or preparing a read.
     pub fn refuse_unframed(self) -> Option<Response> {
         (self == Self::Restricted && WHOLE.try_with(|whole| *whole).unwrap_or(false)).then(|| {
-            let status = StatusCode::HTTP_VERSION_NOT_SUPPORTED;
-            crate::error::problem(
+            let status = StatusCode::UPGRADE_REQUIRED;
+            let mut response = crate::error::problem(
                 status,
                 &serde_json::json!({
-                    "type": "https://nrese.dev/problems/http-version-not-supported",
-                    "title": "HTTP Version Not Supported",
+                    "type": "https://nrese.dev/problems/upgrade-required",
+                    "title": "Upgrade Required",
                     "status": status.as_u16(),
                     "detail": "Use HTTP/1.1 or HTTP/2 for restricted result streams."
                 }),
-            )
+            );
+            let headers = response.headers_mut();
+            headers.insert(header::UPGRADE, HeaderValue::from_static("HTTP/1.1"));
+            headers.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
+            response
         })
     }
 }
@@ -1739,7 +1743,7 @@ mod tests {
             )
             .await
             .expect("the version refusal");
-        assert_eq!(response.status(), StatusCode::HTTP_VERSION_NOT_SUPPORTED);
+        assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
     }
 
     /// Over HTTP/1.0, a refusal of a producer's work carries the cause the budget judged at

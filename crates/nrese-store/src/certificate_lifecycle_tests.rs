@@ -402,7 +402,10 @@ fn a_printed_negation_on_a_quarantined_store_is_unsound() {
         },
     );
     assert_eq!(claim.as_str(), "unsound", "{claim:?}");
-    assert!(claim.header().contains("NOT EXISTS"), "{claim:?}");
+    assert!(
+        claim.header().contains("over answers that may be missing"),
+        "{claim:?}"
+    );
 }
 
 /// The header's reason cap never hides a known clash behind reasons about the query.

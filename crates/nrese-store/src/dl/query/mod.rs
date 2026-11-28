@@ -984,32 +984,86 @@ fn lowerings(
     if let Some(reason) = constant {
         completeness.incomplete(source, reason.clone());
     }
+    let work = std::cell::Cell::new(Some(4 * u64::from(nrese_exec::POLL_UNITS)));
+    let visit = |units| {
+        let left = work.get().and_then(|left| left.checked_sub(units));
+        work.set(left);
+        left.is_some()
+    };
     let typed = |predicate: &Option<String>| {
-        snapshot.is_some_and(|s| {
-            let predicate = match predicate {
-                Some(iri) => match s.lookup(NamedNodeRef::new_unchecked(iri).into()) {
-                    Some(id) => Some(id),
-                    None => return false,
-                },
-                None => None,
-            };
-            match access {
-                None => s.holds_typed_literals(ReadModel::Materialised, predicate, |_| true),
-                Some(access) => {
-                    s.holds_typed_literals(ReadModel::Asserted, predicate, |g| {
-                        access.allows_id(s, g)
-                    }) || (access.inferred
-                        && s.holds_typed_literals(ReadModel::Inferred, predicate, |_| true))
-                }
-            }
-        })
+        let snapshot = snapshot?;
+        let predicate = match predicate {
+            Some(iri) => match snapshot.lookup(NamedNodeRef::new_unchecked(iri).into()) {
+                Some(id) => Some(id),
+                None => return Some(false),
+            },
+            None => None,
+        };
+        typed_literal_evidence(snapshot, predicate, access, &visit)
+            .ok()
+            .flatten()
     };
     let compared = reads.compared.get_or_init(|| compared_values(query));
-    if let Some((what, _)) = compared.iter().find(|(_, by)| by.iter().any(typed)) {
-        completeness.incomplete(source, format!("the query compares {what}: {COMPARED}"));
+    if let Some((what, found)) = compared.iter().find_map(|(what, by)| {
+        by.iter()
+            .map(typed)
+            .find(|found| found.is_none_or(|has| has))
+            .map(|found| (what, found))
+    }) {
+        let reason = if found == Some(true) {
+            COMPARED
+        } else {
+            "literal evidence could not be checked over the data read"
+        };
+        completeness.incomplete(source, format!("the query compares {what}: {reason}"));
     }
     annotation_rule(completeness, (query, reads), source, snapshot);
     true
+}
+
+/// Read literal evidence using only the granted graph ranges. An open-ended graph
+/// grant can have other matches, so absence in its explicit graphs is inconclusive.
+fn typed_literal_evidence(
+    snapshot: &Snapshot,
+    predicate: Option<TermId>,
+    access: Option<&nrese_sparql::GraphAccess>,
+    visit: nrese_engine::Visitor<'_>,
+) -> Result<Option<bool>, nrese_engine::Stopped> {
+    let Some(access) = access else {
+        return snapshot
+            .holds_typed_literals(ReadModel::Materialised, predicate, None, visit)
+            .map(Some);
+    };
+    if access.default_graph {
+        let model = if access.inferred {
+            ReadModel::Materialised
+        } else {
+            ReadModel::Asserted
+        };
+        if snapshot.holds_typed_literals(model, predicate, Some(TermId::DEFAULT_GRAPH), visit)? {
+            return Ok(Some(true));
+        }
+    } else if access.inferred
+        && snapshot
+            .stored()
+            .holds_typed_literals(ReadModel::Inferred, predicate, None, visit)?
+    {
+        return Ok(Some(true));
+    }
+    for iri in access.graphs.iter().filter(|iri| access.allows(iri)) {
+        if let Some(graph) = snapshot.lookup(NamedNodeRef::new_unchecked(iri).into())
+            && snapshot.holds_typed_literals(ReadModel::Asserted, predicate, Some(graph), visit)?
+        {
+            return Ok(Some(true));
+        }
+    }
+    // With a hidden default graph, its asserted equalities cannot justify translating
+    // an inferred predicate to another ID for this check.
+    let unchecked_alias = access.inferred
+        && !access.default_graph
+        && predicate.is_some()
+        && snapshot.identity().equality.is_some();
+    Ok((access.prefixes.is_empty() && !unchecked_alias).then_some(false))
 }
 
 /// Where the status speaks of the OWL 2 Direct Semantics (`owl2-dl`, or the QL rewriting's,

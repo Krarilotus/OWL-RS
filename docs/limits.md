@@ -635,7 +635,7 @@ leave something out.
   A stop never gives a wrong answer. A query whose time limit runs out before its output begins gets `408`; one
   whose limit runs out after the server began sending its output keeps the `200` and the `NRESE-Completeness`
   header already sent, and its body is cut: on HTTP/1.1 the chunked body never gets its last chunk. Treat a body without its end as no answer, whatever its status and header say.
-  Restricted result streams require HTTP/1.1 or HTTP/2, so a reverse proxy that defaults to HTTP/1.0 upstream needs HTTP/1.1 configured for those reads.
+  Over HTTP/1.0, SPARQL query, EXPLAIN, Graph Store and RDF4J statements reads return `426 Upgrade Required` for readers without access to every graph, so set the proxy's upstream protocol to HTTP/1.1 if it defaults to HTTP/1.0 (as nginx does before 1.29.7).
 - Some phases run to their end after a stop: the executor's selection and sorting (seconds at 10 M rows on a term
   key), one call of a regular expression (seconds for adversarial megabyte literals), and the graph kernel's
   sorts and set-up arrays.

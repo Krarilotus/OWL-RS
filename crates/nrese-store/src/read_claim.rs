@@ -78,13 +78,6 @@ impl Claim {
         self.status.reasons.insert(at, reason);
     }
 
-    /// The producer failed before its response started. Delivery can lower a claim
-    /// it already received, without changing what the read found or hiding a clash.
-    pub fn after_failed_delivery(mut self) -> Self {
-        self.lower("delivery", "the result was not delivered");
-        self
-    }
-
     /// The non-disclosing reason for a clash or a quarantine on this read's publication.
     pub fn consistency_reason(&self) -> Option<&str> {
         self.status
@@ -172,7 +165,10 @@ pub(crate) enum RulesEntailment {
 impl StoreService {
     pub(crate) fn assess(&self, at: Revision<'_>, evidence: Evidence<'_>) -> Claim {
         let snapshot = at.snapshot();
-        let printing = matches!(&evidence, Evidence::Printed { .. });
+        let printing = match &evidence {
+            Evidence::Printed { query, .. } => Some(*query),
+            _ => None,
+        };
         let dl_query = matches!(&evidence, Evidence::DlQuery { .. });
         let query = match &evidence {
             Evidence::Query { prepared, .. } | Evidence::DlQuery { prepared, .. } => {
@@ -301,12 +297,19 @@ impl StoreService {
             claim.consistency = base.rules;
         }
         let dl_clash = matches!(claim.dl_verdict, Some(Verdict::Inconsistent));
-        let consistency_reason = if dl_query && dl_clash {
+        let lowers = claim.reported && (query.is_some() || printing.is_some());
+        let consistency_reason = if query.is_some() && !claim.reported {
+            None
+        } else if dl_clash && (dl_query || !lowers) {
             Some(DL_CLASH)
-        } else if dl_query && clash {
-            Some(if base.held { RULES_HOLD } else { RULES_CLASH })
         } else if base.held {
-            Some(QUARANTINE)
+            Some(if !lowers || (dl_query && clash) {
+                RULES_HOLD
+            } else {
+                QUARANTINE
+            })
+        } else if clash && (dl_query || !lowers) {
+            Some(RULES_CLASH)
         } else if clash || dl_clash {
             Some(CLASH)
         } else {
@@ -320,11 +323,14 @@ impl StoreService {
             };
             // A clash can leave query rows missing. It can also be the complete
             // answer of a service that decides whether the ontology has a model.
-            if printing || query.is_some() {
+            if lowers {
                 let newly_incomplete = claim.complete;
                 claim.lower(source, reason);
-                if newly_incomplete && let Some(query) = query {
-                    crate::dl::query::negation_rule(&mut claim.status, query, "consistency");
+                if newly_incomplete {
+                    let reads = crate::dl::query::Reads::default();
+                    if let Some(query) = query.or(printing.map(|query| (query, &reads))) {
+                        crate::dl::query::negation_rule(&mut claim.status, query, "consistency");
+                    }
                 }
             } else {
                 claim.note(source, reason);

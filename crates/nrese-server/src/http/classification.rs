@@ -171,7 +171,6 @@ pub async fn classify(
         "incomplete": incomplete_reasons(status),
         "consistent": consistent,
         "consistency": consistency,
-        "consistency_reason": status.consistency_reason(),
         "micros": report.micros,
         "subsumptions": report.subsumptions,
         "unsatisfiable": report.unsatisfiable,
@@ -227,7 +226,6 @@ pub async fn realise(
         "incomplete": incomplete_reasons(status),
         "consistent": consistent,
         "consistency": consistency,
-        "consistency_reason": status.consistency_reason(),
         "micros": report.micros,
         "types": types,
     });

@@ -1799,44 +1799,77 @@ impl Snapshot {
         .is_some_and(|mut quads| quads.any(|quad| graph(quad.graph)))
     }
 
-    /// Whether a statement read in `model` with `predicate` (any, where `None`) has an object
-    /// literal other than a plain or language-tagged string: an inline number, boolean, date
-    /// or dateTime, or one in the dictionary (any other datatype, and every non-canonical
-    /// spelling). Those kinds' ids are three ranges, so this is up to three seeks in the
-    /// predicate-first index (object-first without a predicate). If the index can't answer
-    /// by range, check the matching statements instead. Canonical numbers count though each
-    /// has one spelling: an integer `7`
-    /// and a decimal `7.0` are one value with two ids, so no finer test (non-canonical
-    /// spellings only) would do.
+    /// Whether a statement of `model` at `predicate` and `graph` has a value literal
+    /// other than a plain or language-tagged string. `None` in either position means any.
+    /// Probe the three object ID ranges in the asserted and stored inferred indexes.
+    /// Equality can change the default graph's predicate to its representative, but
+    /// expanding class members is unnecessary for finding the literal kinds.
+    /// A stopped check has no answer.
     pub fn holds_typed_literals(
         &self,
         model: ReadModel,
         predicate: Option<TermId>,
-        mut readable: impl FnMut(TermId) -> bool,
-    ) -> bool {
-        use crate::TermKind::{
-            DateTime, DerivedInteger, Integer, LangString, String, TypedLiteral,
-        };
-        let mut pattern = QuadPattern::all();
-        pattern.predicate = predicate;
-        let index = predicate.map_or(Permutation::Ospg, |_| Permutation::Posg);
-        for (first, last) in [
-            (Integer, DateTime),
-            (TypedLiteral, TypedLiteral),
-            (DerivedInteger, DerivedInteger),
-        ] {
-            let (low, high) = (TermId::kind_range(first).0, TermId::kind_range(last).1);
-            let Some(mut quads) = self.scan_range_in(model, &pattern, index, low, high) else {
-                return self.quads_for_pattern_in(model, &pattern).any(|q| {
-                    let kind = q.object.kind();
-                    kind.is_literal() && !matches!(kind, String | LangString) && readable(q.graph)
-                });
+        graph: Option<TermId>,
+        visit: crate::Visitor<'_>,
+    ) -> Result<bool, crate::Stopped> {
+        use crate::TermKind::{DateTime, DerivedInteger, Integer, TypedLiteral};
+        let probe = |stack,
+                     predicate: Option<TermId>,
+                     graph: Option<TermId>|
+         -> Result<_, crate::Stopped> {
+            let permutation = match (graph, predicate) {
+                (Some(_), Some(_)) => Permutation::Gpos,
+                (Some(_), None) => Permutation::Gosp,
+                (None, Some(_)) => Permutation::Posg,
+                (None, None) => Permutation::Ospg,
             };
-            if quads.any(|q| readable(q.graph)) {
-                return true;
+            let pattern = QuadPattern {
+                predicate,
+                graph: graph.map_or(GraphSelector::Any, GraphSelector::Exact),
+                ..QuadPattern::all()
+            };
+            let mut plan = AccessPlan::in_permutation(&pattern, permutation)
+                .expect("graph and predicate form the prefix");
+            let object = usize::from(graph.is_some()) + usize::from(predicate.is_some());
+            let index = self.version.stack(stack);
+            for (first, last) in [
+                (Integer, DateTime),
+                (TypedLiteral, TypedLiteral),
+                (DerivedInteger, DerivedInteger),
+            ] {
+                plan.low[object] = TermId::kind_range(first).0.raw();
+                plan.high[object] = TermId::kind_range(last).1.raw();
+                if index.any_plan_counted(&plan, visit)? {
+                    return Ok(true);
+                }
             }
+            Ok(false)
+        };
+        let asserted = model.includes(Stack::Asserted);
+        if asserted && probe(Stack::Asserted, predicate, graph)? {
+            return Ok(true);
         }
-        false
+        if model == ReadModel::Asserted || graph.is_some_and(|g| !g.is_default_graph()) {
+            return Ok(false);
+        }
+        let canonical = match (predicate, self.equality) {
+            (Some(p), Some(same_as)) => {
+                let classes = self
+                    .version
+                    .equality
+                    .classes_with(&self.version, same_as, visit)
+                    .ok_or(crate::Stopped)?;
+                Some(classes.representative(p))
+            }
+            _ => predicate,
+        };
+        if asserted
+            && predicate != canonical
+            && probe(Stack::Asserted, canonical, Some(TermId::DEFAULT_GRAPH))?
+        {
+            return Ok(true);
+        }
+        probe(Stack::Inferred, canonical, graph)
     }
 
     /// Exact number of quads [`scan_range_in`](Self::scan_range_in) yields.
