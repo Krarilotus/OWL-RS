@@ -1757,18 +1757,12 @@ impl<'a> Context<'a> {
             None => resolved,
         };
         let store_default = resolved.store_default;
+        let in_scope = resolved.default.canonical_equality_in_scope();
         let (scope, merge_set) = match resolved.default {
             DefaultGraph::Store => (GraphScope::Default, None),
             DefaultGraph::Graph(graph) => (GraphScope::Named(graph), None),
             DefaultGraph::Merge(graphs) => (GraphScope::Union, graphs),
             DefaultGraph::Empty => (GraphScope::Missing, None),
-        };
-        // Canonical answers where the query's default graph is the one the equality covers
-        // (the store's, or the merge of every graph) and some class exists ([`canonical`]).
-        let in_scope = match scope {
-            GraphScope::Default => true,
-            GraphScope::Union => merge_set.is_none(),
-            _ => false,
         };
         // What this evaluation holds, counted on its own (what it leaves behind is its
         // result's reservation), drawn from the request's envelope; a canonical view the

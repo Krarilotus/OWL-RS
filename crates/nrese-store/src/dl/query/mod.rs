@@ -225,17 +225,18 @@ fn consistency_known(store: &StoreService, snapshot: &Snapshot, view: &View) -> 
 }
 
 /// Why an answer isn't complete for the data's consistency, if it isn't.
-fn consistency_reason(verdict: Verdict) -> Option<String> {
+fn consistency_reason(verdict: &Verdict) -> Option<String> {
     match verdict {
         Verdict::Consistent => None,
-        Verdict::Inconsistent => {
-            Some("the data is inconsistent under OWL 2 DL, so it entails every answer".to_owned())
-        }
+        Verdict::Inconsistent => Some(DL_CLASH.to_owned()),
         Verdict::Unknown(why) => Some(format!(
             "the data's consistency under OWL 2 DL isn't known ({why})"
         )),
     }
 }
+
+pub(crate) const DL_CLASH: &str =
+    "the data is inconsistent under OWL 2 DL, so it entails every answer";
 
 /// The rules run over the RL closure only (DL-safe in effect: their variables bind to the
 /// store's terms), never over what OWL 2 DL entails beyond it nor over U1: a conclusion
@@ -260,6 +261,7 @@ struct Counts {
 #[derive(Debug)]
 struct Status {
     completeness: Completeness,
+    verdict: Option<Verdict>,
     detail: DlDetail,
 }
 
@@ -267,6 +269,7 @@ impl Default for Status {
     fn default() -> Self {
         Self {
             completeness: Completeness::under(nrese_sparql::Regime::Owl2Dl),
+            verdict: None,
             detail: DlDetail::default(),
         }
     }
@@ -285,6 +288,13 @@ impl Status {
 
     fn add(&mut self, reason: String) {
         self.completeness.incomplete("dl", reason);
+    }
+
+    fn set_verdict(&mut self, verdict: Verdict) {
+        if let Some(why) = consistency_reason(&verdict) {
+            self.add(why);
+        }
+        self.verdict = Some(verdict);
     }
 
     /// Names an unresolved candidate (the first [`super::UNRESOLVED_SHOWN`]).
@@ -312,11 +322,11 @@ impl Status {
     }
 
     fn stream(self, read: Read) -> Outcome {
-        Outcome::Stream(self.completeness, read, self.detail)
+        Outcome::Stream((self.completeness, self.verdict), read, self.detail)
     }
 
     fn answers(self, answers: Answers) -> Outcome {
-        Outcome::Answers(answers, self.completeness, self.detail)
+        Outcome::Answers(answers, (self.completeness, self.verdict), self.detail)
     }
 }
 
@@ -332,16 +342,16 @@ pub(crate) fn plan_status(
 ) -> StoreResult<crate::Claim> {
     let analysis = analyse(prepared.query());
     let decided = decided(store, read.snapshot(), prepared, cancellation)?;
-    let completeness = match decided.as_ref() {
-        Ok(at) => plan_status_built(store, prepared, &analysis, at).completeness,
-        Err(why) => fallback(prepared, why).completeness,
+    let status = match decided.as_ref() {
+        Ok(at) => plan_status_built(store, prepared, &analysis, at),
+        Err(why) => fallback(prepared, why),
     };
     Ok(composed(
         store,
         prepared,
         read,
         &decided,
-        completeness,
+        (status.completeness, status.verdict),
         None,
     ))
 }
@@ -458,7 +468,7 @@ fn composed(
     prepared: &PreparedQuery,
     read: Revision<'_>,
     decided: &Decided,
-    status: Completeness,
+    (route, verdict): (Completeness, Option<Verdict>),
     cache: Option<(DlAnswers, &mut Vec<u8>)>,
 ) -> crate::Claim {
     let at = decided.as_ref().map_or(read, Revision::Decided);
@@ -466,7 +476,8 @@ fn composed(
         at,
         crate::service::Evidence::DlQuery {
             prepared,
-            route: status,
+            route,
+            verdict,
             cache,
         },
     )
@@ -828,21 +839,14 @@ const SPELLING: &str = "a stored value written another way doesn't match it, tho
 const COMPARED: &str = "two spellings of one value are two terms to the store, which compares \
                         terms, though OWL 2 compares values";
 
-/// Why a read of a store in quarantine (its certificate's violations) may miss rows: fixed
-/// words, nothing of the clash, for a reader of some graphs too (`/readyz` tells anyone).
-const QUARANTINE: &str = "the store is in quarantine (the consistency rules found violations and \
-                          have not found the data clean since), and as inconsistent data entail \
-                          every answer, no read is certified complete until it leaves";
-
 /// The one rule of every path's status under an OWL 2 regime, composed last onto it (by
 /// both DL entry points, [`plan_status`] and [`answer`], after the bounds; over a ruleset's
 /// closure, with or without the QL rewriting): each step only lowers what the status
 /// asserts. Under `rdfs` and `custom` the regime is the closure's own: what it lacks isn't
 /// entailed. A read [`denied`] names misses rows, and so does
 /// a typed constant ([`typed_constant`]); a data value compared by term ([`compared_values`])
-/// through a property that holds a literal other than a string, in `snapshot` (the data
-/// read; unknown, or read for a restricted reader: every property), can give wrong rows;
-/// a store in quarantine may miss rows ([`QUARANTINE`]), whoever reads it;
+/// through a property that holds a literal other than a string in the data read can give
+/// wrong rows;
 /// and where rows may be missing, an operator
 /// under which a missing row can make a returned one wrong ([`negation`]) makes the answers
 /// unsound. Each from `source`.
@@ -851,8 +855,16 @@ pub(crate) fn certify_closure(
     (query, reads): (&Query, &Reads),
     source: &'static str,
     snapshot: Option<&Snapshot>,
+    canonical: bool,
 ) {
-    certify(completeness, (query, reads), source, false, snapshot);
+    certify(
+        completeness,
+        (query, reads),
+        source,
+        false,
+        snapshot,
+        canonical,
+    );
 }
 
 /// The QL rewriting's own report as it leaves nrese-sparql (run, EXPLAIN, plan and the printed
@@ -867,12 +879,13 @@ pub(crate) fn certify_report(
     completeness: Option<&mut Completeness>,
     query: (&Query, &Reads),
     snapshot: Option<&Snapshot>,
+    canonical: bool,
     store: &StoreService,
 ) {
     let Some(completeness) = completeness else {
         return;
     };
-    if !lowerings(completeness, query, "ql", false, snapshot) {
+    if !lowerings(completeness, query, "ql", false, snapshot, canonical) {
         return;
     }
     let rl = completeness.regime == Some(nrese_sparql::Regime::Owl2Rl);
@@ -909,22 +922,35 @@ pub(crate) struct Reads {
     /// [`typed_constant`]'s.
     constant: std::sync::OnceLock<Option<String>>,
     /// [`compared_values`]'.
-    compared: std::sync::OnceLock<Vec<(String, Vec<Option<String>>)>>,
+    compared: std::sync::OnceLock<analysis::SpellingComparisons>,
     /// [`predicates`]', for [`annotation_rule`].
     predicates: std::sync::OnceLock<Vec<Option<String>>>,
-    /// The reader's graphs, where their view is restricted: [`certify`] then takes every
-    /// property to hold values other than strings, so the status doesn't follow what hidden
-    /// graphs hold, and reads triple terms in their graphs alone.
+    /// The reader's graphs, where their view is restricted.
     access: Option<std::sync::Arc<nrese_sparql::GraphAccess>>,
+    model: ReadModel,
 }
 
 impl Reads {
     /// Nothing found yet, for a reader of every graph (`None`) or of `access`.
-    pub(crate) fn new(access: Option<std::sync::Arc<nrese_sparql::GraphAccess>>) -> Self {
+    pub(crate) fn new(
+        access: Option<std::sync::Arc<nrese_sparql::GraphAccess>>,
+        model: ReadModel,
+    ) -> Self {
         Self {
             access,
+            model,
             ..Self::default()
         }
+    }
+
+    fn spelling_comparisons(&self, query: &Query) -> &SpellingComparisons {
+        self.compared.get_or_init(|| compared_values(query))
+    }
+
+    pub(crate) fn compares_objects(&self, query: &Query) -> bool {
+        self.spelling_comparisons(query)
+            .iter()
+            .any(|(_, predicates)| !predicates.is_empty())
     }
 }
 
@@ -935,8 +961,9 @@ pub(crate) fn certify(
     source: &'static str,
     bounds: bool,
     snapshot: Option<&Snapshot>,
+    canonical: bool,
 ) {
-    if lowerings(completeness, query, source, bounds, snapshot) {
+    if lowerings(completeness, query, source, bounds, snapshot, canonical) {
         negation_rule(completeness, query, source);
     }
 }
@@ -949,6 +976,7 @@ fn lowerings(
     source: &'static str,
     bounds: bool,
     snapshot: Option<&Snapshot>,
+    canonical: bool,
 ) -> bool {
     use nrese_sparql::Regime::{Owl2Dl, Owl2Ql, Owl2Rl};
     if !matches!(completeness.regime, Some(Owl2Dl | Owl2Ql | Owl2Rl)) {
@@ -982,29 +1010,123 @@ fn lowerings(
     if let Some(reason) = constant {
         completeness.incomplete(source, reason.clone());
     }
-    // From the snapshot as given: a restricted reader's is dropped below.
-    let quarantined = snapshot
-        .filter(|s| crate::service::Certificate::of(s).is_some())
-        .is_some_and(|s| crate::service::Certificate::assessment(s, false).held);
-    let given = snapshot;
-    let snapshot = snapshot.filter(|_| access.is_none());
-    let typed = |predicate: &Option<String>| {
-        snapshot.is_none_or(|s| match predicate {
-            Some(p) => s
-                .lookup(NamedNodeRef::new_unchecked(p).into())
-                .is_some_and(|p| s.holds_typed_literals(ReadModel::Materialised, Some(p))),
-            None => s.holds_typed_literals(ReadModel::Materialised, None),
-        })
-    };
-    let compared = reads.compared.get_or_init(|| compared_values(query));
-    if let Some((what, _)) = compared.iter().find(|(_, by)| by.iter().any(typed)) {
-        completeness.incomplete(source, format!("the query compares {what}: {COMPARED}"));
+    if let Some(reason) = spelling_reason(query, reads, snapshot, canonical) {
+        completeness.incomplete(source, reason);
     }
-    if quarantined && completeness.complete {
-        completeness.incomplete(source, QUARANTINE.to_owned());
-    }
-    annotation_rule(completeness, (query, reads), source, given);
+    annotation_rule(completeness, (query, reads), source, snapshot);
     true
+}
+
+/// A comparison is checked against its read's equality before seeking stored literals.
+/// A restricted comparison gets its reason from the query alone.
+fn spelling_reason(
+    query: &Query,
+    reads: &Reads,
+    snapshot: Option<&Snapshot>,
+    canonical: bool,
+) -> Option<String> {
+    let compared = reads.spelling_comparisons(query);
+    let (what, _) = compared.first()?;
+    let unchecked = |what: &str| {
+        format!(
+            "the query compares {what}: literal evidence could not be checked over the data read"
+        )
+    };
+    let Some(snapshot) = snapshot.filter(|_| reads.access.is_none()) else {
+        return Some(unchecked(what));
+    };
+    // A literal alias can reach any compared end. Use the read's own class cache.
+    let classes = (reads.model != ReadModel::Asserted)
+        .then(|| snapshot.equality_classes())
+        .flatten();
+    if classes
+        .as_ref()
+        .is_some_and(|classes| classes.relate_literals())
+    {
+        return Some(unchecked(what));
+    }
+    let canonical = canonical && classes.as_ref().is_some_and(|classes| !classes.is_empty());
+    let stored = classes.as_ref().map(|_| snapshot.stored());
+    let stored = stored.as_ref().unwrap_or(snapshot);
+    for (what, by) in compared {
+        for p in by {
+            // Canonical reads can rename assertions in named graphs. Their evidence
+            // cannot be read from an unexpanded seek over the stored predicate alone.
+            if canonical {
+                return Some(unchecked(what));
+            }
+            let predicate = match p {
+                Some(p) => match stored.lookup(NamedNodeRef::new_unchecked(p).into()) {
+                    Some(id) => Some(id),
+                    None => continue,
+                },
+                None => None,
+            };
+            let representative =
+                predicate.map(|p| classes.as_ref().map_or(p, |c| c.representative(p)));
+            match stored_spelling_evidence(stored, reads.model, predicate, representative) {
+                Some(false) => {}
+                Some(true) => return Some(format!("the query compares {what}: {COMPARED}")),
+                None => return Some(unchecked(what)),
+            }
+        }
+    }
+    None
+}
+
+fn stored_spelling_evidence(
+    stored: &Snapshot,
+    model: ReadModel,
+    predicate: Option<TermId>,
+    representative: Option<TermId>,
+) -> Option<bool> {
+    if predicate == representative || model == ReadModel::Asserted {
+        return typed_literals_in(stored, model, predicate, false);
+    }
+    if model == ReadModel::Inferred {
+        return typed_literals_in(stored, model, representative, false);
+    }
+    if typed_literals_in(stored, ReadModel::Asserted, predicate, false)?
+        || typed_literals_in(stored, ReadModel::Inferred, representative, false)?
+    {
+        return Some(true);
+    }
+    // An alias also reads assertions under its representative in the default graph.
+    // In a strict read, named graphs keep their own predicate names.
+    typed_literals_in(stored, ReadModel::Asserted, representative, true)
+}
+
+fn typed_literals_in(
+    stored: &Snapshot,
+    model: ReadModel,
+    predicate: Option<TermId>,
+    default_only: bool,
+) -> Option<bool> {
+    use nrese_engine::TermKind::{DateTime, DerivedInteger, Integer, TypedLiteral};
+    use nrese_engine::quad::Permutation::{Gpos, Ospg, Posg};
+    let (mut pattern, order) = if default_only {
+        (QuadPattern::in_graph(TermId::DEFAULT_GRAPH), Gpos)
+    } else {
+        (QuadPattern::all(), predicate.map_or(Ospg, |_| Posg))
+    };
+    pattern.predicate = predicate;
+    for (first, last) in [
+        (Integer, DateTime),
+        (TypedLiteral, TypedLiteral),
+        (DerivedInteger, DerivedInteger),
+    ] {
+        let mut quads = stored.scan_range_in(
+            model,
+            &pattern,
+            order,
+            TermId::kind_range(first).0,
+            TermId::kind_range(last).1,
+        )?;
+        if quads.next().is_some() {
+            return Some(true);
+        }
+    }
+    Some(false)
 }
 
 /// Where the status speaks of the OWL 2 Direct Semantics (`owl2-dl`, or the QL rewriting's,
@@ -1611,15 +1733,13 @@ fn plan_status_built(
     // What the run adds whatever path decides ([`decide_answers`]); a consistency the run
     // would check is not known yet.
     let mut status = Status::complete();
-    let consistency = match consistency_known(store, snapshot, view) {
-        Some(known) => consistency_reason(known),
-        None => Some(
+    if let Some(known) = consistency_known(store, snapshot, view) {
+        status.set_verdict(known);
+    } else {
+        status.add(
             "the data's consistency under OWL 2 DL isn't checked yet: decided when it runs"
                 .to_owned(),
-        ),
-    };
-    if let Some(why) = consistency {
-        status.add(why);
+        );
     }
     if crate::service::Certificate::route(snapshot, store.dl()).1 {
         status.add(USER_RULES.to_owned());
@@ -1683,7 +1803,7 @@ pub(crate) fn answer(
     // An ASK the store answered `true` misses nothing, so nothing every name could add changes
     // it: it isn't put to the element. One answered `false` is, as is one streamed.
     let held = matches!(&outcome, Outcome::Answers(Answers::Boolean(true), ..));
-    let (Outcome::Stream(status, _, _) | Outcome::Answers(_, status, _)) = &mut outcome;
+    let (Outcome::Stream((status, _), _, _) | Outcome::Answers(_, (status, _), _)) = &mut outcome;
     if status.complete
         && !held
         && let Ok((_, view)) = &decided
@@ -1740,9 +1860,13 @@ mod cancellation_tests;
 #[path = "../envelope_tests.rs"]
 mod envelope_tests;
 
+#[cfg(test)]
+#[path = "../spelling_tests.rs"]
+mod spelling_tests;
+
 /// How a query is answered: over the lower bound as it streams (its status known before
 /// it runs), or with answers collected and completed through the bounds.
-pub(crate) enum Outcome<C = Completeness> {
+pub(crate) enum Outcome<C = (Completeness, Option<Verdict>)> {
     /// Streamed over what [`Read`] says.
     Stream(C, Read, DlDetail),
     Answers(Answers, C, DlDetail),
@@ -1783,9 +1907,7 @@ fn decide_answers(
         None => Verdict::Unknown("not certified".to_owned()),
     };
     cancellation.check()?;
-    if let Some(why) = consistency_reason(consistency) {
-        status.add(why);
-    }
+    status.set_verdict(consistency);
     if crate::service::Certificate::route(snapshot, store.dl()).1 {
         status.add(USER_RULES.to_owned());
     }

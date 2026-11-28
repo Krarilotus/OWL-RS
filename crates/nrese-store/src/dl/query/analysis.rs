@@ -439,21 +439,21 @@ pub(super) fn typed_constant(query: &Query) -> Option<String> {
     })
 }
 
-/// The data values `query` compares by term: each variable (or blank node, which a path's
-/// sequence makes) at the object end of two or more patterns or paths (or at the start of a
-/// path that can match zero steps), or of one and bound by `VALUES` or `BIND` (a join), or
+/// The data values `query` compares by term: each variable or blank node shared across
+/// pattern positions, or used once and bound by `VALUES` or `BIND` (a join), or
 /// at one that a `DISTINCT` or `REDUCED` returns by its own projection, `GROUP BY` groups or
 /// a `DISTINCT` aggregate reads (or an alias `(?n AS ?m)` of one under `DISTINCT` or `GROUP
-/// BY`, which the walk meets first); the nodes inside and at the start of a path with a
-/// reversed step; and each string constant at an object end (a stored `"Rex"^^xsd:token` is
+/// BY`, which the walk meets first); nodes read through a reversed or zero-step path;
+/// and each string constant at an object end (a stored `"Rex"^^xsd:token` is
 /// `"Rex"` to OWL 2). What it is, and the predicates it is read through: a pattern's, or a
 /// path's own (`None`, any: a variable predicate, a negated set, or a path that can match
 /// zero steps, whose ends are every term of the graph). The store compares terms, the regime
-/// values; whether a value read there has another spelling is the data's ([`certify`] asks
-/// the snapshot read, so a variable's IRIs-only ends, `rdf:type`'s too, mark nothing). One
-/// walk, once per query ([`Reads`]). Every operator and term form is named in its matches,
-/// so a new one doesn't compile until it is said whether it compares terms.
-pub(super) fn compared_values(query: &Query) -> Vec<(String, Vec<Option<String>>)> {
+/// values. Every compared end counts for equality and restricted reads. Only ends
+/// that can hold a stored literal carry predicates. A FILTER that compares values
+/// does so by value and adds no spelling comparison. One walk per query ([`Reads`]).
+pub(super) type SpellingComparisons = Vec<(String, Vec<Option<String>>)>;
+
+pub(super) fn compared_values(query: &Query) -> SpellingComparisons {
     use nrese_sparql_syntax::algebra::{AggregateExpression::*, Expression};
     let (mut ends, mut grouped, mut bound) =
         (HashMap::<_, Vec<_>>::new(), HashSet::new(), HashSet::new());
@@ -463,16 +463,22 @@ pub(super) fn compared_values(query: &Query) -> Vec<(String, Vec<Option<String>>
         let mut end = |t: &TermPattern, p: Vec<Option<String>>| match t {
             TermPattern::Variable(v) => ends.entry(v.as_str().to_owned()).or_default().push(p),
             TermPattern::BlankNode(b) => ends.entry(b.to_string()).or_default().push(p),
-            TermPattern::Literal(l) if l.is_plain() => marks.push((format!("the string {l}"), p)),
+            TermPattern::Literal(l) if l.is_plain() && !p.is_empty() => {
+                marks.push((format!("the string {l}"), p))
+            }
             // A name, a typed constant ([`typed_constant`]'s) or a quoted triple: no value
             // compared here.
             TermPattern::NamedNode(_) | TermPattern::Literal(_) | TermPattern::Triple(_) => {}
         };
         match node {
             Node::Pattern(GraphPattern::Bgp { patterns }) => {
-                patterns
-                    .iter()
-                    .for_each(|t| end(&t.object, vec![pattern_reads(t).0]));
+                for t in patterns {
+                    end(&t.subject, Vec::new());
+                    if let NamedNodePattern::Variable(v) = &t.predicate {
+                        end(&TermPattern::Variable(v.clone()), Vec::new());
+                    }
+                    end(&t.object, vec![pattern_reads(t).0]);
+                }
             }
             Node::Pattern(GraphPattern::Path {
                 subject,
@@ -482,16 +488,31 @@ pub(super) fn compared_values(query: &Query) -> Vec<(String, Vec<Option<String>>
                 let mut reads = Vec::new();
                 path_reads(path, &mut reads);
                 let mut through: Vec<_> = reads.into_iter().map(|(p, _)| p).collect();
-                if zero(path) {
+                let can_stop_at_start = zero(path);
+                let can_step_back = reversed(path);
+                if can_stop_at_start {
                     through = vec![None];
-                    end(subject, through.clone());
                 }
+                end(
+                    subject,
+                    if can_stop_at_start || can_step_back {
+                        through.clone()
+                    } else {
+                        Vec::new()
+                    },
+                );
                 end(object, through.clone());
-                if reversed(path) {
+                if can_stop_at_start {
+                    marks.push(("a path that can match zero steps".to_owned(), through));
+                } else if can_step_back {
                     let what = "a node inside or at the start of a path with a reversed step";
                     marks.push((what.to_owned(), through));
                 }
             }
+            Node::Pattern(GraphPattern::Graph {
+                name: NamedNodePattern::Variable(v),
+                ..
+            }) => end(&TermPattern::Variable(v.clone()), Vec::new()),
             Node::Pattern(GraphPattern::Values { variables, .. }) => {
                 bound.extend(variables.iter().map(|v| v.as_str().to_owned()));
             }
@@ -529,7 +550,7 @@ pub(super) fn compared_values(query: &Query) -> Vec<(String, Vec<Option<String>>
                     }
                 }
             }
-            // These compare terms only at the ends recorded above (a join, LATERAL, OPTIONAL,
+            // These compare terms at the ends recorded above (a join, LATERAL, OPTIONAL,
             // MINUS: on shared variables), by value (FILTER, `=`, IN, a left join's condition,
             // ORDER BY; `sameTerm` by term, as it means to), or not at all (UNION, GRAPH, a
             // projection, which DISTINCT reads above, a slice; SERVICE's are the remote's).

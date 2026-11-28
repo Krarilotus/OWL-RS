@@ -1542,6 +1542,10 @@ impl StoreService {
         memory: &nrese_exec::Envelope,
         cancel: &CancellationToken,
     ) -> StoreResult<Snapshot> {
+        #[cfg(test)]
+        if let Some(view) = hooks::QUERY_VIEW.with_borrow_mut(Option::take) {
+            return Ok(view(base));
+        }
         let Some(scope) = &prepared.inference_scope else {
             return self.view_of(base, prepared.access(), memory, Some(cancel));
         };
@@ -2033,7 +2037,14 @@ impl StoreService {
         if matches!(at, Revision::Pending { .. }) {
             crate::dl::query::negation_rule(&mut status, reads, source);
         } else if certificate.dl {
-            crate::dl::query::certify(&mut status, reads, "dl", decided, Some(at.snapshot()));
+            crate::dl::query::certify(
+                &mut status,
+                reads,
+                "dl",
+                decided,
+                Some(at.snapshot()),
+                self.canonical_spelling_read(prepared, snapshot),
+            );
         }
         let rules = if certificate.dl { "dl" } else { "rules" };
         crate::dl::query::withhold(&mut status, reads, rules, (snapshot, certificate), self);
@@ -2094,7 +2105,13 @@ impl StoreService {
                         .to_owned(),
                 );
             }
-            certify_closure(&mut status, prepared.reads(), "dl", Some(at.snapshot()));
+            certify_closure(
+                &mut status,
+                prepared.reads(),
+                "dl",
+                Some(at.snapshot()),
+                self.canonical_spelling_read(prepared, at.snapshot()),
+            );
             return Some(status);
         }
         let ruleset = certificate.state.ruleset.clone();
@@ -2109,7 +2126,13 @@ impl StoreService {
             ),
         };
         status.incomplete("rules", reason);
-        certify_closure(&mut status, prepared.reads(), "rules", Some(at.snapshot()));
+        certify_closure(
+            &mut status,
+            prepared.reads(),
+            "rules",
+            Some(at.snapshot()),
+            self.canonical_spelling_read(prepared, at.snapshot()),
+        );
         Some(status)
     }
 
@@ -3268,8 +3291,33 @@ impl StoreService {
         prepared: &PreparedQuery,
         snapshot: &nrese_engine::Snapshot,
     ) {
-        let completeness = ql.map(|r| &mut r.completeness);
-        crate::dl::query::certify_report(completeness, prepared.reads(), Some(snapshot), self);
+        let Some(ql) = ql else { return };
+        crate::dl::query::certify_report(
+            Some(&mut ql.completeness),
+            prepared.reads(),
+            Some(snapshot),
+            self.canonical_spelling_read(prepared, snapshot),
+            self,
+        );
+    }
+
+    fn canonical_spelling_read(
+        &self,
+        prepared: &PreparedQuery,
+        snapshot: &nrese_engine::Snapshot,
+    ) -> bool {
+        if !self.settings.equality_canonical
+            || prepared.read_model() == ReadModel::Asserted
+            || prepared.access().is_some()
+        {
+            return false;
+        }
+        let (query, reads) = prepared.reads();
+        // Scoped inference has its own inferred layer and keeps the unchecked reason.
+        reads.compares_objects(query)
+            && (prepared.inference_scope.is_some()
+                || prepared
+                    .canonical_equality_in_scope(snapshot, self.settings.union_default_graph))
     }
 
     /// A statement by the snapshot's ids; `None` if a term isn't in the store.
@@ -3692,8 +3740,11 @@ pub(crate) mod hooks {
     use std::thread::LocalKey;
 
     pub(crate) type Hook = RefCell<Option<Box<dyn FnOnce()>>>;
+    type QueryView = Box<dyn FnOnce(&nrese_engine::Snapshot) -> nrese_engine::Snapshot>;
 
     thread_local! {
+        /// Supply a withheld view for a test after the committed base has been pinned.
+        pub(crate) static QUERY_VIEW: RefCell<Option<QueryView>> = const { RefCell::new(None) };
         /// A bulk load holds the writer slot and is about to read its files.
         pub(crate) static BEFORE_LOAD_READS: Hook = const { RefCell::new(None) };
         /// A bulk load has cleared the reasoning certificate and is about to publish.

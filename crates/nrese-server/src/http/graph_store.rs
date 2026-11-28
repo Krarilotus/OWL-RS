@@ -26,10 +26,13 @@ pub async fn get_graph(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let access = guard::graph_read_access(&state, &authenticated).await?;
-    let (media_type, request) = graph_request(&state, &raw_query, &headers, &access)?;
-    let store = state.store();
     let scope = access.read_scope();
     let reader = Reader::of(&scope);
+    if let Some(response) = reader.refuse_unframed() {
+        return Ok(response);
+    }
+    let (media_type, request) = graph_request(&state, &raw_query, &headers, &access)?;
+    let store = state.store();
     let cancellation = nrese_store::CancellationToken::new();
     let token = cancellation.clone();
     stream_blocking(

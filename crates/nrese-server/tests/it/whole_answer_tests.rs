@@ -1,5 +1,5 @@
-//! Spec: an HTTP/1.0 request gets every streamed answer whole, with its `Content-Length`
-//! (result_stream's "HTTP/1.0"): on every route that streams, the same answer HTTP/1.1 gets.
+//! Spec: an unrestricted HTTP/1.0 read gets its answer whole, with its `Content-Length`.
+//! A restricted HTTP/1.0 result stream is refused before evaluation.
 //! The answer held is charged to the request's memory envelope (`budgets.query_memory`):
 //! past it the request is refused with 413, and what it held is released when it is sent or
 //! refused, or when its client leaves.
@@ -64,6 +64,7 @@ async fn an_http10_answer_is_sent_whole_and_its_memory_released() -> Result<(), 
     let before = held(&store);
     let response = app.oneshot(query_request(Version::HTTP_10)?).await?;
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["nrese-completeness"], "complete");
     assert_eq!(
         response.headers().get(header::CONTENT_LENGTH),
         Some(&WHOLE.into())
@@ -86,12 +87,14 @@ async fn an_http10_answer_past_its_envelope_is_refused_and_its_memory_released()
     let before = held(&store);
     let response = app.oneshot(query_request(Version::HTTP_10)?).await?;
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(!response.headers().contains_key("nrese-completeness"));
     let problem: serde_json::Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await?)?;
     assert_eq!(
         problem["type"],
         "https://nrese.dev/problems/payload-too-large"
     );
+    assert!(problem.get("completeness").is_none(), "{problem}");
     assert_eq!(
         problem["detail"],
         "This answer is larger than the 1 MiB an HTTP/1.0 request can be answered with: \
@@ -299,8 +302,9 @@ impl Ask<'_> {
     }
 
     /// The same request as raw HTTP/1.0 bytes for `host`.
-    fn raw(&self, host: std::net::SocketAddr) -> Vec<u8> {
+    fn raw(&self, host: std::net::SocketAddr, malformed: bool) -> Vec<u8> {
         let (method, accept, body) = match self.query {
+            true if malformed => ("POST", "text/csv", "SELECT ?".to_owned()),
             true => ("POST", "text/csv", query()),
             false => ("GET", "application/n-triples", String::new()),
         };
@@ -315,7 +319,7 @@ impl Ask<'_> {
                 body.len()
             ));
         }
-        head.push_str("\r\n");
+        head.push_str("X-Request-Id: framing-test\r\n\r\n");
         [head.into_bytes(), body.into_bytes()].concat()
     }
 }
@@ -381,101 +385,66 @@ async fn supported_store() -> Result<StoreService, Box<dyn Error>> {
     Ok(store)
 }
 
-/// A response as two responses of one request can be compared: its status, its headers but
-/// those of the exchange (`date`, `x-request-id`), and its body, a problem's without its
-/// `request_id`.
-type Seen = (StatusCode, Vec<(String, Vec<u8>)>, Vec<u8>);
-
-/// What `request` gets, as [`Seen`].
-async fn seen(app: &axum::Router, request: Request<Body>) -> Result<Seen, Box<dyn Error>> {
-    let response = app.clone().oneshot(request).await?;
-    let status = response.status();
-    let headers = response
-        .headers()
-        .iter()
-        .filter(|(name, _)| !matches!(name.as_str(), "date" | "x-request-id"))
-        .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
-        .collect();
-    let mut body = to_bytes(response.into_body(), usize::MAX).await?.to_vec();
-    if let Ok(serde_json::Value::Object(mut problem)) = serde_json::from_slice(&body)
-        && problem.remove("request_id").is_some()
-    {
-        body = serde_json::to_vec(&problem)?;
-    }
-    Ok((status, headers, body))
-}
-
-/// A reader of some graphs' HTTP/1.0 answer is never held whole: on every route (a query, an
-/// EXPLAIN, a Graph Store read, an RDF4J statements read) it streams as it does over HTTP/1.1,
-/// as before the hold. Over a real connection: no `Content-Length` and no chunked coding, so
-/// its end is the connection's close, and the body is the HTTP/1.1 answer's, byte for byte.
+/// A restricted HTTP/1.0 stream has one framed protocol refusal before any query or
+/// authorised view is evaluated. Hidden memory pressure and the route can't change it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_restricted_readers_http10_answer_streams_close_delimited_on_every_route()
--> Result<(), Box<dyn Error>> {
-    let store = supported_store().await?;
-    let reasoner = ReasonerConfig::for_mode(ReasoningMode::Owl2Rl);
-    let app = test_app_with_store(store, policy_of(SUPPORTED)?, reasoner)?;
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let served = app.clone();
-    let server = tokio::spawn(async move { axum::serve(listener, served).await });
-    for (route, ask) in routes(&["nrese.read", "public"], "/dataset/query?explain=plan") {
-        let mut client = TcpStream::connect(addr).await?;
-        client.write_all(&ask.raw(addr)).await?;
-        let mut response = Vec::new();
-        tokio::time::timeout(HANG, client.read_to_end(&mut response)).await??;
-        let split = response
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .ok_or("no head")?;
-        let head = String::from_utf8_lossy(&response[..split]).to_ascii_lowercase();
-        let body = &response[split + 4..];
-        assert!(head.starts_with("http/1.0 200 ok"), "{route}: {head}");
-        assert!(!head.contains("\r\ncontent-length:"), "{route}: {head}");
-        assert!(!head.contains("\r\ntransfer-encoding:"), "{route}: {head}");
-        let streamed = app.clone().oneshot(ask.over(Version::HTTP_11)?).await?;
-        let streamed = to_bytes(streamed.into_body(), usize::MAX).await?;
-        assert!(!body.is_empty(), "{route}");
-        assert_eq!(body, &streamed[..], "{route}: not the HTTP/1.1 answer");
-    }
-    server.abort();
-    Ok(())
-}
-
-/// A reader of some graphs' HTTP/1.0 answer is its HTTP/1.1 answer, status, headers and body,
-/// on every route, alone and while work it can't see holds all but 32 KiB of the memory all
-/// queries share: refused or answered as it is streamed, as before the hold. Its own memory is
-/// 128 KiB, past which the query and its EXPLAIN's run (a 256 KiB result table) are refused.
-/// The store keeps a reader's view of what its graphs support from its first read on, charged
-/// to that shared memory: each route is read once before what it holds is counted.
-#[tokio::test]
-async fn a_restricted_readers_http10_answer_is_its_http11_answer_whatever_the_hidden_load()
+async fn restricted_http10_refuses_before_evaluation_on_every_streamed_route()
 -> Result<(), Box<dyn Error>> {
     let store = supported_store().await?;
     let reasoner = ReasonerConfig::for_mode(ReasoningMode::Owl2Rl);
     let app = test_app_with_store(store.clone(), limited(SUPPORTED, 128 << 10)?, reasoner)?;
-    for (route, ask) in routes(&["nrese.read", "public"], "/dataset/query?explain=true") {
-        seen(&app, ask.over(Version::HTTP_11)?).await?;
-        let before = held(&store);
-        for load in [None, Some(32 << 10)] {
-            let hidden = store.envelope(None);
-            if let Some(room) = load {
-                hidden.charge(SHARED - room - held(&store))?;
-            }
-            let whole = seen(&app, ask.over(Version::HTTP_10)?).await?;
-            released_to(&store, before + hidden.used()).await;
-            let streamed = seen(&app, ask.over(Version::HTTP_11)?).await?;
-            released_to(&store, before + hidden.used()).await;
-            assert_eq!(
-                whole,
-                streamed,
-                "{route}, room {load:?}: {}",
-                String::from_utf8_lossy(&whole.2)
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let before = held(&store);
+    let mut expected = None;
+    for hidden_bytes in [0, SHARED - before] {
+        let hidden = store.envelope(None);
+        hidden.charge(hidden_bytes)?;
+        let routes = routes(&["nrese.read", "public"], "/dataset/query?explain=true");
+        // A version refusal is determined before even trying to prepare the query.
+        let malformed = ("a malformed query", routes[0].1);
+        for ((route, ask), bad_query) in routes
+            .into_iter()
+            .map(|route| (route, false))
+            .chain(std::iter::once((malformed, true)))
+        {
+            let mut client = TcpStream::connect(addr).await?;
+            client.write_all(&ask.raw(addr, bad_query)).await?;
+            let mut response = Vec::new();
+            tokio::time::timeout(HANG, client.read_to_end(&mut response)).await??;
+            let split = response
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .ok_or("no head")?;
+            let head = std::str::from_utf8(&response[..split])?;
+            let body = &response[split + 4..];
+            // The server specifies the protocol it requires (RFC 9110 §§7.8, 15.5.22).
+            assert!(head.starts_with("HTTP/1.0 426 "), "{route}: {head}");
+            let headers = head.to_ascii_lowercase();
+            assert!(headers.contains("\r\nupgrade: http/1.1"), "{head}");
+            assert!(headers.contains("\r\nconnection: upgrade"), "{head}");
+            assert!(
+                head.contains(&format!("\r\ncontent-length: {}", body.len())),
+                "{head}"
             );
-            drop(hidden);
-            released_to(&store, before).await;
+            assert!(!head.contains("nrese-completeness:"), "{head}");
+            assert!(std::str::from_utf8(body)?.contains("HTTP/1.1 or HTTP/2"));
+            let stable_head = head
+                .lines()
+                .filter(|line| !line.starts_with("date:"))
+                .collect::<Vec<_>>()
+                .join("\r\n");
+            let response = (stable_head, body.to_vec());
+            assert_eq!(
+                expected.get_or_insert_with(|| response.clone()),
+                &response,
+                "{route}"
+            );
+            assert_eq!(held(&store), before + hidden.used(), "{route} built a view");
         }
     }
+    server.abort();
     Ok(())
 }
 
@@ -637,6 +606,11 @@ async fn the_same_answer_whole(uri: &str) -> Result<(), Box<dyn Error>> {
     let whole = app.oneshot(get(Version::HTTP_10)?).await?;
     assert_eq!(streamed.status(), StatusCode::OK, "{uri}");
     assert_eq!(whole.status(), StatusCode::OK, "{uri}");
+    assert!(
+        !streamed.headers().contains_key("nrese-completeness"),
+        "{uri}"
+    );
+    assert!(!whole.headers().contains_key("nrese-completeness"), "{uri}");
     let length = whole.headers().get(header::CONTENT_LENGTH).cloned();
     let streamed = to_bytes(streamed.into_body(), usize::MAX).await?;
     let whole = to_bytes(whole.into_body(), usize::MAX).await?;
@@ -742,6 +716,10 @@ async fn an_http10_replication_image_arrives_with_its_length() -> Result<(), Box
             .then(|| value.trim().to_owned())
     });
     assert!(!body.is_empty());
+    assert!(
+        !head.to_ascii_lowercase().contains("nrese-completeness:"),
+        "{head}"
+    );
     assert_eq!(length, Some(body.len().to_string()), "{head}");
     Ok(())
 }

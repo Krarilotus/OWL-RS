@@ -107,7 +107,12 @@ async fn screen(
         .into_response();
     }
     let version = request.version();
-    crate::http::answering(version, next.run(request)).await
+    let head = request.method() == axum::http::Method::HEAD;
+    let mut response = crate::http::answering(version, next.run(request)).await;
+    if head {
+        response.headers_mut().remove(crate::http::COMPLETENESS);
+    }
+    response
 }
 
 #[cfg(test)]

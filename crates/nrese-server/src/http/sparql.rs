@@ -39,6 +39,10 @@ pub async fn execute_query_in(
     accept: Option<&str>,
     pending: Option<nrese_store::StatementsRequest>,
 ) -> Result<Response, ApiError> {
+    let reader = Reader::of(&nrese_store::ReadScope::of(operation.access.clone()));
+    if let Some(response) = reader.refuse_unframed() {
+        return Ok(response);
+    }
     state.ensure_serving()?;
     let policy = state.policy().clone();
     policy.enforce_query_bytes(operation.query.len())?;
@@ -55,7 +59,6 @@ pub async fn execute_query_in(
     }
     let origin = operation.origin.clone();
     let mut request = build_query_request(operation);
-    let reader = Reader::of(&request.scope);
     let memory = policy.limits.max_query_memory_bytes;
     request.memory_limit = (memory > 0).then_some(memory);
     let at = deadline.into_std();
@@ -145,7 +148,7 @@ pub async fn execute_query_in(
     .await?;
     // The run decided the announcement on what its reader reads before its first byte, which
     // `stream_blocking` waits for: the media type is the run's (its place among the headers kept).
-    if explain == Explain::No {
+    if response.status().is_success() && explain == Explain::No {
         let announcement = prepared.media_type();
         let parameters = announcement.find(';').map_or("", |i| &announcement[i..]);
         let media_type = HeaderValue::from_str(&format!("{media_type}{parameters}"))
@@ -153,7 +156,9 @@ pub async fn execute_query_in(
         response.headers_mut().insert(CONTENT_TYPE, media_type);
     }
     let reported = status.lock().unwrap_or_else(|p| p.into_inner()).take();
-    if let Some(value) = reported {
+    if response.status().is_success()
+        && let Some(value) = reported
+    {
         let headers = response.headers_mut();
         headers.insert(COMPLETENESS, value);
         // Readable by a console on another origin too (CORS hides other response headers),

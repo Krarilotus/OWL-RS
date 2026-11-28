@@ -142,6 +142,572 @@ fn reads(store: &StoreService) -> [String; 2] {
     [status(store, READ), status(store, NEGATED)]
 }
 
+/// A value-spelling reason needs a literal in the data read (reasoning-semantics,
+/// status reasons). Compact equality between IRIs doesn't supply one.
+#[test]
+fn distinct_iri_answers_have_no_literal_spelling_reason() {
+    let store = Arc::new(
+        StoreService::new(StoreConfig {
+            equality_compact: true,
+            ql_rewriting: crate::QlRewritingMode::On,
+            ..StoreConfig::in_memory()
+        })
+        .unwrap(),
+    );
+    let writes = pipeline(&store, ReasoningMode::Owl2Rl);
+    commit(&writes, ":x :p :a . :p a owl:ObjectProperty .");
+    commit(&writes, ":a owl:sameAs :b .");
+    let request = SparqlQueryRequest::all(format!(
+        "{PREFIXES} SELECT DISTINCT ?o WHERE {{ :x :p ?o }} ORDER BY ?o"
+    ));
+    let answer = store.execute_query(&request).unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&answer.payload).unwrap();
+    let values: Vec<_> = body["results"]["bindings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["o"]["value"].as_str().unwrap())
+        .collect();
+    assert_eq!(values, ["http://example.com/a", "http://example.com/b"]);
+    let claim = answer.completeness.unwrap();
+    assert!(
+        !claim
+            .reasons
+            .iter()
+            .any(|r| r.text.contains("two spellings")),
+        "{}",
+        claim.header()
+    );
+    assert_eq!(claim.as_str(), "complete");
+}
+
+/// A spelling comparison under DISTINCT must account for a literal alias that
+/// the stored property lacks (reasoning-semantics, values compared by spelling).
+#[test]
+fn a_literal_identity_requires_unchecked_spelling_evidence() {
+    let store = compact_spelling_store(":r owl:sameAs 7 . :s :p :r .");
+    let (values, claim) = spelling_answer(&store, "SELECT DISTINCT ?o { ?s :p ?o }", "o");
+    assert_eq!(values, ["7", "http://example.com/r"]);
+    assert!(
+        claim
+            .header()
+            .contains("literal evidence could not be checked"),
+        "the spelling check must account for a literal identity: {claim:?}"
+    );
+    assert!(!claim.complete, "{claim:?}");
+}
+
+fn compact_spelling_store(data: &str) -> Arc<StoreService> {
+    let store = Arc::new(
+        StoreService::new(StoreConfig {
+            equality_compact: true,
+            ql_rewriting: crate::QlRewritingMode::On,
+            ..StoreConfig::in_memory()
+        })
+        .unwrap(),
+    );
+    let _writes = pipeline(&store, ReasoningMode::Owl2Rl);
+    load(&store, data);
+    store.rematerialise(Ruleset::Owl2Rl).unwrap();
+    store
+}
+
+fn spelling_answer(store: &StoreService, query: &str, var: &str) -> (Vec<String>, crate::Claim) {
+    let answer = store
+        .execute_query_str(&format!("{PREFIXES}{query}"))
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&answer.payload).unwrap();
+    let mut values: Vec<_> = body["results"]["bindings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row[var]["value"].as_str().unwrap().to_owned())
+        .collect();
+    values.sort();
+    (values, answer.completeness.unwrap())
+}
+
+/// Equality can supply a literal in subject position to DISTINCT.
+#[test]
+fn distinct_subjects_account_for_literal_aliases() {
+    let store = compact_spelling_store(":r owl:sameAs 7, 7.0 . :r :p :o .");
+    let (values, claim) = spelling_answer(&store, "SELECT DISTINCT ?s { ?s :p :o }", "s");
+    assert_eq!(values, ["7", "7.0", "http://example.com/r"]);
+    assert!(
+        claim
+            .header()
+            .contains("literal evidence could not be checked"),
+        "a distinct subject can be a literal alias: {claim:?}"
+    );
+}
+
+/// A join compares a shared subject across the rows of both literal-bearing classes.
+#[test]
+fn subject_joins_account_for_literal_aliases() {
+    let store = compact_spelling_store(
+        ":a owl:sameAs 7 ; :p :left ; :q :right .
+         :b owl:sameAs 8 ; :p :left ; :q :right .",
+    );
+    let (values, claim) = spelling_answer(&store, "SELECT ?s { ?s :p :left ; :q :right }", "s");
+    assert_eq!(
+        values,
+        ["7", "8", "http://example.com/a", "http://example.com/b"]
+    );
+    assert!(
+        claim
+            .header()
+            .contains("literal evidence could not be checked"),
+        "a subject join can compare a literal alias: {claim:?}"
+    );
+}
+
+/// The filter compares by value, on either end of an equality-expanded pattern.
+#[test]
+fn filter_only_comparisons_leave_spelling_unmarked() {
+    let store = compact_spelling_store(":r owl:sameAs 7 . :s :p :r . :r :q :x .");
+    for (query, var) in [
+        ("SELECT ?o { :s :p ?o FILTER(?o = 7.0) }", "o"),
+        ("SELECT ?s { ?s :q :x FILTER(?s = 7.0) }", "s"),
+    ] {
+        let (values, claim) = spelling_answer(&store, query, var);
+        assert_eq!(values, ["7"]);
+        let header = claim.header();
+        assert!(
+            !header.contains("literal evidence could not be checked")
+                && !header.contains("two spellings of one value"),
+            "a value-only filter leaves spelling unmarked: {header}"
+        );
+    }
+}
+
+/// The named graph sees the predicate's class under canonical answers.
+#[test]
+fn canonical_named_graph_accounts_for_a_literal_predicate_range() {
+    use nrese_engine::{EncodedQuad, EncodedTriple};
+    use nrese_rdf::{
+        Literal, NamedNodeRef,
+        vocab::{owl, xsd},
+    };
+    for canonical in [false, true] {
+        let store = StoreService::new(StoreConfig {
+            equality_compact: true,
+            equality_canonical_answers: canonical,
+            ..StoreConfig::in_memory()
+        })
+        .unwrap();
+        store.rematerialise(Ruleset::Owl2Rl).unwrap();
+        // Supply a compact version whose only literal statements are in the named graph.
+        let mut tx = store.engine.transaction();
+        let iri = |name| tx.intern(NamedNodeRef::new_unchecked(name).into());
+        let representative = iri("http://example.com/rep");
+        let alias = iri("http://example.com/alias");
+        let subject = iri("http://example.com/s");
+        let graph = iri("http://example.com/g");
+        let same_as = tx.intern(owl::SAME_AS.into());
+        for value in [
+            Literal::new_typed_literal("7", xsd::INTEGER),
+            Literal::new_typed_literal("7.0", xsd::DECIMAL),
+        ] {
+            let object = tx.intern(value.as_ref().into());
+            tx.insert_encoded(EncodedQuad::new(subject, representative, object, graph));
+        }
+        tx.insert_inferred(EncodedTriple {
+            subject: alias,
+            predicate: same_as,
+            object: representative,
+        });
+        tx.read_equality_as(Some(same_as));
+        tx.vouch(tx.base().certificate().unwrap().clone());
+        tx.commit().unwrap();
+        let (values, claim) = spelling_answer(
+            &store,
+            "SELECT DISTINCT ?o { GRAPH ?g { :s :alias ?o } }",
+            "o",
+        );
+        let header = claim.header();
+        assert_eq!(
+            values,
+            if canonical {
+                vec!["7", "7.0"]
+            } else {
+                Vec::new()
+            }
+        );
+        assert_eq!(claim.regime, Some(nrese_sparql::Regime::Owl2Rl));
+        let marked = header.contains("literal evidence could not be checked")
+            || header.contains("two spellings of one value");
+        if canonical {
+            assert!(
+                marked,
+                "the named graph's canonical read needs spelling evidence: {header}"
+            );
+        } else {
+            assert!(
+                !marked,
+                "the named graph's strict read retains its predicate: {header}"
+            );
+        }
+    }
+}
+
+/// A FROM merge with a held named graph does not canonicalise the dataset.
+/// Its IRI-only comparisons keep their status (reasoning-semantics, values compared by spelling).
+#[test]
+fn a_from_merge_with_a_held_named_graph_keeps_its_spelling_status() {
+    let store = Arc::new(
+        StoreService::new(StoreConfig {
+            equality_compact: true,
+            equality_canonical_answers: true,
+            ..StoreConfig::in_memory()
+        })
+        .unwrap(),
+    );
+    let writes = pipeline(&store, ReasoningMode::Owl2Rl);
+    commit(
+        &writes,
+        ":s :p :o . GRAPH :g { :t :p :n . } :left owl:sameAs :right .",
+    );
+    for (named, expected, unchecked) in [
+        (
+            ":g",
+            &["http://example.com/n", "http://example.com/o"][..],
+            false,
+        ),
+        (":missing", &["http://example.com/o"][..], true),
+    ] {
+        let query = format!(
+            "SELECT DISTINCT ?o FROM <urn:x-arq:DefaultGraph> FROM {named} WHERE {{ ?s :p ?o }}"
+        );
+        let (values, claim) = spelling_answer(&store, &query, "o");
+        assert_eq!(values, expected);
+        assert_eq!(claim.regime, Some(nrese_sparql::Regime::Owl2Rl));
+        let header = claim.header();
+        assert_eq!(
+            header.contains("literal evidence could not be checked")
+                || header.contains("two spellings of one value"),
+            unchecked,
+            "a held FROM graph disables the canonical spelling fallback: {named}: {header}"
+        );
+    }
+}
+
+/// Graph scope (reasoning-semantics): changing only hidden axioms can't change a
+/// restricted QL reader's reasons about its own answer.
+#[test]
+fn a_restricted_ql_reason_does_not_report_hidden_equality() {
+    let query = |hidden| {
+        let store = Arc::new(StoreService::new(StoreConfig::in_memory()).unwrap());
+        let writes = pipeline(&store, ReasoningMode::Owl2Ql);
+        commit(
+            &writes,
+            "GRAPH :visible { :A rdfs:subClassOf :B . :x a :A }",
+        );
+        if hidden {
+            commit(&writes, "GRAPH :hidden { :x owl:sameAs :y }");
+        }
+        let mut req = SparqlQueryRequest::all(format!("{PREFIXES} ASK {{ :x a :B }}"));
+        req.scope = crate::ReadScope::of(Some(Arc::new(nrese_sparql::GraphAccess {
+            graphs: vec!["http://example.com/visible".into()],
+            default_graph: true,
+            inferred: true,
+            inferred_by_support: true,
+            ..Default::default()
+        })));
+        let result = store.execute_query(&req).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&result.payload).unwrap();
+        assert_eq!(body["boolean"], true);
+        let claim = result.completeness.unwrap();
+        assert_eq!(result.ql.unwrap().completeness, claim);
+        claim.reasons.clone()
+    };
+    let visible = query(false);
+    assert!(
+        visible
+            .iter()
+            .any(|r| r.text.contains("can't read every graph"))
+    );
+    assert_eq!(query(true), visible);
+}
+
+/// A QL schema hazard depends on the pinned revision (reasoning-semantics, status
+/// reasons). Keeping the deleted predicate's dictionary ID cannot change the answer.
+#[test]
+fn ql_reasons_match_a_fresh_store_after_the_property_axiom_is_deleted() {
+    let query = |historical| {
+        let store = Arc::new(StoreService::new(StoreConfig::in_memory()).unwrap());
+        let writes = pipeline(&store, ReasoningMode::Owl2Ql);
+        commit(&writes, ":i1 owl:sameAs :i0 .");
+        if historical {
+            commit(&writes, ":p1 rdfs:subPropertyOf :p0 .");
+            writes
+                .execute_update_str(&format!(
+                    "{PREFIXES} DELETE DATA {{ :p1 rdfs:subPropertyOf :p0 }}"
+                ))
+                .unwrap();
+        }
+        let answer = store
+            .execute_query(&SparqlQueryRequest::all(format!(
+                "{PREFIXES} SELECT ?x ?o WHERE {{ ?x :p0 ?o }}"
+            )))
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&answer.payload).unwrap();
+        assert_eq!(body["results"]["bindings"], serde_json::json!([]));
+        let claim = answer.completeness.unwrap();
+        (claim.as_str(), claim.reasons.clone())
+    };
+    assert_eq!(query(true), query(false));
+}
+
+/// A published clash is part of the read's claim even when its completeness was
+/// already lowered (reasoning-semantics, consistency).
+#[test]
+fn a_query_on_an_inconsistent_ql_publication_reports_the_clash() {
+    let store = StoreService::new(StoreConfig::in_memory()).unwrap();
+    load(&store, ":A owl:disjointWith :B . :a a :A, :B .");
+    store
+        .rematerialise(
+            ReasonerConfig::for_mode(ReasoningMode::Owl2Ql)
+                .materialised_program()
+                .unwrap(),
+        )
+        .unwrap();
+    assert!(matches!(
+        store.consistency(),
+        crate::ConsistencyStatus::Inconsistent { .. }
+    ));
+    let result = store
+        .execute_query(&SparqlQueryRequest::all(format!(
+            "{PREFIXES} SELECT ?t WHERE {{ :a a ?t }}"
+        )))
+        .unwrap();
+    let claim = result.completeness.unwrap();
+    assert_eq!(claim.as_str(), "sound-only");
+    assert!(matches!(
+        claim.consistency(),
+        crate::ConsistencyStatus::Inconsistent { .. }
+    ));
+    assert!(claim.reasons.iter().any(|r| r.text.contains("quarantine")));
+}
+
+/// A complete service decision can report a clash without saying the service result
+/// is incomplete (read contract, consistency independent of coverage).
+#[test]
+fn complete_services_report_quarantine_without_lowering_language() {
+    use crate::ReadScope;
+    use crate::dl::{Verdict, entailment::Entailed};
+    use crate::reasoning::JustificationMode;
+    use nrese_rdf::NamedNode;
+
+    let (store, _) = certificate_record_tests::quarantined(StoreConfig::in_memory());
+    let snapshot = store.engine.snapshot();
+    let subject = NamedNode::new("http://example.org/x").unwrap();
+    let class = NamedNode::new("http://example.org/A").unwrap();
+    let rules = ReasonerConfig::for_mode(ReasoningMode::Owl2Rl)
+        .materialised_program()
+        .unwrap();
+    let justification = store
+        .justify_statement(
+            rules,
+            &ReadScope::All,
+            [
+                subject.as_ref().into(),
+                nrese_rdf::vocab::rdf::TYPE.into(),
+                class.as_ref().into(),
+            ],
+            JustificationMode::One,
+        )
+        .unwrap()
+        .unwrap();
+    let claims = [
+        (
+            "classification",
+            store.classify(&ReadScope::All).unwrap().claim,
+        ),
+        ("realisation", store.realise(&ReadScope::All).unwrap().claim),
+        ("rules justification", justification.claim),
+        (
+            "rules entailment",
+            store.assess(
+                Revision::Committed(&snapshot),
+                super::Evidence::RulesEntailment(super::RulesEntailment::InconsistentPremise),
+            ),
+        ),
+        (
+            "DL entailment",
+            store.assess(
+                Revision::Committed(&snapshot),
+                super::Evidence::DlEntailment {
+                    premise: Verdict::Inconsistent,
+                    answer: &Entailed::Yes,
+                },
+            ),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (route, claim) in claims {
+        assert_eq!(claim.as_str(), "complete", "{route}: {claim:?}");
+        let reason = claim.consistency_reason().expect("clash or hold");
+        if reason.contains("no read is certified complete") {
+            wrong.push((route, reason.to_owned()));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Where certification is withheld, the publication's quarantine is still reported.
+#[test]
+fn a_restricted_read_keeps_the_quarantine_reason_when_not_certified() {
+    let (store, _) = certificate_record_tests::quarantined(StoreConfig {
+        equality_compact: true,
+        ..StoreConfig::in_memory()
+    });
+    let request = SparqlQueryRequest::new(
+        "ASK { <http://example.org/x> a <http://example.org/A> }",
+        crate::ReadScope::Graphs(Arc::new(nrese_sparql::GraphAccess {
+            default_graph: true,
+            inferred: true,
+            ..Default::default()
+        })),
+    );
+    let claim = store.execute_query(&request).unwrap().completeness.unwrap();
+    let header = claim.header();
+    assert!(
+        header.starts_with("not-certified; reasons=\"consistency: "),
+        "{header}"
+    );
+    assert!(header.contains("quarantine"), "{header}");
+}
+
+/// A missing evidence source lowers coverage without asserting that it found a literal.
+#[test]
+fn unchecked_spelling_evidence_lowers_a_value_comparison() {
+    let prepared = crate::PreparedQuery::parse(&SparqlQueryRequest::all(
+        "SELECT DISTINCT ?o { <urn:s> <urn:p> ?o }",
+    ))
+    .unwrap();
+    let mut status = nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Rl);
+    crate::dl::query::certify_closure(&mut status, prepared.reads(), "rules", None, false);
+    let header = status.header();
+    assert!(
+        header.contains("literal evidence could not be checked"),
+        "{header}"
+    );
+    assert!(!header.contains("two spellings of one value"), "{header}");
+}
+
+/// A printed query also applies the operator rule when quarantine can leave rows missing.
+#[test]
+fn a_printed_negation_on_a_quarantined_store_is_unsound() {
+    let (store, _) = certificate_record_tests::quarantined(StoreConfig::in_memory());
+    let snapshot = store.engine.snapshot();
+    let query = nrese_sparql::compat::parse_query(
+        "SELECT ?s { ?s a <http://example.org/A> FILTER NOT EXISTS { ?s a <http://example.org/C> } }",
+        None,
+    ).unwrap();
+    let claim = store.assess(
+        Revision::Committed(&snapshot),
+        super::Evidence::Printed {
+            query: &query,
+            status: nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Rl),
+        },
+    );
+    assert_eq!(claim.as_str(), "unsound", "{claim:?}");
+    assert!(
+        claim.header().contains("over answers that may be missing"),
+        "{claim:?}"
+    );
+}
+
+/// The header's reason cap never hides a known clash behind reasons about the query.
+#[test]
+fn the_reason_cap_keeps_the_publications_clash() {
+    let (store, _) = certificate_record_tests::quarantined(StoreConfig::in_memory());
+    let snapshot = store.engine.snapshot();
+    let mut status = nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Rl);
+    for i in 0..10 {
+        status.incomplete("query", format!("branch {i} is incomplete"));
+    }
+    let claim = store.assess(
+        Revision::Committed(&snapshot),
+        super::Evidence::Service {
+            status,
+            verdict: None,
+        },
+    );
+    assert!(claim.header().contains("quarantine"), "{}", claim.header());
+    assert!(
+        claim.header().contains("more"),
+        "the fixture reached the cap"
+    );
+}
+
+/// The pinned publication, not the withheld view or a later mode switch, decides the
+/// route for the same query, its explanation, and its plan.
+#[test]
+fn a_withheld_view_keeps_its_committed_bases_dl_route() {
+    let store = Arc::new(StoreService::new(StoreConfig::in_memory()).unwrap());
+    let request = SparqlQueryRequest::all("ASK { <urn:a> <urn:p> <urn:b> }");
+    let prepared = store.prepare_query(&request).unwrap();
+    let arm = || {
+        store.use_dl(true, false);
+        let switcher = Arc::clone(&store);
+        hooks::QUERY_VIEW.set(Some(Box::new(move |base| {
+            let view = base
+                .with_inferred_mask(
+                    &nrese_engine::InferredMask::default(),
+                    false,
+                    &Arc::new(nrese_exec::Budget::unlimited()),
+                )
+                .unwrap()
+                .unwrap();
+            switcher.use_dl(false, false);
+            assert!(super::Certificate::route(base, switcher.dl()).0);
+            assert!(!super::Certificate::route(&view, switcher.dl()).0);
+            view
+        })));
+    };
+    arm();
+    let run = store.execute_query(&request).unwrap();
+    assert_eq!(
+        run.completeness.map(|c| c.as_str()),
+        Some("not-certified"),
+        "execute"
+    );
+    arm();
+    let explained = store
+        .explain_query(&prepared, &CancellationToken::new())
+        .unwrap();
+    assert_eq!(
+        explained.completeness.unwrap().as_str(),
+        "not-certified",
+        "EXPLAIN"
+    );
+    arm();
+    let planned = store
+        .plan_query(&prepared, &CancellationToken::new())
+        .unwrap();
+    assert_eq!(
+        planned.completeness.unwrap().as_str(),
+        "not-certified",
+        "plan"
+    );
+
+    store.use_reasoning_rules(
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl).materialised_program(),
+    );
+    arm();
+    let mut request = request;
+    request.read_model = Some(nrese_engine::ReadModel::Inferred);
+    request.dl_answers = Some(crate::DlAnswers::Exact);
+    assert!(
+        matches!(
+            store.execute_query(&request),
+            Err(crate::StoreError::Incomplete(_))
+        ),
+        "exact"
+    );
+}
+
 /// Whether `header` is OWL 2 RL's closure status for [`READ`].
 fn owl2_rl(header: &str) -> bool {
     header.starts_with("sound-only; regime=owl2-rl")
@@ -926,7 +1492,7 @@ fn a_store_leaving_quarantine_is_not_complete_until_revalidated_then_as_clean_da
     clean.rematerialise(rules()).expect("rebuilt");
     let clean = status(&clean, IN_H);
     let (revision, quarantined, during) = kept.lock().unwrap().take().expect("the hook ran");
-    let told = "sound-only; regime=owl2-dl; reasons=\"dl: the store is in quarantine (the \
+    let told = "sound-only; regime=owl2-dl; reasons=\"consistency: the store is in quarantine (the \
                 consistency rules found violations and have not found the data clean since), and \
                 as inconsistent data entail every answer, no read is certified complete until it \
                 leaves\"";

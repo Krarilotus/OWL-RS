@@ -228,7 +228,8 @@ fn a_commit_in_quarantine_records_no_verdict_and_reads_stay_told_inconsistent() 
 /// Spec: an ill-typed literal under a range is a clash the rules find (dt-not-type), and the
 /// full check has no value for it (`dl/datatypes.rs`): a read is told the consistency isn't
 /// known, never `complete` on the rules' claim; and, as OWL 2 admits no ill-typed literal, that
-/// the store holds one (it::ill_typed_literal_status_tests), and nothing else.
+/// the store holds one (it::ill_typed_literal_status_tests). The quarantine is disclosed
+/// independently of the DL verdict.
 #[test]
 fn an_ill_typed_literal_in_quarantine_is_told_its_consistency_is_not_known() {
     let dl = quarantined(
@@ -240,9 +241,11 @@ fn an_ill_typed_literal_in_quarantine_is_told_its_consistency_is_not_known() {
     let reasons = status.reasons();
     assert_eq!(header.split(';').next(), Some("sound-only"), "{header}");
     assert!(
-        reasons.len() == 2
+        reasons.len() == 3
             && reasons[0].starts_with("the data's consistency under OWL 2 DL isn't known (")
-            && reasons[1].contains("ill-typed"),
+            && reasons[1]
+                == "the store is in quarantine after the materialisation rules found consistency violations"
+            && reasons[2].contains("ill-typed"),
         "{header}"
     );
     assert!(rows.is_empty(), "{rows:?}");

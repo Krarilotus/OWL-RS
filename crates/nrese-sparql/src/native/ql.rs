@@ -19,7 +19,8 @@ use nrese_engine::{GraphSelector, QuadPattern, Snapshot, TermId};
 use nrese_owl::ObjProp;
 use nrese_owl::diagnostics::reserved_vocabulary;
 use nrese_owl::ql::{
-    Atom, Basic, Branch, Budget, Cq, Limits, Outcome, Part, Probe, QTerm, Tbox, rewrite_with,
+    Atom, Basic, Branch, Budget, Cq, Hazard, Limits, Outcome, Part, Probe, QTerm, Tbox,
+    rewrite_with,
 };
 use nrese_rdf::{Literal, NamedNode, Term, Variable};
 use nrese_sparql_syntax::algebra::{Expression, Function, GraphPattern};
@@ -856,7 +857,8 @@ impl Rewriter<'_> {
         let snapshot = self.snapshot;
         let rewritten = |n: &NamedNode| {
             let id = snapshot.lookup(n.as_ref().into()).map(TermId::raw);
-            id.is_some_and(|t| tbox.rewrites_term(t) || tbox.concern(t).is_some())
+            matches!(tbox.global_hazard(), Some(Hazard::Equating))
+                || id.is_some_and(|t| tbox.rewrites_term(t) || tbox.concern(t).is_some())
         };
         let mut hit: Option<String> = None;
         let mut look = |n: Node<'_>| {
@@ -952,7 +954,13 @@ impl Rewriter<'_> {
             let predicate = match &triple.predicate {
                 NamedNodePattern::NamedNode(p) if super::search::names_search(p.as_str()) => None,
                 NamedNodePattern::NamedNode(p) => {
-                    self.snapshot.lookup(p.as_ref().into()).map(TermId::raw)
+                    // Equality can affect answers on any property, including one
+                    // with no dictionary id in this version.
+                    if matches!(self.tbox.global_hazard(), Some(Hazard::Equating)) {
+                        Some(self.constant(Term::NamedNode(p.clone())))
+                    } else {
+                        self.snapshot.lookup(p.as_ref().into()).map(TermId::raw)
+                    }
                 }
                 NamedNodePattern::Variable(_) => None,
             };

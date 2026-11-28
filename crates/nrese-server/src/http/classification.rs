@@ -48,11 +48,25 @@ fn verdict_json(consistency: &Verdict) -> (serde_json::Value, &'static str) {
 
 /// What the N-Triples form starts with: for an inconsistency, its one statement (every
 /// class is below `owl:Nothing`; the report lists nothing else).
-fn triples_head(consistency: &Verdict) -> String {
-    match consistency {
+fn triples_head(claim: &nrese_store::Claim) -> String {
+    let mut text = match claim.dl_verdict().expect("DL assessment") {
         Verdict::Inconsistent => format!("<{THING}> <{SUB_CLASS_OF}> <{NOTHING}> .\n"),
         _ => String::new(),
+    };
+    if let Some(reason) = claim.consistency_reason() {
+        text.push_str(&format!("# {reason}\n"));
     }
+    text
+}
+
+fn incomplete_reasons(claim: &nrese_store::Claim) -> Vec<&str> {
+    let consistency = claim.consistency_reason();
+    claim
+        .reasons
+        .iter()
+        .map(|reason| reason.text.as_str())
+        .filter(|reason| Some(*reason) != consistency)
+        .collect()
 }
 
 /// Whether the client asked for N-Triples.
@@ -138,7 +152,7 @@ pub async fn classify(
             .outside
             .as_ref()
             .map_or_else(String::new, outside_comment);
-        text.push_str(&triples_head(verdict));
+        text.push_str(&triples_head(status));
         for (sub, sup) in &report.subsumptions {
             text.push_str(&format!("<{sub}> <{SUB_CLASS_OF}> <{sup}> .\n"));
         }
@@ -154,7 +168,7 @@ pub async fn classify(
         "profile": "OWL 2 DL",
         "engine": report.engine,
         "complete": status.complete,
-        "incomplete": status.reasons.iter().map(|reason| &reason.text).collect::<Vec<_>>(),
+        "incomplete": incomplete_reasons(status),
         "consistent": consistent,
         "consistency": consistency,
         "micros": report.micros,
@@ -189,7 +203,7 @@ pub async fn realise(
     if wants_triples(headers) {
         #[cfg(test)]
         tests::built(true);
-        let mut text = triples_head(verdict);
+        let mut text = triples_head(status);
         for (individual, types) in &report.types {
             for class in types {
                 text.push_str(&format!("<{individual}> <{RDF_TYPE}> <{class}> .\n"));
@@ -209,7 +223,7 @@ pub async fn realise(
         "profile": "OWL 2 DL",
         "engine": report.engine,
         "complete": status.complete,
-        "incomplete": status.reasons.iter().map(|reason| &reason.text).collect::<Vec<_>>(),
+        "incomplete": incomplete_reasons(status),
         "consistent": consistent,
         "consistency": consistency,
         "micros": report.micros,

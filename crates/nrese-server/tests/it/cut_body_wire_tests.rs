@@ -402,6 +402,7 @@ async fn http10_head_has_the_length_and_no_body() -> Result<(), Box<dyn Error>> 
         );
         assert!(end.is_ok());
         assert!(body.is_empty());
+        assert_eq!(header(&head, "nrese-completeness"), None);
         Ok(())
     })
     .await?
@@ -419,6 +420,7 @@ async fn chunked_cut(close: bool) -> Result<(), Box<dyn Error>> {
     let server = RunningServer::start().await?;
     let (mut client, head) = http1_query(server.addr, "HTTP/1.1", false, close).await?;
     assert_eq!(header(&head, "transfer-encoding"), Some("chunked"));
+    assert_eq!(header(&head, "nrese-completeness"), Some("complete"));
     let mut body = Vec::new();
     for _ in 0..PREFIX_FRAMES {
         assert!(!read_chunk(&mut client, &mut body).await?);
@@ -458,6 +460,7 @@ async fn http11_head_has_no_body_and_no_framing() -> Result<(), Box<dyn Error>> 
         assert_eq!(header(&head, "transfer-encoding"), None, "{head:?}");
         assert!(end.is_ok());
         assert!(body.is_empty());
+        assert_eq!(header(&head, "nrese-completeness"), None);
         Ok(())
     })
     .await?
@@ -494,6 +497,7 @@ async fn http2_cut_resets_the_stream() -> Result<(), Box<dyn Error>> {
         let response = response.await?;
         assert_eq!(response.status(), StatusCode::OK);
         let (head, mut body) = response.into_parts();
+        assert_eq!(head.headers["nrese-completeness"], "complete");
         let mut received = 0;
         while received < PREFIX {
             let data = body
@@ -546,6 +550,7 @@ async fn http2_head_ends_the_stream_without_data() -> Result<(), Box<dyn Error>>
         connection.abort();
         eprintln!("{:?} {:?}; end {end:?}", head.status, head.headers);
         assert!(end.is_none(), "a HEAD answer's stream ends without data");
+        assert!(!head.headers.contains_key("nrese-completeness"));
         Ok(())
     })
     .await?

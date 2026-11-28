@@ -11,8 +11,8 @@
 //!   the producer ended is kept beside the channel ([`Outcome`]), not sent through it: a
 //!   failure that comes while the channel is full (a client that stopped reading) can't be
 //!   lost, and the body ends cleanly only after a producer that finished.
-//! - **Trailers.** A producer may end with trailer fields ([`ChannelWriter::trailers`]),
-//!   sent after the body: what is known only once all of it is written (a checksum).
+//! - **Trailers.** A producer may stage trailer fields ([`ChannelWriter::trailers`]).
+//!   They go out after the producer and the final data write have succeeded.
 //! - **Time ([`Pace`]).** A computation deadline for the whole stream (a query's timeout),
 //!   or a deadline for the first chunk and then a bound on each chunk's stall (reads of
 //!   stored statements, the export): a client that keeps reading is never cut off, one that
@@ -32,9 +32,7 @@
 //!   the first one for all of it, a stall bound's too. Sent, each frame must be taken
 //!   within a stall bound (the read's own, or a query's time) or what is left is let go
 //!   and the body ends short of its length ([`Held`]): a client that stops reading keeps
-//!   no answer charged. Only a reader of every graph's answer is held: a reader of some
-//!   graphs' streams over HTTP/1.0 as over HTTP/1.1, its end the connection's close, so a cut
-//!   answer can look whole to it ([`Reader::Restricted`]).
+//!   no answer charged. A reader of some graphs uses HTTP/1.1 or HTTP/2 for result streams.
 
 use std::collections::VecDeque;
 use std::io;
@@ -92,16 +90,14 @@ pub const MAX_BUFFERED_OUTPUT_BYTES: usize = (CHANNEL_CHUNKS + 3) * CHUNK_BYTES;
 
 type Message = Frame<Bytes>;
 
-/// Whose answer it is, which decides whether it may be held whole.
+/// Whose result stream it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reader {
     /// A reader of every graph: over HTTP/1.0 its answer is held whole, and a memory refusal
     /// of it tells which limit refused it, its own (413, the query's or the HTTP/1.0
     /// answer's) or the memory all queries share (503).
     Every,
-    /// A reader of some graphs: its answer streams over HTTP/1.0 too. Held whole, which of its
-    /// limits refused it first would depend on what else holds the memory all queries share,
-    /// work it may not see.
+    /// A reader of some graphs. Refused on HTTP/1.0 before any evaluation.
     Restricted,
 }
 
@@ -112,6 +108,26 @@ impl Reader {
             true => Self::Every,
             false => Self::Restricted,
         }
+    }
+
+    /// Check the protocol using only the grant, before opening or preparing a read.
+    pub fn refuse_unframed(self) -> Option<Response> {
+        (self == Self::Restricted && WHOLE.try_with(|whole| *whole).unwrap_or(false)).then(|| {
+            let status = StatusCode::UPGRADE_REQUIRED;
+            let mut response = crate::error::problem(
+                status,
+                &serde_json::json!({
+                    "type": "https://nrese.dev/problems/upgrade-required",
+                    "title": "Upgrade Required",
+                    "status": status.as_u16(),
+                    "detail": "Use HTTP/1.1 or HTTP/2 for restricted result streams."
+                }),
+            );
+            let headers = response.headers_mut();
+            headers.insert(header::UPGRADE, HeaderValue::from_static("HTTP/1.1"));
+            headers.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
+            response
+        })
     }
 }
 
@@ -225,6 +241,7 @@ impl Pace {
 pub struct ChannelWriter {
     sender: mpsc::Sender<Message>,
     buffer: Vec<u8>,
+    trailers: Option<HeaderMap>,
     pace: Pace,
     start: Arc<Start>,
     runtime: tokio::runtime::Handle,
@@ -276,10 +293,17 @@ impl ChannelWriter {
         }
     }
 
-    /// Ends the body with `trailers`, sent after everything written so far.
-    pub fn trailers(&mut self, trailers: HeaderMap) -> io::Result<()> {
+    /// Stages the terminal fields until the producer has succeeded.
+    pub fn trailers(&mut self, trailers: HeaderMap) {
+        self.trailers = Some(trailers);
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
         io::Write::flush(self)?;
-        self.send(Frame::trailers(trailers))
+        if let Some(trailers) = self.trailers.take() {
+            self.send(Frame::trailers(trailers))?;
+        }
+        Ok(())
     }
 }
 
@@ -321,8 +345,8 @@ impl Drop for CancelOnDrop {
 
 /// Runs `produce` on a blocking thread and streams what it writes as the response body,
 /// within `pace`; or, for a reader of every graph over HTTP/1.0, holds it whole, charged to
-/// the envelope `memory` opens, which `produce` is handed as [`ChannelWriter::holding`]. A
-/// reader of some graphs' answer always streams ([`Reader`]). `produce` must honour
+/// the envelope `memory` opens, which `produce` is handed as [`ChannelWriter::holding`].
+/// A reader of some graphs' accepted answer streams. `produce` must honour
 /// `cancellation`.
 pub async fn stream_blocking(
     pace: Pace,
@@ -333,9 +357,12 @@ pub async fn stream_blocking(
     timeout_message: &'static str,
     produce: impl FnOnce(&mut ChannelWriter) -> Result<(), ApiError> + Send + 'static,
 ) -> Result<Response, ApiError> {
+    if let Some(response) = reader.refuse_unframed() {
+        return Ok(response);
+    }
     // Set for every request of the server's router (`app::screen`), which is reached only
     // through `build_app`; unset only for a handler a test calls without it, which streams.
-    let whole = reader == Reader::Every && WHOLE.try_with(|whole| *whole).unwrap_or(false);
+    let whole = WHOLE.try_with(|whole| *whole).unwrap_or(false);
     // How long an answer held whole waits for its client to take each frame: a stall
     // bound's own, or the time a query was given.
     let stall = match pace {
@@ -350,6 +377,7 @@ pub async fn stream_blocking(
     let mut writer = ChannelWriter {
         sender,
         buffer: Vec::with_capacity(CHUNK_BYTES),
+        trailers: None,
         pace,
         start: Arc::clone(&start),
         runtime: tokio::runtime::Handle::current(),
@@ -358,7 +386,9 @@ pub async fn stream_blocking(
     let ended = Arc::clone(&outcome);
     tokio::task::spawn_blocking(move || {
         let result = produce(&mut writer).and_then(|()| {
-            io::Write::flush(&mut writer).map_err(|error| ApiError::internal(error.to_string()))
+            writer
+                .finish()
+                .map_err(|error| ApiError::internal(error.to_string()))
         });
         // Recorded before the sender goes (with `writer`): the receiver reads it once the
         // channel closes, however full the channel was.
@@ -741,6 +771,70 @@ mod tests {
             sizes,
             vec![CHUNK_BYTES, CHUNK_BYTES, CHUNK_BYTES, 8 * 1024 + 5]
         );
+    }
+
+    /// Framing can end with a trailer only after the producer succeeds.
+    #[tokio::test]
+    async fn a_late_error_precedes_the_terminal_trailer() {
+        use http_body_util::BodyExt;
+
+        for (version, reader) in [
+            (Version::HTTP_11, Reader::Every),
+            (Version::HTTP_11, Reader::Restricted),
+            (Version::HTTP_2, Reader::Every),
+            (Version::HTTP_2, Reader::Restricted),
+            (Version::HTTP_10, Reader::Every),
+        ] {
+            for succeeds in [false, true] {
+                let response = answering(
+                    version,
+                    stream_blocking(
+                        Pace::Total(Instant::now() + Duration::from_secs(30)),
+                        CancellationToken::new(),
+                        Envelope::unlimited,
+                        reader,
+                        "text/plain",
+                        "timeout",
+                        move |writer| {
+                            io::Write::write_all(writer, &vec![b'x'; CHUNK_BYTES])
+                                .map_err(|error| ApiError::internal(error.to_string()))?;
+                            let mut trailers = HeaderMap::new();
+                            trailers.insert("x-result-checksum", HeaderValue::from_static("check"));
+                            writer.trailers(trailers);
+                            if succeeds {
+                                Ok(())
+                            } else {
+                                Err(ApiError::internal("producer failed"))
+                            }
+                        },
+                    ),
+                )
+                .await;
+                if version == Version::HTTP_10 && !succeeds {
+                    assert_eq!(
+                        response.unwrap_err().into_response().status(),
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    );
+                    continue;
+                }
+                let mut body = response.unwrap().into_body();
+                let data = body.frame().await.unwrap().unwrap().into_data().unwrap();
+                assert_eq!(data.len(), CHUNK_BYTES);
+                let terminal = body.frame().await;
+                if succeeds {
+                    assert_eq!(
+                        terminal.unwrap().unwrap().into_trailers().unwrap()["x-result-checksum"],
+                        "check"
+                    );
+                } else {
+                    assert!(
+                        terminal.is_some_and(|frame| frame.is_err()),
+                        "{version:?}: failure was framed as success"
+                    );
+                }
+                assert!(body.frame().await.is_none());
+            }
+        }
     }
 
     /// On tokio's paused clock: the deadline passes when the test advances the clock, and
@@ -1630,11 +1724,10 @@ mod tests {
         }
     }
 
-    /// Over HTTP/1.0, a reader of some graphs' answer is never held: no envelope is opened
-    /// for it, its producer is handed none, and it streams (no exact length), as over
-    /// HTTP/1.1.
+    /// The shared delivery path refuses a restricted HTTP/1.0 stream before it can
+    /// open a memory envelope or start the producer.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_restricted_readers_http10_answer_streams() {
+    async fn a_restricted_http10_stream_does_not_start_its_producer() {
         let response = WHOLE
             .scope(
                 true,
@@ -1645,20 +1738,12 @@ mod tests {
                     Reader::Restricted,
                     "text/plain",
                     "timeout",
-                    |writer| {
-                        assert!(writer.holding().is_none(), "the producer holds its answer");
-                        io::Write::write_all(writer, &vec![b'x'; 2 * CHUNK_BYTES])
-                            .map_err(|error| ApiError::internal(error.to_string()))
-                    },
+                    |_| panic!("a restricted HTTP/1.0 producer started"),
                 ),
             )
             .await
-            .expect("an answer");
-        assert_eq!(http_body::Body::size_hint(response.body()).exact(), None);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(body.len(), 2 * CHUNK_BYTES);
+            .expect("the version refusal");
+        assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
     }
 
     /// Over HTTP/1.0, a refusal of a producer's work carries the cause the budget judged at

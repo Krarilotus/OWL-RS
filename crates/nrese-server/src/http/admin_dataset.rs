@@ -57,8 +57,8 @@ pub async fn backup(state: AppState) -> Result<Response, ApiError> {
             let checksum = written.map_err(map_backup_error)?;
             let mut trailers = HeaderMap::new();
             insert_header(&mut trailers, CHECKSUM_HEADER, &checksum)?;
-            out.trailers(trailers)
-                .map_err(|error| ApiError::internal(error.to_string()))
+            out.trailers(trailers);
+            Ok(())
         },
     )
     .await?;

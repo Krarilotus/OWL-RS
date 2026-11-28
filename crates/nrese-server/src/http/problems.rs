@@ -45,9 +45,11 @@ pub(crate) async fn problems(method: Method, response: Response) -> Response {
     if own
         && documented
         && let Some(bytes) = &bytes
-        && let Some(body) = with_request_id(bytes, id.as_deref())
+        && let Some((body, len)) = with_request_id(bytes, id.as_deref())
     {
-        parts.headers.remove(header::CONTENT_LENGTH);
+        parts
+            .headers
+            .insert(header::CONTENT_LENGTH, HeaderValue::from(len));
         parts.headers.remove(header::CONTENT_ENCODING);
         return Response::from_parts(parts, body);
     }
@@ -76,21 +78,26 @@ pub(crate) async fn problems(method: Method, response: Response) -> Response {
 /// `document`, a JSON object as [`problem`] writes it, with `"request_id"` as its last
 /// member, as a body of two chunks: the document's bytes up to its closing brace (shared,
 /// not copied) and the member. `None` if it isn't an object's text.
-fn with_request_id(document: &axum::body::Bytes, id: Option<&str>) -> Option<axum::body::Body> {
+fn with_request_id(
+    document: &axum::body::Bytes,
+    id: Option<&str>,
+) -> Option<(axum::body::Body, usize)> {
     let (Some(b'{'), Some(b'}')) = (document.first(), document.last()) else {
         return None;
     };
     let Some(id) = id else {
-        return Some(axum::body::Body::from(document.clone()));
+        return Some((axum::body::Body::from(document.clone()), document.len()));
     };
     let id = serde_json::to_string(id).ok()?;
     let empty = document.len() == 2;
     let tail = format!("{}\"request_id\":{id}}}", if empty { "" } else { "," });
     let head = document.slice(..document.len() - 1);
+    let len = head.len() + tail.len();
     let chunks = [head, axum::body::Bytes::from(tail)].map(Ok::<_, std::convert::Infallible>);
-    Some(axum::body::Body::from_stream(futures_util::stream::iter(
-        chunks,
-    )))
+    Some((
+        axum::body::Body::from_stream(futures_util::stream::iter(chunks)),
+        len,
+    ))
 }
 
 /// The document for a plain answer: the status's kind, its text as the detail.
@@ -228,6 +235,20 @@ mod tests {
         let expected = OWN_AS_WRITTEN.replace("\"x\"}", "\"x\",\"request_id\":\"req-1\"}");
         assert_eq!(String::from_utf8_lossy(&bytes), expected);
         assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    /// An HTTP/1.0 client must be able to detect a cut in the problem with its request id.
+    #[tokio::test]
+    async fn the_request_id_preserves_framing_of_a_problem_document() {
+        let response = respond(app(), Method::GET, "/own-as-written").await;
+        let length = response.headers().get(header::CONTENT_LENGTH).cloned();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            length.unwrap().to_str().unwrap().parse::<usize>().unwrap(),
+            bytes.len()
+        );
     }
 
     /// `len` bytes of text, as a refusal that quotes long values has.

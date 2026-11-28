@@ -312,7 +312,7 @@ fn cancellation_takes_precedence_over_partial_answers_and_incompleteness() {
             mode,
         )
         .unwrap();
-        assert!(matches!(outcome, Outcome::Stream(ref status, _, _) if !status.complete));
+        assert!(matches!(outcome, Outcome::Stream((ref status, _), _, _) if !status.complete));
         token.cancel();
         assert!(matches!(
             answer(
@@ -2430,7 +2430,8 @@ fn a_read_whose_deadline_has_passed_gives_the_labels_no_time() {
             DlAnswers::default(),
         )
         .unwrap();
-        let (Outcome::Stream(status, _, detail) | Outcome::Answers(_, status, detail)) = outcome;
+        let (Outcome::Stream((status, _), _, detail) | Outcome::Answers(_, (status, _), detail)) =
+            outcome;
         println!("labels {model_labels}: {status:?} {detail:?}");
         (status, detail)
     };
