@@ -206,6 +206,18 @@ impl Engine {
         expected: &LogExpectation,
         stop: &nrese_exec::stop::StopSource,
     ) -> EngineResult<Applied> {
+        self.apply_log_with_certificate(frames, expected, stop, || None)
+    }
+
+    /// Like [`Self::apply_log`], attaching a certificate to each new publication. The
+    /// factory runs once per record under the writer slot, after the stop check.
+    pub fn apply_log_with_certificate(
+        &self,
+        frames: &[u8],
+        expected: &LogExpectation,
+        stop: &nrese_exec::stop::StopSource,
+        mut certificate: impl FnMut() -> Option<super::Certificate>,
+    ) -> EngineResult<Applied> {
         let _slot = super::admit(&self.inner.writer, "writer")?;
         let shared = &self.inner.shared;
         // Asked once for every answer: an empty or all-skipped one publishes no record, so no
@@ -241,7 +253,7 @@ impl Engine {
             }
             // Within u64: `checked_batch` refused any range that isn't.
             published = published.max(record.dictionary_start + record.keys.len() as u64);
-            self.apply_record(record, published)?;
+            self.apply_record(record, published, certificate())?;
             applied.revision = record.revision;
         }
         Ok(applied)
@@ -342,7 +354,12 @@ impl Engine {
 
     /// One record as a commit, its dictionary entries already restored and the dictionary
     /// published at `dictionary_len` entries (the writer slot held).
-    fn apply_record(&self, record: &CommitRecord, dictionary_len: u64) -> EngineResult<()> {
+    fn apply_record(
+        &self,
+        record: &CommitRecord,
+        dictionary_len: u64,
+        certificate: Option<super::Certificate>,
+    ) -> EngineResult<()> {
         let shared = &self.inner.shared;
         // Equality classes are found again where `sameAs` statements changed. The record is
         // read as the replica's installed stack is: the records don't carry the primary's
@@ -368,7 +385,7 @@ impl Engine {
                 dictionary_len,
                 regroup,
                 same_as,
-                None,
+                certificate,
                 None,
                 None,
                 None,

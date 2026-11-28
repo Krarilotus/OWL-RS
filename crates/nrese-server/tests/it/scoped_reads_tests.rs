@@ -1169,6 +1169,9 @@ async fn hidden_reader_gets_scoped_assertions_under_compact_equality() -> TestRe
     )
     .await?;
     assert_eq!(reply.rows(), bindings(&[P]));
+    // Spec: docs/spec/reasoning-semantics.md:86 and :141. The authorised asserted-only
+    // merge has no reasoning verdict even when the request asked for scoped inference.
+    assert_eq!(reply.completeness, None, "{reply:?}");
     Ok(())
 }
 

@@ -647,6 +647,7 @@ impl MutationPipeline {
             return Err(MutationError::Cancelled);
         }
         let rights = ticket.hold_rights()?;
+        tx.vouch(self.store.unreasoned_basis());
         if let Some(shapes) = shapes {
             tx.keep_watched(Arc::new(crate::shacl::ShapesCounted(Ok(shapes))));
         }

@@ -1395,7 +1395,9 @@ fn committed_reads_without_a_record_pass_over_the_ontology_at_most_once() {
 #[test]
 fn a_consistency_check_records_what_the_premise_tells() {
     use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
-    let store = Arc::new(StoreService::new(crate::StoreConfig::in_memory()).unwrap());
+    let dir = tempfile::tempdir().expect("store directory");
+    let config = crate::StoreConfig::on_disk(dir.path());
+    let store = Arc::new(StoreService::new(config.clone()).unwrap());
     let pipeline = crate::MutationPipeline::new(
         Arc::clone(&store),
         Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
@@ -1407,8 +1409,12 @@ fn a_consistency_check_records_what_the_premise_tells() {
         &pipeline,
         &format!("INSERT DATA {{ {OFF_ROUTE}{two_kinds} }}"),
     );
-    *store.dl().status.lock().unwrap() = None;
+    drop(pipeline);
+    drop(store);
+    let store = StoreService::new(config).expect("reopen store");
+    store.use_dl(true, false);
     let snapshot = store.engine().snapshot();
+    assert!(crate::service::ReadBasis::dl_status(&snapshot).is_none());
     let _ = consistency_at(
         &store,
         &snapshot,
@@ -1417,7 +1423,9 @@ fn a_consistency_check_records_what_the_premise_tells() {
         Deadline::after(store.config().dl.timeout),
         &nrese_exec::Envelope::unlimited(),
     );
-    let recorded = store.dl().status().expect("a record").left_out;
+    let recorded = crate::service::ReadBasis::dl_status(&snapshot)
+        .expect("a record")
+        .left_out;
     assert!(
         matches!(&recorded, Some(Some(why)) if why.contains("two kinds")),
         "the record names the two kinds: {recorded:?}"

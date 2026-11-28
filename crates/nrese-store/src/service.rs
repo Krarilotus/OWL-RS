@@ -839,6 +839,12 @@ impl StoreService {
         })
     }
 
+    /// A publication made without running the rules carries the current generation and mode
+    /// and gives no verdict about the state of its closure. Called under the writer slot.
+    pub(crate) fn unreasoned_basis(&self) -> nrese_engine::Certificate {
+        self.read_basis(None, self.supports.generation())
+    }
+
     /// `state`'s record of an exact stack under the store's settings now, with `facts`. Whether the recorded
     /// reasoning closes the data under `owl:sameAs` (a ruleset with the equality rules):
     /// queries may then rely on it. Its ill-typed literal isn't looked for until a need asks
@@ -2784,7 +2790,9 @@ impl StoreService {
             self.invalidate_reasoning()?;
         }
         let before = self.current_revision();
-        let applied = self.engine.apply_log(frames, expected, stop);
+        let applied = self
+            .engine
+            .apply_log_with_certificate(frames, expected, stop, || Some(self.unreasoned_basis()));
         #[cfg(test)]
         hooks::run(&hooks::AFTER_WRITE_PUBLICATION);
         let view = self.engine.snapshot();

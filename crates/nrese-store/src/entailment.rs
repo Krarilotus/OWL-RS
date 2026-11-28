@@ -212,7 +212,9 @@ impl StoreService {
         // form, so the rule constants this compiles still enter the dictionary.
         #[allow(clippy::disallowed_methods)]
         let mut tx = self.engine().speculative_shared();
-        if !tx.base().same_version(at) {
+        // The pinned program and verdict belong to `at`; the speculative read needs
+        // the same data and equality reading, which a metadata-only reinstall keeps.
+        if tx.base().identity() != at.identity() {
             return Err(StoreError::Undecided(CHANGED.to_owned()));
         }
         for t in opposite {
