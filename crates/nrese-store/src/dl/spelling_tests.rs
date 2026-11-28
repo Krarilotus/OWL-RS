@@ -93,6 +93,13 @@ fn a_restricted_spelling_reason_does_not_inspect_hidden_data() {
     );
     let (query, reads) = prepared.reads();
     let claim = |snapshot: &Snapshot| spelling_reason(query, reads, Some(snapshot));
+    #[cfg(debug_assertions)]
+    let witnesses = || {
+        use nrese_engine::witness::{Site, get};
+        [get(Site::ScanSteps), get(Site::RunProbes)]
+    };
+    #[cfg(debug_assertions)]
+    let before = witnesses();
     let reason = claim(&visible);
     assert!(
         reason
@@ -105,53 +112,103 @@ fn a_restricted_spelling_reason_does_not_inspect_hidden_data() {
         reason,
         "hidden literals changed the spelling reason"
     );
+    #[cfg(debug_assertions)]
+    assert_eq!(witnesses(), before, "restricted spelling did index work");
 }
 
-/// Subject and predicate positions alone cannot bind a literal. Neither a filter
-/// nor DISTINCT over those variables should request the cold equality classes.
+/// A shared subject has no spelling hazard until equality can bind it to a literal.
 #[test]
-fn spelling_evidence_skips_subject_and_predicate_comparisons() {
+fn spelling_evidence_for_a_subject_join_depends_on_literal_aliases() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
     let mut tx = engine.transaction();
     let subject = id(&tx, "urn:s");
     let alias = id(&tx, "urn:alias");
     let predicate = id(&tx, "urn:p");
-    let same_as = id(&tx, "http://www.w3.org/2002/07/owl#sameAs");
+    let other = id(&tx, "urn:q");
+    let same_as = tx.intern(nrese_rdf::vocab::owl::SAME_AS.into());
     let literal = Literal::new_typed_literal("7", xsd::INTEGER);
     let literal = tx.intern(literal.as_ref().into());
-    tx.insert_encoded(EncodedQuad::new(
-        subject,
-        predicate,
-        literal,
-        TermId::DEFAULT_GRAPH,
-    ));
+    for p in [predicate, other] {
+        tx.insert_encoded(EncodedQuad::new(subject, p, literal, TermId::DEFAULT_GRAPH));
+    }
     tx.insert_inferred(EncodedTriple {
         subject: alias,
         predicate: same_as,
+        object: subject,
+    });
+    tx.read_equality_as(Some(same_as));
+    tx.commit().unwrap();
+    let before_alias = engine.snapshot();
+
+    let mut tx = engine.transaction();
+    tx.insert_inferred(EncodedTriple {
+        subject,
+        predicate: same_as,
+        object: literal,
+    });
+    tx.commit().unwrap();
+    let after_alias = engine.snapshot();
+
+    let join = "SELECT ?s { ?s <urn:p> ?o ; <urn:q> ?v }";
+    let prepared = query(join, None);
+    let (query_ast, reads) = prepared.reads();
+    assert!(spelling_reason(query_ast, reads, Some(&before_alias)).is_none());
+    assert!(
+        spelling_reason(query_ast, reads, Some(&after_alias))
+            .is_some_and(|reason| reason.contains("literal evidence could not be checked")),
+        "a literal alias must mark the subject join"
+    );
+    let restricted = query(
+        join,
+        Some(GraphAccess {
+            inferred: true,
+            ..GraphAccess::default()
+        }),
+    );
+    let (query_ast, reads) = restricted.reads();
+    assert!(
+        spelling_reason(query_ast, reads, Some(&before_alias))
+            .is_some_and(|reason| reason.contains("literal evidence could not be checked")),
+        "restricted readers get the same reason for any subject join"
+    );
+}
+
+/// A comparison through an alias can read the representative's inferred literals.
+#[test]
+fn spelling_evidence_seeks_an_inferred_predicates_representative() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let representative = id(&tx, "urn:rep");
+    let alias = id(&tx, "urn:p");
+    let subject = id(&tx, "urn:s");
+    let same_as = tx.intern(nrese_rdf::vocab::owl::SAME_AS.into());
+    let literal = tx.intern(
+        Literal::new_typed_literal("7", xsd::INTEGER)
+            .as_ref()
+            .into(),
+    );
+    tx.insert_inferred(EncodedTriple {
+        subject: alias,
+        predicate: same_as,
+        object: representative,
+    });
+    tx.insert_inferred(EncodedTriple {
+        subject,
+        predicate: representative,
         object: literal,
     });
     tx.read_equality_as(Some(same_as));
     tx.commit().unwrap();
     let snapshot = engine.snapshot();
-    for access in [
-        None,
-        Some(GraphAccess {
-            inferred: true,
-            ..GraphAccess::default()
-        }),
-    ] {
-        let prepared = query(
-            "SELECT DISTINCT ?s ?p WHERE { ?s ?p ?o FILTER(?s = <urn:s> && ?p = <urn:p>) }",
-            access,
-        );
+    for model in [ReadModel::Inferred, ReadModel::Materialised] {
+        let mut request = SparqlQueryRequest::all(OBJECTS);
+        request.read_model = Some(model);
+        let prepared = PreparedQuery::parse(&request).unwrap();
         let (query, reads) = prepared.reads();
-        #[cfg(debug_assertions)]
-        let before = nrese_engine::witness::get(nrese_engine::witness::Site::RunProbes);
-        assert!(spelling_reason(query, reads, Some(&snapshot)).is_none());
-        #[cfg(debug_assertions)]
-        assert_eq!(
-            nrese_engine::witness::get(nrese_engine::witness::Site::RunProbes),
-            before
+        assert!(
+            spelling_reason(query, reads, Some(&snapshot))
+                .is_some_and(|reason| reason.contains("two spellings of one value")),
+            "{model:?} must check the representative in the inferred stack"
         );
     }
 }

@@ -181,10 +181,23 @@ fn distinct_iri_answers_have_no_literal_spelling_reason() {
     assert_eq!(claim.as_str(), "complete");
 }
 
-/// An equality class can give a value comparison a literal that is absent from
-/// the property in the stored closure.
+/// A spelling comparison under DISTINCT must account for a literal alias that
+/// the stored property lacks (reasoning-semantics, values compared by spelling).
 #[test]
 fn a_literal_identity_requires_unchecked_spelling_evidence() {
+    let store = compact_spelling_store(":r owl:sameAs 7 . :s :p :r .");
+    let (values, claim) = spelling_answer(&store, "SELECT DISTINCT ?o { ?s :p ?o }", "o");
+    assert_eq!(values, ["7", "http://example.com/r"]);
+    assert!(
+        claim
+            .header()
+            .contains("literal evidence could not be checked"),
+        "the spelling check must account for a literal identity: {claim:?}"
+    );
+    assert!(!claim.complete, "{claim:?}");
+}
+
+fn compact_spelling_store(data: &str) -> Arc<StoreService> {
     let store = Arc::new(
         StoreService::new(StoreConfig {
             equality_compact: true,
@@ -194,27 +207,115 @@ fn a_literal_identity_requires_unchecked_spelling_evidence() {
         .unwrap(),
     );
     let _writes = pipeline(&store, ReasoningMode::Owl2Rl);
-    load(&store, ":r owl:sameAs 7 . :s :p :r .");
+    load(&store, data);
     store.rematerialise(Ruleset::Owl2Rl).unwrap();
-    let snapshot = store.engine.snapshot();
-    assert!(snapshot.equality_classes().unwrap().relate_literals());
+    store
+}
+
+fn spelling_answer(store: &StoreService, query: &str, var: &str) -> (Vec<String>, crate::Claim) {
     let answer = store
-        .execute_query_str(&format!(
-            "{PREFIXES} SELECT ?o WHERE {{ :s :p ?o FILTER(?o = 7.0) }}"
-        ))
+        .execute_query_str(&format!("{PREFIXES}{query}"))
         .unwrap();
     let body: serde_json::Value = serde_json::from_slice(&answer.payload).unwrap();
-    let rows = body["results"]["bindings"].as_array().unwrap();
-    assert_eq!(rows.len(), 1, "{body}");
-    assert_eq!(rows[0]["o"]["value"], "7", "{body}");
-    let claim = answer.completeness.unwrap();
+    let mut values: Vec<_> = body["results"]["bindings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row[var]["value"].as_str().unwrap().to_owned())
+        .collect();
+    values.sort();
+    (values, answer.completeness.unwrap())
+}
+
+/// Equality can supply a literal in subject position to DISTINCT.
+#[test]
+fn distinct_subjects_account_for_literal_aliases() {
+    let store = compact_spelling_store(":r owl:sameAs 7, 7.0 . :r :p :o .");
+    let (values, claim) = spelling_answer(&store, "SELECT DISTINCT ?s { ?s :p :o }", "s");
+    assert_eq!(values, ["7", "7.0", "http://example.com/r"]);
     assert!(
         claim
             .header()
             .contains("literal evidence could not be checked"),
-        "the spelling check must account for a literal identity: {claim:?}"
+        "a distinct subject can be a literal alias: {claim:?}"
     );
-    assert!(!claim.complete, "{claim:?}");
+}
+
+/// A join compares a shared subject across the rows of both literal-bearing classes.
+#[test]
+fn subject_joins_account_for_literal_aliases() {
+    let store = compact_spelling_store(
+        ":a owl:sameAs 7 ; :p :left ; :q :right .
+         :b owl:sameAs 8 ; :p :left ; :q :right .",
+    );
+    let (values, claim) = spelling_answer(&store, "SELECT ?s { ?s :p :left ; :q :right }", "s");
+    assert_eq!(
+        values,
+        ["7", "8", "http://example.com/a", "http://example.com/b"]
+    );
+    assert!(
+        claim
+            .header()
+            .contains("literal evidence could not be checked"),
+        "a subject join can compare a literal alias: {claim:?}"
+    );
+}
+
+/// The filter compares by value, on either end of an equality-expanded pattern.
+#[test]
+fn filter_only_comparisons_leave_spelling_unmarked() {
+    let store = compact_spelling_store(":r owl:sameAs 7 . :s :p :r . :r :q :x .");
+    for (query, var) in [
+        ("SELECT ?o { :s :p ?o FILTER(?o = 7.0) }", "o"),
+        ("SELECT ?s { ?s :q :x FILTER(?s = 7.0) }", "s"),
+    ] {
+        let (values, claim) = spelling_answer(&store, query, var);
+        assert_eq!(values, ["7"]);
+        let header = claim.header();
+        assert!(
+            !header.contains("literal evidence could not be checked")
+                && !header.contains("two spellings of one value"),
+            "a value-only filter leaves spelling unmarked: {header}"
+        );
+    }
+}
+
+/// The named graph sees the predicate's class under canonical answers.
+#[test]
+fn canonical_named_graph_accounts_for_a_literal_predicate_range() {
+    for canonical in [false, true] {
+        let store = Arc::new(
+            StoreService::new(StoreConfig {
+                equality_compact: true,
+                equality_canonical_answers: canonical,
+                ..StoreConfig::in_memory()
+            })
+            .unwrap(),
+        );
+        let writes = pipeline(&store, ReasoningMode::Owl2Rl);
+        commit(&writes, "GRAPH :g { :s :rep 7, 7.0 . }");
+        commit(&writes, ":alias owl:sameAs :rep .");
+        let (values, claim) = spelling_answer(
+            &store,
+            "SELECT DISTINCT ?o { GRAPH ?g { :s :alias ?o } }",
+            "o",
+        );
+        let header = claim.header();
+        assert_eq!(
+            values,
+            if canonical {
+                vec!["7", "7.0"]
+            } else {
+                Vec::new()
+            }
+        );
+        assert_eq!(
+            header.contains("literal evidence could not be checked")
+                || header.contains("two spellings of one value"),
+            canonical,
+            "the named graph's canonical read needs spelling evidence: {header}"
+        );
+    }
 }
 
 /// Graph scope (reasoning-semantics): changing only hidden axioms can't change a
