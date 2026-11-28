@@ -585,6 +585,7 @@ impl MutationPipeline {
                 source: StoreError::Engine(error),
             })?;
             drop(rights);
+            self.store.queue_literal_evidence();
             #[cfg(test)]
             crate::service::hooks::run(&crate::service::hooks::AFTER_WRITE_PUBLICATION);
             if let Some(touched) = touched {
@@ -661,7 +662,7 @@ impl MutationPipeline {
             return Err(MutationError::Cancelled);
         }
         let rights = ticket.hold_rights()?;
-        tx.vouch(self.store.unreasoned_basis());
+        tx.vouch(self.store.unreasoned_basis(Some(&tx)));
         if let Some(shapes) = shapes {
             tx.keep_watched(Arc::new(crate::shacl::ShapesCounted(Ok(shapes))));
         }
@@ -672,6 +673,7 @@ impl MutationPipeline {
             }
         })?;
         drop(rights);
+        self.store.queue_literal_evidence();
         #[cfg(test)]
         crate::service::hooks::run(&crate::service::hooks::AFTER_WRITE_PUBLICATION);
         Ok(report)

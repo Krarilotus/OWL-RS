@@ -12,14 +12,12 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use hashbrown::HashMap;
 use rayon::prelude::*;
 
 use super::Layout;
 use super::derive::Ordered;
 use super::keys::{BLOCK, PackedKeys};
 use crate::quad::{EncodedQuad, Key, Permutation};
-use crate::term::{TermId, TermKind};
 
 /// Deltas at least this large are sorted with all of the layout's permutations in parallel.
 const PARALLEL_BUILD_THRESHOLD: usize = 16 * 1024;
@@ -227,46 +225,12 @@ pub(crate) struct Run {
     account: Option<Accounted>,
     /// The signed predicate summary and the charge owned by a derived triple run.
     triples: Option<TripleSummary>,
-    /// Signed counts of value literals in a published run, independent of equality reading.
-    literals: LiteralSummary,
 }
-
-#[derive(Debug, Clone, Default)]
-enum LiteralSummary {
-    /// A temporary, charged run. Its reader can use bounded index probes.
-    #[default]
-    Unavailable,
-    Empty,
-    Counts(Arc<LiteralCounts>),
-}
-
-#[derive(Debug, Default)]
-struct LiteralCounts {
-    total: i64,
-    by_predicate: HashMap<TermId, i64>,
-    by_graph: HashMap<TermId, i64>,
-    exact: HashMap<(TermId, TermId), i64>,
-}
-
-pub(crate) const VALUE_LITERAL_RANGES: [(TermKind, TermKind); 3] = [
-    (TermKind::Integer, TermKind::DateTime),
-    (TermKind::TypedLiteral, TermKind::TypedLiteral),
-    (TermKind::DerivedInteger, TermKind::DerivedInteger),
-];
 
 impl Run {
     /// Builds a run from an exact delta. `inserts` and `deletes` must be disjoint and free of
     /// duplicates (the transaction guarantees this). O(d log d).
     pub(crate) fn from_delta(
-        layout: Layout,
-        inserts: &[EncodedQuad],
-        deletes: &[EncodedQuad],
-    ) -> Self {
-        Self::from_delta_without_literal_counts(layout, inserts, deletes).with_literal_counts()
-    }
-
-    /// Builds only the keys and signs for a temporary run covered by a read budget.
-    pub(crate) fn from_delta_without_literal_counts(
         layout: Layout,
         inserts: &[EncodedQuad],
         deletes: &[EncodedQuad],
@@ -287,14 +251,13 @@ impl Run {
     /// Whether [`super::IndexVersion::with_change_within`] builds a delta of `n` entries
     /// charged array by array ([`Self::from_delta_within_parallel`]: at or above the parallel
     /// threshold, where those charges are noise against the build and a bound's slack would
-    /// be large) rather than as [`Self::from_delta_without_literal_counts`] within
-    /// [`Self::delta_bound`], charged
+    /// be large) rather than as [`Self::from_delta`] within [`Self::delta_bound`], charged
     /// before it builds (DUR-6 slice 2: one reservation per pending snapshot).
     pub(crate) fn charged_exactly(n: usize) -> bool {
         n >= PARALLEL_BUILD_THRESHOLD
     }
 
-    /// At most what [`Self::from_delta_without_literal_counts`] allocates for `n` entries below
+    /// At most what [`Self::from_delta`] allocates at once for `n` entries in `layout` below
     /// the parallel threshold, where it builds one permutation after another: what every
     /// permutation keeps (its tombstone words and packed keys, [`PackedKeys::bound`]), plus
     /// what one holds while it builds (its entries, then their keys collected in place, whose
@@ -386,7 +349,7 @@ impl Run {
                 tombstones: Box::default(),
             };
         }
-        Self::from_permutations(layout, perms).with_literal_counts()
+        Self::from_permutations(layout, perms)
     }
 
     /// Assembles a run from the permutation runs of `layout`, which hold the same entries.
@@ -407,60 +370,7 @@ impl Run {
             quads_form: Default::default(),
             account: None,
             triples: None,
-            literals: LiteralSummary::Unavailable,
         }
-    }
-
-    /// Build from the run's exact insert and delete entries in the three object ranges.
-    /// The same summary works for every snapshot that shares the run.
-    pub(crate) fn with_literal_counts(mut self) -> Self {
-        let objects = self.permutation(Permutation::Ospg);
-        let mut counts = LiteralCounts::default();
-        for (first, last) in VALUE_LITERAL_RANGES {
-            let low = [TermId::kind_range(first).0.raw(), 0, 0, 0];
-            let high = [
-                TermId::kind_range(last).1.raw(),
-                u64::MAX,
-                u64::MAX,
-                u64::MAX,
-            ];
-            let (start, end) = objects.range(&low, &high);
-            for i in start..end {
-                let [_, _, p, g] = objects.keys.get(i);
-                let key = (TermId::from_raw(p), TermId::from_raw(g));
-                let sign = if objects.is_tombstone(i) { -1 } else { 1 };
-                *counts.exact.entry(key).or_default() += sign;
-            }
-        }
-        for (&(p, g), &delta) in &counts.exact {
-            counts.total += delta;
-            *counts.by_predicate.entry(p).or_default() += delta;
-            *counts.by_graph.entry(g).or_default() += delta;
-        }
-        self.literals = if counts.exact.is_empty() {
-            LiteralSummary::Empty
-        } else {
-            LiteralSummary::Counts(Arc::new(counts))
-        };
-        self
-    }
-
-    pub(crate) fn literal_delta(
-        &self,
-        predicate: Option<TermId>,
-        graph: Option<TermId>,
-    ) -> Option<i64> {
-        let counts = match &self.literals {
-            LiteralSummary::Counts(counts) => counts,
-            LiteralSummary::Empty => return Some(0),
-            LiteralSummary::Unavailable => return None,
-        };
-        Some(match (predicate, graph) {
-            (Some(p), Some(g)) => counts.exact.get(&(p, g)).copied().unwrap_or(0),
-            (Some(p), None) => counts.by_predicate.get(&p).copied().unwrap_or(0),
-            (None, Some(g)) => counts.by_graph.get(&g).copied().unwrap_or(0),
-            (None, None) => counts.total,
-        })
     }
 
     pub(super) fn keep_triples(
@@ -579,10 +489,7 @@ impl Run {
         for (permutation, run) in built {
             perms[permutation as usize] = run;
         }
-        Self {
-            literals: self.literals.clone(),
-            ..Self::from_permutations(Layout::Quads, perms)
-        }
+        Self::from_permutations(Layout::Quads, perms)
     }
 
     /// This run in the quad layout ([`Self::with_quads_layout`]), made once and shared by
@@ -634,31 +541,7 @@ impl Run {
         self.perms
             .iter()
             .map(|p| (p.keys.memory_bytes() + p.tombstones.len() * 8) as u64)
-            .sum::<u64>()
-            + self.literal_summary_bytes()
-    }
-
-    fn literal_summary_bytes(&self) -> u64 {
-        let LiteralSummary::Counts(counts) = &self.literals else {
-            return 0;
-        };
-        (size_of::<LiteralCounts>()
-            + 2 * size_of::<usize>()
-            + counts.by_predicate.allocation_size()
-            + counts.by_graph.allocation_size()
-            + counts.exact.allocation_size()) as u64
-    }
-
-    /// A live shared form already counts this run's literal summary in `Forms`.
-    pub(crate) fn memory_outside_forms(&self) -> u64 {
-        let bytes = self.memory_bytes();
-        if matches!(self.literals, LiteralSummary::Counts(_))
-            && self.quads_form.lock().strong_count() != 0
-        {
-            bytes - self.literal_summary_bytes()
-        } else {
-            bytes
-        }
+            .sum()
     }
 
     /// Bytes used in place from a mapped checkpoint.

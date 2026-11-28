@@ -1292,9 +1292,10 @@ impl Snapshot {
             }
         };
         // What the builds held beside what their runs keep: their working memory, freed now.
-        // `Run::delta_bound` bounds what `Run::from_delta_without_literal_counts` allocates.
-        // `with_change_within` asserts it in debug builds. If the bound were underestimated,
-        // the run could keep bytes that were never charged.
+        // Sound because a run never keeps more than its bound: `Run::delta_bound` is derived as
+        // an upper bound of what `Run::from_delta` allocates (`with_change_within` asserts it in
+        // debug builds only). The subtraction saturates, but that doesn't make an underestimated
+        // bound safe: the part kept beyond it would go uncharged.
         held.release(
             bounds[0].saturating_sub(asserted_kept) + bounds[1].saturating_sub(inferred_kept),
         );
@@ -1798,57 +1799,30 @@ impl Snapshot {
         .is_some_and(|mut quads| quads.any(|quad| graph(quad.graph)))
     }
 
-    /// Whether a statement of `model` at `predicate` and `graph` has a value literal
-    /// other than a plain or language-tagged string. `None` in either position means any.
-    /// Use the asserted and stored inferred runs' signed counts.
-    /// Equality can change the default graph's predicate to its representative, but
-    /// expanding class members is unnecessary for finding the literal kinds.
-    /// A stopped check has no answer.
-    pub fn holds_typed_literals(
-        &self,
-        model: ReadModel,
-        predicate: Option<TermId>,
-        graph: Option<TermId>,
-        visit: crate::Visitor<'_>,
-    ) -> Result<bool, crate::Stopped> {
-        let reads_default_inferences =
-            model != ReadModel::Asserted && graph.is_none_or(|g| g.is_default_graph());
-        let classes = match self.equality.filter(|_| reads_default_inferences) {
-            Some(same_as) => Some(
-                self.version
-                    .equality
-                    .classes_with(&self.version, same_as, visit)
-                    .ok_or(crate::Stopped)?,
-            ),
-            None => None,
-        };
-        // The stored ranges can miss a literal introduced by an equality expansion.
-        if classes
-            .as_ref()
-            .is_some_and(|classes| classes.relate_literals())
-        {
-            return Err(crate::Stopped);
-        }
-        let probe = |stack, predicate, graph| {
-            self.version
-                .stack(stack)
-                .holds_typed_literals(predicate, graph, visit)
-        };
-        let asserted = model.includes(Stack::Asserted);
-        if asserted && probe(Stack::Asserted, predicate, graph)? {
-            return Ok(true);
-        }
-        if !reads_default_inferences {
-            return Ok(false);
-        }
-        let canonical = predicate.map(|p| classes.as_ref().map_or(p, |c| c.representative(p)));
-        if asserted
-            && predicate != canonical
-            && probe(Stack::Asserted, canonical, Some(TermId::DEFAULT_GRAPH))?
-        {
-            return Ok(true);
-        }
-        probe(Stack::Inferred, canonical, graph)
+    /// Whether a statement read in `model` with `predicate` (any, where `None`) has an object
+    /// literal other than a plain or language-tagged string: an inline number, boolean, date
+    /// or dateTime, or one in the dictionary (any other datatype, and every non-canonical
+    /// spelling). Those kinds' ids are three ranges, so this is up to three seeks in the
+    /// predicate-first index (object-first without a predicate); `true` where the index can't
+    /// answer by range. Canonical numbers count though each has one spelling: an integer `7`
+    /// and a decimal `7.0` are one value with two ids, so no finer test (non-canonical
+    /// spellings only) would do.
+    pub fn holds_typed_literals(&self, model: ReadModel, predicate: Option<TermId>) -> bool {
+        use crate::TermKind::{DateTime, DerivedInteger, Integer, TypedLiteral};
+        let mut pattern = QuadPattern::all();
+        pattern.predicate = predicate;
+        let index = predicate.map_or(Permutation::Ospg, |_| Permutation::Posg);
+        [
+            (Integer, DateTime),
+            (TypedLiteral, TypedLiteral),
+            (DerivedInteger, DerivedInteger),
+        ]
+        .into_iter()
+        .any(|(first, last)| {
+            let (low, high) = (TermId::kind_range(first).0, TermId::kind_range(last).1);
+            let quads = self.scan_range_in(model, &pattern, index, low, high);
+            quads.is_none_or(|mut quads| quads.next().is_some())
+        })
     }
 
     /// Exact number of quads [`scan_range_in`](Self::scan_range_in) yields.
