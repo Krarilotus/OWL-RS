@@ -2173,10 +2173,9 @@ impl StoreService {
     /// ([`crate::sessions`]); `scope` is the reader's, by which the operations were scoped.
     /// What the operations' replay and the reader's view read and build is charged to
     /// `memory`, the reading query's envelope ([`Self::read_snapshot_within`]).
-    /// The operations' declarations are rebuilt under the rules in force when the read
-    /// starts. A reader that `scope` restricts sees one rule generation: if the rules change
-    /// while it reads, the read starts again once, and a second change refuses it with
-    /// `Unavailable::OtherProgram`, though nothing was committed.
+    /// When pending declarations need rebuilding, they use the rules captured at the start of
+    /// that attempt. A fresh restricted view is rebuilt once if the rules epoch differs from
+    /// the captured epoch. A second mismatch returns `Unavailable::OtherProgram`.
     fn with_pending<T>(
         &self,
         pending: &crate::StatementsRequest,
