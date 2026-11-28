@@ -918,13 +918,18 @@ pub(crate) struct Reads {
     predicates: std::sync::OnceLock<Vec<Option<String>>>,
     /// The reader's graphs, where their view is restricted.
     access: Option<std::sync::Arc<nrese_sparql::GraphAccess>>,
+    model: ReadModel,
 }
 
 impl Reads {
     /// Nothing found yet, for a reader of every graph (`None`) or of `access`.
-    pub(crate) fn new(access: Option<std::sync::Arc<nrese_sparql::GraphAccess>>) -> Self {
+    pub(crate) fn new(
+        access: Option<std::sync::Arc<nrese_sparql::GraphAccess>>,
+        model: ReadModel,
+    ) -> Self {
         Self {
             access,
+            model,
             ..Self::default()
         }
     }
@@ -984,32 +989,102 @@ fn lowerings(
     if let Some(reason) = constant {
         completeness.incomplete(source, reason.clone());
     }
-    let typed = |predicate: Option<&str>| {
-        let snapshot = snapshot?;
-        crate::literal_evidence::LiteralEvidence::holds(snapshot, predicate, access)
-    };
-    const UNCHECKED: &str = "literal evidence could not be checked over the data read";
-    let compared = reads.compared.get_or_init(|| compared_values(query));
-    if let Some((what, found)) = compared.terms.iter().find_map(|(what, by)| {
-        by.iter()
-            .map(|predicate| typed(predicate.as_deref()))
-            .find(|found| found.is_none_or(|has| has))
-            .map(|found| (what, found))
-    }) {
-        let reason = if found == Some(true) {
-            COMPARED
-        } else {
-            UNCHECKED
-        };
-        completeness.incomplete(source, format!("the query compares {what}: {reason}"));
-    } else if compared.values
-        && snapshot.is_some_and(|s| s.identity().equality.is_some())
-        && typed(None).is_none()
-    {
-        completeness.incomplete(source, format!("the query compares values: {UNCHECKED}"));
+    if let Some(reason) = spelling_reason(query, reads, snapshot) {
+        completeness.incomplete(source, reason);
     }
     annotation_rule(completeness, (query, reads), source, snapshot);
     true
+}
+
+/// The query establishes which positions can bind a literal before we consult the store.
+/// A reader of some graphs gets the same unchecked reason for that shape for every dataset.
+fn spelling_reason(query: &Query, reads: &Reads, snapshot: Option<&Snapshot>) -> Option<String> {
+    let compared = reads.compared.get_or_init(|| compared_values(query));
+    let what = compared
+        .terms
+        .first()
+        .map(|(what, _)| what.as_str())
+        .or(compared.values.then_some("values"))?;
+    let unchecked = || {
+        format!(
+            "the query compares {what}: literal evidence could not be checked over the data read"
+        )
+    };
+    let Some(snapshot) = snapshot.filter(|_| reads.access.is_none()) else {
+        return Some(unchecked());
+    };
+    // The snapshot caches the classes for its own expansion. Literal aliases defeat a
+    // test of the stored kinds even when the operator already compares values.
+    let classes = (reads.model != ReadModel::Asserted)
+        .then(|| snapshot.equality_classes())
+        .flatten();
+    if classes
+        .as_ref()
+        .is_some_and(|classes| classes.relate_literals())
+    {
+        return Some(unchecked());
+    }
+    let stored = classes.as_ref().map(|_| snapshot.stored());
+    let stored = stored.as_ref().unwrap_or(snapshot);
+    compared.terms.iter().find_map(|(what, by)| {
+        by.iter()
+            .any(|p| {
+                let predicate = match p {
+                    Some(p) => match stored.lookup(NamedNodeRef::new_unchecked(p).into()) {
+                        Some(id) => Some(id),
+                        None => return false,
+                    },
+                    None => None,
+                };
+                let canonical =
+                    predicate.map(|p| classes.as_ref().map_or(p, |c| c.representative(p)));
+                stored_spelling_evidence(stored, reads.model, predicate, canonical)
+            })
+            .then(|| format!("the query compares {what}: {COMPARED}"))
+    })
+}
+
+fn stored_spelling_evidence(
+    stored: &Snapshot,
+    model: ReadModel,
+    predicate: Option<TermId>,
+    canonical: Option<TermId>,
+) -> bool {
+    if predicate == canonical || model == ReadModel::Asserted {
+        return stored.holds_typed_literals(model, predicate);
+    }
+    if model == ReadModel::Inferred {
+        return stored.holds_typed_literals(model, canonical);
+    }
+    if stored.holds_typed_literals(ReadModel::Asserted, predicate)
+        || stored.holds_typed_literals(ReadModel::Inferred, canonical)
+    {
+        return true;
+    }
+    // An alias also reads assertions under its representative in the default graph.
+    // Named graphs keep their own predicate names.
+    use nrese_engine::TermKind::{DateTime, DerivedInteger, Integer, TypedLiteral};
+    let pattern = QuadPattern {
+        predicate: canonical,
+        ..QuadPattern::in_graph(TermId::DEFAULT_GRAPH)
+    };
+    [
+        (Integer, DateTime),
+        (TypedLiteral, TypedLiteral),
+        (DerivedInteger, DerivedInteger),
+    ]
+    .into_iter()
+    .any(|(first, last)| {
+        stored
+            .scan_range_in(
+                ReadModel::Asserted,
+                &pattern,
+                nrese_engine::quad::Permutation::Gpos,
+                TermId::kind_range(first).0,
+                TermId::kind_range(last).1,
+            )
+            .is_none_or(|mut quads| quads.next().is_some())
+    })
 }
 
 /// Where the status speaks of the OWL 2 Direct Semantics (`owl2-dl`, or the QL rewriting's,
@@ -1742,6 +1817,10 @@ mod cancellation_tests;
 #[cfg(test)]
 #[path = "../envelope_tests.rs"]
 mod envelope_tests;
+
+#[cfg(test)]
+#[path = "../spelling_tests.rs"]
+mod spelling_tests;
 
 /// How a query is answered: over the lower bound as it streams (its status known before
 /// it runs), or with answers collected and completed through the bounds.

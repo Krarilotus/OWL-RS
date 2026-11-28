@@ -157,7 +157,6 @@ fn distinct_iri_answers_have_no_literal_spelling_reason() {
     let writes = pipeline(&store, ReasoningMode::Owl2Rl);
     commit(&writes, ":x :p :a . :p a owl:ObjectProperty .");
     commit(&writes, ":a owl:sameAs :b .");
-    store.finish_literal_evidence();
     let request = SparqlQueryRequest::all(format!(
         "{PREFIXES} SELECT DISTINCT ?o WHERE {{ :x :p ?o }} ORDER BY ?o"
     ));
@@ -197,7 +196,6 @@ fn a_literal_identity_requires_unchecked_spelling_evidence() {
     let _writes = pipeline(&store, ReasoningMode::Owl2Rl);
     load(&store, ":r owl:sameAs 7 . :s :p :r .");
     store.rematerialise(Ruleset::Owl2Rl).unwrap();
-    store.finish_literal_evidence();
     let snapshot = store.engine.snapshot();
     assert!(snapshot.equality_classes().unwrap().relate_literals());
     let answer = store

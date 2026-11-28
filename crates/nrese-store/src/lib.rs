@@ -32,7 +32,6 @@ mod graph_store_executor;
 mod huge_pages_tests;
 pub mod image_backup;
 pub mod jobs;
-mod literal_evidence;
 mod loader;
 mod metadata;
 pub mod mutation;

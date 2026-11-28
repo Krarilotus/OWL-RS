@@ -102,7 +102,6 @@ pub struct StoreService {
     /// test's.
     capacity: fn() -> nrese_exec::memory::Reading,
     engine: Engine,
-    literals: crate::literal_evidence::Builder,
     preloaded_ontology: Option<PathBuf>,
     /// Whether the reasoning state file may exist (see [`Self::reasoning_state`]); saves a
     /// file-system call per write once it is gone.
@@ -202,18 +201,11 @@ pub(crate) struct ReadBasis {
     upper: std::sync::Mutex<Option<crate::dl::bounds::Published>>,
     left_out: std::sync::Mutex<Option<Option<String>>>,
     pub(crate) omission: std::sync::Mutex<Option<Option<String>>>,
-    pub(crate) literal_evidence: crate::literal_evidence::Record,
 }
 
 impl ReadBasis {
     pub(crate) fn of(snapshot: &Snapshot) -> Option<&Self> {
         snapshot.certificate()?.downcast_ref()
-    }
-
-    fn inherit_literal_evidence(&self, snapshot: &Snapshot) {
-        if let Some(record) = Self::of(snapshot).and_then(|base| base.literal_evidence.get()) {
-            let _ = self.literal_evidence.set(record.clone());
-        }
     }
 
     pub(crate) fn dl_status(snapshot: &Snapshot) -> Option<crate::dl::DlStatus> {
@@ -669,9 +661,6 @@ impl StoreService {
             std::sync::Arc::clone(&namespaces),
             std::sync::Arc::clone(&settings.search_scope),
         ));
-        let literals = crate::literal_evidence::Builder::new(std::sync::Arc::new(
-            nrese_exec::Budget::unlimited().within(settings.runtime.memory()),
-        ));
         let service = Self {
             process_memory,
             capacity: nrese_exec::memory::capacity,
@@ -684,7 +673,6 @@ impl StoreService {
             dl: std::sync::Arc::default(),
             config,
             engine,
-            literals,
             preloaded_ontology,
             marker: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             unavailable,
@@ -731,7 +719,6 @@ impl StoreService {
         drop(tx);
         service.refresh_kept_shapes(&service.engine.snapshot(), &StopSource::none());
         service.pin_configured_queries()?;
-        service.queue_literal_evidence();
         Ok(service)
     }
 
@@ -768,9 +755,10 @@ impl StoreService {
         };
         let reading = self.note_equality(writer, &state);
         let certificate = self.certificate(state, facts, &generation);
-        let basis = self.read_basis(Some(certificate), generation);
-        basis.inherit_literal_evidence(tx.base());
-        tx.install(reading, Some(basis));
+        tx.install(
+            reading,
+            Some(self.read_basis(Some(certificate), generation)),
+        );
     }
 
     /// The current record made again under the settings now (a registration, the QL setting,
@@ -783,16 +771,12 @@ impl StoreService {
     ) {
         let record = Certificate::record(tx.base());
         let Some(base) = record.filter(|c| c.exact) else {
-            let basis = self.read_basis(Self::without_verdict(record), generation);
-            basis.inherit_literal_evidence(tx.base());
-            tx.install_certificate(basis);
-            self.queue_literal_evidence();
+            tx.install_certificate(self.read_basis(Self::without_verdict(record), generation));
             return;
         };
         let (mut state, literal) = (base.state.clone(), base.literal);
         edit(&mut state);
         self.certify(tx, state, literal, generation);
-        self.queue_literal_evidence();
     }
 
     /// The record a maintained commit `tx` publishes, from its base's: the same stack's state
@@ -812,7 +796,6 @@ impl StoreService {
     ) -> Option<nrese_engine::Certificate> {
         let basis = ReadBasis::of(tx.base())?;
         let finish = |next: std::sync::Arc<ReadBasis>| -> Option<nrese_engine::Certificate> {
-            self.advance_literal_evidence(tx, &next);
             *next.dl_status.lock().unwrap_or_else(|p| p.into_inner()) = dl_status;
             *next.upper.lock().unwrap_or_else(|p| p.into_inner()) = dl_upper;
             *next.left_out.lock().unwrap_or_else(|p| p.into_inner()) = left_out;
@@ -910,41 +893,13 @@ impl StoreService {
             upper: Default::default(),
             left_out: Default::default(),
             omission: Default::default(),
-            literal_evidence: Default::default(),
         })
     }
 
     /// A publication made without running the rules carries the current generation and mode
     /// and gives no verdict about the state of its closure. Called under the writer slot.
-    pub(crate) fn unreasoned_basis(
-        &self,
-        tx: Option<&nrese_engine::Transaction<'_>>,
-    ) -> nrese_engine::Certificate {
-        let basis = self.read_basis(None, self.supports.generation());
-        if let Some(tx) = tx {
-            self.advance_literal_evidence(tx, &basis);
-        }
-        basis
-    }
-
-    fn advance_literal_evidence(&self, tx: &nrese_engine::Transaction<'_>, next: &ReadBasis) {
-        if let Some(base) = ReadBasis::of(tx.base())
-            .and_then(|basis| basis.literal_evidence.get())
-            .and_then(Option::as_ref)
-        {
-            let _ = next
-                .literal_evidence
-                .set(base.after(tx, &self.literals.budget).ok());
-        }
-    }
-
-    pub(crate) fn queue_literal_evidence(&self) {
-        self.literals.queue(self.engine.snapshot());
-    }
-
-    #[cfg(test)]
-    pub(crate) fn finish_literal_evidence(&self) {
-        self.literals.fill(&self.engine.snapshot());
+    pub(crate) fn unreasoned_basis(&self) -> nrese_engine::Certificate {
+        self.read_basis(None, self.supports.generation())
     }
 
     /// `state`'s record of an exact stack under the store's settings now, with `facts`. Whether the recorded
@@ -1296,15 +1251,7 @@ impl StoreService {
             .filter(|c| c.exact)
             .and_then(|c| self.note_equality(writer, &c.state));
         let withheld = self.invalidate_held(writer)?;
-        if let Some(basis) = withheld
-            .as_ref()
-            .and_then(|value| value.downcast_ref::<ReadBasis>())
-        {
-            basis.inherit_literal_evidence(tx.base());
-        }
         tx.install(reading, withheld);
-        drop(tx);
-        self.queue_literal_evidence();
         Ok(())
     }
 
@@ -1375,10 +1322,7 @@ impl StoreService {
         // An empty stack is read as stored, installed even where it was empty already.
         let basis = self.read_basis(None, self.supports.generation());
         let finished = rematerialisation.finish_held(Vec::new(), None, Some(basis))?;
-        let deleted = finished.summary().inferred_deleted;
-        drop(finished);
-        self.queue_literal_evidence();
-        Ok(deleted)
+        Ok(finished.summary().inferred_deleted)
     }
 
     /// Waits until the engine's background maintenance has nothing requested or running
@@ -2936,10 +2880,7 @@ impl StoreService {
         let before = self.current_revision();
         let applied = self
             .engine
-            .apply_log_with_certificate(frames, expected, stop, || {
-                Some(self.unreasoned_basis(None))
-            });
-        self.queue_literal_evidence();
+            .apply_log_with_certificate(frames, expected, stop, || Some(self.unreasoned_basis()));
         #[cfg(test)]
         hooks::run(&hooks::AFTER_WRITE_PUBLICATION);
         let view = self.engine.snapshot();
@@ -3014,16 +2955,9 @@ impl StoreService {
         let context = self.update_context(self.envelope(None), &cancellation);
         let report = command.apply(&mut tx, requester, &context)?;
         if let Some(withheld) = withheld {
-            self.advance_literal_evidence(
-                &tx,
-                withheld
-                    .downcast_ref::<ReadBasis>()
-                    .expect("store publication"),
-            );
             tx.vouch(withheld);
         }
         let summary = tx.commit()?;
-        self.queue_literal_evidence();
         #[cfg(test)]
         hooks::run(&hooks::AFTER_WRITE_PUBLICATION);
         self.refresh_kept_shapes(&self.engine.snapshot(), &StopSource::none());
@@ -3090,7 +3024,6 @@ impl StoreService {
             &self.quarantine,
             &invalidate,
         );
-        self.queue_literal_evidence();
         #[cfg(test)]
         hooks::run(&hooks::AFTER_WRITE_PUBLICATION);
         // A quarantine error can follow a publication. Count the shapes that are served.
@@ -3553,13 +3486,10 @@ impl StoreService {
         #[cfg(test)]
         hooks::run(&hooks::AFTER_PUBLICATION);
         // From here the new inferences are published: a failure says so.
-        let recorded = self.record_reasoning(finished.writer(), &state);
-        if recorded.is_ok() {
-            self.engine.notify_publication();
-        }
+        self.record_reasoning(finished.writer(), &state)
+            .map_err(|error| crate::StoreError::InferencesNotRecorded(Box::new(error)))?;
+        self.engine.notify_publication();
         drop(finished);
-        self.queue_literal_evidence();
-        recorded.map_err(|error| crate::StoreError::InferencesNotRecorded(Box::new(error)))?;
         if let Some(why) = undecided {
             let text = why.text(violations);
             tracing::error!(ruleset = %rules.name(), violations_at_least, "{text}; the store is in quarantine until it is repaired");

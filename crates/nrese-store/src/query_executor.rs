@@ -182,16 +182,17 @@ impl PreparedQuery {
                 None,
             )
         };
+        let read_model = match request.scope.model() {
+            // Without the inferred statements: what was asserted, whatever was asked.
+            ReadModel::Asserted => ReadModel::Asserted,
+            _ => request.read_model.or(model).unwrap_or_default(),
+        };
         Ok(Self {
             query,
             text: request.query.clone(),
             dataset,
             inference_scope,
-            read_model: match request.scope.model() {
-                // Without the inferred statements: what was asserted, whatever was asked.
-                ReadModel::Asserted => ReadModel::Asserted,
-                _ => request.read_model.or(model).unwrap_or_default(),
-            },
+            read_model,
             memory_limit: request.memory_limit,
             as_written: request.as_written,
             solutions_format: request.solutions_format,
@@ -204,7 +205,7 @@ impl PreparedQuery {
             dl_answers: request.dl_answers,
             deadline: request.deadline,
             on_evaluation: None,
-            reads: crate::dl::query::Reads::new(request.scope.access().cloned()),
+            reads: crate::dl::query::Reads::new(request.scope.access().cloned(), read_model),
         })
     }
 
