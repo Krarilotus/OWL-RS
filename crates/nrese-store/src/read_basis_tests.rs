@@ -136,7 +136,8 @@ fn read_basis_ql_schema_forgets_a_deleted_axiom() {
         ))
         .expect("delete subproperty axiom");
     let after = read();
-    let names_deleted_axiom = |text: &str| text.contains("http://example.com/p1");
+    let names_deleted_axiom =
+        |text: &str| text.contains("an axiom outside the profile equates individuals");
     assert!(
         !after
             .reasons

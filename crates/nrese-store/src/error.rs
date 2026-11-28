@@ -12,7 +12,7 @@ pub type StoreResult<T> = Result<T, StoreError>;
 /// and the first candidates neither proved nor refuted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IncompleteAnswer {
-    pub status: nrese_sparql::Completeness,
+    pub status: crate::Claim,
     /// Unresolved candidates as `?x=<…> ?y=<…>` (`ASK` for a boolean query), at most
     /// [`crate::dl::UNRESOLVED_SHOWN`]; the status's bounds count them all.
     pub unresolved: Vec<String>,

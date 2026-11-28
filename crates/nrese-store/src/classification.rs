@@ -35,13 +35,14 @@ pub struct ClassificationReport {
     /// Set where a procedure outside OWL 2 DL answered (`el`): what is outside, and what
     /// its answer guarantees and what not.
     pub outside: Option<nrese_sparql::Outside>,
+    pub claim: crate::Claim,
     pub micros: u64,
 }
 
 impl ClassificationReport {
     /// Nothing left out, and the consistency decided.
     pub fn complete(&self) -> bool {
-        self.incomplete.is_empty() && self.consistency.decided().is_some()
+        self.claim.complete
     }
 }
 
@@ -56,13 +57,14 @@ pub struct RealisationReport {
     pub engine: &'static str,
     /// Why types may be missing (empty: complete).
     pub incomplete: Vec<String>,
+    pub claim: crate::Claim,
     pub micros: u64,
 }
 
 impl RealisationReport {
     /// Nothing left out, and the consistency decided.
     pub fn complete(&self) -> bool {
-        self.incomplete.is_empty() && self.consistency.decided().is_some()
+        self.claim.complete
     }
 }
 
@@ -158,14 +160,25 @@ impl StoreService {
             true => sorted_iris(&snapshot, ids),
             false => Vec::new(),
         };
+        let incomplete = reasons(consistency, incomplete);
+        let outside = answer.is_ok().then(dl::el_outside);
+        let claim = self.assess(
+            crate::dl::query::Revision::Committed(&snapshot),
+            crate::service::Evidence::Classification {
+                incomplete: &incomplete,
+                verdict: consistency.clone(),
+                outside: outside.clone(),
+            },
+        );
         Ok(ClassificationReport {
             subsumptions,
             unsatisfiable: list(unsatisfiable),
             equivalent_to_thing: list(top),
             consistency: consistency.clone(),
             engine,
-            incomplete: reasons(consistency, incomplete),
-            outside: answer.is_ok().then(dl::el_outside),
+            incomplete,
+            outside,
+            claim,
             micros: started.elapsed().as_micros() as u64,
         })
     }
@@ -198,10 +211,20 @@ impl StoreService {
         types.sort();
         let mut incomplete = r.taxonomy.incomplete.clone();
         incomplete.extend(r.incomplete.iter().cloned());
+        let incomplete = reasons(&consistency, incomplete);
+        let claim = self.assess(
+            crate::dl::query::Revision::Committed(&snapshot),
+            crate::service::Evidence::Classification {
+                incomplete: &incomplete,
+                verdict: consistency.clone(),
+                outside: None,
+            },
+        );
         Ok(RealisationReport {
             types,
-            incomplete: reasons(&consistency, incomplete),
+            incomplete,
             consistency,
+            claim,
             engine: r.taxonomy.profile.path,
             micros: started.elapsed().as_micros() as u64,
         })

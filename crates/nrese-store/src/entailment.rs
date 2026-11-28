@@ -39,7 +39,7 @@ use nrese_sparql::{QueryOptions, QueryResults};
 use nrese_sparql_syntax::SparqlParser;
 
 use crate::error::{StoreError, StoreResult};
-use crate::service::{Certificate, Premise, StoreService};
+use crate::service::{Certificate, Evidence, Premise, RulesEntailment, StoreService};
 
 /// Why a conclusion is entailed, or that it isn't.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,24 +128,31 @@ impl StoreService {
         premise: Premise,
     ) -> StoreResult<Entailment> {
         let consistency = Certificate::assessment(at, self.config().replica).rules;
-        // Not known to entail everything, nor not to: no answer.
-        if let crate::ConsistencyStatus::Undecided { violations, why } = consistency {
-            return Err(StoreError::Undecided(why.text(violations)));
-        }
         // Under owl2-dl the closure is no proof, its inconsistency included: the DL engines
         // decide, the premise's consistency too.
-        if let Some(deadline) = dl {
-            return self.decided_by_dl(at, conclusion, deadline);
-        }
-        if premise == Premise::HeldInconsistent
+        let decided = crate::dl::query::Revision::Committed(at);
+        let rules = if let crate::ConsistencyStatus::Undecided { violations, why } = consistency {
+            RulesEntailment::Undecided(why.text(violations))
+        } else if let Some(deadline) = dl {
+            let evidence = self.entails_dl_at(at, conclusion, deadline)?;
+            return self
+                .assess(
+                    decided,
+                    Evidence::DlEntailment {
+                        premise: evidence.premise,
+                        answer: &evidence.answer,
+                    },
+                )
+                .entailment();
+        } else if premise == Premise::HeldInconsistent
             || matches!(consistency, crate::ConsistencyStatus::Inconsistent { .. })
         {
-            return Ok(Entailment::InconsistentPremise);
-        }
-        match self.shown_by_rules(at, program, &split(conclusion))? {
-            true => Ok(Entailment::Entailed),
-            false => Ok(Entailment::NotEntailed),
-        }
+            RulesEntailment::InconsistentPremise
+        } else {
+            self.shown_by_rules(at, program, &split(conclusion))?
+        };
+        self.assess(decided, Evidence::RulesEntailment(rules))
+            .entailment()
     }
 
     /// Whether the closure at `at` holds every positive statement and the rules refute every
@@ -155,42 +162,21 @@ impl StoreService {
         at: &Snapshot,
         program: &RuleProgram,
         split: &Split,
-    ) -> StoreResult<bool> {
+    ) -> StoreResult<RulesEntailment> {
         let asked = split.positive.is_empty() || self.ask(at, &split.positive)?;
         #[cfg(test)]
         crate::service::hooks::run(&crate::service::hooks::BETWEEN_ENTAILMENT_HALVES);
         if !asked {
-            return Ok(false);
+            return Ok(RulesEntailment::Closure(false));
         }
         for opposite in &split.refutations {
             if !self.refutes(at, program, opposite)? {
-                return Err(StoreError::Undecided(
+                return Ok(RulesEntailment::Undecided(
                     "the rules did not refute the opposite of the conclusion".to_owned(),
                 ));
             }
         }
-        Ok(true)
-    }
-
-    /// [`Self::entails_dl`]'s answer at `at` before `deadline`, as an [`Entailment`];
-    /// undecided where it is unknown.
-    fn decided_by_dl(
-        &self,
-        at: &Snapshot,
-        conclusion: &[Triple],
-        deadline: Deadline,
-    ) -> StoreResult<Entailment> {
-        let decided = self.entails_dl_at(at, conclusion, deadline)?;
-        match (decided.premise, decided.answer) {
-            (crate::dl::Verdict::Inconsistent, crate::dl::entailment::Entailed::Yes) => {
-                Ok(Entailment::InconsistentPremise)
-            }
-            (_, crate::dl::entailment::Entailed::Yes) => Ok(Entailment::Entailed),
-            (_, crate::dl::entailment::Entailed::No) => Ok(Entailment::NotEntailed),
-            (_, crate::dl::entailment::Entailed::Unknown(why)) => {
-                Err(StoreError::Undecided(format!("under OWL 2 DL: {why}")))
-            }
-        }
+        Ok(RulesEntailment::Closure(true))
     }
 
     /// Whether the materialised data at `at` matches `pattern`, blank nodes read as variables.

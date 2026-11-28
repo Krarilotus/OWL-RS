@@ -329,7 +329,7 @@ pub(crate) fn plan_status(
     snapshot: &Snapshot,
     prepared: &PreparedQuery,
     cancellation: &CancellationToken,
-) -> StoreResult<Completeness> {
+) -> StoreResult<crate::Claim> {
     let analysis = analyse(prepared.query());
     let decided = decided(store, snapshot, prepared, cancellation)?;
     let completeness = match decided.as_ref() {
@@ -459,11 +459,17 @@ fn composed(
     snapshot: &Snapshot,
     decided: &Decided,
     status: Completeness,
-) -> Completeness {
+) -> crate::Claim {
     let committed = Revision::Committed(snapshot);
     let at = decided.as_ref().map_or(committed, Revision::Decided);
-    let assessed = store.assess(prepared, at, Some(status));
-    assessed.unwrap_or_else(Completeness::not_certified)
+    store.assess(
+        at,
+        crate::service::Evidence::Query {
+            prepared,
+            route: Some(status),
+            rewritten: false,
+        },
+    )
 }
 
 /// The data a status is composed for ([`mark`]): the view the answers were decided on, or
@@ -1643,7 +1649,7 @@ pub(crate) fn answer(
     cancellation: &CancellationToken,
     memory: &nrese_exec::Envelope,
     mode: DlAnswers,
-) -> StoreResult<Outcome> {
+) -> StoreResult<Outcome<crate::Claim>> {
     cancellation.check()?;
     let analysis = analyse(prepared.query());
     // One view for the answers and their status: a commit in between changes neither.
@@ -1661,8 +1667,7 @@ pub(crate) fn answer(
     // An ASK the store answered `true` misses nothing, so nothing every name could add changes
     // it: it isn't put to the element. One answered `false` is, as is one streamed.
     let held = matches!(&outcome, Outcome::Answers(Answers::Boolean(true), ..));
-    let (Outcome::Stream(status, _, detail) | Outcome::Answers(_, status, detail)) = &mut outcome;
-    *status = composed(store, prepared, snapshot, &decided, status.clone());
+    let (Outcome::Stream(status, _, _) | Outcome::Answers(_, status, _)) = &mut outcome;
     if status.complete
         && !held
         && let Ok((_, view)) = &decided
@@ -1673,8 +1678,19 @@ pub(crate) fn answer(
     }
     // A cancellation while the element was posed is the read's, not a reason.
     cancellation.check()?;
-    refuse_unless_complete(mode, status, || detail.unresolved.clone())?;
-    Ok(outcome)
+    let assess = |status, detail: &DlDetail| {
+        let claim = composed(store, prepared, snapshot, &decided, status);
+        refuse_unless_complete(mode, &claim, || detail.unresolved.clone())?;
+        StoreResult::Ok(claim)
+    };
+    Ok(match outcome {
+        Outcome::Stream(status, read, detail) => {
+            Outcome::Stream(assess(status, &detail)?, read, detail)
+        }
+        Outcome::Answers(answers, status, detail) => {
+            Outcome::Answers(answers, assess(status, &detail)?, detail)
+        }
+    })
 }
 
 /// The one rule of exact answers: under [`DlAnswers::Exact`] an answer whose `status` isn't
@@ -1683,13 +1699,17 @@ pub(crate) fn answer(
 /// (`StoreService::refuse_exact`), ask it.
 pub(crate) fn refuse_unless_complete(
     mode: DlAnswers,
-    status: &Completeness,
+    status: &crate::Claim,
     unresolved: impl FnOnce() -> Vec<String>,
 ) -> StoreResult<()> {
     if mode == DlAnswers::Exact && !status.complete {
         return Err(StoreError::Incomplete(Box::new(crate::IncompleteAnswer {
             status: status.clone(),
-            unresolved: unresolved(),
+            unresolved: if status.certification_withheld {
+                Vec::new()
+            } else {
+                unresolved()
+            },
         })));
     }
     Ok(())
@@ -1705,10 +1725,10 @@ mod envelope_tests;
 
 /// How a query is answered: over the lower bound as it streams (its status known before
 /// it runs), or with answers collected and completed through the bounds.
-pub(crate) enum Outcome {
+pub(crate) enum Outcome<C = Completeness> {
     /// Streamed over what [`Read`] says.
-    Stream(Completeness, Read, DlDetail),
-    Answers(Answers, Completeness, DlDetail),
+    Stream(C, Read, DlDetail),
+    Answers(Answers, C, DlDetail),
 }
 
 /// What a streamed answer reads: the revision its status was decided on, never a later

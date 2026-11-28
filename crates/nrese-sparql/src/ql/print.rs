@@ -66,13 +66,13 @@ impl PrintForm {
 
 /// A printed query, or why it can't be printed exactly.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Printed {
+pub enum Printed<C = crate::Completeness> {
     /// The query, answering exactly as NRESE does, with NRESE's completeness for it: where
     /// NRESE's answers are `sound-only` (an axiom beyond QL meets anonymous individuals),
     /// the printed query's are the same answers, and so `sound-only` too.
     Query {
         text: String,
-        completeness: crate::Completeness,
+        completeness: C,
     },
     NotExpressible(Vec<String>),
 }

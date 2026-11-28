@@ -256,15 +256,6 @@ pub(crate) fn explained(
 
 /// An explanation OWL 2 DL didn't decide, for `why`: an answer that can't be proven
 /// complete, never "doesn't hold".
-fn undecided(why: String) -> crate::StoreError {
-    let mut status = nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Dl);
-    status.incomplete("dl", why);
-    crate::StoreError::Incomplete(Box::new(crate::IncompleteAnswer {
-        status,
-        unresolved: Vec::new(),
-    }))
-}
-
 impl crate::StoreService {
     /// Why the statement `subject predicate object` holds under OWL 2 DL: a minimal set
     /// of the asserted ontology's axioms entailing it, with where each was read from
@@ -284,6 +275,21 @@ impl crate::StoreService {
         scope.require_all("an explanation under OWL 2 DL")?;
         let started = Instant::now();
         let snapshot = self.engine().snapshot();
+        let undecided = |why: String| {
+            let mut status = nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Dl);
+            status.incomplete("dl", why);
+            let claim = self.assess(
+                super::query::Revision::Committed(&snapshot),
+                crate::service::Evidence::Service {
+                    status,
+                    verdict: None,
+                },
+            );
+            crate::StoreError::Incomplete(Box::new(crate::IncompleteAnswer {
+                status: claim,
+                unresolved: Vec::new(),
+            }))
+        };
         let [s, p, o] = statement.map(|t| snapshot.lookup(t).map(TermId::raw));
         // A term the store doesn't hold can still be in an entailed statement (every
         // individual is an owl:Thing); the tests have no id to ask with.

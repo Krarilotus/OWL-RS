@@ -91,8 +91,7 @@ pub async fn execute_query_in(
     use axum::http::HeaderValue;
     let status: std::sync::Arc<std::sync::Mutex<Option<HeaderValue>>> = Default::default();
     let slot = std::sync::Arc::clone(&status);
-    let report = move |r: Option<nrese_sparql::Completeness>, kept: Option<std::sync::Arc<str>>| {
-        let r = told(r);
+    let report = move |r: nrese_store::Claim, kept: Option<std::sync::Arc<str>>| {
         let made = kept.is_none().then(|| r.header());
         let text = kept.as_deref().or(made.as_deref()).unwrap_or_default();
         let value =
@@ -100,7 +99,6 @@ pub async fn execute_query_in(
         *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(value);
         made
     };
-    let scoped = request.inference_scope_dataset;
     let mut response = stream_blocking(
         Pace::Total(deadline),
         cancellation,
@@ -131,7 +129,7 @@ pub async fn execute_query_in(
                         .map_err(|error| map_query_error(&policy, error))?;
                     (explanation_json(&explanation), explanation.completeness)
                 };
-                if scoped {
+                if let Some(completeness) = completeness {
                     report(completeness, None);
                 }
                 return serde_json::to_writer(out, &body)
@@ -170,24 +168,17 @@ pub async fn execute_query_in(
 }
 
 /// The header that says whether the answers are sound and complete, and why not
-/// ([`nrese_sparql::Completeness::header`]; docs/design/ql-rewriting.md §7).
+/// (docs/design/ql-rewriting.md §7).
 pub const COMPLETENESS: &str = "nrese-completeness";
 
-/// What a read with no status is told: `complete`, no reasoning path can leave its answers
-/// out (the store's `None`). The query's header, EXPLAIN and the plan all say it through
-/// here, so they never say different things of one read.
-fn told(status: Option<nrese_sparql::Completeness>) -> nrese_sparql::Completeness {
-    status.unwrap_or_default()
-}
-
-/// The JSON form of an answer's status, as the query's header tells it ([`told`]): the
-/// shared status ([`nrese_sparql::Completeness`]), the bounds' counts where known, and
-/// what decided it (`decided_by`, the DL bounds' paths).
+/// The JSON form of the claim also used for the header, with the bounds' counts and paths.
 fn completeness_json(
-    status: Option<&nrese_sparql::Completeness>,
+    status: Option<&nrese_store::Claim>,
     decided_by: &[&'static str],
 ) -> serde_json::Value {
-    let c = told(status.cloned());
+    let Some(c) = status else {
+        return serde_json::Value::Null;
+    };
     serde_json::json!({
         "status": c.as_str(),
         "regime": c.regime.map(|r| r.as_str()),
@@ -246,7 +237,7 @@ fn explanation_json(explanation: &nrese_store::Explanation) -> serde_json::Value
 
 /// What the OWL 2 QL rewriting did and whether the answers are complete (`null` where it
 /// doesn't apply).
-fn ql_json(report: Option<&nrese_sparql::ql::QlReport>) -> serde_json::Value {
+fn ql_json(report: Option<&nrese_sparql::ql::QlReport<nrese_store::Claim>>) -> serde_json::Value {
     report.map_or(serde_json::Value::Null, |r| {
         serde_json::json!({
             "completeness": r.completeness.as_str(),

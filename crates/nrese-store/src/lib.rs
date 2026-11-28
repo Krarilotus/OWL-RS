@@ -113,8 +113,7 @@ pub use nrese_engine::{
 pub use nrese_engine::{RestoreReport, RestoreStop};
 pub use nrese_shacl::{ValidationReport, ValidationResult};
 pub use nrese_sparql::{
-    CancellationToken, Explanation, PlanStep, PlannedQuery, PlannedStep, QueryEvaluationError,
-    SearchScope,
+    CancellationToken, PlanStep, PlannedStep, QueryEvaluationError, SearchScope,
 };
 pub use process_settings::{ProcessSettings, apply_process_settings, process_settings};
 pub use quarantine::{
@@ -126,6 +125,9 @@ pub use query::{
     SparqlQueryRequest,
 };
 pub use query_executor::PreparedQuery;
+pub use service::Claim;
+pub type Explanation = nrese_sparql::Explanation<Claim>;
+pub type PlannedQuery = nrese_sparql::PlannedQuery<Claim>;
 pub use rdf_io::{ChargedQuads, convert_file, parse_payload};
 pub use reasoning::{InferenceStep, MaterialisationReport, OntologyDiagnostic};
 pub use reasoning_state::{ConsistencyStatus, ReasoningState, WhyUndecided};
