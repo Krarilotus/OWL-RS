@@ -24,6 +24,7 @@ struct Storage {
 }
 
 const ARC_HEADER: usize = 2 * size_of::<usize>();
+const INLINE_RUN_LIMIT: usize = 2;
 
 impl TripleVersion {
     /// Builds a set from triples in any order, ignoring duplicates.
@@ -116,10 +117,9 @@ impl TripleVersion {
     /// Builds one compaction of this version. The returned operation splices the result
     /// into a current version if the inputs still match, preserving any later appends.
     ///
-    /// A writer using `inline_only` normally builds only small windows. Once there are more
-    /// than 16 runs it also takes a deferred window, bounding the backlog when the background
-    /// compactor cannot keep up. If that build cannot be charged, its caller can refuse the
-    /// staged version and keep the old readers' runs.
+    /// A writer using `inline_only` takes small windows and forces a suffix merge when its
+    /// append would publish more than two runs. If the merge cannot be charged, its caller can
+    /// refuse the staged version and keep the old readers' runs.
     pub fn compact(
         &self,
         policy: CompactionPolicy,
@@ -128,22 +128,30 @@ impl TripleVersion {
         Option<impl FnOnce(&Self) -> Result<Option<Self>, BudgetExceeded> + Send + use<>>,
         BudgetExceeded,
     > {
-        let Some(plan) = policy.plan(&self.0.index.runs) else {
+        let runs = &self.0.index.runs;
+        let sized = policy
+            .plan(runs)
+            .filter(|plan| !inline_only || policy.is_inline(plan));
+        let window = if inline_only && runs.len() > INLINE_RUN_LIMIT {
+            let start = INLINE_RUN_LIMIT - 1;
+            let start = sized.map_or(start, |plan| start.min(plan.window.start));
+            Some(start..runs.len())
+        } else {
+            sized.map(|plan| plan.window)
+        };
+        let Some(window) = window else {
             return Ok(None);
         };
-        if inline_only && self.0.index.runs.len() <= 16 && !policy.is_inline(&plan) {
-            return Ok(None);
-        }
-        let merged = merge_triples(&self.0.index.runs[plan.window.clone()], &self.0.budget)?;
+        let merged = merge_triples(&runs[window.clone()], &self.0.budget)?;
         let captured = self.clone();
         Ok(Some(move |current: &Self| {
             let index = &current.0.index;
-            if !index.retains(&captured.0.index, plan.window.clone()) {
+            if !index.retains(&captured.0.index, window.clone()) {
                 return Ok(None);
             }
-            let len = index.runs.len() - plan.window.len() + usize::from(merged.entries() != 0);
+            let len = index.runs.len() - window.len() + usize::from(merged.entries() != 0);
             current
-                .with_index(len, || index.with_compacted(plan.window, merged))
+                .with_index(len, || index.with_compacted(window, merged))
                 .map(Some)
         }))
     }
@@ -310,8 +318,8 @@ mod tests {
         assert_eq!(budget.used(), 0);
     }
 
-    /// §4.3c R5. Signed summaries report zero after a large retract even when
-    /// compaction of the two runs is deferred.
+    /// §4.3c R5. Signed summaries report zero after a large retract. The writer
+    /// enforces its cap even with background compaction delayed.
     #[test]
     fn triple_predicate_counts_are_exact_during_deferred_compaction() {
         let budget = Arc::new(Budget::unlimited());
@@ -321,12 +329,39 @@ mod tests {
         for _ in 0..4 {
             let pinned = latest.successor(&facts, &[]).unwrap();
             latest = pinned.successor(&[], &facts).unwrap();
-            assert!(latest.compact(policy, true).unwrap().is_none());
             assert_eq!(latest.count_predicate(P), 0);
             assert_eq!(latest.count_predicate(P + 1), 1);
             assert_eq!(pinned.count_predicate(P), facts.len());
+            let compact = latest
+                .compact(policy, true)
+                .unwrap()
+                .expect("the writer enforces the cap");
+            latest = compact(&latest).unwrap().unwrap();
+            assert!(latest.0.index.runs.len() <= 2);
         }
         assert!(!latest.any_counted(PREDICATE, &|_| true).unwrap());
+    }
+
+    /// §4.3c R5. A new run can exceed the cap without making a size-tiered window.
+    #[test]
+    fn triple_writer_compacts_at_the_cap_even_without_a_size_tier() {
+        let budget = Arc::new(Budget::unlimited());
+        let policy = CompactionPolicy::default();
+        let base = TripleVersion::build((0..10_000).map(|s| [s, P, 1]), &budget).unwrap();
+        let middle: Vec<_> = (10_000..10_100).map(|s| [s, P, 1]).collect();
+        let pinned = base.successor(&middle, &[]).unwrap();
+        let last = [10_100, P, 1];
+        let next = pinned.successor(&[last], &[]).unwrap();
+        assert!(!next.needs_compaction(policy));
+        let compact = next
+            .compact(policy, true)
+            .unwrap()
+            .expect("the cap selects a suffix");
+        let next = compact(&next).unwrap().unwrap();
+        assert_eq!(next.0.index.runs.len(), 2);
+        assert_eq!(next.len(), 10_101);
+        assert!(next.contains(last));
+        assert!(!pinned.contains(last));
     }
 
     /// §4.3c R7. Compaction completes after a writer appends another delta.
