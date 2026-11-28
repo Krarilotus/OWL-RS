@@ -170,6 +170,22 @@ fn a_rebuild_after_the_version_is_taken_does_not_mix_revisions() {
     };
     let x = id("urn:test:x");
     let rdf_type = id(RDF_TYPE);
+    let before = [x, rdf_type, id("urn:test:Before")];
+    let after = [x, rdf_type, id("urn:test:After")];
+    let contains_program_fact = |snapshot: &Snapshot, fact| {
+        ReadBasis::upper(snapshot)
+            .expect("published bounds")
+            .upper
+            .expect("published program")
+            .program
+            .facts
+            .iter()
+            .any(|(t, _)| *t == fact)
+    };
+    assert!(contains_program_fact(&old, before));
+    assert!(!contains_program_fact(&old, after));
+    assert!(!contains_program_fact(&current, before));
+    assert!(contains_program_fact(&current, after));
     assert_eq!(
         (
             in_view(old_upper, [x, rdf_type, id("urn:test:Before")]),
