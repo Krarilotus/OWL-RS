@@ -147,7 +147,7 @@ fn read_basis_registration_gap_keeps_the_published_program() {
     );
 }
 
-// Spec: docs/spec/reasoning-semantics.md:21 and :135. The QL rules cannot decide the negated
+// Spec: docs/spec/reasoning-semantics.md:159. The QL rules cannot decide the negated
 // equality in this fixture by refutation. Absence of that proof supplies no negative verdict.
 #[test]
 fn read_basis_rules_that_cannot_refute_give_no_entailment_verdict() {
@@ -172,43 +172,76 @@ fn read_basis_rules_that_cannot_refute_give_no_entailment_verdict() {
 }
 
 // Spec: docs/spec/02-storage-and-transactions.md:24 and docs/spec/reasoning-semantics.md:86.
-// A query's rewriting report describes its own schema, even after a hazardous axiom is removed.
+// An unreasoned write to a previously reasoned store publishes the new data without vouching
+// for its closure, even when the inferred stack is empty.
 #[test]
-fn read_basis_ql_schema_forgets_a_deleted_axiom() {
-    let pipeline = pipeline(
-        ReasoningMode::Owl2Ql,
-        ":p1 rdfs:subPropertyOf :p0 . :i1 owl:sameAs :i0 .",
+fn an_unreasoned_commit_keeps_the_need_for_certification() {
+    let store = Arc::new(StoreService::new(StoreConfig::in_memory()).expect("store"));
+    store.use_reasoning_rules(Some(nrese_reasoner::rulesets::Ruleset::Owl2Ql.into()));
+    let writer = MutationPipeline::new(
+        Arc::clone(&store),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Disabled,
+        ))),
     );
-    let store = pipeline.store();
-    let query = SparqlQueryRequest::all(format!("{PREFIXES} SELECT ?x ?o WHERE {{ ?x :p0 ?o }}"));
-    let read = || {
-        store
-            .execute_query(&query)
-            .expect("query")
+    writer
+        .execute_update_str(&format!("{PREFIXES} INSERT DATA {{ :alice :p :value }}"))
+        .expect("unreasoned commit");
+    assert_uncertified_fact(&store, "alice");
+}
+
+// Spec: docs/spec/02-storage-and-transactions.md:24 and docs/spec/reasoning-semantics.md:86.
+// A replica publishes each incoming record with its own evidence. The rows are readable
+// immediately, and the replica cannot vouch for the closure it received.
+#[test]
+fn an_applied_log_record_keeps_the_replicas_need_for_certification() {
+    let dir = tempfile::tempdir().expect("primary directory");
+    let primary = MutationPipeline::new(
+        Arc::new(StoreService::new(StoreConfig::on_disk(dir.path())).expect("primary")),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Disabled,
+        ))),
+    );
+    let replica = StoreService::new(StoreConfig {
+        replica: true,
+        ..StoreConfig::in_memory()
+    })
+    .expect("replica");
+    replica.use_reasoning_rules(Some(nrese_reasoner::rulesets::Ruleset::Owl2Ql.into()));
+    for subject in ["alice", "bob"] {
+        primary
+            .execute_update_str(&format!(
+                "{PREFIXES} INSERT DATA {{ :{subject} :p :value }}",
+            ))
+            .expect("primary commit");
+        let after = replica.current_revision();
+        let batch = primary
+            .store()
+            .replication_log(after, 1 << 20)
+            .expect("log");
+        let applied = replica
+            .apply_replication_log(
+                &batch.frames,
+                &batch.expectation(after),
+                &nrese_exec::stop::StopSource::none(),
+            )
+            .expect("apply record");
+        assert_eq!(applied.revision, after + 1);
+        assert_uncertified_fact(&replica, subject);
+    }
+}
+
+fn assert_uncertified_fact(store: &StoreService, subject: &str) {
+    let query = SparqlQueryRequest::all(format!("{PREFIXES} ASK {{ :{subject} :p :value }}"));
+    let answer = store.execute_query(&query).expect("query");
+    let payload: serde_json::Value = serde_json::from_slice(&answer.payload).expect("ASK JSON");
+    assert_eq!(payload["boolean"], true, "{subject}");
+    assert_eq!(
+        answer
             .completeness
-            .expect("report")
-    };
-    let before = read();
-    pipeline
-        .execute_update_str(&format!(
-            "{PREFIXES} DELETE DATA {{ :p1 rdfs:subPropertyOf :p0 }}"
-        ))
-        .expect("delete subproperty axiom");
-    let after = read();
-    let names_deleted_axiom =
-        |text: &str| text.contains("an axiom outside the profile equates individuals");
-    assert!(
-        !after
-            .reasons
-            .iter()
-            .any(|reason| names_deleted_axiom(&reason.text)),
-        "later query still named the deleted axiom: {after:?}"
-    );
-    assert!(
-        before
-            .reasons
-            .iter()
-            .any(|reason| names_deleted_axiom(&reason.text)),
-        "the live axiom should be reported: {before:?}"
+            .as_deref()
+            .map(nrese_sparql::Completeness::as_str),
+        Some("not-certified"),
+        "{subject}",
     );
 }
