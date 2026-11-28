@@ -7,9 +7,6 @@ use super::gaps::EntryPoint;
 use crate::incremental_tests::{Rng, fuzz};
 
 const SAME_AS: &str = "http://www.w3.org/2002/07/owl#sameAs";
-/// Restriction for the known gaps `sameas-insert-unchecked` and `sameas-removal-unchecked`,
-/// removed with them: a step changes no `owl:sameAs`; the start state may hold some.
-const STEPS_CHANGE_SAME_AS: bool = false;
 /// Restriction for the known gap `shapes-change-repeats-shared-result`, removed with it: a
 /// drawn case is left out whole, before any comparison, where full validation through the
 /// shapes change entry point reports a new result more than once (one result reached by two
@@ -44,7 +41,7 @@ pub(super) fn case(index: u64) -> Case {
             match rng.below(4) {
                 0 => add(&mut asserted, quad(rng, false, false)),
                 1 => remove(&mut asserted, rng),
-                2 => add(&mut inferred, quad(rng, true, STEPS_CHANGE_SAME_AS)),
+                2 => add(&mut inferred, quad(rng, true, true)),
                 _ => remove(&mut inferred, rng),
             }
         }
@@ -97,11 +94,8 @@ fn add(current: &mut Vec<Quad>, quad: Quad) {
 }
 
 fn remove(current: &mut Vec<Quad>, rng: &mut Rng) {
-    let removable = (0..current.len())
-        .filter(|&i| STEPS_CHANGE_SAME_AS || current[i].predicate.as_str() != SAME_AS)
-        .collect::<Vec<_>>();
-    if !removable.is_empty() {
-        current.swap_remove(removable[rng.below(removable.len() as u64) as usize]);
+    if !current.is_empty() {
+        current.swap_remove(rng.below(current.len() as u64) as usize);
     }
 }
 

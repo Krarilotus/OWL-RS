@@ -2,34 +2,6 @@
 # only its own case, step, entry point and kind, with exactly these counts, once per run.
 
 [[gap]]
-id = "sameas-insert-unchecked"
-says = "With the sameAs classes expanded on read, the change check starts from an inferred owl:sameAs insert alone and misses the maxCount result the alias brings to its target."
-limits = "docs/limits.md#shacl"
-case = "row:equality-add-pos"
-step = 1
-entry = "C1"
-kind = "result"
-direction = "missed"
-witness = "sameas-insert-unchecked.toml"
-
-[gap.delta]
-'ResultKey { focus: Rdf(NamedNode(NamedNode { iri: "http://example.com/n0" })), path: Some(Predicate(NamedNode { iri: "http://example.com/p0" })), value: None, shape: Rdf(NamedNode(NamedNode { iri: "http://example.com/Q" })), constraint: None, component: NamedNode { iri: "http://www.w3.org/ns/shacl#MaxCountConstraintComponent" }, severity: NamedNode { iri: "http://www.w3.org/ns/shacl#Violation" }, messages: [] }' = { expected = 1, actual = 0 }
-
-[[gap]]
-id = "sameas-removal-unchecked"
-says = "With the sameAs classes expanded on read, the change check starts from a removed inferred owl:sameAs alone and misses the minCount result the lost support brings to its target."
-limits = "docs/limits.md#shacl"
-case = "row:equality-remove-pos"
-step = 1
-entry = "C1"
-kind = "result"
-direction = "missed"
-witness = "sameas-removal-unchecked.toml"
-
-[gap.delta]
-'ResultKey { focus: Rdf(NamedNode(NamedNode { iri: "http://example.com/n0" })), path: Some(Predicate(NamedNode { iri: "http://example.com/p0" })), value: None, shape: Rdf(NamedNode(NamedNode { iri: "http://example.com/Q" })), constraint: None, component: NamedNode { iri: "http://www.w3.org/ns/shacl#MinCountConstraintComponent" }, severity: NamedNode { iri: "http://www.w3.org/ns/shacl#Violation" }, messages: [] }' = { expected = 1, actual = 0 }
-
-[[gap]]
 id = "shapes-change-repeats-shared-result"
 says = "A shapes change keeps every later result absent before, so one new result reached from two targets is reported twice."
 case = "row:shapes-shared-target"
