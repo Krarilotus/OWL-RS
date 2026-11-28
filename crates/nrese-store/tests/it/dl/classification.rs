@@ -356,6 +356,11 @@ fn an_irregular_el_ontology_whose_thing_is_unsatisfiable_is_inconsistent() {
     assert_eq!(report.engine, "el");
     assert!(report.complete(), "{:?}", report.incomplete);
     assert_eq!(report.consistency, nrese_store::dl::Verdict::Inconsistent);
+    assert!(
+        report.claim.consistency_reason().is_some(),
+        "{}",
+        report.claim.header()
+    );
     assert!(report.subsumptions.is_empty() && report.unsatisfiable.is_empty());
 }
 

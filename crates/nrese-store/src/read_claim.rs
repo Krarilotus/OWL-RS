@@ -47,8 +47,12 @@ impl std::ops::Deref for Claim {
 
 impl Claim {
     fn lower(&mut self, source: &'static str, reason: &str) {
-        self.reported = true;
         self.status.complete = false;
+        self.note(source, reason);
+    }
+
+    fn note(&mut self, source: &'static str, reason: &str) {
+        self.reported = true;
         if !self
             .status
             .reasons
@@ -153,6 +157,7 @@ pub(crate) enum RulesEntailment {
 impl StoreService {
     pub(crate) fn assess(&self, at: Revision<'_>, evidence: Evidence<'_>) -> Claim {
         let snapshot = at.snapshot();
+        let printing = matches!(&evidence, Evidence::Printed { .. });
         let query = match &evidence {
             Evidence::Query { prepared, .. } | Evidence::DlQuery { prepared, .. } => {
                 Some(prepared.reads())
@@ -285,10 +290,16 @@ impl StoreService {
             None
         };
         if let Some(reason) = consistency_reason {
-            let newly_incomplete = claim.complete;
-            claim.lower("consistency", reason);
-            if newly_incomplete && let Some(query) = query {
-                crate::dl::query::negation_rule(&mut claim.status, query, "consistency");
+            // A clash can leave query rows missing. It can also be the complete
+            // answer of a service that decides whether the ontology has a model.
+            if printing || query.is_some() {
+                let newly_incomplete = claim.complete;
+                claim.lower("consistency", reason);
+                if newly_incomplete && let Some(query) = query {
+                    crate::dl::query::negation_rule(&mut claim.status, query, "consistency");
+                }
+            } else {
+                claim.note("consistency", reason);
             }
         }
         if let Some(cache) = header_cache {
