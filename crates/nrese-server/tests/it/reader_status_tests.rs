@@ -50,11 +50,7 @@ fn quarantined_ql_app() -> TestResult<Router> {
     let reasoner = ReasonerConfig::for_mode(ReasoningMode::Owl2Ql);
     store.rematerialise(reasoner.materialised_program().unwrap())?;
     assert!(store.is_quarantined());
-    Ok(crate::support::test_app_with_store(
-        store,
-        Default::default(),
-        reasoner,
-    )?)
+    crate::support::test_app_with_store(store, Default::default(), reasoner)
 }
 
 /// The consistency reason survives a competing query reason in the claim header and

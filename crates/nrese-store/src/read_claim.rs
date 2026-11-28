@@ -316,7 +316,7 @@ impl StoreService {
             None
         };
         if let Some(reason) = consistency_reason {
-            let source = if reason == DL_CLASH {
+            let source = if reason == DL_CLASH && dl_query {
                 "dl"
             } else {
                 "consistency"

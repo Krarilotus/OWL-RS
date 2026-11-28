@@ -1801,7 +1801,7 @@ impl Snapshot {
 
     /// Whether a statement of `model` at `predicate` and `graph` has a value literal
     /// other than a plain or language-tagged string. `None` in either position means any.
-    /// Probe the three object ID ranges in the asserted and stored inferred indexes.
+    /// Use the asserted and stored inferred runs' signed counts.
     /// Equality can change the default graph's predicate to its representative, but
     /// expanding class members is unnecessary for finding the literal kinds.
     /// A stopped check has no answer.
@@ -1812,38 +1812,10 @@ impl Snapshot {
         graph: Option<TermId>,
         visit: crate::Visitor<'_>,
     ) -> Result<bool, crate::Stopped> {
-        use crate::TermKind::{DateTime, DerivedInteger, Integer, TypedLiteral};
-        let probe = |stack,
-                     predicate: Option<TermId>,
-                     graph: Option<TermId>|
-         -> Result<_, crate::Stopped> {
-            let permutation = match (graph, predicate) {
-                (Some(_), Some(_)) => Permutation::Gpos,
-                (Some(_), None) => Permutation::Gosp,
-                (None, Some(_)) => Permutation::Posg,
-                (None, None) => Permutation::Ospg,
-            };
-            let pattern = QuadPattern {
-                predicate,
-                graph: graph.map_or(GraphSelector::Any, GraphSelector::Exact),
-                ..QuadPattern::all()
-            };
-            let mut plan = AccessPlan::in_permutation(&pattern, permutation)
-                .expect("graph and predicate form the prefix");
-            let object = usize::from(graph.is_some()) + usize::from(predicate.is_some());
-            let index = self.version.stack(stack);
-            for (first, last) in [
-                (Integer, DateTime),
-                (TypedLiteral, TypedLiteral),
-                (DerivedInteger, DerivedInteger),
-            ] {
-                plan.low[object] = TermId::kind_range(first).0.raw();
-                plan.high[object] = TermId::kind_range(last).1.raw();
-                if index.any_plan_counted(&plan, visit)? {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
+        let probe = |stack, predicate, graph| {
+            self.version
+                .stack(stack)
+                .holds_typed_literals(predicate, graph, visit)
         };
         let asserted = model.includes(Stack::Asserted);
         if asserted && probe(Stack::Asserted, predicate, graph)? {

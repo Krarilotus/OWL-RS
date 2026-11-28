@@ -15,6 +15,36 @@ fn term(n: u64) -> TermId {
     TermId::new(TermKind::Iri, n + 1)
 }
 
+/// The spelling check sees the literal evidence on its own version and in its own
+/// graphs. Deleting the last value literal in a graph removes its evidence.
+#[test]
+fn typed_literal_evidence_follows_scoped_versions_and_compaction() {
+    let (subject, predicate, readable, hidden) = (term(0), term(1), term(2), term(3));
+    let object = TermId::new(TermKind::Integer, 9);
+    let visible = EncodedQuad::new(subject, predicate, object, readable);
+    let invisible = EncodedQuad::new(subject, predicate, object, hidden);
+    let held = IndexVersion::from_quads(Layout::Quads, vec![visible, invisible]);
+    let current = held.with_delta(&[], &[visible]);
+    let packed = super::compaction::merge_runs(current.runs());
+    let compacted = current.with_compacted(0..current.runs().len(), packed);
+    for index in [&current, &compacted] {
+        assert!(
+            !index
+                .holds_typed_literals(Some(predicate), Some(readable), &|_| true)
+                .unwrap()
+        );
+        assert!(
+            index
+                .holds_typed_literals(Some(predicate), None, &|_| true)
+                .unwrap()
+        );
+    }
+    assert!(
+        held.holds_typed_literals(Some(predicate), Some(readable), &|_| true)
+            .unwrap()
+    );
+}
+
 /// Main-store point and subject/predicate reads count both range bounds.
 /// A single packed block takes 11 units at the lower bound and 14 at the upper bound.
 #[test]

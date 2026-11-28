@@ -38,9 +38,9 @@ use keys::PackedKeys;
 use merge::SignedMerge;
 use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
 pub(crate) use run::Forms;
-use run::{PermutationRun, Run};
+use run::{PermutationRun, Run, VALUE_LITERAL_RANGES};
 
-use crate::quad::{AccessPlan, EncodedQuad, Key, Permutation, QuadPattern};
+use crate::quad::{AccessPlan, EncodedQuad, GraphSelector, Key, Permutation, QuadPattern};
 use crate::term::{ChargedArc, TermId};
 use crate::visit::{Account, Free, Ledger};
 
@@ -264,6 +264,68 @@ pub(crate) struct IndexVersion<R = Arc<Run>> {
 }
 
 impl IndexVersion {
+    /// Sum literal evidence across the immutable runs, including deletion signs.
+    /// A charged temporary run has no summary and is checked in its own key ranges.
+    pub(crate) fn holds_typed_literals(
+        &self,
+        predicate: Option<TermId>,
+        graph: Option<TermId>,
+        visit: crate::Visitor<'_>,
+    ) -> Result<bool, crate::Stopped> {
+        let mut count = 0;
+        for run in &*self.runs {
+            if !visit(1) {
+                return Err(crate::Stopped);
+            }
+            count += match run.literal_delta(predicate, graph) {
+                Some(delta) => delta,
+                None => self
+                    .literal_range_delta(run, predicate, graph, visit)
+                    .ok_or(crate::Stopped)?,
+            };
+        }
+        Ok(count > 0)
+    }
+
+    fn literal_range_delta(
+        &self,
+        run: &Run,
+        predicate: Option<TermId>,
+        graph: Option<TermId>,
+        visit: crate::Visitor<'_>,
+    ) -> Option<i64> {
+        let permutation = match (graph, predicate) {
+            (Some(_), Some(_)) => Permutation::Gpos,
+            (Some(_), None) => Permutation::Gosp,
+            (None, Some(_)) => Permutation::Posg,
+            (None, None) => Permutation::Ospg,
+        };
+        let pattern = QuadPattern {
+            predicate,
+            graph: graph.map_or(GraphSelector::Any, GraphSelector::Exact),
+            ..QuadPattern::all()
+        };
+        let plan = AccessPlan::in_permutation(&pattern, permutation)
+            .expect("graph and predicate form the prefix");
+        let object = usize::from(graph.is_some()) + usize::from(predicate.is_some());
+        let mut count = 0;
+        for (first, last) in VALUE_LITERAL_RANGES {
+            let mut range = plan;
+            range.low[object] = TermId::kind_range(first).0.raw();
+            range.high[object] = TermId::kind_range(last).1.raw();
+            let Some(range) = self.layout.adapt(&range) else {
+                return Some(0);
+            };
+            let perm = run.permutation(range.permutation);
+            let (start, end) = perm
+                .keys
+                .range_counted(&range.low, &range.high, &mut { visit })?;
+            let deleted = perm.tombstones_in_visiting(start, end, visit)? as i64;
+            count += (end - start) as i64 - 2 * deleted;
+        }
+        Some(count)
+    }
+
     pub(crate) fn empty(layout: Layout) -> Self {
         Self {
             layout,
@@ -289,7 +351,8 @@ impl IndexVersion {
                 tombstones: Box::default(),
             };
         }
-        Ok(Self::empty(layout).with_run(Run::from_permutations(layout, perms)))
+        Ok(Self::empty(layout)
+            .with_run(Run::from_permutations(layout, perms).with_literal_counts()))
     }
 
     /// The visible keys of `permutation` as one packed array: the run's own array when the
@@ -398,8 +461,8 @@ impl IndexVersion {
     /// [`Self::with_delta_in`] charged to `held`, a reservation of `budget` (DUR-6): the list
     /// of runs made once (with the base's runs in the quad layout, shared and counted in
     /// `forms`, where the delta needs it, not charged: they are the store's). Below the
-    /// parallel threshold, `bounded`, the delta's run is built as [`Run::from_delta`] builds
-    /// it, within the [`Self::change_bound`] the caller has charged to `held` first; not
+    /// parallel threshold, `bounded`, the delta's run is built without its publication
+    /// summary, within the [`Self::change_bound`] the caller has charged to `held` first; not
     /// `bounded`, with [`Run::from_delta_within`], every array charged to `held` before it is
     /// made (the reference: refused only where exact charging is). At or above the threshold,
     /// with [`Run::from_delta_within_parallel`], its charge then taken into `held`. The new
@@ -424,7 +487,7 @@ impl IndexVersion {
         let (run, kept) = match Run::charged_exactly(n) {
             false if !bounded => (Run::from_delta_within(layout, inserts, deletes, held)?, 0),
             false => {
-                let run = Run::from_delta(layout, inserts, deletes);
+                let run = Run::from_delta_without_literal_counts(layout, inserts, deletes);
                 let kept = run.memory_bytes() as usize;
                 debug_assert!(
                     kept <= Run::delta_bound(layout, n),

@@ -80,7 +80,7 @@ pub(crate) fn merge_runs(runs: &[Arc<Run>]) -> Run {
     let perms = build_all(layout, total as usize, |p| {
         PermutationRun::from_sorted(signed_entries(runs, p).collect())
     });
-    Run::from_permutations(layout, perms)
+    Run::from_permutations(layout, perms).with_literal_counts()
 }
 
 fn signed_entries(
