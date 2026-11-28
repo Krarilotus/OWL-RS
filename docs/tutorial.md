@@ -48,15 +48,41 @@ curl -i http://localhost:8080/dataset/update --data-urlencode 'update=
 HTTP/1.1 400 Bad Request
 content-type: application/problem+json
 
-{"detail":"the commit introduces 1 SHACL result(s) and 0 failure(s); first: focus node <http://example.org/felix>, <http://www.w3.org/ns/shacl#MinCountConstraintComponent>",
- "reasoner_reject":null,"request_id":"63f55350-5736-4b00-a1d4-1f63e22b0fe4","status":400,
- "title":"SHACL Reject","type":"https://nrese.dev/problems/shacl-reject"}
+{
+  "type": "https://nrese.dev/problems/shacl-reject",
+  "title": "SHACL Reject",
+  "status": 400,
+  "detail": "the commit introduces 1 SHACL result(s) the gate rejects; first: focus node <http://example.org/felix>, <http://www.w3.org/ns/shacl#MinCountConstraintComponent>",
+  "reasoner_reject": {
+    "summary": "the commit introduces 1 SHACL result(s) the gate rejects; first: focus node <http://example.org/felix>, <http://www.w3.org/ns/shacl#MinCountConstraintComponent>",
+    "violated_constraint": "http://www.w3.org/ns/shacl#MinCountConstraintComponent",
+    "focus_resource": "<http://example.org/felix>",
+    "likely_commit_trigger": null,
+    "commit_attribution": null,
+    "evidence": []
+  },
+  "shacl": {
+    "results": [{
+      "focusNode": "http://example.org/felix",
+      "resultPath": "http://example.org/name",
+      "value": null,
+      "sourceShape": "_:b3",
+      "sourceConstraintComponent": "http://www.w3.org/ns/shacl#MinCountConstraintComponent",
+      "resultSeverity": "http://www.w3.org/ns/shacl#Violation",
+      "resultMessage": []
+    }],
+    "results_omitted": 0,
+    "failures": [],
+    "failures_omitted": 0
+  },
+  "request_id": "63f55350-5736-4b00-a1d4-1f63e22b0fe4"
+}
 ```
 
-Three more headers are left out here, and the body, which comes as one line, is broken between
-its fields; the `detail` line is left whole. It reads
-`the commit introduces 1 SHACL result(s) and 0 failure(s); first: focus node <http://example.org/felix>, <http://www.w3.org/ns/shacl#MinCountConstraintComponent>`:
-`ex:felix` is the focus node, and `sh:minCount` the constraint it fails.
+The response body is formatted here for readability. The request ID and the stored
+blank-node label for `sourceShape` can vary. The result names `ex:felix` as the focus
+node and `sh:minCount` as the constraint it fails. Its `resultPath` points to the
+missing property, `ex:name`.
 
 Nothing of the rejected commit remains, so the query still answers no rows. With a name, the
 commit passes:

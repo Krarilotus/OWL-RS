@@ -38,6 +38,9 @@ use crate::{RejectKind, StoreService};
 pub(crate) struct Gate {
     pub checked: Checked,
     pub reject: Option<crate::MutationReject>,
+    pub record_verdict: bool,
+    /// The certificate's witness if the gate searched, including an unfinished search.
+    pub ill_typed: Option<crate::service::IllTyped>,
 }
 
 /// Runs `check` with a [`Cancel`] that fires when `cancelled` does (a cancelled commit).
@@ -110,8 +113,12 @@ fn budget_of(
     }
 }
 
+/// Why a proof with no clash still leaves consistency unknown when an ill-typed literal is held.
+pub(crate) const ILL_TYPED: &str =
+    "no clash is found, but the data hold an ill-typed literal, which OWL 2 doesn't admit";
+
 /// Checks the state `tx` would commit. Where U1 after the commit proves it consistent
-/// ([`super::bounds::Preparation`]), nothing more runs: the cost of the U1's change.
+/// ([`super::bounds::Preparation`]), the cost is U1's change and the ill-typed witness search.
 /// Otherwise O(asserted statements) for reading the ontology (unless the preparation
 /// read it), plus the engine's work.
 pub(crate) fn check_commit(
@@ -124,6 +131,8 @@ pub(crate) fn check_commit(
     memory: &nrese_exec::Envelope,
 ) -> Gate {
     let deadline = Deadline::after(store.config().dl.timeout);
+    let stop = || cancelled() || deadline.passed();
+    let rules = matches!(preparation.prepared, super::bounds::Prepared::Rules(_));
     if store.config().dl.consistency == DlConsistency::Off {
         return Gate {
             checked: Checked {
@@ -132,36 +141,45 @@ pub(crate) fn check_commit(
                 elapsed: Duration::ZERO,
             },
             reject: None,
+            record_verdict: !rules || preparation.proves_consistency,
+            ill_typed: None,
         };
     }
     // On the RL route in quarantine, or on a base nobody vouched for, the rules prove nothing,
     // and their gate has admitted the commit on its own facts, as off the route: no DL check.
-    let rules = matches!(preparation.prepared, super::bounds::Prepared::Rules(_));
-    if preparation.proves_consistency || rules {
+    let mut gate = if preparation.proves_consistency || rules {
         let verdict = match preparation.proves_consistency {
             true => Verdict::Consistent,
             false => Verdict::Unknown("the rules assessed no clean closure at the base".to_owned()),
         };
-        return Gate {
+        Gate {
             checked: Checked {
                 verdict,
                 engine: preparation.decided_by,
                 elapsed: Duration::ZERO,
             },
             reject: None,
+            record_verdict: preparation.proves_consistency,
+            ill_typed: None,
+        }
+    } else {
+        cancellable(&stop, |cancel| {
+            let budget = budget(store, Some(cancel), memory);
+            check_with_budget(store, tx, preparation, view, then, &budget, deadline)
+        })
+    };
+    if gate.checked.verdict == Verdict::Consistent {
+        let found = super::bounds::find_ill_typed_after(store, tx, &stop);
+        gate.ill_typed = Some(found);
+        gate.checked.verdict = match found {
+            Some(None) => Verdict::Consistent,
+            Some(Some(_)) => Verdict::Unknown(ILL_TYPED.to_owned()),
+            None => Verdict::Unknown(super::query::UNCHECKED.to_owned()),
         };
+        // An unfinished search leaves the verdict for the next read.
+        gate.record_verdict = found.is_some();
     }
-    cancellable(&|| cancelled() || deadline.passed(), |cancel| {
-        check_with_budget(
-            store,
-            tx,
-            preparation,
-            view,
-            then,
-            &budget(store, Some(cancel), memory),
-            deadline,
-        )
-    })
+    gate
 }
 
 /// What the commit changes, where the revision before was consistent and it changes
@@ -219,6 +237,8 @@ fn check_with_budget(
                 elapsed: started.elapsed(),
             },
             reject: None,
+            record_verdict: true,
+            ill_typed: None,
         };
     }
     // The check's memory: the request's envelope, its reading of the ontology included.
@@ -238,6 +258,8 @@ fn check_with_budget(
                             elapsed: started.elapsed(),
                         },
                         reject: None,
+                        record_verdict: true,
+                        ill_typed: None,
                     };
                 }
             }
@@ -250,10 +272,22 @@ fn check_with_budget(
         .unwrap_or_else(|| {
             consistency::check_naming(ontology, &budget, &|t| consistency::named(tx, t))
         });
+    #[cfg(test)]
+    let checked = if TABLEAU_FINDS_MODEL.replace(false) {
+        assert_eq!(checked.engine, "hypertableau", "{checked:?}");
+        Checked {
+            verdict: Verdict::Consistent,
+            ..checked
+        }
+    } else {
+        checked
+    };
     if checked.verdict != Verdict::Inconsistent {
         return Gate {
             checked,
             reject: None,
+            record_verdict: true,
+            ill_typed: None,
         };
     }
     // Inconsistent after the commit: rejected unless it was so before (quarantine).
@@ -275,11 +309,18 @@ fn check_with_budget(
         return Gate {
             checked,
             reject: None,
+            record_verdict: true,
+            ill_typed: None,
         };
     }
     rejection(
         ontology, view, then, checked, operation, deadline, treatments,
     )
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TABLEAU_FINDS_MODEL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// What a restricted committer is told of a rejection ([`crate::mutation::evidence`]),
@@ -343,6 +384,7 @@ fn rejection(
             }),
             detail,
             attribution: None,
+            shacl: None,
         }
     };
     let reject = view.reject(full, |view| {
@@ -353,6 +395,8 @@ fn rejection(
     Gate {
         checked,
         reject: Some(reject),
+        record_verdict: true,
+        ill_typed: None,
     }
 }
 

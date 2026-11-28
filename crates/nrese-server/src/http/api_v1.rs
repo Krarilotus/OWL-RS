@@ -686,7 +686,7 @@ struct ReasoningRun {
     revision: u64,
     asserted: u64,
     inferred: u64,
-    /// The consistency violations found: 0 exactly when the data is consistent.
+    /// Violations found by the materialisation rules. A count of zero means the rules found none.
     violations: usize,
     /// Their list stopped at its memory budget: `violations` is a lower bound.
     violations_at_least: bool,

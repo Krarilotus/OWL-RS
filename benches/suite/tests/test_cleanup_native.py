@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from suitekit import runtime  # noqa: E402
 
-READS = ("benches/suite/suitekit/__init__.py", "benches/suite/suitekit/lock.py",
+READS = ("benches/suite/suitekit/__init__.py", "benches/suite/suitekit/hosts.py", "benches/suite/suitekit/lock.py",
          "benches/suite/suitekit/ns.py", "benches/suite/suitekit/runtime.py")
 
 

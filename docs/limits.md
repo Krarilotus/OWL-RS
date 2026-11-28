@@ -38,6 +38,8 @@ come with. What is in is on
 - `HAVING` may name a `SELECT` alias, an extension ([why](ops/http-api.md#sparql)). For
   a query that runs the same on other stores, repeat the aggregate:
   `HAVING (COUNT(?x) > 1)`.
+- Integers of any size order and compare by value, but arithmetic (`+`, `-`, `*`, `/`, `SUM`,
+  `AVG`) on an integer beyond signed 64 bits is an overflow error (unbound), never a wrong number.
 - A default graph merged from several graphs keeps a blank node they share as one node,
   where SPARQL's RDF merge keeps them apart ([why](ops/http-api.md#sparql)). No setting
   gives the standard merge. Where it matters, read with `GRAPH ?g { … }` and keep `?g` in
@@ -561,6 +563,13 @@ leave something out.
 - The commit gate is off by default, and when it is on, it checks only what a commit introduces
   ([configuration](ops/config-reference.md)). To check data already stored, validate it
   with `GET /dataset/shacl`.
+- The gate counts the affected nodes it holds across nested shapes against the memory the
+  write may use. A write has no limit of its own: it draws on the memory all running requests
+  share. A commit whose check needs more than is left there is refused without applying the
+  write, even in `report` mode. Commits that used to be accepted while holding more than that
+  can now be refused. To give them more room, raise
+  [`budgets.total_query_memory`](ops/config-reference.md#budgets.total_query_memory)
+  (`NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES`, by default half the machine's memory).
 - A rebuild of the inferences passes no gate: a change of the rules, the rebuild at a start, the
   one after a load or an import, and one asked for (`POST …/reasoning/rematerialise`) store
   their inferences without checking them against the shapes, and

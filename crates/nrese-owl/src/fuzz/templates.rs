@@ -470,7 +470,9 @@ mod tests {
         let mut drawn = std::collections::BTreeMap::new();
         for seed in 0..200 {
             let mut case = case(&mut Rng::new(seed), &sig, Profile::sroiq());
-            crate::diagnostics::check_global_restrictions(&mut case.ontology);
+            let mut found = Vec::new();
+            crate::diagnostics::check_global_restrictions(&case.ontology, false, &mut found);
+            case.ontology.diagnostics.extend(found);
             let broken: Vec<&Diagnostic> = case
                 .ontology
                 .diagnostics

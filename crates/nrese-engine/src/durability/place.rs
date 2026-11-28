@@ -52,6 +52,13 @@ pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
             format!("syncing {} failed (a fault point's)", dir.display()),
         ));
     }
+    #[cfg(feature = "fault-points")]
+    if crate::fault_points::counted_dir_sync_fails(dir) {
+        return Err(std::io::Error::other(format!(
+            "syncing {} failed (a counted fault point's)",
+            dir.display()
+        )));
+    }
     #[cfg(unix)]
     return fs::File::open(dir)?.sync_all();
     #[cfg(windows)]

@@ -1,14 +1,18 @@
 use std::borrow::Cow;
+use std::io;
+use std::sync::Arc;
 
 use axum::Json;
+use axum::body::Bytes;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use nrese_reasoner::RejectExplanation;
+use nrese_exec::Reservation;
 use serde::Serialize;
 use thiserror::Error;
 
 use crate::reject_view::RejectExplanationView;
-use nrese_store::{RejectAttribution, RejectKind};
+use nrese_store::service::UndecidedReason;
+use nrese_store::{MutationReject, RejectKind, ShaclRefusal, UndecidedCause};
 
 #[derive(Clone, Debug, Error)]
 pub enum ApiError {
@@ -22,6 +26,7 @@ pub enum ApiError {
         kind: RejectKind,
         detail: String,
         reject: Box<Option<RejectExplanationView>>,
+        shacl: Option<Arc<ShaclRefusal>>,
     },
     #[error("unauthorized: {0}")]
     Unauthorized(String, Option<&'static str>),
@@ -31,6 +36,9 @@ pub enum ApiError {
     NotFound(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    /// The SHACL gate couldn't use the repository's stored shapes (409).
+    #[error("{0}")]
+    ShaclShapesUnusable(String),
     /// Exact answers asked for (`dl-answers=exact`) that can't be proven complete (422).
     #[error("incomplete answer: {0}")]
     IncompleteAnswer(Box<nrese_store::IncompleteAnswer>),
@@ -81,18 +89,14 @@ impl ApiError {
         self
     }
 
-    pub fn rejected(
-        kind: RejectKind,
-        message: impl Into<String>,
-        reject: Option<RejectExplanation>,
-        commit_attribution: Option<RejectAttribution>,
-    ) -> Self {
+    pub fn rejected(reject: MutationReject) -> Self {
         Self::Rejected {
-            kind,
-            detail: message.into(),
-            reject: Box::new(reject.as_ref().map(|reject| {
-                crate::reject_view::reject_view(reject, commit_attribution.as_ref())
+            kind: reject.kind,
+            detail: reject.detail,
+            reject: Box::new(reject.explanation.as_ref().map(|explanation| {
+                crate::reject_view::reject_view(explanation, reject.attribution.as_ref())
             })),
+            shacl: reject.shacl,
         }
     }
 
@@ -157,10 +161,29 @@ impl IntoResponse for ApiError {
         if let Self::Internal(detail) = &self {
             tracing::error!(%detail, "request failed on the server side");
         }
-        let rejected = match &self {
-            Self::Rejected { kind, .. } => Some(*kind),
-            _ => None,
-        };
+        if let Self::Rejected {
+            kind,
+            detail,
+            reject,
+            shacl,
+        } = self
+        {
+            let (slug, title) = reject_label(kind);
+            let body = ProblemJson {
+                r#type: Cow::Owned(format!("https://nrese.dev/problems/{slug}")),
+                title: Cow::Borrowed(title),
+                status: StatusCode::BAD_REQUEST.as_u16(),
+                detail,
+                reasoner_reject: *reject,
+                shacl: shacl.as_deref().map(crate::http::refusal_json),
+                undecided: (kind == RejectKind::Undecided(UndecidedCause::NoDecider))
+                    .then_some(UndecidedReason::NO_DECIDER),
+            };
+            return match shacl.as_deref() {
+                Some(refusal) => shacl_problem(body, refusal),
+                None => problem(StatusCode::BAD_REQUEST, &body),
+            };
+        }
         if let Self::IncompleteAnswer(answer) = self {
             return incomplete_answer(&answer);
         }
@@ -176,6 +199,7 @@ impl IntoResponse for ApiError {
             );
         }
         let rights_changed = matches!(self, Self::RightsChanged(_));
+        let shapes_unusable = matches!(self, Self::ShaclShapesUnusable(_));
         if let Self::Busy(detail) = self {
             let mut response = Self::ServiceUnavailable(detail).into_response();
             response
@@ -187,8 +211,8 @@ impl IntoResponse for ApiError {
             Self::Unauthorized(_, challenge) => *challenge,
             _ => None,
         };
-        let (status, detail, reasoner_reject) = match self {
-            Self::BadRequest(detail) => (StatusCode::BAD_REQUEST, detail, None),
+        let (status, detail) = match self {
+            Self::BadRequest(detail) => (StatusCode::BAD_REQUEST, detail),
             Self::BadRequestPlainText(detail) => {
                 let mut response = (StatusCode::BAD_REQUEST, detail).into_response();
                 response
@@ -197,40 +221,41 @@ impl IntoResponse for ApiError {
                 response.extensions_mut().insert(Verbatim);
                 return response;
             }
-            Self::Rejected { detail, reject, .. } => (StatusCode::BAD_REQUEST, detail, *reject),
-            Self::Unauthorized(detail, _) => (StatusCode::UNAUTHORIZED, detail, None),
-            Self::Forbidden(detail) => (StatusCode::FORBIDDEN, detail, None),
-            Self::NotFound(detail) => (StatusCode::NOT_FOUND, detail, None),
-            Self::Conflict(detail) => (StatusCode::CONFLICT, detail, None),
-            Self::IncompleteAnswer(_) | Self::Busy(_) | Self::NotImplemented(..) => {
+            Self::Unauthorized(detail, _) => (StatusCode::UNAUTHORIZED, detail),
+            Self::Forbidden(detail) => (StatusCode::FORBIDDEN, detail),
+            Self::NotFound(detail) => (StatusCode::NOT_FOUND, detail),
+            Self::Conflict(detail) | Self::ShaclShapesUnusable(detail) => {
+                (StatusCode::CONFLICT, detail)
+            }
+            Self::Rejected { .. }
+            | Self::IncompleteAnswer(_)
+            | Self::Busy(_)
+            | Self::NotImplemented(..) => {
                 unreachable!("answered above")
             }
-            Self::Gone(detail) => (StatusCode::GONE, detail, None),
-            Self::NotAcceptable(detail) => (StatusCode::NOT_ACCEPTABLE, detail, None),
-            Self::UnsupportedMediaType(detail) => {
-                (StatusCode::UNSUPPORTED_MEDIA_TYPE, detail, None)
-            }
-            Self::PayloadTooLarge(detail) => (StatusCode::PAYLOAD_TOO_LARGE, detail, None),
-            Self::TooManyRequests(detail) => (StatusCode::TOO_MANY_REQUESTS, detail, None),
-            Self::Timeout(detail) => (StatusCode::REQUEST_TIMEOUT, detail, None),
+            Self::Gone(detail) => (StatusCode::GONE, detail),
+            Self::NotAcceptable(detail) => (StatusCode::NOT_ACCEPTABLE, detail),
+            Self::UnsupportedMediaType(detail) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, detail),
+            Self::PayloadTooLarge(detail) => (StatusCode::PAYLOAD_TOO_LARGE, detail),
+            Self::TooManyRequests(detail) => (StatusCode::TOO_MANY_REQUESTS, detail),
+            Self::Timeout(detail) => (StatusCode::REQUEST_TIMEOUT, detail),
             Self::ServiceUnavailable(detail) | Self::RightsChanged(detail) => {
-                (StatusCode::SERVICE_UNAVAILABLE, detail, None)
+                (StatusCode::SERVICE_UNAVAILABLE, detail)
             }
-            Self::Internal(detail) => (StatusCode::INTERNAL_SERVER_ERROR, detail, None),
+            Self::Internal(detail) => (StatusCode::INTERNAL_SERVER_ERROR, detail),
         };
-        let (problem_type, title) = match rejected {
-            Some(reject) => {
-                let (slug, title) = reject_label(reject);
-                (
-                    Cow::Owned(format!("https://nrese.dev/problems/{slug}")),
-                    Cow::Borrowed(title),
-                )
-            }
-            None if rights_changed => (
+        let (problem_type, title) = if rights_changed {
+            (
                 Cow::Borrowed("https://nrese.dev/problems/rights-changed"),
                 Cow::Borrowed("Rights Changed"),
-            ),
-            None => kind(status),
+            )
+        } else if shapes_unusable {
+            (
+                Cow::Borrowed("https://nrese.dev/problems/shacl-shapes-unusable"),
+                Cow::Borrowed("SHACL Shapes Unusable"),
+            )
+        } else {
+            kind(status)
         };
         let mut response = problem(
             status,
@@ -239,7 +264,9 @@ impl IntoResponse for ApiError {
                 title,
                 status: status.as_u16(),
                 detail,
-                reasoner_reject,
+                reasoner_reject: None,
+                shacl: None,
+                undecided: None,
             },
         );
         if let Some(challenge) = challenge {
@@ -262,7 +289,7 @@ impl IntoResponse for ApiError {
 fn reject_label(kind: RejectKind) -> (&'static str, &'static str) {
     match kind {
         RejectKind::Inconsistent => ("reasoner-reject", "Reasoner Reject"),
-        RejectKind::Undecided => ("undecided-reject", "Undecided Reject"),
+        RejectKind::Undecided(_) => ("undecided-reject", "Undecided Reject"),
         RejectKind::ShapesViolated => ("shacl-reject", "SHACL Reject"),
         RejectKind::NotShown => ("commit-reject", "Commit Reject"),
     }
@@ -346,12 +373,72 @@ pub(crate) fn kind(status: StatusCode) -> (Cow<'static, str>, Cow<'static, str>)
 /// ([`Own`]). `body` writes a JSON object with at least one member and none named
 /// `request_id`: the envelope appends the request's id after its last member, unread.
 pub(crate) fn problem(status: StatusCode, body: &impl Serialize) -> Response {
-    let mut response = (status, Json(body)).into_response();
+    problem_media((status, Json(body)).into_response())
+}
+
+fn problem_media(mut response: Response) -> Response {
     response
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(PROBLEM_JSON));
     response.extensions_mut().insert(Own);
     response
+}
+
+/// Size the escaped JSON before allocating, reusing the refusal's reservation.
+/// Even if a top-up is refused, counts alone can report the gate's verdict.
+fn shacl_problem(mut body: ProblemJson<'_>, refusal: &ShaclRefusal) -> Response {
+    if let Some(response) = charged_shacl_problem(&body, refusal) {
+        return response;
+    }
+    body.reasoner_reject = None;
+    body.detail = refusal.count_detail.clone();
+    body.shacl = Some(crate::http::refusal_counts_json(refusal));
+    charged_shacl_problem(&body, refusal).unwrap_or_else(|| {
+        // If even the count-only response has no room, it is a bounded problem
+        // document: no result text, only the fixed fields and two integer counts.
+        problem(StatusCode::BAD_REQUEST, &body)
+    })
+}
+
+fn charged_shacl_problem(body: &ProblemJson<'_>, refusal: &ShaclRefusal) -> Option<Response> {
+    let mut length = JsonLength(0);
+    serde_json::to_writer(&mut length, body).ok()?;
+    let held = refusal.reserve_encoding(length.0).ok()?;
+    let mut bytes = Vec::with_capacity(length.0);
+    serde_json::to_writer(&mut bytes, body).ok()?;
+    debug_assert_eq!(bytes.len(), length.0);
+    let bytes = Bytes::from_owner(ChargedJson { bytes, _held: held });
+    Some(problem_media(
+        (StatusCode::BAD_REQUEST, bytes).into_response(),
+    ))
+}
+
+struct ChargedJson {
+    bytes: Vec<u8>,
+    _held: Reservation,
+}
+
+impl AsRef<[u8]> for ChargedJson {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+struct JsonLength(usize);
+
+impl io::Write for JsonLength {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .filter(|&length| length <= isize::MAX as usize)
+            .ok_or_else(|| io::Error::other("SHACL problem document too large"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Marks a problem document the server wrote itself ([`problem`]): the envelope layer
@@ -363,12 +450,16 @@ pub(crate) struct Own;
 pub(crate) const PROBLEM_JSON: &str = "application/problem+json";
 
 #[derive(Debug, Serialize)]
-struct ProblemJson {
+struct ProblemJson<'a> {
     r#type: Cow<'static, str>,
     title: Cow<'static, str>,
     status: u16,
     detail: String,
     reasoner_reject: Option<RejectExplanationView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shacl: Option<crate::http::RefusalJson<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    undecided: Option<UndecidedReason>,
 }
 
 #[cfg(test)]
@@ -393,8 +484,13 @@ mod tests {
     /// same whichever gate rejected (D16-503).
     #[tokio::test]
     async fn a_rejection_with_no_reason_shown_names_no_gate() {
-        let response =
-            ApiError::rejected(RejectKind::NotShown, "rejected", None, None).into_response();
+        let response = ApiError::Rejected {
+            kind: RejectKind::NotShown,
+            detail: "rejected".to_owned(),
+            reject: Box::new(None),
+            shacl: None,
+        }
+        .into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await

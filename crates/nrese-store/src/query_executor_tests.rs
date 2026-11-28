@@ -2,7 +2,6 @@ use super::*;
 use nrese_engine::{Engine, EngineConfig};
 use nrese_rdf_io::{RdfFormat, RdfParser};
 use nrese_sparql::QueryEvaluationError;
-use nrese_sparql::ql::{Closure, QlRewriting};
 use std::sync::Arc;
 
 struct CancellingWriter<'a> {
@@ -23,7 +22,12 @@ impl Write for CancellingWriter<'_> {
 }
 
 fn fixture() -> (Engine, PreparedQuery, StoreSettings) {
-    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let store = crate::StoreService::new(crate::StoreConfig {
+        ql_rewriting: crate::QlRewritingMode::On,
+        ..crate::StoreConfig::in_memory()
+    })
+    .unwrap();
+    let engine = store.engine().clone();
     let data = "@prefix : <http://example.org/> .
         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
         @prefix owl: <http://www.w3.org/2002/07/owl#> .
@@ -39,26 +43,10 @@ fn fixture() -> (Engine, PreparedQuery, StoreSettings) {
         "SELECT ?x WHERE { ?x <http://example.org/worksFor> ?y }",
     ))
     .unwrap();
-    let store = crate::StoreService::new(crate::StoreConfig {
-        ..crate::StoreConfig::in_memory()
-    })
-    .unwrap();
-    let settings = store.query_settings().clone();
-    // The QL rewriting comes with the version's certificate.
-    let rl = nrese_reasoner::ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Rl)
-        .materialised_program()
-        .expect("OWL 2 RL reasons");
-    let certificate = crate::service::Certificate {
-        state: crate::ReasoningState::of(&rl, 0),
-        ql: Some(Arc::new(QlRewriting::new(Closure { lists: true }))),
-        equality_closed: false,
-        dl: false,
-        user_rules: false,
-    };
-    engine
-        .transaction()
-        .install(None, Some(Arc::new(certificate)));
-    (engine, prepared, settings)
+    store
+        .rematerialise(nrese_reasoner::rulesets::Ruleset::Owl2Rl)
+        .expect("setup: QL rewriting over the RL closure");
+    (engine, prepared, store.query_settings().clone())
 }
 
 #[test]

@@ -40,7 +40,10 @@ pub mod visit;
 pub mod witness;
 
 pub use durability::checkpoint::image_revision;
-pub use durability::{DurabilityConfig, SyncPolicy, WalDamage, place};
+pub use durability::{
+    DurabilityConfig, RESTORE_PENDING, RestoreReport, RestoreStop, StoreLock, SyncPolicy,
+    WalDamage, check_unfinished_restore, place,
+};
 pub use engine::Certificate;
 pub use engine::{
     Admission, Applied, AssertedIdentity, BulkLoad, BulkMode, CommitNote, CommitPublication,

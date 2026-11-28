@@ -197,7 +197,8 @@ fn admissible<'n>(
             | nrese_owl::Unsupported::UniversalObjectProperty
             | nrese_owl::Unsupported::UncountedNegation
             | nrese_owl::Unsupported::TooWide
-            | nrese_owl::Unsupported::IrregularRoleHierarchy => false,
+            | nrese_owl::Unsupported::IrregularRoleHierarchy
+            | nrese_owl::Unsupported::RoleAutomatonOutsideRegularClass => false,
         };
         if !skipped {
             return Err(Unsupported::Normalisation { axiom, why });

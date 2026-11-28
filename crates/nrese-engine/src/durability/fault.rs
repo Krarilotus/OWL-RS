@@ -19,6 +19,12 @@ thread_local! {
     pub(crate) static FAIL_SEGMENT_PLACED: Cell<bool> = const { Cell::new(false) };
     /// Mapping a checkpoint just written fails.
     pub(crate) static FAIL_MAP: Cell<bool> = const { Cell::new(false) };
+    /// A version's install panics at its entry, before the current version changes, with
+    /// [`VERSION_INSTALL_PANIC`] (taken once).
+    pub(crate) static PANIC_AT_VERSION_INSTALL: Cell<bool> = const { Cell::new(false) };
+    /// A commit's publish closure panics as it builds the version, its record already in the
+    /// log, with [`COMMIT_PUBLISH_PANIC`] (taken once).
+    pub(crate) static PANIC_IN_COMMIT_PUBLISH: Cell<bool> = const { Cell::new(false) };
     /// Syncing `wal-cut/` after a copy is placed (or found) fails.
     pub(crate) static FAIL_CUT_DIR_SYNC: Cell<bool> = const { Cell::new(false) };
     /// The wall clock, microseconds since 1970, as commits on this thread read it.
@@ -62,6 +68,12 @@ pub(crate) fn resolution() -> std::io::Result<()> {
         false => Ok(()),
     }
 }
+
+/// What [`PANIC_AT_VERSION_INSTALL`]'s panic says.
+pub(crate) const VERSION_INSTALL_PANIC: &str = "a test's panic as a version is installed";
+
+/// What [`PANIC_IN_COMMIT_PUBLISH`]'s panic says.
+pub(crate) const COMMIT_PUBLISH_PANIC: &str = "a test's panic as a commit's version is built";
 
 /// What [`ON_DIR_SYNC`] calls.
 pub(crate) type DirSyncHook = Box<dyn FnMut(&std::path::Path)>;

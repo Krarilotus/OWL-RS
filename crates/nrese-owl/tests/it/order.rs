@@ -41,6 +41,8 @@ fn kind(d: &Diagnostic) -> &'static str {
         Diagnostic::SharedBlankNode { .. } => "SharedBlankNode",
         Diagnostic::UndeclaredProperty { .. } => "UndeclaredProperty",
         Diagnostic::NonSimpleProperty { .. } => "NonSimpleProperty",
+        Diagnostic::IrregularPropertyHierarchy { .. } => "IrregularPropertyHierarchy",
+        Diagnostic::GlobalRestriction { .. } => "GlobalRestriction",
         Diagnostic::AnonymousIndividual { .. } => "AnonymousIndividual",
         Diagnostic::Syntax { .. } => "Syntax",
         Diagnostic::RepeatedOperand => "RepeatedOperand",

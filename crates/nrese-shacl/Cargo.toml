@@ -26,6 +26,8 @@ nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
 nrese-exec = { path = "../nrese-exec", features = ["measure"] }
 # The measured tests' data directories.
 tempfile = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+toml = "0.9.8"
 
 [[test]]
 name = "w3c_shacl"

@@ -32,7 +32,7 @@ use nrese_reasoner::eval::Stop;
 use nrese_reasoner::ir::Triple;
 
 use super::source;
-use super::upper::{Change, GaveUp, Upper};
+use super::upper::{Change, GaveUp, ProgramFacts, Upper};
 use crate::StoreService;
 
 #[cfg(test)]
@@ -59,6 +59,8 @@ mod shapes_tests;
 /// work, for the store whose bounds it names.
 #[cfg(test)]
 pub(crate) mod seam {
+    use std::cell::RefCell;
+    use std::sync::Arc;
     use std::sync::Mutex;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +73,8 @@ pub(crate) mod seam {
         BuildDeadline,
         /// The TBox's taxonomy for a read, not begun.
         Taxonomy,
+        /// A read filtered the program facts and has yet to recheck the revision.
+        Eligible,
         /// A revision's read view, not begun.
         View,
         /// A commit's ontology read again, not begun.
@@ -80,6 +84,42 @@ pub(crate) mod seam {
     type Hook = Box<dyn FnOnce() + Send>;
     /// One hook a store and point: tests running at once, each on its own store, keep theirs.
     static HOOKS: Mutex<Vec<(usize, Point, Hook)>> = Mutex::new(Vec::new());
+
+    struct Probes {
+        store: Arc<super::StoreService>,
+        total: usize,
+        locked: usize,
+    }
+
+    thread_local! {
+        static PROBES: RefCell<Option<Probes>> = const { RefCell::new(None) };
+    }
+
+    /// Counts the read's probes on this thread, and which found its store's state locked.
+    pub(super) fn count_probes(
+        store: &Arc<super::StoreService>,
+        read: impl FnOnce(),
+    ) -> (usize, usize) {
+        PROBES.set(Some(Probes {
+            store: Arc::clone(store),
+            total: 0,
+            locked: 0,
+        }));
+        read();
+        let probes = PROBES.take().unwrap();
+        (probes.total, probes.locked)
+    }
+
+    pub(super) fn snapshot_probe() {
+        PROBES.with_borrow_mut(|probes| {
+            if let Some(probes) = probes {
+                probes.total += 1;
+                if probes.store.dl().bounds.state.try_lock().is_err() {
+                    probes.locked += 1;
+                }
+            }
+        });
+    }
 
     fn key(bounds: &super::Bounds) -> usize {
         std::ptr::from_ref(bounds) as usize
@@ -111,8 +151,8 @@ pub(crate) mod seam {
 struct State {
     revision: u64,
     /// Shared only with the commit computing its change ([`prepare`]), which lets go
-    /// before [`install`] changes it in place: a read takes what it needs of U1 under the
-    /// bounds' state, never keeping it.
+    /// before [`install`] changes it in place. A read keeps only the immutable
+    /// [`ProgramFacts`] while filtering outside the lock.
     upper: Result<Arc<Upper>, GaveUp>,
     /// How U1 got to this revision: `delta` (the delta executor), `rebuilt` (compiled
     /// and evaluated afresh on commit), `read` (afresh for a query), `kept` (U1 gave up
@@ -136,6 +176,8 @@ struct State {
 struct Slot {
     current: Option<State>,
     floor: u64,
+    // The report survives a U1 eviction or a commit that did not read the ontology.
+    anonymous: Option<(u64, Option<String>)>,
 }
 
 impl std::ops::Deref for Slot {
@@ -146,6 +188,21 @@ impl std::ops::Deref for Slot {
 }
 
 impl Slot {
+    fn record_anonymous(&mut self, revision: u64, read: Option<Option<String>>) {
+        if self
+            .anonymous
+            .as_ref()
+            .is_some_and(|(at, _)| *at > revision || (*at == revision && read.is_none()))
+        {
+            return;
+        }
+        let note = match read {
+            Some(note) => note.map(|text| format!("{text} as of revision {revision}")),
+            None => self.anonymous.take().and_then(|(_, note)| note),
+        };
+        self.anonymous = Some((revision, note));
+    }
+
     fn get_mut(&mut self) -> Option<&mut State> {
         self.current.as_mut()
     }
@@ -184,22 +241,14 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// The route the ontology's profile gives (`nrese_owl::profile`): an OWL 2 RL ontology (its
-/// data's literals of RL's datatypes too) to the RL rules alone, unless an axiom's rules
-/// would compare or type data values: the rule set leaves out dt-eq and dt-type2
-/// (`nrese_owl::ql::reads_data_values`), so the DL path decides it by value; or where theorem
-/// PR1 doesn't hold, which needs no punning and no annotation-property axioms
-/// (`query::reads_differently` says what that costs); or unless a cardinality is spelled
-/// otherwise than the rules name it (`Ontology::noncanonical_cardinality`), so they
-/// wouldn't read it, or a statement the rules don't read was read as axioms they would
-/// (`Ontology::rules_unread`). Its callers also leave the route where the closure leaves out
-/// a list axiom (`StoreService::lists_left_out`): the rules lack that axiom's conclusions,
-/// and PR1's premise doesn't hold.
+/// data's literals of RL's datatypes too) to the RL rules alone where the premise of their
+/// closure holds, the graph exactly the mapping of what the reader read
+/// (`nrese_owl::profile::premise`, the one place that tells it; `query::reads_differently`
+/// says what a break costs). Its callers also leave the route where the closure leaves out
+/// a list axiom (`StoreService::lists_left_out`), the store's own: the rules lack that
+/// axiom's conclusions.
 fn routed_to_rules(ontology: &Ontology) -> bool {
-    nrese_owl::profile::of_ontology(ontology).rl
-        && nrese_owl::ql::reads_data_values(ontology).is_none()
-        && !nrese_owl::profile::rules_read_differently(ontology)
-        && ontology.noncanonical_cardinality.is_none()
-        && ontology.rules_unread.is_none()
+    nrese_owl::profile::of_ontology(ontology).rl && nrese_owl::profile::premise(ontology).exact()
 }
 
 /// What the RL route was decided on: the TBox signature as the reader typed it, the
@@ -274,7 +323,7 @@ impl Kinds {
         if self.cell(tx, s) || self.cell(tx, o) {
             return false;
         }
-        if self.shacl.contains(&p) || (k.annotations.contains(&p) && !named(tx, p, false)) {
+        if self.shacl.contains(&p) || (k.annotations.contains(&p) && !named(tx, p, None)) {
             return true;
         }
         if changes_schema(tx, triple)
@@ -384,6 +433,19 @@ impl Bounds {
     pub(crate) fn kept(&self) -> &Arc<nrese_exec::Budget> {
         self.kept
             .get_or_init(|| Arc::new(nrese_exec::Budget::unlimited()))
+    }
+
+    pub(super) fn anonymous(&self, revision: u64) -> Option<String> {
+        lock(&self.state)
+            .anonymous
+            .as_ref()
+            .filter(|(at, _)| *at == revision)
+            .and_then(|(_, note)| note.clone())
+    }
+
+    pub(super) fn publish_anonymous(&self, revision: u64, ontology: &Ontology) {
+        let report = anonymous_report(ontology);
+        lock(&self.state).record_anonymous(revision, Some(report));
     }
 
     /// Whether the commit `tx` keeps the RL route its base is on ([`route_kept`]), by the kinds
@@ -674,6 +736,8 @@ pub(crate) enum Prepared {
 /// consistency.
 pub(crate) struct Preparation {
     base: u64,
+    // A full read with no finding replaces an earlier note; no read keeps it.
+    anonymous: Option<Option<String>>,
     pub prepared: Prepared,
     /// U1 after the commit proves the data consistent (or, on the RL route, the RL
     /// rules do: [`Preparation::decided_by`]; only where they assessed the base's own
@@ -685,6 +749,16 @@ pub(crate) struct Preparation {
     /// The ontology the commit leaves, where the preparation had to read it (for the
     /// consistency check, which then needn't read it again).
     pub ontology: Option<Ontology>,
+}
+
+impl Preparation {
+    pub(crate) fn record_gate_anonymous(&mut self) {
+        if self.anonymous.is_none()
+            && let Some(ontology) = &self.ontology
+        {
+            self.anonymous = Some(anonymous_report(ontology));
+        }
+    }
 }
 
 /// Prepares U1 for the commit `tx` (after the RL reasoning applied its changes): the
@@ -730,6 +804,7 @@ pub(crate) fn prepare(
             prepared: Prepared::Rules(Arc::clone(kinds)),
             proves_consistency: rules_prove(tx.base()),
             decided_by: "rules",
+            anonymous: None,
             ontology: None,
         };
     }
@@ -761,6 +836,7 @@ pub(crate) fn prepare(
                                 && upper.reads_every_value(&change)
                                 && upper.clashes_after(&change) == 0,
                             prepared: Prepared::Delta(Box::new(change)),
+                            anonymous: None,
                             ontology: None,
                         };
                     }
@@ -774,6 +850,7 @@ pub(crate) fn prepare(
                             ))),
                             decided_by: "upper-bound",
                             proves_consistency: false,
+                            anonymous: None,
                             ontology: None,
                         };
                     }
@@ -787,6 +864,7 @@ pub(crate) fn prepare(
                     prepared: Prepared::Unavailable,
                     decided_by: "upper-bound",
                     proves_consistency: false,
+                    anonymous: None,
                     ontology: None,
                 };
             }
@@ -806,11 +884,12 @@ pub(crate) fn prepare(
             ))))),
             decided_by: "upper-bound",
             proves_consistency: false,
+            anonymous: None,
             ontology: None,
         };
     };
-    let fatal = ontology.diagnostics.iter().any(|d| d.is_fatal());
-    if routed_to_rules(&ontology) && !fatal && !lists_left_out {
+    let anonymous = Some(anonymous_report(&ontology));
+    if routed_to_rules(&ontology) && !lists_left_out {
         // The RL gate that ran before has decided the commit's consistency.
         let lookup = |iri: &str| tx.lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into());
         return Preparation {
@@ -818,6 +897,7 @@ pub(crate) fn prepare(
             prepared: Prepared::Rules(Kinds::of(&ontology, &lookup)),
             proves_consistency: rules_prove(tx.base()),
             decided_by: "rules",
+            anonymous,
             ontology: None,
         };
     }
@@ -836,26 +916,36 @@ pub(crate) fn prepare(
         decided_by: "upper-bound",
         proves_consistency: upper.as_ref().is_ok_and(Upper::proves_consistency),
         prepared: Prepared::Rebuilt(Box::new(upper)),
+        anonymous,
         ontology: Some(ontology),
     }
 }
 
-/// Whether a statement's subject or object is a reserved name, which the reader leaves out,
-/// or it names a SHACL property (`nrese_owl::shacl_properties`) anywhere, which can change
+/// Whether a statement's subject or object is a name the reader leaves out in its place, or
+/// it names a SHACL property (`nrese_owl::shacl_properties`) anywhere, which can change
 /// whether the reader reads SHACL content as content or as any other statement
-/// (`Ontology::shacl`).
+/// (`Ontology::shacl`). The object of `rdf:type` is a class's place
+/// (`nrese_owl::diagnostics::reserved_name`); the subject, and any other object, is taken as
+/// an individual's (`reserved_as_individual`, which also refuses `owl:Thing` and the five
+/// other names OWL 2 gives a class or a property). Where the reader reads such a statement
+/// otherwise (an annotation's subject, OWL's vocabulary) that only reads again.
 fn reserved_named(tx: &impl PendingView, [s, p, o]: Triple) -> bool {
-    named(tx, s, true) || named(tx, o, true) || named(tx, p, false)
+    use nrese_owl::diagnostics::{reserved_as_individual, reserved_name};
+    let object: fn(&str) -> bool = if iri(tx, p).is_some_and(|p| p == RDF_TYPE) {
+        reserved_name
+    } else {
+        reserved_as_individual
+    };
+    named(tx, s, Some(reserved_as_individual)) || named(tx, o, Some(object)) || named(tx, p, None)
 }
 
-/// Whether the term `t` is a SHACL property (`nrese_owl::shacl_properties`) or, with
-/// `reserved`, a reserved name (`nrese_owl::diagnostics::reserved_name`).
-fn named(tx: &impl PendingView, t: u64, reserved: bool) -> bool {
+/// Whether the term `t` is a SHACL property (`nrese_owl::shacl_properties`) or one `reserved`
+/// leaves out.
+fn named(tx: &impl PendingView, t: u64, reserved: Option<fn(&str) -> bool>) -> bool {
     match tx.decode(TermId::from_raw(t)) {
         Some(nrese_rdf::Term::NamedNode(n)) => {
             let iri = n.as_str();
-            nrese_owl::is_shacl_property(iri)
-                || (reserved && nrese_owl::diagnostics::reserved_name(iri))
+            nrese_owl::is_shacl_property(iri) || reserved.is_some_and(|reserved| reserved(iri))
         }
         _ => false,
     }
@@ -1001,6 +1091,8 @@ fn held_by_lower(
 }
 
 fn in_view(view: &Snapshot, [s, p, o]: Triple) -> bool {
+    #[cfg(test)]
+    seam::snapshot_probe();
     view.quads_for_pattern_in(
         ReadModel::Materialised,
         &nrese_engine::QuadPattern {
@@ -1018,6 +1110,9 @@ fn in_view(view: &Snapshot, [s, p, o]: Triple) -> bool {
 pub(crate) fn install(store: &StoreService, preparation: Preparation, revision: u64) {
     let bounds = &store.dl().bounds;
     let mut state = lock(&bounds.state);
+    if revision != preparation.base {
+        state.record_anonymous(revision, preparation.anonymous);
+    }
     match preparation.prepared {
         // Refused for memory: not kept, so a read of the revision builds it again (SYN-61);
         // the generation it would have replaced is superseded, and goes with its charge.
@@ -1204,7 +1299,7 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> ViewEnd {
         }
     };
     drop(stale);
-    // The bounds' U1 at the revision: its compilation, route, `rdf:type`, taxonomy.
+    // The bounds' U1 at the revision: its compilation, route, program facts and taxonomy.
     let found = {
         let state = lock(&bounds.state);
         match state.as_ref() {
@@ -1214,6 +1309,7 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> ViewEnd {
                 s.kinds.is_some(),
                 s.upper.as_ref().ok().map(|u| u.program.names.rdf_type),
                 s.taxonomy.clone(),
+                s.upper.as_deref().ok().map(|u| Arc::clone(u.facts())),
             )),
             _ => None,
         }
@@ -1225,7 +1321,7 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> ViewEnd {
         super::lower::memberships(snapshot, taxonomy, rdf_type, kept).ok()
     };
     let parts = match found {
-        Some((compiled, rules, rdf_type, kept_taxonomy)) => {
+        Some((compiled, rules, rdf_type, kept_taxonomy, facts)) => {
             let lower = match rdf_type {
                 Some(rdf_type) if !rules => {
                     // Held, with its charge, while its memberships are read.
@@ -1236,9 +1332,11 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> ViewEnd {
                 _ => Some(ChargedVec::new(Arc::clone(kept))),
             };
             match lower {
-                // Serial: what the view takes of U1, under the state (a commit's install
-                // may change U1 in place once it is let go).
                 Some(lower) => {
+                    let eligible = facts.and_then(|facts| eligible_facts(snapshot, &facts, kept));
+                    #[cfg(test)]
+                    seam::at(bounds, seam::Point::Eligible);
+                    // The stack may have moved on while the program facts were filtered.
                     let state = lock(&bounds.state);
                     let Some(s) = state
                         .as_ref()
@@ -1252,6 +1350,7 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> ViewEnd {
                         s.upper.as_deref(),
                         s.kinds.is_some(),
                         &lower,
+                        eligible,
                         kept,
                     )
                 }
@@ -1268,7 +1367,7 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> ViewEnd {
             // lets it go only when the taxonomy below reads this revision's, after the build
             // has read in its room (N1).
             store.dl().query_ontology.evict_below(revision);
-            let (upper, kinds) = afresh(store, snapshot);
+            let (upper, kinds, anonymous) = afresh(store, snapshot);
             let rules = kinds.is_some();
             let compiled = bounds.compiled();
             let taxonomy = match &upper {
@@ -1282,11 +1381,18 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> ViewEnd {
                 }
                 _ => Some(ChargedVec::new(Arc::clone(kept))),
             };
-            let parts = lower
-                .and_then(|lower| parts(snapshot, revision, upper.as_ref(), rules, &lower, kept));
+            let parts = lower.and_then(|lower| {
+                let upper = upper.as_ref();
+                let eligible = upper
+                    .ok()
+                    .and_then(|u| eligible_facts(snapshot, u.facts(), kept));
+                parts(snapshot, revision, upper, rules, &lower, eligible, kept)
+            });
             // A U1 a budget refused is not kept: the next read builds it again.
             let refused_upper = upper.as_ref().is_err_and(|g| g.refused);
             keep &= !refused_upper;
+            let mut slot = lock(&bounds.state);
+            slot.record_anonymous(revision, anonymous);
             if !refused_upper {
                 let last = match rules {
                     true => "rules",
@@ -1300,7 +1406,7 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> ViewEnd {
                     taxonomy: taxonomy.and_then(Result::ok),
                     kinds,
                 };
-                publish(&mut lock(&bounds.state), state);
+                publish(&mut slot, state);
             }
             parts
         }
@@ -1323,41 +1429,76 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> ViewEnd {
     ViewEnd::Kept(view)
 }
 
-/// Whether the RL rules prove `snapshot`'s data consistent: its version's certificate says
-/// they assessed this revision, as the rebuild that assessed it installed it or a gated commit
-/// carried it from its base (`tx.vouch`), and found no violation. No certificate (data loaded
-/// past the gates, a replica, a commit that didn't maintain the closure) or violations, decided
-/// or not, prove nothing. A field read of the version, no lock.
+/// The RL rules prove consistency only on a vouched DL version with a consistent assessment.
+/// An ill-typed literal can still make the DL verdict unknown ([`holds_ill_typed`]).
 pub(crate) fn rules_prove(snapshot: &Snapshot) -> bool {
-    crate::service::Certificate::of(snapshot).is_some_and(|c| c.dl && c.state.violations == 0)
+    use crate::service::Certificate;
+    Certificate::of(snapshot).is_some_and(|c| c.dl)
+        && Certificate::assessment(snapshot, false).rules == crate::ConsistencyStatus::Consistent
 }
+
+/// Whether `snapshot`'s version holds an ill-typed literal, which OWL 2 doesn't admit; `None`
+/// without a certificate, or where the search stopped (`Certificate::ill_typed`): undecided.
+pub(crate) fn holds_ill_typed(store: &StoreService, snapshot: &Snapshot) -> Option<bool> {
+    let memory = store.memory_stop();
+    let certificate = crate::service::Certificate::of(snapshot)?;
+    let found = certificate.ill_typed(snapshot, &|| memory.exceeded())?;
+    Some(found.is_some())
+}
+
+/// The literal `tx` leaves, starting from its base's witness. The gate's stop can leave it undecided.
+pub(crate) fn find_ill_typed_after(
+    store: &StoreService,
+    tx: &Transaction<'_>,
+    stopped: &dyn Fn() -> bool,
+) -> crate::service::IllTyped {
+    let memory = store.memory_stop();
+    let stop = || stopped() || memory.exceeded();
+    let base = crate::service::Certificate::of(tx.base())?.ill_typed(tx.base(), &stop)?;
+    super::query::ill_typed_after(tx, base, &stop)
+}
+
+fn anonymous_report(ontology: &Ontology) -> Option<String> {
+    ontology
+        .diagnostics
+        .iter()
+        .find(|d| {
+            matches!(d, nrese_owl::Diagnostic::AnonymousIndividual { axioms, .. } if axioms.iter().any(Option::is_some))
+        })
+        .map(|d| d.describe(&super::consistency::nameless))
+}
+
+type Rebuilt = (
+    Result<Upper, GaveUp>,
+    Option<Arc<Kinds>>,
+    Option<Option<String>>,
+);
 
 /// U1 compiled and evaluated afresh over `snapshot` (or, with the kinds it was decided on,
 /// the RL route's place).
-fn afresh(
-    store: &StoreService,
-    snapshot: &Snapshot,
-) -> (Result<Upper, GaveUp>, Option<Arc<Kinds>>) {
+fn afresh(store: &StoreService, snapshot: &Snapshot) -> Rebuilt {
     let replica = store.dl().replica();
     // U1's names are system vocabulary: the bounds keep them for every later read, so they
     // take shared ids (dictionary lifecycle V1), never a request's private ones.
+    let refused = |what| (Err(GaveUp::refused(source::refused(what))), None, None);
     if !replica && source::intern_system_vocabulary(store.engine()).is_err() {
-        return (
-            Err(GaveUp::refused(source::refused("the vocabulary"))),
-            None,
-        );
+        return refused("the vocabulary");
     }
     let latest = store.engine().snapshot();
     let kept = Arc::clone(store.dl().bounds.kept());
     let ontology = match source::read_snapshot(snapshot, kept, &store.config().dl.treatments) {
         Ok(ontology) => ontology,
-        Err(_) => return (Err(GaveUp::refused(source::refused("the revision"))), None),
+        Err(_) => return refused("the revision"),
     };
-    let fatal = ontology.diagnostics.iter().any(|d| d.is_fatal());
-    if routed_to_rules(&ontology) && !fatal && !store.lists_left_out(snapshot) {
+    let anonymous = Some(anonymous_report(&ontology));
+    if routed_to_rules(&ontology) && !store.lists_left_out(snapshot) {
         let lookup =
             |iri: &str| snapshot.lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into());
-        return (Err(not_compiled()), Some(Kinds::of(&ontology, &lookup)));
+        return (
+            Err(not_compiled()),
+            Some(Kinds::of(&ontology, &lookup)),
+            anonymous,
+        );
     }
     let normalised = nrese_owl::normalise(&ontology);
     let deadline = Deadline::after(store.config().dl.timeout);
@@ -1385,7 +1526,7 @@ fn afresh(
     let kept = store.dl().bounds.kept();
     let upper = Upper::build(&ontology, &normalised, snapshot, &resolve, &stop, kept)
         .map_err(|gave_up| gave_up.by_memory(&memory_hit));
-    (upper, None)
+    (upper, None, anonymous)
 }
 
 /// A taxonomy for a read: kept, with its charge, or (`Err`) one only this read uses, never
@@ -1571,10 +1712,29 @@ fn assemble(snapshot: &Snapshot, parts: Parts, kept: &Arc<nrese_exec::Budget>) -
     (view, true)
 }
 
-/// What a view of `revision` takes of U1 and of L's memberships `lower` (sorted, each once):
-/// serial, nothing waited for (U1-I): one pass over U1's facts, each with the searches of
-/// [`held_by_lower`], then one over the members of the gap signature's classes. Its copies
-/// are charged to `kept` as they grow (SYN-61); `None` where it can't take them.
+/// The program facts the stack and snapshot don't already supply, for this revision.
+fn eligible_facts(
+    snapshot: &Snapshot,
+    facts: &ProgramFacts,
+    kept: &Arc<nrese_exec::Budget>,
+) -> Option<ChargedVec<Triple>> {
+    let mut eligible = ChargedVec::new(Arc::clone(kept));
+    let ProgramFacts { triples, classes } = facts;
+    for &t in triples {
+        // The stack already holds the representative form of facts that touch a class.
+        if t.into_iter().any(|id| classes.class_of(id).is_some()) || in_view(snapshot, t) {
+            continue;
+        }
+        eligible.push(t).ok()?;
+    }
+    Some(eligible)
+}
+
+/// What a view of `revision` takes of U1 and of L's memberships `lower` (sorted, each once).
+/// [`eligible_facts`] filters the program facts before the maintained read rechecks the
+/// revision. Here one serial pass over the stack and eligible facts checks [`held_by_lower`],
+/// then a pass over the gap signature's class members expands it (U1-I). Copies are charged
+/// to `kept` as they grow (SYN-61). Returns `None` where they don't fit.
 ///
 /// Each structure's form in subject, predicate and class object:
 /// - `lower`, L's memberships beyond the RL closure: as derived, by member.
@@ -1596,6 +1756,7 @@ fn parts(
     upper: Result<&Upper, &GaveUp>,
     rules: bool,
     lower: &[Triple],
+    eligible: Option<ChargedVec<Triple>>,
     kept: &Arc<nrese_exec::Budget>,
 ) -> Option<Parts> {
     let empty = || ChargedVec::new(Arc::clone(kept));
@@ -1646,6 +1807,7 @@ fn parts(
             });
         }
     };
+    let eligible = eligible?;
     let rdf_type = upper.program.names.rdf_type;
     let clash = upper.program.names.clash;
     let encode = |[s, p, o]: Triple| {
@@ -1705,11 +1867,12 @@ fn parts(
             Some(over)
         }
     };
-    let mut triples = ChargedVec::with_capacity(Arc::clone(kept), upper.stack.len()).ok()?;
-    for [s, p, o] in upper.stack.iter() {
+    let capacity = upper.stack.len().checked_add(eligible.len())?;
+    let mut triples = ChargedVec::with_capacity(Arc::clone(kept), capacity).ok()?;
+    let mut take = |[s, p, o]: Triple| {
         // L's memberships from the taxonomy are certain: no gap.
         if held_by_lower(lower, classes, [s, p, o]) {
-            continue;
+            return Some(());
         }
         for t in [s, p, o] {
             if upper.is_internal(t) {
@@ -1717,7 +1880,7 @@ fn parts(
             }
         }
         if p == clash {
-            continue;
+            return Some(());
         }
         // By representative here; by member once every fact is seen ([`by_member`]).
         if p == rdf_type {
@@ -1731,8 +1894,12 @@ fn parts(
                 view.named_gap_predicates.insert(p);
             }
         }
-        triples.push(encode([s, p, o])).ok()?;
+        triples.push(encode([s, p, o])).ok()
+    };
+    for t in upper.stack.iter().chain(eligible.iter().copied()) {
+        take(t)?;
     }
+    drop(eligible);
     for signature in [
         &mut view.gap_classes,
         &mut view.gap_predicates,

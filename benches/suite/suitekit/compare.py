@@ -509,8 +509,10 @@ def compare_cases(base: dict[str, dict], new: dict[str, dict], min_ms: float, ou
 def identity(machine: dict | None, started: str | None) -> dict | None:
     """A run's host, the configuration in force when it started (hosts.toml `config`), and
     the governor it read; None for a report that doesn't say (a perf-lab report)."""
-    if not machine or not started:
+    if not isinstance(machine, dict) or not machine:
         return None
+    if not started or not (machine.get("host") or machine.get("host_key")):
+        return {"overlay": machine["overlay"]} if machine.get("overlay") is not None else None
     return hosts.run_identity(machine, started)
 
 
@@ -519,7 +521,8 @@ def host_check(base: list[dict | None], new: list[dict | None], allow: bool) -> 
     a side). A difference refuses the comparison (exit 2) unless `allow`: then it is flagged
     and the comparison goes on. None when nothing stands in the way."""
     problems = []
-    known = [i for i in base + new if i is not None]
+    evidence = base + new
+    known = [i for i in evidence if i and "host" in i]
     if len(known) < len(base) + len(new):
         problems.append("unknown host for some runs (a report without its machine): not checked")
     hosts_seen = {(i["host"], i["config"]) for i in known}
@@ -531,12 +534,24 @@ def host_check(base: list[dict | None], new: list[dict | None], allow: bool) -> 
     governors = {i["governor"] for i in known if i.get("governor")}
     if len(governors) > 1:
         problems.append("the runs read different CPU governors: " + ", ".join(sorted(governors)))
+    overlays = {str(i.get("overlay")) for i in evidence if i}
+    bad_overlay = any(not hosts.valid_identity(i.get("overlay")) for i in evidence if i)
+    missing_overlay = any(i and i.get("overlay") is not None for i in evidence) and len(known) != len(evidence)
+    if missing_overlay:
+        problems.append("some contributing runs lack the machine metadata needed to verify the private overlay")
+    if bad_overlay:
+        problems.append("some runs have no verifiable private overlay identity")
+    if len(overlays) > 1:
+        problems.append("the runs' hosts came from different private overlays: " + ", ".join(sorted(overlays)))
     blocking = [p for p in problems if not p.startswith("unknown host")]
     if not problems:
         return None
     print("## Host configuration\n")
     for problem in problems:
         print(f"- {problem}")
+    if bad_overlay or missing_overlay or len(overlays) > 1:
+        print("\nREFUSED: timing comparisons require matching overlay evidence")
+        return 2
     if blocking and not allow:
         print("\nREFUSED: timings of different hosts or host configurations don't compare "
               "(--allow-host-change compares them anyway, flagged)")
@@ -842,7 +857,8 @@ def manifest_identities(paths: list[Path]) -> list[dict | None]:
         except (OSError, ValueError, KeyError):
             out.append(None)
             continue
-        out += [identity(i.get("machine"), i.get("started")) for i in invocations] or [None]
+        out += [identity(i.get("machine"), i.get("started")) if isinstance(i, dict) else None
+                for i in invocations] if isinstance(invocations, list) and invocations else [None]
     return out
 
 
@@ -1025,6 +1041,7 @@ def main(argv: list[str]) -> int:
                                args.allow_host_change)
     systems = set(args.systems.split(",")) if args.systems else None
     base_files, new_files = files(args.base), files(args.new)
+    refused = host_check(manifest_identities(base_files), manifest_identities(new_files), args.allow_host_change)
     # The input rule of compare_reports() (input_difference()), over the /data files the runs read:
     # another release of a dataset is no evidence of a code change.
     (base_sha, base_bytes), (new_sha, new_bytes) = suite_inputs(base_files), suite_inputs(new_files)
@@ -1033,7 +1050,6 @@ def main(argv: list[str]) -> int:
             print(f"## Inputs\n\n- {why}\n\nREFUSED: the runs didn't read the same input: no time or memory "
                   "verdict would be evidence of a code change")
             return 2
-    refused = host_check(manifest_identities(base_files), manifest_identities(new_files), args.allow_host_change)
     base = collect(base_files, systems, args.include_restricted)
     new = collect(new_files, systems, args.include_restricted)
     print(f"# {args.new} against {args.base}\n")

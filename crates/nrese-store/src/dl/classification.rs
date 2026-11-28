@@ -439,7 +439,7 @@ pub(crate) fn el_answer(
         return None;
     }
     // The driver's lower bound, where an irregular role hierarchy is all it left out.
-    if !taxonomy.left_out.only(Unsupported::IrregularRoleHierarchy) {
+    if !taxonomy.left_out.only_role_automata_and_regularity() {
         return None;
     }
     let options = options(store);
@@ -634,9 +634,7 @@ mod tests {
         let snapshot = store.engine().snapshot();
         let taxonomy = taxonomy(&store, &snapshot);
         assert!(
-            taxonomy
-                .left_out
-                .only(nrese_owl::Unsupported::IrregularRoleHierarchy),
+            taxonomy.left_out.only_role_automata_and_regularity(),
             "{:?}",
             taxonomy.incomplete
         );

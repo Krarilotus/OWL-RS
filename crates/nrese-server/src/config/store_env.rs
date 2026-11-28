@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use nrese_store::{GateSeverity, ShaclGate, StoreConfig, StoreMode};
+use nrese_store::{GateSeverity, ShaclGate, StoreConfig, StoreMode, UndecidedPolicy};
 
 use super::env_names as names;
 use super::env_values::parse_bool;
@@ -164,9 +164,19 @@ pub(super) fn parse_store_config(
             None | Some(0) => nrese_store::InvalidStatements::Quarantine,
             Some(_) => nrese_store::InvalidStatements::Strict,
         },
+        gates_undecided: match choice(source, names::GATES_UNDECIDED, &["mark", "refuse"])? {
+            None | Some(0) => UndecidedPolicy::Mark,
+            Some(_) => UndecidedPolicy::Refuse,
+        },
         shacl_gate: parse_shacl_gate(
             source.get(names::SHACL_GATE).as_deref(),
             source.get(names::SHACL_GATE_SEVERITY).as_deref(),
+        )?,
+        shacl_reject_results: super::env_values::parse_limit(
+            source,
+            names::SHACL_REJECT_RESULTS,
+            defaults.shacl_reject_results,
+            |text| Ok(text.parse()?),
         )?,
         dl: parse_dl(source)?,
         // The role is `replication.mode`'s, set at the open (`main.rs`).

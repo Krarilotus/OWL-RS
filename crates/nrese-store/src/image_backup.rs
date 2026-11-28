@@ -6,9 +6,11 @@
 //! engine that reads its checkpoint format.
 
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+pub use nrese_engine::check_unfinished_restore;
+use nrese_engine::{RESTORE_PENDING, RestoreReport, StoreLock, place};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -100,22 +102,26 @@ pub(crate) fn backup_image(
         .map_err(|error| StoreError::Configuration(error.to_string()))?;
     // Written under a temporary name, synced, then placed and its directory synced:
     // a restore reads it, and a backup reported done must not lose it to a power loss.
-    let path = dir.join(MANIFEST);
+    place_bytes(dir, MANIFEST, &json)?;
+    Ok(manifest)
+}
+
+fn place_bytes(dir: &Path, name: &str, bytes: &[u8]) -> StoreResult<()> {
+    let path = dir.join(name);
     let temporary = path.with_extension("tmp");
     let placed = (|| {
-        use std::io::Write as _;
         let mut file = fs::File::create(&temporary)?;
-        file.write_all(&json)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        nrese_engine::place::rename(&temporary, &path)?;
-        nrese_engine::place::sync_dir(dir)
+        place::rename(&temporary, &path)?;
+        place::sync_dir(dir)
     })();
     if let Err(error) = placed {
         let _ = fs::remove_file(&temporary);
         return Err(io(error, &path));
     }
-    Ok(manifest)
+    Ok(())
 }
 
 impl ImageManifest {
@@ -144,20 +150,50 @@ pub fn read_manifest(dir: &Path) -> StoreResult<ImageManifest> {
 
 /// Restores the backup in `backup` and the WAL segments in `logs` after it (an archive,
 /// `wal-archive/` of a store with `wal_archive`, and the store's live `wal/` where it is
-/// still there) into `data_dir`, which must hold no store, up to revision `until` and the
-/// commits made up to `until_micros` (microseconds since 1970; else as far as the log
-/// goes): [`restore_image`], the segments copied, then the store opened once to replay and
-/// cut the log. Returns the manifest and the revision restored.
+/// still there) into `data_dir`, which must be empty apart from `LOCK` and an empty `wal/`,
+/// up to revision `until` and the commits made up to `until_micros` (microseconds since
+/// 1970; else as far as the log goes). Returns the manifest, the revision restored, and
+/// why recovery stopped with the time of the last commit kept.
 pub fn restore_until(
     backup: &Path,
     data_dir: &Path,
     logs: &[PathBuf],
     until: Option<u64>,
     until_micros: Option<u64>,
-) -> StoreResult<(ImageManifest, u64)> {
-    let manifest = restore_image(backup, data_dir)?;
+) -> StoreResult<(ImageManifest, u64, RestoreReport)> {
+    let manifest = read_manifest(backup)?;
+    let name = manifest.image_name()?;
+    let image = backup.join(name);
+    check_image(&image, &manifest)?;
+    place::create_dir_all(data_dir).map_err(|e| io(e, data_dir))?;
+    let lock = StoreLock::acquire(data_dir)?;
+    check_unfinished_restore(data_dir)?;
     let wal = data_dir.join("wal");
-    nrese_engine::place::create_dir_all(&wal).map_err(|e| io(e, &wal))?;
+    for entry in fs::read_dir(data_dir).map_err(|e| io(e, data_dir))? {
+        let entry = entry.map_err(|e| io(e, data_dir))?;
+        if entry.file_name() == "LOCK" {
+            continue;
+        }
+        if entry.file_name() != "wal"
+            || !entry.file_type().map_err(|e| io(e, &wal))?.is_dir()
+            || fs::read_dir(&wal)
+                .map_err(|e| io(e, &wal))?
+                .next()
+                .is_some()
+        {
+            return Err(StoreError::Configuration(format!(
+                "{} must be empty for a point-in-time restore",
+                data_dir.display()
+            )));
+        }
+    }
+    let pending = format!(
+        "image_revision={}\nuntil={until:?}\nuntil_micros={until_micros:?}\n",
+        manifest.revision
+    );
+    place_bytes(data_dir, RESTORE_PENDING, pending.as_bytes())?;
+    place::copy(&image, &data_dir.join(name)).map_err(|e| io(e, &image))?;
+    place::create_dir_all(&wal).map_err(|e| io(e, &wal))?;
     // Segments are named by their first revision; one ends where the next begins. Those
     // that can hold a revision after the image go along.
     let mut segments: Vec<(u64, PathBuf)> = Vec::new();
@@ -188,21 +224,18 @@ pub fn restore_until(
         if after_image {
             let target = wal.join(path.file_name().expect("segment name"));
             // Synced and durably named before the store opens on it (F3).
-            nrese_engine::place::copy(path, &target).map_err(|e| io(e, path))?;
+            place::copy(path, &target).map_err(|e| io(e, path))?;
         }
     }
-    let config = nrese_engine::EngineConfig {
-        background_maintenance: false,
-        durability: nrese_engine::DurabilityConfig {
-            recover_until: until,
-            recover_until_micros: until_micros,
-            ..nrese_engine::DurabilityConfig::default()
-        },
-        ..nrese_engine::EngineConfig::default()
-    };
-    let engine = nrese_engine::Engine::open(data_dir, config)?;
-    let revision = engine.snapshot().revision();
-    Ok((manifest, revision))
+    let (_lock, revision, report) = lock.recover_restore(nrese_engine::DurabilityConfig {
+        recover_until: until,
+        recover_until_micros: until_micros,
+        ..nrese_engine::DurabilityConfig::default()
+    })?;
+    let marker = data_dir.join(RESTORE_PENDING);
+    fs::remove_file(&marker).map_err(|e| io(e, &marker))?;
+    place::sync_dir(data_dir).map_err(|e| io(e, data_dir))?;
+    Ok((manifest, revision, report))
 }
 
 /// Restores the backup in `backup` into `data_dir`, which must hold no store (no
@@ -222,21 +255,9 @@ pub fn place_image(
     manifest: ImageManifest,
     data_dir: &Path,
 ) -> StoreResult<ImageManifest> {
-    let name = manifest.image_name()?.to_owned();
-    if manifest.format != "nrese-checkpoint" {
-        return Err(StoreError::Configuration(format!(
-            "{}: not an image backup ({})",
-            image.display(),
-            manifest.format
-        )));
-    }
-    let (sha256, bytes) = sha256(image)?;
-    if sha256 != manifest.sha256 || bytes != manifest.bytes {
-        return Err(StoreError::Configuration(format!(
-            "{}: the image doesn't match its manifest",
-            image.display()
-        )));
-    }
+    let name = manifest.image_name()?;
+    check_image(image, &manifest)?;
+    check_unfinished_restore(data_dir)?;
     let holds_store = |dir: &Path| -> bool {
         fs::read_dir(dir).is_ok_and(|entries| {
             entries.flatten().any(|entry| {
@@ -265,12 +286,30 @@ pub fn place_image(
         )));
     }
     // Every new level durably named, as the placement owns it.
-    nrese_engine::place::create_dir_all(data_dir).map_err(|e| io(e, data_dir))?;
-    let target = data_dir.join(&name);
+    place::create_dir_all(data_dir).map_err(|e| io(e, data_dir))?;
+    let target = data_dir.join(name);
     // Synced and durably named (F3): a power loss after the restore returned must not
     // leave a short image, or one with regions that never landed, under the name.
-    nrese_engine::place::copy(image, &target).map_err(|e| io(e, image))?;
+    place::copy(image, &target).map_err(|e| io(e, image))?;
     Ok(manifest)
+}
+
+fn check_image(image: &Path, manifest: &ImageManifest) -> StoreResult<()> {
+    if manifest.format != "nrese-checkpoint" {
+        return Err(StoreError::Configuration(format!(
+            "{}: not an image backup ({})",
+            image.display(),
+            manifest.format
+        )));
+    }
+    let (sha256, bytes) = sha256(image)?;
+    if sha256 != manifest.sha256 || bytes != manifest.bytes {
+        return Err(StoreError::Configuration(format!(
+            "{}: the image doesn't match its manifest",
+            image.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Removes from `archive` (a store's `wal-archive/`) the segments whose records all come

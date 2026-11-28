@@ -2,6 +2,7 @@
 //! file. Each file is a module.
 
 mod access_tests;
+mod big_integer_tests;
 mod calendar_tests;
 mod date_time_range_tests;
 mod depth_tests;

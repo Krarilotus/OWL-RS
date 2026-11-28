@@ -252,12 +252,10 @@ fn dl_inconsistency_of_the_readable_graphs_is_explained() {
     assert!(reject.detail.contains("5 axiom(s)"), "{}", reject.detail);
 }
 
-/// A disjointness of three classes that names `:A` and `:B` twice, so each of them is
-/// empty, and `:U` their union; the commit puts `:x` in `:U`. The one justification has
-/// four axioms, two of them read from the disjointness, each with the whole list's
-/// statements among its sources.
-const DL_REPEAT_DATA: &str = "GRAPH :open { _:d a owl:AllDisjointClasses ; \
-     owl:members ( :A :B :C :A :B ) . :U owl:unionOf ( :A :B ) }";
+/// A disjoint union with one distinct operand reads as an equivalence and an empty
+/// operand. The commit puts `:x` in `:U`. Both schema axioms in the justification
+/// cite the whole list.
+const DL_REPEAT_DATA: &str = "GRAPH :open { :U owl:disjointUnionOf ( :A :A ) }";
 const DL_REPEAT_COMMIT: &str = "GRAPH :open { :x a :U }";
 
 /// The evidence each of `requesters` is shown for the inconsistency `DL_REPEAT_COMMIT`
@@ -277,7 +275,7 @@ fn dl_repeat_evidence(requesters: &[Requester]) -> Vec<Vec<nrese_reasoner::Rejec
     .expect("setup commits");
     let evidence = |requester: &Requester| {
         let reject = reject_on(&p, DL_REPEAT_COMMIT, requester);
-        assert!(reject.detail.contains("4 axiom(s)"), "{}", reject.detail);
+        assert!(reject.detail.contains("3 axiom(s)"), "{}", reject.detail);
         reject.explanation.expect("explained").evidence
     };
     requesters.iter().map(evidence).collect()
@@ -296,7 +294,7 @@ fn triples_once(
     assert!(
         evidence
             .iter()
-            .any(|e| e.object.contains("AllDisjointClasses")),
+            .any(|e| e.predicate.contains("disjointUnionOf")),
         "{evidence:#?}"
     );
     seen

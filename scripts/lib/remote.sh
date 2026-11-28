@@ -28,14 +28,24 @@ host=${NRESE_BUILD_HOST:-$(git config --get nrese.buildHost)}
 [ -n "$host" ] || { echo "no build host (NRESE_BUILD_HOST or git config nrese.buildHost)" >&2; exit 2; }
 root=${NRESE_BUILD_ROOT:-owlrs}
 # The fleet's hosts time benchmarks; a build beside a timed run spoils it (19 Oct 2026: hooks
-# built on the shared host during A-B-B-As). On them, builds and tests go through fleet jobs only.
-case "$(printf %s "$host" | tr '[:upper:]' '[:lower:]')" in
-  office-pc|phuoc-yu|khaleesi|khaleesi-wsl|gamergrill)
-    [ -n "${FLEET_SLICE:-}" ] || {
-      echo "$host is a fleet host: build here (NRESE_BUILD_HOST=local) or submit a fleet job" >&2
-      exit 2
-    } ;;
-esac
+# built on the shared host during A-B-B-As). On them, builds and tests go through fleet jobs only:
+# the private overlay's [fleet] builds_by_fleet_only (benches/suite/suitekit/hosts.py fleet).
+# Python under either name, as scripts/lib/fleet-job.sh: Windows has `python` (its `python3` may be the Store's stub).
+python=$(type -P python || type -P python3)
+fleet_only=$("${python:-python3}" -I benches/suite/suitekit/hosts.py fleet builds_by_fleet_only) || {
+  echo "can't read the policy for fleet-only build hosts" >&2
+  exit 2
+}
+build_allowed() {
+  case " $fleet_only " in
+    *" $(printf %s "$1" | tr '[:upper:]' '[:lower:]') "*)
+      [ -n "${FLEET_SLICE:-}" ] || {
+        echo "$1 is a fleet host: build here (NRESE_BUILD_HOST=local) or submit a fleet job" >&2
+        return 2
+      } ;;
+  esac
+}
+build_allowed "$host" || exit 2
 snapshot=$(git commit-tree "$tree" -p HEAD -m "snapshot of $name")
 
 # While the host's owners use it (its guard wrote ~/owlrs/RETREAT), a build
@@ -45,6 +55,7 @@ capped=""
 if ! ssh -o BatchMode=yes -o ConnectTimeout=8 "$host" true 2>/dev/null; then
   fallback=$(git config --get nrese.buildHostFallback)
   [ -n "$fallback" ] || { echo "$host unreachable and no fallback host" >&2; exit 75; }
+  build_allowed "$fallback" || exit 2
   echo "$host unreachable; building on $fallback" >&2
   host=$fallback
 elif ssh -o BatchMode=yes "$host" "test -f $root/RETREAT"; then

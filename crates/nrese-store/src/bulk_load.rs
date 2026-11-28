@@ -142,9 +142,12 @@ pub(crate) fn bulk_load(
     progress: &LoadProgress,
     invalid: InvalidStatements,
     quarantine: &Quarantine,
-    // Clears the reasoning certificate under the load's writer slot as it publishes: a load
-    // doesn't maintain the inferences.
-    invalidate: &dyn Fn(nrese_engine::WriterHeld<'_>) -> StoreResult<()>,
+    // Clears the reasoning certificate under the load's writer slot as it publishes (a load
+    // doesn't maintain the inferences), returning the record the new version carries: the
+    // rules' hold, where there is one.
+    invalidate: &dyn Fn(
+        nrese_engine::WriterHeld<'_>,
+    ) -> StoreResult<Option<nrese_engine::Certificate>>,
 ) -> StoreResult<BulkLoadReport> {
     let started = Instant::now();
     let sources = request
@@ -201,20 +204,16 @@ pub(crate) fn bulk_load(
     if progress.is_cancelled() {
         return Err(StoreError::LoadCancelled);
     }
-    // The certificate goes as part of the publication, never at the load's start: a load
-    // that stops or adds nothing keeps it. First the certificate, then the data: its marker's
-    // removal is synced before the checkpoint is written, and the marker holds no revision.
-    // A crash or a reader in between finds the old data without a certificate; never one
-    // over data it wasn't computed for. A checkpoint that then fails leaves the old data
-    // without one: the safe side (reasoning has to run again, and the store says so).
+    // Remove the marker durably before writing the checkpoint. Readers still see the old
+    // version's record until the new data and any carried hold publish together.
     let summary = load.finish_with(|writer| {
-        invalidate(writer).map_err(|error| match error {
+        let withheld = invalidate(writer).map_err(|error| match error {
             StoreError::Io(error) => nrese_engine::EngineError::Io(error),
             error => nrese_engine::EngineError::Io(std::io::Error::other(error.to_string())),
         })?;
         #[cfg(test)]
         crate::service::hooks::run(&crate::service::hooks::AFTER_INVALIDATION);
-        Ok(())
+        Ok(withheld)
     });
     memory::release_all();
     let summary = summary?;

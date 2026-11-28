@@ -76,8 +76,8 @@ class ScopeLifetime(unittest.TestCase):
         class Executed(BaseException):
             pass
         captured = {}
-        def execute(program, argv, environ):
-            captured.update(program=program, argv=argv, environ=dict(environ))
+        def execute(program, argv, env):
+            captured.update(program=program, argv=argv, environ=dict(env))
             self.assertTrue(os.get_inheritable(descriptor), "entry dropped an existing inheritable lease")
             raise Executed()
         with patch.dict(os.environ, {"FLEET_SLICE": "fleet-example.slice"}, clear=True), \

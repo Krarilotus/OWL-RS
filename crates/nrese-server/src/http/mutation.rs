@@ -41,7 +41,7 @@ pub async fn run(
     .await
 }
 
-/// The HTTP meaning of a failed mutation: the request's fault (4xx) or the server's (5xx).
+/// The HTTP status of a failed mutation, including conflicts with the repository's state.
 /// The store classifies its errors ([`StoreError::is_request_error`]); the transport only
 /// maps the classes, so every mutation kind reports a storage failure the same way.
 fn map_error(policy: &PolicyConfig, error: MutationError, timeout_message: &str) -> ApiError {
@@ -65,14 +65,9 @@ fn map_error(policy: &PolicyConfig, error: MutationError, timeout_message: &str)
                 ApiError::bad_request(source.to_string())
             }
         }
-        MutationError::Rejected(reject) => {
-            let reject = *reject;
-            ApiError::rejected(
-                reject.kind,
-                reject.detail,
-                reject.explanation,
-                reject.attribution,
-            )
+        MutationError::Rejected(reject) => ApiError::rejected(*reject),
+        error @ MutationError::ShaclShapesUnusable(_) => {
+            ApiError::ShaclShapesUnusable(error.to_string())
         }
         MutationError::Cancelled => ApiError::timeout(timeout_message.to_owned()),
         error @ MutationError::Retired => ApiError::busy(error.to_string()),
@@ -110,8 +105,9 @@ mod tests {
             .status()
     }
 
-    /// Every mutation kind: the request's faults are 4xx, storage faults 5xx, a
-    /// cancellation a timeout.
+    /// Every mutation kind: the request's faults are 4xx and storage faults 5xx. A
+    /// cancellation is a timeout, an internal gate failure is 500, and unusable stored
+    /// shapes are a conflict.
     #[test]
     fn failures_keep_their_meaning_for_every_mutation_kind() {
         let kinds = [
@@ -154,10 +150,19 @@ mod tests {
                 "{kind:?}"
             );
         }
-        assert_eq!(
-            status(MutationError::Cancelled),
-            StatusCode::REQUEST_TIMEOUT
-        );
+        for (error, expected) in [
+            (MutationError::Cancelled, StatusCode::REQUEST_TIMEOUT),
+            (
+                MutationError::Gate("ill-formed SHACL shapes: a malformed path".to_owned()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                MutationError::ShaclShapesUnusable(vec!["a malformed path".to_owned()]),
+                StatusCode::CONFLICT,
+            ),
+        ] {
+            assert_eq!(status(error), expected);
+        }
     }
 
     /// DC-07: a commit stopped because the process's memory couldn't be read is the server's

@@ -1058,7 +1058,12 @@ fn every_annotation_property_axiom_entails_nothing_built_in_or_declared() {
 /// When OWL 2 DL decides these clashes, the tests that call this expect the commit.
 fn refused_as_undecided(data: &str, extra: &str) {
     let reject = refusal(data, extra);
-    assert_eq!(reject.kind, RejectKind::Undecided, "{}", reject.detail);
+    assert_eq!(
+        reject.kind,
+        RejectKind::Undecided(nrese_store::UndecidedCause::ReadsDifferently),
+        "{}",
+        reject.detail
+    );
     assert!(
         reject
             .detail
@@ -1138,7 +1143,7 @@ fn a_plain_clash_is_rejected_as_inconsistent_on_both_routes() {
         let undecided = refusal(ANNOTATION_DOMAIN, extra);
         assert_eq!(
             undecided.kind,
-            RejectKind::Undecided,
+            RejectKind::Undecided(nrese_store::UndecidedCause::ReadsDifferently),
             "{}",
             undecided.detail
         );

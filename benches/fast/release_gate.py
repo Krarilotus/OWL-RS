@@ -7,16 +7,17 @@ the §0 guards green and the W3C suites' counts what they must be?
         the cases a host giving GB can run at their declared caps; the others, with why
     release_gate.py report --passes DIR --candidate NAME --side NAME=REV ... --require NAME,...
                            --harness-revision REV [--min-passes 4] [--diagnostic]
-                           [--not-run CASE=WHY] [--out MD] [--json JSON]
+                           [--not-run CASE=WHY] [--round-one JSON] [--out MD] [--json JSON]
         the timed part: DIR holds the passes, pass-N-SIDE.json, each a full `fast.py run
         --reps 1 --prepared` report of one side's binaries over the same harness and data
     release_gate.py w3c LOGDIR --expected benches/fast/w3c-expected.toml [--run --identity ID] [--json JSON]
         the declared kits (--run: launched here first), each one's outcome and its suites' counts
     release_gate.py guards [--names NAMES] --log LOG [--run --identity ID] [--json JSON]
     release_gate.py verdict --candidate REV [--checkout DIR] --timed JSON [--timed JSON] --w3c JSON
-                            --guards JSON [--out MD]
+                            --guards JSON [--full-correctness] [--out MD]
         every part, each bound to REV's tree (a check by its receipt), under the policy at REV
-        (benches/release-tradeoffs.toml)
+        (benches/release-tradeoffs.toml), the known open faults at REV named
+        (scripts/lib/known-faults.tsv); --full-correctness: a cut that claims it needs that list, empty
 
 Each subcommand exits 0 only when its part passes; `verdict` only when every part does.
 """
@@ -51,6 +52,12 @@ from suitekit.hosts import run_identity  # noqa: E402
 from suitekit.checkout import STORED_OBJECTS, checkout_differs  # noqa: E402,F401
 
 CAMPAIGN_BLOCKS = 2  # blocks a round at least (each: every case on every side, twice, as a palindrome)
+LANDING_BLOCKS = 8
+# A complete pair exits zero even when it records a release verdict failure.
+PAIRED_REPORT_VERSION = 1
+LANDING_CASES = ("load-entities", "load-threads", "q-snowflake", "q-star", "op-group", "commits-plain",
+                 "commits-rdfs", "custom-tc", "rl-single-thread", "rl-clique", "ql-lubm10", "dl-pipeline",
+                 "shacl-lubm", "deletes-tail", "writes-under-readers")
 PASS_FILE = re.compile(r"pass-(\d+)-([A-Za-z0-9_.-]+)\.json$")
 
 
@@ -176,11 +183,14 @@ def fleet_host_errors(passes: list[dict], host: str) -> list[str]:
     return out
 
 
-def provenance_errors(passes: list[dict], sides: dict[str, str], harness: str, planned: list[str]) -> list[str]:
+def provenance_errors(passes: list[dict], sides: dict[str, str], harness: str, planned: list[str],
+                      *, host_errors: list[str] | None = None, verified_binaries: dict | None = None) -> list[str]:
     """What each pass must say about itself: complete, one repetition of exactly the planned
     cases, the clean harness revision at start and end, its side's verified binaries (the same
     in every pass of the side), the same prepared data unchanged, one host and configuration."""
     errors, binaries, prepared, identities, options, layouts = [], {}, set(), set(), {}, {}
+    all_verified = True
+    registry = hosts_registry.public_registry() if passes else {}
     for p in passes:
         r, name = p["report"], p["path"]
         if r.get("reps") != 1:
@@ -201,17 +211,22 @@ def provenance_errors(passes: list[dict], sides: dict[str, str], harness: str, p
         for key in ("binaries", "binaries_finished"):
             b = r.get(key) or {}
             if not b.get("verified") or b.get("revision") != rev:
+                all_verified = False
                 errors.append(f"{name}: {key}: revision {b.get('revision')} verified {b.get('verified')}, "
                               f"expected {rev} verified")
-        if (r.get("binaries") or {}).get("sha256") != (r.get("binaries_finished") or {}).get("sha256"):
+        built = r.get("binaries") or {}
+        hashes = built.get("sha256")
+        if hashes != (r.get("binaries_finished") or {}).get("sha256"):
+            all_verified = False
             errors.append(f"{name}: binaries changed during the pass")
+        if not isinstance(hashes, dict) or not hashes:
+            all_verified = False
         if not (r.get("instance") or {}).get("built"):
             # Blocks timing one cached instance of a build share its offset (lks-aa-20): no
             # independent units (fast.py block --fresh-copies).
             errors.append(f"{name}: timed its side's build in place, not a copy made for its block")
-        layout = (r.get("binaries") or {}).get("layout", 1)
-        binaries.setdefault((p["side"], layout), set()).add(
-            json.dumps((r.get("binaries") or {}).get("sha256"), sort_keys=True))
+        layout = built.get("layout", 1)
+        binaries.setdefault((p["side"], layout), set()).add(json.dumps(hashes, sort_keys=True))
         layouts.setdefault(p["side"], Counter())[layout] += 1
         info = r.get("prepared") or {}
         if not info:
@@ -220,10 +235,13 @@ def provenance_errors(passes: list[dict], sides: dict[str, str], harness: str, p
             errors.append(f"{name}: prepared data changed during the pass: {info['changed'][:3]}")
         prepared.add(info.get("manifest_sha256"))
         options.setdefault(p["side"], set()).add(json.dumps(r.get("options"), sort_keys=True))
-        identities.add(json.dumps({**run_identity(r.get("machine") or {}, r.get("started", "")),
+        identities.add(json.dumps({**run_identity(r.get("machine") or {}, r.get("started", ""), registry),
                                    "runtime": r.get("runtime")}, sort_keys=True))
     errors += [f"{side}: different binaries in its passes" + (f" of layout {layout}" if layout > 1 else "")
                for (side, layout), shas in binaries.items() if len(shas) > 1]
+    if verified_binaries is not None and all_verified and all(len(shas) == 1 for shas in binaries.values()):
+        for (side, layout), shas in binaries.items():
+            verified_binaries.setdefault(side, {})[str(layout)] = json.loads(next(iter(shas)))
     # Builds of several layouts (release-gate.sh GATE_LAYOUTS): every side the same layouts as
     # often, so that a layout's luck falls on all alike.
     if len({json.dumps(sorted(c.items())) for c in layouts.values()}) > 1:
@@ -242,7 +260,10 @@ def provenance_errors(passes: list[dict], sides: dict[str, str], harness: str, p
     if len(prepared) > 1:
         errors.append("the passes read different prepared data")
     if len(identities) > 1:
-        errors.append("not one host and configuration: " + " | ".join(sorted(identities)))
+        error = "not one host and configuration: " + " | ".join(sorted(identities))
+        errors.append(error)
+        if host_errors is not None:
+            host_errors.append(error)
     return errors
 
 
@@ -1057,11 +1078,65 @@ def read_floor(path: Path) -> dict | None:
     """A host's floor (noise-floor/<host>.toml), or None where none was measured."""
     if not path.is_file():
         return None
-    data = tomllib.loads(path.read_text(encoding="utf-8"))
-    return {"source": f"{path.name}: {data.get('source', '?')}", "cases": data.get("cases", {})}
+    return as_floor(path.name, tomllib.loads(path.read_text(encoding="utf-8")))
 
 
-FLOORS = ROOT / "benches" / "fast" / "noise-floor"
+def host_floor(host: str) -> dict | None:
+    """Host `host`'s floor where this process finds it: in a fleet job, the floors the job carries;
+    else the private overlay's noise-floor/ where one is set, else here (suitekit/hosts.py floor())."""
+    found = hosts_registry.floor(host)
+    return as_floor(*found) if found else None
+
+
+def as_floor(name: str, data: dict) -> dict:
+    return {"source": f"{name}: {data.get('source', '?')}", "cases": data.get("cases", {})}
+
+
+def round_inputs(host: str, environ: dict | None = None) -> dict:
+    """Snapshot the timing inputs before the round is measured."""
+    overlay = hosts_registry.resolve_overlay(environ)
+    found = (overlay.floor(host) if overlay else hosts_registry.public_floor(host)) if host else None
+    return {"overlay": overlay.identity if overlay else None, "floor": as_floor(*found) if found else None}
+
+
+def valid_round_inputs(inputs: object) -> bool:
+    if not isinstance(inputs, dict) or set(inputs) != {"overlay", "floor"}:
+        return False
+    floor = inputs["floor"]
+    return hosts_registry.valid_identity(inputs["overlay"]) and (floor is None or (
+        isinstance(floor, dict) and isinstance(floor.get("source"), str) and isinstance(floor.get("cases"), dict)
+        and all(isinstance(dims, dict) and all(type(value) in (float, int) and math.isfinite(value) and value >= 0
+                                             for value in dims.values()) for dims in floor["cases"].values())))
+
+
+def pass_inputs(passes: list[dict], expected: dict | None = None) -> tuple[dict | None, list[str]]:
+    if not passes:
+        return None, ["no passes with recorded timing inputs"]
+    inputs = passes[0]["report"].get("timing_inputs")
+    if not valid_round_inputs(inputs):
+        return None, ["the passes do not record a recoverable timing floor and overlay"]
+    if (expected is not None and inputs != expected) or any(
+            p["report"].get("timing_inputs") != inputs or
+            (p["report"].get("machine") or {}).get("overlay") != inputs["overlay"] for p in passes):
+        return None, ["the round's timing floor or overlay differs between its evidence"]
+    return inputs, []
+
+
+def private_report(report: dict) -> bool:
+    return (hosts_registry.private_run(report.get("machine") or {})
+            or (report.get("timing_inputs") or {}).get("overlay") is not None
+            or bool((report.get("context") or {}).get("host")))
+
+
+def round_input_errors(parts: list[list[dict]]) -> list[str]:
+    readings = [[report.get("timing_inputs") for report in rounds] for rounds in parts]
+    if any(not valid_round_inputs(inputs) for rounds in readings for inputs in rounds):
+        return ["a round has no recoverable timing floor and overlay"]
+    if len({inputs["overlay"] for rounds in readings for inputs in rounds}) > 1:
+        return ["the rounds used different private overlays"]
+    if any(any(inputs["floor"] != rounds[0]["floor"] for inputs in rounds[1:]) for rounds in readings):
+        return ["the rounds of a timed part used different floors"]
+    return []
 
 
 def quiet_verdicts(directory: Path) -> tuple[dict, list[str]]:
@@ -1104,7 +1179,8 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
          min_blocks: int = CAMPAIGN_BLOCKS, diagnostic: bool = False, not_run: dict | None = None,
          catalog: list[dict] | None = None, elsewhere: dict | None = None,
          context: dict | None = None, family: list[str] | None = None, floor: dict | None = None,
-         baseline_candidate: bool = False) -> dict:
+         baseline_candidate: bool = False, timing_errors: list[str] | None = None,
+         *, require_valid_passes: bool = False) -> dict:
     """One round of one timed part: the schedule and provenance checked, every comparison's
     blocks tested; each declared hypothesis's p-value (untested: 1). The decision over the family
     and the rounds is verdict()'s, which alone applies the owner's policy (load_policy()), read
@@ -1123,6 +1199,7 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
         if same is not None:
             aliases[s] = same
     context = dict(context or {})
+    ordered_passes = sorted(passes, key=lambda p: p["n"])
     summary = {"candidate": {"name": candidate, "revision": sides[candidate]},
                "baselines": {s: sides[s] for s in baselines}, "harness": harness,
                "policy": {"alpha": gatestats.ALPHA, "pair_weights": gatestats.PAIR_WEIGHTS,
@@ -1131,10 +1208,10 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
                           "floor": (floor or {}).get("source")},
                "passes": [{"n": p["n"], "side": p["side"], "file": p["path"], "block": p["report"].get("block"),
                            "run": p["report"].get("run"), "layout": p["report"].get("layout")}
-                          for p in sorted(passes, key=lambda p: p["n"])],
+                          for p in ordered_passes],
                "diagnostic": diagnostic or min_blocks < CAMPAIGN_BLOCKS, "required": required,
                "context": context, "flagged": [], "other_blocking": [], "pvalues": {}, "resolution": {}, "emerged": [],
-               "not_run": not_run, "elsewhere": elsewhere, "errors": [],
+               "not_run": not_run, "elsewhere": elsewhere, "errors": list(timing_errors or ()),
                "candidate_failures": {}, "known_issues": {}, "fixed": {}, "comparisons": {}, "blocking": []}
     if missing := [s for s in required if s not in baselines]:
         summary["errors"].append(f"required baselines missing: {', '.join(missing)}")
@@ -1149,7 +1226,10 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
     # Fail closed: a part that timed nothing (no pass, or none that planned a case) passes nothing.
     if not planned:
         summary["errors"].append(f"nothing timed: {len(passes)} passes, none planned a case")
-    summary["errors"] += provenance_errors(passes, sides, harness, planned)
+    host_provenance: list[str] = []
+    verified_binaries: dict = {}
+    summary["errors"] += provenance_errors(passes, sides, harness, planned, host_errors=host_provenance,
+                                           verified_binaries=verified_binaries)
     # Sides that ran one build compare nothing (D16-593): a round of a build against itself reads "no
     # loss". Sides of one revision are declared identical (an A-A' control; a confirmation's main that
     # is its base); any other two must differ, layout by layout. Per build, not per case: a case one
@@ -1162,9 +1242,12 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
                 hashes.setdefault(p["side"], built.get("sha256"))
         identical = {frozenset((s, t)) for s in hashes for t in hashes if s != t and sides.get(s) == sides.get(t)}
         summary["errors"] += [f"layout {layout}: {e}" if layout > 1 else e for e in manifest.one_binary(hashes, identical)]
-    summary["errors"] += fleet_host_errors(passes, str(context.get("host") or ""))
+    fleet_errors = fleet_host_errors(passes, str(context.get("host") or ""))
+    summary["errors"] += fleet_errors
+    host_provenance += fleet_errors
     host_errors, summary["host_notes"] = host_states(passes)
     summary["errors"] += host_errors
+    host_provenance += host_errors
     summary["host"] = sorted({(p["report"].get("machine") or {}).get("host") for p in passes}, key=str)
     by_side = {s: sorted([p for p in passes if p["side"] == s], key=lambda p: p["n"]) for s in sides}
     checks = {c["name"]: {path.split(".")[1] for path in c.get("check", {}) if path.startswith("q.")}
@@ -1187,7 +1270,7 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
                 # The baseline's product lacks it (the catalogue): no hypothesis, named (verdict()).
                 summary.setdefault("absent", {}).setdefault(side, {})[case] = absent[case][side]
                 continue
-            if cand_state == "failed" or side in aliases:
+            if cand_state == "failed" or side in aliases or timing_errors:
                 continue
             row = compare_case(cand, evidence(by_side[side], case), side, checks.get(case, set()),
                                ((floor or {}).get("cases") or {}).get(case))
@@ -1245,6 +1328,8 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
             summary["not_compared"][h] = row["not_compared"][d]
         else:
             summary["errors"].append(f"{h}: declared, but no evidence from the candidate and no reason")
+    if require_valid_passes and summary["errors"]:
+        raise ValueError("round 2 evidence doesn't qualify: " + "; ".join(summary["errors"]))
     summary["other_blocking"] = list(summary["blocking"])
     summary["counts"] = {side: dict(Counter(r["status"] for row in rows.values() for r in row["dimensions"].values()))
                          for side, rows in summary["comparisons"].items()}
@@ -1254,15 +1339,101 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
     summary["passed"] = (not summary["diagnostic"] and not summary["errors"] and not summary["blocking"]
                          and not summary["flagged"] and not summary["emerged"]
                          and not any(set(v.split(", ")) & BAR_OUTCOMES for v in summary["known_issues"].values()))
+    landing_family = family
+    if landing_family is None and planned:
+        selected = [c for c in catalog or [] if c["name"] in planned and "metric" in c]
+        if {c["name"] for c in selected} == set(planned):
+            landing_family = family_of(selected, planned, tuple(baselines))
+    if landing_family is not None:
+        summary["lines"] = {h: landing_dimension(summary, h, len(landing_family)) for h in landing_family}
+        summary.update(gatestats.landing_words(landing_family, landing_pvalues(summary)))
+        summary["host_provenance_errors"] = host_provenance
+        summary["verified_binary_hashes"] = verified_binaries
+        for entry, p in zip(summary["passes"], ordered_passes):
+            # The same pass keeps its identity if copied, renamed, or re-encoded as JSON.
+            content = json.dumps(p["report"], sort_keys=True, separators=(",", ":")).encode("utf-8")
+            entry["sha256"] = hashlib.sha256(content).hexdigest()
     return summary
 
 
-def render(summary: dict) -> str:
+def landing_dimension(summary: dict, h: str, m: int) -> dict:
+    reading = dimension_in(summary, *h.split("|", 2))
+    if reading is None or reading["status"] == "incomplete":
+        return gatestats.landing_lines(None, m, None)
+    return gatestats.landing_lines(reading, m, summary["pvalues"].get(h),
+                                   below_step=reading["status"] in OUTSIDE_FAMILY)
+
+
+def landing_pvalues(summary: dict) -> dict[str, float]:
+    return {h: entry["p"] for h, entry in summary["lines"].items()}
+
+
+def landing_pass_hashes(summary: dict, round_number: int) -> set[str]:
+    hashes = [p.get("sha256") for p in summary.get("passes") or []]
+    if not hashes or any(not isinstance(h, str) or not re.fullmatch(r"[0-9a-f]{64}", h) for h in hashes):
+        raise ValueError(f"round {round_number} has no complete pass identities")
+    return set(hashes)
+
+
+def landing_pair(first: dict, second: dict) -> dict:
+    """Combine the landing-timing words only, using the first report's frozen family."""
+    first_context, second_context = first.get("context") or {}, second["context"]
+    if first_context.get("round", 0) not in (0, "0") or second_context.get("round") != 1:
+        raise ValueError("round 1 report must be paired with round 2")
+    for key in ("candidate", "baselines", "host"):
+        if first.get(key) != second[key]:
+            raise ValueError(f"round 1 report: {key} does not match round 2")
+    first_host, second_host = first_context.get("host") or "", second_context.get("host") or ""
+    if first_host != second_host or (not second_host and not any(second["host"])):
+        raise ValueError("round 1 report: host does not match round 2 or is unknown")
+    try:
+        first_p = landing_pvalues(first)
+        second_p = landing_pvalues(second)
+    except (AttributeError, KeyError, TypeError) as error:
+        raise ValueError("the two reports need landing timing readings from a planned family") from error
+    if first_p.keys() != second_p.keys():
+        raise ValueError("round 1 report: planned family does not match round 2")
+    if any(not number(p) or not 0 <= p <= 1 for p in first_p.values()):
+        raise ValueError("round 1 report has invalid landing timing p-values")
+    for k, report in enumerate((first, second), 1):
+        if report.get("host_provenance_errors") != []:
+            raise ValueError(f"round {k} has a host provenance error or no host provenance record")
+    if landing_pass_hashes(first, 1) & landing_pass_hashes(second, 2):
+        raise ValueError("the rounds share a pass")
+    hashes = first.get("verified_binary_hashes")
+    if not hashes or hashes != second.get("verified_binary_hashes"):
+        raise ValueError("the rounds' verified binary hashes are missing or differ")
+    return gatestats.landing_words(list(second_p), first_p, second_p)
+
+
+def landing_opening(summary: dict, first: dict | None) -> list[str]:
+    lines = [summary["word"], ""]
+    for h in summary["confirmed"] or summary["screened"]:
+        estimates = []
+        for k, report in enumerate([first, summary] if first is not None else [summary], 1):
+            reading = dimension_in(report, *h.split("|", 2)) or {}
+            ci = reading.get("ci")
+            interval = f"{fmt(ci[0])}–{fmt(ci[1])}" if ci else "unavailable"
+            label = f"round {k}" if first is not None else "this round"
+            estimates.append(f"{label} ratio {fmt(reading.get('ratio'))}, interval {interval}")
+        lines.append(f"- **{h}** — " + " / ".join(estimates))
+    if summary["screened"]:
+        lines.append("")
+    lines += ["## Per-dimension resolution", ""]
+    for h, reading in summary["lines"].items():
+        lines += [f"- **{h}**", f"  - {reading['clearance']}",
+                  f"  - Sensitivity: {reading['sensitivity'] or 'unavailable'}"]
+    return [*lines, ""]
+
+
+def render(summary: dict, first: dict | None = None) -> str:
     c = summary["candidate"]
     verdict_ = "PASSED" if summary["passed"] else ("DIAGNOSTIC ONLY, not a release verdict" if summary["diagnostic"]
                                                    else "NOT PASSED on its own (verdict combines the rounds)")
     blocks = sorted({p["block"] for p in summary["passes"] if p.get("block") is not None}, key=str)
-    lines = [f"# Release gate round {summary['context'].get('round', 0)}: {c['name']} {c['revision']}", "",
+    landing = "word" in summary
+    lines = landing_opening(summary, first) if landing else []
+    lines += [f"# Release gate round {summary['context'].get('round', 0)}: {c['name']} {c['revision']}", "",
              f"Against {', '.join(f'{s} {r}' for s, r in summary['baselines'].items())}; harness {summary['harness']}; "
              f"host {', '.join(map(str, summary['host']))}; {len(blocks)} blocks, {len(summary['passes'])} side-runs."
              + "".join(f" {s} is {t}'s build (one revision): timed once, as {t}; its hypotheses are {t}'s."
@@ -1270,7 +1441,7 @@ def render(summary: dict) -> str:
              f"**{verdict_}.** Each declared hypothesis (case x series or metric x baseline: {len(summary['family'])}) "
              "gets a one-sided p-value of a loss from its block contrasts (layouts the outer unit); a loss counts "
              f"when two consecutive rounds show it and Holm over the family rejects at {gatestats.ALPHA} "
-             "(benches/PROTOCOL.md §5). Flagged here: due for confirmation.", ""]
+             "(benches/PROTOCOL.md §5)." + ("" if landing else " Flagged here: due for confirmation."), ""]
     if summary["errors"]:
         lines += ["## The passes don't qualify", ""] + [f"- {e}" for e in summary["errors"]] + [""]
     floor = summary["policy"].get("floor")
@@ -1283,7 +1454,8 @@ def render(summary: dict) -> str:
         lines += [f"- {line}" for line in summary.get("inputs", [])] + [""]
     lines += ["## Blocking (not statistical)", ""] + ([f"- {b}" for b in summary["blocking"]] or ["- nothing"]) + [""]
     if summary["flagged"]:
-        lines += ["## Flagged: a loss shown this round, a confirmation due", "",
+        heading = "nominal p below 0.05: not findings" if landing else "Flagged: a loss shown this round, a confirmation due"
+        lines += [f"## {heading}", "",
                   "| baseline | case / dimension | ratio | interval | p | units |", "|---|---|---|---|---|---|"]
         for f in sorted(summary["flagged"], key=lambda f: f["p"]):
             ci = f"{f['ci'][0]:.4f}-{f['ci'][1]:.4f}" if f.get("ci") else "-"
@@ -1596,8 +1768,8 @@ def run_unit(unit: str, argv: list[str], log: Path, env: dict | None = None) -> 
     if argv[0] == "bash":
         argv = [driver.bash(), *argv[1:]]
     log.parent.mkdir(parents=True, exist_ok=True)
-    with open(log, "wb") as out:
-        code = subprocess.run(argv, stdout=out, stderr=subprocess.STDOUT, env=env).returncode
+    with open(hosts_registry.evidence_path(log), "wb") as out:
+        code = hosts_registry.launch(subprocess.run, argv, stdout=out, stderr=subprocess.STDOUT, environ=env).returncode
     data = log.read_bytes()
     summaries = SUMMARY.findall(data.decode("utf-8", errors="replace"))
     return Outcome(unit, code, hashlib.sha256(data).hexdigest(), bool(summaries) and set(summaries) == {"ok"})
@@ -1692,7 +1864,8 @@ def attempt_record(kind: str, where: Path) -> str:
     first = 1 + max(attempt_records(where, kind).sequences, default=0)
     for sequence in range(first, first + ATTEMPT_TRIES):
         try:
-            fd = os.open(where / f"{kind}.attempt.{sequence:09d}.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            fd = os.open(hosts_registry.evidence_path(where / f"{kind}.attempt.{sequence:09d}.json"),
+                         os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         except FileExistsError:
             continue  # another attempt holds it: the next
         with os.fdopen(fd, "w", encoding="utf-8") as out:
@@ -1733,8 +1906,10 @@ CANT_INVALIDATE = 3
 def publish(path: Path, data: dict) -> None:
     """DATA as PATH's JSON, whole or not at all: written beside it, then renamed over it."""
     part = path.with_name(path.name + ".partial")
-    part.write_text(json.dumps(data, indent=1), encoding="utf-8")
-    os.replace(part, path)
+    private = hosts_registry.private_session()
+    path = hosts_registry.evidence_path(path, private)
+    hosts_registry.evidence_path(part, private).write_text(json.dumps(data, indent=1), encoding="utf-8")
+    os.replace(hosts_registry.evidence_path(part, private), hosts_registry.evidence_path(path, private))
 
 
 def run_w3c(logs: Path, kits: list[Kit], identity: str, attempt: str) -> CheckReceipt:
@@ -2151,7 +2326,7 @@ def measured_at(repo: str, rev: str, sides: dict[str, str] | None = None) -> str
 
 
 def stop_tree(process) -> str | None:
-    """Stops `process` and everything it started, at once (benches/suite/measurement_queue.py's stop, without its
+    """Stops `process` and everything it started, at once (the pre-fleet measurement queue's stop, without its
     grace): on Windows taskkill /T, elsewhere its process group, which it must lead; then the
     process itself, whatever the tree's stop did. What may still run, or None."""
     import subprocess
@@ -2657,7 +2832,7 @@ def rdfc_hash(binary: str | None):
         return None
 
     def run(path: Path) -> str:
-        done = subprocess.run([binary, str(path)], capture_output=True, timeout=3600)
+        done = hosts_registry.launch(subprocess.run, [binary, str(path)], capture_output=True, timeout=3600)
         if done.returncode != 0:
             return f"rdfc failed (exit {done.returncode}): {done.stderr.decode(errors='replace').strip()[-120:]}"
         return hashlib.sha256(done.stdout).hexdigest()
@@ -2772,7 +2947,7 @@ def make_dataset(name: str, entry: dict, root: Path, cache: Path, asides: dict[s
             lines.append(f"FAILED making `{key}`: no perf_lab here (NRESE_PERF_LAB)")
         else:
             start = time.monotonic()
-            done = subprocess.run(argv, cwd=root, env={**os.environ, "NRESE_DATASET_DIR": aside.as_posix()})
+            done = hosts_registry.launch(subprocess.run, argv, cwd=root, environ={**os.environ, "NRESE_DATASET_DIR": aside.as_posix()})
             lines.append(f"ran `{key}` aside: exit {done.returncode}, {time.monotonic() - start:.0f} s")
     made = asides[key] / name
     if not made.is_file():
@@ -2796,7 +2971,7 @@ def probe_dataset(name: str, entry: dict, found: Path | None, make: bool, cache:
     ok = True
     if found is None and make and SPARQL_PREPARE in entry.get("made_by", ""):
         dataset = entry["made_by"].split(SPARQL_PREPARE, 1)[1].split()
-        done = subprocess.run(["bash", str(root / SPARQL_PREPARE), *dataset, "--out", str(cache)], cwd=root)
+        done = hosts_registry.launch(subprocess.run, ["bash", str(root / SPARQL_PREPARE), *dataset, "--out", str(cache)], cwd=root)
         lines.append(f"made {name} ({' '.join(dataset)}): exit {done.returncode}")
         if done.returncode != 0:
             ok = False
@@ -2901,16 +3076,39 @@ def bench_inputs(cases: list[dict]) -> list[dict]:
     return [{"name": BENCH_INPUTS_INPUT, "source": {"git": Path(repo).as_posix(), "rev": rev.stdout.strip()}}]
 
 
+def overlay_job(job: dict, overlay: dict | None = None) -> dict:
+    """A timed job reading the private overlay on its host: its hosts.toml and commit in the job's
+    environment (`overlay`, else hosts.overlay_env(); hosts.overlay_job()). Stops the writer where
+    the overlay isn't here."""
+    return hosts_registry.overlay_job(job, overlay or hosts_registry.overlay_env())
+
+
 def case_seconds(measure: dict | None, case: str) -> float | None:
     """A case's seconds a pass by the calibration, None where it has none."""
     value = (measure or {}).get(case, {}).get("seconds")
     return float(value) if value else None
 
 
+def product_changed(checkout: str, base: str, candidate: str) -> bool:
+    argv = ["git", "-C", checkout, "diff", "--name-only", "-z", "--no-renames", base, candidate, "--"]
+    diff = hosts_registry.launch(subprocess.run, argv, capture_output=True, timeout=60)
+    if diff.returncode:
+        raise SystemExit(f"landing timing could not diff {base} against {candidate}")
+    source_dirs = (b"src", b"examples")
+    for path in diff.stdout.split(b"\0"):
+        parts = path.split(b"/")
+        if parts[-1] == b"Cargo.toml" or path == b"Cargo.lock":
+            return True
+        if parts[0] == b"crates" and (len(parts) > 3 and parts[2] in source_dirs
+                                    or len(parts) > 4 and parts[1] == b"rdf" and parts[3] in source_dirs):
+            return True
+    return False
+
+
 def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_round: int, cases: str | None,
-         base: str = BASE, main: str = MAIN, max_gb: float = 24, checks: bool = True,
+         base: str = BASE, main: str | None = None, max_gb: float = 24, checks: bool = True,
          big_gb: float | None = 28, measure: dict | None = None, batch: bool = False,
-         layouts: int = 1, catalog: list[dict] | None = None) -> dict[str, dict]:
+         layouts: int = 1, catalog: list[dict] | None = None, *, mode: str | None = None) -> dict[str, dict]:
     """The gate's fleet jobs, one set: its timed part (the cases up to `max_gb`) and its big part
     (those up to `big_gb`), each one owlrs.timed job on a timing host the fleet picks by capability
     (TIMING_ROLES, Linux: ELF binaries, never native Windows; the memory; the data its cases read):
@@ -2918,16 +3116,32 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
     blocks alone and reports; and the W3C suites and the guards on any test host. With `measure` the
     k-th block runs the cases needing k blocks; blocks rotate through `layouts` builds. Each job's
     `est_min` is its planned minutes (plan_minutes())."""
+    if blocks_per_round < 1:
+        raise SystemExit("the number of blocks must be positive")
+    if mode not in (None, "C"):
+        raise SystemExit("the landing timing mode is C")
+    landing = mode == "C"
+    main = main or (base if landing else MAIN)
+    if landing:
+        if cases or main != base or layouts != 1:
+            raise SystemExit("mode C uses the landing cases, one baseline and layout 1")
+        cases = ",".join(LANDING_CASES)
+        blocks_per_round = LANDING_BLOCKS
+    if layouts < 1:
+        raise SystemExit("the number of layouts must be positive")
     catalog = cases_registry.load() if catalog is None else catalog
     selection = cases.split(",") if cases else None
     run, _, elsewhere = plan(catalog, max_gb, selection, 0, big_gb)
+    if landing and (missing := set(LANDING_CASES) - set(run)):
+        raise SystemExit(f"landing cases must fit one timed part: {', '.join(sorted(missing))} unavailable "
+                         f"or above --max-gb {max_gb:g}")
     by_name = {c["name"]: c for c in catalog}
     # Each part's mutable gate state (release-gate.sh GATE: its plan, data view, passes) is the
     # request's and the part's own: placed by capability, two requests at one candidate, or a part and
     # the checks, may meet on one host. The shared binaries and data caches stay
     # shared (GATE_BIN, SPARQL_DATA).
     request = json.dumps([candidate, harness, base, main, cases, blocks_per_round, max_gb, big_gb, layouts, batch,
-                          prefix])
+                          prefix] + ([mode] if landing else []))
     gate_name = f"gate-v2-{candidate[:8]}-{hashlib.sha256(request.encode()).hexdigest()[:8]}"
     env = {"GATE_NAME": gate_name, "GATE_MAX_GB": str(max_gb), "NRESE_QUIET_SLOT": "0",
            "GATE_MIN_BLOCKS": str(blocks_per_round), **({"GATE_CASES": cases} if cases else {}),
@@ -2936,24 +3150,40 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
     source = [{"name": "checkout", "source": {"git": checkout, "rev": checkout_rev(checkout, candidate, harness)}}]
     gate_ = ["bash", "scripts/release-gate.sh"]
     revs = {"base": base, "main": main, "cand": candidate}
-    revisions = list(dict.fromkeys([base, main, candidate, harness]))
+    timed_revisions = list(dict.fromkeys([base, main, candidate]))
+    revisions = list(dict.fromkeys([*timed_revisions, harness]))
     inputs = source + side_inputs(checkout, source[0]["source"]["rev"], revisions)
     # Every build and the data's preparation in one first step, exclusive like every step: the fleet
     # keeps an exclusive job's host only before an exclusive step and while the host takes exclusive
     # work, so the part starts only where it can time and every step runs where these binaries are
     # (an untimed first step built on a host outside its timing window).
+    harness_build = 'GATE_LAYOUTS=1 bash scripts/release-gate.sh build "$harness"; ' if harness not in timed_revisions else ""
     builds = [["bash", "-c", 'set -e; harness=$1; shift; bash scripts/release-gate.sh begin; '
                'for rev in "$@"; do bash scripts/release-gate.sh build "$rev"; '
-               'done; bash scripts/release-gate.sh prepare "$harness"', "prepare", harness, *revisions]]
+               'done; ' + harness_build + 'bash scripts/release-gate.sh prepare "$harness"',
+               "prepare", harness, *timed_revisions]]
     # the sides timed (a main that is the base isn't timed again)
     sides = 2 + (main != base)
     # Whole Latin squares (whole_squares()): every timed side opens a case's blocks alike.
     env["GATE_SQUARE"] = str(sides)
     blocks_per_round = whole_squares(blocks_per_round, sides)
     env["GATE_MIN_BLOCKS"] = str(blocks_per_round)
-    need = {c: whole_squares(int(e.get("blocks", blocks_per_round)), sides) for c, e in (measure or {}).items()}
-    count = max([blocks_per_round, *need.values()]) if measure else blocks_per_round
-    report = [[*gate_, "report", harness, f"cand={candidate}", f"base={base}", f"main={main}"], [*gate_, "clean"]]
+    calibrated = measure if not landing else None
+    need = {c: whole_squares(int(e.get("blocks", blocks_per_round)), sides) for c, e in (calibrated or {}).items()}
+    count = max([blocks_per_round, *need.values()])
+    layout_plan = None
+    if layouts > 1:
+        checked = {c for c in run if by_name[c].get("outcome", "ok") != "ok"}
+        layout_plan = (blocks(run, calibrated, blocks_per_round, square=sides, checked=checked)
+                       if calibrated else [run] * blocks_per_round)
+        count = len(layout_plan)
+        visits = Counter(c for row in layout_plan for c in row if c not in checked)
+        if (not visits or count % layouts or any(n % layouts for n in visits.values())
+                or (elsewhere and blocks_per_round % layouts)):
+            raise SystemExit("planned timed blocks must be a multiple of the layouts after rounding for side order")
+    finish = ["python3", "benches/fast/release_gate.py", "landing-round-two"] if landing else [*gate_, "clean"]
+    report = [[*gate_, "report", harness, f"cand={candidate}", f"base={base}", f"main={main}"], finish]
+    overlay = hosts_registry.overlay_env()  # one overlay commit for every part
 
     def part(job_id: str, part_env: dict, planned: list[str], timed_steps: list[list[str]], ram_gb: float,
              block_cases: list[list[str]]) -> dict:
@@ -2972,21 +3202,24 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
         if fetched:
             part_env = {**part_env, "BENCH_INPUTS_REV": fetched[0]["source"]["rev"]}
         est = plan_minutes(len(revisions), sides, block_cases, measure)
-        return {"id": job_id, "group": "release", "kind": "owlrs.timed", "class": "exclusive", **data_fields,
+        if landing:
+            part_env["GATE_LANDING"] = "1"
+            est["landing"] = True
+        return overlay_job({"id": job_id, "group": "release", "kind": "owlrs.timed", "class": "exclusive", **data_fields,
                 "priority_class": "merge-gate", "env": part_env, "stall_after_min": 90,
                 "est_min": round(est["total_min"]), "_plan": est,
                 "steps": steps,
                 # Builds ask the part's whole memory: a host too small for its blocks would end the hold
                 # after them.
                 "step_deadline_min": BUILD_MIN * len(revisions) + 120,
-                "requires": requires, "inputs": inputs + fetched}
+                "requires": requires, "inputs": inputs + fetched}, overlay)
 
-    timed_steps = [[*gate_, "plan-blocks", harness]] if measure else []
-    block_cases = []
+    timed_steps = [[*gate_, "plan-blocks", harness]] if calibrated else []
     for k in range(1, count + 1):
         timed_steps.append(block_step(gate_, k, harness, block_layout(k, layouts),
-                                      f"plan-block-{k}.json" if measure else None, revs))
-        block_cases.append([c for c in run if not measure or k == 1 or need.get(c, blocks_per_round) >= k])
+                                      f"plan-block-{k}.json" if calibrated else None, revs))
+    block_cases = layout_plan if layout_plan is not None else [
+        [c for c in run if not calibrated or k == 1 or need.get(c, blocks_per_round) >= k] for k in range(1, count + 1)]
     out = {f"{prefix}-timed": part(f"{prefix}-timed", {**env, "GATE_NAME": f"{gate_name}-timed", "GATE_PREFIX": prefix,
                                                            "GATE_RAM_GB": str(max_gb)},
                                    run, timed_steps, max_gb, block_cases)}
@@ -3036,7 +3269,7 @@ def fleet_call(*args: str) -> tuple[int, str]:
     if not binary:
         return -1, "fleet: not on PATH (set FLEET_BIN)"
     try:
-        done = subprocess.run([binary, *args], capture_output=True, text=True, encoding="utf-8",
+        done = hosts_registry.launch(subprocess.run, [binary, *args], capture_output=True, text=True, encoding="utf-8",
                               errors="replace", timeout=FLEET_DEADLINE_S)
     except subprocess.TimeoutExpired:
         return -1, f"fleet {args[0]}: no answer in {FLEET_DEADLINE_S} s (stopped)"
@@ -3058,6 +3291,11 @@ def set_plan(found: dict[str, dict], prefix: str, candidate: str, harness: str, 
                      + f"; asks {job['kind']}" + (f", roles {'+'.join(asks['roles'])}" if asks.get("roles") else "")
                      + f", {asks.get('os', 'any OS')}, {asks['cores']} cores, {asks['ram_gb']} GB"
                      + (f", has {'+'.join(asks['has'])}" if asks.get("has") else ""))
+        est = job.get("_plan", {})
+        if est.get("landing"):
+            seconds = sum(case_seconds(measure, c) or 60 for c in LANDING_CASES)
+            lines.append(f"    mode C, {seconds:g} s a pass: {', '.join(LANDING_CASES)}")
+            lines.append(f"    a second round adds up to {est['timed_min']:g} timed min, only if a dimension screens")
         total += job["est_min"]
         exclusive += job["est_min"] if timed else 0  # a timed part holds its host from its first step
     guessed = sorted({c for job in found.values() for c in (job.get("_plan") or {}).get("guessed", [])})
@@ -3104,9 +3342,52 @@ def latest(parts: list, side: str, case: str, dimension: str) -> dict | None:
 CONFIRM_BLOCKS = (2, 30)  # blocks of a confirmation round: its cases' calibrated blocks, within these
 
 
+def landing_screen_cases(report: dict) -> list[str]:
+    return sorted({h.split("|", 2)[1] for h in report["screened"]})
+
+
+def landing_round_two(out: Path) -> None:
+    """Continue the current attempt on its host using the original gate and binary cache."""
+    output = hosts_registry.evidence_path(out / "release-gate.json")
+    first = json.loads(output.read_text(encoding="utf-8"))
+    attempt, error = newest_attempt(out, "timed")
+    if not attempt or first.get("attempt") != attempt["attempt"] or not first.get("landing"):
+        raise SystemExit(f"landing round 2 needs the current attempt's landing report: {error or output}")
+    if first["word"] != "needs a second round":
+        return
+    cases = landing_screen_cases(first)
+    if not cases or not set(cases) <= set(first["planned"]):
+        raise SystemExit("landing round 2 needs screened cases from round 1")
+
+    # The block runner stores its seed, passes and resume state beside its output.
+    # Use a fresh directory per original attempt and leave the first-round input there.
+    second = hosts_registry.evidence_path(out / "round-two" / attempt["attempt"])
+    second.mkdir(parents=True, exist_ok=True)
+    publish(second / "round-one.json", first)
+    env = {**os.environ, "FLEET_OUT": str(second), "GATE_ROUND": "1", "GATE_PLAN": "plan-landing-round-two.json"}
+    gate_ = ["bash", "scripts/release-gate.sh"]
+    revs = {"cand": first["candidate"]["revision"], **first["baselines"]}
+    harness = first["harness"]
+    hosts_registry.launch(subprocess.run, [*gate_, "plan-cases", ",".join(cases)], environ=env, check=True)
+    for n in range(1, LANDING_BLOCKS + 1):
+        hosts_registry.launch(subprocess.run, block_step(gate_, n, harness, 1, None, revs), environ=env, check=True)
+
+    hosts_registry.launch(subprocess.run, [*gate_, "report", harness, "--round-one", str(output),
+                                         *(f"{side}={rev}" for side, rev in revs.items())], environ=env, check=True)
+    paired = json.loads((second / "release-gate.json").read_text(encoding="utf-8"))
+    # A compatible harness can predate the completed-evidence check in its reporter.
+    if paired["errors"]:
+        raise ValueError("round 2 evidence doesn't qualify: " + "; ".join(paired["errors"]))
+    paired["attempt"] = attempt["attempt"]
+    (second / "release-gate.md").replace(hosts_registry.evidence_path(out / "release-gate.md"))
+    publish(output, paired)
+
+
 def confirm_job(rounds: list[dict], checkout: str, measure: dict | None = None) -> dict | None:
     """The next round's fleet job for one timed part: the cases of its pending hypotheses, each
     for its calibrated blocks (measure.toml), layouts rotating; None when nothing is pending."""
+    if errors := round_input_errors([rounds]):
+        raise SystemExit("confirmation refused: " + ", ".join(errors))
     pending = decide([rounds])["pending"]
     if not pending:
         return None
@@ -3115,6 +3396,9 @@ def confirm_job(rounds: list[dict], checkout: str, measure: dict | None = None) 
     if not ctx.get("host"):
         raise SystemExit(f"{ctx.get('prefix') or 'a timed part'}: its report names no host (GATE_HOST, else FLEET_HOST): "
                          "a confirmation runs where round 1 ran (its binaries, its floor), so none is written")
+    overlay = hosts_registry.overlay_env()
+    if round_inputs(ctx["host"], overlay) != first["timing_inputs"]:
+        raise SystemExit("confirmation refused: its overlay or floor differs from round 1")
     cases = sorted({h.split("|")[1] for h in pending})
     low, high = CONFIRM_BLOCKS
     revs = {"cand": first["candidate"]["revision"], **first["baselines"]}
@@ -3134,7 +3418,7 @@ def confirm_job(rounds: list[dict], checkout: str, measure: dict | None = None) 
            "GATE_ROUND": str(k), "GATE_PREFIX": prefix, "GATE_MIN_BLOCKS": str(n), "NRESE_QUIET_SLOT": "0",
            "GATE_PLAN": f"plan-confirm{k}.json", "GATE_MAX_GB": str(ctx.get("max_gb", 24)),
            **({"GATE_LAYOUTS": str(layouts)} if layouts > 1 else {})}
-    return {"id": name, "group": "release", "kind": "owlrs.timed", "class": "exclusive",
+    return overlay_job({"id": name, "group": "release", "kind": "owlrs.timed", "class": "exclusive",
             "priority_class": "merge-gate", "env": env,
             "est_min": round(n * (seconds / 60 + 2) + 5), "stall_after_min": 60,
             "steps": [[*gate_, "plan-cases", ",".join(cases)]]
@@ -3145,7 +3429,7 @@ def confirm_job(rounds: list[dict], checkout: str, measure: dict | None = None) 
                          "ram_gb": ctx.get("ram_gb", 24)},
             "pin_reason": "a confirmation round runs on its first round's host: its builds there, its floor, its rounds combined",
             "inputs": [{"name": "checkout", "source": {"git": checkout,
-                                                       "rev": checkout_rev(checkout, revs["cand"], harness)}}]}
+                                                       "rev": checkout_rev(checkout, revs["cand"], harness)}}]}, overlay)
 
 
 def known_lines(timed: list[dict], policy: Policy) -> tuple[list[str], list[str]]:
@@ -3174,13 +3458,29 @@ def known_lines(timed: list[dict], policy: Policy) -> tuple[list[str], list[str]
     return lines, blocking
 
 
+KNOWN_FAULTS = "scripts/lib/known-faults.tsv"
+
+
+def known_faults(text: str | None) -> list[tuple[str, str]] | None:
+    """The known open faults a tree lists (KNOWN_FAULTS, its TEXT; None: the tree has no list): each
+    test's id and what is wrong."""
+    if text is None:
+        return None
+    return [tuple(line.split("\t", 1)) for line in text.splitlines() if line.strip() and not line.startswith("#")]
+
+
 def verdict(timed: list[dict], w3c: dict, guards: dict, policy: Policy = NO_POLICY,
-            evidence: list[str] | None = None) -> tuple[bool, str]:
+            evidence: list[str] | None = None, open_faults: list[tuple[str, str]] | None = (),
+            full_correctness: bool = False) -> tuple[bool, str]:
     """Every part together: the family over every timed part decided (decide()), the other blocks
     of every round, the cases one part left to another, the W3C counts and the guards, under the
     owner's POLICY (none: nothing the bar forbids is accepted). EVIDENCE: what binding the parts to
-    the candidate found (release_verdict(), the command's only way here)."""
+    the candidate found (release_verdict(), the command's only way here). OPEN_FAULTS: the candidate's
+    known open faults (known_faults(); None: it lists none, not even an empty list), named for the cut's
+    notes; a cut that claims FULL_CORRECTNESS needs a list, and an empty one."""
     parts = rounds_of(timed)
+    if errors := round_input_errors(parts):
+        return False, "# Release verdict\n\n" + "\n".join(f"- {e}" for e in errors) + "\n\n**NOT PASSED**\n"
     d = decide(parts)
     lines = ["# Release verdict", "",
              f"Family: {d['m']} hypotheses declared (case x series or metric x baseline, every timed part); "
@@ -3280,7 +3580,14 @@ def verdict(timed: list[dict], w3c: dict, guards: dict, policy: Policy = NO_POLI
                  f"({'; '.join(map(str, w3c.get('errors') or [])) or 'every suite as required'})")
     lines.append(f"- §0 guards: {'passed' if guards_ok else 'NOT passed'} "
                  f"({'; '.join(map(str, (guards.get('errors') or [])[:5])) or str(guards.get('guards')) + ' guards ran and passed'})")
-    passed = (not blocking_losses and not blocking_emerged and not d["pending"] and not not_compared and not other
+    unclaimed = full_correctness and (open_faults is None or len(open_faults) > 0)
+    mark = "**known open fault**" if unclaimed else "known open fault"
+    lines += [f"- {mark}: {test}: {about}" for test, about in open_faults or []]
+    lines.append("- known open faults: "
+                 + (f"no list ({KNOWN_FAULTS})" if open_faults is None else str(len(open_faults)))
+                 + ("; a cut that claims full correctness needs a list, and an empty one" if unclaimed else ""))
+    passed = (not unclaimed
+              and not blocking_losses and not blocking_emerged and not d["pending"] and not not_compared and not other
               and not errors
               and not diagnostic and not missing and not empty and w3c_ok and guards_ok
               and not evidence and not policy.errors and not wrong)
@@ -3446,13 +3753,15 @@ def evidence_errors(timed: list[dict], checks: dict[str, dict | None], candidate
 def release_verdict(timed: list[dict], w3c: dict | None, guards: dict | None, candidate: Candidate,
                     policy: Policy, contract: Contract,
                     attempts: dict[str, tuple[dict | None, str | None]],
-                    timed_attempts: list[tuple[dict | None, str | None]]) -> tuple[bool, str]:
+                    timed_attempts: list[tuple[dict | None, str | None]],
+                    open_faults: list[tuple[str, str]] | None = (),
+                    full_correctness: bool = False) -> tuple[bool, str]:
     """`verdict`: the parts bound to the candidate, each check to its step's latest attempt (ATTEMPTS)
     and each timed part's report to its part's (TIMED_ATTEMPTS)
     and to its tree's contract (evidence_errors()), under its tree's policy. A check without a result
-    (None) is no pass."""
+    (None) is no pass. OPEN_FAULTS, FULL_CORRECTNESS: as verdict()'s."""
     evidence = evidence_errors(timed, {"w3c": w3c, "guards": guards}, candidate, contract, attempts, timed_attempts)
-    passed, text = verdict(timed, w3c or {}, guards or {}, policy, evidence)
+    passed, text = verdict(timed, w3c or {}, guards or {}, policy, evidence, open_faults, full_correctness)
     head, rest = text.split("\n", 1)
     return passed, f"{head}\n\nCandidate: {candidate.commit} (tree {candidate.tree})\n{rest}"
 
@@ -3503,10 +3812,11 @@ def main() -> int:
     s.add_argument("--context", action="append", default=[], metavar="KEY=VALUE",
                    help="the job: host (fleet's name), round (0 the first run), prefix, gate_name, max_gb, ram_gb, "
                         "layouts")
-    s.add_argument("--floor", type=Path, help="the host's A-A' noise floor (default noise-floor/HOST.toml, "
-                                               "HOST the context's)")
+    s.add_argument("--floor", type=Path, help="check that this file supplies the floor recorded by the passes")
+    s.add_argument("--round-one", type=Path, help="the first round's release-gate.json, for the landing timing word")
     s.add_argument("--out", type=Path)
     s.add_argument("--json", type=Path)
+    sub.add_parser("landing-round-two", help="finish screened landing timing cases in this fleet job")
     s = sub.add_parser("floor", help="a host's noise floor (noise-floor/HOST.toml) from an A-A' gate's report")
     s.add_argument("report", type=Path, help="its release-gate.json (every side one revision)")
     s.add_argument("--host", required=True, help="fleet's name of the host")
@@ -3542,7 +3852,8 @@ def main() -> int:
     s.add_argument("--blocks", type=int, default=CAMPAIGN_BLOCKS, help="blocks of round 1 at least (fewer than 2: diagnostic)")
     s.add_argument("--cases", help="a selection: a dry run, diagnostic only")
     s.add_argument("--base", default=BASE)
-    s.add_argument("--main", default=MAIN)
+    s.add_argument("--main", help="second baseline for the release gate (default: recorded main)")
+    s.add_argument("--mode", choices=("C",), help="after-landing timing of all landing cases after a product change")
     s.add_argument("--max-gb", type=float, default=24)
     s.add_argument("--no-checks", action="store_true", help="without the W3C and guards job")
     s.add_argument("--big-gb", type=float, default=28,
@@ -3551,7 +3862,7 @@ def main() -> int:
     s.add_argument("--plan", action="store_true", help="the plan and fleet's check of the set only: nothing queued")
     s.add_argument("--submit", action="store_true", help="submit the set (fleet submit) once fleet's check takes it")
     s.add_argument("--layouts", type=int, default=1, help="builds a side in different layouts (GATE_LAYOUTS)")
-    s.add_argument("--out", type=Path, default=Path("."))
+    s.add_argument("--out", type=Path, help="private plan directory (default: overlay/jobs)")
     s = sub.add_parser("data", help="what this host holds of the cases' frozen inputs (exit 1: something missing)")
     s.add_argument("--cases", help="comma-separated; default every registry case")
     s.add_argument("--make", action="store_true", help="make what benches/sparql/prepare.sh can into SPARQL_DATA first")
@@ -3563,7 +3874,7 @@ def main() -> int:
     s.add_argument("--no-batch", action="store_true", help="no batched timing for the microsecond cases")
     s.add_argument("--keep", type=Path, help="the calibration the passes ran with: its runs stay, only blocks are new")
     s.add_argument("--sides", type=Path, help="a real gate's passes: each case's time on every side, for the budget")
-    s.add_argument("--out", type=Path, default=ROOT / "benches" / "fast" / "measure.toml")
+    s.add_argument("--out", type=Path, help="destination for the calibration")
     s = sub.add_parser("blocks", help="each block's plan of a gate (release-gate.sh plan-blocks)")
     s.add_argument("--plan", type=Path, required=True)
     s.add_argument("--measure", type=Path, required=True)
@@ -3573,7 +3884,7 @@ def main() -> int:
     s = sub.add_parser("confirm", help="the confirmation job of each host whose run flagged a loss or an undecided case")
     s.add_argument("--reports", type=Path, nargs="+", required=True, help="every timed report so far (release-gate.json)")
     s.add_argument("--checkout", default=ROOT.as_posix())
-    s.add_argument("--out", type=Path, default=Path("."))
+    s.add_argument("--out", type=Path, help="private plan directory (default: overlay/jobs)")
     s = sub.add_parser("verdict", help="every part together, for one candidate (release-gate.sh verdict)")
     s.add_argument("--candidate", required=True, help="the candidate: a revision of --checkout; every part must "
                                                       "be its tree's, and its tree's policy applies")
@@ -3581,6 +3892,8 @@ def main() -> int:
     s.add_argument("--timed", type=Path, action="append", required=True)
     s.add_argument("--w3c", type=Path, required=True)
     s.add_argument("--guards", type=Path, required=True)
+    s.add_argument("--full-correctness", action="store_true",
+                   help=f"a cut that claims full correctness: it needs {KNOWN_FAULTS} at the candidate, empty")
     s.add_argument("--out", type=Path)
     s = sub.add_parser("measured-at", help="the commit a side is built and timed from (release-gate.sh build)")
     s.add_argument("rev")
@@ -3606,45 +3919,116 @@ def main() -> int:
         catalog = cases_registry.load()
         run, not_run, elsewhere = plan(catalog, args.max_gb, args.cases.split(",") if args.cases else None,
                                        args.min_gb, args.big_gb, args.big_host)
-        family = family_of(catalog, run, tuple(b for b in args.baselines.split(",") if b))
+        baselines = ("base",) if os.environ.get("GATE_LANDING") else tuple(filter(None, args.baselines.split(",")))
+        family = family_of(catalog, run, baselines)
         print(json.dumps({"run": run, "not_run": not_run, "elsewhere": elsewhere, "family": family}, indent=1))
         return 0
+    if args.command == "landing-round-two":
+        if not os.environ.get("FLEET_OUT"):
+            p.error("landing-round-two needs FLEET_OUT")
+        try:
+            landing_round_two(Path(os.environ["FLEET_OUT"]).resolve())
+        except (OSError, ValueError, subprocess.CalledProcessError) as error:
+            p.error(f"landing round 2: {error}")
+        finally:
+            cleanup = hosts_registry.launch(subprocess.run, ["bash", "scripts/release-gate.sh", "clean"], check=False)
+        return cleanup.returncode
     if args.command == "report":
         sides = pairs(args.side, "--side")
         passes = load_passes(args.passes)
         family = json.loads(args.family.read_text(encoding="utf-8")).get("family") if args.family else None
         context = {k: v for k, v in pairs(args.context, "--context").items()}
-        floor_file = args.floor or (FLOORS / f"{context['host']}.toml" if context.get("host") else None)
-        summary = gate(passes, sides, args.candidate, [s for s in args.require.split(",") if s], args.harness_revision,
-                       args.min_blocks, args.diagnostic, pairs(args.not_run, "--not-run"),
-                       cases_registry.load(), pairs(args.elsewhere, "--elsewhere"), context, family,
-                       read_floor(floor_file) if floor_file else None)
+        first = None
+        if args.round_one:
+            try:
+                first = json.loads(args.round_one.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as error:
+                p.error(f"cannot read round 1 report: {error}")
+            if not isinstance(first, dict):
+                p.error("round 1 report must be a JSON object")
+            context.setdefault("round", "1")
+        private = bool(context.get("host")) or any(private_report(p["report"]) for p in passes)
+        private = private or (first is not None and private_report(first))
+        output = hosts_registry.evidence_path(args.out, private) if args.out else None
+        json_output = hosts_registry.evidence_path(args.json, private) if args.json else None
+        timing, errors = pass_inputs(passes)
+        floor = timing["floor"] if timing else None
+        if args.floor and (not args.floor.is_file() or read_floor(args.floor) != floor):
+            errors.append("the requested floor differs from the floor recorded by the passes")
+        landing_pairing = first is not None and bool(first.get("landing"))
+        try:
+            summary = gate(passes, sides, args.candidate, [s for s in args.require.split(",") if s], args.harness_revision,
+                           args.min_blocks, args.diagnostic, pairs(args.not_run, "--not-run"),
+                           cases_registry.load(), pairs(args.elsewhere, "--elsewhere"), context, family, floor,
+                           timing_errors=errors, require_valid_passes=landing_pairing)
+        except ValueError as error:
+            p.error(str(error))
+        summary["timing_inputs"] = timing
+        landing = bool(os.environ.get("GATE_LANDING")) or landing_pairing
+        if landing:
+            summary["landing"] = True
         for key in ("round", "max_gb", "ram_gb", "layouts"):
             if key in summary["context"]:
                 summary["context"][key] = float(summary["context"][key]) if "gb" in key else int(summary["context"][key])
+        if first is not None:
+            try:
+                if landing_pairing:
+                    different = round_input_errors([[first, summary]])
+                    screened = landing_screen_cases(first)
+                    incomplete = (set(summary["planned"]) != set(screened) or
+                                  len({p["block"] for p in summary["passes"]}) != LANDING_BLOCKS)
+                    if different or incomplete:
+                        raise ValueError(", ".join(different) if different else
+                                         "round 2 did not time the screened cases in eight blocks")
+                summary.update(landing_pair(first, summary))
+            except ValueError as error:
+                p.error(str(error))
+            if landing_pairing:
+                omitted = set(first["planned"]) - set(summary["planned"])
+                summary["candidate_failures"].update(
+                    (case, why) for case, why in first["candidate_failures"].items() if case in omitted)
+                for key in ("blocking", "other_blocking"):
+                    summary[key].extend(line for line in first[key]
+                                        if line.split(":", 1)[0].split(" against ", 1)[0] in omitted)
+                summary["passed"] = summary["passed"] and not summary["blocking"]
         if args.inputs and args.inputs.is_file():
             summary["inputs"] = args.inputs.read_text(encoding="utf-8").splitlines()
         summary["quiet"], notes = quiet_verdicts(args.passes)
         summary["host_notes"] = [*summary.get("host_notes", []), *notes]
         prepared = {(p["report"].get("prepared") or {}).get("manifest_sha256") for p in passes}
         summary["prepared_manifest"] = sorted(map(str, prepared))
-        # The part's run this report is of: the newest attempt record beside the report.
-        record, _ = newest_attempt(args.json.parent, "timed") if args.json else (None, None)
-        summary["attempt"] = record["attempt"] if record else None
-        text = render(summary)
-        print(text)
-        if args.out:
-            args.out.write_text(text, encoding="utf-8")
+        record = None
         if args.json:
-            args.json.write_text(json.dumps(summary, indent=1, default=str), encoding="utf-8")
-        return 0 if summary["passed"] else 1
+            # A paired report is staged away from its results and their attempt records.
+            results = args.passes.parent if first is not None else args.json.parent
+            record, _ = newest_attempt(results, "timed")
+        summary["attempt"] = record["attempt"] if record else None
+        text = render(summary, first)
+        print(text)
+        if output:
+            hosts_registry.evidence_path(output, private).write_text(text, encoding="utf-8")
+        if json_output:
+            if landing:
+                publish(json_output, summary)
+            else:
+                hosts_registry.evidence_path(json_output, private).write_text(
+                    json.dumps(summary, indent=1, default=str), encoding="utf-8")
+        # A completed pair can record a timing loss or an earlier correctness failure.
+        return 0 if summary["passed"] or (first is not None and not summary["errors"]) else 1
     if args.command == "floor":
         summary = json.loads(args.report.read_text(encoding="utf-8"))
         floor = noise_floor(summary)
-        FLOORS.mkdir(exist_ok=True)
-        out = FLOORS / f"{args.host}.toml"
+        private = hosts_registry.private_dir()
+        floors = (private or ROOT / "benches" / "fast") / "noise-floor"
+        out = floors / f"{args.host}.toml"
+        private_floor = private_report(summary) or private is not None
+        if private_floor:
+            if private is None:
+                raise SystemExit("a private floor needs a private overlay checkout")
+            out = hosts_registry.private_output(out)
+        out.parent.mkdir(exist_ok=True)
         source = f"{summary['context'].get('gate_name') or args.report.parent.name} round {summary['context'].get('round', 0)}"
-        out.write_text(write_floor(floor, source), encoding="utf-8")
+        hosts_registry.evidence_path(out, private_floor).write_text(write_floor(floor, source), encoding="utf-8")
         print(f"{out}: {sum(len(d) for d in floor['cases'].values())} dimensions of {len(floor['cases'])} cases, "
               f"{floor['blocks']} blocks")
         return 0
@@ -3656,6 +4040,11 @@ def main() -> int:
         # A local check's directory is never a gate's: its logs and tables were never receipted.
         p.error(f"w3c: {args.logs} is a local check's directory ({LOCAL_MARK}); the gate uses its own")
     if args.command in ("w3c", "guards") and args.run:
+        if hosts_registry.private_session():
+            log = args.logs if args.command == "w3c" else args.log
+            for output in (log, args.json):
+                if output:
+                    hosts_registry.private_output(output)
         # A run's earlier result (and the W3C receipt) goes before anything that can fail, its setup
         # included: a run stopped at any point leaves none, never one that speaks for what it didn't run.
         # Its own is published only once it is whole (publish()).
@@ -3759,6 +4148,9 @@ def main() -> int:
             m = PASS_FILE.search(f.name)
             found.append({"n": int(m.group(1)) if m else i, "side": m.group(2) if m else "?", "path": f.name,
                           "report": json.loads(f.read_text(encoding="utf-8"))})
+        private = any(private_report(p["report"]) for p in found)
+        home = hosts_registry.private_home() if private else ROOT / "benches" / "fast"
+        out = hosts_registry.evidence_path(args.out or home / "measure.toml", private)
         result = calibrate(cases_registry.load(), found, args.budget_min, args.max_blocks, m=args.family_size,
                            batch=not args.no_batch,
                            keep=read_measure(args.keep.read_text(encoding="utf-8")) if args.keep else None,
@@ -3768,7 +4160,8 @@ def main() -> int:
                                for i, f in enumerate(sorted(args.sides.glob("*.json")))]) if args.sides else None)
         hosts_ = sorted({str((p["report"].get("machine") or {}).get("host")) for p in found})
         source = f"{len(found)} passes on {', '.join(hosts_)} ({', '.join(sorted({p['path'] for p in found})[:2])} ...)"
-        args.out.write_text(write_measure(result, source), encoding="utf-8")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        hosts_registry.evidence_path(out, private).write_text(write_measure(result, source), encoding="utf-8")
         under = {c: e for c, e in result["cases"].items() if e.get("power", 1) < TARGET_POWER}
         print(f"{len(result['cases'])} cases, family m = {result['m']}; timed part {result['minutes']} min; "
               f"blocks at most {result['cap']}; "
@@ -3781,49 +4174,61 @@ def main() -> int:
                        if args.measure.is_file() else {}, args.min_blocks, square=args.square,
                        checked={c["name"] for c in cases_registry.load() if c.get("outcome", "ok") != "ok"})
         for k, cases in enumerate(found, start=1):
-            (args.out / f"plan-block-{k}.json").write_text(json.dumps({"run": cases, "not_run": {}, "elsewhere": {}},
-                                                                      indent=1), encoding="utf-8")
+            hosts_registry.evidence_path(args.out / f"plan-block-{k}.json").write_text(
+                json.dumps({"run": cases, "not_run": {}, "elsewhere": {}}, indent=1), encoding="utf-8")
         print("blocks: " + ", ".join(f"{k} {len(c)} cases" for k, c in enumerate(found, start=1)))
         return 0
     if args.command == "confirm":
         reports = [json.loads(path.read_text(encoding="utf-8")) for path in args.reports]
-        args.out.mkdir(parents=True, exist_ok=True)
-        written = 0
+        parts = rounds_of(reports)
+        if errors := round_input_errors(parts):
+            raise SystemExit("confirmation refused: " + ", ".join(errors))
         shown = (ROOT / "benches" / "fast" / "measure.toml")
         measure = read_measure(shown.read_text(encoding="utf-8")) if shown.is_file() else {}
-        for rounds in rounds_of(reports):
+        for rounds in parts:
             job = confirm_job(rounds, args.checkout, measure)
             d = decide([rounds])
             print(f"{(rounds[0].get('context') or {}).get('host')}: {len(d['losses'])} losses, "
                   f"{len(d['pending'])} pending of {d['m']}" + (": " + ", ".join(d["pending"][:20]) if d["pending"] else ""))
             if job:
-                (args.out / f"{job['id']}.toml").write_text(toml_job(job), encoding="utf-8")
-                print(f"  {args.out / (job['id'] + '.toml')}: {len(job['steps']) - 3} blocks, est {job['est_min']} min")
-                written += 1
+                out = args.out or hosts_registry.jobs_dir()
+                path = hosts_registry.write_job(out / f"{job['id']}.toml", toml_job(job), args.checkout, [job])
+                print(f"  {path}: {len(job['steps']) - 3} blocks, est {job['est_min']} min")
         return 0
     if args.command == "jobs":
-        import subprocess
         rev = lambda r: subprocess.run(["git", "-C", args.checkout, "rev-parse", r], capture_output=True,  # noqa: E731
                                        text=True, check=True).stdout.strip()
         candidate = rev(args.candidate)
+        base = rev(args.base)
+        if args.blocks < 1:
+            p.error("the number of blocks must be positive")
+        if args.mode == "C" and not product_changed(args.checkout, base, candidate):
+            print("no product change: nothing to time")
+            return 0
         harness = rev(args.harness or candidate)
+        if args.mode == "C" and git_line(args.checkout, "grep", "-qE", "-e",
+                                         f"^PAIRED_REPORT_VERSION = {PAIRED_REPORT_VERSION}$",
+                                         harness, "--", "benches/fast/release_gate.py") is None:
+            p.error(f"mode C requires a harness with paired report version {PAIRED_REPORT_VERSION}: {harness}")
+        main_side = rev(args.main or (args.base if args.mode else MAIN))
         # The harness's calibration, and batched timing only where every side's perf lab batches.
         shown = subprocess.run(["git", "-C", args.checkout, "show", f"{harness}:benches/fast/measure.toml"],
                                capture_output=True, text=True)
         measure = read_measure(shown.stdout if shown.returncode == 0 else None)
         batch = all(subprocess.run(["git", "-C", args.checkout, "grep", "-q", "-e", '"--batch"', r, "--",
                                     "crates/nrese-store/examples"], capture_output=True).returncode == 0
-                    for r in {candidate, rev(args.base), rev(args.main)})
+                    for r in {candidate, base, main_side})
         prefix = args.id or f"rg-{candidate[:8]}"
         found = jobs(candidate, harness, args.checkout, prefix,
-                     args.blocks, args.cases, rev(args.base), rev(args.main), max_gb=args.max_gb,
+                     args.blocks, args.cases, base, main_side, max_gb=args.max_gb,
                      checks=not args.no_checks, big_gb=None if args.no_big else args.big_gb,
                      measure=measure, batch=batch, layouts=args.layouts,
-                     catalog=cases_registry.load_at(args.checkout, harness))
-        args.out.mkdir(parents=True, exist_ok=True)
-        path = args.out / f"{prefix}.set.toml"
-        path.write_bytes(toml_set({"id": prefix, "fail": "continue"}, list(found.values())).encode("utf-8"))
-        print(set_plan(found, prefix, candidate, harness, rev(args.base), rev(args.main), measure))
+                     catalog=cases_registry.load_at(args.checkout, harness), mode=args.mode)
+        out = args.out or hosts_registry.jobs_dir()
+        path = hosts_registry.write_job(out / f"{prefix}.set.toml",
+                                        toml_set({"id": prefix, "fail": "continue"}, list(found.values())),
+                                        args.checkout, found.values())
+        print(set_plan(found, prefix, candidate, harness, base, main_side, measure))
         print(f"  set file: {path}")
         if not (args.plan or args.submit):
             print(f"  not checked or submitted: --plan asks fleet where it can run, --submit submits it")
@@ -3863,11 +4268,15 @@ def main() -> int:
         attempts[kind] = newest_attempt(path.parent, kind)
     if not all(isinstance(part, dict) for part in [*timed, *(c for c in checks.values() if c is not None)]):
         p.error("verdict: every part is a JSON object (release-gate.json, w3c.json, guards.json)")
+    # The known open faults as the candidate's tree lists them (None: it has no list).
+    open_faults = known_faults(git_line(args.checkout, "show", f"{commit}:{KNOWN_FAULTS}"))
     passed, text = release_verdict(timed, checks["w3c"], checks["guards"], candidate, policy, contract, attempts,
-                                   [newest_attempt(path.parent, "timed") for path in args.timed])
+                                   [newest_attempt(path.parent, "timed") for path in args.timed],
+                                   open_faults, args.full_correctness)
     print(text)
     if args.out:
-        args.out.write_text(text, encoding="utf-8")
+        hosts_registry.evidence_path(args.out, any(private_report(report) for report in timed),
+                                     args.checkout).write_text(text, encoding="utf-8")
     return 0 if passed else 1
 
 

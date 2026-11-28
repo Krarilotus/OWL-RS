@@ -3,7 +3,7 @@ use thiserror::Error;
 
 use super::attribution::RejectAttribution;
 use super::command::MutationKind;
-use crate::error::StoreError;
+use crate::error::{StoreError, shacl_shapes_message};
 
 /// Why a mutation was not committed. Transport layers map these to protocol responses;
 /// they never need to inspect error strings.
@@ -20,6 +20,10 @@ pub enum MutationError {
     /// A validation gate rejected the resulting dataset state.
     #[error("{}", .0.detail)]
     Rejected(Box<MutationReject>),
+    /// The SHACL gate couldn't compile the stored shapes, so it refused the write. The
+    /// messages are projected for the committer's read access.
+    #[error("{}", shacl_shapes_message(.0))]
+    ShaclShapesUnusable(Vec<String>),
     /// The caller cancelled (for example on timeout) before the commit started.
     #[error("mutation was cancelled before commit")]
     Cancelled,
@@ -52,6 +56,8 @@ pub struct MutationReject {
     pub detail: String,
     pub explanation: Option<RejectExplanation>,
     pub attribution: Option<RejectAttribution>,
+    /// Results and validation failures when a SHACL reason is shown.
+    pub shacl: Option<std::sync::Arc<crate::ShaclRefusal>>,
     pub(super) _projected: super::evidence::Projected,
 }
 
@@ -63,11 +69,19 @@ pub enum RejectKind {
     /// The data shown is inconsistent (an OWL 2 RL consistency rule, or OWL 2 DL): the
     /// whole data for a reader of every graph, else the committer's own graphs.
     Inconsistent,
-    /// Under `owl2-dl`, the OWL 2 RL rules find a clash in the whole data that OWL 2 DL may
-    /// read as consistent, and the store doesn't decide which (`crate::WhyUndecided`).
-    Undecided,
+    /// No consistency decision is available under the active profile.
+    Undecided(UndecidedCause),
     /// The data shown has SHACL results the gate rejects for, as above.
     ShapesViolated,
     /// The committer's graphs show no reason by themselves: the same for every gate.
     NotShown,
+}
+
+/// The cause of an undecided refusal that may be shown to the committer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UndecidedCause {
+    /// The OWL 2 RL rules found a clash whose interpretation under OWL 2 DL is unsettled.
+    ReadsDifferently,
+    /// No consistency check runs under OWL 2 QL.
+    NoDecider,
 }

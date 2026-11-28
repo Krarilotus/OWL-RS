@@ -147,9 +147,15 @@ pub struct StoreConfig {
     /// How checkpoints store the dictionary's keys (`store.vocabulary`): `Plain`, or `Fsst`
     /// (compressed to about half; a key costs a decode when read).
     pub vocabulary: nrese_engine::VocabularyEncoding,
+    /// How to handle a write whose consistency cannot be decided.
+    pub gates_undecided: crate::UndecidedPolicy,
     /// SHACL as a commit gate (design `docs/design/shacl.md` §7): what a commit's changes
     /// may introduce against the shapes graph.
     pub shacl_gate: ShaclGate,
+    /// How many results and how many validation failures a refusal lists. Ten fits
+    /// form-sized writes and keeps large batch refusals short. None or zero removes
+    /// the count limit. The write's memory budget still applies.
+    pub shacl_reject_results: Option<usize>,
     /// The `owl2-dl` mode's settings (`dl.*`), used when the reasoner runs that mode.
     pub dl: crate::dl::DlConfig,
     /// Opened as a read replica (`replication.mode = "replica"`), set before the open: its
@@ -305,6 +311,8 @@ pub const DEFAULT_QUERY_CACHE_BYTES: usize = 64 << 20;
 /// documentation apply unchanged.
 pub const DEFAULT_SHAPES_GRAPH: &str = "http://rdf4j.org/schema/rdf4j#SHACLShapeGraph";
 
+const DEFAULT_SHACL_REJECT_RESULTS: usize = 10;
+
 impl Default for StoreConfig {
     fn default() -> Self {
         Self::in_memory()
@@ -416,7 +424,9 @@ impl StoreConfig {
             wal_damage: nrese_engine::WalDamage::Refuse,
             index_encoding: nrese_engine::IndexEncoding::Fast,
             vocabulary: nrese_engine::VocabularyEncoding::Plain,
+            gates_undecided: crate::UndecidedPolicy::Mark,
             shacl_gate: ShaclGate::Off,
+            shacl_reject_results: Some(DEFAULT_SHACL_REJECT_RESULTS),
             dl: crate::dl::DlConfig::default(),
             replica: false,
         }
@@ -456,7 +466,9 @@ impl StoreConfig {
             wal_damage: nrese_engine::WalDamage::Refuse,
             index_encoding: nrese_engine::IndexEncoding::Fast,
             vocabulary: nrese_engine::VocabularyEncoding::Plain,
+            gates_undecided: crate::UndecidedPolicy::Mark,
             shacl_gate: ShaclGate::Off,
+            shacl_reject_results: Some(DEFAULT_SHACL_REJECT_RESULTS),
             dl: crate::dl::DlConfig::default(),
             replica: false,
         }

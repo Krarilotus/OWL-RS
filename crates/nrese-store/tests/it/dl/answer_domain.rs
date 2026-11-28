@@ -437,26 +437,38 @@ fn a_reserved_name_is_never_an_answer_in_an_individuals_place() {
         }
     }
     // A reserved IRI the data itself states in such a place belongs to a part the reader
-    // leaves out, and a read that returns it is told `unsound` with the left-out reason. Not
-    // yet for the six names OWL 2 gives a class's or a property's role (`owl:Thing`,
-    // `owl:Nothing`, the top and bottom properties): the reader allows them in every role, so
-    // data that states one as an individual isn't left out, and a read can be `complete`.
-    let dl = pipeline();
-    insert(
-        &dl,
-        ":p a owl:ObjectProperty . :a0 :p rdf:nil . :p rdfs:range :C0 .",
-    )
-    .expect("ok");
-    for read in ["SELECT ?x { :a0 :p ?x }", TYPE_C0, "ASK { rdf:nil a :C0 }"] {
-        let (rows, status) = query_with(&dl, read, None).expect("answers");
-        let told = status.shared.as_str();
-        let left_out = status.reasons().iter().any(|r| r.contains("were left out"));
-        if !told.starts_with("unsound") || !left_out || status.bounds.is_some_and(|c| c.refuted > 0)
-        {
-            wrong.push(format!(
-                "rdf:nil {read}: {rows:?}, {told}, {:?}",
-                status.reasons()
-            ));
+    // leaves out, and a read that returns it is told `unsound` with the left-out reason: so
+    // also the six names OWL 2 gives only a class's or a property's role (§2.4: `owl:Thing`,
+    // `owl:Nothing`, the top and bottom properties), which are no individuals either.
+    let six = [
+        "owl:Thing",
+        "owl:Nothing",
+        "owl:topObjectProperty",
+        "owl:bottomObjectProperty",
+        "owl:topDataProperty",
+        "owl:bottomDataProperty",
+    ];
+    for name in ["rdf:nil"].into_iter().chain(six) {
+        let dl = pipeline();
+        insert(
+            &dl,
+            &format!(":p a owl:ObjectProperty . :a0 :p {name} . :p rdfs:range :C0 ."),
+        )
+        .expect("ok");
+        let ask = format!("ASK {{ {name} a :C0 }}");
+        for read in ["SELECT ?x { :a0 :p ?x }", TYPE_C0, &ask] {
+            let (rows, status) = query_with(&dl, read, None).expect("answers");
+            let told = status.shared.as_str();
+            let left_out = status.reasons().iter().any(|r| r.contains("were left out"));
+            if !told.starts_with("unsound")
+                || !left_out
+                || status.bounds.is_some_and(|c| c.refuted > 0)
+            {
+                wrong.push(format!(
+                    "{name} {read}: {rows:?}, {told}, {:?}",
+                    status.reasons()
+                ));
+            }
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");

@@ -5,6 +5,7 @@ nrese-sparql:it:native_differential_tests::
 nrese-store:it:equality_compact_tests::
 nrese-store:it:dl_oracle_tests::generated_cases_answer_as_the_dl_oracle
 nrese-shacl:it:incremental_tests::
+nrese-shacl:it:change_differential::
 nrese-engine:it:inferred_stack_tests::
 nrese-engine:lib:index::model_tests
 nrese-reasoner:lib:

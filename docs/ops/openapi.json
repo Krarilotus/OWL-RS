@@ -836,7 +836,7 @@
             "type": "string"
           },
           "reasoner_reject": {
-            "description": "For a rejected commit (type `reasoner-reject`, `undecided-reject`, `shacl-reject` or\n`commit-reject`): the violated rule or constraint and the statements it shows, where\nthere are any. The name is kept for every kind, so that clients that read it go on\nworking."
+            "description": "For a rejected commit (type `reasoner-reject`, `undecided-reject`, `shacl-reject` or\n`commit-reject`): the rule or constraint and any statements shown. For `shacl-reject`,\nthe first listed result's component and focus node, with an empty evidence list."
           },
           "request_id": {
             "description": "The request's id, as in the `x-request-id` header and the server's log.",
@@ -844,6 +844,9 @@
               "string",
               "null"
             ]
+          },
+          "shacl": {
+            "description": "For `shacl-reject`, the refusing `results` in the validation report's JSON form, with\nsorted messages, the validation `failures`, and the counts `results_omitted` and\n`failures_omitted` for items left out by the count or memory limit."
           },
           "status": {
             "format": "int32",
@@ -856,6 +859,9 @@
           "type": {
             "description": "The problem's kind, a URI (`https://nrese.dev/problems/…`).",
             "type": "string"
+          },
+          "undecided": {
+            "description": "For an undecided OWL 2 QL refusal, the gate, causes and deciding profile."
           }
         },
         "required": [
@@ -1011,7 +1017,7 @@
             "type": "string"
           },
           "violations": {
-            "description": "The consistency violations found: 0 exactly when the data is consistent.",
+            "description": "Violations found by the materialisation rules. A count of zero means the rules found none.",
             "minimum": 0,
             "type": "integer"
           },
@@ -6384,6 +6390,16 @@
             },
             "description": "Timed out, or an operator cancelled the query"
           },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The SHACL gate's stored shapes don't compile (`shacl-shapes-unusable`); nothing committed. Repair or clear the shapes graph"
+          },
           "413": {
             "content": {
               "application/problem+json": {
@@ -6621,6 +6637,16 @@
               }
             },
             "description": "Timed out (`budgets.update_timeout`); nothing committed"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The SHACL gate's stored shapes don't compile (`shacl-shapes-unusable`); nothing committed. Repair or clear the shapes graph"
           },
           "413": {
             "content": {
