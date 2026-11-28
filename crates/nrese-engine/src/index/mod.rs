@@ -41,7 +41,7 @@ pub(crate) use run::Forms;
 use run::{PermutationRun, Run};
 
 use crate::quad::{AccessPlan, EncodedQuad, Key, Permutation, QuadPattern};
-use crate::term::TermId;
+use crate::term::{ChargedArc, TermId};
 use crate::visit::{Account, Free, Ledger};
 
 pub use compaction::CompactionPolicy;
@@ -494,7 +494,21 @@ impl IndexVersion {
     }
 }
 
-impl<R: Deref<Target = Run>> IndexVersion<R> {
+/// The counted quad-store reads keep their range accounting. Derived triple reads
+/// use the narrow probes appropriate to their own visitor contract.
+pub(crate) trait RunReference: Deref<Target = Run> {
+    const TRIPLE_PROBES: bool;
+}
+
+impl RunReference for Arc<Run> {
+    const TRIPLE_PROBES: bool = false;
+}
+
+impl RunReference for ChargedArc<Run> {
+    const TRIPLE_PROBES: bool = true;
+}
+
+impl<R: RunReference> IndexVersion<R> {
     /// Number of visible quads. O(1).
     pub(crate) fn len(&self) -> u64 {
         self.len
@@ -512,7 +526,18 @@ impl<R: Deref<Target = Run>> IndexVersion<R> {
     pub(crate) fn contains(&self, quad: &EncodedQuad) -> bool {
         #[cfg(any(test, all(feature = "witness", debug_assertions)))]
         crate::witness::add(crate::witness::Site::RunProbes, self.runs.len() as u64);
-        self.runs.iter().map(|run| run.sign_of(quad)).sum::<i64>() > 0
+        self.runs
+            .iter()
+            .map(|run| {
+                if R::TRIPLE_PROBES {
+                    run.triple_sign_counted(quad, &mut Free)
+                        .expect("nothing is counted")
+                } else {
+                    run.sign_of(quad)
+                }
+            })
+            .sum::<i64>()
+            > 0
     }
 
     /// [`Self::contains`], each run's probe and its search's comparisons counted on `visit`
@@ -538,7 +563,12 @@ impl<R: Deref<Target = Run>> IndexVersion<R> {
     ) -> Result<bool, Stopped> {
         let mut sign = 0;
         for run in self.runs.iter() {
-            sign += run.sign_of_counted(quad, account).ok_or(Stopped)?;
+            let found = if R::TRIPLE_PROBES {
+                run.triple_sign_counted(quad, account)
+            } else {
+                run.sign_of_counted(quad, account)
+            };
+            sign += found.ok_or(Stopped)?;
             // Looked at once its search was counted, the run with it (`bound_counted`).
             #[cfg(any(test, all(feature = "witness", debug_assertions)))]
             crate::witness::add(crate::witness::Site::RunProbes, 1);
@@ -634,7 +664,8 @@ impl<R: Deref<Target = Run>> IndexVersion<R> {
         };
         // A subject/predicate probe usually reads only a few keys. On one run it can
         // stop at the first key outside the bound, saving a second seek and a merge.
-        if let [run] = self.runs()
+        if R::TRIPLE_PROBES
+            && let [run] = self.runs()
             && adapted.permutation == Permutation::Spog
             && adapted.low[..2] == adapted.high[..2]
         {

@@ -41,6 +41,7 @@ use nrese_rdf::{LiteralRef, NamedNodeRef, TermRef};
 use nrese_reasoner::delta::{self, Base, VisitsBase};
 use nrese_reasoner::eval::{GroundProgram, Poller, Probe, Schema, Stop, Stopped, Visit};
 use nrese_reasoner::ir::{self, Triple};
+use nrese_reasoner::representatives::EqualityClasses;
 
 /// A pattern over every graph.
 fn pattern([s, p, o]: [Option<u64>; 3]) -> QuadPattern {
@@ -498,12 +499,12 @@ pub(super) struct ProgramFacts {
 /// Immutable evidence held together by a read of one publication.
 #[derive(Clone)]
 pub struct UpperVersion {
-    pub program: Arc<bounds::Program>,
-    pub stack: TripleVersion,
-    pub eligible: TripleVersion,
+    pub(crate) program: Arc<bounds::Program>,
+    pub(crate) stack: TripleVersion,
+    pub(crate) eligible: TripleVersion,
     facts: Arc<ProgramFacts>,
     values_unread: bool,
-    pub literals_by_value: usize,
+    pub(crate) literals_by_value: usize,
 }
 
 /// U1: its published read evidence and the writer's state for maintaining it.
@@ -610,6 +611,17 @@ const SCRATCH_REFUSED: &str = "its evaluation's input doesn't fit the queries' m
 
 fn facts_refused(_: nrese_exec::BudgetExceeded) -> GaveUp {
     GaveUp::refused("its facts don't fit the queries' memory")
+}
+
+fn is_eligible(
+    view: &Snapshot,
+    classes: &EqualityClasses,
+    fact: Triple,
+    stacked: impl FnOnce() -> bool,
+) -> bool {
+    !fact.iter().any(|&id| classes.class_of(id).is_some())
+        && !super::bounds::in_view(view, fact)
+        && !stacked()
 }
 
 /// `facts` sorted, each once; in place, allocating nothing.
@@ -730,11 +742,10 @@ impl Upper {
             TripleVersion::build(facts_derived.iter().copied(), kept).map_err(facts_refused)?;
         drop(facts_derived);
         let eligible = TripleVersion::build(
-            facts.iter().copied().filter(|t| {
-                !t.iter().any(|&id| m.classes.class_of(id).is_some())
-                    && !super::bounds::in_view(view, *t)
-                    && !stack.contains(*t)
-            }),
+            facts
+                .iter()
+                .copied()
+                .filter(|&t| is_eligible(view, &m.classes, t, || stack.contains(t))),
             kept,
         )
         .map_err(facts_refused)?;
@@ -907,28 +918,8 @@ impl Upper {
         compacted: Option<(TripleVersion, TripleVersion)>,
         #[cfg(test)] bounds: &super::bounds::Bounds,
     ) -> Result<(UpperVersion, Change), GaveUp> {
-        let mut candidates = nrese_exec::ChargedVec::new(Arc::clone(budget));
-        for t in changed.filter(|t| self.facts.triples.contains(t)) {
-            candidates.push(t).map_err(facts_refused)?;
-        }
-        sort_dedup(&mut candidates);
-        let mut inserts = nrese_exec::ChargedVec::new(Arc::clone(budget));
-        let mut deletes = nrese_exec::ChargedVec::new(Arc::clone(budget));
-        for &t in candidates.iter() {
-            let was = self.eligible.contains(t);
-            let now = !super::bounds::in_view(view, t);
-            match (was, now) {
-                (false, true) => inserts.push(t).map_err(facts_refused)?,
-                (true, false) => deletes.push(t).map_err(facts_refused)?,
-                _ => {}
-            }
-        }
         let (stack, eligible) =
             compacted.unwrap_or_else(|| (self.stack.clone(), self.eligible.clone()));
-        let eligible = advance(&eligible, &inserts, &deletes)?;
-        #[cfg(test)]
-        super::bounds::seam::at(bounds, super::bounds::seam::Point::StageStack);
-
         change.moved.append(&mut change.remove);
         change.moved.sort_unstable();
         change.moved.dedup();
@@ -938,6 +929,33 @@ impl Upper {
             .moved
             .retain(|&t| stack.contains(t) && change.insert.binary_search(&t).is_err());
         change.insert.retain(|&t| !stack.contains(t));
+        let mut candidates = nrese_exec::ChargedVec::new(Arc::clone(budget));
+        let stack_changes = change.insert.iter().chain(&change.moved).copied();
+        for t in changed
+            .chain(stack_changes)
+            .filter(|t| self.facts.triples.contains(t))
+        {
+            candidates.push(t).map_err(facts_refused)?;
+        }
+        sort_dedup(&mut candidates);
+        let mut inserts = nrese_exec::ChargedVec::new(Arc::clone(budget));
+        let mut deletes = nrese_exec::ChargedVec::new(Arc::clone(budget));
+        for &t in candidates.iter() {
+            let was = eligible.contains(t);
+            let now = is_eligible(view, self.classes(), t, || {
+                change.insert.binary_search(&t).is_ok()
+                    || (change.moved.binary_search(&t).is_err() && stack.contains(t))
+            });
+            match (was, now) {
+                (false, true) => inserts.push(t).map_err(facts_refused)?,
+                (true, false) => deletes.push(t).map_err(facts_refused)?,
+                _ => {}
+            }
+        }
+        let eligible = advance(&eligible, &inserts, &deletes)?;
+        #[cfg(test)]
+        super::bounds::seam::at(bounds, super::bounds::seam::Point::StageStack);
+
         let stack = advance(&stack, &change.insert, &change.moved);
         #[cfg(test)]
         super::bounds::seam::at(bounds, super::bounds::seam::Point::StackAttempted);

@@ -172,7 +172,12 @@ fn the_cached_ontology_is_charged_with_what_the_bounds_keep() {
     let snapshot = store.engine().snapshot();
     let ontology = super::super::query::ontology_at(&store, &snapshot).unwrap();
     let cached = nrese_dl::memory::ontology_bytes(ontology.value());
-    let stack = report.upper_facts * 3 * std::mem::size_of::<[u64; 3]>();
+    let stack = ReadBasis::upper(&snapshot)
+        .unwrap()
+        .upper
+        .unwrap()
+        .stack
+        .packed_bytes();
     let kept = store.dl().bounds.kept().used();
     assert!(
         kept >= cached + stack,
@@ -347,8 +352,8 @@ fn a_views_copies_of_the_upper_bound_are_charged_before_they_are_made() {
 }
 
 /// What the bounds keep at a revision is charged to their budget while kept (SYN-61): U1's
-/// own stack among it, which holds each of U1's facts three times as 24-byte keys, so the
-/// charge is at least that, whatever the views' runs add.
+/// own stack among it. The packed permutations and their tombstones give a lower bound
+/// on the charge, before run lists, summaries and views are included.
 #[test]
 fn the_upper_bounds_stack_is_charged_while_it_is_kept() {
     let store = StoreService::new(StoreConfig::in_memory()).unwrap();
@@ -365,7 +370,14 @@ fn the_upper_bounds_stack_is_charged_while_it_is_kept() {
     store.update_str_ungated(&data).unwrap();
     let report = report(&store);
     assert_eq!(report.unavailable, None, "{report:?}");
-    let keys = report.upper_facts * 3 * std::mem::size_of::<[u64; 3]>();
+    let snapshot = store.engine().snapshot();
+    let keys = ReadBasis::upper(&snapshot)
+        .unwrap()
+        .upper
+        .unwrap()
+        .stack
+        .packed_bytes();
+    assert!(keys > 0);
     let kept = store.dl().bounds.kept().used();
     assert!(
         kept >= keys,

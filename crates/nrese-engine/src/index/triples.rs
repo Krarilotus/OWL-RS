@@ -1,4 +1,6 @@
+use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::Ordering::Relaxed;
 
 use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
 
@@ -11,6 +13,7 @@ use crate::{Stopped, TermId, Visitor};
 type Triple = [u64; 3];
 type Pattern = [Option<u64>; 3];
 type CompactionResult<T> = Result<Option<T>, BudgetExceeded>;
+type MergeResult<T> = Result<T, BudgetExceeded>;
 
 /// An immutable version of a set of encoded triples. Clones share their list, and versions
 /// share any runs they have in common. All retained storage is charged once.
@@ -28,6 +31,22 @@ struct Storage {
 const VERSION_BYTES: usize = ChargedArc::<Storage>::COST + 2 * size_of::<usize>();
 const RUN_REF_BYTES: usize = size_of::<ChargedArc<Run>>();
 const INLINE_RUN_LIMIT: usize = 2;
+
+/// Holds the end of the owner's window. Writers can still compact the tail after it.
+struct CompactionPin(ChargedArc<Run>);
+
+impl CompactionPin {
+    fn new(end: &ChargedArc<Run>) -> Self {
+        end.compactions().fetch_add(1, Relaxed);
+        Self(end.clone())
+    }
+}
+
+impl Drop for CompactionPin {
+    fn drop(&mut self) {
+        self.0.compactions().fetch_sub(1, Relaxed);
+    }
+}
 
 impl TripleVersion {
     /// Builds a set from triples in any order, ignoring duplicates.
@@ -116,33 +135,75 @@ impl TripleVersion {
     /// Builds one compaction of this version. The returned operation splices the result
     /// into a current version if the inputs still match, preserving any later appends.
     ///
-    /// A writer using `inline_only` takes small windows and forces a suffix merge when its
-    /// append would publish more than two runs. If the merge cannot be charged, its caller can
-    /// refuse the staged version and keep the old readers' runs.
+    /// A writer using `inline_only` takes small windows and caps the list at two runs.
+    /// While the background owner holds its two input runs, a third run is allowed and
+    /// the writer merges only the tail after the owner's window. If that merge cannot
+    /// be charged, the writer can refuse the staged version and keep the old readers' runs.
     pub fn compact(
         &self,
         policy: CompactionPolicy,
         inline_only: bool,
     ) -> CompactionResult<impl FnOnce(&Self) -> CompactionResult<Self> + Send + use<>> {
         let runs = &self.0.index.runs;
+        if !inline_only {
+            let Some(plan) = policy.plan(runs) else {
+                return Ok(None);
+            };
+            let pin = (plan.window.end <= INLINE_RUN_LIMIT)
+                .then(|| CompactionPin::new(&runs[plan.window.end - 1]));
+            return self.clone().merge_window(plan.window, pin).map(Some);
+        }
+        let floor = runs
+            .iter()
+            .rposition(|run| run.compactions().load(Relaxed) != 0)
+            .map_or(0, |at| at + 1);
         let sized = policy
-            .plan(runs)
-            .filter(|plan| !inline_only || policy.is_inline(plan));
-        let window = if inline_only && runs.len() > INLINE_RUN_LIMIT {
-            let start = INLINE_RUN_LIMIT - 1;
-            let start = sized.map_or(start, |plan| start.min(plan.window.start));
-            Some(start..runs.len())
+            .plan(&runs[floor..])
+            .filter(|plan| policy.is_inline(plan));
+        let forced = runs.len() > INLINE_RUN_LIMIT && runs.len() - floor > 1;
+        let start = sized.map_or(runs.len(), |plan| plan.window.start + floor);
+        let start = if forced {
+            start.min(floor.max(INLINE_RUN_LIMIT - 1))
         } else {
-            sized.map(|plan| plan.window)
+            start
         };
-        let Some(window) = window else {
+        if start == runs.len() {
             return Ok(None);
+        }
+        self.clone().merge_window(start..runs.len(), None).map(Some)
+    }
+
+    /// Reserve an owner's window before releasing its mailbox lock. The returned work
+    /// builds the merge outside that lock, and its splice can retain subsequent appends.
+    pub fn plan_compaction(
+        &self,
+        policy: CompactionPolicy,
+    ) -> Option<
+        impl FnOnce() -> MergeResult<impl FnOnce(&Self) -> CompactionResult<Self> + Send + use<>>
+        + use<>,
+    > {
+        let runs = &self.0.index.runs;
+        let window = if runs.len() > INLINE_RUN_LIMIT {
+            // A previous owner can leave a third run on refusal. Fold the base first.
+            0..INLINE_RUN_LIMIT
+        } else {
+            policy.plan(runs)?.window
         };
-        let merged = merge_triples(&runs[window.clone()], &self.0.budget)?;
+        let pin = CompactionPin::new(&runs[window.end - 1]);
         let captured = self.clone();
-        Ok(Some(move |current: &Self| {
+        Some(move || captured.merge_window(window, Some(pin)))
+    }
+
+    fn merge_window(
+        self,
+        window: Range<usize>,
+        pin: Option<CompactionPin>,
+    ) -> MergeResult<impl FnOnce(&Self) -> CompactionResult<Self> + Send + use<>> {
+        let merged = merge_triples(&self.0.index.runs[window.clone()], &self.0.budget)?;
+        Ok(move |current: &Self| {
+            let _pin = pin;
             let index = &current.0.index;
-            if !index.retains(&captured.0.index, window.clone()) {
+            if !index.retains(&self.0.index, window.clone()) {
                 return Ok(None);
             }
             let run_count = index.runs.len() - window.len() + usize::from(merged.is_some());
@@ -150,12 +211,12 @@ impl TripleVersion {
                 index.with_compacted_ref(window, merged)
             })
             .map(Some)
-        }))
+        })
     }
 
     /// Whether the policy has a merge for this version.
     pub fn needs_compaction(&self, policy: CompactionPolicy) -> bool {
-        policy.plan(&self.0.index.runs).is_some()
+        self.0.index.runs.len() > INLINE_RUN_LIMIT || policy.plan(&self.0.index.runs).is_some()
     }
 
     pub fn len(&self) -> usize {
@@ -164,6 +225,17 @@ impl TripleVersion {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    #[cfg(feature = "witness")]
+    #[doc(hidden)]
+    pub fn packed_bytes(&self) -> usize {
+        self.0
+            .index
+            .runs
+            .iter()
+            .map(|run| run.memory_bytes() as usize)
+            .sum()
     }
 
     pub fn contains(&self, triple: Triple) -> bool {

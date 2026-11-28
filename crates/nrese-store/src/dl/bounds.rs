@@ -178,7 +178,6 @@ pub(crate) struct Published {
     compiled: u64,
     taxonomy: Arc<Mutex<Option<KeptTaxonomy>>>,
     last: &'static str,
-    rules: bool,
 }
 
 impl Published {
@@ -188,12 +187,15 @@ impl Published {
             compiled: bounds.compiled(),
             taxonomy: Arc::default(),
             last,
-            rules: last == "rules",
         }
     }
 
     pub(crate) fn compiled(&self) -> u64 {
         self.compiled
+    }
+
+    pub(crate) fn refused(&self) -> bool {
+        self.upper.as_ref().is_err_and(|g| g.refused)
     }
 }
 
@@ -462,6 +464,24 @@ struct Compacting {
     panic_before_merge: bool,
 }
 
+struct CompactionOwner<'a>(Option<&'a Mutex<Compacting>>);
+
+impl CompactionOwner<'_> {
+    /// Release while holding the mailbox so a publisher can see that it should start work.
+    fn finish(&mut self, slot: &mut Compacting) {
+        slot.active = false;
+        self.0 = None;
+    }
+}
+
+impl Drop for CompactionOwner<'_> {
+    fn drop(&mut self) {
+        if let Some(shared) = self.0.take() {
+            lock(shared).active = false;
+        }
+    }
+}
+
 impl Compaction {
     fn take(&self, revision: u64) -> Option<(TripleVersion, TripleVersion)> {
         let slot = lock(&self.0);
@@ -473,7 +493,11 @@ impl Compaction {
         let policy = CompactionPolicy::default();
         let mut slot = lock(&self.0);
         slot.latest = upper
-            .filter(|u| u.stack.needs_compaction(policy) || u.eligible.needs_compaction(policy))
+            .filter(|u| {
+                slot.active
+                    || u.stack.needs_compaction(policy)
+                    || u.eligible.needs_compaction(policy)
+            })
             .map(|u| (revision, u.stack.clone(), u.eligible.clone()));
         if slot.latest.is_none() || slot.active {
             return;
@@ -482,39 +506,43 @@ impl Compaction {
         let shared = Arc::clone(&self.0);
         drop(slot);
         rayon::spawn(move || {
+            let mut owner = CompactionOwner(Some(&shared));
             loop {
                 let mut slot = lock(&shared);
-                let Some((revision, stack, eligible)) = slot.latest.clone() else {
-                    slot.active = false;
+                let Some((revision, stack, eligible)) = slot.latest.as_ref() else {
+                    owner.finish(&mut slot);
                     return;
                 };
+                let revision = *revision;
+                let stack = stack.plan_compaction(policy);
+                let eligible = eligible.plan_compaction(policy);
                 #[cfg(test)]
                 let panic_before_merge = std::mem::take(&mut slot.panic_before_merge);
                 drop(slot);
                 #[cfg(test)]
                 assert!(!panic_before_merge, "injected compaction panic");
-                let stack = stack.compact(policy, false);
-                let eligible = eligible.compact(policy, false);
+                let stack = stack.map(|build| build());
+                let eligible = eligible.map(|build| build());
                 let mut slot = lock(&shared);
                 let Some((latest, current_stack, current_eligible)) = &mut slot.latest else {
-                    slot.active = false;
+                    owner.finish(&mut slot);
                     return;
                 };
                 let mut again = *latest != revision;
-                if let Ok(Some(splice)) = stack
+                if let Some(Ok(splice)) = stack
                     && let Ok(Some(merged)) = splice(current_stack)
                 {
                     *current_stack = merged;
                     again |= current_stack.needs_compaction(policy);
                 }
-                if let Ok(Some(splice)) = eligible
+                if let Some(Ok(splice)) = eligible
                     && let Ok(Some(merged)) = splice(current_eligible)
                 {
                     *current_eligible = merged;
                     again |= current_eligible.needs_compaction(policy);
                 }
                 if !again {
-                    slot.active = false;
+                    owner.finish(&mut slot);
                     return;
                 }
             }
@@ -880,7 +908,7 @@ impl Preparation {
             ),
             Prepared::Unavailable => {
                 let mut base = ReadBasis::upper(base)
-                    .unwrap_or_else(|| Published::new(bounds, Err(not_compiled()), "kept"));
+                    .expect("the unavailable bound belongs to the base publication");
                 base.last = "kept";
                 base
             }
@@ -919,7 +947,7 @@ pub(crate) fn prepare(
     let compiled = ReadBasis::upper(tx.base()).map(|u| u.compiled);
     let current = lock(&store.dl().bounds.state)
         .as_ref()
-        .filter(|s| s.revision == base && compiled.is_none_or(|id| s.compiled == id))
+        .filter(|s| s.revision == base && compiled.is_some_and(|id| s.compiled == id))
         .map(|s| (s.kinds.clone(), s.upper.clone()));
     // The commit's asserted changes, read from the transaction each time: no copy of them.
     let asserted = || tx.inserted().chain(tx.deleted()).map(quad_triple);
@@ -987,10 +1015,8 @@ pub(crate) fn prepare(
                 match change {
                     Ok(Some((version, change))) => {
                         let proves_consistency = version.proves_consistency();
-                        let bounds = &store.dl().bounds;
-                        let mut published = ReadBasis::upper(before).unwrap_or_else(|| {
-                            Published::new(bounds, Err(not_compiled()), "delta")
-                        });
+                        let mut published = ReadBasis::upper(before)
+                            .expect("the delta advances the base publication's upper bound");
                         published.upper = Ok(version);
                         published.last = "delta";
                         return Preparation {
@@ -1412,7 +1438,7 @@ pub(crate) fn view_until(
 }
 
 fn published_for_read(store: &StoreService, snapshot: &Snapshot) -> Published {
-    if let Some(published) = ReadBasis::upper(snapshot) {
+    if let Some(published) = ReadBasis::upper(snapshot).filter(|u| !u.refused()) {
         return published;
     }
     let bounds = &store.dl().bounds;
@@ -1434,7 +1460,10 @@ fn published_for_read(store: &StoreService, snapshot: &Snapshot) -> Published {
         last,
     );
     if !upper.as_ref().is_err_and(|g| g.refused) {
-        ReadBasis::record_upper(snapshot, published.clone());
+        let recorded = ReadBasis::record_upper(snapshot, published.clone());
+        if recorded.compiled != published.compiled {
+            return recorded;
+        }
         // Retained and superseded readers can finish without replacing the writer's root.
         if current() {
             let mut slot = lock(&bounds.state);
@@ -1474,9 +1503,10 @@ fn read(store: &StoreService, snapshot: &Snapshot, key: ReadKey) -> (Arc<View>, 
     #[cfg(test)]
     seam::at(bounds, seam::Point::Eligible);
     let kept = bounds.kept();
-    let mut keep = !published.upper.as_ref().is_err_and(|g| g.refused);
+    let mut keep = !published.refused();
+    let rules = published.last == "rules";
     let lower = match &published.upper {
-        Ok(upper) if !published.rules => {
+        Ok(upper) => {
             let taxonomy = taxonomy(store, snapshot, &published);
             keep &= taxonomy.is_ok();
             super::lower::memberships(snapshot, of(&taxonomy), upper.program.names.rdf_type, kept)
@@ -1489,7 +1519,7 @@ fn read(store: &StoreService, snapshot: &Snapshot, key: ReadKey) -> (Arc<View>, 
             snapshot,
             revision,
             published.upper.as_ref(),
-            published.rules,
+            rules,
             &lower,
             kept,
         )
@@ -1891,7 +1921,7 @@ fn parts(
         named_gap_classes: HashSet::new(),
         named_gap_predicates: HashSet::new(),
         internal: HashSet::new(),
-        facts: upper.stack.len() + eligible.len(),
+        facts: upper.stack.len(),
         proves_consistency: upper.proves_consistency(),
         rules: false,
     };
@@ -2023,13 +2053,6 @@ pub(crate) fn report(store: &StoreService) -> BoundsReport {
 /// maintained, or with `afresh` evaluated anew (not installed). `None` if U1 isn't
 /// available. For the differential tests of the maintenance.
 pub(crate) fn upper_facts(store: &StoreService, afresh: bool) -> Option<Vec<[String; 3]>> {
-    let collect = |upper: &UpperVersion| {
-        upper
-            .stack
-            .scan([None; 3])
-            .chain(upper.eligible.scan([None; 3]))
-            .collect()
-    };
     let snapshot = store.engine().snapshot();
     let facts: Vec<Triple> = if afresh {
         // Shared ids, as `afresh`'s (dictionary lifecycle V1): the decoder below, taken
@@ -2056,10 +2079,15 @@ pub(crate) fn upper_facts(store: &StoreService, afresh: bool) -> Option<Vec<[Str
             store.dl().bounds.kept(),
         )
         .ok()?;
-        collect(&upper)
+        upper.stack.scan([None; 3]).collect()
     } else {
         let (snapshot, _) = view(store);
-        collect(ReadBasis::upper(&snapshot)?.upper.as_ref().ok()?)
+        ReadBasis::upper(&snapshot)?
+            .upper
+            .ok()?
+            .stack
+            .scan([None; 3])
+            .collect()
     };
     let decoder = store.engine().snapshot();
     let decode = |t: u64| {

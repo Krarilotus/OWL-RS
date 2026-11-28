@@ -10,6 +10,7 @@
 //! independent of run order. Merges of any adjacent runs just add the signs.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use rayon::prelude::*;
 
@@ -197,6 +198,13 @@ struct Accounted {
     forms: Forms,
 }
 
+#[derive(Debug)]
+struct TripleSummary {
+    counts: Vec<(u64, i64)>,
+    _held: nrese_exec::Reservation,
+    compactions: AtomicUsize,
+}
+
 impl Drop for Accounted {
     fn drop(&mut self) {
         (self.forms.0).fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
@@ -216,7 +224,7 @@ pub(crate) struct Run {
     /// On a quad-layout form: its bytes in its engine's [`Forms`] while it lives.
     account: Option<Accounted>,
     /// The signed predicate summary and the charge owned by a derived triple run.
-    triples: Option<(Vec<(u64, i64)>, nrese_exec::Reservation)>,
+    triples: Option<TripleSummary>,
 }
 
 impl Run {
@@ -393,26 +401,32 @@ impl Run {
         }
         let (counts, charge) = counts.into_parts();
         held.absorb(charge);
-        self.triples = Some((
+        self.triples = Some(TripleSummary {
             counts,
-            std::mem::replace(
-                held,
-                nrese_exec::Reservation::new(std::sync::Arc::clone(budget)),
-            ),
-        ));
+            _held: std::mem::replace(held, nrese_exec::Reservation::new(Arc::clone(budget))),
+            compactions: AtomicUsize::new(0),
+        });
         Ok(())
     }
 
     pub(super) fn predicate_delta(&self, predicate: u64) -> i64 {
-        let (counts, _) = self.triples.as_ref().expect("derived triple run");
+        let counts = &self.triples.as_ref().expect("derived triple run").counts;
         counts
             .binary_search_by_key(&predicate, |&(p, _)| p)
             .map_or(0, |i| counts[i].1)
     }
 
+    pub(super) fn compactions(&self) -> &AtomicUsize {
+        &self
+            .triples
+            .as_ref()
+            .expect("derived triple run")
+            .compactions
+    }
+
     #[cfg(test)]
     pub(super) fn triple_overhead(&self) -> usize {
-        let (counts, _) = self.triples.as_ref().unwrap();
+        let counts = &self.triples.as_ref().unwrap().counts;
         counts.capacity() * size_of::<(u64, i64)>() + crate::term::ChargedArc::<Self>::COST
     }
 
@@ -547,6 +561,20 @@ impl Run {
     /// [`Self::sign_of`], its searches counted on `account` before they are made: `None`
     /// once the account has stopped.
     pub(crate) fn sign_of_counted(
+        &self,
+        quad: &EncodedQuad,
+        account: &mut impl crate::visit::Account,
+    ) -> Option<i64> {
+        let perm = self.permutation(Permutation::Spog);
+        let key = Permutation::Spog.to_key(quad);
+        Some(match perm.keys.range_counted(&key, &key, account)? {
+            (start, end) if start == end => 0,
+            (start, _) if perm.is_tombstone(start) => -1,
+            _ => 1,
+        })
+    }
+
+    pub(super) fn triple_sign_counted(
         &self,
         quad: &EncodedQuad,
         account: &mut impl crate::visit::Account,

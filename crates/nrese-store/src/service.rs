@@ -247,14 +247,19 @@ impl ReadBasis {
             .clone()
     }
 
-    pub(crate) fn record_upper(snapshot: &Snapshot, upper: crate::dl::bounds::Published) {
-        if let Some(basis) = Self::of(snapshot) {
-            basis
-                .upper
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .get_or_insert(upper);
+    pub(crate) fn record_upper(
+        snapshot: &Snapshot,
+        upper: crate::dl::bounds::Published,
+    ) -> crate::dl::bounds::Published {
+        let Some(basis) = Self::of(snapshot) else {
+            return upper;
+        };
+        let mut recorded = basis.upper.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(existing) = recorded.as_ref().filter(|u| !u.refused()) {
+            return existing.clone();
         }
+        *recorded = Some(upper.clone());
+        upper
     }
 
     pub(crate) fn record_dl(snapshot: &Snapshot, status: crate::dl::DlStatus) {
