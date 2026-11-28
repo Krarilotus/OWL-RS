@@ -48,6 +48,40 @@ impl Drop for CompactionPin {
     }
 }
 
+/// Work reserved for a background compaction. Dropping it releases the input window.
+pub struct TripleCompaction {
+    captured: TripleVersion,
+    window: Range<usize>,
+    pin: Option<CompactionPin>,
+}
+
+impl TripleCompaction {
+    /// Build outside the owner's mailbox lock. The splice still needs matching input runs.
+    pub fn build(
+        self,
+    ) -> MergeResult<impl FnOnce(&TripleVersion) -> CompactionResult<TripleVersion> + Send + use<>>
+    {
+        let Self {
+            captured,
+            window,
+            pin,
+        } = self;
+        let merged = merge_triples(&captured.0.index.runs[window.clone()], &captured.0.budget)?;
+        Ok(move |current: &TripleVersion| {
+            let _pin = pin;
+            let index = &current.0.index;
+            if !index.retains(&captured.0.index, window.clone()) {
+                return Ok(None);
+            }
+            let run_count = index.runs.len() - window.len() + usize::from(merged.is_some());
+            TripleVersion::with_index(&current.0.budget, run_count, || {
+                index.with_compacted_ref(window, merged)
+            })
+            .map(Some)
+        })
+    }
+}
+
 impl TripleVersion {
     /// Builds a set from triples in any order, ignoring duplicates.
     pub fn build(
@@ -151,7 +185,13 @@ impl TripleVersion {
             };
             let pin = (plan.window.end <= INLINE_RUN_LIMIT)
                 .then(|| CompactionPin::new(&runs[plan.window.end - 1]));
-            return self.clone().merge_window(plan.window, pin).map(Some);
+            return TripleCompaction {
+                captured: self.clone(),
+                window: plan.window,
+                pin,
+            }
+            .build()
+            .map(Some);
         }
         let floor = runs
             .iter()
@@ -170,18 +210,18 @@ impl TripleVersion {
         if start == runs.len() {
             return Ok(None);
         }
-        self.clone().merge_window(start..runs.len(), None).map(Some)
+        TripleCompaction {
+            captured: self.clone(),
+            window: start..runs.len(),
+            pin: None,
+        }
+        .build()
+        .map(Some)
     }
 
     /// Reserve an owner's window before releasing its mailbox lock. The returned work
     /// builds the merge outside that lock, and its splice can retain subsequent appends.
-    pub fn plan_compaction(
-        &self,
-        policy: CompactionPolicy,
-    ) -> Option<
-        impl FnOnce() -> MergeResult<impl FnOnce(&Self) -> CompactionResult<Self> + Send + use<>>
-        + use<>,
-    > {
+    pub fn plan_compaction(&self, policy: CompactionPolicy) -> Option<TripleCompaction> {
         let runs = &self.0.index.runs;
         let window = if runs.len() > INLINE_RUN_LIMIT {
             // A previous owner can leave a third run on refusal. Fold the base first.
@@ -189,28 +229,10 @@ impl TripleVersion {
         } else {
             policy.plan(runs)?.window
         };
-        let pin = CompactionPin::new(&runs[window.end - 1]);
-        let captured = self.clone();
-        Some(move || captured.merge_window(window, Some(pin)))
-    }
-
-    fn merge_window(
-        self,
-        window: Range<usize>,
-        pin: Option<CompactionPin>,
-    ) -> MergeResult<impl FnOnce(&Self) -> CompactionResult<Self> + Send + use<>> {
-        let merged = merge_triples(&self.0.index.runs[window.clone()], &self.0.budget)?;
-        Ok(move |current: &Self| {
-            let _pin = pin;
-            let index = &current.0.index;
-            if !index.retains(&self.0.index, window.clone()) {
-                return Ok(None);
-            }
-            let run_count = index.runs.len() - window.len() + usize::from(merged.is_some());
-            Self::with_index(&current.0.budget, run_count, || {
-                index.with_compacted_ref(window, merged)
-            })
-            .map(Some)
+        Some(TripleCompaction {
+            captured: self.clone(),
+            pin: Some(CompactionPin::new(&runs[window.end - 1])),
+            window,
         })
     }
 

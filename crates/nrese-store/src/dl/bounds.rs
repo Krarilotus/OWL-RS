@@ -521,8 +521,8 @@ impl Compaction {
                 drop(slot);
                 #[cfg(test)]
                 assert!(!panic_before_merge, "injected compaction panic");
-                let stack = stack.map(|build| build());
-                let eligible = eligible.map(|build| build());
+                let stack = stack.map(|plan| plan.build());
+                let eligible = eligible.map(|plan| plan.build());
                 let mut slot = lock(&shared);
                 let Some((latest, current_stack, current_eligible)) = &mut slot.latest else {
                     owner.finish(&mut slot);
