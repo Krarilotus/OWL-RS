@@ -672,7 +672,7 @@ impl StoreService {
             let obj = nrese_engine::TermId::from_raw(s.triple[2]);
             crate::dl::query::is_ill_typed(obj, &decode).then_some(s.triple[2])
         }) {
-            return Ok(DlEntailment {
+            return Ok(DlEvidence {
                 answer: Entailed::Unknown(format!(
                     "the conclusion isn't well-formed OWL 2 DL: ill-typed literal: {}",
                     name(bad)
@@ -686,7 +686,7 @@ impl StoreService {
         };
         // Admitted: an inconsistent premise has no model, so it entails the conclusion.
         if inconsistent {
-            return Ok(DlEntailment {
+            return Ok(DlEvidence {
                 answer: Entailed::Yes,
                 premise: checked.verdict,
             });
@@ -701,7 +701,7 @@ impl StoreService {
             })
             .collect();
         let fresh = fresh?;
-        Ok(DlEntailment {
+        Ok(DlEvidence {
             answer: entails_prepared_within(
                 prepared,
                 !read.anonymous.is_empty(),

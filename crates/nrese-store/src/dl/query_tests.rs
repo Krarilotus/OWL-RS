@@ -748,6 +748,7 @@ fn marks_and_passes(
         let marks = status
             .expect("a status")
             .reasons
+            .clone()
             .into_iter()
             .filter(|r| r.text.contains(ONLY))
             .map(|r| r.text)
