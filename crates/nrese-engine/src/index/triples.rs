@@ -236,9 +236,9 @@ impl TripleVersion {
         })
     }
 
-    /// Whether the policy has a merge for this version.
+    /// Whether the size tiers select a merge for this version.
     pub fn needs_compaction(&self, policy: CompactionPolicy) -> bool {
-        self.0.index.runs.len() > INLINE_RUN_LIMIT || policy.plan(&self.0.index.runs).is_some()
+        policy.plan(&self.0.index.runs).is_some()
     }
 
     pub fn len(&self) -> usize {
