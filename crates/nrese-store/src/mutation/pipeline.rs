@@ -499,7 +499,7 @@ impl MutationPipeline {
                 let record = read.or_else(|| match &bounds.prepared {
                     crate::dl::bounds::Prepared::Rules(_) => Some(None),
                     crate::dl::bounds::Prepared::Delta(_) => {
-                        crate::service::ReadBasis::dl_status(tx.base()).and_then(|s| s.left_out)
+                        crate::service::ReadBasis::left_out(tx.base())
                     }
                     crate::dl::bounds::Prepared::Rebuilt(_)
                     | crate::dl::bounds::Prepared::Unavailable => None,
@@ -537,9 +537,18 @@ impl MutationPipeline {
                     left_out: left_out.clone(),
                 })
             });
-            let certificate = self
-                .store
-                .successor(&tx, literal_equality, witness, dl_status);
+            let dl_upper = dl
+                .as_ref()
+                .map(|(_, bounds, _)| bounds.published(&self.store, tx.base()));
+            let left_out = dl.as_ref().and_then(|(_, _, note)| note.clone());
+            let certificate = self.store.successor(
+                &tx,
+                literal_equality,
+                witness,
+                dl_status,
+                dl_upper.clone(),
+                left_out,
+            );
             if !ticket.begin_commit() {
                 return Err(MutationError::Cancelled);
             }
@@ -583,7 +592,12 @@ impl MutationPipeline {
             }
             (self.store.lists).commit(before, summary.revision, lists_left_out);
             if let Some((gate, bounds, left_out)) = dl {
-                crate::dl::bounds::install(&self.store, bounds, summary.revision);
+                crate::dl::bounds::install(
+                    &self.store,
+                    bounds,
+                    dl_upper.expect("DL publication").compiled(),
+                    summary.revision,
+                );
                 if gate.record_verdict {
                     self.store.dl().record(crate::dl::DlStatus {
                         revision: summary.revision,

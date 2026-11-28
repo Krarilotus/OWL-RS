@@ -12,6 +12,7 @@ use super::*;
 use crate::{
     MutationCommand, MutationPipeline, MutationTicket, Requester, SparqlUpdateRequest, StoreConfig,
 };
+use nrese_engine::QuadPattern;
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
 
 /// Not OWL 2 RL (an existential on the right), so U1 is compiled; a few classes, so the
@@ -45,7 +46,11 @@ fn update(pipeline: &MutationPipeline, text: &str) {
 
 /// A store under `owl2-dl` and its pipeline, with the schema and its members committed.
 fn pipeline() -> (Arc<StoreService>, MutationPipeline) {
-    let store = Arc::new(StoreService::new(StoreConfig::in_memory()).unwrap());
+    pipeline_with(StoreConfig::in_memory())
+}
+
+fn pipeline_with(config: StoreConfig) -> (Arc<StoreService>, MutationPipeline) {
+    let store = Arc::new(StoreService::new(config).unwrap());
     let pipeline = MutationPipeline::new(
         Arc::clone(&store),
         Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
@@ -88,7 +93,7 @@ const DELETE: &str = "PREFIX : <urn:test:> DELETE DATA { :a0 a :A . :a1 a :A . :
 
 /// A maintained read doesn't hold the bounds state across probes of its snapshot.
 #[test]
-fn program_fact_snapshot_probes_leave_the_bounds_state_unlocked() {
+fn a_read_uses_the_published_eligible_program_facts() {
     use std::fmt::Write as _;
 
     const MEMBERS: usize = 128;
@@ -116,19 +121,16 @@ fn program_fact_snapshot_probes_leave_the_bounds_state_unlocked() {
         assert_eq!(after.unavailable, None, "{after:?}");
     });
     eprintln!("{total} snapshot probes, {locked} under the bounds state lock");
-    assert!(
-        total >= MEMBERS,
-        "the read made only {total} snapshot probes"
-    );
+    assert_eq!(total, 0, "the read recomputed eligible facts");
     assert_eq!(
         locked, 0,
         "snapshot probes with the bounds state locked, of {total}"
     );
 }
 
-/// A view can't use an older U1's facts with a newer compilation of its stack.
+/// A held publication reads its own program across a rebuild.
 #[test]
-fn a_rebuild_during_fact_probes_does_not_mix_revisions() {
+fn a_rebuild_after_the_version_is_taken_does_not_mix_revisions() {
     let (store, pipeline) = pipeline();
     update(
         &pipeline,
@@ -140,7 +142,6 @@ fn a_rebuild_during_fact_probes_does_not_mix_revisions() {
     );
     let old = store.engine().snapshot();
     seam::set(&store.dl().bounds, Point::Eligible, move || {
-        assert!(pipeline.store().dl().bounds.state.try_lock().is_ok());
         update(
             &pipeline,
             "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#>
@@ -150,7 +151,11 @@ fn a_rebuild_during_fact_probes_does_not_mix_revisions() {
         );
     });
 
-    let old_read = view_until(&store, &old, None, None);
+    let old_read = view_until(&store, &old, None, None)
+        .expect("read attempted")
+        .expect("held publication has its upper bound");
+    let old_upper = old_read.upper.as_ref().expect("old U1");
+    assert_eq!(old_read.revision, old.revision());
     let (current, latest) = view(&store);
     assert!(
         current.revision() > old.revision(),
@@ -165,15 +170,452 @@ fn a_rebuild_during_fact_probes_does_not_mix_revisions() {
     };
     let x = id("urn:test:x");
     let rdf_type = id(RDF_TYPE);
+    let before = [x, rdf_type, id("urn:test:Before")];
+    let after = [x, rdf_type, id("urn:test:After")];
+    let contains_program_fact = |snapshot: &Snapshot, fact| {
+        ReadBasis::upper(snapshot)
+            .expect("published bounds")
+            .upper
+            .expect("published program")
+            .program
+            .facts
+            .iter()
+            .any(|(t, _)| *t == fact)
+    };
+    assert!(contains_program_fact(&old, before));
+    assert!(!contains_program_fact(&old, after));
+    assert!(!contains_program_fact(&current, before));
+    assert!(contains_program_fact(&current, after));
     assert_eq!(
         (
-            matches!(old_read, Some(Err(Missing::Later))),
+            in_view(old_upper, [x, rdf_type, id("urn:test:Before")]),
+            in_view(old_upper, [x, rdf_type, id("urn:test:After")]),
             in_view(upper, [x, rdf_type, id("urn:test:Before")]),
             in_view(upper, [x, rdf_type, id("urn:test:After")]),
         ),
-        (true, false, true),
-        "the previous read must yield to the rebuild and the new view use the new facts"
+        (true, false, false, true),
+        "each publication uses its own compiled program"
     );
+}
+
+/// A fact added and then removed stays visible only
+/// to the reader that pinned the intermediate publication.
+#[test]
+fn installing_a_delta_preserves_the_readers_stack() {
+    let (store, pipeline) = pipeline();
+    let before = store.engine().snapshot();
+    update(&pipeline, "PREFIX : <urn:test:> INSERT DATA { :i0 a :A }");
+    let intermediate = store.engine().snapshot();
+    update(&pipeline, "PREFIX : <urn:test:> DELETE DATA { :i0 a :A }");
+    let after = store.engine().snapshot();
+    let term = |iri| intermediate.lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into());
+    let pattern = QuadPattern {
+        subject: term("urn:test:i0"),
+        predicate: term("urn:test:p"),
+        ..QuadPattern::all()
+    };
+    assert!(pattern.subject.is_some() && pattern.predicate.is_some());
+    for (snapshot, present) in [(&before, false), (&intermediate, true), (&after, false)] {
+        let view = view_until(&store, snapshot, None, None)
+            .expect("read attempted")
+            .expect("held publication has its upper bound");
+        assert_eq!(view.revision, snapshot.revision());
+        let upper = view.upper.as_ref().expect("U1");
+        let found = upper
+            .quads_for_pattern_in(ReadModel::Materialised, &pattern)
+            .next();
+        assert_eq!(found.is_some(), present, "revision {}", snapshot.revision());
+    }
+}
+
+/// A SELECT keeps its complete answer when an unrelated
+/// commit publishes after it has taken its snapshot.
+#[test]
+fn an_unrelated_commit_keeps_the_pinned_query_complete() {
+    let (store, pipeline) = pipeline();
+    update(
+        &pipeline,
+        "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+         INSERT DATA {
+           :i0 a owl:NamedIndividual , [ owl:complementOf [ owl:complementOf :A ] ] .
+         }",
+    );
+    seam::set(&store.dl().bounds, Point::Eligible, move || {
+        update(
+            &pipeline,
+            "PREFIX : <urn:test:> INSERT DATA { :unrelated a :F }",
+        );
+    });
+    let request = crate::SparqlQueryRequest::all(
+        "PREFIX : <urn:test:> SELECT ?x WHERE { ?x a :A . FILTER(sameTerm(?x, :i0)) }",
+    );
+    let result = store.execute_query(&request).expect("product read");
+    let payload: serde_json::Value = serde_json::from_slice(&result.payload).expect("SELECT JSON");
+    let claim = result.completeness.expect("DL claim");
+    assert_eq!(
+        payload["results"]["bindings"],
+        serde_json::json!([{"x":{"type":"uri","value":"urn:test:i0"}}]),
+        "{}",
+        claim.header(),
+    );
+    assert!(claim.complete, "{}", claim.header());
+}
+
+/// Eligibility follows the visible input, across graph
+/// duplicates, inferred support, a rebuild and a change in the equality reading.
+#[test]
+fn eligible_program_facts_follow_the_published_revision() {
+    const PREFIX: &str = "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>";
+    let (store, pipeline) = pipeline_with(StoreConfig {
+        equality_compact: true,
+        ..StoreConfig::in_memory()
+    });
+    let apply = |text: &str| update(&pipeline, &format!("{PREFIX} {text}"));
+    apply(
+        "INSERT DATA {
+        :D rdfs:subClassOf :M . :M a owl:Class .
+        :x a owl:NamedIndividual , [ owl:complementOf [ owl:complementOf :M ] ] .
+    }",
+    );
+    let first = store.engine().snapshot();
+    let id = |iri| {
+        first
+            .lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into())
+            .unwrap()
+            .raw()
+    };
+    let target = [id("urn:test:x"), id(RDF_TYPE), id("urn:test:M")];
+    let results = [
+        ("INSERT DATA { :x a :M }", true, false),
+        ("DELETE DATA { :x a :M }", false, true),
+        (
+            "INSERT DATA { GRAPH :g1 { :x a :M } GRAPH :g2 { :x a :M } }",
+            true,
+            false,
+        ),
+        ("DELETE DATA { GRAPH :g1 { :x a :M } }", true, false),
+        ("DELETE DATA { GRAPH :g2 { :x a :M } }", false, true),
+        ("INSERT DATA { :x a :D }", true, false),
+        ("DELETE DATA { :x a :D }", false, true),
+        ("INSERT DATA { :F rdfs:subClassOf :M }", false, true),
+        ("INSERT DATA { :x owl:sameAs :a0 }", false, false),
+        ("INSERT DATA { :x a :M }", true, false),
+        ("DELETE DATA { :x a :M }", false, false),
+        ("DELETE DATA { :x owl:sameAs :a0 }", false, true),
+    ]
+    .map(|(update, materialised, eligible)| {
+        apply(update);
+        let snapshot = store.engine().snapshot();
+        if update == "DELETE DATA { :x a :M }" && !eligible {
+            let maintained = ReadBasis::upper(&snapshot).unwrap().upper.unwrap();
+            let rebuilt = afresh(&store, &snapshot).0.unwrap();
+            assert_eq!(
+                maintained.eligible.scan([None; 3]).collect::<Vec<_>>(),
+                rebuilt.eligible.scan([None; 3]).collect::<Vec<_>>(),
+                "a sameAs member's retraction must keep the fresh eligible set",
+            );
+            // Commits with classes rebuild the root. Exercise the eligibility stage on the
+            // same retraction directly so it must enforce the build's class exclusion too.
+            assert!(rebuilt.classes().class_of(target[0]).is_some());
+            assert!(
+                rebuilt
+                    .program
+                    .facts
+                    .iter()
+                    .any(|(fact, _)| *fact == target)
+            );
+            let bounds = &store.dl().bounds;
+            let (staged, _) = rebuilt
+                .stage(
+                    Change::default(),
+                    [target].into_iter(),
+                    &snapshot,
+                    bounds.kept(),
+                    None,
+                    bounds,
+                )
+                .unwrap();
+            assert_eq!(
+                staged.eligible.scan([None; 3]).collect::<Vec<_>>(),
+                rebuilt.eligible.scan([None; 3]).collect::<Vec<_>>(),
+                "staging the retraction must also exclude the equality member",
+            );
+        }
+        (snapshot, materialised, eligible)
+    });
+    for (snapshot, materialised, eligible) in std::iter::once((first, false, true)).chain(results) {
+        let published = ReadBasis::upper(&snapshot).expect("pinned U1 publication");
+        let upper = published.upper.expect("its eligible set");
+        assert_eq!(
+            in_view(&snapshot, target),
+            materialised,
+            "revision {}",
+            snapshot.revision()
+        );
+        assert_eq!(
+            upper.eligible.contains(target),
+            eligible,
+            "revision {}",
+            snapshot.revision()
+        );
+    }
+}
+
+/// A stack insertion can change eligibility even when the fact itself was not
+/// in the materialised delta. Compare the staged move with a full evaluation.
+#[test]
+fn staging_a_program_fact_on_the_stack_removes_its_eligibility() {
+    const PREFIX: &str = "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>";
+    let (store, pipeline) = pipeline();
+    update(
+        &pipeline,
+        &format!(
+            "{PREFIX} INSERT DATA {{
+            :C rdfs:subClassOf :M . :M a owl:Class .
+            :x a owl:NamedIndividual , [ owl:complementOf [ owl:complementOf :M ] ] .
+        }}"
+        ),
+    );
+    let before = store.engine().snapshot();
+    let root = afresh(&store, &before).0.unwrap();
+    let id = |iri| {
+        before
+            .lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into())
+            .unwrap()
+            .raw()
+    };
+    let fact = [id("urn:test:x"), id(RDF_TYPE), id("urn:test:M")];
+    assert!(root.eligible.contains(fact));
+
+    // Give the fresh evaluation a rule derivation in place of the program fact.
+    // The ungated write leaves that derivation for U1 to make beyond L.
+    store
+        .update_str_ungated(&format!(
+            "{PREFIX}
+            DELETE {{ :x a ?outer . ?outer owl:complementOf ?inner . ?inner owl:complementOf :M }}
+            INSERT {{ :x a :C }}
+            WHERE {{ :x a ?outer . ?outer owl:complementOf ?inner . ?inner owl:complementOf :M }}"
+        ))
+        .unwrap();
+    let snapshot = store.engine().snapshot();
+    let fresh = afresh(&store, &snapshot).0.unwrap();
+    assert!(!in_view(&snapshot, fact));
+    assert!(fresh.stack.contains(fact));
+    let bounds = &store.dl().bounds;
+    let (staged, _) = root
+        .stage(
+            Change::inserting(fact),
+            std::iter::empty(),
+            &snapshot,
+            bounds.kept(),
+            None,
+            bounds,
+        )
+        .unwrap();
+    assert!(staged.stack.contains(fact));
+    assert_eq!(
+        staged.eligible.scan([None; 3]).collect::<Vec<_>>(),
+        fresh.eligible.scan([None; 3]).collect::<Vec<_>>(),
+        "a fact staged on the stack must leave the eligible set",
+    );
+}
+
+/// A publication that has no U1 cannot supply the next delta's root.
+#[test]
+fn a_commit_rebuilds_after_a_same_revision_reinstall_without_u1() {
+    let (store, pipeline) = pipeline();
+    let previous = store.engine().snapshot();
+    let compiled = ReadBasis::upper(&previous).unwrap().compiled;
+    store.use_dl(true, false);
+    let reinstalled = store.engine().snapshot();
+    assert_eq!(reinstalled.revision(), previous.revision());
+    assert!(!reinstalled.same_version(&previous));
+    assert!(ReadBasis::upper(&reinstalled).is_none());
+
+    update(&pipeline, "PREFIX : <urn:test:> INSERT DATA { :a0 a :F }");
+    let snapshot = store.engine().snapshot();
+    let published = ReadBasis::upper(&snapshot).expect("the new publication carries U1");
+    assert!(published.upper.is_ok());
+    assert_ne!(
+        published.compiled, compiled,
+        "the old root cannot supply the delta"
+    );
+    assert_eq!(published.last, "rebuilt");
+}
+
+/// A panicking compaction must hand its ownership back to the next publisher.
+#[test]
+fn a_compaction_panic_releases_its_owner() {
+    let (store, _) = pipeline();
+    let mut upper = ReadBasis::upper(&store.engine().snapshot())
+        .unwrap()
+        .upper
+        .unwrap();
+    let budget = Arc::new(nrese_exec::Budget::unlimited());
+    upper.stack = TripleVersion::build([[1, 2, 3]], &budget)
+        .unwrap()
+        .successor(&[[4, 2, 3]], &[])
+        .unwrap();
+    let compaction = Compaction::default();
+    lock(&compaction.0).panic_before_merge = true;
+    let (notify, panicked) = std::sync::mpsc::channel();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .panic_handler(move |_| {
+            let _ = notify.send(());
+        })
+        .build()
+        .unwrap();
+    pool.install(|| compaction.publish(1, Some(&upper)));
+    panicked
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the worker panicked");
+    assert!(
+        !lock(&compaction.0).active,
+        "the next publication must be able to start a compactor"
+    );
+}
+
+/// The diagnostic's upper fact count and fact list describe the stack, even when
+/// the published program also has eligible facts (the BoundsReport API).
+#[test]
+fn upper_facts_reports_only_the_stack() {
+    let (store, pipeline) = pipeline();
+    update(
+        &pipeline,
+        "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+        INSERT DATA { :x a owl:NamedIndividual ,
+            [ owl:complementOf [ owl:complementOf :A ] ] . }",
+    );
+    let snapshot = store.engine().snapshot();
+    let upper = ReadBasis::upper(&snapshot).unwrap().upper.unwrap();
+    assert!(!upper.eligible.is_empty());
+    assert_eq!(
+        (
+            report(&store).upper_facts,
+            upper_facts(&store, false).unwrap().len()
+        ),
+        (upper.stack.len(), upper.stack.len())
+    );
+    assert_eq!(
+        canonical(&upper_facts(&store, true).unwrap()),
+        canonical(&upper_facts(&store, false).unwrap())
+    );
+}
+
+/// Under the default and named graph semantics, an assertion
+/// in any graph suppresses the inferred default-graph statement while present.
+#[test]
+fn a_named_graph_assertion_suppresses_the_program_fact_in_the_default_graph() {
+    let (store, pipeline) = pipeline();
+    update(
+        &pipeline,
+        "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+        INSERT DATA { :i0 a owl:NamedIndividual ,
+            [ owl:complementOf [ owl:complementOf :A ] ] }",
+    );
+    let request = crate::SparqlQueryRequest::all(
+        "PREFIX : <urn:test:> SELECT ?x WHERE { ?x a :A . FILTER(sameTerm(?x, :i0)) }",
+    );
+    let bindings = || {
+        let result = store.execute_query(&request).expect("product read");
+        let result: serde_json::Value =
+            serde_json::from_slice(&result.payload).expect("SELECT JSON");
+        result["results"]["bindings"].as_array().unwrap().clone()
+    };
+    let expected = [serde_json::json!({"x":{"type":"uri","value":"urn:test:i0"}})];
+    assert_eq!(bindings(), expected);
+    update(
+        &pipeline,
+        "PREFIX : <urn:test:> INSERT DATA { GRAPH :g { :i0 a :A } }",
+    );
+    assert!(bindings().is_empty());
+    update(
+        &pipeline,
+        "PREFIX : <urn:test:> DELETE DATA { GRAPH :g { :i0 a :A } }",
+    );
+    assert_eq!(bindings(), expected);
+}
+
+/// Part B T5. A replacement and its rematerialisation use their own program facts
+/// while a reader still holds the previous publication.
+#[test]
+fn a_bulk_replacement_builds_eligibility_for_its_own_revision() {
+    let (store, pipeline) = pipeline();
+    update(
+        &pipeline,
+        "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+        INSERT DATA { :i0 a owl:NamedIndividual ,
+            [ owl:complementOf [ owl:complementOf :A ] ] }",
+    );
+    let old = store.engine().snapshot();
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("replacement.ttl");
+    std::fs::write(
+        &file,
+        "@prefix : <urn:test:> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         :After a owl:Class . :i0 a owl:NamedIndividual ,
+              [ owl:complementOf [ owl:complementOf :After ] ] .",
+    )
+    .unwrap();
+    store
+        .bulk_load(&crate::BulkLoadRequest {
+            files: vec![file],
+            replace: true,
+            graph: crate::GraphTarget::DefaultGraph,
+            invalid: None,
+        })
+        .unwrap();
+    let program = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl)
+        .materialised_program()
+        .unwrap();
+    store.rematerialise(program).unwrap();
+    let (current, latest) = view(&store);
+    let old_read = view_until(&store, &old, None, None).unwrap().unwrap();
+    let id = |iri: &str| {
+        current
+            .lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into())
+            .or_else(|| old.lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into()))
+            .unwrap()
+            .raw()
+    };
+    let fact = |class| [id("urn:test:i0"), id(RDF_TYPE), id(class)];
+    let old_upper = old_read.upper.as_ref().expect("retained upper bound");
+    let latest_upper = latest.upper.as_ref().expect("replacement upper bound");
+    assert!(in_view(old_upper, fact("urn:test:A")));
+    assert!(!in_view(latest_upper, fact("urn:test:A")));
+    assert!(in_view(latest_upper, fact("urn:test:After")));
+}
+
+/// Part B T6. Repeated publishers cannot force a diagnostic to restart its pinned read.
+#[test]
+fn a_writer_cannot_keep_restarting_a_latest_view() {
+    let (store, pipeline) = pipeline();
+    let before = store.current_revision();
+    let writes = Arc::new(AtomicUsize::new(0));
+    fn interpose(pipeline: Arc<MutationPipeline>, writes: Arc<AtomicUsize>) {
+        let store = Arc::clone(pipeline.store());
+        seam::set(&store.dl().bounds, Point::Eligible, move || {
+            let index = writes.fetch_add(1, Ordering::Relaxed);
+            update(
+                &pipeline,
+                &format!("PREFIX : <urn:test:> INSERT DATA {{ :a{index} a :F }}"),
+            );
+            if index < 3 {
+                interpose(pipeline, writes);
+            }
+        });
+    }
+    interpose(Arc::new(pipeline), Arc::clone(&writes));
+    let report = report(&store);
+    seam::set(&store.dl().bounds, Point::Eligible, || {});
+    seam::at(&store.dl().bounds, Point::Eligible);
+    assert_eq!(report.unavailable, None);
+    assert_eq!(report.revision, before);
+    assert_eq!(store.current_revision(), before + 1);
+    assert_eq!(writes.load(Ordering::Relaxed), 1);
 }
 
 /// A read of the revision U1 and its view describe gets that view while a commit computes
@@ -444,7 +886,13 @@ fn until(event: impl Fn() -> bool) {
 
 /// Whether a read is asleep on the view build of `revision` under way (only while one is).
 fn asleep(store: &StoreService, revision: u64) -> bool {
-    matches!(store.dl().bounds.views.claim(revision, Kind::Opaque, || None),
+    let snapshot = store.engine().snapshot();
+    assert_eq!(snapshot.revision(), revision);
+    let key = (
+        snapshot.identity(),
+        ReadBasis::of(&snapshot).map(|basis| basis.id),
+    );
+    matches!(store.dl().bounds.views.claim(key, Kind::Opaque, || None),
         Claim::Wait(build) if build.waiting() >= 1)
 }
 
@@ -542,7 +990,7 @@ fn a_joined_read_gives_up(explain: bool) {
     // The build went on after its own request stopped, and is kept.
     let first = first.join().unwrap();
     assert!(cancelled(&first), "the first read, stopped: {first:?}");
-    let kept = lock(&store.dl().bounds.view)
+    let (_, kept) = lock(&store.dl().bounds.view)
         .clone()
         .expect("the view the stopped build made is kept");
     assert_eq!(kept.revision, revision);

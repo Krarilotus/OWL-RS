@@ -83,6 +83,79 @@ fn an_upper_bound_refused_for_memory_is_built_once_memory_is_free() {
     assert!(after.upper_facts > 0, "{after:?}");
 }
 
+/// A refusal after eligibility was staged leaves both of
+/// the old reader's versions usable and publishes U1 unavailable for the commit.
+#[test]
+fn a_successor_that_really_does_not_fit_drops_u1() {
+    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    let store = Arc::new(
+        StoreService::new(StoreConfig {
+            total_query_memory_bytes: 1 << 29,
+            ..StoreConfig::in_memory()
+        })
+        .unwrap(),
+    );
+    let pipeline = crate::MutationPipeline::new(
+        Arc::clone(&store),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Dl,
+        ))),
+    );
+    pipeline.execute_update_str(&members(32)).unwrap();
+    pipeline
+        .execute_update_str(
+            "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+         INSERT DATA { :x a owl:NamedIndividual ,
+          [ owl:complementOf [ owl:complementOf :A ] ] }",
+        )
+        .unwrap();
+    let before = store.engine().snapshot();
+    let upper = ReadBasis::upper(&before).unwrap().upper.unwrap();
+    let id = |iri| {
+        before
+            .lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into())
+            .unwrap()
+            .raw()
+    };
+    let x = id("urn:test:x");
+    let fact = [x, id(RDF_TYPE), id("urn:test:A")];
+    assert!(upper.eligible.contains(fact));
+    let count = upper.stack.len();
+    let held = Arc::new(Mutex::new(None));
+    let charge = Arc::clone(&held);
+    let writer = Arc::clone(&store);
+    seam::set(&store.dl().bounds, seam::Point::StageStack, move || {
+        *lock(&charge) = Some(squeeze(&writer, 0));
+    });
+    seam::set(&store.dl().bounds, seam::Point::StackAttempted, move || {
+        drop(
+            lock(&held)
+                .take()
+                .expect("the stack was built with no room"),
+        );
+    });
+    pipeline
+        .execute_update_str("PREFIX : <urn:test:> INSERT DATA { :x a :A . :fresh a :A }")
+        .unwrap();
+    let current = store.engine().snapshot();
+    assert!(current.revision() > before.revision());
+    assert!(in_view(&current, fact));
+    let published = ReadBasis::upper(&current).unwrap();
+    assert!(published.upper.is_err_and(|g| g.refused));
+    assert!(upper.eligible.contains(fact));
+    assert_eq!(upper.stack.len(), count);
+    let pinned = view_until(&store, &before, None, None).unwrap().unwrap();
+    assert!(in_view(pinned.upper.as_ref().unwrap(), fact));
+
+    // The commit reported the refusal, and its pinned revision can now rebuild.
+    let recovered = report(&store);
+    assert_eq!(recovered.revision, current.revision());
+    assert_eq!(recovered.unavailable, None, "{recovered:?}");
+    let rebuilt = ReadBasis::upper(&current).expect("the pinned revision retains its rebuild");
+    assert!(rebuilt.upper.is_ok());
+    assert_eq!(report(&store).last, "read");
+}
+
 /// What the bounds keep is charged while kept (SYN-61): the query-ontology cache's ontology
 /// among it, beside U1's stack, so the charge is at least both.
 #[test]
@@ -99,7 +172,12 @@ fn the_cached_ontology_is_charged_with_what_the_bounds_keep() {
     let snapshot = store.engine().snapshot();
     let ontology = super::super::query::ontology_at(&store, &snapshot).unwrap();
     let cached = nrese_dl::memory::ontology_bytes(ontology.value());
-    let stack = report.upper_facts * 3 * std::mem::size_of::<[u64; 3]>();
+    let stack = ReadBasis::upper(&snapshot)
+        .unwrap()
+        .upper
+        .unwrap()
+        .stack
+        .packed_bytes();
     let kept = store.dl().bounds.kept().used();
     assert!(
         kept >= cached + stack,
@@ -193,7 +271,6 @@ fn a_late_build_of_a_revision_a_read_let_go_publishes_nothing() {
         upper: Err(not_compiled()),
         last: "read",
         compiled: store.dl().bounds.compiled(),
-        taxonomy: None,
         kinds: None,
     };
     publish(&mut lock(&store.dl().bounds.state), state);
@@ -275,8 +352,8 @@ fn a_views_copies_of_the_upper_bound_are_charged_before_they_are_made() {
 }
 
 /// What the bounds keep at a revision is charged to their budget while kept (SYN-61): U1's
-/// own stack among it, which holds each of U1's facts three times as 24-byte keys, so the
-/// charge is at least that, whatever the views' runs add.
+/// own stack among it. The packed permutations and their tombstones give a lower bound
+/// on the charge, before run lists, summaries and views are included.
 #[test]
 fn the_upper_bounds_stack_is_charged_while_it_is_kept() {
     let store = StoreService::new(StoreConfig::in_memory()).unwrap();
@@ -293,7 +370,14 @@ fn the_upper_bounds_stack_is_charged_while_it_is_kept() {
     store.update_str_ungated(&data).unwrap();
     let report = report(&store);
     assert_eq!(report.unavailable, None, "{report:?}");
-    let keys = report.upper_facts * 3 * std::mem::size_of::<[u64; 3]>();
+    let snapshot = store.engine().snapshot();
+    let keys = ReadBasis::upper(&snapshot)
+        .unwrap()
+        .upper
+        .unwrap()
+        .stack
+        .packed_bytes();
+    assert!(keys > 0);
     let kept = store.dl().bounds.kept().used();
     assert!(
         kept >= keys,
@@ -389,7 +473,8 @@ fn an_upper_bound_the_process_memory_stopped_is_not_kept() {
         matches!(&prepared.prepared, Prepared::Rebuilt(upper) if upper.is_err()),
         "the commit's U1 is stopped too"
     );
-    install(&store, prepared, tx.base().revision() + 1);
+    let compiled = prepared.published(&store, tx.base()).compiled();
+    install(&store, prepared, compiled, tx.base().revision() + 1);
     assert!(
         !kept(&store),
         "a commit installs no U1 the process's memory stopped"
@@ -442,7 +527,6 @@ fn embedded_low_memory_stops_maintenance_of_an_existing_upper_bound() {
             upper: Ok(Arc::new(upper)),
             last: "read",
             compiled: store.dl().bounds.compiled(),
-            taxonomy: None,
             kinds: None,
         },
     );

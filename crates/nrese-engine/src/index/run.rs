@@ -10,12 +10,13 @@
 //! independent of run order. Merges of any adjacent runs just add the signs.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use rayon::prelude::*;
 
 use super::Layout;
 use super::derive::Ordered;
-use super::keys::PackedKeys;
+use super::keys::{BLOCK, PackedKeys};
 use crate::quad::{EncodedQuad, Key, Permutation};
 
 /// Deltas at least this large are sorted with all of the layout's permutations in parallel.
@@ -123,7 +124,7 @@ impl PermutationRun {
 
     /// [`Self::from_sorted`], each array reserved on `charge` before it is made, the keys
     /// packed on one thread unless `parallel`.
-    fn from_sorted_within<C: super::Charge>(
+    pub(super) fn from_sorted_within<C: super::Charge>(
         entries: Vec<(Key, bool)>,
         charge: &mut C,
         parallel: bool,
@@ -197,6 +198,13 @@ struct Accounted {
     forms: Forms,
 }
 
+#[derive(Debug)]
+struct TripleSummary {
+    counts: Vec<(u64, i64)>,
+    _held: nrese_exec::Reservation,
+    compactions: AtomicUsize,
+}
+
 impl Drop for Accounted {
     fn drop(&mut self) {
         (self.forms.0).fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
@@ -215,6 +223,8 @@ pub(crate) struct Run {
     quads_form: parking_lot::Mutex<std::sync::Weak<Run>>,
     /// On a quad-layout form: its bytes in its engine's [`Forms`] while it lives.
     account: Option<Accounted>,
+    /// The signed predicate summary and the charge owned by a derived triple run.
+    triples: Option<TripleSummary>,
 }
 
 impl Run {
@@ -359,7 +369,65 @@ impl Run {
             deletes,
             quads_form: Default::default(),
             account: None,
+            triples: None,
         }
+    }
+
+    pub(super) fn keep_triples(
+        &mut self,
+        budget: &std::sync::Arc<nrese_exec::Budget>,
+        held: &mut nrese_exec::Reservation,
+    ) -> Result<(), nrese_exec::BudgetExceeded> {
+        let mut counts = nrese_exec::ChargedVec::new(std::sync::Arc::clone(budget));
+        let pos = self.permutation(Permutation::Posg);
+        let len = pos.keys.len();
+        {
+            // The summary only needs the predicate column, one block at a time.
+            let capacity = len.min(BLOCK);
+            let mut scratch = nrese_exec::Reservation::new(Arc::clone(budget));
+            scratch.charge(capacity * size_of::<u64>())?;
+            let mut predicates = [Vec::with_capacity(capacity)];
+            for start in (0..len).step_by(BLOCK) {
+                pos.keys
+                    .decode_columns(start, (start + BLOCK).min(len), &[0], &mut predicates);
+                for (i, predicate) in predicates[0].drain(..).enumerate() {
+                    let sign = if pos.is_tombstone(start + i) { -1 } else { 1 };
+                    match counts.last_mut() {
+                        Some((p, count)) if *p == predicate => *count += sign,
+                        _ => counts.push((predicate, sign))?,
+                    }
+                }
+            }
+        }
+        let (counts, charge) = counts.into_parts();
+        held.absorb(charge);
+        self.triples = Some(TripleSummary {
+            counts,
+            _held: std::mem::replace(held, nrese_exec::Reservation::new(Arc::clone(budget))),
+            compactions: AtomicUsize::new(0),
+        });
+        Ok(())
+    }
+
+    pub(super) fn predicate_delta(&self, predicate: u64) -> i64 {
+        let counts = &self.triples.as_ref().expect("derived triple run").counts;
+        counts
+            .binary_search_by_key(&predicate, |&(p, _)| p)
+            .map_or(0, |i| counts[i].1)
+    }
+
+    pub(super) fn compactions(&self) -> &AtomicUsize {
+        &self
+            .triples
+            .as_ref()
+            .expect("derived triple run")
+            .compactions
+    }
+
+    #[cfg(test)]
+    pub(super) fn triple_overhead(&self) -> usize {
+        let counts = &self.triples.as_ref().unwrap().counts;
+        counts.capacity() * size_of::<(u64, i64)>() + crate::term::ChargedArc::<Self>::COST
     }
 
     pub(crate) fn layout(&self) -> Layout {
@@ -503,6 +571,29 @@ impl Run {
             (start, end) if start == end => 0,
             (start, _) if perm.is_tombstone(start) => -1,
             _ => 1,
+        })
+    }
+
+    pub(super) fn triple_sign_counted(
+        &self,
+        quad: &EncodedQuad,
+        account: &mut impl crate::visit::Account,
+    ) -> Option<i64> {
+        let perm = self.permutation(Permutation::Spog);
+        let key = Permutation::Spog.to_key(quad);
+        let at = perm.keys.bound_counted(&key, account)?;
+        if at == perm.keys.len() {
+            return Some(0);
+        }
+        if !account.take(3) {
+            return None;
+        }
+        Some(if perm.keys.get(at) != key {
+            0
+        } else if perm.is_tombstone(at) {
+            -1
+        } else {
+            1
         })
     }
 }

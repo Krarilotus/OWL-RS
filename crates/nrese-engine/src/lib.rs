@@ -56,7 +56,7 @@ pub use engine::{
 };
 pub use error::{EngineError, EngineResult};
 pub use index::cursor::SeekStats;
-pub use index::{CompactionPolicy, IndexEncoding, set_index_encoding};
+pub use index::{CompactionPolicy, IndexEncoding, TripleVersion, set_index_encoding};
 /// Vector literals, metrics and indexes ([`Snapshot::vector_search`]).
 pub use nrese_vector as vector;
 pub use quad::{EncodedQuad, EncodedTriple, GraphSelector, QuadPattern};

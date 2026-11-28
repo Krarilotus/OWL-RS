@@ -505,13 +505,7 @@ impl Versions {
                 let index = current.stack(stack);
                 // A commit that turned the stack into the quad layout replaced its runs
                 // meanwhile: the merge is of runs that are gone.
-                let unchanged = index.layout() == merged.layout()
-                    && plan.window.clone().all(|i| {
-                        index
-                            .runs()
-                            .get(i)
-                            .is_some_and(|run| Arc::ptr_eq(run, &runs[i]))
-                    });
+                let unchanged = index.retains(version.stack(stack), plan.window.clone());
                 match unchanged {
                     true => {
                         self.compactions.fetch_add(1, Ordering::Relaxed);

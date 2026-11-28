@@ -43,6 +43,8 @@ openapi = ["dep:utoipa"]
 fault-points = []
 
 [dev-dependencies]
+# Enable the integration tests' private diagnostic helpers only in dev builds.
+nrese-store = { path = ".", features = ["fault-points"] }
 libmimalloc-sys = { workspace = true }
 mimalloc = { workspace = true }
 # The support graph sets' memory guard measures against budgets (tests/support_memory.rs).

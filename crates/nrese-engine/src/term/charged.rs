@@ -11,8 +11,10 @@ use std::sync::Arc;
 use nrese_exec::{Budget, BudgetExceeded, Reservation};
 
 /// A value shared by its holders, its `Arc` block charged ([`Self::COST`]).
+#[derive(Debug)]
 pub(crate) struct ChargedArc<T>(Option<Arc<Held<T>>>);
 
+#[derive(Debug)]
 struct Held<T> {
     // Declared first: dropped (its own charges released) before the block's reservation.
     value: T,

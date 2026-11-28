@@ -25,8 +25,9 @@ mod derive;
 pub(crate) mod keys;
 mod merge;
 pub(crate) mod run;
+mod triples;
 
-use std::ops::Range;
+use std::ops::{Deref, Range};
 use std::sync::Arc;
 
 use rayon::prelude::*;
@@ -40,11 +41,12 @@ pub(crate) use run::Forms;
 use run::{PermutationRun, Run};
 
 use crate::quad::{AccessPlan, EncodedQuad, Key, Permutation, QuadPattern};
-use crate::term::TermId;
+use crate::term::{ChargedArc, TermId};
 use crate::visit::{Account, Free, Ledger};
 
 pub use compaction::CompactionPolicy;
 pub use keys::{IndexEncoding, set_index_encoding};
+pub use triples::TripleVersion;
 
 /// Which quads a stack of runs may hold, and therefore which permutations it maintains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -255,9 +257,9 @@ const _: () =
     assert!(size_of::<Part<'static>>() <= size_of::<ChargedVec<(u64, i64), &'static Budget>>());
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct IndexVersion {
+pub(crate) struct IndexVersion<R = Arc<Run>> {
     layout: Layout,
-    runs: Arc<[Arc<Run>]>,
+    runs: Arc<[R]>,
     len: u64,
 }
 
@@ -313,15 +315,6 @@ impl IndexVersion {
     /// A version holding exactly the (deduplicated) `quads` in one base run.
     pub(crate) fn from_quads(layout: Layout, quads: Vec<EncodedQuad>) -> Self {
         Self::empty(layout).with_run(Run::from_quads(layout, quads))
-    }
-
-    /// Number of visible quads. O(1).
-    pub(crate) fn len(&self) -> u64 {
-        self.len
-    }
-
-    pub(crate) fn layout(&self) -> Layout {
-        self.layout
     }
 
     /// The layout `self` takes with the delta `inserts` and `deletes`: the quad layout once a
@@ -499,8 +492,33 @@ impl IndexVersion {
             len: self.len,
         }
     }
+}
 
-    pub(crate) fn runs(&self) -> &[Arc<Run>] {
+/// The counted quad-store reads keep their range accounting. Derived triple reads
+/// use the narrow probes appropriate to their own visitor contract.
+pub(crate) trait RunReference: Deref<Target = Run> {
+    const TRIPLE_PROBES: bool;
+}
+
+impl RunReference for Arc<Run> {
+    const TRIPLE_PROBES: bool = false;
+}
+
+impl RunReference for ChargedArc<Run> {
+    const TRIPLE_PROBES: bool = true;
+}
+
+impl<R: RunReference> IndexVersion<R> {
+    /// Number of visible quads. O(1).
+    pub(crate) fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub(crate) fn layout(&self) -> Layout {
+        self.layout
+    }
+
+    pub(crate) fn runs(&self) -> &[R] {
         &self.runs
     }
 
@@ -508,7 +526,18 @@ impl IndexVersion {
     pub(crate) fn contains(&self, quad: &EncodedQuad) -> bool {
         #[cfg(any(test, all(feature = "witness", debug_assertions)))]
         crate::witness::add(crate::witness::Site::RunProbes, self.runs.len() as u64);
-        self.runs.iter().map(|run| run.sign_of(quad)).sum::<i64>() > 0
+        self.runs
+            .iter()
+            .map(|run| {
+                if R::TRIPLE_PROBES {
+                    run.triple_sign_counted(quad, &mut Free)
+                        .expect("nothing is counted")
+                } else {
+                    run.sign_of(quad)
+                }
+            })
+            .sum::<i64>()
+            > 0
     }
 
     /// [`Self::contains`], each run's probe and its search's comparisons counted on `visit`
@@ -534,7 +563,12 @@ impl IndexVersion {
     ) -> Result<bool, Stopped> {
         let mut sign = 0;
         for run in self.runs.iter() {
-            sign += run.sign_of_counted(quad, account).ok_or(Stopped)?;
+            let found = if R::TRIPLE_PROBES {
+                run.triple_sign_counted(quad, account)
+            } else {
+                run.sign_of_counted(quad, account)
+            };
+            sign += found.ok_or(Stopped)?;
             // Looked at once its search was counted, the run with it (`bound_counted`).
             #[cfg(any(test, all(feature = "witness", debug_assertions)))]
             crate::witness::add(crate::witness::Site::RunProbes, 1);
@@ -628,6 +662,32 @@ impl IndexVersion {
                 false,
             ));
         };
+        // A subject/predicate probe usually reads only a few keys. On one run it can
+        // stop at the first key outside the bound, saving a second seek and a merge.
+        if R::TRIPLE_PROBES
+            && let [run] = self.runs()
+            && adapted.permutation == Permutation::Spog
+            && adapted.low[..2] == adapted.high[..2]
+        {
+            let run = run.permutation(adapted.permutation);
+            let at = run
+                .keys
+                .bound_counted(&adapted.low, account)
+                .ok_or(Stopped)?;
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+            crate::witness::add(crate::witness::Site::RunProbes, 1);
+            return Ok(QuadScan {
+                source: ScanSource::Bounded(BoundedScan {
+                    run,
+                    at,
+                    high: adapted.high,
+                    stopped: false,
+                }),
+                permutation: adapted.permutation,
+                exclude_default_graph: adapted.exclude_default_graph,
+                ledger: (0, 0),
+            });
+        }
         // Each range handed to the merge as it is searched, with no list of them first (the
         // plain scan's shape: a list per scan cost the counted reads about 2.7 % on the support
         // update, p2-reas3-cnt4).
@@ -1170,7 +1230,9 @@ impl IndexVersion {
             plan.exclude_default_graph,
         )
     }
+}
 
+impl IndexVersion {
     /// `self` with `extra` on top, for reading only: their signs add to the stack's, so
     /// together they must leave each quad at 0 or 1 ([`crate::InferredMask`]).
     pub(crate) fn with_runs(&self, extra: &[Arc<Run>]) -> Self {
@@ -1190,17 +1252,7 @@ impl IndexVersion {
         if run.entries() == 0 {
             return self.clone();
         }
-        debug_assert_eq!(run.layout(), self.layout, "run built for another stack");
-        let len = self
-            .len
-            .checked_add_signed(run.net())
-            .expect("exact delta can't make the quad count negative");
-        let runs = self.runs.iter().cloned().chain([Arc::new(run)]).collect();
-        Self {
-            layout: self.layout,
-            runs,
-            len,
-        }
+        self.with_run_ref(Arc::new(run))
     }
 
     /// A new version where the first `covered` runs are replaced by the runs of `base`, which
@@ -1223,10 +1275,29 @@ impl IndexVersion {
     /// A new version where the runs in `window` are replaced by `merged`, which must be
     /// [`compaction::merge_runs`] of exactly those runs.
     pub(crate) fn with_compacted(&self, window: Range<usize>, merged: Run) -> Self {
+        self.with_compacted_ref(window, (merged.entries() > 0).then(|| Arc::new(merged)))
+    }
+}
+
+impl<R: Clone + Deref<Target = Run>> IndexVersion<R> {
+    fn with_run_ref(&self, run: R) -> Self {
+        debug_assert_eq!(run.layout(), self.layout, "run built for another stack");
+        let len = self
+            .len
+            .checked_add_signed(run.net())
+            .expect("exact delta can't make the quad count negative");
+        Self {
+            layout: self.layout,
+            runs: self.runs.iter().cloned().chain([run]).collect(),
+            len,
+        }
+    }
+
+    fn with_compacted_ref(&self, window: Range<usize>, merged: Option<R>) -> Self {
         let runs = self.runs[..window.start]
             .iter()
             .cloned()
-            .chain((merged.entries() > 0).then(|| Arc::new(merged)))
+            .chain(merged)
             .chain(self.runs[window.end..].iter().cloned())
             .collect();
         Self {
@@ -1234,6 +1305,16 @@ impl IndexVersion {
             runs,
             len: self.len,
         }
+    }
+
+    /// A compaction taken from `captured` is still applicable where its input runs survive.
+    pub(crate) fn retains(&self, captured: &Self, mut window: Range<usize>) -> bool {
+        self.layout == captured.layout
+            && window.all(|i| {
+                self.runs
+                    .get(i)
+                    .is_some_and(|run| std::ptr::eq(&**run, &*captured.runs[i]))
+            })
     }
 }
 
@@ -1321,7 +1402,7 @@ impl ColumnScan<'_> {
 
 /// Iterator returned by [`IndexVersion::scan`].
 pub(crate) struct QuadScan<'a> {
-    merge: SignedMerge<'a>,
+    source: ScanSource<'a>,
     permutation: Permutation,
     exclude_default_graph: bool,
     /// A counted scan's ledger between its steps: units asked for and not yet taken, and the
@@ -1329,12 +1410,50 @@ pub(crate) struct QuadScan<'a> {
     ledger: (u64, u64),
 }
 
+enum ScanSource<'a> {
+    Merge(SignedMerge<'a>),
+    Bounded(BoundedScan<'a>),
+}
+
+/// A short bound scan on a single run. The next key also supplies the upper-bound test.
+struct BoundedScan<'a> {
+    run: &'a PermutationRun,
+    at: usize,
+    high: Key,
+    stopped: bool,
+}
+
+impl BoundedScan<'_> {
+    #[inline]
+    fn step(&mut self, account: &mut impl Account) -> Result<Option<(Key, i64)>, Stopped> {
+        if self.stopped || !account.take(4) {
+            self.stopped = true;
+            return Err(Stopped);
+        }
+        if self.at == self.run.keys.len() {
+            return Ok(None);
+        }
+        let key = self.run.keys.get(self.at);
+        if key > self.high {
+            self.at = self.run.keys.len();
+            return Ok(None);
+        }
+        let sign = if self.run.is_tombstone(self.at) {
+            -1
+        } else {
+            1
+        };
+        self.at += 1;
+        Ok(Some((key, sign)))
+    }
+}
+
 pub(crate) use crate::visit::{Stopped, Visitor};
 
 impl<'a> QuadScan<'a> {
     fn new(merge: SignedMerge<'a>, permutation: Permutation, exclude_default_graph: bool) -> Self {
         Self {
-            merge,
+            source: ScanSource::Merge(merge),
             permutation,
             exclude_default_graph,
             ledger: (0, 0),
@@ -1382,7 +1501,11 @@ impl<'a> QuadScan<'a> {
     #[inline]
     fn step_key_with(&mut self, account: &mut impl Account) -> Result<Option<Key>, Stopped> {
         loop {
-            let Some((key, sign)) = self.merge.step(account)? else {
+            let step = match &mut self.source {
+                ScanSource::Merge(merge) => merge.step(account),
+                ScanSource::Bounded(run) => run.step(account),
+            };
+            let Some((key, sign)) = step? else {
                 return Ok(None);
             };
             #[cfg(any(test, all(feature = "witness", debug_assertions)))]
@@ -1433,7 +1556,11 @@ impl Iterator for QuadScan<'_> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, Some(self.merge.remaining()))
+        let remaining = match &self.source {
+            ScanSource::Merge(merge) => Some(merge.remaining()),
+            ScanSource::Bounded(_) => None,
+        };
+        (0, remaining)
     }
 }
 

@@ -10,12 +10,16 @@
 //! commit (microseconds to a few milliseconds); larger ones go to the engine's background
 //! compactor, so commit latency never includes a rewrite of the base run.
 
-use std::ops::Range;
+use std::ops::{Deref, Range};
 use std::sync::Arc;
 
-use super::merge::SignedMerge;
+use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
+
+use super::Layout;
+use super::merge::{SignedMerge, scan_bytes};
 use super::run::{PermutationRun, Run, build_all};
-use crate::quad::Key;
+use crate::quad::{Key, Permutation};
+use crate::term::ChargedArc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionPolicy {
@@ -43,7 +47,7 @@ pub(crate) struct CompactionPlan {
 
 impl CompactionPolicy {
     /// The window of runs (a suffix of `runs`) that should be merged, if any.
-    pub(crate) fn plan(&self, runs: &[Arc<Run>]) -> Option<CompactionPlan> {
+    pub(crate) fn plan(&self, runs: &[impl Deref<Target = Run>]) -> Option<CompactionPlan> {
         let newest = runs.len().checked_sub(1)?;
         let mut start = newest;
         let mut entries = runs[newest].entries();
@@ -73,18 +77,52 @@ pub(crate) fn merge_runs(runs: &[Arc<Run>]) -> Run {
         "merging runs of different stacks"
     );
     let total: u64 = runs.iter().map(|run| run.entries()).sum();
-    let perms = build_all(layout, total as usize, |permutation| {
-        let parts = runs.iter().map(|run| {
-            let perm = run.permutation(permutation);
-            (perm, 0, perm.keys.len())
-        });
-        let entries: Vec<(Key, bool)> = SignedMerge::new(parts)
-            .filter(|&(_, sign)| sign != 0)
-            .map(|(key, sign)| (key, sign < 0))
-            .collect();
-        PermutationRun::from_sorted(entries)
+    let perms = build_all(layout, total as usize, |p| {
+        PermutationRun::from_sorted(signed_entries(runs, p).collect())
     });
     Run::from_permutations(layout, perms)
+}
+
+fn signed_entries(
+    runs: &[impl Deref<Target = Run>],
+    permutation: Permutation,
+) -> impl Iterator<Item = (Key, bool)> {
+    let parts = runs.iter().map(|run| {
+        let perm = run.permutation(permutation);
+        (perm, 0, perm.keys.len())
+    });
+    SignedMerge::new(parts)
+        .filter(|&(_, sign)| sign != 0)
+        .map(|(key, sign)| (key, sign < 0))
+}
+
+/// The same signed merge, charged to the budget for a derived triple index.
+pub(super) fn merge_triples(
+    runs: &[ChargedArc<Run>],
+    budget: &Arc<Budget>,
+) -> Result<Option<ChargedArc<Run>>, BudgetExceeded> {
+    let mut held = Reservation::new(Arc::clone(budget));
+    let mut perms: [PermutationRun; Permutation::COUNT] = Default::default();
+    let layout = Layout::DefaultGraph;
+    for &p in layout.permutations() {
+        let mut scratch = Reservation::new(Arc::clone(budget));
+        scratch.charge(scan_bytes(runs.len()))?;
+        let mut entries = ChargedVec::new(Arc::clone(budget));
+        for entry in signed_entries(runs, p) {
+            entries.push(entry)?;
+        }
+        drop(scratch);
+        // Both signs cancel in every permutation if they cancel in the first.
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        let (entries, scratch) = entries.into_parts();
+        perms[p as usize] = PermutationRun::from_sorted_within(entries, &mut held, false)?;
+        drop(scratch);
+    }
+    let mut run = Run::from_permutations(layout, perms);
+    run.keep_triples(budget, &mut held)?;
+    ChargedArc::new(run, budget).map(Some)
 }
 
 #[cfg(test)]
