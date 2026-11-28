@@ -8,11 +8,11 @@ use std::rc::Rc;
 use super::lex::{Lexer, Tok, position};
 use super::{Document, Intern, Model};
 use crate::diagnostics::Diagnostic;
-use crate::model::Disjoint;
 use crate::model::{
     Axiom, Characteristic, ClassExpr, DataRange, EntityKind, ExprId, ObjProp, RangeId, Term,
     canonical,
 };
+use crate::model::{Disjoint, DisjointReading};
 use crate::rules::{Atom, DArg, IArg, Rule};
 use crate::vocab::{OWL, RDF, RDFS, XSD};
 
@@ -46,6 +46,8 @@ pub(super) struct Parser<'t, 'm> {
     full: HashMap<&'t str, (Term, Special)>,
     short: HashMap<&'t str, (Term, Special)>,
     blanks: HashMap<&'t str, Term>,
+    /// The reserved-name walk over a repeated disjointness's axioms, kept across them.
+    walk: crate::diagnostics::Walk,
 }
 
 fn fail<T>(at: usize, what: &'static str) -> R<T> {
@@ -100,6 +102,7 @@ impl<'t, 'm> Parser<'t, 'm> {
             full: HashMap::new(),
             short: HashMap::new(),
             blanks: HashMap::new(),
+            walk: crate::diagnostics::Walk::new(0),
         }
     }
 
@@ -765,12 +768,34 @@ impl<'t, 'm> Parser<'t, 'm> {
     }
 
     /// The rest of a disjointness axiom (its operands read): its axioms
-    /// (`Disjoint::axioms`), a repeated operand reported.
+    /// (`Disjoint::axioms`), a repeated operand reported, and then, where they name a reserved
+    /// name in its place, all of them left out with it (`diagnostics::reserved_in`).
     fn disjoint(&mut self, d: Disjoint) -> R<()> {
         self.close()?;
-        let (axioms, repeated) = d.axioms(&mut self.model.classes, &mut self.model.ranges);
+        let model = &mut self.model;
+        let (axioms, repeated) = d.axioms(
+            &mut model.classes,
+            &mut model.ranges,
+            DisjointReading::Canonical,
+        );
         if repeated {
             self.model.diagnostics.push(Diagnostic::RepeatedOperand);
+            let terms: &dyn crate::mapping::Terms = &*self.terms;
+            let reserved = crate::diagnostics::reserved_in(
+                &self.model.classes,
+                &axioms,
+                terms,
+                &mut self.walk,
+            );
+            if !reserved.is_empty() {
+                for term in reserved {
+                    let d = Diagnostic::Reserved { term };
+                    if !self.model.diagnostics.contains(&d) {
+                        self.model.diagnostics.push(d);
+                    }
+                }
+                return Ok(());
+            }
         }
         for a in axioms {
             self.add(a);

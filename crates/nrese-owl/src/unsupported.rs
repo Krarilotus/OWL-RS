@@ -22,8 +22,10 @@ pub enum Unsupported {
     UncountedNegation,
     /// A clause or key that needs more variables than a `u16` numbers.
     TooWide,
-    /// A universal that needs an automaton of an irregular role.
+    /// A role automaton that could not be built because splicing revisited a role.
     IrregularRoleHierarchy,
+    /// A role automaton whose inclusions fall outside HKS Definition 2.
+    RoleAutomatonOutsideRegularClass,
 }
 
 impl Unsupported {
@@ -43,6 +45,9 @@ impl Unsupported {
             Unsupported::UncountedNegation => "a cardinality whose negation is past 4294967295",
             Unsupported::TooWide => "a clause or key with more than 65535 variables",
             Unsupported::IrregularRoleHierarchy => "an irregular role hierarchy",
+            Unsupported::RoleAutomatonOutsideRegularClass => {
+                "a role automaton outside the engine's regular class"
+            }
         }
     }
 }

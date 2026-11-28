@@ -20,6 +20,7 @@ use nrese_rdf::{Quad, Term, TermRef};
 use nrese_reasoner::{RejectEvidence, RejectExplanation};
 use nrese_sparql::{GraphAccess, QueryEvaluationError, ReadView, Resources};
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use super::attribution::RejectAttribution;
 use super::{MutationReject, RejectKind};
@@ -35,10 +36,14 @@ pub(crate) struct Draft {
     pub detail: String,
     pub explanation: Option<RejectExplanation>,
     pub attribution: Option<RejectAttribution>,
+    pub shacl: Option<Arc<crate::ShaclRefusal>>,
 }
 
 /// Ends every restricted committer's rejection.
 pub(crate) const ONLY_READABLE: &str = "Only statements in graphs you can read are shown.";
+const READABLE_REASON_PREFIX: &str = "the mutation was rejected; in the graphs you can read, ";
+pub(crate) const READABLE_REASON_FRAMING_BYTES: usize =
+    READABLE_REASON_PREFIX.len() + ". ".len() + ONLY_READABLE.len();
 
 /// The one problem told of a shapes graph the committer may not read
 /// ([`EvidenceView::shapes_error`]).
@@ -122,17 +127,39 @@ impl<'v, 'e> EvidenceView<'v, 'e> {
             detail,
             explanation,
             attribution,
+            shacl,
         } = match self.restricted() {
             false => full(),
-            true => view(self),
+            true => {
+                // Return the full report's memory before looking for the view's reason.
+                drop(full);
+                view(self)
+            }
         };
         MutationReject {
             kind,
             detail,
             explanation,
             attribution,
+            shacl,
             _projected: Projected(()),
         }
+    }
+
+    /// The fixed explanation for this refusal carries no graph evidence.
+    pub(crate) fn no_ql_decider(&self, kind: RejectKind) -> MutationReject {
+        let draft = || Draft {
+            kind,
+            detail: format!(
+                "the write is refused: gates.undecided is refuse, and {}. \
+                 Set gates.undecided to mark to accept it marked.",
+                crate::WhyUndecided::NoQlDecider.text(0)
+            ),
+            explanation: None,
+            attribution: None,
+            shacl: None,
+        };
+        self.reject(draft, |_| draft())
     }
 }
 
@@ -147,6 +174,7 @@ pub(crate) fn nothing_shown() -> Draft {
         ),
         explanation: None,
         attribution: None,
+        shacl: None,
     }
 }
 
@@ -161,9 +189,7 @@ pub(crate) fn shown(
 ) -> Draft {
     Draft {
         kind,
-        detail: format!(
-            "the mutation was rejected; in the graphs you can read, {reason}. {ONLY_READABLE}"
-        ),
+        detail: in_readable_graphs(&reason),
         explanation: Some(RejectExplanation {
             summary: reason,
             violated_constraint: constraint.to_owned(),
@@ -171,7 +197,12 @@ pub(crate) fn shown(
             evidence,
         }),
         attribution: None,
+        shacl: None,
     }
+}
+
+pub(crate) fn in_readable_graphs(reason: &str) -> String {
+    format!("{READABLE_REASON_PREFIX}{reason}. {ONLY_READABLE}")
 }
 
 /// The likely commit-local trigger sentence of `attribution`, or nothing.

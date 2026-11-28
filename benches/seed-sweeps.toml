@@ -71,7 +71,8 @@ filters = ["http_fuzz_tests::random_requests_get_answers_not_server_errors",
 [[target]]
 crate = "nrese-shacl"
 test = "it"
-filters = ["incremental_tests::incremental_validation_equals_the_difference_of_full_validations"]
+filters = ["incremental_tests::incremental_validation_equals_the_difference_of_full_validations",
+           "change_differential::random_changes"]
 
 [[target]]
 crate = "nrese-sparql"

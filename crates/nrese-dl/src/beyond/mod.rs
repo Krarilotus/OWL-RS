@@ -114,9 +114,17 @@ fn restriction(d: &Diagnostic) -> Option<(&'static str, bool)> {
             "OWL 2 Structural Specification §11.1-11.2: a simple property required",
             true,
         ),
-        Diagnostic::AnonymousIndividual { .. } => (
-            "OWL 2 Structural Specification §11.2: a named individual in a nominal or hasValue",
+        Diagnostic::IrregularPropertyHierarchy { .. } => (
+            "OWL 2 Structural Specification §11.2: a regular property hierarchy",
             true,
+        ),
+        Diagnostic::AnonymousIndividual { .. } => (
+            "OWL 2 Structural Specification §11.2: restrictions on anonymous individuals",
+            true,
+        ),
+        Diagnostic::GlobalRestriction { .. } => (
+            "OWL 2 Structural Specification §11.2: global restrictions",
+            false,
         ),
         // The reader leaves nothing out, and a model checks each axiom; but where an axiom
         // reads the name, the engines read its two kinds as one name, so no model of theirs
@@ -152,9 +160,8 @@ fn restriction(d: &Diagnostic) -> Option<(&'static str, bool)> {
 /// to the engines, as before: listed, not changed here.)
 fn engine_restriction(why: Unsupported) -> &'static str {
     match why {
-        Unsupported::IrregularRoleHierarchy => {
-            "OWL 2 Structural Specification §11.2: a regular property hierarchy"
-        }
+        Unsupported::IrregularRoleHierarchy => "the engine could not build a role automaton",
+        Unsupported::RoleAutomatonOutsideRegularClass => "outside the engine's regular class",
         Unsupported::DatatypeDefinitions => {
             "OWL 2 Structural Specification §4, §11.2: the datatype map"
         }

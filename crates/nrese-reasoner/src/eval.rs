@@ -503,15 +503,40 @@ impl<'v, 'p> Probe<'v, 'p> {
 /// the poller before using a program that may have been interrupted.
 pub struct AllFacts<'a, 'p, S: ?Sized>(pub &'a S, pub &'a Poller<'p>);
 
+impl<S: Source + ?Sized> AllFacts<'_, '_, S> {
+    fn scanned(&self) -> impl Facts + '_ {
+        ScannedFacts(
+            |pattern, found: &mut dyn FnMut(Triple)| self.0.scan(pattern, Seg::All, self.1, found),
+            self.1,
+        )
+    }
+}
+
 impl<S: Source + ?Sized> Facts for AllFacts<'_, '_, S> {
     fn objects(&self, subject: u64, predicate: u64) -> Vec<u64> {
+        self.scanned().objects(subject, predicate)
+    }
+
+    fn pairs(&self, predicate: u64) -> Vec<(u64, u64)> {
+        self.scanned().pairs(predicate)
+    }
+
+    fn stopped(&self) -> bool {
+        self.1.tick()
+    }
+}
+
+pub(crate) struct ScannedFacts<'a, 'p, F>(pub F, pub &'a Poller<'p>);
+
+impl<F> Facts for ScannedFacts<'_, '_, F>
+where
+    F: Fn([Option<u64>; 3], &mut dyn FnMut(Triple)) -> Result<(), Stopped>,
+{
+    fn objects(&self, subject: u64, predicate: u64) -> Vec<u64> {
         let mut out = Vec::new();
-        let read = self.0.scan(
-            [Some(subject), Some(predicate), None],
-            Seg::All,
-            self.1,
-            &mut |t| out.push(t[2]),
-        );
+        let read = (self.0)([Some(subject), Some(predicate), None], &mut |t| {
+            out.push(t[2])
+        });
         if read.is_err() {
             return Vec::new();
         }
@@ -522,11 +547,9 @@ impl<S: Source + ?Sized> Facts for AllFacts<'_, '_, S> {
 
     fn pairs(&self, predicate: u64) -> Vec<(u64, u64)> {
         let mut out = Vec::new();
-        let read = self
-            .0
-            .scan([None, Some(predicate), None], Seg::All, self.1, &mut |t| {
-                out.push((t[0], t[2]))
-            });
+        let read = (self.0)([None, Some(predicate), None], &mut |t| {
+            out.push((t[0], t[2]))
+        });
         if read.is_err() {
             return Vec::new();
         }
@@ -1598,6 +1621,7 @@ pub struct OperationStop<'a> {
     memory: MemoryPoll<'a>,
     /// The operation's own memory limit's room, beside the process's ([`Self::within`]).
     room: Option<MemoryRoom<'a>>,
+    groundings: Option<&'a std::sync::atomic::AtomicU64>,
     /// 0: not fired; else what fired it ([`OperationStop::fired`]).
     fired: std::sync::atomic::AtomicU8,
 }
@@ -1614,6 +1638,7 @@ impl<'a> OperationStop<'a> {
             caller,
             memory,
             room: None,
+            groundings: None,
             fired: std::sync::atomic::AtomicU8::new(0),
         }
     }
@@ -1624,6 +1649,18 @@ impl<'a> OperationStop<'a> {
         Self {
             room: Some(room),
             ..self
+        }
+    }
+
+    /// Count whole-store groundings performed on behalf of this operation.
+    pub fn counting_groundings(mut self, counter: &'a std::sync::atomic::AtomicU64) -> Self {
+        self.groundings = Some(counter);
+        self
+    }
+
+    pub(crate) fn count_grounding(&self) {
+        if let Some(counter) = self.groundings {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -2519,6 +2556,13 @@ impl std::fmt::Debug for GroundProgram {
 }
 
 impl GroundProgram {
+    #[cfg(test)]
+    pub(crate) fn operand_templates(&self) -> Option<&[(Rule, Vec<Triple>)]> {
+        self.list_operands
+            .as_ref()
+            .map(|ops| ops.templates.as_slice())
+    }
+
     /// Files one ground fact rule; returns its index if it is new and has a body.
     pub fn add(&mut self, rule: Rule) -> Option<usize> {
         self.add_with(rule, Vec::new(), None, None)

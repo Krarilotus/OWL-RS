@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from suitekit.driver import Suite
-from suitekit.adapters import Context, Graphdb
+from suitekit.adapters import Context, Graphdb, Nrese
 from suitekit.adapters import Endpoint, Step
 from suitekit.manifest import Manifest
 from suitekit.runtime import Measured, Mount
@@ -35,6 +35,27 @@ class PrebuiltHarness(unittest.TestCase):
                     suite.host_command.assert_not_called()
                     if not expected:
                         self.assertIn('--skip-build requires an existing harness', suite.say.call_args.args[0])
+
+
+class NreseTiming(unittest.TestCase):
+    @patch('suitekit.adapters.time.sleep', side_effect=AssertionError('preparation is disabled'))
+    @patch('suitekit.adapters.urllib.request.urlopen')
+    @patch('suitekit.adapters.wait_ready', return_value=True)
+    def test_disabled_write_program_does_not_delay_a_timed_case(self, _ready, request, sleep):
+        # Spec: state 0 lets timed cases proceed for no rules and for a replica.
+        root = Path(__file__).resolve().parents[3]
+        runtime = Mock(kind='process', dry=False, port=8080)
+        runtime.url.return_value = 'http://fixture'
+        ctx = Context(runtime, root, root, root, Mount('/fixture-data', '/data'), [], 30,
+                      {}, 'contract')
+        request.return_value.__enter__.return_value.read.return_value = (
+            b'nrese_write_program_state{repository="nrese"} 0\n'
+        )
+        for regime in ('owl2-rl', 'none'):
+            with self.subTest(regime=regime):
+                endpoint = Nrese().serve(ctx, '/own-store', regime)
+                self.assertEqual(endpoint.update, 'http://fixture/dataset/update')
+        sleep.assert_not_called()
 
 
 class GraphdbContract(unittest.TestCase):

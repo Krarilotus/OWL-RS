@@ -29,7 +29,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use crate::budget::{Budget, BudgetExceeded, Reservation};
-use crate::terminal::{Guard, Terminal, terminal};
+use crate::terminal::{Guard, STOP_POLL, Terminal, terminal};
 
 /// How a build runs its parallel work, and so who may wait for it (the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,10 +44,6 @@ pub enum Kind {
 /// value (or build it some other way that waits for nothing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Busy;
-
-/// The longest a waiter sleeps before it asks its stop and its deadline again: the stores'
-/// stops are flags, polled, not signalled.
-const STOP_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -541,6 +537,11 @@ pub struct Builder<'c, K: Eq + Hash + Clone, V> {
 }
 
 impl<K: Eq + Hash + Clone, V> Builder<'_, K, V> {
+    /// The handle waiters can join for the outcome of this claim.
+    pub fn handle(&self) -> Arc<Build<V>> {
+        Arc::clone(&self.build)
+    }
+
     /// The build, which [`Scan::run`] publishes its slices on.
     pub fn build(&self) -> &Build<V> {
         &self.build

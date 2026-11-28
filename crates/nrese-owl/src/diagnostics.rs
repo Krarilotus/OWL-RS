@@ -2,10 +2,10 @@
 //! involved, never dropped silently. A task an affected axiom takes part in is answered
 //! `unsupported` (docs/design/owl2-dl.md §2).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::mapping::{Ontology, Terms};
-use crate::model::{Axiom, Characteristic, ClassExpr, EntityKind, ObjProp, Term};
+use crate::model::{Axiom, Characteristic, ClassExpr, EntityKind, Interner, ObjProp, Term};
 
 /// What the store does with a part of the data that breaks the premise of the OWL 2 RL rules'
 /// closure (theorem PR1, OWL 2 Profiles §4.3: the graph is exactly the mapping of the ontology
@@ -144,13 +144,25 @@ pub enum Diagnostic {
         axiom: usize,
         what: &'static str,
     },
+    /// An impossible pair in the strict property order required by OWL 2 DL (§11.2).
+    IrregularPropertyHierarchy { lower: ObjProp, upper: ObjProp },
     /// A global restriction of OWL 2 DL broken: an anonymous individual in a nominal or a
     /// `hasValue`, which take named ones only (*OWL 2 Structural Specification* §11.2).
     /// The Direct Semantics still reads it (§2.3.7–2.4): in an ontology, one individual,
     /// existential over the whole ontology, which keys skip as they skip every anonymous
     /// one ([`Diagnostic::is_fatal`]); in a conclusion, as every anonymous individual
     /// there, one to prove.
-    AnonymousIndividual { node: Term },
+    AnonymousIndividual {
+        node: Term,
+        what: &'static str,
+        axioms: [Option<usize>; 2],
+    },
+    /// A retained axiom that witnesses a violation of OWL 2 DL's global restrictions.
+    GlobalRestriction {
+        term: Term,
+        axiom: usize,
+        what: &'static str,
+    },
     /// Text the functional-syntax reader can't read (`crate::ofn`), where it is (from 1;
     /// the column in characters): the axiom it is in is left out.
     Syntax {
@@ -158,9 +170,9 @@ pub enum Diagnostic {
         column: u32,
         what: &'static str,
     },
-    /// A disjointness that repeats an operand (`x owl:disjointWith x`, `a owl:differentFrom
-    /// a`): OWL 2 DL's n-ary axioms take operands without repeats, so it is read as what
-    /// being disjoint from itself means (`crate::model::Disjoint`).
+    /// A disjointness with a repeated operand. The canonical reading deduplicates it
+    /// when at least two operands remain. With one operand, and under the RDF-Based
+    /// reading, a repeat expresses self-disjointness.
     RepeatedOperand,
     /// An IRI of the reserved vocabulary used as a class, property or individual (*OWL 2
     /// Structural Specification* §2.4): the axioms that do are left out.
@@ -184,7 +196,9 @@ impl Diagnostic {
             Self::NotOwl { triple } => return (triple, "not owl"),
             Self::Unused { node, .. } => (node, "unused"),
             Self::NonSimpleProperty { property, what, .. } => (property, what),
-            Self::AnonymousIndividual { node } => (node, "anonymous individual"),
+            Self::IrregularPropertyHierarchy { upper, .. } => (upper.named(), "irregular roles"),
+            Self::AnonymousIndividual { node, what, .. } => (node, what),
+            Self::GlobalRestriction { term, what, .. } => (term, what),
             Self::Syntax { line, column, what } => {
                 ((u64::from(line) << 32) | u64::from(column), what)
             }
@@ -203,7 +217,7 @@ impl Diagnostic {
     /// no axiom uses says nothing; by default a name of two kinds an axiom reads is fatal).
     ///
     /// *OWL 2 Structural Specification* §11.2 keeps anonymous individuals out of OWL 2 DL in
-    /// more places: in a nominal or `hasValue` (flagged here) and, unflagged, in
+    /// more places: in a nominal or `hasValue`, in
     /// `SameIndividual`, `DifferentIndividuals` or a negative assertion, and in assertions
     /// whose anonymous individuals don't form its forest. None of them is fatal: why the
     /// answers on such input stay those of the Direct Semantics, and what witnesses it, is in
@@ -222,6 +236,8 @@ impl Diagnostic {
             | Self::Unsupported { .. }
             | Self::NotOwl { .. }
             | Self::NonSimpleProperty { .. }
+            | Self::IrregularPropertyHierarchy { .. }
+            | Self::GlobalRestriction { .. }
             | Self::Syntax { .. }
             | Self::Reserved { .. }
             | Self::Rule { .. } => true,
@@ -256,6 +272,8 @@ impl Diagnostic {
             | Self::Unsupported { .. }
             | Self::NotOwl { .. }
             | Self::NonSimpleProperty { .. }
+            | Self::IrregularPropertyHierarchy { .. }
+            | Self::GlobalRestriction { .. }
             | Self::AnonymousIndividual { .. }
             | Self::Syntax { .. }
             | Self::RepeatedOperand
@@ -308,10 +326,12 @@ impl Diagnostic {
             // Read as written: only a global restriction of OWL 2 DL is broken (what keeps
             // reasoning decidable), not what the axiom says; what a reasoner doesn't follow
             // of it is that reasoner's own hazard.
-            Self::NonSimpleProperty { .. } => false,
+            Self::NonSimpleProperty { .. }
+            | Self::IrregularPropertyHierarchy { .. }
+            | Self::GlobalRestriction { .. } => false,
             // Read as written: the Direct Semantics reads it (§2.3.7–2.4), as above.
             Self::AnonymousIndividual { .. } => false,
-            // Read as what being disjoint from itself means (`crate::model::Disjoint`).
+            // Read according to the selected disjointness semantics.
             Self::RepeatedOperand => false,
         }
     }
@@ -338,7 +358,19 @@ impl Diagnostic {
             Self::NonSimpleProperty { property, what, .. } => {
                 at(&format!("a non-simple property in {what}"), property)
             }
-            Self::AnonymousIndividual { node } => at("a blank node in oneOf or hasValue", node),
+            Self::IrregularPropertyHierarchy { lower, upper } => {
+                let property = |p| match p {
+                    ObjProp::Named(t) => name(t),
+                    ObjProp::Inverse(t) => format!("inverse of {}", name(t)),
+                };
+                format!(
+                    "an irregular property hierarchy: {} < {}",
+                    property(lower),
+                    property(upper)
+                )
+            }
+            Self::AnonymousIndividual { node, what, .. } => at(what, node),
+            Self::GlobalRestriction { term, what, .. } => at(what, term),
             Self::Syntax { line, column, what } => {
                 format!("text not read at line {line}, column {column}: {what}")
             }
@@ -353,20 +385,32 @@ impl Diagnostic {
 /// ones. A property is non-simple if a composite one is (through the hierarchy) a
 /// subproperty of it; so is its inverse. Composite (*OWL 2 Structural Specification*
 /// §11.1): a chain's or a transitive property's superproperty, and
-/// `owl:topObjectProperty`. (§11.1 makes `owl:bottomObjectProperty` composite too; it
-/// relates nothing, so nothing above it gets a pair from it, and it isn't counted.)
-pub(crate) fn check_global_restrictions(ontology: &mut Ontology) {
+/// `owl:topObjectProperty` and `owl:bottomObjectProperty`. The bottom seed belongs to
+/// the stored ontology's membership check.
+pub(crate) fn check_global_restrictions(
+    ontology: &Ontology,
+    membership: bool,
+    out: &mut Vec<Diagnostic>,
+) {
+    if let Some((lower, upper)) = impossible_role_order(ontology) {
+        out.push(Diagnostic::IrregularPropertyHierarchy { lower, upper });
+    }
     // Nominals and `hasValue` take named individuals only (§11.2).
     let anonymous: BTreeSet<Term> = crate::mapping::in_expressions(ontology)
         .filter(|t| ontology.anonymous.contains(t))
         .collect();
     for node in anonymous {
-        ontology
-            .diagnostics
-            .push(Diagnostic::AnonymousIndividual { node });
+        out.push(Diagnostic::AnonymousIndividual {
+            node,
+            what: "a blank node in oneOf or hasValue",
+            axioms: [None; 2],
+        });
     }
     let mut supers: HashMap<Term, Vec<Term>> = HashMap::new();
     let mut seeds: Vec<Term> = ontology.builtin.top_object.into_iter().collect();
+    if membership {
+        seeds.extend(ontology.builtin.bottom_object);
+    }
     for axiom in &ontology.axioms {
         match axiom {
             Axiom::SubObjectPropertyOf(chain, sup) => {
@@ -421,6 +465,7 @@ pub(crate) fn check_global_restrictions(ontology: &mut Ontology) {
         }
     }
     let mut found = Vec::new();
+    let memo = (!needing.is_empty()).then(|| build_non_simple_memo(ontology, &needing));
     for (index, axiom) in ontology.axioms.iter().enumerate() {
         let direct = match axiom {
             Axiom::ObjectCharacteristic(
@@ -452,18 +497,114 @@ pub(crate) fn check_global_restrictions(ontology: &mut Ontology) {
             });
             continue;
         }
-        for expr in expressions_of(axiom) {
-            if let Some(&(property, what)) = uses_any(ontology, expr, &needing) {
-                found.push(Diagnostic::NonSimpleProperty {
-                    property,
-                    axiom: index,
-                    what,
-                });
-                break;
+        if let Some(memo) = memo.as_deref() {
+            for expr in expressions_of(axiom) {
+                if let Some(&(property, what)) = needing.get(&memo[expr as usize]) {
+                    found.push(Diagnostic::NonSimpleProperty {
+                        property,
+                        axiom: index,
+                        what,
+                    });
+                    break;
+                }
             }
         }
     }
-    ontology.diagnostics.extend(found);
+    out.extend(found);
+}
+
+/// The first impossible pair in the least strict order required by §11.2.
+fn impossible_role_order(ontology: &Ontology) -> Option<(ObjProp, ObjProp)> {
+    let top = ontology.builtin.top_object.map(ObjProp::Named);
+    let mut pairs = VecDeque::new();
+    for axiom in &ontology.axioms {
+        let Axiom::SubObjectPropertyOf(chain, upper) = axiom else {
+            continue;
+        };
+        if chain.len() < 2 || Some(*upper) == top {
+            continue;
+        }
+        let last = chain.len() - 1;
+        let required = match (chain[0] == *upper, chain[last] == *upper) {
+            (true, true) if last == 1 => continue,
+            (true, true) => return Some((*upper, *upper)),
+            (true, false) => &chain[1..],
+            (false, true) => &chain[..last],
+            (false, false) => chain,
+        };
+        pairs.extend(required.iter().map(|&lower| (lower, *upper)));
+    }
+    if pairs.is_empty() {
+        return None;
+    }
+
+    let mut seen = HashSet::new();
+    pairs.retain(|&pair| seen.insert(pair));
+    let mut before: BTreeMap<ObjProp, Vec<ObjProp>> = BTreeMap::new();
+    let mut after: HashMap<ObjProp, Vec<ObjProp>> = HashMap::new();
+    while let Some((lower, upper)) = pairs.pop_front() {
+        if lower == upper {
+            return Some((lower, upper));
+        }
+        let predecessors = before
+            .get(&lower)
+            .into_iter()
+            .flatten()
+            .map(|&p| (p, upper));
+        let successors = after.get(&upper).into_iter().flatten().map(|&s| (lower, s));
+        let inverted = matches!(upper, ObjProp::Named(_)).then(|| (lower.inverse(), upper));
+        pairs.extend(
+            predecessors
+                .chain(successors)
+                .chain(inverted)
+                .filter(|&p| seen.insert(p)),
+        );
+        before.entry(upper).or_default().push(lower);
+        after.entry(lower).or_default().push(upper);
+    }
+
+    // Test against the oriented property hierarchy, separately from the strict order.
+    let mut hierarchy: HashMap<ObjProp, Vec<ObjProp>> = HashMap::new();
+    let mut include = |lower: ObjProp, upper: ObjProp| {
+        for (a, b) in [(lower, upper), (lower.inverse(), upper.inverse())] {
+            hierarchy.entry(a).or_default().push(b);
+        }
+    };
+    for axiom in &ontology.axioms {
+        match axiom {
+            Axiom::SubObjectPropertyOf(chain, upper) if chain.len() == 1 => {
+                include(chain[0], *upper)
+            }
+            Axiom::EquivalentObjectProperties(ps) => {
+                for pair in ps.windows(2) {
+                    include(pair[0], pair[1]);
+                    include(pair[1], pair[0]);
+                }
+            }
+            Axiom::InverseObjectProperties(a, b) => {
+                include(*a, b.inverse());
+                include(b.inverse(), *a);
+            }
+            Axiom::ObjectCharacteristic(Characteristic::Symmetric, p) => include(*p, p.inverse()),
+            _ => {}
+        }
+    }
+    let mut reached = HashSet::new();
+    let mut todo = Vec::new();
+    for upper in before.into_keys() {
+        reached.clear();
+        todo.push(upper);
+        while let Some(lower) = todo.pop() {
+            if !reached.insert(lower) {
+                continue;
+            }
+            if seen.contains(&(lower, upper)) {
+                return Some((lower, upper));
+            }
+            todo.extend(hierarchy.get(&lower).into_iter().flatten().copied());
+        }
+    }
+    None
 }
 
 /// The class expressions an axiom holds directly.
@@ -493,39 +634,82 @@ fn push_expressions(axiom: &Axiom, out: &mut Vec<u32>) {
     }
 }
 
-/// The first expression in `id`'s subexpressions that `needing` names.
-fn uses_any<'a>(
-    ontology: &Ontology,
-    id: u32,
-    needing: &'a HashMap<u32, (Term, &'static str)>,
-) -> Option<&'a (Term, &'static str)> {
-    let mut stack = vec![id];
-    let mut seen = HashSet::new();
-    while let Some(id) = stack.pop() {
-        if !seen.insert(id) {
-            continue;
-        }
-        if let Some(found) = needing.get(&id) {
-            return Some(found);
-        }
-        match ontology.classes.get(id) {
-            ClassExpr::And(xs) | ClassExpr::Or(xs) => stack.extend(xs.iter().map(|x| x.0)),
-            ClassExpr::Not(x)
-            | ClassExpr::Some(_, x)
-            | ClassExpr::All(_, x)
-            | ClassExpr::Min(_, _, x)
-            | ClassExpr::Max(_, _, x)
-            | ClassExpr::Exact(_, _, x) => stack.push(x.0),
-            _ => {}
-        }
+const CLEAN: u32 = u32::MAX;
+
+/// Bytes for the non-simple-property memo table over `classes` expressions.
+pub fn non_simple_memo_bytes(classes: usize) -> usize {
+    classes.saturating_mul(std::mem::size_of::<u32>())
+}
+
+fn class_children(expr: &ClassExpr) -> &[crate::ExprId] {
+    match expr {
+        ClassExpr::And(xs) | ClassExpr::Or(xs) => xs,
+        ClassExpr::Not(x)
+        | ClassExpr::Some(_, x)
+        | ClassExpr::All(_, x)
+        | ClassExpr::Min(_, _, x)
+        | ClassExpr::Max(_, _, x)
+        | ClassExpr::Exact(_, _, x) => std::slice::from_ref(x),
+        _ => &[],
     }
-    None
+}
+
+/// First non-simple-property expression reachable from each interned class, filled bottom-up.
+// Child-before-parent: Interner::intern is append-only and immutable (model.rs:211-219), the RDF
+// reader guards against cycles (mapping.rs:1205-1210), and the importer interns children first.
+fn build_non_simple_memo(
+    ontology: &Ontology,
+    needing: &HashMap<u32, (Term, &'static str)>,
+) -> Vec<u32> {
+    let n = ontology.classes.len();
+    let mut memo = vec![CLEAN; n];
+    #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+    record_non_simple_scratch(memo.capacity() * std::mem::size_of::<u32>());
+    for id in 0..n as u32 {
+        #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+        NON_SIMPLE_EXPANSIONS.with(|c| c.set(c.get() + 1));
+        memo[id as usize] = if needing.contains_key(&id) {
+            id
+        } else {
+            class_children(ontology.classes.get(id))
+                .iter()
+                .rev()
+                .map(|c| memo[c.0 as usize])
+                .find(|&h| h != CLEAN)
+                .unwrap_or(CLEAN)
+        };
+    }
+    memo
+}
+
+#[cfg(any(test, all(feature = "witness", debug_assertions)))]
+thread_local! {
+    static NON_SIMPLE_EXPANSIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static NON_SIMPLE_SCRATCH_PEAK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, all(feature = "witness", debug_assertions)))]
+fn record_non_simple_scratch(bytes: usize) {
+    NON_SIMPLE_SCRATCH_PEAK.with(|p| p.set(p.get().max(bytes)));
+}
+
+/// Class-expression expansions made by the non-simple-property check on this thread.
+#[cfg(any(test, all(feature = "witness", debug_assertions)))]
+pub fn non_simple_expansions() -> u64 {
+    NON_SIMPLE_EXPANSIONS.with(std::cell::Cell::get)
+}
+
+/// Peak scratch bytes held by the non-simple-property memo pass on this thread, resetting it.
+#[cfg(any(test, all(feature = "witness", debug_assertions)))]
+pub fn take_non_simple_scratch_peak() -> usize {
+    NON_SIMPLE_SCRATCH_PEAK.with(|p| p.replace(0))
 }
 
 /// Whether an IRI is of the reserved vocabulary (`rdf:`, `rdfs:`, `xsd:`, `owl:`) and not
 /// one of the names OWL 2 DL gives it (`owl:Thing`, `owl:Nothing`, the top and bottom
-/// properties): an entity the reader leaves out (`leave_out_reserved`). Callers that
-/// choose input for the reader ask it here, not by a copy of the list.
+/// properties): a class or property the reader leaves out (`leave_out_reserved`); where an
+/// individual goes, [`reserved_as_individual`]. Callers that choose input for the reader ask
+/// it here, not by a copy of the list.
 pub fn reserved_name(iri: &str) -> bool {
     const ALLOWED: [&str; 6] = [
         "Thing",
@@ -541,6 +725,13 @@ pub fn reserved_name(iri: &str) -> bool {
     reserved_vocabulary(iri) && !allowed
 }
 
+/// Whether an IRI where an individual goes is one the reader leaves out: every IRI of the
+/// reserved vocabulary, the six names [`reserved_name`] allows included, which OWL 2 DL
+/// gives a class's or a property's role only (*Structural Specification* §2.4, §5.6.1).
+pub fn reserved_as_individual(iri: &str) -> bool {
+    reserved_vocabulary(iri)
+}
+
 /// Whether an IRI is of the reserved vocabulary (`rdf:`, `rdfs:`, `xsd:`, `owl:`; §2.4).
 pub fn reserved_vocabulary(iri: &str) -> bool {
     use crate::vocab::{OWL, RDF, RDFS, XSD};
@@ -549,8 +740,9 @@ pub fn reserved_vocabulary(iri: &str) -> bool {
 
 /// Leaves out the axioms that use an IRI of the reserved vocabulary (`rdf:`, `rdfs:`,
 /// `xsd:`, `owl:`; *OWL 2 Structural Specification* §2.4) as a class, a property or an
-/// individual, but for those §2.4 gives OWL 2 DL (`owl:Thing`, `owl:Nothing`, the top and
-/// bottom properties; datatypes are data ranges, not touched here): every such name an
+/// individual, but for those §2.4 gives OWL 2 DL as a class or a property (`owl:Thing`,
+/// `owl:Nothing`, the top and bottom properties; [`reserved_name`] and
+/// [`reserved_as_individual`]; datatypes are data ranges, not touched here): every such name an
 /// axiom uses, each with a [`Diagnostic::Reserved`] (not only its first: what is reported
 /// doesn't depend on the order the statements are read in). Such a name means in OWL 2
 /// DL nothing of what it means in RDF (`rdfs:Class`, `rdf:type`, `rdf:first` as entities
@@ -559,11 +751,11 @@ pub fn reserved_vocabulary(iri: &str) -> bool {
 /// follows from the rest still follows. Terms whose IRI the source doesn't give
 /// ([`Terms::iri_text`]) aren't checked.
 pub(crate) fn leave_out_reserved(ontology: &mut Ontology, terms: &dyn Terms) {
-    let mut cache: HashMap<Term, bool, foldhash::fast::RandomState> = HashMap::default();
-    let mut reserved = |t: Term| -> bool {
-        *cache
-            .entry(t)
-            .or_insert_with(|| terms.iri_text(t).is_some_and(|iri| reserved_name(&iri)))
+    // Per term: reserved as a class or property, and as an individual.
+    let mut cache: HashMap<Term, [bool; 2], foldhash::fast::RandomState> = HashMap::default();
+    let mut reserved = |t: Term, individual: bool| -> bool {
+        let roles = *cache.entry(t).or_insert_with(|| reserved_roles(terms, t));
+        roles[usize::from(individual)]
     };
     let mut walk = Walk::new(ontology.classes.len());
     let mut kept = Vec::with_capacity(ontology.axioms.len());
@@ -580,8 +772,11 @@ pub(crate) fn leave_out_reserved(ontology: &mut Ontology, terms: &dyn Terms) {
     let all_sources = std::mem::take(&mut ontology.sources);
     for (axiom, source) in axioms.into_iter().zip(all_sources) {
         let mut any = false;
-        for &term in entities_of(ontology, &axiom, &mut walk) {
-            if reserved(term) {
+        let (names, individuals) = entities_of(&ontology.classes, &axiom, &mut walk);
+        let roles =
+            (names.iter().map(|&t| (t, false))).chain(individuals.iter().map(|&t| (t, true)));
+        for (term, individual) in roles {
+            if reserved(term, individual) {
                 any = true;
                 if met.insert(term) {
                     found.push(Diagnostic::Reserved { term });
@@ -598,11 +793,66 @@ pub(crate) fn leave_out_reserved(ontology: &mut Ontology, terms: &dyn Terms) {
     ontology.diagnostics.extend(found);
 }
 
+/// Whether `t`'s IRI is reserved as a class or property ([`reserved_name`]), and where an
+/// individual goes ([`reserved_as_individual`]); neither where the source gives no IRI.
+fn reserved_roles(terms: &dyn Terms, t: Term) -> [bool; 2] {
+    (terms.iri_text(t)).map_or([false; 2], |iri| {
+        [reserved_name(&iri), reserved_as_individual(&iri)]
+    })
+}
+
+/// The reserved names that the axioms one statement is read as name in their places, each
+/// once, as [`leave_out_reserved`] asks of each axiom. A reader asks it of a disjointness or
+/// distinctness that repeats an operand, which it reads as several axioms (the n-ary one and
+/// the repeat's own, `model::Disjoint::axioms`), and leaves them all out where one names any:
+/// left out one by one, the repeat's axiom alone (`ex:a` different from itself) would stay,
+/// a part of a statement read where the rest is not.
+/// `walk` is the reader's, kept across its statements.
+pub(crate) fn reserved_in(
+    classes: &Interner<ClassExpr>,
+    axioms: &[Axiom],
+    terms: &dyn Terms,
+    walk: &mut Walk,
+) -> Vec<Term> {
+    let mut found = Vec::new();
+    for axiom in axioms {
+        let (names, individuals) = entities_of(classes, axiom, walk);
+        let roles =
+            (names.iter().map(|&t| (t, false))).chain(individuals.iter().map(|&t| (t, true)));
+        for (term, individual) in roles {
+            if reserved_roles(terms, term)[usize::from(individual)] && !found.contains(&term) {
+                found.push(term);
+            }
+        }
+    }
+    found
+}
+
+/// Reports each reserved name a nominal or a `hasValue` puts where an individual goes, which
+/// the reader read no axiom of, once: an expression stays interned where the axiom using it is
+/// left out, or the structure around it rejected after it was read (a disjoint union of one
+/// class), and [`Ontology::named_individuals`], which the DL engines realise, leaves out what
+/// is reported so.
+pub(crate) fn report_reserved_in_expressions(ontology: &mut Ontology, terms: &dyn Terms) {
+    let mut met: HashSet<Term> = (ontology.diagnostics.iter())
+        .filter_map(|d| match *d {
+            Diagnostic::Reserved { term } => Some(term),
+            _ => None,
+        })
+        .collect();
+    let found: Vec<Term> = crate::mapping::in_expressions(ontology)
+        .filter(|&t| reserved_roles(terms, t)[1] && met.insert(t))
+        .collect();
+    (ontology.diagnostics).extend(found.into_iter().map(|term| Diagnostic::Reserved { term }));
+}
+
 /// [`entities_of`]'s lists, kept from one axiom to the next so that the walk over every
-/// axiom allocates nothing per axiom: the names found, the expressions left to visit, and
-/// per expression the round of the axiom that last visited it.
-struct Walk {
+/// axiom allocates nothing per axiom: the classes and properties found, the individuals found,
+/// the expressions left to visit, and per expression the round of the axiom that last visited
+/// it.
+pub(crate) struct Walk {
     names: Vec<Term>,
+    individuals: Vec<Term>,
     stack: Vec<u32>,
     seen: Vec<u32>,
     round: u32,
@@ -610,9 +860,10 @@ struct Walk {
 
 impl Walk {
     /// A walk over an ontology of `expressions` class expressions.
-    fn new(expressions: usize) -> Self {
+    pub(crate) fn new(expressions: usize) -> Self {
         Self {
             names: Vec::new(),
+            individuals: Vec::new(),
             stack: Vec::new(),
             seen: vec![0; expressions],
             round: 0,
@@ -620,9 +871,14 @@ impl Walk {
     }
 }
 
-/// The classes, properties and individuals an axiom names (datatypes, literals and
-/// facets aside), in `walk`'s list.
-fn entities_of<'w>(o: &Ontology, axiom: &Axiom, walk: &'w mut Walk) -> &'w [Term] {
+/// The classes and properties an axiom names, then the individuals (datatypes, literals and
+/// facets aside), in `walk`'s lists; its class expressions in `classes`.
+fn entities_of<'w>(
+    classes: &Interner<ClassExpr>,
+    axiom: &Axiom,
+    walk: &'w mut Walk,
+) -> (&'w [Term], &'w [Term]) {
+    use crate::model::EntityKind;
     if walk.round == u32::MAX {
         walk.seen.fill(0);
         walk.round = 0;
@@ -630,20 +886,20 @@ fn entities_of<'w>(o: &Ontology, axiom: &Axiom, walk: &'w mut Walk) -> &'w [Term
     walk.round += 1;
     let Walk {
         names: out,
+        individuals: ind,
         stack,
         seen,
         round,
     } = walk;
     out.clear();
+    ind.clear();
     stack.clear();
     let p = |q: &ObjProp| q.named();
     match axiom {
+        Axiom::Declaration(EntityKind::NamedIndividual, t) => ind.push(*t),
         Axiom::Declaration(kind, t) => {
             // Datatypes and annotation properties of the reserved vocabulary are OWL 2's.
-            if !matches!(
-                kind,
-                crate::model::EntityKind::Datatype | crate::model::EntityKind::AnnotationProperty
-            ) {
+            if !matches!(kind, EntityKind::Datatype | EntityKind::AnnotationProperty) {
                 out.push(*t);
             }
         }
@@ -669,26 +925,33 @@ fn entities_of<'w>(o: &Ontology, axiom: &Axiom, walk: &'w mut Walk) -> &'w [Term
             out.extend(os.iter().map(p));
             out.extend(ds);
         }
-        Axiom::ClassAssertion(_, a) => out.push(*a),
+        Axiom::ClassAssertion(_, a) => ind.push(*a),
         Axiom::ObjectPropertyAssertion(q, a, b2)
-        | Axiom::NegativeObjectPropertyAssertion(q, a, b2) => out.extend([*q, *a, *b2]),
-        Axiom::DataPropertyAssertion(q, a, _) | Axiom::NegativeDataPropertyAssertion(q, a, _) => {
-            out.extend([*q, *a]);
+        | Axiom::NegativeObjectPropertyAssertion(q, a, b2) => {
+            out.push(*q);
+            ind.extend([*a, *b2]);
         }
-        Axiom::SameIndividual(xs) | Axiom::DifferentIndividuals(xs) => out.extend(xs),
+        Axiom::DataPropertyAssertion(q, a, _) | Axiom::NegativeDataPropertyAssertion(q, a, _) => {
+            out.push(*q);
+            ind.push(*a);
+        }
+        Axiom::SameIndividual(xs) | Axiom::DifferentIndividuals(xs) => ind.extend(xs),
         _ => {}
     }
     push_expressions(axiom, stack);
     while let Some(id) = stack.pop() {
+        if seen.len() <= id as usize {
+            seen.resize(classes.len(), 0);
+        }
         if seen[id as usize] == *round {
             continue;
         }
         seen[id as usize] = *round;
-        match o.classes.get(id) {
+        match classes.get(id) {
             ClassExpr::Class(t) => out.push(*t),
             ClassExpr::And(xs) | ClassExpr::Or(xs) => stack.extend(xs.iter().map(|x| x.0)),
             ClassExpr::Not(x) => stack.push(x.0),
-            ClassExpr::OneOf(xs) => out.extend(xs),
+            ClassExpr::OneOf(xs) => ind.extend(xs),
             ClassExpr::Some(q, x)
             | ClassExpr::All(q, x)
             | ClassExpr::Min(_, q, x)
@@ -697,7 +960,10 @@ fn entities_of<'w>(o: &Ontology, axiom: &Axiom, walk: &'w mut Walk) -> &'w [Term
                 out.push(q.named());
                 stack.push(x.0);
             }
-            ClassExpr::HasValue(q, a) => out.extend([q.named(), *a]),
+            ClassExpr::HasValue(q, a) => {
+                out.push(q.named());
+                ind.push(*a);
+            }
             ClassExpr::HasSelf(q) => out.push(q.named()),
             ClassExpr::DataSome(q, _)
             | ClassExpr::DataAll(q, _)
@@ -708,5 +974,137 @@ fn entities_of<'w>(o: &Ontology, axiom: &Axiom, walk: &'w mut Walk) -> &'w [Term
             ClassExpr::Thing | ClassExpr::Nothing => {}
         }
     }
-    out
+    (out, ind)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::ExprId;
+
+    /// Spec (Structural Specification §11.2): memoising non-simple-property reachability
+    /// preserves the right-to-left witness choice across set operands for every axiom sharing
+    /// the expression; a single matching child reports that child's property and reason.
+    #[test]
+    fn non_simple_memo_preserves_first_finding() {
+        let mut o = Ontology::default();
+        let thing = ExprId(o.classes.intern(ClassExpr::Thing));
+        let self_p = ExprId(o.classes.intern(ClassExpr::HasSelf(ObjProp::Named(1))));
+        let max_q = ExprId(
+            o.classes
+                .intern(ClassExpr::Max(1, ObjProp::Named(2), thing)),
+        );
+        let both = ExprId(o.classes.intern(ClassExpr::And(vec![self_p, max_q])));
+        let c1 = ExprId(o.classes.intern(ClassExpr::Class(10)));
+        let c2 = ExprId(o.classes.intern(ClassExpr::Class(11)));
+        o.axioms = vec![
+            Axiom::ObjectCharacteristic(Characteristic::Transitive, ObjProp::Named(1)),
+            Axiom::ObjectCharacteristic(Characteristic::Transitive, ObjProp::Named(2)),
+            Axiom::SubClassOf(c1, both),
+            Axiom::SubClassOf(c2, both),
+        ];
+        o.axioms.sort_unstable();
+        let expected_indices: Vec<usize> = o
+            .axioms
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| matches!(a, Axiom::SubClassOf(..)).then_some(i))
+            .collect();
+        assert_eq!(expected_indices.len(), 2);
+
+        let mut out = Vec::new();
+        check_global_restrictions(&o, true, &mut out);
+        let hits: Vec<_> = out
+            .iter()
+            .filter_map(|d| match *d {
+                Diagnostic::NonSimpleProperty {
+                    property,
+                    axiom,
+                    what,
+                } => Some((property, axiom, what)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            hits,
+            expected_indices
+                .into_iter()
+                .map(|idx| (2, idx, "a cardinality restriction"))
+                .collect::<Vec<_>>()
+        );
+
+        // One-child control: reports the sole matching child's property and reason.
+        let mut single = Ontology::default();
+        let only_p = ExprId(single.classes.intern(ClassExpr::HasSelf(ObjProp::Named(1))));
+        let wrap = ExprId(single.classes.intern(ClassExpr::Not(only_p)));
+        let c = ExprId(single.classes.intern(ClassExpr::Class(10)));
+        single.axioms = vec![
+            Axiom::ObjectCharacteristic(Characteristic::Transitive, ObjProp::Named(1)),
+            Axiom::SubClassOf(c, wrap),
+        ];
+        single.axioms.sort_unstable();
+        let sub_idx = single
+            .axioms
+            .iter()
+            .position(|a| matches!(a, Axiom::SubClassOf(..)))
+            .unwrap();
+        let mut single_out = Vec::new();
+        check_global_restrictions(&single, true, &mut single_out);
+        let single_hits: Vec<_> = single_out
+            .iter()
+            .filter_map(|d| match *d {
+                Diagnostic::NonSimpleProperty {
+                    property,
+                    axiom,
+                    what,
+                } => Some((property, axiom, what)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(single_hits, vec![(1, sub_idx, "a self restriction")]);
+    }
+
+    /// Spec (contracts.md, Memory; Structural Specification §11.2): the non-simple-property
+    /// memo's advertised byte bound covers all live scratch held during the pass on a dense
+    /// acyclic DAG with many shared parent edges.
+    #[test]
+    fn non_simple_memo_reservation_covers_shared_parent_edges() {
+        let mut o = Ontology::default();
+        let hit = ExprId(o.classes.intern(ClassExpr::HasSelf(ObjProp::Named(1))));
+        let leaf = ExprId(o.classes.intern(ClassExpr::Class(2)));
+        let c = ExprId(o.classes.intern(ClassExpr::Class(3)));
+        let mut prior = vec![hit, leaf];
+        let mut root = hit;
+        for _ in 0..1_024usize {
+            root = ExprId(o.classes.intern(ClassExpr::And(prior.clone())));
+            prior.push(root);
+        }
+        o.axioms = vec![
+            Axiom::ObjectCharacteristic(Characteristic::Transitive, ObjProp::Named(1)),
+            Axiom::SubClassOf(c, root),
+        ];
+        o.axioms.sort_unstable();
+
+        let _ = take_non_simple_scratch_peak();
+        let mut out = Vec::new();
+        check_global_restrictions(&o, true, &mut out);
+        let held = take_non_simple_scratch_peak();
+        let reserved = non_simple_memo_bytes(o.classes.len());
+        assert!(
+            out.iter().any(|d| matches!(
+                d,
+                Diagnostic::NonSimpleProperty {
+                    property: 1,
+                    what: "a self restriction",
+                    ..
+                }
+            )),
+            "expected non-simple self-restriction finding: {out:?}"
+        );
+        assert!(
+            held <= reserved,
+            "shared-parent DAG held {held} scratch bytes against {reserved} reserved ({} classes)",
+            o.classes.len()
+        );
+    }
 }

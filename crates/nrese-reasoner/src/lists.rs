@@ -17,11 +17,13 @@
 //! linear walks by member and other graphs by reachability between positions.
 //! The rule encoder's bounds select a form;
 //! they leave no accepting walk unread.
+//! In Direct Semantics mode, lists supplied only by rule conclusions keep every pair.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::ir::{Atom, Guard, Head, ListPairs, OWL, RDF, Rule, Term, Vocabulary};
+use super::representatives::EqualityClasses;
 
 mod per_cell;
 pub(crate) use per_cell::{Predicates, TableKind, internal, table_kind};
@@ -59,6 +61,7 @@ pub struct ListVocabulary {
     all_different: u64,
     /// The blank nodes' ids, when keys bind named individuals only.
     named_keys: Option<(u64, u64)>,
+    canonical_disjoints: bool,
 }
 
 impl ListVocabulary {
@@ -66,6 +69,15 @@ impl ListVocabulary {
     pub fn named_keys(mut self, blank_nodes: Option<(u64, u64)>) -> Self {
         self.named_keys = blank_nodes;
         self
+    }
+
+    pub(crate) fn canonical_disjoints(mut self, canonical: bool) -> Self {
+        self.canonical_disjoints = canonical;
+        self
+    }
+
+    pub(crate) fn uses_written_disjoints(&self) -> bool {
+        self.canonical_disjoints
     }
 
     pub fn new(vocabulary: &mut impl Vocabulary) -> Self {
@@ -90,6 +102,7 @@ impl ListVocabulary {
             all_disjoint_properties: vocabulary.iri(&format!("{OWL}AllDisjointProperties")),
             all_different: vocabulary.iri(&format!("{OWL}AllDifferent")),
             named_keys: None,
+            canonical_disjoints: false,
         }
     }
 
@@ -118,6 +131,7 @@ impl ListVocabulary {
             all_disjoint_properties: named(self.all_disjoint_properties),
             all_different: named(self.all_different),
             named_keys: self.named_keys,
+            canonical_disjoints: self.canonical_disjoints,
         };
         (vocabulary != *self).then_some(vocabulary)
     }
@@ -164,7 +178,7 @@ impl ListVocabulary {
                 .contains(&o))
     }
 
-    fn nil_is_cell(&self, facts: &impl Facts) -> bool {
+    fn nil_is_cell(&self, facts: &dyn Facts) -> bool {
         !facts.objects(self.nil, self.first).is_empty()
             && !facts.objects(self.nil, self.rest).is_empty()
     }
@@ -195,7 +209,7 @@ impl ListVocabulary {
     /// Walks of the enumerated form, or the accepting cells of the other form.
     fn list(
         &self,
-        facts: &impl Facts,
+        facts: &dyn Facts,
         head: u64,
         nil_is_cell: bool,
         kind: ListKind,
@@ -221,7 +235,7 @@ impl ListVocabulary {
     /// case a broken cell or a repeated node also decides the whole reading.
     fn linear_list(
         &self,
-        facts: &impl Facts,
+        facts: &dyn Facts,
         head: u64,
     ) -> Option<Result<Vec<Variant>, ListProblem>> {
         let (mut members, mut used) = (Vec::new(), Vec::<[u64; 3]>::new());
@@ -252,7 +266,7 @@ impl ListVocabulary {
     /// back from nil. A cell without a first cannot supply an incoming edge.
     fn accepting_cells(
         &self,
-        facts: &impl Facts,
+        facts: &dyn Facts,
         head: u64,
     ) -> Result<HashMap<u64, Cell>, ListProblem> {
         let mut cells = HashMap::new();
@@ -302,7 +316,7 @@ impl ListVocabulary {
 
     fn enumerate(
         &self,
-        facts: &impl Facts,
+        facts: &dyn Facts,
         cells: &HashMap<u64, Cell>,
         head: u64,
         kind: ListKind,
@@ -372,7 +386,7 @@ impl ListVocabulary {
 
     fn each_member(
         &self,
-        facts: &impl Facts,
+        facts: &dyn Facts,
         cells: &HashMap<u64, Cell>,
         head: u64,
         mut emit: impl FnMut(u64, Vec<[u64; 3]>),
@@ -397,10 +411,38 @@ impl ListVocabulary {
         }
     }
 
+    /// A walk of at least two positions can choose `member` at every cell.
+    fn single_member_walk(
+        &self,
+        facts: &dyn Facts,
+        cells: &HashMap<u64, Cell>,
+        head: u64,
+        member: u64,
+    ) -> bool {
+        if !cells[&head].firsts.contains(&member) {
+            return false;
+        }
+        let mut pending = cells[&head].rests.clone();
+        let mut visited = HashSet::new();
+        while let Some(node) = pending.pop() {
+            if facts.stopped() {
+                return false;
+            }
+            let cell = &cells[&node];
+            if visited.insert(node) && cell.firsts.contains(&member) {
+                if cell.rests.contains(&self.nil) {
+                    return true;
+                }
+                pending.extend(&cell.rests);
+            }
+        }
+        false
+    }
+
     /// One path as first/rest premises, including a first at each position.
     fn path(
         &self,
-        facts: &impl Facts,
+        facts: &dyn Facts,
         cells: &HashMap<u64, Cell>,
         from: u64,
         to: u64,
@@ -625,7 +667,13 @@ pub fn instantiate_with_premises(
     vocabulary: &ListVocabulary,
     facts: &impl Facts,
 ) -> (Vec<Rule>, Vec<Vec<[u64; 3]>>, Vec<ListDiagnostic>) {
-    compile(vocabulary, facts, &mut Predicates::default(), RuleKind::All)
+    compile(
+        vocabulary,
+        facts,
+        &mut Predicates::default(),
+        RuleKind::All,
+        None,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -635,12 +683,21 @@ pub(crate) enum RuleKind {
     Consistency,
 }
 
+pub(crate) type ListRules = (Vec<Rule>, Vec<Vec<[u64; 3]>>, Vec<ListDiagnostic>);
+
+pub(crate) struct WrittenLists<'a> {
+    pub vocabulary: &'a ListVocabulary,
+    pub facts: &'a dyn Facts,
+    pub projection: Option<&'a EqualityClasses>,
+}
+
 pub(crate) fn compile(
     voc: &ListVocabulary,
-    facts: &impl Facts,
+    facts: &dyn Facts,
     predicates: &mut Predicates,
     rule_kind: RuleKind,
-) -> (Vec<Rule>, Vec<Vec<[u64; 3]>>, Vec<ListDiagnostic>) {
+    written: Option<WrittenLists<'_>>,
+) -> ListRules {
     #[cfg(test)]
     crate::witness::add(crate::witness::Site::ListGrounding, 1);
     let mut rules = Vec::new();
@@ -648,8 +705,11 @@ pub(crate) fn compile(
     let mut diagnostics: Vec<ListDiagnostic> = Vec::new();
     let nil_is_cell = std::cell::OnceCell::new();
     let long = std::cell::RefCell::new(Long::default());
-    let mut lists =
-        |predicate, name: &'static str, kind, rules: &mut Vec<Rule>, make: &mut MakeRules| {
+    let projection = written.as_ref().and_then(|written| written.projection);
+    let project = |term| projection.map_or(term, |classes| classes.representative(term));
+    let mut lists = {
+        let (premises, diagnostics, long) = (&mut premises, &mut diagnostics, &long);
+        move |predicate, name, kind, rules: &mut Vec<Rule>, make: &mut MakeRules| {
             debug_assert!(voc.is_list_fact([0, predicate, 0]), "read, not a list fact");
             match (rule_kind, kind) {
                 (RuleKind::Inference, ListKind::Pairwise)
@@ -659,14 +719,52 @@ pub(crate) fn compile(
                 ) => return,
                 _ => {}
             }
-            for (subject, head) in facts.pairs(predicate) {
+            let written = written
+                .as_ref()
+                .filter(|_| matches!(kind, ListKind::Pairwise) && voc.uses_written_disjoints());
+            let asserted = written.into_iter().flat_map(|w| {
+                let p = if predicate == voc.members {
+                    w.vocabulary.members
+                } else {
+                    w.vocabulary.distinct_members
+                };
+                w.facts
+                    .pairs(p)
+                    .into_iter()
+                    .map(move |pair| (pair, Some(w)))
+            });
+            let inferred = facts.pairs(predicate).into_iter().map(|pair| (pair, None));
+            // A written list takes priority over equality copies of its operands.
+            let mut covered = HashSet::new();
+            let written_nil = std::cell::OnceCell::new();
+            for ((subject, head), written) in asserted.chain(inferred) {
                 if facts.stopped() {
                     return;
                 }
-                let axiom = [subject, predicate, head];
-                let nil_is_cell = *nil_is_cell.get_or_init(|| voc.nil_is_cell(facts));
-                let list = match voc.list(facts, head, nil_is_cell, kind) {
+                let (reader, vocabulary, nil) = written.map_or((facts, voc, &nil_is_cell), |w| {
+                    (w.facts, w.vocabulary, &written_nil)
+                });
+                let subject = if written.is_some() {
+                    project(subject)
+                } else {
+                    subject
+                };
+                let axiom = [
+                    subject,
+                    predicate,
+                    if written.is_some() {
+                        project(head)
+                    } else {
+                        head
+                    },
+                ];
+                if written.is_none() && covered.contains(&axiom) {
+                    continue;
+                }
+                let nil_is_cell = *nil.get_or_init(|| vocabulary.nil_is_cell(reader));
+                let list = match vocabulary.list(reader, head, nil_is_cell, kind) {
                     Ok(list) => list,
+                    Err(_) if written.is_some() => continue,
                     Err(problem) => {
                         diagnostics.push(ListDiagnostic {
                             rules: name,
@@ -683,6 +781,9 @@ pub(crate) fn compile(
                 } else {
                     Vec::new()
                 };
+                if written.is_some() {
+                    covered.insert(axiom);
+                }
                 let mut make_walk = |members: &[u64], mut used: Vec<[u64; 3]>, unary: bool| {
                     let before = rules.len();
                     make(subject, members, rules);
@@ -711,7 +812,18 @@ pub(crate) fn compile(
                 match list {
                     List::Walks(walks, extra_members) => {
                         let mut seen = HashSet::new();
-                        for (members, used) in walks {
+                        for (mut members, used) in walks {
+                            if written.is_some()
+                                && members.windows(2).any(|pair| pair[0] != pair[1])
+                            {
+                                let mut distinct = HashSet::new();
+                                members.retain(|&member| distinct.insert(member));
+                            }
+                            if written.is_some() && projection.is_some() {
+                                members
+                                    .iter_mut()
+                                    .for_each(|member| *member = project(*member));
+                            }
                             if extra_members.is_some() {
                                 seen.extend(members.iter().copied());
                             }
@@ -765,14 +877,28 @@ pub(crate) fn compile(
                                     .filter(move |_| !cell.rests.is_empty())
                                     .map(move |member| (member, id))
                             });
-                            let Some(pairs) = ListPairs::new(&edges, members, || facts.stopped())
+                            let Some(mut pairs) =
+                                ListPairs::new(&edges, members, || facts.stopped())
                             else {
                                 return;
                             };
+                            let mut repeats = HashSet::new();
                             for member in pairs.repeated() {
                                 if facts.stopped() {
                                     return;
                                 }
+                                if written.is_none()
+                                    || vocabulary.single_member_walk(reader, &cells, head, member)
+                                {
+                                    repeats.insert(project(member));
+                                }
+                            }
+                            if written.is_some() && projection.is_some() {
+                                pairs.project(&project, &mut repeats, &|| facts.stopped());
+                            }
+                            let mut repeats: Vec<_> = repeats.into_iter().collect();
+                            repeats.sort_unstable();
+                            for member in repeats {
                                 make_walk(&[member, member], Vec::new(), false);
                             }
                             let pairs = Arc::new(pairs);
@@ -824,7 +950,8 @@ pub(crate) fn compile(
                     }
                 }
             }
-        };
+        }
+    };
     let ty = voc.rdf_type;
     // prp-spo2: (x0 p1 x1) … (x(n-1) pn xn) -> (x0 p xn)
     lists(

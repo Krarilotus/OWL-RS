@@ -190,7 +190,8 @@ fn deleting_the_literal_that_makes_a_property_data_valued_leaves_the_route() {
 /// leaves out (`nrese_owl::diagnostics::reserved_name`): a commit that so uses one reads
 /// again, and the ontology leaves the route. A built-in annotation property already
 /// known, on either side of an equality; a class of the vocabulary; a reserved value of a
-/// known property.
+/// known property; and the six names OWL 2 gives only a class's or a property's role
+/// (Structural Specification §2.4, §5.6.1) as a value, a subject or a typed individual.
 #[test]
 fn a_later_individual_use_of_a_reserved_name_reads_again() {
     for (data, later) in [
@@ -207,6 +208,15 @@ fn a_later_individual_use_of_a_reserved_name_reads_again() {
             ":owns a owl:ObjectProperty . :ann :owns :rex .",
             ":ann :owns rdf:nil .",
         ),
+        (
+            ":owns a owl:ObjectProperty . :ann :owns :rex .",
+            ":ann :owns owl:Thing .",
+        ),
+        (
+            ":owns a owl:ObjectProperty . :ann :owns :rex .",
+            "owl:Nothing :owns :rex .",
+        ),
+        (":C a owl:Class . :a a :C .", "owl:topDataProperty a :C ."),
     ] {
         let (store, pipeline) = on_the_route(data);
         assert!(commit(&store, &pipeline, later), "{later}");

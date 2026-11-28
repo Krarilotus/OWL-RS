@@ -115,8 +115,8 @@ fn a_detection_refused_at_its_budget_leaves_the_clash_undecided() {
     );
 }
 
-/// The reason is derived, never stored: a store opened again finds it again under
-/// `owl2-dl`, and not under `owl2-rl`, whose promise is the rules' reading.
+/// The reason is derived at reopen under the matching `owl2-dl` program. Opening with
+/// the different `owl2-rl` program carries only the hold until it rebuilds.
 #[test]
 fn the_reason_is_derived_again_at_open_under_the_mode_opened_with() {
     let dir = tempfile::tempdir().unwrap();
@@ -124,11 +124,8 @@ fn the_reason_is_derived_again_at_open_under_the_mode_opened_with() {
     loaded(&dl, ANNOTATION_CLASH);
     drop(dl);
     let rl = store(StoreConfig::on_disk(dir.path()), ReasoningMode::Owl2Rl);
-    let consistency = rl.store().consistency();
-    assert!(
-        matches!(consistency, ConsistencyStatus::Inconsistent { .. }),
-        "{consistency:?}"
-    );
+    assert_eq!(rl.store().consistency(), ConsistencyStatus::Unknown);
+    assert!(rl.store().is_quarantined());
     drop(rl);
     let dl = store(StoreConfig::on_disk(dir.path()), ReasoningMode::Owl2Dl);
     let consistency = dl.store().consistency();
@@ -230,7 +227,8 @@ fn a_commit_in_quarantine_records_no_verdict_and_reads_stay_told_inconsistent() 
 
 /// Spec: an ill-typed literal under a range is a clash the rules find (dt-not-type), and the
 /// full check has no value for it (`dl/datatypes.rs`): a read is told the consistency isn't
-/// known, never `complete` on the rules' claim.
+/// known, never `complete` on the rules' claim; and, as OWL 2 admits no ill-typed literal, that
+/// the store holds one (it::ill_typed_literal_status_tests), and nothing else.
 #[test]
 fn an_ill_typed_literal_in_quarantine_is_told_its_consistency_is_not_known() {
     let dl = quarantined(
@@ -242,8 +240,9 @@ fn an_ill_typed_literal_in_quarantine_is_told_its_consistency_is_not_known() {
     let reasons = status.reasons();
     assert_eq!(header.split(';').next(), Some("sound-only"), "{header}");
     assert!(
-        reasons.len() == 1
-            && reasons[0].starts_with("the data's consistency under OWL 2 DL isn't known ("),
+        reasons.len() == 2
+            && reasons[0].starts_with("the data's consistency under OWL 2 DL isn't known (")
+            && reasons[1].contains("ill-typed"),
         "{header}"
     );
     assert!(rows.is_empty(), "{rows:?}");
@@ -499,7 +498,7 @@ fn a_kind_keeping_refusal_on_the_rules_route_is_decided_past_the_reads_budget() 
     assert_eq!(dl.store().dl_bounds().last, "rules", "the store's route");
     assert_eq!(
         control.0,
-        RejectKind::Undecided,
+        RejectKind::Undecided(nrese_store::UndecidedCause::ReadsDifferently),
         "the control: {}",
         control.1
     );
@@ -577,7 +576,12 @@ fn a_refusal_that_puns_a_name_stays_undecided() {
     let write = "INSERT DATA { GRAPH :open { :x a :A , :B . :y :p :A } }";
     let with = refused(&kept(BASE), &Requester::all(), write);
     let without = refused(&read_in_full(BASE), &Requester::all(), write);
-    assert_eq!(with.0, RejectKind::Undecided, "{}", with.1);
+    assert_eq!(
+        with.0,
+        RejectKind::Undecided(nrese_store::UndecidedCause::ReadsDifferently),
+        "{}",
+        with.1
+    );
     assert!(
         with.1
             .contains("annotation-property axioms or a punned name")
@@ -598,7 +602,11 @@ fn a_refusal_with_no_kinds_kept_reads_as_before() {
     let data = format!("{ROUTED} {}", members(0..GROWN));
     assert_eq!(loaded(&dl, &data), ConsistencyStatus::Consistent);
     let (kind, detail) = refused(&dl, &Requester::all(), REFUSED);
-    assert_eq!(kind, RejectKind::Undecided, "{detail}");
+    assert_eq!(
+        kind,
+        RejectKind::Undecided(nrese_store::UndecidedCause::ReadsDifferently),
+        "{detail}"
+    );
     assert!(
         detail.contains("did not finish within its budget"),
         "{detail}"

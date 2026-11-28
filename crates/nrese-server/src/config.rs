@@ -150,6 +150,7 @@ impl ServerConfig {
                 },
             ),
             ("shacl.shapes_graph", store.shapes_graph.clone()),
+            ("gates.undecided", store.gates_undecided.as_str().to_owned()),
             ("shacl.gate", format!("{:?}", store.shacl_gate)),
             ("reasoner.mode", self.reasoner.mode().as_str().to_owned()),
             (
@@ -372,6 +373,27 @@ mod tests {
             source.insert(*key, *value);
         }
         source
+    }
+
+    /// Spec (docs/ops/http-api.md, docs/design/shacl.md, docs/ops/config-reference.md):
+    /// the SHACL refusal limit takes a count or an unlimited value from the file or env.
+    #[test]
+    fn shacl_refusal_limit_accepts_counts_zero_and_unlimited() {
+        for (value, toml_value, expected) in [
+            ("3", "3", Some(3)),
+            ("0", "0", None),
+            ("unlimited", "\"unlimited\"", None),
+        ] {
+            let document = format!("[shacl]\nreject_results = {toml_value}")
+                .parse::<toml::Table>()
+                .expect("setting");
+            let file = super::settings::from_file(&document).expect("recognised setting");
+            let environment = env(&[("NRESE_SHACL_REJECT_RESULTS", value)]);
+            for source in [&file, &environment] {
+                let config = ServerConfig::from_source(source).expect("server config");
+                assert_eq!(config.store.shacl_reject_results, expected, "{value}");
+            }
+        }
     }
 
     #[test]

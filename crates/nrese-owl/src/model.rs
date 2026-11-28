@@ -236,6 +236,16 @@ impl<T: Clone + Eq + Hash> Interner<T> {
     }
 }
 
+/// How repeated operands of disjointness and distinctness are read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisjointReading {
+    /// Use the distinct operands if at least two remain. A repeat with one
+    /// distinct operand expresses self-disjointness.
+    Canonical,
+    /// Every repeated operand expresses self-disjointness.
+    RdfBased,
+}
+
 /// The operands of a disjointness as read: classes, a class's disjoint union, object or
 /// data properties, or individuals (`DifferentIndividuals`).
 pub(crate) enum Disjoint {
@@ -248,54 +258,60 @@ pub(crate) enum Disjoint {
 }
 
 impl Disjoint {
-    /// The axioms it stands for, and whether an operand was repeated: the n-ary axiom over
-    /// its operands without repeats (where two or more remain) and, per repeated operand,
-    /// what being disjoint from itself says (the meaning OWL 2's RDF-Based Semantics gives
-    /// `x owl:disjointWith x`, `p owl:propertyDisjointWith p`, `a owl:differentFrom a`):
-    /// a class or property is empty, an individual contradicts.
+    /// The axioms it stands for, and whether an operand was repeated. With at least
+    /// two distinct operands, emit the n-ary axiom. Where the reading calls for
+    /// self-disjointness, a repeated class or property is empty and a repeated
+    /// individual contradicts.
     pub(crate) fn axioms(
         self,
         classes: &mut Interner<ClassExpr>,
         ranges: &mut Interner<DataRange>,
+        reading: DisjointReading,
     ) -> (Vec<Axiom>, bool) {
-        fn split<T: Ord + Clone>(mut items: Vec<T>) -> (Vec<T>, Vec<T>) {
+        fn split<T: Ord + Clone>(
+            mut items: Vec<T>,
+            reading: DisjointReading,
+            repeated: &mut bool,
+        ) -> (Vec<T>, Vec<T>) {
+            let len = items.len();
             items.sort();
-            let mut repeated: Vec<T> = Vec::new();
-            for w in items.windows(2) {
-                if w[0] == w[1] && repeated.last() != Some(&w[0]) {
-                    repeated.push(w[0].clone());
+            let mut self_disjoint: Vec<T> = Vec::new();
+            if reading == DisjointReading::RdfBased || items.first() == items.last() {
+                for w in items.windows(2) {
+                    if w[0] == w[1] && self_disjoint.last() != Some(&w[0]) {
+                        self_disjoint.push(w[0].clone());
+                    }
                 }
             }
             items.dedup();
-            (items, repeated)
+            *repeated = items.len() < len;
+            (items, self_disjoint)
         }
         let nothing = ExprId(classes.intern(ClassExpr::Nothing));
         let thing = ExprId(classes.intern(ClassExpr::Thing));
         let mut out = Vec::new();
-        let repeated = match self {
+        let mut repeated = false;
+        match self {
             Disjoint::Classes(xs) => {
-                let (xs, rep) = split(xs);
+                let (xs, rep) = split(xs, reading, &mut repeated);
                 if xs.len() > 1 {
                     out.push(Axiom::DisjointClasses(xs));
                 }
                 out.extend(rep.iter().map(|&x| Axiom::SubClassOf(x, nothing)));
-                !rep.is_empty()
             }
-            // The class is the union of its operands, which are pairwise disjoint: a repeated
-            // one is empty, as in `Disjoint::Classes`; of one left without repeats the class
-            // is equal to it.
+            // The class is the union of its pairwise disjoint operands. If one
+            // distinct operand remains, the class is equivalent to it.
             Disjoint::Union(class, xs) => {
-                let (xs, rep) = split(xs);
+                let (xs, rep) = split(xs, reading, &mut repeated);
                 match xs[..] {
                     [x] if x == class => {}
                     [x] => out.push(Axiom::EquivalentClasses(canonical(vec![class, x]))),
                     _ => out.push(Axiom::DisjointUnion(class, xs)),
                 }
                 out.extend(rep.iter().map(|&x| Axiom::SubClassOf(x, nothing)));
-                !rep.is_empty()
             }
             Disjoint::Objects(ps) => {
-                let (ps, rep) = split(ps);
+                let (ps, rep) = split(ps, reading, &mut repeated);
                 if ps.len() > 1 {
                     out.push(Axiom::DisjointObjectProperties(ps));
                 }
@@ -303,10 +319,9 @@ impl Disjoint {
                     let some = ExprId(classes.intern(ClassExpr::Some(p, thing)));
                     out.push(Axiom::SubClassOf(some, nothing));
                 }
-                !rep.is_empty()
             }
             Disjoint::Data(ps) => {
-                let (ps, rep) = split(ps);
+                let (ps, rep) = split(ps, reading, &mut repeated);
                 if ps.len() > 1 {
                     out.push(Axiom::DisjointDataProperties(ps));
                 }
@@ -315,17 +330,15 @@ impl Disjoint {
                     let some = ExprId(classes.intern(ClassExpr::DataSome(p, literal)));
                     out.push(Axiom::SubClassOf(some, nothing));
                 }
-                !rep.is_empty()
             }
             Disjoint::Individuals(xs) => {
-                let (xs, rep) = split(xs);
+                let (xs, rep) = split(xs, reading, &mut repeated);
                 if xs.len() > 1 {
                     out.push(Axiom::DifferentIndividuals(xs));
                 }
                 out.extend(rep.iter().map(|&a| Axiom::ClassAssertion(nothing, a)));
-                !rep.is_empty()
             }
-        };
+        }
         (out, repeated)
     }
 }

@@ -9,8 +9,8 @@
 # checkout, once the checkout is TREE: the tree's toolchain (rust-toolchain.toml), installed through
 # the host's rustup when it or its clippy is missing (windows_job_toolchain: under a lock and a
 # deadline; never by rustup's proxies; no verdict without it), a target directory of its own in the
-# checkout, never a shared one, and its temporary files in the checkout's tmp/windows-job: both go
-# with the checkout. The suite contracts' Python packages come from an environment of their own in
+# checkout, never a shared one, which goes with the checkout, and its temporary files in the job's own
+# directory beside its results, outside the checkout. The suite contracts' Python packages come from an environment of their own in
 # the host's cache, as the Linux gate's do (scripts/lib/suite-python.sh), never the host's Python:
 # made from the Python the tree declares (scripts/lib/gate-tools.txt python-windows, python.org's
 # build, installed under the cache), it must run with the runtime the tree declares
@@ -133,9 +133,12 @@ run() {
   [ "$(printf '%s\n' "$runner" | tr -d '\r' | awk 'NR == 1 { print $2 }')" = "$want" ] \
     || infra "cargo nextest is ${runner:-none}, not the pinned cargo-nextest $want (\$CARGO_HOME/bin first)"
 
-  local temp
-  mkdir -p tmp/windows-job/temp
-  temp=$(cygpath -m "$PWD/tmp/windows-job/temp" 2> /dev/null || printf '%s' "$PWD/tmp/windows-job/temp")
+  # The temporary files go beside the results, in the job's own directory (the fleet removes it whole),
+  # never into the checkout under test: the suite refuses private benchmark output inside the public
+  # checkout, and its tests write theirs under the temporary directory. `out` is already in forward
+  # slashes, where Git Bash's dirname would not split a Windows path.
+  local temp=${out%/*}/temp
+  mkdir -p "$temp"
   # Its own target directory, whatever the host sets: cargo decides freshness by mtimes, so two
   # checkouts building in one directory can hand a job the other's code (26 Oct 2026, lane D).
   CARGO_TARGET_DIR=$(cygpath -m "$PWD/target" 2> /dev/null || printf '%s' "$PWD/target")

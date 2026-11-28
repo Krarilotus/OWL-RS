@@ -22,6 +22,29 @@ pub const RDFS: &str = namespace!(RDFS);
 pub const OWL: &str = namespace!(OWL);
 pub const XSD: &str = namespace!(XSD);
 
+macro_rules! datatype_map {
+    ($($ns:ident => $($name:literal),+;)+) => {
+        &[$($(concat!(namespace!($ns), $name)),+),+]
+    };
+}
+
+/// Built-in datatypes admitted by OWL 2 DL (Structural Specification, `w3c2012owl2syntax.txt`).
+pub(crate) const DL_DATATYPES: &[&str] = datatype_map![
+    OWL => "real", "rational"; // §4.1, lines 1023–1025
+    XSD => "decimal", "integer", "nonNegativeInteger", "nonPositiveInteger"; // §4.1, lines 1027–1033
+    XSD => "positiveInteger", "negativeInteger", "long", "int", "short", "byte"; // §4.1, lines 1035–1045
+    XSD => "unsignedLong", "unsignedInt", "unsignedShort", "unsignedByte"; // §4.1, lines 1047–1053
+    XSD => "double", "float"; // §4.2, lines 1107–1109
+    RDF => "PlainLiteral"; // §4.3, line 1169
+    XSD => "string", "normalizedString", "token", "language", "Name", "NCName", "NMTOKEN"; // §4.3, lines 1173–1185
+    XSD => "boolean"; // §4.4, line 1191
+    XSD => "hexBinary", "base64Binary"; // §4.5, lines 1197–1199
+    XSD => "anyURI"; // §4.6, line 1227
+    XSD => "dateTime", "dateTimeStamp"; // §4.7, lines 1237–1239
+    RDF => "XMLLiteral"; // §4.8, line 1302
+    RDFS => "Literal"; // §11.2, line 4884
+];
+
 /// The IRIs of the OWL 2 datatype map's datatypes and facets, `rdfs:Literal` and
 /// `rdf:langString`: those a source's ids are looked up by when it can't give an IRI's
 /// text. Joined at compile time, so a caller that looks them up pays no allocation for

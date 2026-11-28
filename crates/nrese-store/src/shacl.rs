@@ -6,16 +6,24 @@
 //!
 //! [`StoreConfig::shapes_graph`]: crate::StoreConfig::shapes_graph
 
+use std::cmp::Ordering;
+use std::fmt::{self, Write as _};
+use std::sync::{Arc, Mutex};
+
 use nrese_engine::{EncodedQuad, GraphSelector, ReadModel, Snapshot, TermId, Transaction};
 use nrese_exec::stop::StopSource;
+use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Envelope, Reservation};
 use nrese_rdf::{GraphName, NamedNode, NamedNodeRef, Term};
 use nrese_shacl::{
-    PropertyPath, Selection, ShapeError, Shapes, ValidationReport, compile, compile_until,
-    validate, validate_changes, validate_shapes_change,
+    PropertyPath, Selection, ShapeError, Shapes, ValidationReport, ValidationResult, compile,
+    compile_until, validate, validate_changes, validate_shapes_change,
 };
 use nrese_sparql::{CancellationToken, QueryEvaluationError, ReadView, Resources};
 
 use crate::error::{StoreError, StoreResult};
+use crate::mutation::evidence::{
+    Draft, EvidenceView, READABLE_REASON_FRAMING_BYTES, in_readable_graphs,
+};
 use crate::mutation::{MutationState, MutationTicket};
 use crate::query::GraphResultFormat;
 use crate::rdf_io::{BlankNodes, each_graph_quad, serialize_triples};
@@ -122,6 +130,86 @@ pub struct ShaclResultText {
     pub messages: Vec<String>,
 }
 
+/// The results and validation failures shown to the committer of a refused write.
+#[derive(Debug)]
+pub struct ShaclRefusal {
+    pub results: Vec<ShaclResultText>,
+    /// Refusing results left out by the count or memory limit.
+    pub results_omitted: usize,
+    pub failures: Vec<String>,
+    /// Validation failures left out by the count or memory limit.
+    pub failures_omitted: usize,
+    /// The refusal's detail with its counts alone, as a restricted committer's is framed:
+    /// for an answer that lists no result.
+    pub count_detail: String,
+    memory: Arc<Budget>,
+    encoding_floor: usize,
+    // Drop the text and vectors before giving their space back.
+    text: Mutex<Reservation>,
+    _slots: (Reservation, Reservation),
+}
+
+impl ShaclRefusal {
+    /// The write's budget for preparing and encoding this refusal.
+    pub fn memory(&self) -> &Arc<Budget> {
+        &self.memory
+    }
+
+    /// Holds the encoded buffer alongside the refusal, after mapping the explanation.
+    /// Reuse the part of the text reservation that covered temporaries, keeping the
+    /// live texts covered until drop.
+    pub fn reserve_encoding(&self, bytes: usize) -> Result<Reservation, BudgetExceeded> {
+        let mut text = self.text.lock().expect("refusal text reservation");
+        let reusable = bytes.min(text.bytes().saturating_sub(self.encoding_floor));
+        let mut encoded = Reservation::new(Arc::clone(&self.memory));
+        encoded.charge(bytes - reusable)?;
+        if reusable > 0 {
+            // Keep both portions charged to the same write throughout the transfer.
+            let held = std::mem::replace(&mut *text, Reservation::new(Arc::clone(&self.memory)));
+            let remaining = held.transfer() - reusable;
+            *text = Reservation::adopt(Arc::clone(&self.memory), remaining);
+            encoded.absorb(Reservation::adopt(Arc::clone(&self.memory), reusable));
+        }
+        Ok(encoded)
+    }
+}
+
+impl ShaclResultText {
+    fn of(result: &ValidationResult) -> Self {
+        let text = |term: &Term| match term {
+            Term::NamedNode(node) => node.as_str().to_owned(),
+            other => other.to_string(),
+        };
+        Self {
+            focus_node: text(&result.focus_node),
+            path: result.path.as_ref().map(|path| match path {
+                PropertyPath::Predicate(predicate) => predicate.as_str().to_owned(),
+                other => other.to_string(),
+            }),
+            value: result.value.as_ref().map(text),
+            source_shape: text(&result.source_shape),
+            component: result.component.as_str().to_owned(),
+            severity: result.severity.as_str().to_owned(),
+            messages: result
+                .messages
+                .iter()
+                .map(|message| message.value().to_owned())
+                .collect(),
+        }
+    }
+
+    fn heap_bytes(&self) -> usize {
+        self.focus_node.capacity()
+            + self.path.as_ref().map_or(0, String::capacity)
+            + self.value.as_ref().map_or(0, String::capacity)
+            + self.source_shape.capacity()
+            + self.component.capacity()
+            + self.severity.capacity()
+            + self.messages.capacity() * size_of::<String>()
+            + self.messages.iter().map(String::capacity).sum::<usize>()
+    }
+}
+
 impl ShaclValidation {
     /// The report as an RDF graph in `format`.
     pub fn serialize(&self, format: GraphResultFormat) -> StoreResult<Vec<u8>> {
@@ -130,29 +218,10 @@ impl ShaclValidation {
 
     /// The results in plain text.
     pub fn results_text(&self) -> Vec<ShaclResultText> {
-        let text = |term: &Term| match term {
-            Term::NamedNode(node) => node.as_str().to_owned(),
-            other => other.to_string(),
-        };
         self.report
             .results
             .iter()
-            .map(|result| ShaclResultText {
-                focus_node: text(&result.focus_node),
-                path: result.path.as_ref().map(|path| match path {
-                    PropertyPath::Predicate(predicate) => predicate.as_str().to_owned(),
-                    other => other.to_string(),
-                }),
-                value: result.value.as_ref().map(text),
-                source_shape: text(&result.source_shape),
-                component: result.component.as_str().to_owned(),
-                severity: result.severity.as_str().to_owned(),
-                messages: result
-                    .messages
-                    .iter()
-                    .map(|message| message.value().to_owned())
-                    .collect(),
-            })
+            .map(ShaclResultText::of)
             .collect()
     }
 }
@@ -355,7 +424,7 @@ fn introduced_in<A: ReadView + Sync, B: ReadView + Sync>(
 /// A result as a refusal names it: its focus node and component, and its messages
 /// (`sh:resultMessage`) where it has any, in the order of their text: the report's order is
 /// the dictionary's, which statements in graphs a committer may not read can decide.
-pub(crate) fn described(result: &nrese_shacl::ValidationResult) -> String {
+fn described(result: &ValidationResult) -> String {
     let mut text = format!("focus node {}, {}", result.focus_node, result.component);
     let mut messages: Vec<String> = result.messages.iter().map(ToString::to_string).collect();
     messages.sort_unstable();
@@ -366,18 +435,266 @@ pub(crate) fn described(result: &nrese_shacl::ValidationResult) -> String {
     text
 }
 
+/// By decoded terms, so interning terms in hidden graphs cannot change the order.
+fn result_key(result: &ValidationResult) -> impl Ord + '_ {
+    (
+        &result.focus_node,
+        &result.component,
+        &result.path,
+        &result.value,
+        &result.source_shape,
+        &result.severity,
+        &result.source_constraint,
+        &result.messages,
+    )
+}
+
+fn sort_messages(result: &mut ValidationResult) -> &ValidationResult {
+    // Validation can carry message literals in dictionary order.
+    result.messages.sort_unstable();
+    result
+}
+
+fn compare_results(left: &ValidationResult, right: &ValidationResult) -> Ordering {
+    result_key(left).cmp(&result_key(right))
+}
+
+/// Orders only the prefix the refusal can list, in the report's already charged storage.
+fn order_prefix<T>(items: &mut [T], bound: usize, mut compare: impl FnMut(&T, &T) -> Ordering) {
+    let listed = bound.min(items.len());
+    if listed < items.len() {
+        items.select_nth_unstable_by(listed, &mut compare);
+    }
+    items[..listed].sort_unstable_by(compare);
+}
+
+/// Size the formatted text without allocating it.
+fn display_len(value: &impl fmt::Display) -> usize {
+    #[derive(Default)]
+    struct Count(usize);
+    impl fmt::Write for Count {
+        fn write_str(&mut self, text: &str) -> fmt::Result {
+            self.0 = self.0.saturating_add(text.len());
+            Ok(())
+        }
+    }
+    let mut count = Count::default();
+    write!(count, "{value}").expect("counting does not fail");
+    count.0
+}
+
+/// A growing string can hold both its old and new buffers during reallocation.
+fn growing_text_bytes(len: usize) -> usize {
+    len.max(8).saturating_mul(3)
+}
+
+fn term_text_bytes(term: &Term) -> usize {
+    match term {
+        Term::NamedNode(node) => node.as_str().len(),
+        other => growing_text_bytes(display_len(other)),
+    }
+}
+
+fn path_text_bytes(path: &PropertyPath) -> usize {
+    match path {
+        PropertyPath::Predicate(node) => node.as_str().len(),
+        other => growing_text_bytes(display_len(other)),
+    }
+}
+
+fn result_text_bytes(result: &ValidationResult) -> usize {
+    term_text_bytes(&result.focus_node)
+        .saturating_add(result.path.as_ref().map_or(0, path_text_bytes))
+        .saturating_add(result.value.as_ref().map_or(0, term_text_bytes))
+        .saturating_add(term_text_bytes(&result.source_shape))
+        .saturating_add(result.component.as_str().len())
+        .saturating_add(result.severity.as_str().len())
+        .saturating_add(result.messages.iter().fold(0usize, |bytes, message| {
+            bytes
+                .saturating_add(size_of::<String>())
+                .saturating_add(message.value().len())
+        }))
+}
+
+fn first_result_bytes(result: &ValidationResult, detail: &str) -> usize {
+    let focus = display_len(&result.focus_node);
+    let component = display_len(&result.component);
+    let mut description = "focus node , "
+        .len()
+        .saturating_add(focus)
+        .saturating_add(component);
+    let mut message_text = 0usize;
+    for message in &result.messages {
+        let len = display_len(message);
+        description = description.saturating_add(", message ".len().saturating_add(len));
+        message_text = message_text
+            .saturating_add(size_of::<String>())
+            .saturating_add(growing_text_bytes(len));
+    }
+    let full_detail = detail
+        .len()
+        .saturating_add("; first: ".len())
+        .saturating_add(description);
+    // First, the temporary description and its sorted message strings. Then the
+    // detail, framing for a restricted committer, and the two explanation summaries
+    // that can overlap in nrese-server's reject_view::reject_view, which clones the
+    // summary, focus and constraint before the store's explanation drops.
+    let describe = growing_text_bytes(description)
+        .saturating_add(message_text)
+        .saturating_add(detail.len());
+    let append = growing_text_bytes(description).saturating_add(growing_text_bytes(full_detail));
+    let explain = full_detail
+        .saturating_mul(2)
+        .saturating_add(growing_text_bytes(
+            full_detail.saturating_add(READABLE_REASON_FRAMING_BYTES),
+        ))
+        .saturating_add(growing_text_bytes(focus))
+        .saturating_add(component.saturating_mul(2));
+    describe.max(append).max(explain)
+}
+
+/// The common refusal for either the full validation or the committer's own validation.
+pub(crate) fn refusal(
+    mut report: ValidationReport,
+    rejects: impl Fn(&ValidationResult) -> bool,
+    bound: Option<usize>,
+    memory: &Envelope,
+    restricted: bool,
+    running: impl Fn() -> bool,
+) -> Option<Draft> {
+    let memory = Arc::new(memory.optional_part());
+    let bound = bound.filter(|&bound| bound > 0).unwrap_or(usize::MAX);
+    report.results.retain(|result| running() && rejects(result));
+    let total_results = report.results.len();
+    let total_failures = report.failures.len();
+    if !running() || (total_results == 0 && total_failures == 0) {
+        return None;
+    }
+    let mut detail =
+        format!("the commit introduces {total_results} SHACL result(s) the gate rejects");
+    if total_failures > 0 {
+        detail.push_str(&format!(" and {total_failures} failure(s)"));
+    }
+    let count_detail = if restricted {
+        in_readable_graphs(&detail)
+    } else {
+        detail.clone()
+    };
+    let mut text = Reservation::new(Arc::clone(&memory));
+    let mut results = ChargedVec::new(Arc::clone(&memory));
+    let mut live_text_bytes = 0;
+    let mut explanation = None;
+    for result in report.results.iter_mut().take_while(|_| running()) {
+        sort_messages(result);
+    }
+    order_prefix(&mut report.results, bound, compare_results);
+    for result in report.results.iter().take(bound).take_while(|_| running()) {
+        let first = results.is_empty();
+        let mut bytes = result_text_bytes(result);
+        if first {
+            bytes = bytes.saturating_add(first_result_bytes(result, &detail));
+        }
+        if results.reserve(1).is_err() || text.charge(bytes).is_err() {
+            break;
+        }
+        if first {
+            write!(detail, "; first: {}", described(result)).expect("writing to a string");
+            explanation = Some(nrese_reasoner::RejectExplanation {
+                summary: detail.clone(),
+                violated_constraint: result.component.as_str().to_owned(),
+                focus_resource: result.focus_node.to_string(),
+                evidence: Vec::new(),
+            });
+        }
+        let result = ShaclResultText::of(result);
+        live_text_bytes += result.heap_bytes();
+        results
+            .push_within(result)
+            .expect("the result's slot was reserved");
+    }
+    order_prefix(&mut report.failures, bound, Ord::cmp);
+    let mut failures = ChargedVec::new(Arc::clone(&memory));
+    for failure in report
+        .failures
+        .drain(..)
+        .take(bound)
+        .take_while(|_| running())
+    {
+        let bytes = failure.capacity();
+        if failures.reserve(1).is_err() || text.charge(bytes).is_err() {
+            break;
+        }
+        live_text_bytes += bytes;
+        failures
+            .push_within(failure)
+            .expect("the failure's slot was reserved");
+    }
+    if !running() {
+        return None;
+    }
+    let (results, result_slots) = results.into_parts();
+    let (failures, failure_slots) = failures.into_parts();
+    if restricted {
+        detail = in_readable_graphs(&detail);
+    }
+    // By encoding time the server holds one copy of the explanation strings. The
+    // result and failure vector slots have their own reservations.
+    let encoding_floor = live_text_bytes
+        + detail.capacity()
+        + explanation.as_ref().map_or(0, |explanation| {
+            explanation.summary.len()
+                + explanation.violated_constraint.len()
+                + explanation.focus_resource.len()
+        });
+    Some(Draft {
+        kind: crate::RejectKind::ShapesViolated,
+        detail,
+        explanation,
+        attribution: None,
+        shacl: Some(Arc::new(ShaclRefusal {
+            results_omitted: total_results - results.len(),
+            failures_omitted: total_failures - failures.len(),
+            results,
+            failures,
+            count_detail,
+            memory,
+            encoding_floor,
+            text: Mutex::new(text),
+            _slots: (result_slots, failure_slots),
+        })),
+    })
+}
+
+/// The gate log counts every result, in the same order a refusal would use.
+pub(crate) fn reported(mut report: ValidationReport) -> String {
+    let first = report
+        .results
+        .iter_mut()
+        .map(sort_messages)
+        .min_by(|left, right| compare_results(left, right))
+        .map_or_else(String::new, |result| {
+            format!("; first: {}", described(result))
+        });
+    format!(
+        "the commit introduces {} SHACL result(s) and {} failure(s){first}",
+        report.results.len(),
+        report.failures.len()
+    )
+}
+
 /// The SHACL reason a restricted committer's view shows: the results the commit introduces
 /// in the statements asserted in graphs it may read, against the shapes of the shapes
 /// graph, if it may read that ([`crate::mutation::evidence::Readable`]). `None` if there
 /// are none, that isn't known within `resources`, or the shapes use SHACL-SPARQL, whose
 /// queries the view can't confine (D16-065).
 pub(crate) fn view_reason(
-    view: &crate::mutation::evidence::EvidenceView<'_, '_>,
+    view: &EvidenceView<'_, '_>,
     pending: Option<&Snapshot>,
     shapes_graph: &str,
-    rejects: impl Fn(&nrese_shacl::ValidationResult) -> bool,
+    rejects: impl Fn(&ValidationResult) -> bool,
+    bound: Option<usize>,
     resources: &Resources,
-) -> Option<crate::mutation::evidence::Draft> {
+) -> Option<Draft> {
     let tx = view.tx();
     let shapes_id = tx.lookup(graph_iri(shapes_graph).ok()?.as_ref().into())?;
     if !view.graph(shapes_id) {
@@ -415,43 +732,9 @@ pub(crate) fn view_reason(
         resources,
     )
     .ok()??;
-    // The first by what the view's statements say, never by the results' order, which is
-    // the dictionary's: term ids follow what was interned first, in any graph.
-    // Every field, as decoded terms (`nrese_rdf::Term`'s order: the kind, then the value; a
-    // blank node by its label, the store's name for it in the committer's view), never
-    // their text: equal keys are equal results, so either is shown the same.
-    let mut count = 0;
-    let first = report
-        .results
-        .iter()
-        .take_while(|_| resources.check().is_ok())
-        .filter(|result| rejects(result))
-        .inspect(|_| count += 1)
-        .min_by_key(|result| {
-            (
-                result.focus_node.clone(),
-                result.component.clone(),
-                result.path.clone(),
-                result.value.clone(),
-                result.source_shape.clone(),
-                result.severity.clone(),
-                result.source_constraint.clone(),
-                result.messages.clone(),
-            )
-        })?;
-    resources.check().ok()?;
-    let reason = format!(
-        "the commit introduces {} SHACL result(s) the gate rejects; first: {}",
-        count,
-        described(first)
-    );
-    Some(crate::mutation::evidence::shown(
-        crate::RejectKind::ShapesViolated,
-        reason,
-        first.component.as_str(),
-        first.focus_node.to_string(),
-        Vec::new(),
-    ))
+    refusal(report, rejects, bound, &resources.memory, true, || {
+        resources.check().is_ok()
+    })
 }
 
 /// The SHACL commit gate's state: its policy, and the shapes it checks commits against (the

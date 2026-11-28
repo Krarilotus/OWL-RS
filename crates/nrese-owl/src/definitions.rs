@@ -22,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::mapping::Ontology;
 use crate::model::{Axiom, ClassExpr, ExprId, Term};
+use crate::walk::{self, Holds};
 
 /// The unfolded definitions: `A ↦ D`, and by axiom index `(A, D)` as expressions.
 #[derive(Debug, Default)]
@@ -69,7 +70,7 @@ pub(crate) fn unfolded(ontology: &Ontology) -> Unfolded {
             _ => {}
         }
         for e in expressions(axiom) {
-            in_fillers(ontology, e, false, &mut excluded);
+            in_fillers(ontology, e, &mut excluded);
         }
     }
     candidates.retain(|a, &mut (_, _, d)| {
@@ -116,23 +117,23 @@ pub(crate) fn unfolded(ontology: &Ontology) -> Unfolded {
 
 /// Whether `D ⊑ A` is a Horn clause: `D` holds only of what body atoms say.
 fn horn_reverse(ontology: &Ontology, d: ExprId) -> bool {
-    match ontology.classes.get(d.0) {
-        ClassExpr::Class(_) | ClassExpr::Thing | ClassExpr::HasValue(..) => true,
-        ClassExpr::OneOf(xs) => xs.len() == 1,
-        ClassExpr::And(xs) => xs.iter().all(|&x| horn_reverse(ontology, x)),
-        ClassExpr::Some(_, x) => horn_reverse(ontology, *x),
-        _ => false,
-    }
+    walk::holds(d, (), |e, ()| match ontology.classes.get(e.0) {
+        ClassExpr::Class(_) | ClassExpr::Thing | ClassExpr::HasValue(..) => Holds::Is(true),
+        ClassExpr::OneOf(xs) => Holds::Is(xs.len() == 1),
+        ClassExpr::And(xs) => Holds::All(xs, ()),
+        ClassExpr::Some(_, x) => Holds::All(std::slice::from_ref(x), ()),
+        _ => Holds::Is(false),
+    })
 }
 
 /// Whether `d` is a Boolean combination of names.
 fn propositional(ontology: &Ontology, d: ExprId) -> bool {
-    match ontology.classes.get(d.0) {
-        ClassExpr::Class(_) | ClassExpr::Thing | ClassExpr::Nothing => true,
-        ClassExpr::Not(x) => propositional(ontology, *x),
-        ClassExpr::And(xs) | ClassExpr::Or(xs) => xs.iter().all(|&x| propositional(ontology, x)),
-        _ => false,
-    }
+    walk::holds(d, (), |e, ()| match ontology.classes.get(e.0) {
+        ClassExpr::Class(_) | ClassExpr::Thing | ClassExpr::Nothing => Holds::Is(true),
+        ClassExpr::Not(x) => Holds::All(std::slice::from_ref(x), ()),
+        ClassExpr::And(xs) | ClassExpr::Or(xs) => Holds::All(xs, ()),
+        _ => Holds::Is(false),
+    })
 }
 
 /// The class expressions an axiom holds directly.
@@ -152,42 +153,45 @@ fn expressions(axiom: &Axiom) -> Vec<ExprId> {
     }
 }
 
-/// Every named class in `e`.
+/// Every named class in `e`, from the left, with a stack of its own (the nesting depth is
+/// no call depth).
 fn names(ontology: &Ontology, e: ExprId, f: &mut dyn FnMut(Term)) {
-    match ontology.classes.get(e.0) {
-        ClassExpr::Class(a) => f(*a),
-        ClassExpr::Not(x)
-        | ClassExpr::Some(_, x)
-        | ClassExpr::All(_, x)
-        | ClassExpr::Min(_, _, x)
-        | ClassExpr::Max(_, _, x)
-        | ClassExpr::Exact(_, _, x) => names(ontology, *x, f),
-        ClassExpr::And(xs) | ClassExpr::Or(xs) => {
-            for &x in xs {
-                names(ontology, x, f);
-            }
+    let mut stack = vec![e];
+    while let Some(e) = stack.pop() {
+        match ontology.classes.get(e.0) {
+            ClassExpr::Class(a) => f(*a),
+            ClassExpr::Not(x)
+            | ClassExpr::Some(_, x)
+            | ClassExpr::All(_, x)
+            | ClassExpr::Min(_, _, x)
+            | ClassExpr::Max(_, _, x)
+            | ClassExpr::Exact(_, _, x) => stack.push(*x),
+            ClassExpr::And(xs) | ClassExpr::Or(xs) => stack.extend(xs.iter().rev()),
+            _ => {}
         }
-        _ => {}
     }
 }
 
-/// Adds every named class inside a cardinality's filler in `e` to `out`.
-fn in_fillers(ontology: &Ontology, e: ExprId, inside: bool, out: &mut HashSet<Term>) {
-    match ontology.classes.get(e.0) {
-        ClassExpr::Class(a) if inside => {
-            out.insert(*a);
-        }
-        ClassExpr::Min(_, _, x) | ClassExpr::Max(_, _, x) | ClassExpr::Exact(_, _, x) => {
-            in_fillers(ontology, *x, true, out)
-        }
-        ClassExpr::Not(x) | ClassExpr::Some(_, x) | ClassExpr::All(_, x) => {
-            in_fillers(ontology, *x, inside, out)
-        }
-        ClassExpr::And(xs) | ClassExpr::Or(xs) => {
-            for &x in xs {
-                in_fillers(ontology, x, inside, out);
+/// Adds every named class inside a cardinality's filler in `e` to `out`, with a stack of
+/// its own (the nesting depth is no call depth).
+fn in_fillers(ontology: &Ontology, e: ExprId, out: &mut HashSet<Term>) {
+    // Each expression with whether it is inside a cardinality's filler.
+    let mut stack = vec![(e, false)];
+    while let Some((e, inside)) = stack.pop() {
+        match ontology.classes.get(e.0) {
+            ClassExpr::Class(a) if inside => {
+                out.insert(*a);
             }
+            ClassExpr::Min(_, _, x) | ClassExpr::Max(_, _, x) | ClassExpr::Exact(_, _, x) => {
+                stack.push((*x, true))
+            }
+            ClassExpr::Not(x) | ClassExpr::Some(_, x) | ClassExpr::All(_, x) => {
+                stack.push((*x, inside))
+            }
+            ClassExpr::And(xs) | ClassExpr::Or(xs) => {
+                stack.extend(xs.iter().rev().map(|&x| (x, inside)))
+            }
+            _ => {}
         }
-        _ => {}
     }
 }

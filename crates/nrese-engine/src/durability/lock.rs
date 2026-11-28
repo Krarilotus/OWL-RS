@@ -27,12 +27,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::error::{EngineError, EngineResult};
+use crate::index::CompactionPolicy;
+use crate::term::Dictionary;
+
+use super::{DurabilityConfig, Durable, RestoreReport};
 
 /// The directories of the stores this process has open.
 static OPEN: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 
 /// The lock of an open store, released when dropped.
-pub(crate) struct StoreLock {
+pub struct StoreLock {
     /// Holds the lock; unlocked and closed, when dropped, before [`OPEN`] lets another open of
     /// the store in.
     file: Option<File>,
@@ -43,7 +47,7 @@ pub(crate) struct StoreLock {
 impl StoreLock {
     /// Locks the store in `root` (created), or [`EngineError::Locked`] if another engine, in
     /// this process or another, has it open.
-    pub(crate) fn acquire(root: &Path) -> EngineResult<Self> {
+    pub fn acquire(root: &Path) -> EngineResult<Self> {
         let dir = root.canonicalize()?;
         let locked = || EngineError::Locked(root.to_path_buf());
         let mut open = OPEN
@@ -67,6 +71,26 @@ impl StoreLock {
             file: Some(file),
             dir,
         })
+    }
+
+    /// Replays and cuts a restore target under this lock, then returns the lock still held.
+    pub fn recover_restore(
+        self,
+        config: DurabilityConfig,
+    ) -> EngineResult<(Self, u64, RestoreReport)> {
+        let root = self.dir.clone();
+        let recovered = Durable::open(
+            &root,
+            &Dictionary::default(),
+            &CompactionPolicy::default(),
+            config,
+            Some(self),
+        )?;
+        Ok((
+            recovered.durable._lock,
+            recovered.version.revision,
+            recovered.restore,
+        ))
     }
 }
 

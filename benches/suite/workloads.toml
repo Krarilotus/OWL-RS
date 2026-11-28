@@ -69,7 +69,7 @@ tiers = ["50m", "256m"]
 check = "the benchmark's own validation of query results and of its OWL 2 RL rules"
 state = "partial"
 kit = "benches/reasoning/spb"
-note = "The industry's audited reasoning benchmark (GraphDB publishes audited results). Its advanced query mix also needs fulltext and geosparql; the kit runs the basic mix with the benchmark's own ruleset on both systems. Office-PC's GraphDB licence is Free (1 CPU core, two concurrent queries; checked 12 Oct 2026): the comparison is the matched one-CPU scenario, and the audited Enterprise results can't be reproduced with it"
+note = "The industry's audited reasoning benchmark (GraphDB publishes audited results). Its advanced query mix also needs fulltext and geosparql; the kit runs the basic mix with the benchmark's own ruleset on both systems. The build host's GraphDB licence is Free (1 CPU core, two concurrent queries; checked 12 Oct 2026): the comparison is the matched one-CPU scenario, and the audited Enterprise results can't be reproduced with it"
 
 [integration-rg-gs-gnd]
 title = "RG x GS x GND integration: identity reasoning over real links, 10 competency questions"
@@ -135,7 +135,7 @@ licence = "per ontology"
 tiers = ["dev", "full"]
 state = "partial"
 kit = "benches/reasoning/dl"
-note = "dev: the development subset (80 tasks: 40 DL and 20 EL classifications, 20 DL consistency checks, up to 5 MB; ore.py subset); full: all 1,920 ontologies x 3 tasks (Draco). NRESE classifies the EL track (benches/reasoning/dl/nrese.py el); its DL engines come with phase 3"
+note = "dev: the development subset (80 tasks: 40 DL and 20 EL classifications, 20 DL consistency checks, up to 5 MB; ore.py subset); full: all 1,920 ontologies x 3 tasks (a cluster host). NRESE classifies the EL track (benches/reasoning/dl/nrese.py el); its DL engines come with phase 3"
 check = "canonical taxonomies compared by hash across the reference reasoners; differences settled by hand"
 
 [w3c-owl2-dl]
@@ -192,7 +192,7 @@ tiers = ["sparqloscope-dblp"]
 state = "ready"
 kit = "benches/sparql"
 check = "the answers every engine of the paper published alike (66 of 105), the others against the reference systems"
-note = "QLever's home turf: its paper's Table 2 (QLever 0.18 s geometric mean on DBLP) is the bar; Wikidata truthy waits for Draco"
+note = "QLever's home turf: its paper's Table 2 (QLever 0.18 s geometric mean on DBLP) is the bar; Wikidata truthy waits for a cluster host"
 
 [bsbm]
 title = "Berlin SPARQL Benchmark V3.1: e-commerce explore and business intelligence mixes, 1 to 64 clients"
@@ -262,7 +262,7 @@ tiers = ["wdbench"]
 state = "planned"
 kit = "benches/sparql"
 check = "answers against the reference systems"
-note = "MillenniumDB's home turf; larger than office-pc and phuoc-yu hold for the competitors: khaleesi S: or Draco"
+note = "MillenniumDB's home turf; larger than the build and timed hosts hold for the competitors: the big-memory host or a cluster host"
 
 [write-scaling]
 title = "Single-statement and batch writes at 1 M, 10 M, 100 M; writes under read load"
@@ -484,7 +484,7 @@ tiers = ["l", "le"]
 state = "partial"
 kit = "benches/reasoning/datalog"
 check = "facts per relation (each relation is one triple pattern) across the engines; GLog's published totals"
-note = "The worst case for proof-based deletion; GLog's single-thread result (Claros-L 119 s against RDFox's 2,512 s, reported). The kit runs NRESE (the program as user rules), Soufflé, Nemo, VLog and GLog; RDFox waits for a licence. LE's closure may not fit Office-PC's 31 GiB on every engine"
+note = "The worst case for proof-based deletion; GLog's single-thread result (Claros-L 119 s against RDFox's 2,512 s, reported). The kit runs NRESE (the program as user rules), Soufflé, Nemo, VLog and GLog; RDFox waits for a licence. LE's closure may not fit the build host's 31 GiB on every engine"
 
 [sspe]
 title = "SSPE: single-source path graphs where one deletion invalidates long derivations"

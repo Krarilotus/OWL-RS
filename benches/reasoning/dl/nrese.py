@@ -57,7 +57,7 @@ import reference
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 sys.path.insert(0, str(HERE.parents[1] / "suite"))
-from suitekit import ns  # noqa: E402  (the suite's one container launcher: ns.run_args)
+from suitekit import hosts, ns  # noqa: E402
 
 # A task whose step did not run: its input missing, its program not started, not found or not
 # executable (exit 126, 127), its N-Triples never made. No answer of the reasoner's: `ore.py`
@@ -131,13 +131,14 @@ def ntriples(cases, tasks, timeout=600):
     the start. A file counts only with the runner's `converted` row, and is then recorded (RECORD);
     the reason of every task left without one."""
     manifest, report = cases / "manifest.nt.tsv", cases / "results.nt.tsv"
-    manifest.write_text("".join(f"{t}\tconvert\tntriples\t/work/files/{t.split('-el-')[0]}.owl\n" for t in tasks),
+    hosts.evidence_path(manifest).write_text("".join(f"{t}\tconvert\tntriples\t/work/files/{t.split('-el-')[0]}.owl\n" for t in tasks),
                         encoding="utf-8")
     report.unlink(missing_ok=True)
     try:
-        ns.pin_images([reference.IMAGE], ROOT)
-        run = subprocess.run([ns.executable(), *ns.run_args(ROOT, "reasoning"), "--rm",
-                              "-v", f"{cases.as_posix()}:/work", ns.image_id(reference.IMAGE, ROOT), "batch",
+        image = reference.image()
+        ns.pin_images([image], ROOT)
+        run = hosts.launch(subprocess.run, [ns.executable(), *ns.run_args(ROOT, "reasoning"), "--rm",
+                              "-v", f"{cases.as_posix()}:/work", ns.image_id(image, ROOT), "batch",
                               "/work/manifest.nt.tsv", "/work/results.nt.tsv", "/work/tax", str(timeout)],
                              capture_output=True, text=True)
         failed = f"the conversion exited {run.returncode}: {run.stderr.strip()[-200:]}" if run.returncode else ""
@@ -148,7 +149,7 @@ def ntriples(cases, tasks, timeout=600):
     manifest.unlink()
     report.unlink(missing_ok=True)
     unmade = {}
-    with open(cases / "tax" / RECORD, "a", encoding="utf-8", newline="\n") as record:
+    with open(hosts.evidence_path(cases / "tax" / RECORD), "a", encoding="utf-8", newline="\n") as record:
         for t in tasks:
             row, nt = said.get(t), cases / "tax" / f"{t}.nt"
             if row and row[3:4] == ["converted"] and nt.is_file():
@@ -159,6 +160,7 @@ def ntriples(cases, tasks, timeout=600):
     return unmade
 
 
+@hosts.run_snapshot
 def el(args):
     cases = pathlib.Path(args.cases).resolve()
     path, rows = results(cases)
@@ -178,7 +180,7 @@ def el(args):
     unmade = ntriples(cases, missing) if missing else {}
     binary = pathlib.Path(args.binary)
     missed = 0
-    with open(path, "a", encoding="utf-8", newline="\n") as out:
+    with open(hosts.evidence_path(path), "a", encoding="utf-8", newline="\n") as out:
         for t in todo:
             taxonomy = next((cases / "tax" / f"{t}.{r}.tax" for r in ("hermit", "konclude", "elk", "openllet")
                              if (cases / "tax" / f"{t}.{r}.tax").exists()), None)
@@ -209,7 +211,7 @@ def el(args):
                 continue
             pairs = [tuple(l.rstrip("\n").split("\t")[:2]) for l in open(closure, encoding="utf-8") if "\t" in l]
             text = canonical.canonical(canonical.signature(taxonomy), pairs)
-            (cases / "tax" / f"{t}.nrese-el.tax").write_text(text, encoding="utf-8", newline="\n")
+            hosts.evidence_path(cases / "tax" / f"{t}.nrese-el.tax").write_text(text, encoding="utf-8", newline="\n")
             digest = hashlib.sha256(text.encode()).hexdigest()
             profile = next((l[len("profile "):] for l in reversed(stderr.splitlines())
                             if l.startswith("profile ")), "")
@@ -248,7 +250,7 @@ def launch(command, timeout, inputs=(), grace=60):
     if missing:
         raise NotRun(f"input missing: {', '.join(missing)}")
     try:
-        run = subprocess.run(command, capture_output=True, text=True, timeout=timeout + grace)
+        run = hosts.launch(subprocess.run, command, capture_output=True, text=True, timeout=timeout + grace)
     except subprocess.TimeoutExpired:
         return -9, "", "killed past the timeout"
     except OSError as error:
@@ -278,7 +280,7 @@ def dl(args):
         return nothing_ran("classification or realisation", cases)
     binary = pathlib.Path(args.binary)
     missed = 0
-    with open(path, "a", encoding="utf-8", newline="\n") as out:
+    with open(hosts.evidence_path(path), "a", encoding="utf-8", newline="\n") as out:
         for t, kind in tasks:
             if (t, "nrese-dl") in have and not args.again:
                 continue
@@ -337,7 +339,7 @@ def consistency(args):
     if not tasks:
         return nothing_ran("consistency", cases)
     missed = 0
-    with open(path, "a", encoding="utf-8", newline="\n") as out:
+    with open(hosts.evidence_path(path), "a", encoding="utf-8", newline="\n") as out:
         for t, _ in tasks:
             if (t, "nrese-dl") in have and not args.again:
                 continue

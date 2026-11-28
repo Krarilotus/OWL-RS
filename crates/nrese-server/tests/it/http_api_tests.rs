@@ -779,11 +779,11 @@ async fn query_answers_say_whether_answers_through_existentials_are_complete()
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let response = app.clone().oneshot(query()?).await?;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response.headers()["nrese-completeness"],
-        "complete; regime=owl2-ql",
-        "{:?}",
-        response.headers()
+    let completeness = response.headers()["nrese-completeness"].to_str()?;
+    assert!(
+        completeness.starts_with("sound-only; regime=owl2-ql")
+            && completeness.contains("consistency:"),
+        "{completeness}"
     );
     // Exposed to a console on another origin (CORS hides unexposed response headers).
     assert_eq!(

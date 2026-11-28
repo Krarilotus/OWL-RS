@@ -32,6 +32,7 @@ use rayon::prelude::*;
 
 use super::spill::{Spill, Spiller};
 use super::{CommitSummary, Inner, ReadModel, Snapshot, Stack, Version, VersionData, Watch};
+use crate::durability::wal::PendingInstall;
 use crate::durability::{Durable, checkpoint, later};
 use crate::error::{EngineError, EngineResult};
 use crate::index::keys::PackedKeys;
@@ -200,16 +201,17 @@ impl<'e> BulkLoad<'e> {
     /// Publishes the loaded quads as one new revision (see the module docs for durability).
     /// Returns the revision and the asserted and inferred quads added and removed.
     pub fn finish(self) -> EngineResult<CommitSummary> {
-        self.finish_with(|_| Ok(()))
+        self.finish_with(|_| Ok(None))
     }
 
     /// [`finish`](Self::finish), calling `before_publish` once the load is known to publish,
     /// under its writer slot and before anything of the new version is written (its
     /// checkpoint) or served. A load that changes nothing, or fails before, doesn't call it;
-    /// its error fails the load, nothing published.
+    /// its error fails the load, nothing published. The certificate it returns is the new
+    /// version's, published with it ([`super::Certificate`]; none: the version has none).
     pub fn finish_with(
         self,
-        before_publish: impl FnOnce(super::WriterHeld<'_>) -> EngineResult<()>,
+        before_publish: impl FnOnce(super::WriterHeld<'_>) -> EngineResult<Option<super::Certificate>>,
     ) -> EngineResult<CommitSummary> {
         // A load that spilled sends what is left as its last chunk.
         if self.spiller.lock().is_some() {
@@ -279,8 +281,8 @@ impl<'e> BulkLoad<'e> {
         renumbered?;
         if let Some(spill) = spilled {
             // A load spills only what it holds: it publishes.
-            before_publish(super::WriterHeld::new())?;
-            return publish_spilled(engine, spill, current, started);
+            let certificate = before_publish(super::WriterHeld::new())?;
+            return publish_spilled(engine, spill, current, started, certificate);
         }
         // By radix over the bits the ids use ([`nrese_exec::sort`]).
         nrese_exec::heap::phase("load: sorting");
@@ -310,6 +312,7 @@ impl<'e> BulkLoad<'e> {
                         previous: current.committed_micros,
                     },
                     dictionary_len: shared.dictionary.len(),
+                    certificate: None,
                 };
                 (next, summary)
             }
@@ -408,13 +411,21 @@ impl<'e> BulkLoad<'e> {
             }
         };
         if summary.inserted + summary.deleted + summary.inferred_deleted == 0 {
+            shared.acknowledge_unchanged()?;
             return Ok(CommitSummary {
                 revision: current.revision,
                 ..summary
             });
         }
 
-        before_publish(super::WriterHeld::new())?;
+        // The version's certificate, from the caller under the writer slot: built in, never
+        // installed after.
+        let mut next = next;
+        let installed = before_publish(super::WriterHeld::new())?;
+        match &mut next {
+            Next::Built(version, _) => version.certificate = installed,
+            Next::Streamed { certificate, .. } => *certificate = installed,
+        }
         let built = started.elapsed();
         publish(engine, next)?;
         // The writer slot is held: the latest version is the one just published.
@@ -453,6 +464,7 @@ fn publish_spilled(
     spill: Spill,
     current: &Version,
     started: Instant,
+    certificate: Option<super::Certificate>,
 ) -> EngineResult<CommitSummary> {
     let revision = current.revision + 1;
     let dictionary_len = engine.shared.dictionary.len();
@@ -466,6 +478,7 @@ fn publish_spilled(
             previous: current.committed_micros,
         },
         dictionary_len,
+        certificate,
     )?;
     let summary = CommitSummary {
         revision,
@@ -517,6 +530,8 @@ enum Next {
         revision: u64,
         stamp: Stamp,
         dictionary_len: u64,
+        /// What its caller publishes with it ([`BulkLoad::finish_with`]).
+        certificate: Option<super::Certificate>,
     },
 }
 
@@ -560,10 +575,19 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
             revision,
             stamp,
             dictionary_len,
+            certificate,
         } => {
             let source = Source::Memory(builder);
-            return publish_streamed(engine, source, layout, revision, stamp, dictionary_len)
-                .map(|_| ());
+            return publish_streamed(
+                engine,
+                source,
+                layout,
+                revision,
+                stamp,
+                dictionary_len,
+                certificate,
+            )
+            .map(|_| ());
         }
     };
     let Some(durable) = &shared.durable else {
@@ -572,8 +596,10 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
         next.committed_micros = stamp.take(shared).0;
         let next = Version::new(watch, next);
         drop(current);
-        let _compaction = shared.versions.compaction_slot.lock();
+        let compaction = shared.versions.compaction_slot.lock();
         shared.versions.install(next);
+        drop(compaction);
+        shared.versions.notify();
         return Ok(());
     };
     // The checkpoint image's version: an unpublished snapshot's, never installed. The one
@@ -595,7 +621,7 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
         }
     });
     let mut committed_micros = None;
-    let path = commit_image(durable, revision, || {
+    let (path, pending) = commit_image(durable, revision, || {
         checkpoint::write_stamped(
             durable.root(),
             &image,
@@ -651,9 +677,11 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
     let compaction = shared.versions.compaction_slot.lock();
     let mut wal = durable.wal.lock();
     shared.versions.install(next);
+    pending.disarm();
     release_covered(&mut wal, durable.root(), revision);
     drop(wal);
     drop(compaction);
+    shared.versions.notify();
     if let Some(base) = base
         && let Err(error) = shared.dictionary.rebase(base)
     {
@@ -672,6 +700,7 @@ fn publish_streamed(
     revision: u64,
     stamp: Stamp,
     dictionary_len: u64,
+    certificate: Option<super::Certificate>,
 ) -> EngineResult<u64> {
     let shared = &engine.shared;
     let Some(durable) = &shared.durable else {
@@ -693,7 +722,7 @@ fn publish_streamed(
             equality: Default::default(),
             // An empty inferred stack, kept by no program: read as stored.
             reading: None,
-            certificate: None,
+            certificate,
             canonical: Default::default(),
             own: Default::default(),
         };
@@ -747,7 +776,7 @@ fn publish_streamed(
         )
     });
     drop(source);
-    let path = path?;
+    let (path, pending) = path?;
     shared
         .checkpoints
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -756,7 +785,7 @@ fn publish_streamed(
         Err(error) => {
             // Committed (the checkpoint is in place), but nothing else holds the data to
             // serve it: no write may follow before a reopen recovers it.
-            durable.wal.lock().poison();
+            drop(pending);
             tracing::error!(%error, revision, "a committed bulk load's checkpoint couldn't be mapped; reopen the engine to serve it");
             return Err(EngineError::CommitUnsettled { revision });
         }
@@ -773,7 +802,7 @@ fn publish_streamed(
         equality: Default::default(),
         // An empty inferred stack, kept by no program: read as stored.
         reading: None,
-        certificate: None,
+        certificate,
         canonical: Default::default(),
         own: Default::default(),
     };
@@ -784,9 +813,11 @@ fn publish_streamed(
     let compaction = shared.versions.compaction_slot.lock();
     let mut wal = durable.wal.lock();
     shared.versions.install(next);
+    pending.disarm();
     release_covered(&mut wal, durable.root(), revision);
     drop(wal);
     drop(compaction);
+    shared.versions.notify();
     if let Err(error) = shared.dictionary.rebase(base) {
         tracing::warn!(%error, "checkpoint dictionary not mapped; it stays in memory");
     }
@@ -794,19 +825,20 @@ fn publish_streamed(
 }
 
 /// Writes, with `write`, the checkpoint of `revision`, a new revision of a bulk load or
-/// rematerialisation, and returns its path: the commit point (EEV-01, B-301). The caller
-/// holds the writer, compaction and checkpoint slots.
+/// rematerialisation, and returns its path: the commit point (EEV-01, B-301), and the fence
+/// the caller disarms once it has installed the revision's version. The caller holds the
+/// writer, compaction and checkpoint slots.
 ///
 /// Before it the log moves to a new segment, the one step that can leave it unfit for the
 /// commits after; past it nothing may report the revision uncommitted, since a restart
-/// recovers it. A write that failed with the checkpoint possibly in place (its rename's
-/// outcome unknown, its directory unsynced) poisons the log: no commit of any kind can then
+/// recovers it. Any exit from the write on until the install, but a write that failed with
+/// the checkpoint proven absent, poisons the log (the fence): no commit of any kind can then
 /// take the revision again before a reopen settles which one is on disk.
 fn commit_image(
     durable: &Durable,
     revision: u64,
     write: impl FnOnce() -> EngineResult<PathBuf>,
-) -> EngineResult<PathBuf> {
+) -> EngineResult<(PathBuf, PendingInstall<'_>)> {
     {
         let mut wal = durable.wal.lock();
         // The names a reopen left pending, before anything is written (deferred-sync design
@@ -814,14 +846,18 @@ fn commit_image(
         wal.settle_names()?;
         wal.rotate(revision)?;
     }
+    let pending = PendingInstall::arm(&durable.wal);
     let error = match write() {
-        Ok(path) => return Ok(path),
+        Ok(path) => return Ok((path, pending)),
         Err(error) => error,
     };
     match checkpoint::placed(durable.root(), revision) {
-        Ok(false) => Err(error),
+        Ok(false) => {
+            pending.disarm();
+            Err(error)
+        }
         placed => {
-            durable.wal.lock().poison();
+            drop(pending);
             tracing::error!(%error, revision, ?placed, "a bulk publication's outcome is unknown until the engine is reopened");
             Err(EngineError::CommitUnsettled { revision })
         }
@@ -951,6 +987,7 @@ impl<'e> Rematerialisation<'e> {
             asserted: base.asserted_identity(),
         };
         if inserted + deleted == 0 {
+            shared.acknowledge_unchanged()?;
             shared.install(reading, certificate);
             let summary = CommitSummary {
                 revision: base.revision(),

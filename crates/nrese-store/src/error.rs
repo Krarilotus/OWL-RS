@@ -51,7 +51,7 @@ pub enum StoreError {
     #[error("RDF parse error: {0}")]
     RdfParse(#[from] RdfParseError),
     /// The shapes graph is ill-formed; one message per problem.
-    #[error("ill-formed SHACL shapes: {}", .0.join("; "))]
+    #[error("{}", shacl_shapes_message(.0))]
     ShaclShapes(Vec<String>),
     #[error("RDF parse error in {}: {source}; nothing was loaded", path.display())]
     FileParse {
@@ -338,6 +338,10 @@ fn limit_told(limit: &Option<usize>) -> String {
     limit.map_or_else(String::new, |limit| {
         format!(": limit {}", nrese_exec::limit_text(limit))
     })
+}
+
+pub(crate) fn shacl_shapes_message(problems: &[String]) -> impl std::fmt::Display + '_ {
+    std::fmt::from_fn(move |f| write!(f, "ill-formed SHACL shapes: {}", problems.join("; ")))
 }
 
 /// What a refusal before rematerialisation says, on a primary and on a read replica.

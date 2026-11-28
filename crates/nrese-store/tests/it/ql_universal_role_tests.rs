@@ -18,10 +18,10 @@ const SUBPROPERTY: &str = ":q a owl:ObjectProperty ; rdfs:subPropertyOf owl:topO
 enum Expected {
     True,
     False,
-    FalseComplete,
+    FalseWithConsistencyReason,
     TrueOrIncomplete,
     Incomplete,
-    /// A `SELECT` with no row, or one not told `complete`.
+    /// A `SELECT` with no row, or one with the rewriter's reason.
     NoRowOrIncomplete,
 }
 
@@ -30,7 +30,9 @@ enum Expected {
 // and superproperties keep that relation. A subproperty may be empty.
 #[test]
 fn reads_of_universal_roles() {
-    use Expected::{False, FalseComplete, Incomplete, NoRowOrIncomplete, True, TrueOrIncomplete};
+    use Expected::{
+        False, FalseWithConsistencyReason, Incomplete, NoRowOrIncomplete, True, TrueOrIncomplete,
+    };
 
     let cases = [
         ("equivalent", EQUIVALENT, "ASK { :a :q ?y }", True),
@@ -84,31 +86,31 @@ fn reads_of_universal_roles() {
             "control: object subproperty",
             SUBPROPERTY,
             "ASK { :a :q ?y }",
-            FalseComplete,
+            FalseWithConsistencyReason,
         ),
         (
             "control: named pair",
             SUBPROPERTY,
             "ASK { :a :q :b }",
-            FalseComplete,
+            FalseWithConsistencyReason,
         ),
         (
             "control: class join",
             SUBPROPERTY,
             "ASK { :a :q ?y . ?y a :C }",
-            FalseComplete,
+            FalseWithConsistencyReason,
         ),
         (
             "control: no class witness",
             EQUIVALENT,
             "ASK { :a :q ?y . ?y a :Absent }",
-            FalseComplete,
+            FalseWithConsistencyReason,
         ),
         (
             "control: data subproperty",
             ":d a owl:DatatypeProperty ; rdfs:subPropertyOf owl:topDataProperty .",
             "ASK { :a :d ?v }",
-            FalseComplete,
+            FalseWithConsistencyReason,
         ),
     ];
 
@@ -144,23 +146,36 @@ fn reads_of_universal_roles() {
                 .unwrap();
             let value: Value = serde_json::from_slice(&result.payload).unwrap();
             let answer = value["boolean"].as_bool();
-            let complete = result.completeness.map(|status| status.complete);
+            let rewriter_reason = result.completeness.as_ref().is_some_and(|status| {
+                status.reasons.iter().any(|reason| {
+                    reason.source == "ql"
+                        && !reason.text.contains("over answers that may be missing")
+                })
+            });
             let correct = match expected {
                 True => answer == Some(true),
                 False => answer == Some(false),
-                FalseComplete => answer == Some(false) && complete == Some(true),
-                TrueOrIncomplete => answer == Some(true) || complete == Some(false),
-                Incomplete => complete == Some(false),
+                FalseWithConsistencyReason => {
+                    answer == Some(false)
+                        && result.completeness.as_ref().is_some_and(|status| {
+                            status.as_str() == "sound-only"
+                                && status.reasons.len() == 1
+                                && status.reasons[0].source == "consistency"
+                        })
+                }
+                TrueOrIncomplete => answer == Some(true) || rewriter_reason,
+                Incomplete => rewriter_reason,
                 NoRowOrIncomplete => {
                     value["results"]["bindings"]
                         .as_array()
                         .is_some_and(|rows| rows.is_empty())
-                        || complete == Some(false)
+                        || rewriter_reason
                 }
             };
             if !correct {
                 failures.push(format!(
-                    "{name}, {route}: expected {expected:?}, got {value}, complete={complete:?}"
+                    "{name}, {route}: expected {expected:?}, got {value}, {:?}",
+                    result.completeness
                 ));
             }
         }

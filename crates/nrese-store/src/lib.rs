@@ -7,8 +7,8 @@
 /// fails a test (as `nrese-engine`'s unit tests do).
 #[cfg(test)]
 #[global_allocator]
-static MEASURED: nrese_exec::measure::Measured<std::alloc::System> =
-    nrese_exec::measure::Measured(std::alloc::System);
+static MEASURED: dl::entailment::scratch_lifetime_tests::WatchFrees =
+    dl::entailment::scratch_lifetime_tests::WatchFrees;
 
 pub mod access;
 pub mod autocomplete;
@@ -96,7 +96,7 @@ pub use image_backup::{
 pub use mutation::{
     DeltaPlanner, MutationCommand, MutationCommitReport, MutationError, MutationKind,
     MutationPipeline, MutationReject, MutationTicket, ReasoningRunRecord, RejectAttribution,
-    RejectAttributionCandidate, RejectKind, UpdateContext,
+    RejectAttributionCandidate, RejectKind, UndecidedCause, UndecidedPolicy, UpdateContext,
 };
 pub use namespaces::{NamespaceMap, Namespaces};
 /// The CPU the binary was built for against the one it runs on, for the server's start.
@@ -110,6 +110,7 @@ pub use nrese_engine::{
     Applied, CorpusTuning, EngineError, IndexEncoding, LogExpectation, ReadModel,
     VocabularyEncoding, WalDamage,
 };
+pub use nrese_engine::{RestoreReport, RestoreStop};
 pub use nrese_shacl::{ValidationReport, ValidationResult};
 pub use nrese_sparql::{
     CancellationToken, Explanation, PlanStep, PlannedQuery, PlannedStep, QueryEvaluationError,
@@ -134,8 +135,8 @@ pub use scope::{EntryPoint, ReadContext, ReadScope, Requester, WriteScope};
 pub use service::{QueryRun, StoreService};
 pub use sessions::{SESSION_IDLE, Sessions};
 pub use shacl::{
-    ShaclGateState, ShaclResultText, ShaclValidation, ShaclValidationRequest, ShapesSource,
-    ValidatedGraphs,
+    ShaclGateState, ShaclRefusal, ShaclResultText, ShaclValidation, ShaclValidationRequest,
+    ShapesSource, ValidatedGraphs,
 };
 pub use statements::{RdfPayload, StatementOp, StatementOps, StatementPattern, StatementsRequest};
 pub use stats::StoreStats;

@@ -184,8 +184,17 @@ fn statements<B: std::ops::Deref<Target = nrese_exec::Budget>>(
 
 /// `statements` read, each name of two kinds and each unused structure given its kind's
 /// treatment (`dl.treatments`).
-fn read(statements: &[Statement], terms: &dyn Terms, treatments: &Treatments) -> Ontology {
-    let mut ontology = nrese_owl::read(statements, terms);
+fn read(
+    statements: &[Statement],
+    terms: &dyn Terms,
+    treatments: &Treatments,
+    membership: bool,
+) -> Ontology {
+    let mut ontology = if membership {
+        nrese_owl::read(statements, terms)
+    } else {
+        nrese_owl::read_beside(statements, &[], terms)
+    };
     ontology.treat(treatments);
     ontology
 }
@@ -204,7 +213,7 @@ pub(crate) fn read_pending<B: std::ops::Deref<Target = nrese_exec::Budget>>(
         decode: &decode,
         lookup: &lookup,
     };
-    Ok(read(&statements, &terms, treatments))
+    Ok(read(&statements, &terms, treatments, true))
 }
 
 /// The ontology of a transaction's statements asserted in the graphs `readable` admits,
@@ -226,7 +235,7 @@ pub(crate) fn read_pending_where<B: std::ops::Deref<Target = nrese_exec::Budget>
         decode: &decode,
         lookup: &lookup,
     };
-    Ok(read(&statements, &terms, treatments))
+    Ok(read(&statements, &terms, treatments, true))
 }
 
 /// The ontology of a snapshot's asserted statements, its scratch charged to `budget`
@@ -236,7 +245,7 @@ pub(crate) fn read_snapshot<B: std::ops::Deref<Target = nrese_exec::Budget>>(
     budget: B,
     treatments: &Treatments,
 ) -> Result<Ontology, nrese_exec::BudgetExceeded> {
-    Ok(read_premise(snapshot, budget, treatments)?.0)
+    Ok(read_premise(snapshot, budget, treatments, true)?.0)
 }
 
 /// [`read_snapshot`], with the statements it read, which a conclusion is read beside
@@ -245,6 +254,7 @@ pub(crate) fn read_premise<B: std::ops::Deref<Target = nrese_exec::Budget>>(
     snapshot: &Snapshot,
     budget: B,
     treatments: &Treatments,
+    membership: bool,
 ) -> Result<(Ontology, nrese_exec::ChargedVec<Statement, B>), nrese_exec::BudgetExceeded> {
     let statements = statements(
         snapshot.quads_for_pattern_in(ReadModel::Asserted, &ANY),
@@ -256,7 +266,10 @@ pub(crate) fn read_premise<B: std::ops::Deref<Target = nrese_exec::Budget>>(
         decode: &decode,
         lookup: &lookup,
     };
-    Ok((read(&statements, &terms, treatments), statements))
+    Ok((
+        read(&statements, &terms, treatments, membership),
+        statements,
+    ))
 }
 
 /// Why an ontology wasn't read: its statements didn't fit `budget`'s memory.

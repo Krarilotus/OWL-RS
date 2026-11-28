@@ -565,8 +565,7 @@ fn a_load_that_stops_keeps_the_answers_and_the_certificate() {
         ask(&store),
         "the certificate's rewriting answers the existential"
     );
-    // The certificate as the marker records it: an open sets the literal-equality flag, which
-    // the marker doesn't hold.
+    // The recorded identity of the closure is preserved across a reopen.
     let recorded = |store: &StoreService| {
         let state = store.reasoning_state();
         state.map(|s| {
@@ -579,18 +578,19 @@ fn a_load_that_stops_keeps_the_answers_and_the_certificate() {
             )
         })
     };
-    let certified = (recorded(&store), store.consistency());
+    let certified = recorded(&store);
+    let consistency = store.consistency();
     let (revision, written) = (store.current_revision(), marker());
     assert!(
-        certified.0.is_some() && written.is_some(),
+        certified.is_some() && written.is_some(),
         "the store is certified"
     );
     let mut wrong = Vec::new();
-    let unchanged = |store: &StoreService, after: &str, wrong: &mut Vec<String>| {
+    let unchanged = |store: &StoreService, after: &str, expected, wrong: &mut Vec<String>| {
         let seen = [
             (ask(store), "the answer"),
             (
-                (recorded(store), store.consistency()) == certified,
+                recorded(store) == certified && store.consistency() == expected,
                 "the certificate",
             ),
             (store.current_revision() == revision, "the revision"),
@@ -634,7 +634,7 @@ fn a_load_that_stops_keeps_the_answers_and_the_certificate() {
         if result.is_ok() {
             wrong.push(format!("{stop}: the load didn't stop"));
         }
-        unchanged(&store, stop, &mut wrong);
+        unchanged(&store, stop, consistency, &mut wrong);
     }
     // A statement the store holds: no blank node, so nothing new.
     let known = file("known.ttl", &format!("{prefixes}:a a :A .\n"));
@@ -644,10 +644,15 @@ fn a_load_that_stops_keeps_the_answers_and_the_certificate() {
             "a load of what is there added something: {again:?}"
         ));
     }
-    unchanged(&store, "a load that adds nothing", &mut wrong);
+    unchanged(&store, "a load that adds nothing", consistency, &mut wrong);
     drop(store);
     let store = StoreService::new(config()).unwrap();
-    unchanged(&store, "after a reopen", &mut wrong);
+    unchanged(
+        &store,
+        "after a reopen",
+        nrese_store::ConsistencyStatus::Unknown,
+        &mut wrong,
+    );
     store
         .bulk_load(&request(&[&whole], false, quarantine))
         .unwrap();

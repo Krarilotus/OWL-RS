@@ -56,6 +56,7 @@ if sys.version_info < (3, 11):
 sys.path.append(str(Path(__file__).resolve().parents[2] / "benches" / "suite"))
 from verifykit import checks, client, jobs, scenario as scenarios, selftest  # noqa: E402
 from verifykit.server import LaunchError, Server, sha256_of  # noqa: E402
+from suitekit import hosts  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 DOCTOR = ("/healthz", "/readyz", "/version", "/api/v1/repositories")
@@ -248,7 +249,7 @@ def run_one(sc: scenarios.Scenario, out: Path, target: dict, settings: dict[str,
     """The five phases of one scenario; its result is appended to `results` first, so an
     interruption (re-raised after the cleanup) leaves it there, failed."""
     out.mkdir(parents=True, exist_ok=True)
-    (out / ("scenario.toml" if sc.path else "scenario.json")).write_text(sc.text, encoding="utf-8")
+    hosts.evidence_path(out / ("scenario.toml" if sc.path else "scenario.json")).write_text(sc.text, encoding="utf-8")
     result = {"scenario": sc.name, "dir": out.name, "file": str(sc.path) if sc.path else None,
               "description": sc.description, "ok": False, "error": None, "doctor": None, "launch": None,
               "cleanup": None, "steps": []}
@@ -292,7 +293,7 @@ def run_one(sc: scenarios.Scenario, out: Path, target: dict, settings: dict[str,
 
 def _write(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=1, ensure_ascii=False, default=str) + "\n", encoding="utf-8")
+    hosts.evidence_path(path).write_text(json.dumps(data, indent=1, ensure_ascii=False, default=str) + "\n", encoding="utf-8")
 
 
 def cgroup_peak_mib() -> float | None:
@@ -354,7 +355,7 @@ def summarise(evidence: Path, results: list[dict], target: dict, title: str, ext
                       + (f" ({cleanup['directory']})" if not cleanup["removed"] else "")
                       + (f"; **{cleanup['error']}**" if cleanup["error"] else "")]
     path = evidence / "summary.md"
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    hosts.evidence_path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path
 
 
@@ -417,17 +418,19 @@ def _target_of(args) -> dict:
 
 
 def evidence_dir(args, kind: str) -> Path:
+    private = hosts.private_session()
     if args.evidence:
-        path = Path(args.evidence)
+        path = hosts.evidence_path(Path(args.evidence), private, ROOT)
         if path.exists() and any(path.iterdir()):
             raise SystemExit(f"{path}: exists and isn't empty: name another evidence directory")
         return path
     if os.environ.get("FLEET_OUT"):
-        path = Path(os.environ["FLEET_OUT"]) / kind
+        path = hosts.private_output(Path(os.environ["FLEET_OUT"]) / kind, ROOT)
         if path.exists():
             shutil.rmtree(path)  # this job's own, from a step run before (requeued)
         return path
-    return ROOT / "tmp" / "verify" / f"{time.strftime('%Y%m%d-%H%M%S')}-{kind}"
+    home = hosts.private_home() if private else ROOT / "tmp"
+    return hosts.evidence_path(home / "verify" / f"{time.strftime('%Y%m%d-%H%M%S')}-{kind}", private, ROOT)
 
 
 def overrides(pairs: list[str]) -> dict[str, str]:
@@ -515,7 +518,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--rev", required=True, help="the server's commit")
     p.add_argument("--harness", help="the runner's and scenarios' commit (default: --rev)")
     p.add_argument("--repo", type=Path, default=ROOT, help="the repository fleet takes them from")
-    p.add_argument("--out", type=Path, default=ROOT / "tmp" / "verify" / "jobs")
+    p.add_argument("--out", type=Path, help="private output directory (default: overlay/jobs/verify)")
     p.add_argument("--priority", type=int, default=600, help="600-700 exploratory; 790 a v1.5 fix verification")
     p.add_argument("--reason", required=True, help="why the run is worth its place in the queue")
     p.add_argument("--verifies", help="the commit or issue a fix verification verifies")
@@ -533,10 +536,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "jobs":
         out = jobs.jobs(args.repo, args.rev, args.harness or args.rev, [Path(s).as_posix() for s in args.scenarios],
                         args.set, args.priority, args.reason, args.verifies, not args.no_selftest, args.ram_gb)
-        args.out.mkdir(parents=True, exist_ok=True)
-        for job_id, job in out.items():
-            path = args.out / f"{job_id}.toml"
-            path.write_text(jobs.toml_job(job), encoding="utf-8")
+        directory = args.out or hosts.jobs_dir() / "verify"
+        paths = [hosts.private_output(directory / f"{job_id}.toml", args.repo) for job_id in out]
+        for path, job in zip(paths, out.values()):
+            path = hosts.write_job(path, jobs.toml_job(job), args.repo, [job])
             print(path)
         return 0
     if args.command == "doctor":

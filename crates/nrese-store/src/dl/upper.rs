@@ -29,6 +29,7 @@
 //! facts as stored, and a class that may split is never maintained.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nrese_dl::bounds;
@@ -676,6 +677,12 @@ fn check_stop(stop: Stop<'_>) -> Result<(), GaveUp> {
     }
 }
 
+/// The immutable part of U1 a read can keep while a commit updates the stack.
+pub(super) struct ProgramFacts {
+    pub(super) triples: HashSet<Triple>,
+    pub(super) classes: nrese_reasoner::representatives::EqualityClasses,
+}
+
 /// U1: the compiled program, its rules as the reasoner's, and its stack.
 pub struct Upper {
     pub program: bounds::Program,
@@ -684,8 +691,7 @@ pub struct Upper {
     /// The `owl:sameAs` id `rules` hold the equality rules over, if they do, asked once with
     /// them ([`nrese_reasoner::delta::Rules::equality`]).
     equality: Option<u64>,
-    /// The program's facts.
-    facts: HashSet<Triple>,
+    facts: Arc<ProgramFacts>,
     pub stack: Stack,
     /// The classes U1 was compiled for: memberships in others change it.
     signature: HashSet<u64>,
@@ -702,8 +708,6 @@ pub struct Upper {
     /// as its change is computed and kept with the change ([`Self::apply`]): U1 is read,
     /// never changed, while the change is computed.
     values: Values,
-    /// The `owl:sameAs` classes, by representative: the stack is over them.
-    classes: nrese_reasoner::representatives::EqualityClasses,
     rdf_type: u64,
     same_as: u64,
     /// How long the last evaluation or maintenance took.
@@ -714,7 +718,7 @@ impl std::fmt::Debug for Upper {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Upper")
             .field("rules", &self.rules.len())
-            .field("facts", &self.facts.len())
+            .field("facts", &self.facts.triples.len())
             .field("stack", &self.stack.len())
             .finish_non_exhaustive()
     }
@@ -901,14 +905,16 @@ impl Upper {
             equality: nrese_reasoner::representatives::same_as(&rules, schema.same_as()),
             rules,
             schema,
-            facts,
+            facts: Arc::new(ProgramFacts {
+                triples: facts,
+                classes: m.classes,
+            }),
             stack,
             signature,
             object_properties,
             data_properties,
             ground: None,
             values,
-            classes: m.classes,
             elapsed: started.elapsed(),
         })
     }
@@ -960,7 +966,7 @@ impl Upper {
         let mut inserted: Vec<Triple> = inserted
             .iter()
             .map(|&t| values.map(t))
-            .filter(|t| !self.facts.contains(t))
+            .filter(|t| !self.facts.triples.contains(t))
             .collect();
         inserted.sort_unstable();
         inserted.dedup();
@@ -975,13 +981,13 @@ impl Upper {
         let mut deleted: Vec<Triple> = deleted
             .iter()
             .map(|&t| values.map(t))
-            .filter(|t| !self.facts.contains(t))
+            .filter(|t| !self.facts.triples.contains(t))
             .collect();
         deleted.sort_unstable();
         deleted.dedup();
         let base = UpperBase {
             view: view.counted(),
-            facts: &self.facts,
+            facts: &self.facts.triples,
             stack: &self.stack,
             values: &values,
         };
@@ -1100,11 +1106,16 @@ impl Upper {
         !self.values.unread && !change.noted.unread
     }
 
+    /// The program's facts before projection and their equality classes.
+    pub(super) fn facts(&self) -> &Arc<ProgramFacts> {
+        &self.facts
+    }
+
     /// U1's `owl:sameAs` classes: its stack is over their representatives, each other
     /// identity stored as `identity sameAs representative`; empty where nothing is
     /// equated. A U1 with classes is evaluated afresh on each commit.
     pub fn classes(&self) -> &nrese_reasoner::representatives::EqualityClasses {
-        &self.classes
+        &self.facts.classes
     }
 
     /// `owl:sameAs`, as U1's program names it.

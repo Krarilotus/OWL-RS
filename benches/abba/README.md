@@ -38,9 +38,10 @@ fleet results set:abba-<name>-<b8>     # its member's results hold abba-verdict.
 - The family's cases are the declared harness's registry, in the plan, the job's check and the
   report alike: a case the harness doesn't have is refused before anything is timed.
 - The family travels in the job (`ABBA_FAMILY`); `family.toml` beside the set file (default
-  `benches/suite/results/abba/NAME-B8/`, git-ignored) is the same family, for a combined report:
+  `jobs/NAME-B8/` in the private overlay) is the same family, for a combined report:
   `abba.py report PATH/family.toml R1 R2`.
-- A confirmation round: the same command with `--round 2`.
+- A confirmation round: the same command with `--round 2`. Reports use the floor and overlay
+  recorded in the passes and require matching overlays across rounds.
 - A reviewed recurring family stays possible: `benches/abba/NAME.toml` (format in `abba.py`'s
   docstring; cases of its own allowed there, in the registry's schema), then `abba.py jobs
   benches/abba/NAME.toml --out DIR` and `fleet submit DIR/<set>.set.toml`. A family of registry cases
@@ -110,7 +111,8 @@ The harness answers it in two ways:
 - **The A-A' arm** (A' is A's build again, a copy of its own, interleaved in every block) measures
   the round's own floor. A round whose A-A' arm itself differs has no verdict (3). B against A is
   judged with a spread of at least that arm's, or the host's recorded floor
-  (`benches/fast/noise-floor/HOST.toml`) where larger.
+  (`noise-floor/HOST.toml`, in the private overlay; a fleet job carries it in its environment)
+  where larger.
 
 Before you chase a small loss in a path the change doesn't touch:
 - read its history across rounds;

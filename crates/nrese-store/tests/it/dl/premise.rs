@@ -196,7 +196,12 @@ fn an_unused_negative_assertion_clash_is_refused_as_undecided() {
     );
     match refused {
         Err(MutationError::Rejected(reject)) => {
-            assert_eq!(reject.kind, RejectKind::Undecided, "{}", reject.detail);
+            assert_eq!(
+                reject.kind,
+                RejectKind::Undecided(nrese_store::UndecidedCause::ReadsDifferently),
+                "{}",
+                reject.detail
+            );
         }
         other => panic!("expected a refusal, got {other:?}"),
     }
@@ -252,6 +257,50 @@ fn a_kept_upper_bound_takes_the_premise_from_the_gates_read() {
         status.left_out
     );
     true_never_sound(&dl, ":a a :C");
+}
+
+/// A gate read of the committed ontology reports a tree with two named attachments
+/// even when the upper bound is kept. One attachment satisfies the forest restriction.
+#[test]
+fn a_kept_upper_bound_reports_anonymous_findings_from_the_gates_read() {
+    for (attachments, expected) in [(":y", false), (":y, :z", true)] {
+        let config = DlConfig {
+            timeout: Some(Duration::from_nanos(1)),
+            ..DlConfig::default()
+        };
+        let (dl, _, _) = committed_with(
+            config,
+            &format!(
+                ":C a owl:Class . :p rdfs:domain :C . :b :p :c .
+                 :Pet rdfs:subClassOf [ owl:unionOf ( :Dog :Cat ) ] .
+                 :q a owl:ObjectProperty . :y a owl:NamedIndividual .
+                 :z a owl:NamedIndividual . _:b :q {attachments} ."
+            ),
+        );
+        let before = dl.store().current_revision();
+        let revision = insert(&dl, ":a :p \"x\" .").expect("admitted");
+        assert!(revision > before);
+        assert_eq!(dl.store().dl_bounds().last, "kept");
+        let status = dl.store().dl().status().expect("a DL status");
+        assert_eq!(status.revision, revision);
+        let recorded = status.left_out.flatten().expect("the gate's report");
+        assert!(recorded.contains("two kinds"), "{recorded}");
+        let reasons = true_never_sound(&dl, ":a a :C");
+        let anonymous: Vec<_> = reasons
+            .iter()
+            .filter(|reason| reason.contains("anonymous"))
+            .collect();
+        if expected {
+            assert!(
+                anonymous
+                    .iter()
+                    .any(|reason| reason.contains("anonymous tree has no root")),
+                "{attachments}: missing anonymous tree report in {reasons:?}"
+            );
+        } else {
+            assert!(anonymous.is_empty(), "{attachments}: {anonymous:?}");
+        }
+    }
 }
 
 /// The treatment of each kind is a setting (`dl.treatments`): F2's name of two kinds taken
@@ -356,7 +405,12 @@ fn a_clash_through_a_part_left_out_is_refused_as_undecided() {
     );
     match refused {
         Err(MutationError::Rejected(reject)) => {
-            assert_eq!(reject.kind, RejectKind::Undecided, "{}", reject.detail);
+            assert_eq!(
+                reject.kind,
+                RejectKind::Undecided(nrese_store::UndecidedCause::ReadsDifferently),
+                "{}",
+                reject.detail
+            );
         }
         other => panic!("expected a refusal, got {other:?}"),
     }

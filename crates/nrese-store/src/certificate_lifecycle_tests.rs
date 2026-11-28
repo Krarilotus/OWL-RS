@@ -18,6 +18,9 @@ use crate::{
 use nrese_reasoner::rulesets::Ruleset;
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
 
+#[path = "certificate_record_tests.rs"]
+pub(super) mod certificate_record_tests;
+
 const PREFIXES: &str = "PREFIX : <http://example.com/> \
      PREFIX owl: <http://www.w3.org/2002/07/owl#> \
      PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> ";
@@ -796,113 +799,6 @@ fn a_repair_commit_in_quarantine_establishes_no_consistency_it_did_not_check() {
     cells.finish();
 }
 
-/// A store in `dir` holding `data` (Turtle over [`PREFIXES`]'s names), reasoned under OWL 2
-/// RL, its memory read through [`capacity`].
-fn reasoned(dir: &Path, data: &str) -> Arc<StoreService> {
-    let store = StoreService::new(StoreConfig::on_disk(dir))
-        .expect("store")
-        .with_capacity(capacity);
-    load(&store, data);
-    store.rematerialise(Ruleset::Owl2Rl).expect("reasoned");
-    Arc::new(store)
-}
-
-/// Commits `DELETE DATA { data }` through `pipeline`, its revalidation stopped: the store's
-/// memory can't be read from the commit's publication on. Whether the commit succeeded, and
-/// whether the memory was read while it couldn't be.
-fn repaired_unrevalidated(pipeline: &MutationPipeline, data: &str) -> (Result<(), String>, bool) {
-    hooks::BEFORE_REVALIDATION.set(Some(Box::new(|| UNREAD.set((true, false)))));
-    let repaired = pipeline.apply(
-        MutationCommand::Update(SparqlUpdateRequest::new(format!(
-            "{PREFIXES}DELETE DATA {{ {data} }}"
-        ))),
-        &Requester::all(),
-        &MutationTicket::new(),
-    );
-    hooks::BEFORE_REVALIDATION.set(None);
-    let (_, tried) = UNREAD.get();
-    UNREAD.set((false, false));
-    (repaired.map(|_| ()).map_err(|e| e.to_string()), tried)
-}
-
-/// A readiness reading (`is_quarantined`) with a change of the store's assessment between
-/// its reads, where the store is in quarantine before the change and after it, says
-/// quarantined: whatever it read first and last, the store was never ready.
-/// - Across a repair commit whose revalidation stops: before it, the data is inconsistent;
-///   after it, the consistency isn't assessed again.
-/// - Across a rematerialisation that records the data inconsistent: before it, a repair
-///   commit's revalidation stopped and the consistency isn't assessed; after it, the data is
-///   inconsistent.
-#[test]
-fn a_readiness_reading_across_a_change_of_quarantine_says_quarantined() {
-    use crate::ConsistencyStatus::{Inconsistent, Unknown};
-    let mut cells = Cells::default();
-    let readiness = |quarantined: bool| match quarantined {
-        true => "quarantined",
-        false => "ready",
-    };
-    let quarantined = |h: &str| h == "quarantined";
-
-    let dir = tempfile::tempdir().expect("dir");
-    let store = reasoned(dir.path(), &format!("{DATA} :a a owl:Nothing ."));
-    let before = store.consistency();
-    let rl = pipeline(&store, ReasoningMode::Owl2Rl);
-    let kept = Arc::new(Mutex::new(None));
-    let into = Arc::clone(&kept);
-    hooks::BETWEEN_QUARANTINE_READS.set(Some(Box::new(move || {
-        *into.lock().unwrap() = Some(repaired_unrevalidated(&rl, ":a a owl:Nothing"));
-    })));
-    let read = store.is_quarantined();
-    hooks::BETWEEN_QUARANTINE_READS.set(None);
-    let after = store.consistency();
-    match (before, kept.lock().unwrap().take(), after) {
-        (Inconsistent { .. }, Some((Ok(()), true)), Unknown) => cells.check(
-            "a reading across a repair commit | readiness",
-            readiness(read),
-            quarantined,
-            "quarantined",
-        ),
-        (before, committed, after) => cells.unmet(
-            "a reading across a repair commit",
-            &format!("{before:?}, then {committed:?} (committed, the memory read), then {after:?}"),
-        ),
-    }
-
-    let dir = tempfile::tempdir().expect("dir");
-    let store = reasoned(
-        dir.path(),
-        &format!("{DATA} :a a owl:Nothing . :b a owl:Nothing ."),
-    );
-    let (repaired, tried) =
-        repaired_unrevalidated(&pipeline(&store, ReasoningMode::Owl2Rl), ":a a owl:Nothing");
-    let before = store.consistency();
-    let (recorder, kept) = (Arc::clone(&store), Arc::new(Mutex::new(None)));
-    let into = Arc::clone(&kept);
-    hooks::BETWEEN_QUARANTINE_READS.set(Some(Box::new(move || {
-        let recorded = recorder.rematerialise(Ruleset::Owl2Rl);
-        *into.lock().unwrap() = Some(recorded.map(|_| ()).map_err(|e| e.to_string()));
-    })));
-    let read = store.is_quarantined();
-    hooks::BETWEEN_QUARANTINE_READS.set(None);
-    let after = store.consistency();
-    match (repaired, tried, before, kept.lock().unwrap().take(), after) {
-        (Ok(()), true, Unknown, Some(Ok(())), Inconsistent { violations: 1 }) => cells.check(
-            "a reading across a recorded assessment | readiness",
-            readiness(read),
-            quarantined,
-            "quarantined",
-        ),
-        (repaired, tried, before, recorded, after) => cells.unmet(
-            "a reading across a recorded assessment",
-            &format!(
-                "repaired {repaired:?} (the memory read: {tried}), then {before:?}, \
-                 recorded {recorded:?}, then {after:?}"
-            ),
-        ),
-    }
-    cells.finish();
-}
-
 /// A change of a repository's reasoning (`Catalog::change`) rebuilds its inferences under the
 /// new rules before its new write path registers them. A reader of every graph between the
 /// rebuild's publication and that registration is told `not-certified`: the closure published
@@ -1153,7 +1049,7 @@ fn a_readers_pending_view_scans_a_key_through_an_alias_of_has_key() {
     );
 }
 
-/// Two writers and a literal equality's condition (`ReasoningState::literal_equality`). The
+/// Two writers and a literal equality's condition. The
 /// first writer's commit derives an equality of two literals and fails; in the gap after
 /// its failure, before its write returns, a second writer commits an equality of its own.
 /// The second writes through a second pipeline over the store.
@@ -1246,6 +1142,374 @@ fn a_failed_commit_leaves_a_later_writers_literal_equality_withheld() {
     );
 }
 
+/// An ill-typed literal (OWL 2 Structural Specification §5.7): [`PREFIXES`] names no `xsd:`.
+const ILL_TYPED: &str = ":a :d \"abc\"^^<http://www.w3.org/2001/XMLSchema#integer> .";
+
+thread_local! {
+    /// How many more memory readings of a [`counted`] store succeed; unset: every one.
+    static READINGS: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// The memory reading of a store given it by [`StoreService::with_capacity`]: readable while
+/// [`READINGS`] is unset, else for that many readings more, then unreadable (the store's
+/// operations stop, failing closed).
+fn counted() -> nrese_exec::memory::Reading {
+    match READINGS.get() {
+        Some(0) => Err(nrese_exec::memory::Unread::Failed),
+        Some(left) => {
+            READINGS.set(Some(left - 1));
+            nrese_exec::memory::capacity()
+        }
+        None => nrese_exec::memory::capacity(),
+    }
+}
+
+/// Under `owl2-ql`, a store far shorter than one poll of the search for an ill-typed literal
+/// (4096 statements), its memory unreadable: the search stops before it starts, so the
+/// consistency is `unknown` and the read isn't `complete`, and nothing is kept. With the memory
+/// readable again, the next need searches, finds none, and the QL no-decider reason applies.
+#[test]
+fn an_ill_typed_search_stopped_before_it_starts_keeps_nothing_and_the_next_need_searches() {
+    use crate::ConsistencyStatus::{Undecided, Unknown};
+    let store = StoreService::new(StoreConfig::in_memory())
+        .expect("store")
+        .with_capacity(counted);
+    load(&store, DATA);
+    store.rematerialise(Ruleset::Owl2Ql).expect("reasoned");
+    READINGS.set(Some(0));
+    let stopped = (store.consistency(), status(&store, READ));
+    READINGS.set(None);
+    let again = (store.consistency(), status(&store, READ));
+    assert!(
+        stopped.0 == Unknown && !stopped.1.starts_with("complete"),
+        "stopped: {stopped:?}"
+    );
+    assert!(
+        again.0
+            == Undecided {
+                violations: 0,
+                why: crate::WhyUndecided::NoQlDecider,
+            }
+            && again.1.starts_with("sound-only")
+            && again.1.contains("consistency:"),
+        "again: {again:?}"
+    );
+}
+
+/// A stopped ill-typed search proves nothing even when the rules have found no clash.
+/// Under QL's refuse policy that leaves the write accepted, with consistency unknown.
+#[test]
+fn a_stopped_ql_literal_check_leaves_the_write_accepted_under_refuse() {
+    let store = Arc::new(
+        StoreService::new(StoreConfig {
+            gates_undecided: crate::UndecidedPolicy::Refuse,
+            ..StoreConfig::in_memory()
+        })
+        .expect("store")
+        .with_capacity(counted),
+    );
+    let ql = pipeline(&store, ReasoningMode::Owl2Ql);
+    load(&store, DATA);
+    store.rematerialise(Ruleset::Owl2Ql).expect("reasoned");
+    let before = store.current_revision();
+
+    // Let the rules use memory first. The candidate's literal check then cannot get a reading.
+    hooks::AFTER_PREFLIGHT.set(Some(Box::new(|| READINGS.set(Some(1)))));
+    let written = ql.execute_update_str(&format!("{PREFIXES}INSERT DATA {{ :fido a :Dog }}"));
+    hooks::AFTER_PREFLIGHT.set(None);
+    let status = store.consistency();
+    READINGS.set(None);
+
+    assert!(
+        written.is_ok(),
+        "the interrupted check refused: {written:?}"
+    );
+    assert!(
+        store.current_revision() > before,
+        "the write didn't publish"
+    );
+    assert_eq!(status, crate::ConsistencyStatus::Unknown);
+}
+
+/// A stopped ill-typed search proves nothing even when the rules have found no clash.
+#[test]
+fn an_ill_typed_search_stopped_at_a_dl_commit_records_no_verdict_and_the_next_read_searches() {
+    check_stopped_dl_commit(DATA, 1, "rules");
+}
+
+/// A stopped ill-typed search proves nothing even when U1 has found no clash.
+#[test]
+fn an_ill_typed_search_stopped_at_an_upper_bound_commit_leaves_the_verdict_for_the_next_read() {
+    check_stopped_dl_commit(
+        &format!("{DATA} :A rdfs:subClassOf [ owl:unionOf ( :B :C ) ] . :rex a :A ."),
+        2,
+        "delta",
+    );
+}
+
+/// Let the reasoning and bounds finish, then stop the commit's witness search. The revision
+/// has no verdict. Once memory is readable, its next read searches and is complete and consistent.
+fn check_stopped_dl_commit(data: &str, readings: u32, route: &str) {
+    let store = StoreService::new(StoreConfig::in_memory())
+        .expect("store")
+        .with_capacity(counted);
+    let store = Arc::new(store);
+    let dl = pipeline(&store, ReasoningMode::Owl2Dl);
+    commit(&dl, data);
+    hooks::AFTER_PREFLIGHT.set(Some(Box::new(move || READINGS.set(Some(readings)))));
+    commit(&dl, ":fido a :Dog .");
+    READINGS.set(None);
+    assert_eq!(store.dl_bounds().last, route);
+    let at = store.current_revision();
+    let recorded = (store.dl().status()).filter(|s| s.revision == at);
+    assert!(
+        recorded.is_none(),
+        "a verdict recorded at the stopped revision: {recorded:?}"
+    );
+    let read = (status(&store, READ), store.consistency());
+    assert!(
+        read.0.starts_with("complete") && read.1 == crate::ConsistencyStatus::Consistent,
+        "after the stop: {read:?}"
+    );
+}
+
+/// OWL 2 Structural Specification §5.7: a literal's lexical form must belong to its
+/// datatype. The read must withhold consistency and completeness even where the DL engine
+/// can model the logical axioms and the commit left no verdict.
+#[test]
+fn a_dl_read_does_not_record_consistency_for_an_ill_typed_literal() {
+    let store = Arc::new(
+        StoreService::new(StoreConfig::in_memory())
+            .expect("store")
+            .with_capacity(counted),
+    );
+    let dl = pipeline(&store, ReasoningMode::Owl2Dl);
+    commit(&dl, DATA);
+
+    // U1 shares the existential witness, so it collides with the disjoint ranges. The
+    // logical axioms have a model with a different successor for each individual.
+    let schema =
+        ":A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; owl:someValuesFrom :B ] .
+         :Left rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; owl:allValuesFrom :C ] .
+         :Right rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; owl:allValuesFrom :D ] .
+         :C owl:disjointWith :D . :left a :A, :Left . :right a :A, :Right .";
+    // Let the rules and U1 use memory. The commit's DL witness search then stops.
+    hooks::AFTER_PREFLIGHT.set(Some(Box::new(|| READINGS.set(Some(2)))));
+    commit(
+        &dl,
+        &format!("{schema} :d a owl:AnnotationProperty . {ILL_TYPED}"),
+    );
+    READINGS.set(None);
+    let at = store.current_revision();
+    let committed = store.dl().status().filter(|report| report.revision == at);
+    assert!(committed.is_none(), "the commit left {committed:?}");
+
+    let read = status(&store, READ);
+    let recorded = store
+        .dl()
+        .status()
+        .filter(|report| report.revision == at)
+        .expect("the read reached the consistency engine");
+    let snapshot = store.engine().snapshot();
+    let witness = super::Certificate::of(&snapshot)
+        .expect("the read has a certified revision")
+        .ill_typed(&snapshot, &|| false)
+        .flatten();
+    assert!(
+        witness.is_some(),
+        "the store still holds the ill-typed literal"
+    );
+    println!(
+        "F3 engine={} verdict={:?} read={read}",
+        recorded.consistency.engine, recorded.consistency.verdict
+    );
+    assert_eq!(
+        (
+            recorded.consistency.verdict == crate::dl::Verdict::Consistent,
+            read.starts_with("complete"),
+        ),
+        (false, false),
+        "an ill-typed literal withholds the read verdict and completeness"
+    );
+}
+
+/// Removing the last occurrence of the literal needs one scan for both the DL verdict and
+/// the version's certificate. Both must then vouch for the repaired store.
+#[test]
+fn a_dl_witness_search_is_shared_when_the_last_ill_typed_literal_is_removed() {
+    use crate::dl::query::ILL_TYPED_AFTER_CALLS;
+    let store = Arc::new(StoreService::new(StoreConfig::in_memory()).expect("store"));
+    let dl = pipeline(&store, ReasoningMode::Owl2Dl);
+    commit(
+        &dl,
+        &format!("{DATA} :d a owl:DatatypeProperty . {ILL_TYPED}"),
+    );
+    assert_eq!(store.consistency(), crate::ConsistencyStatus::Unknown);
+    ILL_TYPED_AFTER_CALLS.set(0);
+    dl.execute_update_str(&format!("{PREFIXES}DELETE DATA {{ {ILL_TYPED} }}"))
+        .expect("delete the sole occurrence");
+    assert_eq!(
+        ILL_TYPED_AFTER_CALLS.replace(0),
+        1,
+        "commit witness searches"
+    );
+    let recorded = store.dl().status().expect("the repair's verdict");
+    assert_eq!(recorded.revision, store.current_revision());
+    assert_eq!(recorded.consistency.verdict, crate::dl::Verdict::Consistent);
+    assert_eq!(store.consistency(), crate::ConsistencyStatus::Consistent);
+    assert!(status(&store, READ).starts_with("complete"));
+}
+
+/// Even if the tableau finds a model, the commit gate must withhold consistency when its
+/// RDF data contain an ill-typed literal. The real tableau also has its own approximation guard.
+#[test]
+fn a_dl_witness_search_checks_even_a_tableau_model() {
+    use crate::dl::{Verdict, gate};
+    let store = Arc::new(StoreService::new(StoreConfig::in_memory()).expect("store"));
+    let dl = pipeline(&store, ReasoningMode::Owl2Dl);
+    gate::TABLEAU_FINDS_MODEL.set(true);
+    commit(
+        &dl,
+        &format!(
+            "{DATA} :A rdfs:subClassOf [ owl:unionOf ( :B :C ) ] . \
+                  :a a :A . :B owl:disjointWith :C . {ILL_TYPED}"
+        ),
+    );
+    let checked = store
+        .dl()
+        .status()
+        .expect("the write's verdict")
+        .consistency;
+    assert_eq!(checked.engine, "hypertableau", "{checked:?}");
+    assert_eq!(
+        checked.verdict,
+        Verdict::Unknown(gate::ILL_TYPED.to_owned())
+    );
+}
+
+/// A pending proof has no reusable verdict once the gate's request has stopped. Calling the
+/// gate directly leaves the separately cancelled publication out of the experiment.
+#[test]
+fn a_dl_witness_search_stops_with_the_gate_request() {
+    use crate::dl::{Verdict, bounds, gate, query};
+    use crate::mutation::evidence::{EvidenceView, nothing_shown};
+    let store = Arc::new(StoreService::new(StoreConfig::in_memory()).expect("store"));
+    let dl = pipeline(&store, ReasoningMode::Owl2Dl);
+    commit(&dl, DATA);
+    let mut tx = store.engine().transaction();
+    tx.insert(
+        nrese_rdf::Quad::new(
+            nrese_rdf::NamedNode::new_unchecked("http://example.com/fido"),
+            nrese_rdf::vocab::rdf::TYPE,
+            nrese_rdf::NamedNode::new_unchecked("http://example.com/Dog"),
+            nrese_rdf::GraphName::DefaultGraph,
+        )
+        .as_ref(),
+    );
+    let mut prepared = bounds::prepare(&store, &tx, nrese_reasoner::eval::NEVER, false);
+    assert!(prepared.proves_consistency);
+    let gate = gate::check_commit(
+        &store,
+        &tx,
+        &|| true,
+        &mut prepared,
+        &EvidenceView::new(&crate::ReadScope::All, &tx),
+        &|_, _| nothing_shown(),
+        &nrese_exec::Envelope::unlimited(),
+    );
+    assert_eq!(
+        gate.checked.verdict,
+        Verdict::Unknown(query::UNCHECKED.to_owned())
+    );
+    assert!(!gate.record_verdict, "another read must be able to retry");
+}
+
+/// A pinned consistency read still checks its DL record's ill-typed witness after DL is
+/// switched off at the same revision. A new read answers under the new record.
+#[test]
+fn an_ill_typed_consistency_reading_decides_from_one_observation() {
+    use crate::ConsistencyStatus::{Consistent, Unknown};
+    let store = Arc::new(StoreService::new(StoreConfig::in_memory()).expect("store"));
+    let dl = pipeline(&store, ReasoningMode::Owl2Dl);
+    commit(
+        &dl,
+        &format!("{DATA} :d a owl:DatatypeProperty . {ILL_TYPED}"),
+    );
+    let snapshot = store.engine().snapshot();
+    assert_eq!(store.consistency(), Unknown);
+    store.use_dl(false, false);
+    assert_eq!(store.current_revision(), snapshot.revision());
+    assert_eq!(
+        (store.consistency_at(&snapshot, None), store.consistency()),
+        (Unknown, Consistent)
+    );
+}
+
+/// A consistency reading inside a registration of rules, after the rules are registered and
+/// before a certificate is made under them: a store holding an ill-typed literal, materialised
+/// under `owl2-rl` (its certificate that program's, which keeps no witness: `consistent`), is
+/// given an `owl2-ql` pipeline. During registration a read still sees the old version's
+/// verdict. Once the replacement record is published it answers unknown.
+#[test]
+fn a_consistency_read_during_rule_registration_answers_the_published_record() {
+    use crate::ConsistencyStatus::{Consistent, Unknown};
+    let store = Arc::new(StoreService::new(StoreConfig::in_memory()).expect("store"));
+    commit(&pipeline(&store, ReasoningMode::Disabled), ILL_TYPED);
+    store.rematerialise(Ruleset::Owl2Rl).expect("reasoned");
+    assert_eq!(store.consistency(), Consistent);
+    let (reader, seen) = (Arc::clone(&store), Arc::new(Mutex::new(None)));
+    let into = Arc::clone(&seen);
+    hooks::AFTER_RULES_REGISTERED.set(Some(Box::new(move || {
+        *into.lock().unwrap() = Some(reader.consistency());
+    })));
+    let _ql = pipeline(&store, ReasoningMode::Owl2Ql);
+    hooks::AFTER_RULES_REGISTERED.set(None);
+    assert_eq!(*seen.lock().unwrap(), Some(Consistent), "read in the gap");
+    assert_eq!(store.consistency(), Unknown, "read after recertification");
+}
+
+/// A commit's search for its base's ill-typed literal (`dl::query::ill_typed_after`) where an
+/// earlier commit deleted the base's 20 000 occurrences, its deletions a run of their own (left
+/// uncompacted: the run they were inserted in, with 100 000 other statements, is more than the
+/// compaction's fanout times larger), and the commit inserts one more, its stop raised once
+/// the search has begun: the search stops (nothing kept) within its poll, while it passes the
+/// deleted keys, before it reaches the one inserted.
+#[test]
+fn an_ill_typed_search_past_deleted_occurrences_stops_within_its_poll() {
+    use nrese_engine::{EncodedQuad, Engine, EngineConfig, QuadPattern, ReadModel};
+    let engine = Engine::new(EngineConfig::default()).expect("engine");
+    let ex = "http://example.org/";
+    let integer = "\"abc\"^^<http://www.w3.org/2001/XMLSchema#integer>";
+    let held = (0..20_000).map(|i| format!("<{ex}s{i}> <{ex}d> {integer} .\n"));
+    let other = (0..100_000).map(|i| format!("<{ex}f{i}> <{ex}e> <{ex}g> .\n"));
+    let data: String = held.chain(other).collect();
+    let mut tx = engine.transaction();
+    let parser = nrese_rdf_io::RdfParser::from_format(nrese_rdf_io::RdfFormat::Turtle);
+    for quad in parser.for_reader(data.as_bytes()) {
+        tx.insert(quad.expect("a statement").as_ref());
+    }
+    tx.commit().expect("inserted");
+    let snapshot = engine.snapshot();
+    let mut all = snapshot.quads_for_pattern_in(ReadModel::Asserted, &QuadPattern::all());
+    let any = all.find(|q| q.object.kind().is_dictionary_literal());
+    let any = any.expect("the literal");
+    let mut held = QuadPattern::all();
+    held.object = Some(any.object);
+    let mut gone = engine.transaction();
+    gone.remove_matching(&held).expect("deleted");
+    gone.commit().expect("deleted");
+    let mut tx = engine.transaction();
+    let keep = tx.intern(nrese_rdf::NamedNodeRef::new_unchecked("http://example.org/keep").into());
+    tx.insert_encoded(EncodedQuad::new(keep, any.predicate, any.object, any.graph));
+    let asked = std::cell::Cell::new(0u32);
+    let stop = || {
+        asked.set(asked.get() + 1);
+        asked.get() > 1
+    };
+    let found = crate::dl::query::ill_typed_after(&tx, Some(any.object), &stop);
+    assert_eq!((found, asked.get()), (None, 2), "found, and the stop asked");
+}
+
 /// A commit on a store in quarantine whose rules equate two literals (two spellings of one
 /// value under a functional property), under OWL 2 RL with the QL rewriting on. The
 /// quarantine's invalidation takes the kept state and its marker before the commit publishes,
@@ -1256,10 +1520,8 @@ fn a_failed_commit_leaves_a_later_writers_literal_equality_withheld() {
 /// - after a certificate made again (`use_reasoning_rules`) under OWL 2 RL. Under other rules
 ///   first, the read is `not-certified`: the certificate was made again, and none vouches.
 ///
-/// A repair commit of an equality that fails after staging (its log write refused) publishes
-/// nothing, and a certificate made again afterwards finds no reasoning state to make one
-/// from. A read of the property isn't `complete`, and its answer is the data's: the stored
-/// value alone, without the failed commit's.
+/// A repair commit of an equality that fails after staging keeps the old assessed hold.
+/// A read of the property still returns only the old value.
 #[test]
 fn a_commit_in_quarantine_that_equates_two_literals_is_never_told_complete() {
     const INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
@@ -1416,15 +1678,14 @@ fn a_commit_in_quarantine_that_equates_two_literals_is_never_told_complete() {
         (true, Err(_)) => {
             store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
             let name = "a failed commit and a certificate made again";
-            let state = store.reasoning_state();
-            cells.check(
-                &format!("{name} | the reasoning state"),
-                &format!("{state:?}"),
-                |_| state.is_none(),
-                "None",
-            );
             let (values, status) = answer(&store, "SELECT ?v { :s :p ?v }");
-            println!("{name}: in quarantine {}", store.is_quarantined());
+            let verdict = store.consistency();
+            cells.check(
+                &format!("{name} | the held verdict"),
+                verdict.as_str(),
+                |word| word == "inconsistent" && store.is_quarantined(),
+                "inconsistent and held",
+            );
             let complete =
                 |s: &Option<nrese_sparql::Completeness>| s.as_ref().is_some_and(|s| s.complete);
             cells.check(

@@ -18,7 +18,6 @@ READS = ("benches/reasoning/dl/canonical.py", "benches/reasoning/dl/nrese.py",
 DL = Path(__file__).resolve().parents[2] / "reasoning" / "dl"
 sys.path.insert(0, str(DL))
 # `reference` resolves its image through Docker on import; the consistency track doesn't use it.
-sys.modules.setdefault("reference", SimpleNamespace(IMAGE="unused"))
 spec = importlib.util.spec_from_file_location("nrese_consistency_contract", DL / "nrese.py")
 nrese = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(nrese)

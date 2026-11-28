@@ -7,6 +7,8 @@ use nrese_store::dl::entailment::Entailed;
 
 use super::{PREFIXES, pipeline};
 
+mod admission;
+
 pub(super) fn turtle(text: &str) -> Vec<Triple> {
     let prefixes = PREFIXES
         .split("PREFIX ")
@@ -96,8 +98,77 @@ fn an_inconsistent_premise_entails_everything() {
         .store()
         .entails_dl(&turtle(":y a :Q ."))
         .expect("entailment");
+    assert_eq!(answer.answer, Entailed::Yes);
     assert!(answer.holds());
     assert_eq!(answer.premise.as_str(), "inconsistent");
+}
+
+/// A store holding [`INCONSISTENT`], committed with the DL check off.
+pub(super) fn unchecked_inconsistent() -> nrese_store::MutationPipeline {
+    let dl = super::pipeline_with(nrese_store::DlConfig {
+        consistency: nrese_store::DlConsistency::Off,
+        ..nrese_store::DlConfig::default()
+    });
+    super::insert(&dl, INCONSISTENT).expect("premise, unchecked");
+    dl
+}
+
+/// A restriction with no filler: not well-formed OWL 2 DL, so the conclusion is never read.
+const UNREAD: &str = ":y a [ a owl:Restriction ; owl:onProperty :r ] .";
+
+/// Spec (`entails_dl`: a conclusion that isn't well-formed OWL 2 DL is unknown; an answer
+/// only after the conclusion is admitted): over an inconsistent premise, [`UNREAD`] is
+/// unknown and doesn't hold; the premise's verdict stays as evidence.
+#[test]
+fn an_unread_conclusion_over_an_inconsistent_premise_is_unknown() {
+    let dl = unchecked_inconsistent();
+    let answer = dl.store().entails_dl(&turtle(UNREAD)).expect("entailment");
+    assert!(matches!(answer.answer, Entailed::Unknown(_)), "{answer:?}");
+    assert!(!answer.holds());
+    assert_eq!(answer.premise.as_str(), "inconsistent");
+}
+
+/// The rules the store under `owl2-dl` maintains for `dl`.
+fn rules(dl: &nrese_store::MutationPipeline) -> nrese_reasoner::RuleProgram {
+    dl.reasoner()
+        .config()
+        .materialised_program()
+        .expect("rules")
+}
+
+/// Spec (`entails` under `owl2-dl`: the DL engines decide; where they don't, undecided):
+/// over an inconsistent premise the rules don't find, [`UNREAD`] is undecided, not
+/// `InconsistentPremise`.
+#[test]
+fn entails_reports_an_unread_conclusion_over_an_inconsistent_premise_as_undecided() {
+    let dl = unchecked_inconsistent();
+    let answer = dl.store().entails(rules(&dl), &turtle(UNREAD));
+    assert!(
+        matches!(answer, Err(nrese_store::StoreError::Undecided(_))),
+        "{answer:?}"
+    );
+}
+
+/// Spec (OWL 2 Direct Semantics: an inconsistent ontology entails every conclusion): over the
+/// same premise, an admitted conclusion is `InconsistentPremise` through `entails`.
+#[test]
+fn entails_reports_an_admitted_conclusion_over_an_inconsistent_premise_as_inconsistent() {
+    let dl = unchecked_inconsistent();
+    let answer = dl.store().entails(rules(&dl), &turtle(":y a :Q ."));
+    assert!(
+        matches!(answer, Ok(nrese_store::Entailment::InconsistentPremise)),
+        "{answer:?}"
+    );
+}
+
+/// Spec (Mapping to RDF Table 10 reads only annotation properties on a header): `:p` is a
+/// declared object property, so `:o :p :b` on the ontology node `:o` is an object-property
+/// assertion, which the unrelated premise doesn't entail.
+#[test]
+fn a_declared_object_propertys_assertion_on_an_ontology_node_is_read() {
+    let conclusion = ":o a owl:Ontology , owl:NamedIndividual . :b a owl:NamedIndividual . \
+                      :p a owl:ObjectProperty . :o :p :b .";
+    assert_eq!(entailed(":q a owl:Class .", conclusion), Entailed::No);
 }
 
 /// - Input: a premise with an anonymous `hasValue` filler, `A ⊑ ∃p.{_:b}` and `_:b` a
@@ -152,21 +223,25 @@ fn a_conclusions_anonymous_individual_is_some_individual() {
     );
 }
 
-/// Spec (OWL 2 Direct Semantics: a declaration carries no meaning, an annotation property's
-/// none either; premise and conclusion are each read on their own): a conclusion declaring
-/// `:note` an annotation property, which the premise uses as an object property, is decided by
-/// its other statement: `:x a :A`, which holds in every model of the premise, is entailed;
-/// `:x a :B` is not.
+/// Spec (conclusion admission over the joint ontology, OWL 2 Structural Specification §5.8.1):
+/// an annotation declaration for an unused name carries no logical content. Reusing the
+/// premise's object property as an annotation property withholds either definite answer.
 #[test]
 fn a_conclusions_annotation_declaration_of_a_premises_property_carries_no_meaning() {
-    let premise = ":x :note :y . :x a :A .";
-    let declared = ":note a owl:AnnotationProperty .";
-    assert_eq!(
-        entailed(premise, &format!("{declared} :x a :A .")),
-        Entailed::Yes
-    );
-    assert_eq!(
-        entailed(premise, &format!("{declared} :x a :B .")),
-        Entailed::No
-    );
+    let premise = ":note a owl:ObjectProperty . :x :note :y . :x a :A . :B a owl:Class .";
+    let mut wrong = Vec::new();
+    for (class, expected) in [(":A", Entailed::Yes), (":B", Entailed::No)] {
+        let neutral = entailed(
+            premise,
+            &format!(":remark a owl:AnnotationProperty . :x a {class} ."),
+        );
+        let clash = entailed(
+            premise,
+            &format!(":note a owl:AnnotationProperty . :x a {class} ."),
+        );
+        if neutral != expected || !matches!(clash, Entailed::Unknown(_)) {
+            wrong.push((class, neutral, clash));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }

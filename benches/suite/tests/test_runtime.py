@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from suitekit.runtime import run_quiet  # noqa: E402
 
-READS = ("benches/suite/suitekit/__init__.py", "benches/suite/suitekit/lock.py",
+READS = ("benches/suite/suitekit/__init__.py", "benches/suite/suitekit/hosts.py", "benches/suite/suitekit/lock.py",
          "benches/suite/suitekit/ns.py", "benches/suite/suitekit/runtime.py")
 
 

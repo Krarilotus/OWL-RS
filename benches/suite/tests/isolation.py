@@ -14,6 +14,8 @@ once for the whole run, for the tests and every process they start:
 - removes every GIT_* variable but ALLOWED (none: a test sets what it needs itself), and the
   scope settings a calling suite run passes its workers (SUITE_SCOPE_*: runtime.scope_argv
   reads them by default, so a caller's SUITE_SCOPE_STOP_S=bad failed every scoped runtime test);
+- removes the proof host and any real overlay sources. Tests of private evidence supply their
+  own synthetic provenance. FLEET_OUT stays available as a place for test-owned scratch;
 - gives git a configuration of the suite's own: no system file (GIT_CONFIG_NOSYSTEM), an empty
   global file this module owns (GIT_CONFIG_GLOBAL), and through GIT_CONFIG_COUNT a test identity
   and core.hooksPath on an empty directory it owns, so no test repository runs our hooks or the
@@ -48,16 +50,19 @@ import unittest
 from pathlib import Path
 
 ALLOWED: frozenset[str] = frozenset()
+HOST_SETTINGS = {"FLEET_HOST", "BENCH_INPUTS_GIT", "NRESE_BENCH_PRIVATE", "NRESE_BENCH_HOSTS",
+                 "NRESE_BENCH_FLOORS", "NRESE_BENCH_OVERLAY_REV"}
 CONFIG = (("user.name", "suite test"), ("user.email", "suite-test@localhost"))
 ROOT = Path(__file__).resolve().parents[3]
 START = Path.cwd()
 
 
 def isolate(environ=os.environ) -> Path:
-    """The caller's GIT_* and SUITE_SCOPE_* variables out, the suite's git configuration and ceilings in; the
+    """Remove caller git, scope and host settings, configure the suite's git and ceilings, and return the
     directory holding that configuration (its global file and its empty hooks directory) and
     the scratch directory the tests run in."""
-    for name in [k for k in environ if k.startswith(("GIT_", "SUITE_SCOPE_")) and k not in ALLOWED]:
+    for name in [k for k in environ if k in HOST_SETTINGS or
+                 (k.startswith(("GIT_", "SUITE_SCOPE_")) and k not in ALLOWED)]:
         del environ[name]
     own = Path(tempfile.mkdtemp(prefix="suite-git-"))
     (own / "gitconfig").write_text("", encoding="utf-8")
@@ -130,6 +135,45 @@ def repo(path: Path, commits: int) -> list[str]:
     for n in range(commits):
         git("commit", "-q", "--allow-empty", "-m", f"commit {n + 1}")
     return git("rev-list", "--reverse", "HEAD").split()
+
+
+#: A private overlay's hosts.toml for a test: one host, neutral names.
+OVERLAY_HOSTS = '[host.timed-host]\nhostname = "timed-host"\nhas = []\nassets = false\n'
+
+
+def overlay_repo(path: Path, hosts: str = OVERLAY_HOSTS) -> str:
+    """A private bench inputs repository of the test's own at `path`: one commit holding
+    overlay/hosts.toml (`hosts`); its id."""
+    (path / "overlay").mkdir(parents=True, exist_ok=True)
+    (path / "overlay" / "hosts.toml").write_text(hosts, encoding="utf-8", newline="\n")
+    return repo(path, 1)[0]
+
+
+def writers_overlay() -> str:
+    """For a test module whose tests write fleet jobs, from its setUpModule: the job writers stop
+    without the private bench overlay (suitekit/hosts.py overlay_env), so a repository of the
+    module's own holds one, its overlay/ named by NRESE_BENCH_PRIVATE until the module's tests end
+    (BENCH_INPUTS_GIT unset); its content identity. Set and restored here, not by a started mock patch: a
+    test's patch.stopall would stop that one too."""
+    path = Path(tempfile.mkdtemp(prefix="overlay-", dir=OWN))
+    overlay_repo(path)
+    names = ("NRESE_BENCH_PRIVATE", "BENCH_INPUTS_GIT", "NRESE_BENCH_HOSTS", "NRESE_BENCH_FLOORS",
+             "NRESE_BENCH_OVERLAY_REV")
+    before = {name: os.environ.get(name) for name in names}
+    for name in names:
+        os.environ.pop(name, None)
+    os.environ["NRESE_BENCH_PRIVATE"] = (path / "overlay").as_posix()
+
+    def restore() -> None:
+        for name, value in before.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    unittest.addModuleCleanup(restore)
+    import hashlib
+    import json
+    return "sha256:" + hashlib.sha256(json.dumps([OVERLAY_HOSTS, ""]).encode("utf-8")).hexdigest()
 
 
 if __name__ == "__main__":

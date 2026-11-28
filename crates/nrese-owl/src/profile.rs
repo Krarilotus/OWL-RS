@@ -134,26 +134,34 @@ fn datatype(o: &Ontology, datatype: Term) -> Profiles {
     }
 }
 
-/// Which profiles admit the data range `r`.
+/// Which profiles admit the data range `r`: those admitting every range in it, read with a
+/// stack of its own (the nesting depth is no call depth).
 fn range(o: &Ontology, r: RangeId) -> Profiles {
-    match o.range(r) {
-        DataRange::Literal => Profiles::ALL,
-        DataRange::Datatype(t) => datatype(o, *t),
-        DataRange::And(rs) => rs
-            .iter()
-            .fold(Profiles::ALL, |acc, &r| acc.and(range(o, r))),
-        // EL: one literal only.
-        DataRange::OneOf(xs) => Profiles {
-            el: xs.len() == 1,
-            ql: false,
-            rl: false,
-        },
-        DataRange::Or(_) | DataRange::Not(_) | DataRange::Restriction(..) => Profiles {
-            el: false,
-            ql: false,
-            rl: false,
-        },
+    let mut out = Profiles::ALL;
+    let mut stack = vec![r];
+    while let Some(r) = stack.pop() {
+        let own = match o.range(r) {
+            DataRange::Literal => Profiles::ALL,
+            DataRange::Datatype(t) => datatype(o, *t),
+            DataRange::And(rs) => {
+                stack.extend(rs.iter().rev());
+                Profiles::ALL
+            }
+            // EL: one literal only.
+            DataRange::OneOf(xs) => Profiles {
+                el: xs.len() == 1,
+                ql: false,
+                rl: false,
+            },
+            DataRange::Or(_) | DataRange::Not(_) | DataRange::Restriction(..) => Profiles {
+                el: false,
+                ql: false,
+                rl: false,
+            },
+        };
+        out = out.and(own);
     }
+    out
 }
 
 fn named(p: ObjProp) -> bool {
@@ -172,19 +180,84 @@ fn unwrap(o: &Ontology, mut e: ExprId) -> ExprId {
     e
 }
 
-/// Whether EL admits the class expression `e` (EL has one grammar for every position).
+/// The grammar rules below, decided over nested expressions by [`admits`].
+#[derive(Clone, Copy)]
+enum Rule {
+    El,
+    QlSuper,
+    RlSub,
+    RlSuper,
+    RlEquiv,
+}
+
+/// Whether `rule` admits `e`, with a stack of its own (the nesting depth is no call depth).
+/// Each rule says what an expression needs of itself and of its operands, by rule.
+fn admits(o: &Ontology, e: ExprId, rule: Rule) -> bool {
+    use crate::walk::Holds::{All, Is};
+    let one = std::slice::from_ref;
+    let thing = |f: &ExprId| matches!(o.class(*f), ClassExpr::Thing);
+    crate::walk::holds(e, rule, |e, rule| {
+        let e = unwrap(o, e);
+        match (rule, o.class(e)) {
+            (Rule::El, expr) => match expr {
+                ClassExpr::Class(_) | ClassExpr::Thing | ClassExpr::Nothing => Is(true),
+                ClassExpr::And(es) => All(es, Rule::El),
+                ClassExpr::Some(p, f) if named(*p) => All(one(f), Rule::El),
+                ClassExpr::HasValue(p, _) | ClassExpr::HasSelf(p) => Is(named(*p)),
+                ClassExpr::OneOf(xs) => Is(xs.len() == 1),
+                ClassExpr::DataSome(_, r) => Is(range(o, *r).el),
+                ClassExpr::DataHasValue(..) => Is(true),
+                _ => Is(false),
+            },
+            (Rule::QlSuper, expr) => match expr {
+                ClassExpr::Class(_) | ClassExpr::Thing | ClassExpr::Nothing => Is(true),
+                ClassExpr::And(es) => All(es, Rule::QlSuper),
+                ClassExpr::Not(e) => Is(ql_sub(o, *e)),
+                ClassExpr::Some(_, f) => Is(matches!(
+                    o.class(*f),
+                    ClassExpr::Class(_) | ClassExpr::Thing
+                )),
+                ClassExpr::DataSome(_, r) => Is(range(o, *r).ql),
+                _ => Is(false),
+            },
+            (Rule::RlSub, expr) => match expr {
+                ClassExpr::Class(_) | ClassExpr::Nothing => Is(true),
+                ClassExpr::And(es) | ClassExpr::Or(es) => All(es, Rule::RlSub),
+                ClassExpr::OneOf(_) => Is(true),
+                ClassExpr::Some(_, f) if thing(f) => Is(true),
+                ClassExpr::Some(_, f) => All(one(f), Rule::RlSub),
+                ClassExpr::DataSome(_, r) => Is(range(o, *r).rl),
+                ClassExpr::HasValue(..) | ClassExpr::DataHasValue(..) => Is(true),
+                _ => Is(false),
+            },
+            (Rule::RlSuper, expr) => match expr {
+                ClassExpr::Class(_) | ClassExpr::Nothing => Is(true),
+                ClassExpr::And(es) => All(es, Rule::RlSuper),
+                ClassExpr::Not(e) => All(one(e), Rule::RlSub),
+                ClassExpr::All(_, f) => All(one(f), Rule::RlSuper),
+                ClassExpr::HasValue(..) | ClassExpr::DataHasValue(..) => Is(true),
+                ClassExpr::Max(n, _, _) if *n > 1 => Is(false),
+                ClassExpr::Max(_, _, f) if thing(f) => Is(true),
+                ClassExpr::Max(_, _, f) => All(one(f), Rule::RlSub),
+                ClassExpr::DataAll(_, r) => Is(range(o, *r).rl),
+                ClassExpr::DataMax(n, _, r) => Is(*n <= 1 && range(o, *r).rl),
+                _ => Is(false),
+            },
+            (Rule::RlEquiv, expr) => match expr {
+                ClassExpr::Class(_) | ClassExpr::Nothing => Is(true),
+                ClassExpr::And(es) => All(es, Rule::RlEquiv),
+                ClassExpr::HasValue(..) | ClassExpr::DataHasValue(..) => Is(true),
+                _ => Is(false),
+            },
+        }
+    })
+}
+
+/// Whether EL admits the class expression `e` (EL has one grammar for every position): a
+/// class, intersections of them, `∃R.C` over a named `R`, values, a single nominal, `∃D`
+/// over an EL range.
 fn el(o: &Ontology, e: ExprId) -> bool {
-    let e = unwrap(o, e);
-    match o.class(e) {
-        ClassExpr::Class(_) | ClassExpr::Thing | ClassExpr::Nothing => true,
-        ClassExpr::And(es) => es.iter().all(|&e| el(o, e)),
-        ClassExpr::Some(p, f) => named(*p) && el(o, *f),
-        ClassExpr::HasValue(p, _) | ClassExpr::HasSelf(p) => named(*p),
-        ClassExpr::OneOf(xs) => xs.len() == 1,
-        ClassExpr::DataSome(_, r) => range(o, *r).el,
-        ClassExpr::DataHasValue(..) => true,
-        _ => false,
-    }
+    admits(o, e, Rule::El)
 }
 
 /// QL's `subClassExpression` (§3.2.3): a class, `∃R.⊤`, `∃D.Literal`.
@@ -201,61 +274,25 @@ fn ql_sub(o: &Ontology, e: ExprId) -> bool {
 /// QL's `superClassExpression`: a class, an intersection of them, the complement of a
 /// `subClassExpression`, `∃R.A`, `∃D.range`.
 fn ql_super(o: &Ontology, e: ExprId) -> bool {
-    let e = unwrap(o, e);
-    match o.class(e) {
-        ClassExpr::Class(_) | ClassExpr::Thing | ClassExpr::Nothing => true,
-        ClassExpr::And(es) => es.iter().all(|&e| ql_super(o, e)),
-        ClassExpr::Not(e) => ql_sub(o, *e),
-        ClassExpr::Some(_, f) => matches!(o.class(*f), ClassExpr::Class(_) | ClassExpr::Thing),
-        ClassExpr::DataSome(_, r) => range(o, *r).ql,
-        _ => false,
-    }
+    admits(o, e, Rule::QlSuper)
 }
 
 /// RL's `subClassExpression` (§4.2.3): a class other than `owl:Thing`, intersections and
 /// unions of them, enumerations, `∃R.sub` (or `∃R.⊤`), `∃D.range`, values.
 fn rl_sub(o: &Ontology, e: ExprId) -> bool {
-    let e = unwrap(o, e);
-    match o.class(e) {
-        ClassExpr::Class(_) | ClassExpr::Nothing => true,
-        ClassExpr::And(es) | ClassExpr::Or(es) => es.iter().all(|&e| rl_sub(o, e)),
-        ClassExpr::OneOf(_) => true,
-        ClassExpr::Some(_, f) => matches!(o.class(*f), ClassExpr::Thing) || rl_sub(o, *f),
-        ClassExpr::DataSome(_, r) => range(o, *r).rl,
-        ClassExpr::HasValue(..) | ClassExpr::DataHasValue(..) => true,
-        _ => false,
-    }
+    admits(o, e, Rule::RlSub)
 }
 
 /// RL's `superClassExpression`: a class other than `owl:Thing`, intersections, the
 /// complement of a `subClassExpression`, `∀R.super`, values, `≤ 0/1 R(.sub)`, `∀D.range`,
 /// `≤ 0/1 D(.range)`.
 pub(crate) fn rl_super(o: &Ontology, e: ExprId) -> bool {
-    let e = unwrap(o, e);
-    match o.class(e) {
-        ClassExpr::Class(_) | ClassExpr::Nothing => true,
-        ClassExpr::And(es) => es.iter().all(|&e| rl_super(o, e)),
-        ClassExpr::Not(e) => rl_sub(o, *e),
-        ClassExpr::All(_, f) => rl_super(o, *f),
-        ClassExpr::HasValue(..) | ClassExpr::DataHasValue(..) => true,
-        ClassExpr::Max(n, _, f) => {
-            *n <= 1 && (matches!(o.class(*f), ClassExpr::Thing) || rl_sub(o, *f))
-        }
-        ClassExpr::DataAll(_, r) => range(o, *r).rl,
-        ClassExpr::DataMax(n, _, r) => *n <= 1 && range(o, *r).rl,
-        _ => false,
-    }
+    admits(o, e, Rule::RlSuper)
 }
 
 /// RL's `equivClassExpression`: a class other than `owl:Thing`, intersections, values.
 fn rl_equiv(o: &Ontology, e: ExprId) -> bool {
-    let e = unwrap(o, e);
-    match o.class(e) {
-        ClassExpr::Class(_) | ClassExpr::Nothing => true,
-        ClassExpr::And(es) => es.iter().all(|&e| rl_equiv(o, e)),
-        ClassExpr::HasValue(..) | ClassExpr::DataHasValue(..) => true,
-        _ => false,
-    }
+    admits(o, e, Rule::RlEquiv)
 }
 
 /// The individuals an assertion names.
@@ -274,31 +311,31 @@ fn individuals(axiom: &Axiom) -> Vec<Term> {
     }
 }
 
-/// The properties an expression names, with those of its fillers.
+/// The properties an expression names, with those of its fillers, in the order of a walk
+/// from the left, with a stack of its own (the nesting depth is no call depth).
 fn expr_properties(o: &Ontology, e: ExprId, out: &mut Vec<Term>) {
-    match o.class(e) {
-        ClassExpr::And(es) | ClassExpr::Or(es) => {
-            for &e in es {
-                expr_properties(o, e, out);
+    let mut stack = vec![e];
+    while let Some(e) = stack.pop() {
+        match o.class(e) {
+            ClassExpr::And(es) | ClassExpr::Or(es) => stack.extend(es.iter().rev()),
+            ClassExpr::Not(e) => stack.push(*e),
+            ClassExpr::Some(p, f)
+            | ClassExpr::All(p, f)
+            | ClassExpr::Min(_, p, f)
+            | ClassExpr::Max(_, p, f)
+            | ClassExpr::Exact(_, p, f) => {
+                out.push(p.named());
+                stack.push(*f);
             }
+            ClassExpr::HasValue(p, _) | ClassExpr::HasSelf(p) => out.push(p.named()),
+            ClassExpr::DataSome(d, _)
+            | ClassExpr::DataAll(d, _)
+            | ClassExpr::DataHasValue(d, _)
+            | ClassExpr::DataMin(_, d, _)
+            | ClassExpr::DataMax(_, d, _)
+            | ClassExpr::DataExact(_, d, _) => out.push(*d),
+            _ => {}
         }
-        ClassExpr::Not(e) => expr_properties(o, *e, out),
-        ClassExpr::Some(p, f)
-        | ClassExpr::All(p, f)
-        | ClassExpr::Min(_, p, f)
-        | ClassExpr::Max(_, p, f)
-        | ClassExpr::Exact(_, p, f) => {
-            out.push(p.named());
-            expr_properties(o, *f, out);
-        }
-        ClassExpr::HasValue(p, _) | ClassExpr::HasSelf(p) => out.push(p.named()),
-        ClassExpr::DataSome(d, _)
-        | ClassExpr::DataAll(d, _)
-        | ClassExpr::DataHasValue(d, _)
-        | ClassExpr::DataMin(_, d, _)
-        | ClassExpr::DataMax(_, d, _)
-        | ClassExpr::DataExact(_, d, _) => out.push(*d),
-        _ => {}
     }
 }
 
@@ -504,26 +541,42 @@ fn grammar(o: &Ontology, axiom: &Axiom) -> Profiles {
 /// QL rewriting covers where it runs over that profile's closure: `∃R.C` and `≥ n R.C`
 /// with n ≥ 1, for any filler, and their data forms. Its generators and the TBox's ledger
 /// of unread conclusions seed them (I24b).
+///
+/// Decided with a stack of its own (the nesting depth is no call depth): every expression
+/// reached must be covered.
 fn super_covered(o: &Ontology, e: ExprId, rl: bool) -> bool {
-    let e = unwrap(o, e);
-    let plain = match rl {
-        true => rl_super(o, e),
-        false => ql_super(o, e),
-    };
-    plain
-        || match o.class(e) {
-            ClassExpr::And(es) => es.iter().all(|&e| super_covered(o, e, rl)),
-            ClassExpr::Some(..) | ClassExpr::DataSome(..) => true,
-            ClassExpr::Min(n, ..) | ClassExpr::DataMin(n, ..) => *n >= 1,
-            // `∀R.F` concludes `F` of the successors: what the closure's `cls-avf` gives,
-            // where RL has it.
-            ClassExpr::All(_, f) => rl && super_covered(o, *f, rl),
-            // Nothing else: a form the grammar doesn't admit as written is answered by
-            // neither the TBox nor the rules, which see it as written (`¬¬D`, `¬≥ 2 R`).
-            // What it may conclude decides whether it matters
-            // ([`concluded_terms`], [`concludes_equality`]).
-            _ => false,
+    let mut stack = vec![e];
+    while let Some(e) = stack.pop() {
+        let e = unwrap(o, e);
+        let plain = match rl {
+            true => rl_super(o, e),
+            false => ql_super(o, e),
+        };
+        let covered = plain
+            || match o.class(e) {
+                ClassExpr::And(es) => {
+                    stack.extend(es.iter().rev());
+                    true
+                }
+                ClassExpr::Some(..) | ClassExpr::DataSome(..) => true,
+                ClassExpr::Min(n, ..) | ClassExpr::DataMin(n, ..) => *n >= 1,
+                // `∀R.F` concludes `F` of the successors: what the closure's `cls-avf` gives,
+                // where RL has it.
+                ClassExpr::All(_, f) => {
+                    stack.push(*f);
+                    rl
+                }
+                // Nothing else: a form the grammar doesn't admit as written is answered by
+                // neither the TBox nor the rules, which see it as written (`¬¬D`, `¬≥ 2 R`).
+                // What it may conclude decides whether it matters
+                // ([`concluded_terms`], [`concludes_equality`]).
+                _ => false,
+            };
+        if !covered {
+            return false;
         }
+    }
+    true
 }
 
 /// Whether what a rewriting over the closure of QL (`rl` false) or RL can miss of
@@ -629,60 +682,74 @@ pub fn concluded_terms(o: &Ontology, axiom: &Axiom, rl: bool) -> Vec<Term> {
 /// - A class adds a membership positively only.
 ///
 /// Equality is [`concludes_equality`]'s.
+///
+/// Walked with a stack of its own (the nesting depth is no call depth), each expression
+/// before its operands and the operands from the left.
 pub(crate) fn positive_terms(o: &Ontology, e: ExprId, positive: bool, out: &mut Vec<Term>) {
-    match (o.class(e), positive) {
-        (ClassExpr::Class(c), true) => out.push(*c),
-        (ClassExpr::And(es) | ClassExpr::Or(es), p) => {
-            for &e in es {
-                positive_terms(o, e, p, out);
+    let mut stack = vec![(e, positive)];
+    while let Some((e, positive)) = stack.pop() {
+        match (o.class(e), positive) {
+            (ClassExpr::Class(c), true) => out.push(*c),
+            (ClassExpr::And(es) | ClassExpr::Or(es), p) => {
+                stack.extend(es.iter().rev().map(|&e| (e, p)));
             }
-        }
-        (ClassExpr::Not(e), p) => positive_terms(o, *e, !p, out),
-        (ClassExpr::Some(r, f), true) | (ClassExpr::All(r, f), false) => {
-            out.push(r.named());
-            positive_terms(o, *f, positive, out);
-        }
-        (ClassExpr::Some(_, f), false) | (ClassExpr::All(_, f), true) => {
-            positive_terms(o, *f, positive, out)
-        }
-        (ClassExpr::Min(n, r, f) | ClassExpr::Exact(n, r, f), true) if *n >= 1 => {
-            out.push(r.named());
-            positive_terms(o, *f, true, out);
-        }
-        // `≤ 0 R.F` (also `= 0`, `¬≥ 1`) puts every successor outside `F`: facts of `¬F`,
-        // no `R` edge. A larger bound equates ([`concludes_equality`]).
-        (ClassExpr::Max(0, _, f) | ClassExpr::Exact(0, _, f), true)
-        | (ClassExpr::Min(1, _, f), false) => positive_terms(o, *f, false, out),
-        (ClassExpr::Max(_, r, f) | ClassExpr::Exact(_, r, f), false) => {
-            out.push(r.named());
-            positive_terms(o, *f, true, out);
-            // `¬= 1` may be `≤ 0`.
-            if matches!(o.class(e), ClassExpr::Exact(1, ..)) {
-                positive_terms(o, *f, false, out);
+            (ClassExpr::Not(e), p) => stack.push((*e, !p)),
+            (ClassExpr::Some(r, f), true) | (ClassExpr::All(r, f), false) => {
+                out.push(r.named());
+                stack.push((*f, positive));
             }
+            (ClassExpr::Some(_, f), false) | (ClassExpr::All(_, f), true) => {
+                stack.push((*f, positive))
+            }
+            (ClassExpr::Min(n, r, f) | ClassExpr::Exact(n, r, f), true) if *n >= 1 => {
+                out.push(r.named());
+                stack.push((*f, true));
+            }
+            // `≤ 0 R.F` (also `= 0`, `¬≥ 1`) puts every successor outside `F`: facts of `¬F`,
+            // no `R` edge. A larger bound equates ([`concludes_equality`]).
+            (ClassExpr::Max(0, _, f) | ClassExpr::Exact(0, _, f), true)
+            | (ClassExpr::Min(1, _, f), false) => stack.push((*f, false)),
+            (ClassExpr::Max(_, r, f) | ClassExpr::Exact(_, r, f), false) => {
+                out.push(r.named());
+                // `¬= 1` may be `≤ 0`: the filler's complement too, after the filler.
+                if matches!(o.class(e), ClassExpr::Exact(1, ..)) {
+                    stack.push((*f, false));
+                }
+                stack.push((*f, true));
+            }
+            (ClassExpr::HasValue(r, _) | ClassExpr::HasSelf(r), true) => out.push(r.named()),
+            (ClassExpr::DataSome(d, _) | ClassExpr::DataHasValue(d, _), true)
+            | (ClassExpr::DataAll(d, _) | ClassExpr::DataMax(_, d, _), false) => out.push(*d),
+            (ClassExpr::DataMin(n, d, _) | ClassExpr::DataExact(n, d, _), true) if *n >= 1 => {
+                out.push(*d)
+            }
+            (ClassExpr::DataExact(_, d, _), false) => out.push(*d),
+            _ => {}
         }
-        (ClassExpr::HasValue(r, _) | ClassExpr::HasSelf(r), true) => out.push(r.named()),
-        (ClassExpr::DataSome(d, _) | ClassExpr::DataHasValue(d, _), true)
-        | (ClassExpr::DataAll(d, _) | ClassExpr::DataMax(_, d, _), false) => out.push(*d),
-        (ClassExpr::DataMin(n, d, _) | ClassExpr::DataExact(n, d, _), true) if *n >= 1 => {
-            out.push(*d)
-        }
-        (ClassExpr::DataExact(_, d, _), false) => out.push(*d),
-        _ => {}
     }
 }
 
 /// A term to name an axiom's hazard by: a property, else a class or an individual of its
 /// expressions (`C ⊑ {a}` names no property).
 pub(crate) fn label(o: &Ontology, axiom: &Axiom) -> Option<Term> {
+    /// The first class or individual from the left, with a stack of its own (the nesting
+    /// depth is no call depth).
     fn any(o: &Ontology, e: ExprId) -> Option<Term> {
-        match o.class(e) {
-            ClassExpr::Class(c) => Some(*c),
-            ClassExpr::OneOf(xs) => xs.first().copied(),
-            ClassExpr::And(es) | ClassExpr::Or(es) => es.iter().find_map(|&e| any(o, e)),
-            ClassExpr::Not(e) => any(o, *e),
-            _ => None,
+        let mut stack = vec![e];
+        while let Some(e) = stack.pop() {
+            match o.class(e) {
+                ClassExpr::Class(c) => return Some(*c),
+                ClassExpr::OneOf(xs) => {
+                    if let Some(&x) = xs.first() {
+                        return Some(x);
+                    }
+                }
+                ClassExpr::And(es) | ClassExpr::Or(es) => stack.extend(es.iter().rev()),
+                ClassExpr::Not(e) => stack.push(*e),
+                _ => {}
+            }
         }
+        None
     }
     let exprs: Vec<ExprId> = match axiom {
         Axiom::SubClassOf(a, b) => vec![*a, *b],
@@ -773,25 +840,49 @@ pub fn concludes_equality(
     axiom: &Axiom,
     equating: &std::collections::HashSet<Term>,
 ) -> bool {
+    /// Whether `e` or an expression in it equates, with a stack of its own (the nesting
+    /// depth is no call depth).
     fn contains(o: &Ontology, e: ExprId, equating: &std::collections::HashSet<Term>) -> bool {
         let p = |r: &ObjProp| equating.contains(&r.named());
-        let inner = |f: &ExprId| contains(o, *f, equating);
-        match o.class(e) {
-            ClassExpr::OneOf(_) | ClassExpr::HasValue(..) | ClassExpr::HasSelf(_) => true,
-            ClassExpr::Class(_) | ClassExpr::Thing | ClassExpr::Nothing => false,
-            ClassExpr::And(es) | ClassExpr::Or(es) => es.iter().any(inner),
-            ClassExpr::Not(f) => inner(f),
-            ClassExpr::Min(0, ..) | ClassExpr::DataMin(0, ..) => false,
-            ClassExpr::Max(n, r, f) | ClassExpr::Exact(n, r, f) => *n >= 1 || p(r) || inner(f),
-            ClassExpr::Min(n, r, f) => *n >= 2 || p(r) || inner(f),
-            ClassExpr::Some(r, f) | ClassExpr::All(r, f) => p(r) || inner(f),
-            ClassExpr::DataSome(d, _)
-            | ClassExpr::DataAll(d, _)
-            | ClassExpr::DataHasValue(d, _)
-            | ClassExpr::DataMin(_, d, _)
-            | ClassExpr::DataMax(_, d, _)
-            | ClassExpr::DataExact(_, d, _) => equating.contains(d),
+        let mut stack = vec![e];
+        while let Some(e) = stack.pop() {
+            // Whether `e` equates by itself, its operands aside.
+            let equates = match o.class(e) {
+                ClassExpr::OneOf(_) | ClassExpr::HasValue(..) | ClassExpr::HasSelf(_) => true,
+                ClassExpr::Class(_) | ClassExpr::Thing | ClassExpr::Nothing => false,
+                ClassExpr::And(es) | ClassExpr::Or(es) => {
+                    stack.extend(es.iter().rev());
+                    false
+                }
+                ClassExpr::Not(f) => {
+                    stack.push(*f);
+                    false
+                }
+                ClassExpr::Min(0, ..) | ClassExpr::DataMin(0, ..) => false,
+                ClassExpr::Max(n, r, f) | ClassExpr::Exact(n, r, f) => {
+                    stack.push(*f);
+                    *n >= 1 || p(r)
+                }
+                ClassExpr::Min(n, r, f) => {
+                    stack.push(*f);
+                    *n >= 2 || p(r)
+                }
+                ClassExpr::Some(r, f) | ClassExpr::All(r, f) => {
+                    stack.push(*f);
+                    p(r)
+                }
+                ClassExpr::DataSome(d, _)
+                | ClassExpr::DataAll(d, _)
+                | ClassExpr::DataHasValue(d, _)
+                | ClassExpr::DataMin(_, d, _)
+                | ClassExpr::DataMax(_, d, _)
+                | ClassExpr::DataExact(_, d, _) => equating.contains(d),
+            };
+            if equates {
+                return true;
+            }
         }
+        false
     }
     let any = |v: &[ExprId]| v.iter().any(|&e| contains(o, e, equating));
     match axiom {
@@ -884,14 +975,81 @@ pub fn punned(o: &Ontology) -> Vec<Term> {
     punned
 }
 
-/// Whether the OWL 2 RL rules may read `o` otherwise than OWL 2 DL does: `o` has
-/// annotation-property axioms ([`Ontology::annotation_schema`]) or puns ([`punned`]), which
-/// theorem PR1 (OWL 2 Profiles §4.3) excludes, or an empty intersection or union
-/// ([`Ontology::empty_list`]), which they don't read, or a list's cell used outside its list
-/// ([`Ontology::list_cell_outside`]), which they may equate with another and so read
-/// sequences the graph doesn't write, or a name of two kinds or a structure no axiom uses that
-/// the rules read otherwise ([`crate::Diagnostic::reads_otherwise`]). The one detection the
-/// route, the answers' status and the consistency verdicts take.
+/// Whether the OWL 2 RL rules over the source read what OWL 2 DL reads of the ontology read:
+/// the premise of their closure (theorem PR1, OWL 2 Profiles §4.3: the graph is exactly the
+/// RDF mapping of that ontology), per way it breaks ([`premise`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Premise {
+    /// A diagnostic past which no model of the read ontology speaks of the source
+    /// ([`crate::Diagnostic::is_fatal`]).
+    pub fatal: bool,
+    /// The rules may read the source otherwise than OWL 2 DL reads the ontology, so a
+    /// conclusion of theirs, a clash too, may not be entailed ([`rules_read_differently`]).
+    pub reads_otherwise: bool,
+    /// The rules read less than the ontology says: what they conclude holds, but not all of it.
+    pub reads_less: bool,
+}
+
+impl Premise {
+    /// The graph is exactly the mapping of what the reader read: the rules decide it.
+    pub fn exact(self) -> bool {
+        !self.fatal && !self.reads_otherwise && !self.reads_less
+    }
+}
+
+/// [`Premise`] of `o`: the one place that tells it, from every diagnostic (each kind decided
+/// by [`crate::Diagnostic::is_fatal`] and [`crate::Diagnostic::reads_otherwise`], with no
+/// catch-all arm) and every part of `o`, each given its verdict below, so that a part added
+/// to [`Ontology`] doesn't compile here until it has one. Otherwise: annotation-property axioms
+/// or puns ([`punned`]), which PR1 excludes; an empty intersection or union, where a rule
+/// naming `owl:Thing` sees a blank node; a list's cell used outside its list, which the rules
+/// may equate with another and so read sequences the graph doesn't write. Less: a cardinality
+/// spelled otherwise than the rules name it, a statement the rules don't read that was read as
+/// axioms they would, or an axiom whose rules would compare or type data values
+/// ([`crate::ql::reads_data_values`]: the rule set has no dt-eq or dt-type2).
+pub fn premise(o: &Ontology) -> Premise {
+    let Ontology {
+        // The axioms read and their parts: what the checks below and the profile read.
+        classes: _,
+        ranges: _,
+        axioms: _,
+        sources: _,
+        diagnostics,
+        // Read past: no axiom (an annotation-property axiom is in `annotation_schema`).
+        annotations: _,
+        // Read by `rules_read_differently`, as are `empty_list` and `list_cell_outside`.
+        annotation_schema: _,
+        // A name of two kinds among them is a `Diagnostic::TwoKinds` (`crate::typing`).
+        annotation_uses: _,
+        annotation_axioms: _,
+        // SHACL content has no OWL meaning; copies across an equality are the status's own.
+        shacl: _,
+        // Ids, of the built-in properties and of the data axioms' literals.
+        builtin: _,
+        data: _,
+        // Each in a nominal or `hasValue` is a `Diagnostic::AnonymousIndividual`.
+        anonymous: _,
+        // Each is a `Diagnostic::Rule`, fatal.
+        rules: _,
+        noncanonical_cardinality,
+        empty_list: _,
+        // Read by `reads_data_values`.
+        qualified_data_max: _,
+        rules_unread,
+        list_cell_outside: _,
+    } = o;
+    Premise {
+        fatal: diagnostics.iter().any(crate::Diagnostic::is_fatal),
+        reads_otherwise: rules_read_differently(o),
+        reads_less: noncanonical_cardinality.is_some()
+            || rules_unread.is_some()
+            || crate::ql::reads_data_values(o).is_some(),
+    }
+}
+
+/// Whether the OWL 2 RL rules may read `o` otherwise than OWL 2 DL does
+/// ([`Premise::reads_otherwise`], as [`premise`] says): what a clash of theirs needs to be a
+/// verdict.
 pub fn rules_read_differently(o: &Ontology) -> bool {
     !o.annotation_schema.is_empty()
         || !punned(o).is_empty()

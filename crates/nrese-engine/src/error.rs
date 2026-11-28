@@ -36,6 +36,8 @@ pub enum EngineError {
     TransactionTooLarge { bytes: u64 },
     #[error("data directory {0} is locked by another process")]
     Locked(std::path::PathBuf),
+    #[error("an unfinished restore: empty the directory and restore again")]
+    UnfinishedRestore,
     #[error("{0} uses an unsupported storage format; reload the data into a new directory")]
     UnsupportedFormat(std::path::PathBuf),
     /// A speculative transaction ([`crate::Engine::speculative`]) was asked to commit.

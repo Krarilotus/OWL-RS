@@ -153,7 +153,7 @@ def rounds(candidate: str, records_of=None) -> list[dict]:
 
 
 def verdict(repo: Path, candidate: str, timed: list[dict], w3c: dict, guards: dict,
-            attempts: dict | None = None) -> subprocess.CompletedProcess:
+            attempts: dict | None = None, flags: tuple = ()) -> subprocess.CompletedProcess:
     """`release_gate.py verdict` on these parts, CANDIDATE resolved in REPO; each check's attempt records
     beside its result: the one its result names (ATTEMPTS: a kind's records instead, oldest first, or
     None for none)."""
@@ -163,13 +163,13 @@ def verdict(repo: Path, candidate: str, timed: list[dict], w3c: dict, guards: di
         records = (attempts or {}).get(kind, [attempt_record(kind, str(result.get("attempt")), tree)])
         write_attempts(tmp, kind, records or [])
     try:
-        return verdict_on(repo, candidate, tmp, timed, w3c, guards)
+        return verdict_on(repo, candidate, tmp, timed, w3c, guards, flags)
     finally:
         shutil.rmtree(tmp, True)
 
 
 def verdict_on(repo: Path, candidate: str, where: Path, timed: list[dict], w3c: dict | Path,
-               guards: dict | Path) -> subprocess.CompletedProcess:
+               guards: dict | Path, flags: tuple = ()) -> subprocess.CompletedProcess:
     """`release_gate.py verdict` with the timed parts and each check written into WHERE (a check given as a
     path: that file, where its attempt record lies beside it). A timed part goes where a fetch puts it, a
     directory of its own (WHERE/part-I), its report its part's newest attempt's (one carrying none is
@@ -189,7 +189,7 @@ def verdict_on(repo: Path, candidate: str, where: Path, timed: list[dict], w3c: 
         files[-1].write_text(json.dumps(part), encoding="utf-8")
     args = [a for f in files[:-2] for a in ("--timed", str(f))]
     return subprocess.run([sys.executable, str(GATE), "verdict", "--checkout", str(repo), "--candidate", candidate,
-                           *args, "--w3c", str(files[-2]), "--guards", str(files[-1])],
+                           *args, "--w3c", str(files[-2]), "--guards", str(files[-1]), *flags],
                           capture_output=True, text=True, timeout=120,
                           env=isolation.inherit("NRESE_", "FLEET_", PYTHONIOENCODING="utf-8"))
 
@@ -241,6 +241,38 @@ class CandidateJoin(Scratch):
         done = verdict(self.repo.path, a, rounds(a), *checks(b, self.repo.tree(a)))
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
         self.assertIn(f"{b[:12]} isn't of tree", done.stdout)
+
+
+class KnownOpenFaults(Scratch):
+    """The known open faults the verdict names are the candidate's own list (scripts/lib/known-faults.tsv)."""
+
+    def test_the_verdict_names_the_candidate_s_known_faults_and_a_full_correctness_cut_needs_none(self):
+        # Spec (scripts/lib/known-faults.tsv, its header; release_gate.py verdict --full-correctness): the
+        # verdict names each known open fault of the candidate's tree, never another commit's (HEAD here
+        # lists other ones), and counts them. An intermediate cut passes with them; a cut that claims full
+        # correctness is NOT PASSED with one listed or with no list at all, and passes with the candidate's
+        # list empty, whatever HEAD's says.
+        none = self.repo.commit(message="no list")
+        listed = "crate::it a::b\tA, said plainly.\n"
+        a = self.repo.commit(message="candidate A", files={"scripts/lib/known-faults.tsv": "# header\n" + listed})
+        empty = self.repo.commit(policy="# another tree\n", message="candidate B",
+                                 files={"scripts/lib/known-faults.tsv": "# header\n"})
+        self.repo.commit(policy="# a third tree\n", message="head", files={
+            "scripts/lib/known-faults.tsv": "# header\ncrate::it c::d\tC, said plainly.\n"})
+        done = verdict(self.repo.path, a, rounds(a), *checks(a, self.repo.tree(a)))
+        self.assertEqual(done.returncode, 0, f"SPEC known-intermediate\n{done.stdout}{done.stderr}")
+        self.assertIn("- known open fault: crate::it a::b: A, said plainly.\n- known open faults: 1\n", done.stdout,
+                      "SPEC known-notes: the candidate's list")
+        self.assertNotIn("c::d", done.stdout, "SPEC known-notes: never HEAD's list")
+        done = verdict(self.repo.path, a, rounds(a), *checks(a, self.repo.tree(a)), flags=("--full-correctness",))
+        self.assertEqual(done.returncode, 1, f"SPEC known-full-correctness\n{done.stdout}{done.stderr}")
+        self.assertIn("a cut that claims full correctness needs a list, and an empty one", done.stdout)
+        done = verdict(self.repo.path, empty, rounds(empty), *checks(empty, self.repo.tree(empty)),
+                       flags=("--full-correctness",))
+        self.assertEqual(done.returncode, 0, f"SPEC known-full-correctness: an empty list\n{done.stdout}{done.stderr}")
+        done = verdict(self.repo.path, none, rounds(none), *checks(none, self.repo.tree(none)),
+                       flags=("--full-correctness",))
+        self.assertEqual(done.returncode, 1, f"SPEC known-full-correctness: no list\n{done.stdout}{done.stderr}")
 
 
 class EvidenceContract(Scratch):

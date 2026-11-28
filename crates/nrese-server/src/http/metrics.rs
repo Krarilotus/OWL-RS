@@ -49,6 +49,25 @@ nrese_store_mode_info{{mode=\"{}\",durability=\"{}\"}} 1\n",
         state.store_mode_name(),
         state.durability_name(),
     );
+    body.push_str(
+        "# HELP nrese_write_program_state Write program state (0 none, 1 building, 2 ready, 3 failed).\n\
+# TYPE nrese_write_program_state gauge\n\
+# HELP nrese_write_program_builds_total Write program build attempts by cause.\n\
+# TYPE nrese_write_program_builds_total counter\n",
+    );
+    let repositories = state.repositories();
+    let ids = std::iter::once(nrese_store::catalog::DEFAULT_REPOSITORY.to_owned())
+        .chain(repositories.list().into_iter().map(|(id, _)| id));
+    for id in ids {
+        if let Some(repo) = repositories.get(&id) {
+            let (phase, prepare, commit) = repo.pipeline.read().write_program_metrics();
+            body.push_str(&format!(
+                "nrese_write_program_state{{repository=\"{id}\"}} {phase}\n\
+nrese_write_program_builds_total{{repository=\"{id}\",cause=\"prepare\"}} {prepare}\n\
+nrese_write_program_builds_total{{repository=\"{id}\",cause=\"commit\"}} {commit}\n"
+            ));
+        }
+    }
     let replication = state.replication();
     if replication.is_replica() {
         let status = replication.status(state.store().current_revision());

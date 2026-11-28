@@ -33,35 +33,45 @@ pub struct EngineBase<'a> {
     deletes: HashSet<EncodedQuad>,
     /// The ruleset's axioms (sorted): they count as asserted, so no deletion retracts them.
     axioms: &'a [Triple],
+    axiom_predicates: HashSet<u64>,
 }
 
 impl<'a> EngineBase<'a> {
     pub fn new(tx: &'a Transaction<'_>, axioms: &'a [Triple]) -> Self {
         let inserts: Vec<Triple> = tx.inserted().map(triple).collect();
+        let mut axiom_predicates = HashSet::new();
+        for &[_, predicate, _] in axioms {
+            axiom_predicates.insert(predicate);
+        }
         Self {
             snapshot: tx.base().counted(),
             inserts: MemoryBase::new(&inserts, &[]),
             deletes: tx.deleted().collect(),
             axioms,
+            axiom_predicates,
         }
     }
 
-    /// Whether `fact` was in the state before the transaction (any graph, either stack): one
+    /// Whether `fact` was in `model` before the transaction (any graph): one
     /// lookup, counted on `poll` before it is made; [`Stopped`] once `poll`
     /// has stopped, never a "not known" that would keep the fact.
-    fn known_before(&self, fact: Triple, poll: &Poller<'_>) -> Result<bool, Stopped> {
+    fn known_before(
+        &self,
+        model: ReadModel,
+        fact: Triple,
+        poll: &Poller<'_>,
+    ) -> Result<bool, Stopped> {
         #[cfg(test)]
         crate::witness::add(crate::witness::Site::KnownBefore, 1);
         if poll.tick() {
             return Err(Stopped);
         }
         // Its work in the engine counted too (REAS-3, SW016), a deleted copy found as any.
-        let found = self.snapshot.point_graphs(
-            ReadModel::Materialised,
-            ids(fact),
-            &|n| poll.visit(n),
-            |_| Ok(ControlFlow::Break(())),
-        )?;
+        let found = self
+            .snapshot
+            .point_graphs(model, ids(fact), &|n| poll.visit(n), |_| {
+                Ok(ControlFlow::Break(()))
+            })?;
         Ok(found.is_break())
     }
 
@@ -186,6 +196,9 @@ impl VisitsBase for EngineBase<'_> {
             }
         }
         self.inserts.visit(bound, visit);
+        if bound[1].is_some_and(|predicate| !self.axiom_predicates.contains(&predicate)) {
+            return;
+        }
         let matches = |fact: &Triple| {
             bound
                 .iter()
@@ -193,6 +206,8 @@ impl VisitsBase for EngineBase<'_> {
                 .all(|(want, have)| want.is_none_or(|want| want == *have))
         };
         for axiom in self.axioms.iter() {
+            #[cfg(test)]
+            crate::witness::add(crate::witness::Site::AssertedAxiom, 1);
             let going = match matches(axiom) {
                 true => visit.fact(*axiom),
                 false => visit.skip(),
@@ -322,15 +337,20 @@ pub fn maintain_with_report_budget(
 ) -> Result<Maintenance, delta::Interrupted> {
     // Axioms that need an inferred copy published by this commit.
     let mut missing_axioms: Vec<Triple> = Vec::new();
-    // Unnamed classes left out: as the commit leaves them; one it makes consumable
-    // needs a rematerialisation for the memberships left out so far.
-    let (schema, revived) = if program.hide_unnamed_classes {
+    // The new hidden map may restore memberships or withdraw ones the old closure held.
+    let (schema, revived, rehidden) = if program.hide_unnamed_classes {
         let before = program.hidden_classes(tx.base());
         let after = program.hidden_classes(&tx.pending_snapshot());
         let revived = before.keys().any(|class| !after.contains_key(class));
-        (program.schema.clone().hiding(after), revived)
+        let rehidden = after.iter().any(|(&class, hidden)| {
+            before.get(&class).map_or_else(
+                || super::mentions(tx.base(), class),
+                |previous| previous != hidden,
+            )
+        });
+        (program.schema.clone().hiding(after), revived, rehidden)
     } else {
-        (program.schema.clone(), false)
+        (program.schema.clone(), false, false)
     };
     // A first load (no asserted fact before, nothing deleted): its closure is the whole
     // closure, so it is materialised once, by the batch executor, and its violations are
@@ -373,7 +393,8 @@ pub fn maintain_with_report_budget(
         None
     };
     let redeclared = !first_load && changed_annotations.is_some();
-    let comparison_memory = (redeclared && !uses_rebuilt_report).then(working_memory);
+    let settled = !first_load && (redeclared || rehidden);
+    let comparison_memory = (settled && !uses_rebuilt_report).then(working_memory);
     let rebuild_memory = comparison_memory.as_ref().unwrap_or(memory);
     // Revived memberships participate in the delta executor's introduced-only checks.
     // Keep the full result for installation below, so it is computed once.
@@ -416,20 +437,29 @@ pub fn maintain_with_report_budget(
         // derived one known before) count on the commit's stop, as the update's do.
         let stop: crate::eval::Stop<'_> = &|| operation.fired();
         let prep = Poller::new(stop).ok_or_else(|| operation.interrupted())?;
-        // Facts new to the state: in no graph and not inferred before the transaction. Each
-        // lookup in the state before counts on `prep`; the first that finds
-        // `prep` stopped ends the maintenance there, its partial lists dropped (a stopped lookup read as "not known" kept every fact after
-        // it).
+        // Each lookup in the old state counts on `prep`; a stop ends maintenance.
         let interrupted = |_: Stopped| operation.interrupted();
         let mut inserted: Vec<Triple> = Vec::new();
         for fact in tx.inserted().map(triple) {
-            if !base.known_before(fact, &prep).map_err(interrupted)? {
+            // An assertion changes a written list even if the fact was already inferred.
+            let model = if rules
+                .lists
+                .is_some_and(|lists| lists.uses_written_disjoints() && lists.is_list_fact(fact))
+            {
+                ReadModel::Asserted
+            } else {
+                ReadModel::Materialised
+            };
+            if !base.known_before(model, fact, &prep).map_err(interrupted)? {
                 inserted.push(fact);
             }
         }
         if !(inserted.is_empty() && tx.deleted().next().is_none()) {
             for &axiom in &program.axioms {
-                if base.known_before(axiom, &prep).map_err(interrupted)? {
+                if base
+                    .known_before(ReadModel::Materialised, axiom, &prep)
+                    .map_err(interrupted)?
+                {
                     continue;
                 }
                 if !base.inserts.contains(axiom, &prep).map_err(interrupted)? {
@@ -444,15 +474,18 @@ pub fn maintain_with_report_budget(
                 .iter()
                 .map(|t| triple(t.in_default_graph()))
             {
-                if !base.known_before(fact, &prep).map_err(interrupted)? {
+                if !base
+                    .known_before(ReadModel::Materialised, fact, &prep)
+                    .map_err(interrupted)?
+                {
                     inserted.push(fact);
                 }
             }
         }
         inserted.sort_unstable();
         inserted.dedup();
-        // A triple deleted from one graph but still asserted in another stays a fact. The
-        // first probe that finds `prep` stopped ends the maintenance.
+        // A triple deleted from one graph but still asserted in another stays a fact.
+        // Loss of the last assertion changes a written list even if the fact is rederived.
         let mut deleted: Vec<Triple> = Vec::new();
         let mut republished = BTreeSet::new();
         for fact in tx.deleted().map(triple) {
@@ -476,7 +509,7 @@ pub fn maintain_with_report_budget(
         // Facts with an inverse expression as their predicate: the stored closure lacks the
         // base's, so a delta can't read them. Such a change runs its delta, whose consistency
         // check stands, and is then rebuilt: the closure after it is the one a rebuild gives.
-        delta_ran = !(first_load || redeclared || inserted.is_empty() && deleted.is_empty());
+        delta_ran = !(first_load || settled || inserted.is_empty() && deleted.is_empty());
         deletes = !deleted.is_empty();
         unkept = delta_ran && has_inverse_expression(tx.base(), &prep).map_err(interrupted)?;
         // A rebuild reads the asserted facts and writes the closure, both about the size
@@ -489,7 +522,7 @@ pub fn maintain_with_report_budget(
                 .then(|| tx.base().len_in(ReadModel::Materialised)),
             split_rebuilds: program.stores_representatives(),
         };
-        if redeclared {
+        if settled {
             // Rebuilt, then judged by the rebuild's report or by what it introduces (below).
             delta::Update {
                 policy: delta::policy::Counts {
@@ -566,7 +599,7 @@ pub fn maintain_with_report_budget(
     // A list that already stopped at its budget makes the change inconsistent: the
     // datatype checks would add nothing to that. A first load judged by its rebuild has
     // them in the batch's report already.
-    if !redeclared && update.violations.complete() && !(first_load && uses_rebuilt_report) {
+    if !settled && update.violations.complete() && !(first_load && uses_rebuilt_report) {
         let datatypes = super::datatypes::violations(
             &update.insert,
             program.rdf_type,
@@ -668,6 +701,7 @@ pub fn maintain_with_report_budget(
         // class. Ground the final prospective state, and publish this cache only if
         // the caller commits. Existing unrelated violations remain tolerated.
         let ground_at = |snapshot| {
+            operation.count_grounding();
             program
                 .ground_program_until(snapshot, &|| operation.fired())
                 .map_err(|_| operation.interrupted())
@@ -901,6 +935,10 @@ fn store_over_representatives(
     }
     Some((inserted, removed))
 }
+
+#[cfg(test)]
+#[path = "../tests/maintain_grounding.rs"]
+mod grounding_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1267,7 +1305,7 @@ mod tests {
             assert_eq!(base.contains(fact, &poll), Ok(left), "held: {left}");
             assert_eq!(base.is_asserted(fact, &poll), Ok(left), "asserted: {left}");
             assert_eq!(
-                base.known_before(fact, &poll),
+                base.known_before(ReadModel::Materialised, fact, &poll),
                 Ok(true),
                 "known before the change"
             );
@@ -1762,6 +1800,79 @@ mod tests {
         assert!(
             maintained.is_err(),
             "a stopped commit's maintenance is interrupted"
+        );
+    }
+
+    #[test]
+    fn writing_a_long_list_does_not_scan_unrelated_program_axioms() {
+        use crate::witness::{self, Site};
+        use std::fmt::Write;
+
+        let visits = [8, 64].map(|axioms| {
+            let engine = Engine::new(EngineConfig {
+                background_maintenance: false,
+                ..EngineConfig::default()
+            })
+            .unwrap();
+            let mut schema = String::new();
+            for i in 0..axioms {
+                writeln!(
+                    schema,
+                    "<http://example.com/C{i}> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://example.com/Root> ."
+                )
+                .unwrap();
+            }
+            let rules = crate::RuleProgram::new(
+                Some(crate::rulesets::Ruleset::Owl2Rl),
+                Some(Arc::new(crate::UserRules::n3("schema", schema).unwrap())),
+            )
+            .unwrap()
+            .with_named_keys(true);
+            let mut tx = engine.transaction();
+            let program = Program::compile(&rules, &|t| tx.intern(t));
+            let iri = |s: &str| tx.intern(NamedNodeRef::new_unchecked(s).into()).raw();
+            let sub = iri("http://www.w3.org/2000/01/rdf-schema#subClassOf");
+            let root = iri("http://example.com/Root");
+            let members: Vec<_> = (0..10_000)
+                .map(|i| iri(&format!("http://example.com/C{i}")))
+                .collect();
+            for &class in &members[..axioms] {
+                tx.insert_encoded(encode([class, sub, root]).in_default_graph());
+            }
+            let loaded = maintain(&program, None, &mut tx, crate::eval::NEVER).unwrap();
+            let ground = loaded.program.expect("schema ground program");
+            tx.commit().unwrap();
+
+            let mut tx = engine.transaction();
+            let iri = |s: &str| tx.intern(NamedNodeRef::new_unchecked(s).into()).raw();
+            let rdf = |s| iri(&format!("http://www.w3.org/1999/02/22-rdf-syntax-ns#{s}"));
+            let owl = |s| iri(&format!("http://www.w3.org/2002/07/owl#{s}"));
+            let blank = |s: &str| tx.intern(BlankNodeRef::new_unchecked(s).into()).raw();
+            let (first, rest, nil) = (rdf("first"), rdf("rest"), rdf("nil"));
+            let axiom = blank("axiom");
+            let cells: Vec<_> = (0..members.len()).map(|i| blank(&format!("c{i}"))).collect();
+            for fact in [
+                [axiom, rdf("type"), owl("AllDisjointClasses")],
+                [axiom, owl("members"), cells[0]],
+            ] {
+                tx.insert_encoded(encode(fact).in_default_graph());
+            }
+            for (i, (&cell, &member)) in cells.iter().zip(&members).enumerate() {
+                let next = cells.get(i + 1).copied().unwrap_or(nil);
+                tx.insert_encoded(encode([cell, first, member]).in_default_graph());
+                tx.insert_encoded(encode([cell, rest, next]).in_default_graph());
+            }
+            let before = witness::get(Site::AssertedAxiom);
+            let done = maintain(&program, Some(&ground), &mut tx, crate::eval::NEVER).unwrap();
+            let examined = witness::get(Site::AssertedAxiom) - before;
+            assert!(done.violations.consistent());
+            assert!(done.diagnostics.is_empty());
+            tx.commit().unwrap();
+            examined
+        });
+        assert_eq!(
+            visits[0], visits[1],
+            "unrelated axioms increased list reads"
         );
     }
 

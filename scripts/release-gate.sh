@@ -15,7 +15,7 @@
 #                                           every side's runs centred on the same time), on each
 #                                           side's build of layout LAYOUT (GATE_LAYOUTS), copied
 #                                           for the block; orientation and case order from GATE_SEED
-#   release-gate.sh report HARNESS SIDE=REV ...   the timed part's report (the first SIDE the candidate)
+#   release-gate.sh report HARNESS [--round-one FILE] SIDE=REV ...   the timed part's report
 #   release-gate.sh w3c                     the W3C suites with their data required, their counts checked
 #   release-gate.sh guards                  every guard docs/design/performance.md §0 names, run and passed
 #   release-gate.sh pack REV ...            the revisions' verified binaries as one tar (FLEET_OUT/binaries),
@@ -29,7 +29,10 @@
 #                                           runs it
 #   release-gate.sh verdict CAND TIMED_DIR... CHECKS_DIR   every part together, each host's rounds
 #                                           combined, every part bound to CAND's tree, under the
-#                                           policy CAND's tree holds (benches/release-tradeoffs.toml)
+#                                           policy CAND's tree holds (benches/release-tradeoffs.toml), its
+#                                           known open faults named (scripts/lib/known-faults.tsv); with
+#                                           GATE_FULL_CORRECTNESS=1, a cut that claims full correctness,
+#                                           it passes only with that list at CAND, empty
 #   release-gate.sh jobs CAND [OPTIONS]     the fleet jobs of a whole gate (release_gate.py jobs --help)
 #   release-gate.sh clean                   the gate's worktrees and build trees, and what dead invocations
 #                                           of its process space left (binaries and data stay; a live
@@ -81,6 +84,10 @@ GATE_HOST=${GATE_HOST:-${FLEET_HOST:-}}
 anchored() { case $1 in /* | [A-Za-z]:[/\\]*) printf '%s' "$1" ;; *) printf '%s/%s' "$PWD" "$1" ;; esac; }
 GATE=$(anchored "$GATE") GATE_BIN=$(anchored "$GATE_BIN") OUT=$(anchored "$OUT")
 SPARQL_DATA=$(anchored "$SPARQL_DATA") SHARED=$(anchored "$SHARED")
+if [ -n "${FLEET_HOST:-}${GATE_HOST:-}${NRESE_BENCH_PRIVATE:-}${BENCH_INPUTS_GIT:-}${NRESE_BENCH_HOSTS+x}${NRESE_BENCH_FLOORS+x}${NRESE_BENCH_OVERLAY_REV+x}" ]; then
+  GATE_HOST="$GATE_HOST" python3 -I benches/suite/suitekit/hosts.py evidence \
+    "$GATE" "$GATE_BIN" "$OUT" "$OUT/gate.log" "$SPARQL_DATA" "$SHARED" || exit 2
+fi
 mkdir -p "$GATE" "$GATE_BIN" "$OUT"
 # A desktop's file indexer (GNOME's localsearch on the timed host indexes all of $HOME) reads every
 # file the gate writes, during the passes: these directories are excluded from it (Tracker's
@@ -115,10 +122,12 @@ drop_checkout() {
   rm -rf "$1" && git worktree remove --force "$1" 2>/dev/null
   return 0
 }
+report_stage=
 finish() {
   local dir
   cd "$launch" 2>/dev/null || cd /
   for dir in "$RUN"/src-*; do [ ! -d "$dir" ] || drop_checkout "$dir"; done
+  [ -z "$report_stage" ] || rm -rf -- "$report_stage"
   rm -rf "$RUN"
 }
 trap finish EXIT
@@ -709,8 +718,18 @@ p = sys.argv[1]; v = json.load(open(p)); v["repeat"] = True; json.dump(v, open(p
 report)
   harness=$(git rev-parse "$2") || exit 2
   shift 2
+  args=() candidate= round_one=
+  if [ "${1:-}" = --round-one ]; then
+    round_one=$(cd "$launch" && anchored "${2:?report --round-one needs a file}") || exit 2
+    [ -f "$round_one" ] || { echo "report: no first-round file ($round_one)" >&2; exit 2; }
+    if [ "$round_one" -ef "$OUT/release-gate.json" ] || [ "$round_one" -ef "$OUT/release-gate.md" ]; then
+      echo "report: the first-round input is also a report output ($round_one)" >&2
+      exit 2
+    fi
+    args+=(--round-one "$round_one")
+    shift 2
+  fi
   tree=$(worktree "$harness") || exit 2
-  args=() candidate=
   for spec in "$@"; do
     name=${spec%%=*}
     rev=$(git rev-parse "${spec#*=}") || exit 2
@@ -722,7 +741,10 @@ report)
   # the gate directory holds by now; a confirmation prepares nothing and reads
   # its part's (GATE_PLAN, the part's plan.json and inputs.txt).
   own_plan=$PLAN own_family=$GATE/plan.json own_inputs=$GATE/inputs.txt
-  if [ -z "${GATE_PLAN:-}" ] && [ -f "$OUT/plan.json" ] && [ -f "$OUT/inputs.txt" ]; then
+  if [ -n "$round_one" ]; then
+    first_out=$(dirname "$round_one")
+    own_family=$first_out/plan.json own_inputs=$first_out/inputs.txt
+  elif [ -z "${GATE_PLAN:-}" ] && [ -f "$OUT/plan.json" ] && [ -f "$OUT/inputs.txt" ]; then
     own_plan=$OUT/plan.json own_family=$OUT/plan.json own_inputs=$OUT/inputs.txt
   fi
   for key in not_run elsewhere; do
@@ -734,16 +756,41 @@ report)
   # writing left the earlier PASSED one, which the step and the verdict took for this run's).
   { rm -f "$OUT/release-gate.json" "$OUT/release-gate.md" && [ ! -e "$OUT/release-gate.json" ]; } \
     || { log "report: the earlier report $OUT/release-gate.json can't be removed: no report"; exit 1; }
+  report_out=$OUT
+  if [ -n "$round_one" ]; then
+    report_stage=$(mktemp -d "$OUT/.paired-report-XXXXXX") || exit 2
+    report_out=$report_stage
+  fi
   (cd "$tree" && py benches/fast/release_gate.py report --passes "$OUT/passes" --candidate "$candidate" "${args[@]}" \
      --require "$required" --harness-revision "$harness" --min-blocks "${GATE_MIN_BLOCKS:-2}" --family "$own_family" \
      --inputs "$own_inputs" \
      --context "host=${GATE_HOST:-}" --context "round=${GATE_ROUND:-0}" --context "prefix=${GATE_PREFIX:-}" \
      --context "gate_name=${GATE_NAME:-}" --context "max_gb=$MAX_GB" --context "ram_gb=${GATE_RAM_GB:-$MAX_GB}" \
      --context "layouts=$LAYOUTS" \
-     --out "$OUT/release-gate.md" --json "$OUT/release-gate.json") > "$OUT/report.log" 2>&1
+     --out "$report_out/release-gate.md" --json "$report_out/release-gate.json") > "$OUT/report.log" 2>&1
   code=$?
-  log "timed part: $( [ $code -eq 0 ] && echo passed || echo 'not passed') ($OUT/release-gate.md)"
-  # The verdict is the gate's; this step only fails when no report could be written.
+  if [ -n "$round_one" ]; then
+    [ "$code" -eq 0 ] || exit "$code"
+    if ! [ -f "$report_out/release-gate.md" ] ||
+       ! py -c 'import json, sys; sys.exit(json.load(open(sys.argv[1], encoding="utf-8")).get("errors") != [])' \
+            "$report_out/release-gate.json" >> "$OUT/report.log" 2>&1; then
+      log "paired report: incomplete outputs or evidence errors ($OUT/report.log)"
+      exit 1
+    fi
+    # The JSON is the receipt that both files are ready, so it goes last.
+    if ! mv -- "$report_out/release-gate.md" "$OUT/release-gate.md" ||
+       ! mv -- "$report_out/release-gate.json" "$OUT/release-gate.json"; then
+      rm -f "$OUT/release-gate.json" "$OUT/release-gate.md"
+      exit 1
+    fi
+    log "paired report published ($OUT/release-gate.md)"
+  elif [ "$code" -gt 1 ]; then
+    rm -f "$OUT/release-gate.json" "$OUT/release-gate.md"
+    exit "$code"
+  else
+    log "timed part: $( [ $code -eq 0 ] && echo passed || echo 'not passed') ($OUT/release-gate.md)"
+  fi
+  # For an ordinary round, exit 1 with a completed report is a judged result.
   [ -f "$OUT/release-gate.json" ] || exit 1
   ;;
 
@@ -826,7 +873,7 @@ verdict)
   }
   w3c=$(one w3c.json "$1") && guards=$(one guards.json "$1") || exit 2
   py "$CODE/benches/fast/release_gate.py" verdict --checkout "$launch" --candidate "$candidate" "${args[@]}" \
-    --w3c "$w3c" --guards "$guards" --out "$OUT/verdict.md"
+    --w3c "$w3c" --guards "$guards" ${GATE_FULL_CORRECTNESS:+--full-correctness} --out "$OUT/verdict.md"
   ;;
 
 pack)

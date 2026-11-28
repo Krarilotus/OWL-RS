@@ -41,7 +41,7 @@ sys.path.insert(0, str(ROOT / "benches/suite"))
 import datalog  # noqa: E402
 import program as P  # noqa: E402
 from maintenance import CountingWriter, NreseBinary, update  # noqa: E402
-from suitekit import quiet  # noqa: E402
+from suitekit import hosts, quiet  # noqa: E402
 from suitekit.adapters import Context, images_for  # noqa: E402
 from suitekit.manifest import Manifest  # noqa: E402
 from suitekit.runtime import DockerRuntime, Mount, memory_fields  # noqa: E402
@@ -158,8 +158,9 @@ def run_case(args, case: dict, rep: int, runtime: DockerRuntime, writer, results
         shutil.rmtree(work, ignore_errors=True)
 
 
+@hosts.run_snapshot
 def cmd_run(args) -> int:
-    results = Path(args.results)
+    results = hosts.evidence_path(Path(args.results), hosts.private_session(), ROOT)
     results.mkdir(parents=True, exist_ok=True)
     args.date = datetime.datetime.now().isoformat(timespec="minutes")
     args.stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")

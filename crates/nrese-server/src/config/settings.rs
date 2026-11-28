@@ -298,6 +298,14 @@ pub const SETTINGS: &[Setting] = &[
         OPTIONAL_FILE,
         "A file loaded at startup; a missing file is a startup error.",
     ),
+    // [gates]
+    setting(
+        "gates.undecided",
+        names::GATES_UNDECIDED,
+        Choice(&["mark", "refuse"]),
+        Unset::Text("mark"),
+        "What to do when the store's consistency cannot be decided.",
+    ),
     // [shacl]
     setting(
         "shacl.shapes_graph",
@@ -319,6 +327,13 @@ pub const SETTINGS: &[Setting] = &[
         Choice(&["violation", "warning", "info"]),
         Unset::Text("violation"),
         "The least severity an enforcing gate rejects.",
+    ),
+    setting(
+        "shacl.reject_results",
+        names::SHACL_REJECT_RESULTS,
+        Limit(None),
+        Unset::Number(10),
+        "The count limit for each list in a SHACL refusal (0 or unlimited: no count limit). The write's memory budget also applies.",
     ),
     // [reasoner]
     setting(

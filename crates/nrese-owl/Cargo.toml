@@ -10,6 +10,10 @@ license.workspace = true
 [dependencies]
 foldhash = { workspace = true }
 
+[features]
+# Test-only work counters for other crates' tests (debug builds only).
+witness = []
+
 [dev-dependencies]
 nrese-rdf = { path = "../rdf/nrese-rdf" }
 nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }

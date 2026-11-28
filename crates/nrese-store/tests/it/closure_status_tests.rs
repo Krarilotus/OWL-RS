@@ -166,17 +166,55 @@ fn committed(more: &str) -> nrese_store::MutationPipeline {
 
 /// The rows of `query` and its statuses, as the answer and its plan give them.
 fn answer(store: &StoreService, query: &str) -> (String, [&'static str; 2]) {
+    let (rows, claims) = answer_claims(store, query);
+    (
+        rows,
+        claims.map(|claim| claim.map_or("none", |c| c.as_str())),
+    )
+}
+
+fn answer_claims(
+    store: &StoreService,
+    query: &str,
+) -> (String, [Option<nrese_sparql::Completeness>; 2]) {
     let request = SparqlQueryRequest::all(format!("{PREFIXES}{RDF}{query}"));
     let result = store.execute_query(&request).expect("answered");
     let prepared = store.prepare_query(&request).expect("prepared");
     let planned = store
         .plan_query(&prepared, &CancellationToken::new())
         .expect("planned");
-    let status = |c: Option<nrese_sparql::Completeness>| c.map_or("none", |c| c.as_str());
     (
         String::from_utf8(result.payload).unwrap(),
-        [status(result.completeness), status(planned.completeness)],
+        [result.completeness, planned.completeness],
     )
+}
+
+// The clean comparison controls still exclude a datatype reason. OWL 2 QL adds its
+// consistency reason, which also makes a count or negation provisional.
+fn clean_comparison(
+    regime: &str,
+    query: &str,
+    claims: &[Option<nrese_sparql::Completeness>; 2],
+) -> bool {
+    claims.iter().all(|claim| {
+        claim.as_ref().is_some_and(|status| {
+            if regime != "owl2-ql" {
+                return status.as_str() == "complete";
+            }
+            let operator = query.contains("COUNT(") || query.contains("NOT EXISTS");
+            status.as_str() == if operator { "unsound" } else { "sound-only" }
+                && status.reasons.len() == if operator { 2 } else { 1 }
+                && status
+                    .reasons
+                    .iter()
+                    .any(|reason| reason.source == "consistency")
+                && (!operator
+                    || status.reasons.iter().any(|reason| {
+                        reason.source == "ql"
+                            && reason.text.contains("over answers that may be missing")
+                    }))
+        })
+    })
 }
 
 /// Each case's wrong row is returned and labelled `unsound`; what else happens, as text.
@@ -310,22 +348,28 @@ fn only_user_predicates_and_classes_can_be_complete() {
             "SELECT ?p { :ann ?p :rex }",
             "SELECT ?c { :rex a ?c }",
         ] {
-            let status = answer(store, denied).1;
-            if status.contains(&"complete") {
+            let status = answer_claims(store, denied).1;
+            if !status.iter().all(|claim| {
+                claim.as_ref().is_some_and(|claim| {
+                    !claim.complete
+                        && (name != "owl2-ql"
+                            || claim.reasons.iter().any(|reason| reason.source == "ql"))
+                })
+            }) {
                 all.push(format!("{name}: {denied}: {status:?}"));
             }
         }
         for guard in ["ASK { :ann :owns :rex }", "SELECT ?x { ?x a :Animal }"] {
-            let status = answer(store, guard).1;
-            if status != ["complete"; 2] {
+            let status = answer_claims(store, guard).1;
+            if !clean_comparison(name, guard, &status) {
                 all.push(format!("{name}: guard {guard}: {status:?}"));
             }
         }
     }
     let store = closure(DATA, Ruleset::Owl2Ql, QlRewritingMode::Auto);
     let guard = "SELECT ?x { ?x a :Animal FILTER NOT EXISTS { ?x a :Dog } }";
-    let status = answer(&store, guard).1;
-    if status != ["complete"; 2] {
+    let status = answer_claims(&store, guard).1;
+    if !clean_comparison("owl2-ql", guard, &status) {
         all.push(format!("owl2-ql: guard {guard}: {status:?}"));
     }
     assert!(all.is_empty(), "{all:#?}");
@@ -1639,9 +1683,9 @@ fn a_typed_constant_no_pattern_matches_leaves_an_answer_complete() {
         "SELECT ?v (1 AS ?k) { ?v :age ?a }",
     ] {
         for (regime, store) in [("owl2-dl", owl2_dl(data)), ("owl2-ql", ql(data))] {
-            let (rows, status) = answer(&store, read);
+            let (rows, status) = answer_claims(&store, read);
             eprintln!("{regime} {read}: {rows} {status:?}");
-            if !rows.contains("example.com/a0") || status != ["complete"; 2] {
+            if !rows.contains("example.com/a0") || !clean_comparison(regime, read, &status) {
                 wrong.push(format!("{regime} {read}: {rows} {status:?}"));
             }
         }
@@ -2039,9 +2083,9 @@ fn comparing_iris_or_strings_by_term_leaves_an_answer_complete() {
     let mut wrong = Vec::new();
     for (regime, store) in PROMISING {
         for (data, read, right) in cases {
-            let (rows, status) = answer(&store(data), read);
+            let (rows, status) = answer_claims(&store(data), read);
             eprintln!("{regime}, {read}: {rows} {status:?}");
-            if !right(&rows) || status != ["complete"; 2] {
+            if !right(&rows) || !clean_comparison(regime, read, &status) {
                 wrong.push(format!("{regime}, {read}: {rows} {status:?}"));
             }
         }
@@ -2080,9 +2124,9 @@ fn owl2_ql_keeps_complete_over_undeclared_properties_of_iris_or_strings() {
     ];
     let mut wrong = Vec::new();
     for (data, read, right) in cases {
-        let (rows, status) = answer(&store(data), read);
+        let (rows, status) = answer_claims(&store(data), read);
         eprintln!("{read}: {rows} {status:?}");
-        if !right(&rows) || status != ["complete"; 2] {
+        if !right(&rows) || !clean_comparison("owl2-ql", read, &status) {
             wrong.push(format!("{read}: {rows} {status:?}"));
         }
     }
@@ -2179,9 +2223,9 @@ fn a_plain_string_asked_where_one_is_stored_stays_complete() {
     let mut wrong = Vec::new();
     for (regime, store) in PROMISING {
         for read in NAMES_REX {
-            let (rows, status) = answer(&store(data), read);
+            let (rows, status) = answer_claims(&store(data), read);
             eprintln!("{regime}, {read}: {rows} {status:?}");
-            if !rows.contains("example.com/a\"") || status != ["complete"; 2] {
+            if !rows.contains("example.com/a\"") || !clean_comparison(regime, read, &status) {
                 wrong.push(format!("{regime}, {read}: {rows} {status:?}"));
             }
         }
@@ -2252,10 +2296,10 @@ fn a_join_at_the_start_of_a_path_without_a_reversed_step_stays_complete() {
     let read = "SELECT ?x ?y { ?z :knows+ ?x . ?z :knows+ ?y FILTER(?x != ?y) }";
     let mut wrong = Vec::new();
     for (regime, store) in PROMISING {
-        let (rows, status) = answer(&store(data), read);
+        let (rows, status) = answer_claims(&store(data), read);
         eprintln!("{regime}: {rows} {status:?}");
         let pair = rows.contains("example.com/a\"") && rows.contains("example.com/b\"");
-        if !pair || status != ["complete"; 2] {
+        if !pair || !clean_comparison(regime, read, &status) {
             wrong.push(format!("{regime}: {rows} {status:?}"));
         }
     }
@@ -2364,9 +2408,9 @@ fn a_paths_end_over_iris_stays_complete_beside_a_number() {
     for (regime, store) in PROMISING {
         let store = store(data);
         for (read, right) in cases {
-            let (rows, status) = answer(&store, read);
+            let (rows, status) = answer_claims(&store, read);
             eprintln!("{regime}, {read}: {rows} {status:?}");
-            if !right(&rows) || status != ["complete"; 2] {
+            if !right(&rows) || !clean_comparison(regime, read, &status) {
                 wrong.push(format!("{regime}, {read}: {rows} {status:?}"));
             }
         }

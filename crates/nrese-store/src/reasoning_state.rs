@@ -36,31 +36,21 @@ pub struct ReasoningState {
     /// is current only for data that doesn't equate `rdf:nil` with another term, so only a
     /// store whose data does rebuilds, once.
     pub nil_lists: bool,
-    /// The rules equate a literal with another term, a fact no store holds, so statements
-    /// written since lack its copies (`nrese_reasoner::engine::Closure::literal_equality`):
-    /// reads of typed values aren't `complete` (`dl::query::withhold`). Set by a
-    /// rematerialisation as its closure tells or by a commit that derives one. A
-    /// certificate also sets it when literal equality is unknown. Never written.
-    pub(crate) literal_equality: bool,
-    /// An open without a rematerialisation leaves literal equality unknown. Certification
-    /// clears this uncertainty only for a matching program that cannot equate literals.
-    /// Otherwise, no reader's view can settle it and every reader's reads of literals are
-    /// withheld, a reader by support's too (`dl::query::withhold`).
-    pub(crate) literal_equality_unknown: bool,
 }
 
 /// Whether the stored data is consistent under the configured ruleset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsistencyStatus {
-    /// No current reasoning state (reasoning off, or not yet materialised).
+    /// No current reasoning state (reasoning off, or not yet materialised); or, under
+    /// `owl2-dl` and `owl2-ql`, no clash while the data hold an ill-typed literal, which OWL 2
+    /// doesn't admit, or before they are checked for one (`StoreService::consistency`).
     Unknown,
     Consistent,
     /// Quarantine: violations in the baseline (see the module docs).
     Inconsistent {
         violations: usize,
     },
-    /// The rules' violations, which `owl2-dl` doesn't decide, for `why`: in quarantine as
-    /// [`Self::Inconsistent`] is, but not said to be inconsistent.
+    /// Consistency could not be decided. The rules may have found violations.
     Undecided {
         violations: usize,
         why: WhyUndecided,
@@ -78,9 +68,11 @@ impl ConsistencyStatus {
     }
 }
 
-/// Why the OWL 2 RL rules' violations aren't decided under OWL 2 DL in this release.
+/// Why the active profile does not decide consistency in this release.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WhyUndecided {
+    /// No complete consistency check runs under OWL 2 QL.
+    NoQlDecider,
     /// The ontology has annotation-property axioms or a punned name, or an empty
     /// intersection or union, or a list's cell used outside its list, or a structure no
     /// axiom uses or a name used as two kinds that the rules read otherwise
@@ -95,6 +87,9 @@ impl WhyUndecided {
     /// What is known, and the ways out: the one text for each place that says it.
     pub fn text(self, violations: usize) -> String {
         let why = match self {
+            Self::NoQlDecider => {
+                return "no check decides this store's consistency under owl2-ql yet".to_owned();
+            }
             Self::ReadsDifferently => {
                 "the ontology has annotation-property axioms or a punned name, or an empty \
                  intersection or union, or a list's cell used outside its list, or a \
@@ -118,15 +113,14 @@ impl WhyUndecided {
 }
 
 /// The fingerprint of `program` as the store runs it: leaving out unnamed classes'
-/// memberships is another closure. Its value changed when the program, not a rule's name,
-/// came to say whether those classes' members are things: every closure an older
-/// build left out memberships in is rebuilt once.
+/// memberships is another closure. Bump its fingerprint when membership maintenance
+/// changes so older closures that hide unnamed classes rebuild once.
 pub(crate) fn fingerprint(
     program: &RuleProgram,
     hide_unnamed_classes: bool,
     compact_equality: bool,
 ) -> u64 {
-    const HIDDEN_UNNAMED_CLASSES: u64 = 0x5717_c1a5_5e5f_0008;
+    const HIDDEN_UNNAMED_CLASSES: u64 = 0x5717_c1a5_5e5f_0009;
     // Another form of the stack, not another closure; still not interchangeable.
     const COMPACT_EQUALITY: u64 = 0x0e9a_11c0_3a5c_0b02;
     program.fingerprint()
@@ -188,8 +182,6 @@ impl ReasoningState {
             undecided: None,
             compact_equality,
             nil_lists: !compact_equality,
-            literal_equality: false,
-            literal_equality_unknown: false,
         }
     }
 
@@ -270,8 +262,6 @@ impl ReasoningState {
             undecided: None,
             compact_equality,
             nil_lists,
-            literal_equality: false,
-            literal_equality_unknown: false,
         })
     }
 }
@@ -281,6 +271,23 @@ mod tests {
     use nrese_reasoner::rulesets::Ruleset;
 
     use super::*;
+
+    /// Spec: a certificate from before hidden membership withdrawal requires a rebuild
+    /// in skip mode. Certificates for the same rules in derive mode stay current.
+    #[test]
+    fn earlier_certificates_are_stale_only_for_hidden_unnamed_classes() {
+        let program = RuleProgram::builtin(Ruleset::Owl2Rl);
+        let old = ReasoningState {
+            fingerprint: program.fingerprint(),
+            ..ReasoningState::of(&program, 0)
+        };
+        let old_hidden = ReasoningState {
+            fingerprint: old.fingerprint ^ 0x5717_c1a5_5e5f_0008,
+            ..old.clone()
+        };
+        assert!(!old_hidden.is_current_with(&program, true, false, || false));
+        assert!(old.is_current_for(&program));
+    }
 
     #[test]
     fn state_round_trips_and_old_markers_are_not_current() {

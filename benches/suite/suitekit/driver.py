@@ -191,12 +191,17 @@ class Suite:
         self.date = now.isoformat(timespec="minutes")
         self.stamp = now.strftime("%Y%m%d-%H%M%S-%f")
         self.host = socket.gethostname()
-        scratch_root = Path(self.settings.get("NRESE_BENCH_SCRATCH") or root / "tmp")
+        private = hosts.private_session()
+        scratch_root = Path(self.settings.get("NRESE_BENCH_SCRATCH") or
+                            (hosts.private_home() / "scratch" if private else root / "tmp"))
         self.scratch = scratch_root.resolve() / f"{ns.name('suite', root)}-{self.stamp}"
-        self.results = Path(args.results or root / "benches/suite/results" / now.strftime("%Y-%m-%d")).resolve()
+        results_home = hosts.private_home() / "results/suite" if private else root / "benches/suite/results"
+        self.results = Path(args.results or results_home / now.strftime("%Y-%m-%d")).resolve()
         if args.dry_run:
             # A dry run writes nothing that stays: its rows and logs go with the scratch.
             self.results = self.scratch / "dry-run-results"
+        self.scratch = hosts.evidence_path(self.scratch, private, root)
+        self.results = hosts.evidence_path(self.results, private, root)
         self.keep = args.keep or bool(self.settings.get("NRESE_BENCH_KEEP"))
         self.tools_installed = (root / ".cache/bench-toolbox").exists()
         if args.runtime == "docker":
@@ -247,7 +252,7 @@ class Suite:
         directory (Manifest's lock), never before, so a second starter, refused there, never opens
         it (Writer's exists check, then open "w")."""
         if getattr(self, "_writer", None) is None:
-            self._writer = Writer(self.results / "results.csv", echo=print)
+            self._writer = Writer(self.results / "results.csv", echo=print, checkout=self.root)
         return self._writer
 
     @writer.setter
@@ -259,21 +264,21 @@ class Suite:
         print(text, flush=True)
 
     def host_command(self, command: list[str], log: Path | None = None, timeout: float | None = None,
-                     cwd: Path | None = None, env: dict | None = None, environ: dict | None = None) -> int:
+                     cwd: Path | None = None, environ: dict | None = None) -> int:
         """Runs a command on the host, from the repository root unless `cwd` says otherwise
-        (echoed in a dry run): in this process's environment with `env` added, or in `environ` alone."""
+        (echoed in a dry run), with the run's frozen overlay in the replacement environment."""
         if command[0] == "bash":
             command = [bash(), *command[1:]]
         if self.args.dry_run:
             self.say(f"    [host] {shell(command)}")
             return 0
-        environment = environ if environ is not None else ({**os.environ, **env} if env else None)
         if log is None:
-            return subprocess.run(command, cwd=cwd or self.root, timeout=timeout, env=environment).returncode
+            return hosts.launch(subprocess.run, command, cwd=cwd or self.root, timeout=timeout,
+                                environ=environ).returncode
         log.parent.mkdir(parents=True, exist_ok=True)
-        with open(log, "w", encoding="utf-8", errors="replace") as f:
-            return subprocess.run(command, cwd=cwd or self.root, stdout=f, stderr=subprocess.STDOUT,
-                                  timeout=timeout, env=environment).returncode
+        with open(hosts.evidence_path(log), "w", encoding="utf-8", errors="replace") as f:
+            return hosts.launch(subprocess.run, command, cwd=cwd or self.root, stdout=f, stderr=subprocess.STDOUT,
+                                timeout=timeout, environ=environ).returncode
 
     def emit(self, base: dict, **fields):
         result = Result(**{**base, **fields})
@@ -879,7 +884,7 @@ class Suite:
                 return
         self.say(f"\n{key} / {plan.workload}: {shell(plan.command)}")
         started = time.monotonic()
-        rc = self.host_command(plan.command, log, env=kit_env(os.environ))
+        rc = self.host_command(plan.command, log, environ={**os.environ, **kit_env(os.environ)})
         counts = "" if self.args.dry_run else kit_counts(log)
         self.emit(base, task="conformance", item=plan.workload, status="ok" if rc == 0 else "failed",
                   ms=(time.monotonic() - started) * 1000,
@@ -1610,6 +1615,7 @@ def images(argv: list[str], systems: dict, root: Path) -> int:
     return 0
 
 
+@hosts.run_snapshot
 def main(argv: list[str], systems: dict, workloads: dict, root: Path) -> int:
     args = arguments(argv)
     suite = Suite(args, systems, workloads, root)

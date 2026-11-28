@@ -51,6 +51,7 @@ nrese-exec = { path = "../nrese-exec", features = ["lifecycle-explorer", "measur
 # The engine's work counters, for the tests of the work a read does after its stop (REAS-3), and
 # a directory sync the store's own tests make fail (nrese_engine::fault_points): DUR-4.
 nrese-engine = { path = "../nrese-engine", features = ["witness", "fault-points"] }
+nrese-owl = { path = "../nrese-owl", features = ["witness"] }
 tempfile = { workspace = true }
 
 [lints]

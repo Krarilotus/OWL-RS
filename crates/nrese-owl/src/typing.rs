@@ -13,7 +13,9 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use crate::mapping::Ontology;
+use crate::Diagnostic;
+use crate::mapping::{Ontology, Terms};
+use crate::membership::Membership;
 use crate::model::{Axiom, ClassExpr, DataRange, EntityKind, ExprId, ObjProp, RangeId, Term};
 use crate::rules::Atom;
 
@@ -41,15 +43,30 @@ pub const PAIRS: [[EntityKind; 2]; 4] = [
 
 /// Every name of `ontology` used as two kinds of a pair of [`PAIRS`], by term, then pair.
 pub fn two_kinds(ontology: &Ontology) -> Vec<TwoKinds> {
+    check(ontology, None).0
+}
+
+pub(crate) fn check(
+    ontology: &Ontology,
+    terms: Option<&dyn Terms>,
+) -> (Vec<TwoKinds>, Vec<Diagnostic>) {
     let mut check = Check {
         o: ontology,
         uses: BTreeMap::new(),
         classes: HashSet::new(),
         ranges: HashSet::new(),
+        membership: terms.map(|terms| Membership::new(ontology, terms)),
     };
-    for axiom in &ontology.axioms {
+    for (index, axiom) in ontology.axioms.iter().enumerate() {
+        if let Some(membership) = &mut check.membership {
+            membership.axiom = index;
+        }
         check.axiom(axiom);
     }
+    let findings = check
+        .membership
+        .take()
+        .map_or_else(Vec::new, Membership::finish);
     for rule in &ontology.rules {
         for atom in rule.body.iter().chain(&rule.head) {
             check.atom(atom);
@@ -89,7 +106,7 @@ pub fn two_kinds(ontology: &Ontology) -> Vec<TwoKinds> {
             }
         }
     }
-    out
+    (out, findings)
 }
 
 /// A name's kinds, a bit each ([`bit`]): all, and those something other than an assertion
@@ -118,10 +135,16 @@ struct Check<'o> {
     /// The class expressions and data ranges walked from an axiom ([`Self::expression`]).
     classes: HashSet<ExprId>,
     ranges: HashSet<RangeId>,
+    membership: Option<Membership<'o>>,
 }
 
 impl Check<'_> {
     fn mark(&mut self, term: Term, kind: EntityKind, by_axiom: bool) {
+        if kind == EntityKind::Datatype
+            && let Some(membership) = &mut self.membership
+        {
+            membership.occurs.entry(term).or_insert(membership.axiom);
+        }
         let uses = self.uses.entry(term).or_default();
         uses.any |= bit(kind);
         if by_axiom {
@@ -134,12 +157,18 @@ impl Check<'_> {
     }
 
     fn data(&mut self, p: Term, by_axiom: bool) {
+        if Some(p) == self.o.builtin.top_data
+            && let Some(membership) = &mut self.membership
+        {
+            membership.report(p, "owl:topDataProperty outside the superproperty position");
+        }
         self.mark(p, EntityKind::DataProperty, by_axiom);
     }
 
     #[deny(clippy::wildcard_enum_match_arm)]
     fn axiom(&mut self, axiom: &Axiom) {
         match axiom {
+            Axiom::Declaration(EntityKind::DataProperty, t) => self.data(*t, true),
             Axiom::Declaration(kind, t) => self.mark(*t, *kind, true),
             Axiom::SubClassOf(a, b) => {
                 self.class(*a);
@@ -170,7 +199,7 @@ impl Check<'_> {
             Axiom::ObjectCharacteristic(_, p) => self.object(*p, true),
             Axiom::SubDataPropertyOf(a, b) => {
                 self.data(*a, true);
-                self.data(*b, true);
+                self.mark(*b, EntityKind::DataProperty, true);
             }
             Axiom::EquivalentDataProperties(ps) | Axiom::DisjointDataProperties(ps) => {
                 ps.iter().for_each(|&p| self.data(p, true));
@@ -185,6 +214,9 @@ impl Check<'_> {
             }
             Axiom::FunctionalDataProperty(p) => self.data(*p, true),
             Axiom::DatatypeDefinition(t, r) => {
+                if let Some(membership) = &mut self.membership {
+                    membership.definition(*t, *r);
+                }
                 self.mark(*t, EntityKind::Datatype, true);
                 self.range(*r);
             }
@@ -214,51 +246,62 @@ impl Check<'_> {
     /// class here is named by an axiom, not by an assertion's own place. Everything within
     /// is: the rules read a restriction or a set operator in an assertion's class as they
     /// read one in an axiom.
+    /// Walked with its own stack, operands in order, so that the nesting depth of an
+    /// expression is no call depth.
     #[deny(clippy::wildcard_enum_match_arm)]
     fn expression(&mut self, id: ExprId, by_axiom: bool) {
-        // Only the walks from an axiom are remembered: one from an assertion marks less.
-        if by_axiom && !self.classes.insert(id) {
-            return;
-        }
-        match self.o.class(id) {
-            ClassExpr::Class(t) => self.mark(*t, EntityKind::Class, by_axiom),
-            ClassExpr::Thing | ClassExpr::Nothing | ClassExpr::OneOf(_) => {}
-            ClassExpr::And(xs) | ClassExpr::Or(xs) => xs.iter().for_each(|&x| self.class(x)),
-            ClassExpr::Not(x) => self.class(*x),
-            ClassExpr::Some(p, x)
-            | ClassExpr::All(p, x)
-            | ClassExpr::Min(_, p, x)
-            | ClassExpr::Max(_, p, x)
-            | ClassExpr::Exact(_, p, x) => {
-                self.object(*p, true);
-                self.class(*x);
+        let mut stack = vec![(id, by_axiom)];
+        while let Some((id, by_axiom)) = stack.pop() {
+            // Only the walks from an axiom are remembered: one from an assertion marks less.
+            if by_axiom && !self.classes.insert(id) {
+                continue;
             }
-            ClassExpr::HasValue(p, _) | ClassExpr::HasSelf(p) => self.object(*p, true),
-            ClassExpr::DataSome(p, r)
-            | ClassExpr::DataAll(p, r)
-            | ClassExpr::DataMin(_, p, r)
-            | ClassExpr::DataMax(_, p, r)
-            | ClassExpr::DataExact(_, p, r) => {
-                self.data(*p, true);
-                self.range(*r);
+            match self.o.class(id) {
+                ClassExpr::Class(t) => self.mark(*t, EntityKind::Class, by_axiom),
+                ClassExpr::Thing | ClassExpr::Nothing | ClassExpr::OneOf(_) => {}
+                ClassExpr::And(xs) | ClassExpr::Or(xs) => {
+                    stack.extend(xs.iter().rev().map(|&x| (x, true)));
+                }
+                ClassExpr::Not(x) => stack.push((*x, true)),
+                ClassExpr::Some(p, x)
+                | ClassExpr::All(p, x)
+                | ClassExpr::Min(_, p, x)
+                | ClassExpr::Max(_, p, x)
+                | ClassExpr::Exact(_, p, x) => {
+                    self.object(*p, true);
+                    stack.push((*x, true));
+                }
+                ClassExpr::HasValue(p, _) | ClassExpr::HasSelf(p) => self.object(*p, true),
+                ClassExpr::DataSome(p, r)
+                | ClassExpr::DataAll(p, r)
+                | ClassExpr::DataMin(_, p, r)
+                | ClassExpr::DataMax(_, p, r)
+                | ClassExpr::DataExact(_, p, r) => {
+                    self.data(*p, true);
+                    self.range(*r);
+                }
+                ClassExpr::DataHasValue(p, _) => self.data(*p, true),
             }
-            ClassExpr::DataHasValue(p, _) => self.data(*p, true),
         }
     }
 
-    /// A data range an axiom (or a rule) names, and every range in it.
+    /// A data range an axiom (or a rule) names, and every range in it, each before its
+    /// operands, from the left, with a stack of its own (the nesting depth is no call depth).
     #[deny(clippy::wildcard_enum_match_arm)]
     fn range(&mut self, id: RangeId) {
-        if !self.ranges.insert(id) {
-            return;
-        }
-        match self.o.range(id) {
-            DataRange::Literal | DataRange::OneOf(_) => {}
-            DataRange::Datatype(t) | DataRange::Restriction(t, _) => {
-                self.mark(*t, EntityKind::Datatype, true);
+        let mut stack = vec![id];
+        while let Some(id) = stack.pop() {
+            if !self.ranges.insert(id) {
+                continue;
             }
-            DataRange::And(rs) | DataRange::Or(rs) => rs.iter().for_each(|&r| self.range(r)),
-            DataRange::Not(r) => self.range(*r),
+            match self.o.range(id) {
+                DataRange::Literal | DataRange::OneOf(_) => {}
+                DataRange::Datatype(t) | DataRange::Restriction(t, _) => {
+                    self.mark(*t, EntityKind::Datatype, true);
+                }
+                DataRange::And(rs) | DataRange::Or(rs) => stack.extend(rs.iter().rev()),
+                DataRange::Not(r) => stack.push(*r),
+            }
         }
     }
 

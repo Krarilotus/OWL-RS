@@ -326,8 +326,8 @@ fn a_conclusion_reads_shacl_content_as_one_store_with_its_premise() {
 }
 
 /// Spec (OWL 2 Direct Semantics: an inconsistent ontology has no model, so it entails every
-/// conclusion): from an inconsistent premise a conclusion stating SHACL content follows, however
-/// that content would be read.
+/// conclusion): from an inconsistent premise an admitted conclusion stating SHACL content
+/// follows, however that content would be read.
 #[test]
 fn from_an_inconsistent_premise_a_conclusion_stating_shacl_content_follows() {
     let dl = super::pipeline_with(nrese_store::DlConfig {
@@ -405,20 +405,31 @@ fn a_premise_typing_a_shacl_property_reads_the_conclusions_content_as_any_other(
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// Spec (one source, one reading: a conclusion is read by the SHACL rule over premise and
-/// conclusion together; a statement whose predicate is an annotation property names nothing;
-/// OWL 2 Direct Semantics: declarations and SHACL content hold no axiom to entail): the premise's
-/// `:x :note sh:path` names `sh:path`, but the conclusion declares `:note` an annotation
-/// property, so premise and conclusion together hold `:s sh:path :q` as SHACL content and the
-/// conclusion, with nothing else, is entailed. The premise keeps its own reading.
+/// Spec (*OWL 2 Structural Specification* §5.8.1: the sets of IRIs used as object and
+/// annotation properties in the axiom closure are disjoint; *OWL 2 Mapping to RDF Graphs*
+/// Table 10 and *OWL 2 Direct Semantics* §2.3: a declaration carries no logical content and
+/// an annotation property's statement names no SHACL term): when the premise itself declares
+/// `:note` an annotation property, the joint closure keeps a single kind, `:s sh:path :q` is
+/// read as SHACL content, and the conclusion is entailed. When the premise leaves `:note`
+/// undeclared (read as an object property) while the conclusion declares it an annotation
+/// property, the joint closure breaks §5.8.1—following
+/// `a_conclusions_annotation_declaration_of_a_premises_property_carries_no_meaning`—and the
+/// answer is withheld.
 #[test]
 fn a_conclusion_declaring_an_annotation_property_holds_its_shacl_statements_as_content() {
     let path = "<http://www.w3.org/ns/shacl#path>";
     let conclusion = format!(":note a owl:AnnotationProperty . :s {path} :q .");
     assert_eq!(
-        entailed(&format!(":x :note {path} ."), &conclusion),
+        entailed(
+            &format!(":note a owl:AnnotationProperty . :x :note {path} ."),
+            &conclusion
+        ),
         Entailed::Yes
     );
+    assert!(matches!(
+        entailed(&format!(":x :note {path} ."), &conclusion),
+        Entailed::Unknown(_)
+    ));
 }
 
 /// Spec (OWL 2 Direct Semantics: SHACL content, like an annotation, has no meaning, so an

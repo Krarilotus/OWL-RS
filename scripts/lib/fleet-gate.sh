@@ -12,7 +12,8 @@
 # target and lock of its own on the host, so it never waits behind a push gate. Sized by measurement
 # (1 to 5 minutes a changed crate on a warm target): est_min 10, a step deadline of 30 minutes. Never
 # a merge gate: it lands nothing.
-# MODE nightly (LIST empty): the same, for scripts/check.sh nightly: gate-job.sh mode nightly, every
+# MODE nightly (LIST empty): first a job of its own for the outside check (below), then the same, for
+# scripts/check.sh nightly: gate-job.sh mode nightly, every
 # test in its full form, in push's worktree, target and lock on the host (one build for both; a push
 # gate there waits for it), of push's fleet kind, placed by the fleet as push's is. Sized by measurement
 # (below). Never a merge gate: it lands nothing.
@@ -35,11 +36,12 @@
 # check by hand that names no ref.
 #
 # A failure on a host whose failures don't count alone (NRESE_GATE_UNCONFIRMED_HOSTS, default
-# the development machine and its WSL VM: its RAM never formally verified) is reported
-# as unconfirmed and the gate runs again on another host (NRESE_GATE_CONFIRM_HOSTS, default
-# the shared host, the timed host, the checks host; for windows the Windows host). The tree fails only if that run
-# fails too; if it passes, the pass counts and both jobs are named as a possible fault of the
-# first host.
+# the private overlay's [fleet] gate_unconfirmed: the development machine and its WSL VM, its RAM
+# never formally verified) is reported as unconfirmed and the gate runs again on another host
+# (NRESE_GATE_CONFIRM_HOSTS, default its gate_confirm, for windows gate_confirm_windows;
+# benches/suite/suitekit/hosts.py fleet). The tree fails only if that run fails too; if it
+# passes, the pass counts and both jobs are named as a possible fault of the first host.
+# Without a configured unconfirmed-host list or an explicit override there is no verdict.
 #
 # Exit: 0 passed (WHERE then names the job, its host and the CPU), 1 failed (its log is shown),
 # 75 no verdict: no FLEET_OWNER, the fleet refused or didn't answer, no host started it within
@@ -60,13 +62,16 @@ fleet_label="fleet gate"
 . scripts/lib/fleet-job.sh
 start_s=${NRESE_GATE_START_S:-180}
 max_s=${NRESE_GATE_MAX_S:-10800}
-unconfirmed=" ${NRESE_GATE_UNCONFIRMED_HOSTS:-khaleesi khaleesi-wsl} "
+# fleet_hosts NAME: a configured [fleet] list, space-separated. An absent list fails.
+fleet_hosts() { python -I benches/suite/suitekit/hosts.py fleet "$1"; }
 no_verdict() {
   fleet_say "$*: no verdict, so no pass"
   fleet_cancel
   exit 75
 }
 
+unconfirmed=${NRESE_GATE_UNCONFIRMED_HOSTS:-$(fleet_hosts gate_unconfirmed)} || no_verdict "can't read unconfirmed hosts"
+unconfirmed=" $unconfirmed "
 fleet_ready || no_verdict "no fleet to ask"
 [ "$(git rev-parse "$commit^{tree}" 2> /dev/null)" = "$tree" ] || no_verdict "commit $commit isn't tree $tree"
 # shellcheck source=gate-key.sh
@@ -78,7 +83,7 @@ fi
 
 # What a tier asks for (cores also bound its compilers; the step's slice caps its memory on
 # Linux, scripts/cargo-guarded.sh's job object on Windows).
-os=linux kind=owlrs.gate confirm="office-pc phuoc-yu gamergrill"
+os=linux kind=owlrs.gate confirm_list=gate_confirm
 reason="the $mode gate of a pushed commit (scripts/check.sh); no push without it"
 deadline=""
 case $mode in
@@ -104,7 +109,7 @@ case $mode in
     # was free.
     # est: the slowest whole 4-core run, 1,547 s, x 1.5 (others took 1,011-1,073 s).
     cores=${NRESE_GATE_CORES:-4} ram=${NRESE_GATE_RAM_GB:-9} est=${NRESE_GATE_EST_MIN:-39}
-    os=windows kind=owlrs.any confirm=kraris-gptler start_s=${NRESE_GATE_START_S:-1800}
+    os=windows kind=owlrs.any confirm_list=gate_confirm_windows start_s=${NRESE_GATE_START_S:-1800}
     # What the tier uses there, in the fleet config's names: `rust`, rustup with its MSVC toolchain
     # and linker (scripts/lib/windows-job.sh installs the tree's pinned release). The rest comes with
     # every Windows host of the fleet, unnamed: Git Bash, a stdlib `python` on PATH (the cache's
@@ -138,7 +143,9 @@ trap 'rm -f "$job"' EXIT
 # gate HOSTS: one gate job (on one of HOSTS, if any), followed to its end; sets verdict, log, host.
 gate() {
   {
-    echo "id = $(q "gate-$mode-${tree:0:10}-$(date +%s)")"
+    # The first job's id at the outside check's second (below); a re-check's at its own.
+    echo "id = $(q "gate-$mode-${tree:0:10}-${stamp:-$(date +%s)}")"
+    stamp=""
     echo 'group = "gate"'
     # The fleet refuses the same job again after a failure it diagnosed as the job's own. A rerun
     # for a cause outside the tree says what was repaired, with its evidence (NRESE_GATE_REPAIR).
@@ -238,13 +245,78 @@ EOF
   case $verdict in passed* | failed*) ;; *) no_verdict "its result doesn't count: ${verdict#invalid }" ;; esac
 }
 
+# The nightly run's outside check (scripts/check.sh nightly-outside), a job of its own: it starts
+# containers, which the gate's own job never may. Submitted before the nightly run, and never followed:
+# its verdict and counts are its own results (gate.json, tier nightly-outside, as a gate job's; check.log;
+# outside/outside.json), and the nightly run's doesn't wait for them. Its id is the nightly run's with
+# -outside after the tier, at the same second. Its hosts: the private overlay's [fleet] gate_outside
+# (benches/suite/suitekit/hosts.py fleet), or NRESE_GATE_OUTSIDE_HOSTS; with neither it isn't submitted,
+# and the run says so. NRESE_GATE_NO_OUTSIDE: not submitted.
+stamp=$(date +%s)
+outside_hosts=""
+if [ "$mode" = nightly ] && [ -z "${NRESE_GATE_NO_OUTSIDE:-}" ]; then
+  outside_hosts=${NRESE_GATE_OUTSIDE_HOSTS:-$(fleet_hosts gate_outside 2> /dev/null)}
+  for target in $outside_hosts; do
+    [[ $target =~ ^[A-Za-z0-9_.-]+$ ]] || no_verdict "invalid outside check host"
+  done
+  [ -n "$outside_hosts" ] || fleet_say "the outside check wasn't submitted: no hosts for it (the private" \
+    "overlay's [fleet] gate_outside, or NRESE_GATE_OUTSIDE_HOSTS); the nightly run goes on without it"
+fi
+if [ -n "$outside_hosts" ]; then
+  {
+    echo "id = $(q "gate-nightly-outside-${tree:0:10}-$stamp")"
+    echo 'group = "gate"'
+    echo 'kind = "owlrs.any"'
+    echo "priority = $priority"
+    echo 'priority_reason = "the nightly run'"'"'s outside check (scripts/check.sh nightly-outside); it lands nothing"'
+    # Measured (22 Nov 2026, 6 cores): 3,000 cases in 7 min, a cold release build in 6; the step's own
+    # deadline is 30 minutes for both blocks (scripts/check.sh).
+    echo 'est_min = 20'
+    echo 'step_deadline_min = 40'
+    # Pinned, as the fleet allows nothing else: its containers start inside outside.sh, out of the
+    # fleet's sight, which a host with a memory envelope never admits (a container there must show its
+    # cap in the step itself). A host joins gate_outside once it has Docker, can build images and has no
+    # envelope.
+    echo 'pin_reason = "Docker containers the fleet cannot see: only hosts without a memory envelope admit them"'
+    printf 'steps = [["bash", "scripts/lib/outside-job.sh", %s, %s, %s]]\n' \
+      "$(q "$tree")" "$(q "$list_hash")" "$(q "$identity")"
+    echo '[env]'
+    echo 'NRESE_ON_BUILD_HOST = "1"'
+    echo 'CARGO_BUILD_JOBS = "6"'
+    echo '[requires]'
+    echo 'os = "linux"'
+    echo 'roles = ["test"]'
+    echo 'has = ["docker", "docker-build"]'
+    echo 'cores = 6'
+    echo 'ram_gb = 12'
+    printf 'hosts = [%s]\n' "$(for target in $outside_hosts; do printf '%s, ' "$(q "$target")"; done | sed 's/, $//')"
+    echo '[[inputs]]'
+    echo 'name = "checkout"'
+    echo "source = { git = $(q "$(fleet_repo)"), rev = $(q "$commit") }"
+  } > "$job"
+  if fleet_submit "$job"; then
+    fleet_say "submitted, the nightly run's outside check; its verdict is its own (fleet results $fleet_id)"
+  else
+    fleet_say "the outside check wasn't submitted: the nightly run goes on without it"
+  fi
+  fleet_id=""
+fi
+
 gate "${NRESE_GATE_HOSTS:-}"
 first=$fleet_id first_host=$host recheck=""
 if [[ $verdict == failed* && $unconfirmed == *" $host "* ]]; then
   sed -n '/^=== summary/,$p' "$log"
+  confirm=${NRESE_GATE_CONFIRM_HOSTS:-$(fleet_hosts "$confirm_list")} || no_verdict "can't read confirmation hosts"
+  eligible=""
+  for target in $confirm; do
+    [[ $target =~ ^[A-Za-z0-9_.-]+$ ]] || no_verdict "invalid confirmation host"
+    [[ $unconfirmed == *" $target "* ]] || eligible="${eligible:+$eligible }$target"
+  done
+  [ -n "$eligible" ] || no_verdict "no confirmation host for $host"
   fleet_say "failed on $host: unconfirmed ($host); running it again on another host (log: $log)"
   fleet_id=""
-  gate "${NRESE_GATE_CONFIRM_HOSTS:-$confirm}"
+  gate "$eligible"
+  [[ " $eligible " == *" $host "* ]] || no_verdict "confirmation ran on an ineligible host"
   case $verdict in
     passed*)
       recheck="fleet:$first@$first_host (failed there)"
