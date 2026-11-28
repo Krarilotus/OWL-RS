@@ -46,7 +46,11 @@ fn update(pipeline: &MutationPipeline, text: &str) {
 
 /// A store under `owl2-dl` and its pipeline, with the schema and its members committed.
 fn pipeline() -> (Arc<StoreService>, MutationPipeline) {
-    let store = Arc::new(StoreService::new(StoreConfig::in_memory()).unwrap());
+    pipeline_with(StoreConfig::in_memory())
+}
+
+fn pipeline_with(config: StoreConfig) -> (Arc<StoreService>, MutationPipeline) {
+    let store = Arc::new(StoreService::new(config).unwrap());
     let pipeline = MutationPipeline::new(
         Arc::clone(&store),
         Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
@@ -239,6 +243,132 @@ fn an_unrelated_commit_keeps_the_pinned_query_complete() {
         claim.header(),
     );
     assert!(claim.complete, "{}", claim.header());
+}
+
+/// Contract §4.3c R1 and R3. Eligibility follows the visible input, across graph
+/// duplicates, inferred support, a rebuild and a change in the equality reading.
+#[test]
+fn eligible_program_facts_follow_the_published_revision() {
+    const PREFIX: &str = "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>";
+    let (store, pipeline) = pipeline_with(StoreConfig {
+        equality_compact: true,
+        ..StoreConfig::in_memory()
+    });
+    let apply = |text: &str| update(&pipeline, &format!("{PREFIX} {text}"));
+    apply(
+        "INSERT DATA {
+        :D rdfs:subClassOf :M . :M a owl:Class .
+        :x a owl:NamedIndividual , [ owl:complementOf [ owl:complementOf :M ] ] .
+    }",
+    );
+    let first = store.engine().snapshot();
+    let id = |iri| {
+        first
+            .lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into())
+            .unwrap()
+            .raw()
+    };
+    let target = [id("urn:test:x"), id(RDF_TYPE), id("urn:test:M")];
+    let results = [
+        ("INSERT DATA { :x a :M }", true, false),
+        ("DELETE DATA { :x a :M }", false, true),
+        (
+            "INSERT DATA { GRAPH :g1 { :x a :M } GRAPH :g2 { :x a :M } }",
+            true,
+            false,
+        ),
+        ("DELETE DATA { GRAPH :g1 { :x a :M } }", true, false),
+        ("DELETE DATA { GRAPH :g2 { :x a :M } }", false, true),
+        ("INSERT DATA { :x a :D }", true, false),
+        ("DELETE DATA { :x a :D }", false, true),
+        ("INSERT DATA { :F rdfs:subClassOf :M }", false, true),
+        ("INSERT DATA { :x owl:sameAs :a0 }", false, false),
+        ("DELETE DATA { :x owl:sameAs :a0 }", false, true),
+    ]
+    .map(|(update, materialised, eligible)| {
+        apply(update);
+        (store.engine().snapshot(), materialised, eligible)
+    });
+    for (snapshot, materialised, eligible) in std::iter::once((first, false, true)).chain(results) {
+        let published = ReadBasis::upper(&snapshot).expect("pinned U1 publication");
+        let upper = published.upper.expect("its eligible set");
+        assert_eq!(
+            in_view(&snapshot, target),
+            materialised,
+            "revision {}",
+            snapshot.revision()
+        );
+        assert_eq!(
+            upper.eligible.contains(target),
+            eligible,
+            "revision {}",
+            snapshot.revision()
+        );
+    }
+}
+
+/// Part B T1 and reasoning-semantics.md §Default and named graphs. An assertion
+/// in any graph suppresses the inferred default-graph statement while present.
+#[test]
+fn a_named_graph_assertion_suppresses_the_program_fact_in_the_default_graph() {
+    let (store, pipeline) = pipeline();
+    update(
+        &pipeline,
+        "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+        INSERT DATA { :i0 a owl:NamedIndividual ,
+            [ owl:complementOf [ owl:complementOf :A ] ] }",
+    );
+    let request = crate::SparqlQueryRequest::all(
+        "PREFIX : <urn:test:> SELECT ?x WHERE { ?x a :A . FILTER(sameTerm(?x, :i0)) }",
+    );
+    let bindings = || {
+        let result = store.execute_query(&request).expect("product read");
+        let result: serde_json::Value =
+            serde_json::from_slice(&result.payload).expect("SELECT JSON");
+        result["results"]["bindings"].as_array().unwrap().clone()
+    };
+    let expected = [serde_json::json!({"x":{"type":"uri","value":"urn:test:i0"}})];
+    assert_eq!(bindings(), expected);
+    update(
+        &pipeline,
+        "PREFIX : <urn:test:> INSERT DATA { GRAPH :g { :i0 a :A } }",
+    );
+    assert!(bindings().is_empty());
+    update(
+        &pipeline,
+        "PREFIX : <urn:test:> DELETE DATA { GRAPH :g { :i0 a :A } }",
+    );
+    assert_eq!(bindings(), expected);
+}
+
+/// Part B T6. Repeated publishers cannot force a diagnostic to restart its pinned read.
+#[test]
+fn a_writer_cannot_keep_restarting_a_latest_view() {
+    let (store, pipeline) = pipeline();
+    let before = store.current_revision();
+    let writes = Arc::new(AtomicUsize::new(0));
+    fn interpose(pipeline: Arc<MutationPipeline>, writes: Arc<AtomicUsize>) {
+        let store = Arc::clone(pipeline.store());
+        seam::set(&store.dl().bounds, Point::Eligible, move || {
+            let index = writes.fetch_add(1, Ordering::Relaxed);
+            update(
+                &pipeline,
+                &format!("PREFIX : <urn:test:> INSERT DATA {{ :a{index} a :F }}"),
+            );
+            if index < 3 {
+                interpose(pipeline, writes);
+            }
+        });
+    }
+    interpose(Arc::new(pipeline), Arc::clone(&writes));
+    let report = report(&store);
+    seam::set(&store.dl().bounds, Point::Eligible, || {});
+    seam::at(&store.dl().bounds, Point::Eligible);
+    assert_eq!(report.unavailable, None);
+    assert_eq!(report.revision, before);
+    assert_eq!(store.current_revision(), before + 1);
+    assert_eq!(writes.load(Ordering::Relaxed), 1);
 }
 
 /// A read of the revision U1 and its view describe gets that view while a commit computes

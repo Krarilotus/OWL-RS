@@ -240,3 +240,110 @@ fn pattern(bound: Pattern) -> QuadPattern {
         ..QuadPattern::all()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const P: u64 = 23;
+    const A: Triple = [0, P, 1];
+    const T: Triple = [100, P, 1];
+    const Z: Triple = [200, P, 1];
+    const PREDICATE: Pattern = [None, Some(P), None];
+
+    fn base(budget: &Arc<Budget>) -> TripleVersion {
+        TripleVersion::build((0..100).map(|s| [s, P, 1]), budget).unwrap()
+    }
+
+    /// §4.3c R2. A proper suffix cannot cancel a deletion against an older insertion.
+    #[test]
+    fn triple_compaction_keeps_an_unmatched_deletion_and_the_held_list() {
+        let budget = Arc::new(Budget::unlimited());
+        let pinned = base(&budget).successor(&[T], &[]).unwrap();
+        let current = pinned.successor(&[], &[A, T]).unwrap();
+        let compact = current
+            .compact(CompactionPolicy::default(), false)
+            .unwrap()
+            .unwrap();
+        let latest = compact(&current).unwrap().unwrap();
+        assert_eq!((latest.contains(A), latest.contains(T)), (false, false));
+        assert_eq!((pinned.contains(A), pinned.contains(T)), (true, true));
+        assert_eq!(latest.scan(PREDICATE).count(), 99);
+        assert_eq!(latest.count_predicate(P), 99);
+    }
+
+    /// §4.3c R4. The old allocation is shared before a rewrite and retains its charge
+    /// while a reader still holds it after the rewrite.
+    #[test]
+    fn triple_run_charges_follow_the_shared_allocations() {
+        let budget = Arc::new(Budget::unlimited());
+        let pinned = base(&budget);
+        let original = budget.used();
+        let alias = pinned.clone();
+        assert_eq!(budget.used(), original);
+        let current = pinned.successor(&[T], &[]).unwrap();
+        assert!(
+            budget.used() - original < original,
+            "the successor copied the base"
+        );
+        let policy = CompactionPolicy {
+            fanout: 128,
+            ..CompactionPolicy::default()
+        };
+        let splice = current.compact(policy, false).unwrap().unwrap();
+        let latest = splice(&current).unwrap().unwrap();
+        drop(current);
+        assert_eq!(
+            budget.used(),
+            original
+                + latest.0._held.bytes()
+                + latest.0.index.runs[0].memory_bytes() as usize
+                + latest.0.index.runs[0].triple_overhead()
+        );
+        let both = budget.used();
+        drop(pinned);
+        assert_eq!(budget.used(), both);
+        drop(alias);
+        assert_eq!(budget.used(), both - original);
+        assert!(latest.contains(T));
+        drop(latest);
+        assert_eq!(budget.used(), 0);
+    }
+
+    /// §4.3c R5. Signed summaries report zero after a large retract even when
+    /// compaction of the two runs is deferred.
+    #[test]
+    fn triple_predicate_counts_are_exact_during_deferred_compaction() {
+        let budget = Arc::new(Budget::unlimited());
+        let policy = CompactionPolicy::default();
+        let facts: Vec<_> = (0..16_385).map(|s| [s, P, 1]).collect();
+        let mut latest = TripleVersion::build([[0, P + 1, 1]], &budget).unwrap();
+        for _ in 0..4 {
+            let pinned = latest.successor(&facts, &[]).unwrap();
+            latest = pinned.successor(&[], &facts).unwrap();
+            assert!(latest.compact(policy, true).unwrap().is_none());
+            assert_eq!(latest.count_predicate(P), 0);
+            assert_eq!(latest.count_predicate(P + 1), 1);
+            assert_eq!(pinned.count_predicate(P), facts.len());
+        }
+        assert!(!latest.any_counted(PREDICATE, &|_| true).unwrap());
+    }
+
+    /// §4.3c R7. Compaction completes after a writer appends another delta.
+    #[test]
+    fn triple_compaction_splices_into_the_version_with_a_later_append() {
+        let budget = Arc::new(Budget::unlimited());
+        let old = base(&budget).successor(&[T], &[]).unwrap();
+        let captured = old.successor(&[], &[T]).unwrap();
+        let splice = captured
+            .compact(CompactionPolicy::default(), false)
+            .unwrap()
+            .unwrap();
+        let current = captured.successor(&[Z], &[]).unwrap();
+        let latest = splice(&current).unwrap().unwrap();
+        assert!(latest.contains(Z), "compaction dropped the later append");
+        assert!(!latest.contains(T));
+        assert!(old.contains(T));
+        assert!(!old.contains(Z));
+    }
+}

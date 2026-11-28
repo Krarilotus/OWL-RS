@@ -388,7 +388,8 @@ fn an_upper_bound_the_process_memory_stopped_is_not_kept() {
         matches!(&prepared.prepared, Prepared::Rebuilt(upper) if upper.is_err()),
         "the commit's U1 is stopped too"
     );
-    install(&store, prepared, tx.base().revision() + 1);
+    let compiled = prepared.published(&store, tx.base()).compiled();
+    install(&store, prepared, compiled, tx.base().revision() + 1);
     assert!(
         !kept(&store),
         "a commit installs no U1 the process's memory stopped"

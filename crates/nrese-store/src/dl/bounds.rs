@@ -1276,6 +1276,8 @@ pub(crate) fn install(
             let superseded = state.evict_below(revision);
             drop(state);
             drop(superseded);
+            bounds.compaction.publish(revision, None);
+            return;
         }
         Prepared::Rebuilt(upper) => publish(
             &mut state,
