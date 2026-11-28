@@ -2436,6 +2436,42 @@ fn a_zero_length_paths_ends_can_be_data_values() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// A zero-step match compares terms even without a join or DISTINCT (reasoning-semantics).
+#[test]
+fn a_standalone_zero_step_path_compares_data_values() {
+    path_compares_literal_subjects("SELECT ?x ?y { ?x :knows* ?y }");
+}
+
+/// A reversed non-zero step can read a literal at the subject end (reasoning-semantics).
+#[test]
+fn a_standalone_reversed_path_reads_literal_subjects() {
+    path_compares_literal_subjects("SELECT ?x ?y { ?x (^:age)+ ?y }");
+}
+
+fn path_compares_literal_subjects(query: &str) {
+    let store = closure(SEVEN, Ruleset::Owl2Rl, QlRewritingMode::On);
+    let (rows, claims) = answer_claims(&store, query);
+    let result: serde_json::Value = serde_json::from_str(&rows).unwrap();
+    let bindings = result["results"]["bindings"].as_array().unwrap();
+    for value in ["07", "7"] {
+        assert!(
+            bindings.iter().any(|row| row["x"]["value"] == value),
+            "{query}: {rows}"
+        );
+    }
+    for claim in claims {
+        let claim = claim.expect("the path read has a claim");
+        assert!(
+            !claim.complete
+                && claim
+                    .reasons
+                    .iter()
+                    .any(|reason| reason.text.contains("two spellings of one value")),
+            "a standalone path must account for its literal subjects: {query}: {claim:?}"
+        );
+    }
+}
+
 /// A reader of the default graph and `:open`, with the inferences their graphs support, and
 /// not of `:secret`, under `owl2-ql` and `owl2-rl` with the rewriting on: whether `:p` holds
 /// a number in `:secret` is hidden from them. Spec: their rows and their entire assessment

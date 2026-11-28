@@ -350,6 +350,47 @@ fn canonical_named_graph_accounts_for_a_literal_predicate_range() {
     }
 }
 
+/// A FROM merge with a held named graph does not canonicalise the dataset.
+/// Its IRI-only comparisons keep their status (reasoning-semantics, values compared by spelling).
+#[test]
+fn a_from_merge_with_a_held_named_graph_keeps_its_spelling_status() {
+    let store = Arc::new(
+        StoreService::new(StoreConfig {
+            equality_compact: true,
+            equality_canonical_answers: true,
+            ..StoreConfig::in_memory()
+        })
+        .unwrap(),
+    );
+    let writes = pipeline(&store, ReasoningMode::Owl2Rl);
+    commit(
+        &writes,
+        ":s :p :o . GRAPH :g { :t :p :n . } :left owl:sameAs :right .",
+    );
+    for (named, expected, unchecked) in [
+        (
+            ":g",
+            &["http://example.com/n", "http://example.com/o"][..],
+            false,
+        ),
+        (":missing", &["http://example.com/o"][..], true),
+    ] {
+        let query = format!(
+            "SELECT DISTINCT ?o FROM <urn:x-arq:DefaultGraph> FROM {named} WHERE {{ ?s :p ?o }}"
+        );
+        let (values, claim) = spelling_answer(&store, &query, "o");
+        assert_eq!(values, expected);
+        assert_eq!(claim.regime, Some(nrese_sparql::Regime::Owl2Rl));
+        let header = claim.header();
+        assert_eq!(
+            header.contains("literal evidence could not be checked")
+                || header.contains("two spellings of one value"),
+            unchecked,
+            "a held FROM graph disables the canonical spelling fallback: {named}: {header}"
+        );
+    }
+}
+
 /// Graph scope (reasoning-semantics): changing only hidden axioms can't change a
 /// restricted QL reader's reasons about its own answer.
 #[test]
