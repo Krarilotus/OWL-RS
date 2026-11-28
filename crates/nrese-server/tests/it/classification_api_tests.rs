@@ -210,7 +210,31 @@ async fn every_form_states_the_verdict_or_its_absence() -> Result<(), Box<dyn st
                 .clone()
                 .oneshot(get_at(route, "application/json")?)
                 .await?;
+            let header = response.headers()["nrese-completeness"]
+                .to_str()?
+                .to_owned();
             let json: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
+            // Spec: docs/spec/reasoning-semantics.md:135. Classification and realisation
+            // give one completeness verdict in their body and their header.
+            assert_eq!(header.split(';').next(), Some(status), "{name} {route}");
+            assert!(
+                header.contains("regime=owl2-dl"),
+                "{name} {route}: {header}"
+            );
+            assert_eq!(json["complete"], status == "complete", "{name} {route}");
+            assert_eq!(
+                json["incomplete"].as_array().is_some_and(Vec::is_empty),
+                status == "complete",
+                "{name} {route}"
+            );
+            if name == "declared" {
+                let mut head = get_at(route, "application/json")?;
+                *head.method_mut() = Method::HEAD;
+                let head = app.clone().oneshot(head).await?;
+                assert_eq!(head.status(), StatusCode::OK, "{route}");
+                assert_eq!(head.headers()["nrese-completeness"], header);
+                assert!(body_text(head).await?.is_empty());
+            }
             if (&json["consistent"], &json["consistency"])
                 != (&consistent, &serde_json::json!(consistency))
             {

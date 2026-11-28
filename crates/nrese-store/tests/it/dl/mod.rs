@@ -112,10 +112,10 @@ pub fn ask(pipeline: &MutationPipeline, pattern: &str) -> bool {
 }
 
 /// A DL answer's status as the tests read it: the shared status
-/// ([`nrese_sparql::Completeness`]) with what decided it ([`nrese_store::DlDetail`]).
+/// ([`nrese_store::Claim`]) with what decided it ([`nrese_store::DlDetail`]).
 #[derive(Debug)]
 pub struct Status {
-    pub shared: nrese_sparql::Completeness,
+    pub shared: nrese_store::Claim,
     pub paths: Vec<&'static str>,
     pub bounds: Option<Counts>,
     /// Of the refuted, those one model of the premise refuted by its labels.

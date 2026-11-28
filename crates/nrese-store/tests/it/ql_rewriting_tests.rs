@@ -812,7 +812,10 @@ fn store_rows(store: &StoreService, query: &str) -> Vec<Vec<usize>> {
 
 /// [`store_rows`], and whether the store says they are complete (with its reasons).
 /// What the rewriting did for a query.
-fn store_report(store: &StoreService, query: &str) -> Option<nrese_sparql::ql::QlReport> {
+fn store_report(
+    store: &StoreService,
+    query: &str,
+) -> Option<nrese_sparql::ql::QlReport<nrese_store::Claim>> {
     let mut request = SparqlQueryRequest::all(query);
     request.solutions_format = SolutionsResultFormat::Tsv;
     store.execute_query(&request).ok()?.ql
@@ -826,7 +829,7 @@ fn store_answer(store: &StoreService, query: &str) -> (Vec<Vec<usize>>, Complete
         .unwrap_or_else(|e| panic!("{query}: {e}"));
     let completeness = result
         .ql
-        .map(|report| report.completeness)
+        .map(|report| (*report.completeness).clone())
         .unwrap_or_default();
     let text = String::from_utf8(result.payload).unwrap();
     let rows = text
@@ -1233,7 +1236,10 @@ fn owl_thing_on_the_left_answers_for_every_individual() {
         } else {
             "false"
         };
-        (answer.to_owned(), result.completeness.unwrap_or_default())
+        (
+            answer.to_owned(),
+            result.completeness.as_deref().cloned().unwrap_or_default(),
+        )
     };
     let dir = tempfile::tempdir().unwrap();
     let mut wrong = Vec::new();
@@ -1278,7 +1284,7 @@ fn owl_thing_on_the_left_answers_for_every_individual() {
             .execute_query(&SparqlQueryRequest::all(literal.as_str()))
             .unwrap_or_else(|e| panic!("{literal}: {e}"));
         let text = String::from_utf8(result.payload).unwrap();
-        let status = result.completeness.unwrap_or_default();
+        let status = result.completeness.as_deref().cloned().unwrap_or_default();
         if text.contains("\"3\"") || !clean_read_claim(ruleset, &status) {
             wrong.push(format!("{name}, guard {literal}: {text}, {status:?}"));
         }
@@ -2175,7 +2181,7 @@ fn an_axiom_the_reader_leaves_out_is_never_told_complete_under_owl2_ql() {
         let result = store
             .execute_query(&SparqlQueryRequest::all(query.as_str()))
             .unwrap();
-        let completeness = result.completeness.unwrap_or_default();
+        let completeness = result.completeness.as_deref().cloned().unwrap_or_default();
         (select_rows(&result.payload), completeness)
     };
     let a = vec![format!("x={E}a")];
@@ -3031,7 +3037,7 @@ fn rewritten_read(
         "setup: the QL rewriting didn't answer ({status})"
     );
     let reasons = (result.completeness.into_iter())
-        .flat_map(|s| s.reasons.into_iter().map(|r| r.text))
+        .flat_map(|s| s.reasons.clone().into_iter().map(|r| r.text))
         .collect();
     (status, reasons)
 }

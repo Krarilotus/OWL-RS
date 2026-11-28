@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
-use nrese_sparql::Completeness;
+use nrese_store::Claim;
 use nrese_store::{
     DlAnswers, MutationError, MutationPipeline, RejectKind, StatementOp, StoreConfig, StoreError,
     StoreService,
@@ -1209,7 +1209,7 @@ fn owl2_rl_answers_the_punning_and_annotation_reads_from_the_closure() {
                     &CancellationToken::new(),
                 )
                 .expect("planned");
-            let status = |c: Option<nrese_sparql::Completeness>| c.map_or("none", |c| c.as_str());
+            let status = |c: Option<nrese_store::Claim>| c.map_or("none", |c| c.as_str());
             let answer = String::from_utf8(result.payload).expect("utf8");
             let line = format!(
                 "{read}: true {}, status {} / plan {}",
@@ -1305,7 +1305,7 @@ const ENTAILED: &str = ":y a :F . :F rdfs:subClassOf :E .";
 /// reaching a punned name, each with [`ENTAILED`] beside it: the line of each whose `read`
 /// of `?x a :E` doesn't answer `y` alone (the entailed row kept), or isn't `unsound`
 /// with the reason.
-fn unmarked(read: impl Fn(&MutationPipeline) -> (Vec<String>, Completeness)) -> Vec<String> {
+fn unmarked(read: impl Fn(&MutationPipeline) -> (Vec<String>, Claim)) -> Vec<String> {
     let mut wrong = Vec::new();
     for (data, reason) in [
         (ANNOTATION_AXIOMS, "annotation-property axioms"),

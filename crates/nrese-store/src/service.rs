@@ -1135,6 +1135,8 @@ impl StoreService {
     /// The answer and metadata for repository information, from a single held publication.
     pub fn publication_report(&self) -> PublicationReport {
         let snapshot = self.engine.snapshot();
+        #[cfg(test)]
+        hooks::run(&hooks::AFTER_DECIDED);
         let dl_mode = Certificate::route(&snapshot, &self.dl).0;
         let dl = dl_mode.then(|| ReadBasis::dl_status(&snapshot)).flatten();
         let verdict = dl.as_ref().map(|status| status.consistency.verdict.clone());
@@ -2081,7 +2083,9 @@ impl StoreService {
         cancellation: &CancellationToken,
     ) -> StoreResult<crate::Explanation> {
         let memory = self.settings.query_envelope(prepared);
-        self.explain_in(prepared, &memory, cancellation)
+        let mut explanation = self.explain_in(prepared, &memory, cancellation)?;
+        explanation.completeness = explanation.completeness.and_then(Claim::into_report);
+        Ok(explanation)
     }
 
     /// [`Self::explain_query`] in the envelope `memory`.
@@ -2170,7 +2174,9 @@ impl StoreService {
         cancellation: &CancellationToken,
     ) -> StoreResult<crate::PlannedQuery> {
         let memory = self.settings.query_envelope(prepared);
-        self.plan_in(prepared, &memory, cancellation)
+        let mut plan = self.plan_in(prepared, &memory, cancellation)?;
+        plan.completeness = plan.completeness.and_then(Claim::into_report);
+        Ok(plan)
     }
 
     /// [`Self::plan_query`] in the envelope `memory`.

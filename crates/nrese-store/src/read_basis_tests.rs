@@ -68,6 +68,66 @@ fn read_basis_pending_base_keeps_its_program_during_registration() {
     );
 }
 
+// Spec: docs/spec/02-storage-and-transactions.md:24 and docs/spec/reasoning-semantics.md:130.
+// A DL mode switch can replace the publication without incrementing its revision. The held
+// view still reports DL's undecided literal while the next one reports the rules' verdict.
+#[test]
+fn read_basis_a_mode_switch_at_the_same_revision_keeps_both_verdicts() {
+    use crate::ConsistencyStatus::{Consistent, Unknown};
+    let pipeline = pipeline(
+        ReasoningMode::Owl2Dl,
+        ":d a owl:DatatypeProperty . :a :d \"abc\"^^<http://www.w3.org/2001/XMLSchema#integer> .",
+    );
+    let store = pipeline.store();
+    let writer = Arc::clone(store);
+    hooks::AFTER_DECIDED.set(Some(Box::new(move || writer.use_dl(false, false))));
+    let held = store.publication_report();
+    let latest = store.publication_report();
+    assert_eq!(
+        (held.claim.consistency(), latest.claim.consistency()),
+        (Unknown, Consistent)
+    );
+    assert_eq!(held.revision, latest.revision);
+    assert!(!held.claim.eq(&latest.claim));
+    assert!(held.dl_mode && !latest.dl_mode);
+}
+
+// Spec: docs/spec/02-storage-and-transactions.md:24 and docs/spec/reasoning-semantics.md:167.
+// The repository's information is one observation of a repair that leaves quarantine.
+#[test]
+fn read_basis_repository_information_survives_revalidation() {
+    use crate::ConsistencyStatus::{Consistent, Inconsistent};
+    let import = pipeline(
+        ReasoningMode::Disabled,
+        ":A owl:disjointWith :B . :a a :A, :B .",
+    );
+    let store = import.store();
+    let repair = MutationPipeline::new(
+        Arc::clone(store),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Rl,
+        ))),
+    );
+    store
+        .rematerialise(nrese_reasoner::rulesets::Ruleset::Owl2Rl)
+        .expect("rebuild imported data");
+    let revision = store.current_revision();
+    hooks::AFTER_DECIDED.set(Some(Box::new(move || {
+        repair
+            .execute_update_str(&format!("{PREFIXES} DELETE DATA {{ :a a :B }}"))
+            .expect("repair");
+    })));
+    let held = store.publication_report();
+    assert_eq!(held.claim.consistency(), Inconsistent { violations: 1 });
+    assert_eq!(
+        (held.revision, held.shacl.view_revision, held.quarantined),
+        (revision, revision, true)
+    );
+    let latest = store.publication_report();
+    assert_eq!(latest.claim.consistency(), Consistent);
+    assert!(latest.revision > held.revision && !latest.quarantined);
+}
+
 // Spec: docs/spec/02-storage-and-transactions.md:24 and docs/spec/reasoning-semantics.md:95.
 // A read during registration sees the published program and certificate as a pair.
 #[test]

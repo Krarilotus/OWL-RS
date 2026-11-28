@@ -77,7 +77,7 @@ fn class(header: &str) -> &str {
 }
 
 /// The status header of `status`, or `none`.
-fn header(status: Option<nrese_sparql::Completeness>) -> String {
+fn header(status: Option<nrese_store::Claim>) -> String {
     status.map_or_else(|| "none".to_owned(), |s| s.header())
 }
 

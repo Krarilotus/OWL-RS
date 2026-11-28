@@ -7,7 +7,7 @@
 //! honest about them: `complete` only with exactly these rows, `sound` only with none outside
 //! them (the outside check's FAIL rule).
 
-use nrese_sparql::Completeness;
+use nrese_store::Claim;
 use nrese_store::{MutationPipeline, SparqlQueryRequest};
 
 use super::{pipeline, update};
@@ -58,7 +58,7 @@ const NOT_PROP_2: &str = "SELECT ?v0 ?v1 { ?v0 f:p3 ?v1 . FILTER NOT EXISTS { ?v
 const NOT_PROP: &str = "SELECT ?v0 ?v1 { ?v0 f:p1 ?v1 . FILTER NOT EXISTS { ?v0 f:p3 ?v1 . } }";
 
 /// A query's rows (its variables' local names, in order, sorted) and status.
-fn answers(dl: &MutationPipeline, select: &str) -> (Vec<Vec<String>>, Completeness) {
+fn answers(dl: &MutationPipeline, select: &str) -> (Vec<Vec<String>>, Claim) {
     let store = dl.store();
     let prepared = store
         .prepare_query(&SparqlQueryRequest::all(format!("{F}{select}")))

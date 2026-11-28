@@ -652,6 +652,17 @@ async fn scoped_rows_and_explanations_are_not_certified() -> TestResult {
         explain.json()["completeness"]["status"],
         plan.json()["completeness"]["status"]
     );
+    // Spec: docs/spec/reasoning-semantics.md:86 and :141. A scoped view carries no
+    // whole-store regime, bounds, or reasons across any representation.
+    for reply in [&explain, &plan] {
+        let body = reply.json();
+        let claim = &body["completeness"];
+        assert_eq!(claim["status"], "not-certified");
+        assert_eq!(claim["complete"], false);
+        assert_eq!(claim["sound"], false);
+        assert_eq!(claim["reasons"], serde_json::json!([]));
+        assert!(claim["regime"].is_null() && claim["bounds"].is_null() && body["ql"].is_null());
+    }
     Ok(())
 }
 

@@ -293,7 +293,7 @@ fn queries_without_tree_witnesses_plan_as_before() {
             "{query}"
         );
         // Nothing rewritten, and nothing missing (complete under the closure's regime).
-        let mut nothing = nrese_sparql::ql::QlReport::default();
+        let mut nothing = nrese_sparql::ql::QlReport::<nrese_sparql::Completeness>::default();
         nothing.completeness.regime = with.ql.as_ref().and_then(|r| r.completeness.regime);
         assert_eq!(with.ql.unwrap_or_default(), nothing);
     }
@@ -315,7 +315,7 @@ fn queries_without_tree_witnesses_plan_as_before() {
             "{query}"
         );
         // Nothing rewritten, and nothing missing (complete under the closure's regime).
-        let mut nothing = nrese_sparql::ql::QlReport::default();
+        let mut nothing = nrese_sparql::ql::QlReport::<nrese_sparql::Completeness>::default();
         nothing.completeness.regime = with.ql.as_ref().and_then(|r| r.completeness.regime);
         assert_eq!(with.ql.unwrap_or_default(), nothing);
     }

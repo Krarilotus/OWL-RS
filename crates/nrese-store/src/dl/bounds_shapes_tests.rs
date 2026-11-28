@@ -200,7 +200,7 @@ const READS: [&str; 3] = [
 /// whole, a literal quoted, each blank node `_:` with the number of answers it is, so that two
 /// stores' answers are equal exactly when they are equal up to a renaming of blank nodes (RDF
 /// 1.1 Concepts §3.6).
-fn answers(store: &StoreService, read: &str) -> (Vec<String>, nrese_sparql::Completeness) {
+fn answers(store: &StoreService, read: &str) -> (Vec<String>, crate::Claim) {
     let request = crate::SparqlQueryRequest::all(format!("{PREFIXES}{read}"));
     let prepared = store.prepare_query(&request).expect("query");
     let mut out = Vec::new();

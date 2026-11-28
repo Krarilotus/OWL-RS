@@ -98,7 +98,7 @@ pub(super) fn in_transaction(
     dl: &MutationPipeline,
     ops: Vec<StatementOp>,
     q: &str,
-) -> (String, Option<nrese_sparql::Completeness>) {
+) -> (String, Option<nrese_store::Claim>) {
     let store = dl.store();
     let prepared = store
         .prepare_query(&SparqlQueryRequest::all(format!("{PREFIXES}{q}")))

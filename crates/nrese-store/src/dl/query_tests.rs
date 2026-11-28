@@ -495,11 +495,7 @@ fn racing(
 }
 
 /// `query` over [`racing`]`(first, then)`, run: the answer and its status.
-fn decided_then(
-    first: &str,
-    then: &'static str,
-    query: &str,
-) -> (String, nrese_sparql::Completeness) {
+fn decided_then(first: &str, then: &'static str, query: &str) -> (String, crate::Claim) {
     let (store, ran) = racing(first, then);
     let prepared = store
         .prepare_query(&crate::SparqlQueryRequest::all(format!(
@@ -881,8 +877,8 @@ fn a_deleted_triple_a_surviving_reification_names_is_told_as_a_fresh_read_tells_
             let request = crate::SparqlQueryRequest::all(ask.clone());
             store.prepare_query(&request).unwrap()
         };
-        let marks = |status: Option<nrese_sparql::Completeness>| -> Vec<String> {
-            let reasons = status.expect("a status").reasons.into_iter();
+        let marks = |status: Option<crate::Claim>| -> Vec<String> {
+            let reasons = status.expect("a status").reasons.clone().into_iter();
             reasons
                 .filter(|r| r.text.contains(ONLY))
                 .map(|r| r.text)
@@ -970,7 +966,7 @@ fn a_reinserted_triple_a_surviving_reification_names_is_told_as_a_fresh_read_tel
                     None
                 });
             read.unwrap();
-            let reasons = status.expect("a status").reasons.into_iter();
+            let reasons = status.expect("a status").reasons.clone().into_iter();
             reasons
                 .filter(|r| r.text.contains(ONLY))
                 .map(|r| r.text)
@@ -2106,10 +2102,7 @@ fn unions_store_of(dl: crate::DlConfig, data: &str) -> Arc<StoreService> {
 }
 
 /// A read's answers' bytes and its status with what decided it.
-type Read = (
-    Vec<u8>,
-    Option<(nrese_sparql::Completeness, crate::dl::DlDetail)>,
-);
+type Read = (Vec<u8>, Option<(crate::Claim, crate::dl::DlDetail)>);
 
 /// `SELECT ?x { ?x a :U0 }` over `store` within `memory` bytes.
 fn unions_read(store: &StoreService, memory: Option<usize>) -> crate::StoreResult<Read> {
@@ -2249,8 +2242,7 @@ fn without_model_labels_a_read_is_decided_by_its_tests_alone() {
     let ((off_status, off_detail), (on_status, on_detail)) =
         (off_status.unwrap(), on_status.unwrap());
     println!("off {off_status:?} {off_detail:?}; on {on_status:?} {on_detail:?}");
-    let bounds =
-        |s: &nrese_sparql::Completeness| s.bounds.map(|b| (b.lower, b.upper, b.unresolved));
+    let bounds = |s: &crate::Claim| s.bounds.map(|b| (b.lower, b.upper, b.unresolved));
     assert_eq!(bounds(&off_status), Some((12, 24, 8)));
     assert_eq!(
         (
@@ -2445,8 +2437,7 @@ fn a_read_past_its_requests_deadline_is_told_incomplete_with_its_rows() {
     let (rows, (status, detail)) = read(Some(std::time::Instant::now()));
     let (free_rows, (free, free_detail)) = read(None);
     println!("passed {status:?} {detail:?}; no deadline {free:?} {free_detail:?}");
-    let bounds =
-        |s: &nrese_sparql::Completeness| s.bounds.map(|b| (b.lower, b.upper, b.unresolved));
+    let bounds = |s: &crate::Claim| s.bounds.map(|b| (b.lower, b.upper, b.unresolved));
     let counts = |d: &crate::dl::DlDetail| (d.proved, d.refuted);
     assert_eq!(
         (bounds(&status), counts(&detail), status.complete),
@@ -2654,7 +2645,7 @@ fn promoted_store(model_labels: bool) -> Arc<StoreService> {
 }
 
 /// [`promoted_store`]'s read with the labels on and no memory limit: what decided it, its status.
-fn promoted_read() -> (crate::dl::DlDetail, nrese_sparql::Completeness) {
+fn promoted_read() -> (crate::dl::DlDetail, crate::Claim) {
     let (_, status) = unions_read_of(&promoted_store(true), PROMOTED, None).unwrap();
     let (status, detail) = status.expect("a status");
     println!("{status:?} {detail:?}");

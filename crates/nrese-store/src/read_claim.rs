@@ -7,6 +7,14 @@ use crate::entailment::Entailment;
 
 /// The store's assessment of an answer, composed once from the publication and its route.
 /// A route supplies evidence ([`Completeness`]); only `StoreService::assess` issues a claim.
+///
+/// ```compile_fail
+/// use nrese_sparql::Completeness;
+/// use nrese_store::Claim;
+/// fn issue_without_assessment(evidence: Completeness) -> Claim {
+///     evidence.into()
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Claim {
     status: Completeness,
