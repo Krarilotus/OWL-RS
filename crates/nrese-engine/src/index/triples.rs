@@ -364,6 +364,30 @@ mod tests {
         assert!(!pinned.contains(last));
     }
 
+    /// §4.3c R6. A counted one-run scan obeys its upper bound and can stop
+    /// partway through a long range.
+    #[test]
+    fn a_counted_subject_predicate_scan_stops_at_the_bound_or_visitor() {
+        let budget = Arc::new(Budget::unlimited());
+        let n = 4 * u64::from(nrese_exec::POLL_UNITS);
+        let expected: Vec<_> = (1..=n).map(|o| [1, P, o]).collect();
+        let version = TripleVersion::build(
+            expected.iter().copied().chain([[1, P + 1, 1], [2, P, 1]]),
+            &budget,
+        )
+        .unwrap();
+        let bound = [Some(1), Some(P), None];
+        let scan = version.scan_counted(bound, &|_| true).unwrap();
+        assert_eq!(scan.collect::<Result<Vec<_>, _>>().unwrap(), expected);
+        let going = std::cell::Cell::new(true);
+        let visit = |_| going.get();
+        let mut scan = version.scan_counted(bound, &visit).unwrap();
+        assert_eq!(scan.next(), Some(Ok(expected[0])));
+        going.set(false);
+        let seen = scan.collect::<Result<Vec<_>, _>>();
+        assert_eq!(seen, Err(Stopped));
+    }
+
     /// §4.3c R7. Compaction completes after a writer appends another delta.
     #[test]
     fn triple_compaction_splices_into_the_version_with_a_later_append() {

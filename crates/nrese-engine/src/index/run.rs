@@ -542,10 +542,19 @@ impl Run {
     ) -> Option<i64> {
         let perm = self.permutation(Permutation::Spog);
         let key = Permutation::Spog.to_key(quad);
-        Some(match perm.keys.range_counted(&key, &key, account)? {
-            (start, end) if start == end => 0,
-            (start, _) if perm.is_tombstone(start) => -1,
-            _ => 1,
+        let at = perm.keys.bound_counted(&key, account)?;
+        if at == perm.keys.len() {
+            return Some(0);
+        }
+        if !account.take(3) {
+            return None;
+        }
+        Some(if perm.keys.get(at) != key {
+            0
+        } else if perm.is_tombstone(at) {
+            -1
+        } else {
+            1
         })
     }
 }

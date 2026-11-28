@@ -630,6 +630,31 @@ impl IndexVersion {
                 false,
             ));
         };
+        // A subject/predicate probe usually reads only a few keys. On one run it can
+        // stop at the first key outside the bound, saving a second seek and a merge.
+        if let [run] = self.runs()
+            && adapted.permutation == Permutation::Spog
+            && adapted.low[..2] == adapted.high[..2]
+        {
+            let run = run.permutation(adapted.permutation);
+            let at = run
+                .keys
+                .bound_counted(&adapted.low, account)
+                .ok_or(Stopped)?;
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+            crate::witness::add(crate::witness::Site::RunProbes, 1);
+            return Ok(QuadScan {
+                source: ScanSource::Bounded(BoundedScan {
+                    run,
+                    at,
+                    high: adapted.high,
+                    stopped: false,
+                }),
+                permutation: adapted.permutation,
+                exclude_default_graph: adapted.exclude_default_graph,
+                ledger: (0, 0),
+            });
+        }
         // Each range handed to the merge as it is searched, with no list of them first (the
         // plain scan's shape: a list per scan cost the counted reads about 2.7 % on the support
         // update, p2-reas3-cnt4).
@@ -1333,7 +1358,7 @@ impl ColumnScan<'_> {
 
 /// Iterator returned by [`IndexVersion::scan`].
 pub(crate) struct QuadScan<'a> {
-    merge: SignedMerge<'a>,
+    source: ScanSource<'a>,
     permutation: Permutation,
     exclude_default_graph: bool,
     /// A counted scan's ledger between its steps: units asked for and not yet taken, and the
@@ -1341,12 +1366,50 @@ pub(crate) struct QuadScan<'a> {
     ledger: (u64, u64),
 }
 
+enum ScanSource<'a> {
+    Merge(SignedMerge<'a>),
+    Bounded(BoundedScan<'a>),
+}
+
+/// A short bound scan on a single run. The next key also supplies the upper-bound test.
+struct BoundedScan<'a> {
+    run: &'a PermutationRun,
+    at: usize,
+    high: Key,
+    stopped: bool,
+}
+
+impl BoundedScan<'_> {
+    #[inline]
+    fn step(&mut self, account: &mut impl Account) -> Result<Option<(Key, i64)>, Stopped> {
+        if self.stopped || !account.take(4) {
+            self.stopped = true;
+            return Err(Stopped);
+        }
+        if self.at == self.run.keys.len() {
+            return Ok(None);
+        }
+        let key = self.run.keys.get(self.at);
+        if key > self.high {
+            self.at = self.run.keys.len();
+            return Ok(None);
+        }
+        let sign = if self.run.is_tombstone(self.at) {
+            -1
+        } else {
+            1
+        };
+        self.at += 1;
+        Ok(Some((key, sign)))
+    }
+}
+
 pub(crate) use crate::visit::{Stopped, Visitor};
 
 impl<'a> QuadScan<'a> {
     fn new(merge: SignedMerge<'a>, permutation: Permutation, exclude_default_graph: bool) -> Self {
         Self {
-            merge,
+            source: ScanSource::Merge(merge),
             permutation,
             exclude_default_graph,
             ledger: (0, 0),
@@ -1394,7 +1457,11 @@ impl<'a> QuadScan<'a> {
     #[inline]
     fn step_key_with(&mut self, account: &mut impl Account) -> Result<Option<Key>, Stopped> {
         loop {
-            let Some((key, sign)) = self.merge.step(account)? else {
+            let step = match &mut self.source {
+                ScanSource::Merge(merge) => merge.step(account),
+                ScanSource::Bounded(run) => run.step(account),
+            };
+            let Some((key, sign)) = step? else {
                 return Ok(None);
             };
             #[cfg(any(test, all(feature = "witness", debug_assertions)))]
@@ -1445,7 +1512,11 @@ impl Iterator for QuadScan<'_> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, Some(self.merge.remaining()))
+        let remaining = match &self.source {
+            ScanSource::Merge(merge) => Some(merge.remaining()),
+            ScanSource::Bounded(_) => None,
+        };
+        (0, remaining)
     }
 }
 
