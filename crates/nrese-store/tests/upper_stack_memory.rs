@@ -1,17 +1,16 @@
-//! Guard of U1's stack's memory (SYN-61): what the stack's trees and table hold is charged
-//! before it grows, at every size, through inserts and removes alike, and nothing stays
-//! charged once it goes. Measured against the budget (`nrese_exec::measure`), so this file is
-//! a test binary of its own.
+//! Guard of U1's run memory (SYN-61). Building, advancing and compacting the stack and
+//! eligible sets must stay within their charge. Pinned readers keep their runs charged
+//! until they drop them. This test binary measures allocations against the budget.
 
 use std::sync::Arc;
 
+use nrese_engine::{CompactionPolicy, TripleVersion};
 use nrese_exec::{Budget, measure};
-use nrese_store::dl::upper::Stack;
 
 #[global_allocator]
 static ALLOCATOR: measure::Measured<std::alloc::System> = measure::Measured(std::alloc::System);
 
-/// Facts over `predicates` predicates, in an order that splits nodes everywhere.
+/// Facts over `predicates` predicates, in shuffled subject order.
 fn facts(n: u64, predicates: u64) -> Vec<[u64; 3]> {
     (0..n)
         .map(|i| {
@@ -24,38 +23,57 @@ fn facts(n: u64, predicates: u64) -> Vec<[u64; 3]> {
         .collect()
 }
 
-/// At sizes from one fact to past ten thousand, inserted, half removed, inserted again
-/// (commits' churn), then dropped: nothing held beyond the charge, the charge back to 0.
-/// Every row is reported.
+/// Moves every other fact from the stack to the eligible set and back, holding the
+/// intermediate publication across compaction. The last drop returns the charge to zero.
 #[test]
-fn the_stack_holds_nothing_beyond_its_charge() {
+fn the_runs_hold_nothing_beyond_their_charge() {
     if !measure::alone() {
         return;
     }
     let mut failed = Vec::new();
+    let policy = CompactionPolicy {
+        // Only the two-run cap can force an inline compaction with this limit.
+        inline_entry_limit: 0,
+        ..CompactionPolicy::default()
+    };
     for (n, predicates) in [(1, 1), (40, 3), (2_000, 17), (12_000, 600)] {
         let facts = facts(n, predicates);
+        let mut moved: Vec<_> = facts.iter().step_by(2).copied().collect();
+        moved.sort_unstable();
         let budget = Arc::new(Budget::unlimited());
-        let (peak, excess) = measure::measure_within(&budget, || {
-            let mut stack = Stack::within(&budget);
-            for &t in &facts {
-                stack.try_insert(t).unwrap();
-            }
-            for &t in facts.iter().step_by(2) {
-                stack.remove_charged(t);
-            }
-            for &t in facts.iter().step_by(2) {
-                stack.try_insert(t).unwrap();
-            }
-            let peak = budget.used();
-            drop(stack);
-            peak
+        let (held_charge, excess) = measure::measure_within(&budget, || {
+            let mut stack = TripleVersion::build(facts.iter().copied(), &budget).unwrap();
+            let mut eligible = TripleVersion::build(std::iter::empty(), &budget).unwrap();
+            stack = stack.successor(&[], &moved).unwrap();
+            eligible = eligible.successor(&moved, &[]).unwrap();
+            let (held_stack, held_eligible) = (stack.clone(), eligible.clone());
+
+            stack = stack.successor(&moved, &[]).unwrap();
+            eligible = eligible.successor(&[], &moved).unwrap();
+            let compact = stack.compact(policy, true).unwrap().expect("third run");
+            stack = compact(&stack).unwrap().expect("matching stack");
+            let compact = eligible
+                .compact(policy, false)
+                .unwrap()
+                .expect("two equal-sized eligible runs");
+            eligible = compact(&eligible).unwrap().expect("matching eligible set");
+
+            assert_eq!(stack.len(), facts.len());
+            assert!(eligible.is_empty());
+            drop((stack, eligible));
+            assert_eq!(held_stack.len(), facts.len() - moved.len());
+            assert_eq!(held_eligible.len(), moved.len());
+            let held_charge = budget.used();
+            drop((held_stack, held_eligible));
+            held_charge
         });
-        if excess != 0 || peak == 0 || budget.used() != 0 {
-            failed.push(format!(
-                "{n} facts: {excess} bytes beyond the charge, {peak} charged, {} left",
-                budget.used()
-            ));
+        let remaining = budget.used();
+        let row = format!(
+            "{n} facts: {excess} bytes beyond the charge, {held_charge} charged while held, {remaining} left"
+        );
+        eprintln!("{row}");
+        if excess != 0 || held_charge == 0 || remaining != 0 {
+            failed.push(row);
         }
     }
     assert!(failed.is_empty(), "{failed:#?}");
@@ -68,12 +86,20 @@ fn a_refused_fact_is_not_inserted() {
         return;
     }
     let budget = Arc::new(Budget::new(4096));
-    let mut stack = Stack::within(&budget);
+    let mut stack = TripleVersion::build(std::iter::empty(), &budget).unwrap();
     let mut inserted = 0;
     for t in facts(1_000, 7) {
-        match stack.try_insert(t) {
-            Ok(_) => inserted += 1,
-            Err(_) => break,
+        let charged = budget.used();
+        match stack.successor(&[t], &[]) {
+            Ok(next) => {
+                stack = next;
+                inserted += 1;
+            }
+            Err(_) => {
+                assert!(!stack.contains(t));
+                assert_eq!(budget.used(), charged);
+                break;
+            }
         }
     }
     assert!(inserted > 0 && inserted < 1_000, "{inserted} inserted");
