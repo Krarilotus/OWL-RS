@@ -237,10 +237,10 @@ enum LiteralSummary {
     #[default]
     Unavailable,
     Empty,
-    Counts(Box<LiteralCounts>),
+    Counts(Arc<LiteralCounts>),
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 struct LiteralCounts {
     total: i64,
     by_predicate: HashMap<TermId, i64>,
@@ -287,7 +287,8 @@ impl Run {
     /// Whether [`super::IndexVersion::with_change_within`] builds a delta of `n` entries
     /// charged array by array ([`Self::from_delta_within_parallel`]: at or above the parallel
     /// threshold, where those charges are noise against the build and a bound's slack would
-    /// be large) rather than as [`Self::from_delta`] within [`Self::delta_bound`], charged
+    /// be large) rather than as [`Self::from_delta_without_literal_counts`] within
+    /// [`Self::delta_bound`], charged
     /// before it builds (DUR-6 slice 2: one reservation per pending snapshot).
     pub(crate) fn charged_exactly(n: usize) -> bool {
         n >= PARALLEL_BUILD_THRESHOLD
@@ -439,7 +440,7 @@ impl Run {
         self.literals = if counts.exact.is_empty() {
             LiteralSummary::Empty
         } else {
-            LiteralSummary::Counts(Box::new(counts))
+            LiteralSummary::Counts(Arc::new(counts))
         };
         self
     }
@@ -630,20 +631,34 @@ impl Run {
 
     /// Heap bytes held.
     pub(crate) fn memory_bytes(&self) -> u64 {
-        let literals = match &self.literals {
-            LiteralSummary::Counts(counts) => {
-                size_of::<LiteralCounts>()
-                    + counts.by_predicate.allocation_size()
-                    + counts.by_graph.allocation_size()
-                    + counts.exact.allocation_size()
-            }
-            _ => 0,
-        };
         self.perms
             .iter()
             .map(|p| (p.keys.memory_bytes() + p.tombstones.len() * 8) as u64)
             .sum::<u64>()
-            + literals as u64
+            + self.literal_summary_bytes()
+    }
+
+    fn literal_summary_bytes(&self) -> u64 {
+        let LiteralSummary::Counts(counts) = &self.literals else {
+            return 0;
+        };
+        (size_of::<LiteralCounts>()
+            + 2 * size_of::<usize>()
+            + counts.by_predicate.allocation_size()
+            + counts.by_graph.allocation_size()
+            + counts.exact.allocation_size()) as u64
+    }
+
+    /// A live shared form already counts this run's literal summary in `Forms`.
+    pub(crate) fn memory_outside_forms(&self) -> u64 {
+        let bytes = self.memory_bytes();
+        if matches!(self.literals, LiteralSummary::Counts(_))
+            && self.quads_form.lock().strong_count() != 0
+        {
+            bytes - self.literal_summary_bytes()
+        } else {
+            bytes
+        }
     }
 
     /// Bytes used in place from a mapped checkpoint.

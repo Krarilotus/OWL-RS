@@ -1292,10 +1292,9 @@ impl Snapshot {
             }
         };
         // What the builds held beside what their runs keep: their working memory, freed now.
-        // Sound because a run never keeps more than its bound: `Run::delta_bound` is derived as
-        // an upper bound of what `Run::from_delta` allocates (`with_change_within` asserts it in
-        // debug builds only). The subtraction saturates, but that doesn't make an underestimated
-        // bound safe: the part kept beyond it would go uncharged.
+        // `Run::delta_bound` bounds what `Run::from_delta_without_literal_counts` allocates.
+        // `with_change_within` asserts it in debug builds. If the bound were underestimated,
+        // the run could keep bytes that were never charged.
         held.release(
             bounds[0].saturating_sub(asserted_kept) + bounds[1].saturating_sub(inferred_kept),
         );
@@ -1812,6 +1811,24 @@ impl Snapshot {
         graph: Option<TermId>,
         visit: crate::Visitor<'_>,
     ) -> Result<bool, crate::Stopped> {
+        let reads_default_inferences =
+            model != ReadModel::Asserted && graph.is_none_or(|g| g.is_default_graph());
+        let classes = match self.equality.filter(|_| reads_default_inferences) {
+            Some(same_as) => Some(
+                self.version
+                    .equality
+                    .classes_with(&self.version, same_as, visit)
+                    .ok_or(crate::Stopped)?,
+            ),
+            None => None,
+        };
+        // The stored ranges can miss a literal introduced by an equality expansion.
+        if classes
+            .as_ref()
+            .is_some_and(|classes| classes.relate_literals())
+        {
+            return Err(crate::Stopped);
+        }
         let probe = |stack, predicate, graph| {
             self.version
                 .stack(stack)
@@ -1821,20 +1838,10 @@ impl Snapshot {
         if asserted && probe(Stack::Asserted, predicate, graph)? {
             return Ok(true);
         }
-        if model == ReadModel::Asserted || graph.is_some_and(|g| !g.is_default_graph()) {
+        if !reads_default_inferences {
             return Ok(false);
         }
-        let canonical = match (predicate, self.equality) {
-            (Some(p), Some(same_as)) => {
-                let classes = self
-                    .version
-                    .equality
-                    .classes_with(&self.version, same_as, visit)
-                    .ok_or(crate::Stopped)?;
-                Some(classes.representative(p))
-            }
-            _ => predicate,
-        };
+        let canonical = predicate.map(|p| classes.as_ref().map_or(p, |c| c.representative(p)));
         if asserted
             && predicate != canonical
             && probe(Stack::Asserted, canonical, Some(TermId::DEFAULT_GRAPH))?

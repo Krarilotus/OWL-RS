@@ -159,8 +159,8 @@ pub struct EngineStats {
     pub runs: usize,
     /// Index memory of both stacks on the heap: the latest version's own runs, and every
     /// quad-layout form of a default-graph run alive (shared by pending versions over a base
-    /// that hasn't the quad layout yet, published or not), each once (DUR-6). Array payload,
-    /// not run boxes; older versions held by snapshots aren't counted.
+    /// that hasn't the quad layout yet, published or not), each once (DUR-6). Includes literal
+    /// summaries. Run boxes and older versions held by snapshots are excluded.
     pub index_bytes: u64,
     /// Index data of both stacks used in place from a mapped checkpoint.
     pub index_mapped_bytes: u64,
@@ -1434,7 +1434,7 @@ impl Engine {
             index_bytes: version
                 .runs()
                 .filter(|run| !run.is_form())
-                .map(|run| run.memory_bytes())
+                .map(|run| run.memory_outside_forms())
                 .sum::<u64>()
                 + self.inner.shared.forms.bytes(),
             index_mapped_bytes: version.runs().map(|run| run.mapped_bytes()).sum(),
