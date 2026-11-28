@@ -371,7 +371,7 @@ fn a_restricted_read_keeps_the_quarantine_reason_when_not_certified() {
 /// A missing evidence source lowers coverage without asserting that it found a literal.
 #[test]
 fn unchecked_spelling_evidence_lowers_a_value_comparison() {
-    let prepared = PreparedQuery::parse(&SparqlQueryRequest::all(
+    let prepared = crate::PreparedQuery::parse(&SparqlQueryRequest::all(
         "SELECT DISTINCT ?o { <urn:s> <urn:p> ?o }",
     ))
     .unwrap();
