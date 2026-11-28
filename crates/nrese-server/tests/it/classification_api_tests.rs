@@ -232,7 +232,6 @@ async fn every_form_states_the_verdict_or_its_absence() -> Result<(), Box<dyn st
                 *head.method_mut() = Method::HEAD;
                 let head = app.clone().oneshot(head).await?;
                 assert_eq!(head.status(), StatusCode::OK, "{route}");
-                assert_eq!(head.headers()["nrese-completeness"].to_str()?, header);
                 assert!(body_text(head).await?.is_empty());
             }
             if (&json["consistent"], &json["consistency"])

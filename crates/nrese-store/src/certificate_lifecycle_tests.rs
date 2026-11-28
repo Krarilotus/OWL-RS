@@ -503,7 +503,7 @@ fn a_version_no_one_published_read_without_its_operations_is_not_certified() {
         &cancel,
         |snapshot| {
             Ok(store
-                .status_outside_dl(&prepared, None, Revision::Committed(snapshot))
+                .status_outside_dl(&prepared, None, Revision::Committed(snapshot), None)
                 .into_report())
         },
     );
@@ -528,7 +528,7 @@ fn a_version_no_one_published_read_without_its_operations_is_not_certified() {
         &cancel,
         |snapshot| {
             Ok(store
-                .status_outside_dl(&prepared, None, Revision::Committed(snapshot))
+                .status_outside_dl(&prepared, None, Revision::Committed(snapshot), None)
                 .into_report())
         },
     );
@@ -550,7 +550,8 @@ fn a_version_no_one_published_read_without_its_operations_is_not_certified() {
     ) {
         Ok(()) => {
             let snapshot = tx.pending_snapshot();
-            let got = store.status_outside_dl(&prepared, None, Revision::Committed(&snapshot));
+            let got =
+                store.status_outside_dl(&prepared, None, Revision::Committed(&snapshot), None);
             cells.class(
                 "row 14 a pending version",
                 &header(got.into_report()),

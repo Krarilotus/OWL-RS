@@ -9,6 +9,7 @@
 //! - **Negative statements** the rules never derive are decided by refutation: their
 //!   opposite is added in a speculative transaction (never committed), the reasoner
 //!   maintains the closure over it, and a violated consistency rule refutes the opposite.
+//!   Where the rules cannot refute it, the negative statement is undecided.
 //!   The forms recognised:
 //!   - `a owl:differentFrom b`, by adding `a owl:sameAs b`;
 //!   - `owl:AllDifferent` with `owl:members` or `owl:distinctMembers`, each pair so;
@@ -16,10 +17,9 @@
 //!   - an `owl:NegativePropertyAssertion`, by adding the assertion.
 //! - **An inconsistent premise** entails everything.
 //!
-//! The answer is sound; it is complete as far as the rules are for the premise (OWL 2 RL
-//! premises and the forms above). A conclusion outside them may be entailed although the
-//! answer is no, except under `owl2-dl`. There none of the above applies, as the closure
-//! proves nothing under the Direct Semantics (an annotation property's domain puts its
+//! A failed positive lookup only decides entailment where the rules are complete for the
+//! premise and conclusion. Under `owl2-dl` the closure does not prove entailment under
+//! the Direct Semantics (an annotation property's domain puts its
 //! subjects in the closure, for one): the DL engines decide the whole conclusion
 //! ([`StoreService::entails_dl`]), an [`StoreError::Undecided`] error where they can't,
 //! within one `dl.timeout` from the call. A store whose rules' consistency is undecided

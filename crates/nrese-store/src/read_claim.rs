@@ -1,6 +1,6 @@
-use nrese_sparql::{Completeness, completeness::Reason};
+use nrese_sparql::Completeness;
 
-use super::{PreparedQuery, StoreService, status_for_its_reader};
+use super::{PreparedQuery, StoreService, context_outside_dl, dl_context, status_for_its_reader};
 use crate::ConsistencyStatus;
 use crate::dl::{Verdict, query::Revision};
 use crate::entailment::Entailment;
@@ -34,12 +34,6 @@ impl std::ops::Deref for Claim {
 }
 
 impl Claim {
-    /// Orders or encoders may lose answers during delivery.
-    pub fn lower(&mut self, reason: Reason) {
-        self.status.incomplete(reason.source, reason.text);
-        self.reported = true;
-    }
-
     /// The rules' consistency assessment of the publication.
     pub fn consistency(&self) -> ConsistencyStatus {
         self.consistency
@@ -68,10 +62,6 @@ impl Claim {
     pub(crate) fn dl_answer(&self) -> Option<&crate::dl::entailment::Entailed> {
         self.dl_answer.as_ref()
     }
-
-    pub(super) fn cache_status(&self) -> Option<&Completeness> {
-        self.reported.then_some(&self.status)
-    }
 }
 
 pub(crate) enum Evidence<'a> {
@@ -79,6 +69,12 @@ pub(crate) enum Evidence<'a> {
         prepared: &'a PreparedQuery,
         route: Option<Completeness>,
         rewritten: bool,
+        cache: Option<&'a mut Vec<u8>>,
+    },
+    DlQuery {
+        prepared: &'a PreparedQuery,
+        route: Completeness,
+        cache: Option<(crate::DlAnswers, &'a mut Vec<u8>)>,
     },
     Service {
         status: Completeness,
@@ -117,12 +113,35 @@ impl StoreService {
                 prepared,
                 route,
                 rewritten,
+                cache,
             } => {
                 let status = self.compose_query_status(prepared, at, route);
+                if let Some(cache) = cache {
+                    *cache = context_outside_dl(status.as_ref(), rewritten);
+                }
                 let told = status_for_its_reader(
                     prepared,
                     status,
                     rewritten,
+                    self.config.equality_compact,
+                );
+                (told, ConsistencyStatus::Unknown, None)
+            }
+            Evidence::DlQuery {
+                prepared,
+                route,
+                cache,
+            } => {
+                let status = self
+                    .compose_query_status(prepared, at, Some(route))
+                    .unwrap_or_else(Completeness::not_certified);
+                if let Some((mode, cache)) = cache {
+                    *cache = dl_context(mode, &status);
+                }
+                let told = status_for_its_reader(
+                    prepared,
+                    Some(status),
+                    false,
                     self.config.equality_compact,
                 );
                 (told, ConsistencyStatus::Unknown, None)

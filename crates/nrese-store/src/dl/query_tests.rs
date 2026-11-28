@@ -51,11 +51,12 @@ fn lower_true_ask_evaluates_once_and_delivers_that_result() {
     crate::query_executor::BOUND_EVALUATIONS.with(|n| n.set(0));
     let outcome = answer(
         &store,
-        &store.engine().snapshot(),
+        Revision::Committed(&store.engine().snapshot()),
         &prepared,
         &CancellationToken::new(),
         &nrese_exec::Envelope::unlimited(),
         DlAnswers::Exact,
+        None,
     )
     .unwrap();
     let Outcome::Answers(answers @ Answers::Boolean(true), status, detail) = outcome else {
@@ -316,11 +317,12 @@ fn cancellation_takes_precedence_over_partial_answers_and_incompleteness() {
         assert!(matches!(
             answer(
                 &store,
-                &store.engine().snapshot(),
+                Revision::Committed(&store.engine().snapshot()),
                 &prepared,
                 &token,
                 &nrese_exec::Envelope::unlimited(),
                 mode,
+                None,
             ),
             Err(StoreError::SparqlEvaluation(
                 nrese_sparql::QueryEvaluationError::Cancelled
@@ -349,11 +351,12 @@ fn a_cancellation_while_the_element_is_posed_is_the_reads() {
         crate::service::hooks::BEFORE_STAND_IN.set(Some(Box::new(move || cancel.cancel())));
         let outcome = answer(
             &store,
-            &store.engine().snapshot(),
+            Revision::Committed(&store.engine().snapshot()),
             &prepared,
             &token,
             &nrese_exec::Envelope::unlimited(),
             mode,
+            None,
         )
         .err();
         assert!(
@@ -1322,6 +1325,7 @@ fn a_pending_read_takes_its_bases_record_only_for_changes_on_the_list() {
             ));
         }
         let at = |keeps_record| Revision::Pending {
+            base: &snapshot,
             snapshot: &pending,
             deletes: !deleted.is_empty(),
             keeps_record,
@@ -1725,6 +1729,7 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
         let keeps_record = store.dl().bounds.keeps_record(&tx);
         keeping += usize::from(keeps_record);
         let at = Revision::Pending {
+            base: &snapshot,
             snapshot: &pending,
             deletes: true,
             keeps_record,
@@ -1955,6 +1960,7 @@ fn a_kept_record_marks_a_pending_read_as_its_own_ontology_does() {
             let pending = tx.pending_snapshot().unwrap();
             let keeps_record = store.dl().bounds.keeps_record(&tx);
             let at = |keeps_record| Revision::Pending {
+                base: &snapshot,
                 snapshot: &pending,
                 deletes: !removed.is_empty(),
                 keeps_record,
@@ -2473,11 +2479,12 @@ fn an_operators_cancel_is_an_error_past_the_deadline_too() {
         crate::service::hooks::AFTER_DECIDED.set(Some(Box::new(move || cancel.cancel())));
         let outcome = answer(
             &store,
-            &store.engine().snapshot(),
+            Revision::Committed(&store.engine().snapshot()),
             &prepared,
             &token,
             &nrese_exec::Envelope::unlimited(),
             DlAnswers::default(),
+            None,
         )
         .err();
         assert!(

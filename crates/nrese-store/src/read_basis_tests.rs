@@ -210,7 +210,7 @@ fn read_basis_registration_gap_keeps_the_published_program() {
     );
 }
 
-// Spec: docs/spec/reasoning-semantics.md:159. The QL rules cannot decide the negated
+// Spec: read-boundary contract §4.5. The QL rules cannot decide the negated
 // equality in this fixture by refutation. Absence of that proof supplies no negative verdict.
 #[test]
 fn read_basis_rules_that_cannot_refute_give_no_entailment_verdict() {
@@ -229,7 +229,7 @@ fn read_basis_rules_that_cannot_refute_give_no_entailment_verdict() {
         .expect("QL program");
     let answer = pipeline.store().entails(&program, &conclusion);
     assert!(
-        matches!(answer, Err(StoreError::Undecided(_))),
+        matches!(&answer, Err(StoreError::Undecided(why)) if why.contains("did not refute")),
         "unproved refutation gave {answer:?}"
     );
 }

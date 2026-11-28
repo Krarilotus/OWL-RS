@@ -196,7 +196,6 @@ pub(crate) struct ReadBasis {
     certificate: Option<Certificate>,
     pub(crate) generation: crate::support::Generation,
     dl_route: (bool, bool),
-    pub(crate) dl: std::sync::Weak<crate::dl::Dl>,
     dl_status: std::sync::Mutex<Option<crate::dl::DlStatus>>,
     pub(crate) omission: std::sync::Mutex<Option<Option<String>>>,
 }
@@ -833,7 +832,6 @@ impl StoreService {
             certificate,
             generation,
             dl_route: (self.dl.active(), self.dl.user_rules()),
-            dl: std::sync::Arc::downgrade(&self.dl),
             dl_status: Default::default(),
             omission: Default::default(),
         })
@@ -1480,24 +1478,24 @@ impl StoreService {
 
     fn query_view(
         &self,
+        base: &Snapshot,
         prepared: &PreparedQuery,
         memory: &nrese_exec::Envelope,
         cancel: &CancellationToken,
     ) -> StoreResult<Snapshot> {
-        let snapshot = self.engine.snapshot();
         let Some(scope) = &prepared.inference_scope else {
-            return self.view_of(&snapshot, prepared.access(), memory, Some(cancel));
+            return self.view_of(base, prepared.access(), memory, Some(cancel));
         };
         let view = self
             .reading(Some(scope), memory, Some(cancel))
             .expect("the dataset's selector requests inferred statements")
-            .scoped(
-                &snapshot,
-                prepared.read_model(),
-                prepared.access().is_some(),
-            )?;
-        self.refuse_exact(prepared, &snapshot, || {
-            self.status_outside_dl(prepared, None, Revision::Committed(&view))
+            .scoped(base, prepared.read_model(), prepared.access().is_some())?;
+        self.refuse_exact(prepared, base, || {
+            let at = Revision::View {
+                base,
+                snapshot: &view,
+            };
+            self.status_outside_dl(prepared, None, at, None)
         })?;
         Ok(view)
     }
@@ -1815,11 +1813,25 @@ impl StoreService {
         // draws from it.
         let memory = memory.clone();
         // One snapshot the route, the answers and their status are all of (T3, N5).
-        let snapshot = self.query_view(prepared, &memory, cancellation)?;
+        let base = self.engine.snapshot();
+        let snapshot = self.query_view(&base, prepared, &memory, cancellation)?;
+        let at = Revision::View {
+            base: &base,
+            snapshot: &snapshot,
+        };
         prepared.announce_on(&snapshot);
-        if let Some(mode) = self.dl_mode(prepared, &snapshot) {
+        if let Some(mode) = self.dl_mode(prepared, &base) {
             use crate::dl::query::{Outcome, Read};
-            let detail = match answer(self, &snapshot, prepared, cancellation, &memory, mode)? {
+            let mut context = Vec::new();
+            let detail = match answer(
+                self,
+                at,
+                prepared,
+                cancellation,
+                &memory,
+                mode,
+                Some(&mut context),
+            )? {
                 Outcome::Answers(answers, status, detail) => {
                     report(status, None);
                     crate::query_executor::write_answers(prepared, answers, cancellation, out)?;
@@ -1832,7 +1844,6 @@ impl StoreService {
                     let snapshot = match read {
                         Read::Lower(snapshot) | Read::At(snapshot) => snapshot,
                     };
-                    let context = dl_context(mode, &status);
                     run_query(
                         &snapshot,
                         prepared,
@@ -1849,10 +1860,9 @@ impl StoreService {
         }
         #[cfg(test)]
         hooks::run(&hooks::AFTER_DECIDED);
-        let at = Revision::Committed(&snapshot);
-        let status = || self.status_outside_dl(prepared, None, at);
+        let status = || self.status_outside_dl(prepared, None, at, None);
         if prepared.inference_scope.is_none() {
-            self.refuse_exact(prepared, &snapshot, status)?;
+            self.refuse_exact(prepared, &base, status)?;
         }
         // Set where the status is decided, before the answer, a cached one too.
         let mut withheld = true;
@@ -1866,9 +1876,9 @@ impl StoreService {
             |mut ql| {
                 self.certify_ql(ql.as_deref_mut(), prepared, &snapshot);
                 let ql = ql.as_deref();
-                let claim = self.status_outside_dl(prepared, ql, at);
-                let context = context_outside_dl(claim.cache_status(), ql.is_some());
-                withheld = withholds_report(prepared, claim.cache_status());
+                let mut context = Vec::new();
+                let claim = self.status_outside_dl(prepared, ql, at, Some(&mut context));
+                withheld = withholds_report(prepared, &claim);
                 (context, move |kept| report(claim, kept))
             },
         )?;
@@ -1884,6 +1894,7 @@ impl StoreService {
         prepared: &PreparedQuery,
         ql: Option<&nrese_sparql::ql::QlReport>,
         at: Revision<'_>,
+        cache: Option<&mut Vec<u8>>,
     ) -> Claim {
         let route = match ql {
             Some(ql) => Some(ql.completeness.clone()),
@@ -1895,6 +1906,7 @@ impl StoreService {
                 prepared,
                 route,
                 rewritten: ql.is_some(),
+                cache,
             },
         )
     }
@@ -1915,17 +1927,18 @@ impl StoreService {
         at: Revision<'_>,
         route: Option<nrese_sparql::Completeness>,
     ) -> Option<nrese_sparql::Completeness> {
-        if prepared.read_model() == ReadModel::Asserted {
-            return None;
-        }
         let snapshot = at.snapshot();
         if prepared.inference_scope.is_some() {
             return (!Certificate::bare(snapshot, false))
                 .then(nrese_sparql::Completeness::not_certified);
         }
-        let unpublished = matches!(at, Revision::Committed(_)) && snapshot.shared_state().is_none();
+        if prepared.read_model() == ReadModel::Asserted {
+            return None;
+        }
+        let unpublished = matches!(at, Revision::Committed(_) | Revision::View { .. })
+            && snapshot.shared_state().is_none();
         let Some(certificate) = Certificate::of(snapshot).filter(|_| !unpublished) else {
-            let ever = ReadBasis::of(snapshot).is_some_and(|basis| basis.generation.ever);
+            let ever = ReadBasis::of(at.base()).is_some_and(|basis| basis.generation.ever);
             let bare = Certificate::bare(snapshot, ever);
             return (!bare).then(nrese_sparql::Completeness::not_certified);
         };
@@ -1985,7 +1998,8 @@ impl StoreService {
                 },
             ));
         }
-        self.status_outside_dl(prepared, None, at).into_report()
+        self.status_outside_dl(prepared, None, at, None)
+            .into_report()
     }
 
     /// [`Self::status_without_dl`] of a read of the data `at`.
@@ -2096,9 +2110,7 @@ impl StoreService {
         cancellation: &CancellationToken,
     ) -> StoreResult<crate::Explanation> {
         let memory = self.settings.query_envelope(prepared);
-        let mut explanation = self.explain_in(prepared, &memory, cancellation)?;
-        explanation.completeness = explanation.completeness.and_then(Claim::into_report);
-        Ok(explanation)
+        self.explain_in(prepared, &memory, cancellation)
     }
 
     /// [`Self::explain_query`] in the envelope `memory`.
@@ -2130,19 +2142,24 @@ impl StoreService {
             .running
             .register(prepared.text(), prepared.origin(), cancellation);
         let memory = memory.clone();
-        let snapshot = self.query_view(prepared, &memory, cancellation)?;
+        let base = self.engine.snapshot();
+        let snapshot = self.query_view(&base, prepared, &memory, cancellation)?;
+        let at = Revision::View {
+            base: &base,
+            snapshot: &snapshot,
+        };
         #[cfg(test)]
         hooks::run(&hooks::AFTER_DECIDED);
         let mut explanation =
             explain_prepared(&snapshot, prepared, &self.settings, cancellation, &memory)?;
         self.certify_ql(explanation.ql.as_mut(), prepared, &snapshot);
-        let claim = if let Some(mode) = self.dl_mode(prepared, &snapshot) {
+        let claim = if let Some(mode) = self.dl_mode(prepared, &base) {
             // The status as the query would answer, never failing for it.
             let mode = match mode {
                 crate::DlAnswers::Exact => crate::DlAnswers::CertainWhereComplete,
                 other => other,
             };
-            let answered = answer(self, &snapshot, prepared, cancellation, &memory, mode)?;
+            let answered = answer(self, at, prepared, cancellation, &memory, mode, None)?;
             let (status, detail) = match answered {
                 crate::dl::query::Outcome::Answers(_, status, detail)
                 | crate::dl::query::Outcome::Stream(status, _, detail) => (status, detail),
@@ -2155,12 +2172,11 @@ impl StoreService {
             });
             status
         } else {
-            let at = Revision::Committed(&snapshot);
-            self.status_outside_dl(prepared, explanation.ql.as_ref(), at)
+            self.status_outside_dl(prepared, explanation.ql.as_ref(), at, None)
         };
         let ql = explanation
             .ql
-            .filter(|_| !withholds_report(prepared, claim.cache_status()))
+            .filter(|_| !withholds_report(prepared, &claim))
             .map(|report| ql_claim(report, &claim));
         Ok(nrese_sparql::Explanation {
             executor: explanation.executor,
@@ -2187,9 +2203,7 @@ impl StoreService {
         cancellation: &CancellationToken,
     ) -> StoreResult<crate::PlannedQuery> {
         let memory = self.settings.query_envelope(prepared);
-        let mut plan = self.plan_in(prepared, &memory, cancellation)?;
-        plan.completeness = plan.completeness.and_then(Claim::into_report);
-        Ok(plan)
+        self.plan_in(prepared, &memory, cancellation)
     }
 
     /// [`Self::plan_query`] in the envelope `memory`.
@@ -2217,20 +2231,24 @@ impl StoreService {
         cancellation: &CancellationToken,
     ) -> StoreResult<crate::PlannedQuery> {
         let memory = memory.clone();
-        let snapshot = self.query_view(prepared, &memory, cancellation)?;
+        let base = self.engine.snapshot();
+        let snapshot = self.query_view(&base, prepared, &memory, cancellation)?;
+        let at = Revision::View {
+            base: &base,
+            snapshot: &snapshot,
+        };
         #[cfg(test)]
         hooks::run(&hooks::AFTER_DECIDED);
         let mut planned =
             plan_prepared(&snapshot, prepared, &self.settings, cancellation, &memory)?;
         self.certify_ql(planned.ql.as_mut(), prepared, &snapshot);
-        let at = Revision::Committed(&snapshot);
-        let claim = match self.dl_mode(prepared, &snapshot) {
-            Some(_) => plan_status(self, &snapshot, prepared, cancellation)?,
-            None => self.status_outside_dl(prepared, planned.ql.as_ref(), at),
+        let claim = match self.dl_mode(prepared, &base) {
+            Some(_) => plan_status(self, at, prepared, cancellation)?,
+            None => self.status_outside_dl(prepared, planned.ql.as_ref(), at, None),
         };
         let ql = planned
             .ql
-            .filter(|_| !withholds_report(prepared, claim.cache_status()))
+            .filter(|_| !withholds_report(prepared, &claim))
             .map(|report| ql_claim(report, &claim));
         Ok(nrese_sparql::PlannedQuery {
             rewrites: planned.rewrites,
@@ -2553,7 +2571,7 @@ impl StoreService {
             return for_its_reader(prepared, crate::EntryPoint::RunPending, run, |_| {});
         }
         let run = self.with_pending_record(
-            latest,
+            latest.clone(),
             pending,
             &scope,
             &memory,
@@ -2562,12 +2580,13 @@ impl StoreService {
                 // The status the answers carry, of the pending state `at` they are read from.
                 // Under `owl2-dl` the QL rewriting doesn't run: the status needs no report.
                 let at = Revision::Pending {
+                    base: &latest,
                     snapshot,
                     deletes,
                     keeps_record,
                 };
-                let status = || self.status_outside_dl(prepared, None, at);
-                self.refuse_exact(prepared, snapshot, status)?;
+                let status = || self.status_outside_dl(prepared, None, at, None);
+                self.refuse_exact(prepared, &latest, status)?;
                 run_query(
                     snapshot,
                     prepared,
@@ -2579,7 +2598,7 @@ impl StoreService {
                         // A transaction's pending state: never answered from the cache.
                         self.certify_ql(ql.as_deref_mut(), prepared, snapshot);
                         let ql = ql.as_deref();
-                        let status = self.status_outside_dl(prepared, ql, at);
+                        let status = self.status_outside_dl(prepared, ql, at, None);
                         report(status, None);
                         (Vec::new(), |_| None)
                     },
@@ -3525,8 +3544,8 @@ fn ql_claim(
 /// Whether `prepared`'s reader, told `told`, is shown no report of the rewriting: where its
 /// assessment is withheld ([`withholds_certification`]), and where its status is. Rows a
 /// withheld view's rewriting gives stand; its report, a claim, doesn't.
-fn withholds_report(prepared: &PreparedQuery, told: Option<&nrese_sparql::Completeness>) -> bool {
-    withholds_certification(prepared) || told.is_some_and(|c| c.certification_withheld)
+fn withholds_report(prepared: &PreparedQuery, told: &Claim) -> bool {
+    withholds_certification(prepared) || told.certification_withheld
 }
 
 /// Whether `prepared`'s reader is told no assessment of the rewriting, neither its status

@@ -246,7 +246,7 @@ fn the_empty_conclusion_past_the_time_is_unknown() {
 
 /// Spec (`entails`: the mode at the call's start gives its route and, under `owl2-dl`, its one
 /// `dl.timeout`): a check started outside `owl2-dl` stays on the rules' route when the mode
-/// switches to `owl2-dl` during it. Under docs/spec/reasoning-semantics.md:159 it leaves
+/// switches to `owl2-dl` during it. Under the read-boundary contract §4.5 it leaves
 /// a complement only DL can show undecided when the rules cannot refute its opposite.
 #[test]
 fn a_mode_switch_during_the_check_leaves_it_on_its_route() {

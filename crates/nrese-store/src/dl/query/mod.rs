@@ -326,17 +326,24 @@ impl Status {
 /// sound-only ([`DEADLINE`]) where the request's time was up instead.
 pub(crate) fn plan_status(
     store: &StoreService,
-    snapshot: &Snapshot,
+    read: Revision<'_>,
     prepared: &PreparedQuery,
     cancellation: &CancellationToken,
 ) -> StoreResult<crate::Claim> {
     let analysis = analyse(prepared.query());
-    let decided = decided(store, snapshot, prepared, cancellation)?;
+    let decided = decided(store, read.snapshot(), prepared, cancellation)?;
     let completeness = match decided.as_ref() {
         Ok(at) => plan_status_built(store, prepared, &analysis, at).completeness,
         Err(why) => fallback(prepared, why).completeness,
     };
-    Ok(composed(store, prepared, snapshot, &decided, completeness))
+    Ok(composed(
+        store,
+        prepared,
+        read,
+        &decided,
+        completeness,
+        None,
+    ))
 }
 
 /// The status when the DL bounds view isn't used ([`PART`], [`LATER`], [`DEADLINE`]): `why`,
@@ -456,18 +463,18 @@ fn deadline_of(store: &StoreService, prepared: &PreparedQuery) -> Deadline {
 fn composed(
     store: &StoreService,
     prepared: &PreparedQuery,
-    snapshot: &Snapshot,
+    read: Revision<'_>,
     decided: &Decided,
     status: Completeness,
+    cache: Option<(DlAnswers, &mut Vec<u8>)>,
 ) -> crate::Claim {
-    let committed = Revision::Committed(snapshot);
-    let at = decided.as_ref().map_or(committed, Revision::Decided);
+    let at = decided.as_ref().map_or(read, Revision::Decided);
     store.assess(
         at,
-        crate::service::Evidence::Query {
+        crate::service::Evidence::DlQuery {
             prepared,
-            route: Some(status),
-            rewritten: false,
+            route: status,
+            cache,
         },
     )
 }
@@ -479,7 +486,12 @@ fn composed(
 pub(crate) enum Revision<'a> {
     Decided(&'a (Snapshot, Arc<View>)),
     Committed(&'a Snapshot),
+    View {
+        base: &'a Snapshot,
+        snapshot: &'a Snapshot,
+    },
     Pending {
+        base: &'a Snapshot,
         snapshot: &'a Snapshot,
         /// Whether one of the operations may delete.
         deletes: bool,
@@ -493,7 +505,16 @@ impl Revision<'_> {
     pub(crate) fn snapshot(&self) -> &Snapshot {
         match self {
             Revision::Decided((snapshot, _)) => snapshot,
-            Revision::Committed(snapshot) | Revision::Pending { snapshot, .. } => snapshot,
+            Revision::Committed(snapshot)
+            | Revision::View { snapshot, .. }
+            | Revision::Pending { snapshot, .. } => snapshot,
+        }
+    }
+
+    pub(crate) fn base(&self) -> &Snapshot {
+        match self {
+            Revision::View { base, .. } | Revision::Pending { base, .. } => base,
+            _ => self.snapshot(),
         }
     }
 }
@@ -621,7 +642,7 @@ fn reads_differently(store: &StoreService, at: Revision<'_>) -> Option<String> {
     let (snapshot, pending, keeps_record) = match at {
         Revision::Decided((_, view)) if view.rules => return None,
         Revision::Decided((snapshot, _)) => (snapshot, false, true),
-        Revision::Committed(snapshot) => (snapshot, false, true),
+        Revision::Committed(snapshot) | Revision::View { snapshot, .. } => (snapshot, false, true),
         Revision::Pending {
             snapshot,
             keeps_record,
@@ -1644,13 +1665,15 @@ fn plan_status_built(
 /// engines.
 pub(crate) fn answer(
     store: &StoreService,
-    snapshot: &Snapshot,
+    at: Revision<'_>,
     prepared: &PreparedQuery,
     cancellation: &CancellationToken,
     memory: &nrese_exec::Envelope,
     mode: DlAnswers,
+    cache: Option<&mut Vec<u8>>,
 ) -> StoreResult<Outcome<crate::Claim>> {
     cancellation.check()?;
+    let snapshot = at.snapshot();
     let analysis = analyse(prepared.query());
     // One view for the answers and their status: a commit in between changes neither.
     let decided = decided(store, snapshot, prepared, cancellation)?;
@@ -1678,17 +1701,18 @@ pub(crate) fn answer(
     }
     // A cancellation while the element was posed is the read's, not a reason.
     cancellation.check()?;
-    let assess = |status, detail: &DlDetail| {
-        let claim = composed(store, prepared, snapshot, &decided, status);
+    let assess = |status, detail: &DlDetail, cache| {
+        let claim = composed(store, prepared, at, &decided, status, cache);
         refuse_unless_complete(mode, &claim, || detail.unresolved.clone())?;
         StoreResult::Ok(claim)
     };
     Ok(match outcome {
         Outcome::Stream(status, read, detail) => {
-            Outcome::Stream(assess(status, &detail)?, read, detail)
+            let cache = cache.map(|key| (mode, key));
+            Outcome::Stream(assess(status, &detail, cache)?, read, detail)
         }
         Outcome::Answers(answers, status, detail) => {
-            Outcome::Answers(answers, assess(status, &detail)?, detail)
+            Outcome::Answers(answers, assess(status, &detail, None)?, detail)
         }
     })
 }
