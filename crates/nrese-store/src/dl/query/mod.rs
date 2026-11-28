@@ -913,7 +913,7 @@ pub(crate) struct Reads {
     /// [`typed_constant`]'s.
     constant: std::sync::OnceLock<Option<String>>,
     /// [`compared_values`]'.
-    compared: std::sync::OnceLock<Vec<(String, Vec<Option<String>>)>>,
+    compared: std::sync::OnceLock<analysis::SpellingComparisons>,
     /// [`predicates`]', for [`annotation_rule`].
     predicates: std::sync::OnceLock<Vec<Option<String>>>,
     /// The reader's graphs, where their view is restricted.
@@ -984,23 +984,29 @@ fn lowerings(
     if let Some(reason) = constant {
         completeness.incomplete(source, reason.clone());
     }
-    let typed = |predicate: &Option<String>| {
+    let typed = |predicate: Option<&str>| {
         let snapshot = snapshot?;
-        crate::literal_evidence::LiteralEvidence::holds(snapshot, predicate.as_deref(), access)
+        crate::literal_evidence::LiteralEvidence::holds(snapshot, predicate, access)
     };
+    const UNCHECKED: &str = "literal evidence could not be checked over the data read";
     let compared = reads.compared.get_or_init(|| compared_values(query));
-    if let Some((what, found)) = compared.iter().find_map(|(what, by)| {
+    if let Some((what, found)) = compared.terms.iter().find_map(|(what, by)| {
         by.iter()
-            .map(typed)
+            .map(|predicate| typed(predicate.as_deref()))
             .find(|found| found.is_none_or(|has| has))
             .map(|found| (what, found))
     }) {
         let reason = if found == Some(true) {
             COMPARED
         } else {
-            "literal evidence could not be checked over the data read"
+            UNCHECKED
         };
         completeness.incomplete(source, format!("the query compares {what}: {reason}"));
+    } else if compared.values
+        && snapshot.is_some_and(|s| s.identity().equality.is_some())
+        && typed(None).is_none()
+    {
+        completeness.incomplete(source, format!("the query compares values: {UNCHECKED}"));
     }
     annotation_rule(completeness, (query, reads), source, snapshot);
     true

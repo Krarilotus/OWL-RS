@@ -453,12 +453,18 @@ pub(super) fn typed_constant(query: &Query) -> Option<String> {
 /// the snapshot read, so a variable's IRIs-only ends, `rdf:type`'s too, mark nothing). One
 /// walk, once per query ([`Reads`]). Every operator and term form is named in its matches,
 /// so a new one doesn't compile until it is said whether it compares terms.
-pub(super) fn compared_values(query: &Query) -> Vec<(String, Vec<Option<String>>)> {
+pub(super) struct SpellingComparisons {
+    pub(super) terms: Vec<(String, Vec<Option<String>>)>,
+    pub(super) values: bool,
+}
+
+pub(super) fn compared_values(query: &Query) -> SpellingComparisons {
     use nrese_sparql_syntax::algebra::{AggregateExpression::*, Expression};
     let (mut ends, mut grouped, mut bound) =
         (HashMap::<_, Vec<_>>::new(), HashSet::new(), HashSet::new());
     let (mut distinct, mut all, mut marks) = (false, false, Vec::new());
     let mut deduped = HashSet::new();
+    let mut values = false;
     pattern_of(query).find(&mut |node| {
         let mut end = |t: &TermPattern, p: Vec<Option<String>>| match t {
             TermPattern::Variable(v) => ends.entry(v.as_str().to_owned()).or_default().push(p),
@@ -529,6 +535,16 @@ pub(super) fn compared_values(query: &Query) -> Vec<(String, Vec<Option<String>>
                     }
                 }
             }
+            // Value comparisons handle spelling themselves, but an expanded equality
+            // class can supply literal aliases that the stored evidence cannot describe.
+            Node::Expression(
+                Expression::Equal(..)
+                | Expression::Greater(..)
+                | Expression::GreaterOrEqual(..)
+                | Expression::Less(..)
+                | Expression::LessOrEqual(..)
+                | Expression::In(..),
+            ) => values = true,
             // These compare terms only at the ends recorded above (a join, LATERAL, OPTIONAL,
             // MINUS: on shared variables), by value (FILTER, `=`, IN, a left join's condition,
             // ORDER BY; `sameTerm` by term, as it means to), or not at all (UNION, GRAPH, a
@@ -567,7 +583,10 @@ pub(super) fn compared_values(query: &Query) -> Vec<(String, Vec<Option<String>>
         .collect();
     compared.extend(marks);
     compared.sort();
-    compared
+    SpellingComparisons {
+        terms: compared,
+        values,
+    }
 }
 
 /// Whether `path` can match zero steps (`*`, `?`, a sequence of such, an alternative with
