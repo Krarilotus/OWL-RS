@@ -181,6 +181,42 @@ fn distinct_iri_answers_have_no_literal_spelling_reason() {
     assert_eq!(claim.as_str(), "complete");
 }
 
+/// An equality class can give a value comparison a literal that is absent from
+/// the property in the stored closure.
+#[test]
+fn a_literal_identity_requires_unchecked_spelling_evidence() {
+    let store = Arc::new(
+        StoreService::new(StoreConfig {
+            equality_compact: true,
+            ql_rewriting: crate::QlRewritingMode::On,
+            ..StoreConfig::in_memory()
+        })
+        .unwrap(),
+    );
+    let _writes = pipeline(&store, ReasoningMode::Owl2Rl);
+    load(&store, ":r owl:sameAs 7 . :s :p :r .");
+    store.rematerialise(Ruleset::Owl2Rl).unwrap();
+    let snapshot = store.engine.snapshot();
+    assert!(snapshot.equality_classes().unwrap().relate_literals());
+    let answer = store
+        .execute_query_str(&format!(
+            "{PREFIXES} SELECT ?o WHERE {{ :s :p ?o FILTER(?o = 7.0) }}"
+        ))
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&answer.payload).unwrap();
+    let rows = body["results"]["bindings"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{body}");
+    assert_eq!(rows[0]["o"]["value"], "7", "{body}");
+    let claim = answer.completeness.unwrap();
+    assert!(
+        claim
+            .header()
+            .contains("literal evidence could not be checked"),
+        "the spelling check must account for a literal identity: {claim:?}"
+    );
+    assert!(!claim.complete, "{claim:?}");
+}
+
 /// Graph scope (reasoning-semantics): changing only hidden axioms can't change a
 /// restricted QL reader's reasons about its own answer.
 #[test]
