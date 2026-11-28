@@ -1438,7 +1438,7 @@ fn a_consistency_check_records_what_the_premise_tells() {
     assert!(told.is_some(), "a committed read is told it");
 }
 
-/// Slice 2, D16-1291. An omission belongs to the publication whose ontology tells it.
+/// A read reports omissions from the ontology of its pinned publication.
 #[test]
 fn an_omission_record_follows_the_publication_that_read_it() {
     use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};

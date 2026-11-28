@@ -128,7 +128,7 @@ fn a_read_uses_the_published_eligible_program_facts() {
     );
 }
 
-/// Contract §4.3c R3. A held publication reads its own program across a rebuild.
+/// A held publication reads its own program across a rebuild.
 #[test]
 fn a_rebuild_after_the_version_is_taken_does_not_mix_revisions() {
     let (store, pipeline) = pipeline();
@@ -198,7 +198,7 @@ fn a_rebuild_after_the_version_is_taken_does_not_mix_revisions() {
     );
 }
 
-/// Contract §4.3c R1 and §7 A1. A fact added and then removed stays visible only
+/// A fact added and then removed stays visible only
 /// to the reader that pinned the intermediate publication.
 #[test]
 fn installing_a_delta_preserves_the_readers_stack() {
@@ -228,7 +228,7 @@ fn installing_a_delta_preserves_the_readers_stack() {
     }
 }
 
-/// Contract §4.2 and §7 A3. Run 4's SELECT keeps the same complete answer when an unrelated
+/// A SELECT keeps its complete answer when an unrelated
 /// commit publishes after it has taken its snapshot.
 #[test]
 fn an_unrelated_commit_keeps_the_pinned_query_complete() {
@@ -261,7 +261,7 @@ fn an_unrelated_commit_keeps_the_pinned_query_complete() {
     assert!(claim.complete, "{}", claim.header());
 }
 
-/// Contract §4.3c R1 and R3. Eligibility follows the visible input, across graph
+/// Eligibility follows the visible input, across graph
 /// duplicates, inferred support, a rebuild and a change in the equality reading.
 #[test]
 fn eligible_program_facts_follow_the_published_revision() {
@@ -362,7 +362,7 @@ fn eligible_program_facts_follow_the_published_revision() {
     }
 }
 
-/// R1. A stack insertion can change eligibility even when the fact itself was not
+/// A stack insertion can change eligibility even when the fact itself was not
 /// in the materialised delta. Compare the staged move with a full evaluation.
 #[test]
 fn staging_a_program_fact_on_the_stack_removes_its_eligibility() {
@@ -422,7 +422,7 @@ fn staging_a_program_fact_on_the_stack_removes_its_eligibility() {
     );
 }
 
-/// Contract §4.2 and §4.3c R3. A publication that has no U1 cannot supply the next delta's root.
+/// A publication that has no U1 cannot supply the next delta's root.
 #[test]
 fn a_commit_rebuilds_after_a_same_revision_reinstall_without_u1() {
     let (store, pipeline) = pipeline();
@@ -445,7 +445,7 @@ fn a_commit_rebuilds_after_a_same_revision_reinstall_without_u1() {
     assert_eq!(published.last, "rebuilt");
 }
 
-/// R5. A panicking compaction must hand its ownership back to the next publisher.
+/// A panicking compaction must hand its ownership back to the next publisher.
 #[test]
 fn a_compaction_panic_releases_its_owner() {
     let (store, _) = pipeline();
@@ -505,7 +505,7 @@ fn upper_facts_reports_only_the_stack() {
     );
 }
 
-/// Part B T1 and reasoning-semantics.md §Default and named graphs. An assertion
+/// Under the default and named graph semantics, an assertion
 /// in any graph suppresses the inferred default-graph statement while present.
 #[test]
 fn a_named_graph_assertion_suppresses_the_program_fact_in_the_default_graph() {

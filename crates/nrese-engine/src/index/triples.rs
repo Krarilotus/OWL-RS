@@ -339,7 +339,7 @@ mod tests {
         TripleVersion::build((0..100).map(|s| [s, P, 1]), budget).unwrap()
     }
 
-    /// §4.3c R2. A proper suffix cannot cancel a deletion against an older insertion.
+    /// A proper suffix cannot cancel a deletion against an older insertion.
     #[test]
     fn triple_compaction_keeps_an_unmatched_deletion_and_the_held_list() {
         let budget = Arc::new(Budget::unlimited());
@@ -357,7 +357,7 @@ mod tests {
         assert_eq!(latest.count_predicate(P), 99);
     }
 
-    /// §4.3c R4. The old allocation is shared before a rewrite and retains its charge
+    /// The old allocation is shared before a rewrite and retains its charge
     /// while a reader still holds it after the rewrite.
     #[test]
     fn triple_run_charges_follow_the_shared_allocations() {
@@ -396,7 +396,7 @@ mod tests {
         assert_eq!(budget.used(), 0);
     }
 
-    /// §4.3c R5. Signed summaries report zero after a large retract. The writer
+    /// Signed summaries report zero after a large retract. The writer
     /// enforces its cap even with background compaction delayed.
     #[test]
     fn triple_predicate_counts_are_exact_during_deferred_compaction() {
@@ -420,7 +420,7 @@ mod tests {
         assert!(!latest.any_counted(PREDICATE, &|_| true).unwrap());
     }
 
-    /// §4.3c R5. A new run can exceed the cap without making a size-tiered window.
+    /// A new run can exceed the cap without making a size-tiered window.
     #[test]
     fn triple_writer_compacts_at_the_cap_even_without_a_size_tier() {
         let budget = Arc::new(Budget::unlimited());
@@ -442,7 +442,7 @@ mod tests {
         assert!(!pinned.contains(last));
     }
 
-    /// §4.3c R6. A counted one-run scan obeys its upper bound and can stop
+    /// A counted one-run scan obeys its upper bound and can stop
     /// partway through a long range.
     #[test]
     fn a_counted_subject_predicate_scan_stops_at_the_bound_or_visitor() {
@@ -466,7 +466,7 @@ mod tests {
         assert_eq!(seen, Err(Stopped));
     }
 
-    /// §4.3c R7. Compaction completes after a writer appends another delta.
+    /// Compaction completes after a writer appends another delta.
     #[test]
     fn triple_compaction_splices_into_the_version_with_a_later_append() {
         let budget = Arc::new(Budget::unlimited());
@@ -484,7 +484,7 @@ mod tests {
         assert!(!old.contains(Z));
     }
 
-    /// R5 and R7. A stream of inserts uses the writer's cap without rewriting the runs
+    /// A stream of inserts uses the writer's cap without rewriting the runs
     /// that a compactor will splice. The reader can see the merged base and every append.
     #[test]
     fn triple_writer_preserves_a_background_merge_during_monotonic_inserts() {

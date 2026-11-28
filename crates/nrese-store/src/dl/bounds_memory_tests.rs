@@ -83,7 +83,7 @@ fn an_upper_bound_refused_for_memory_is_built_once_memory_is_free() {
     assert!(after.upper_facts > 0, "{after:?}");
 }
 
-/// Contract §4.3c R4. A refusal after eligibility was staged leaves both of
+/// A refusal after eligibility was staged leaves both of
 /// the old reader's versions usable and publishes U1 unavailable for the commit.
 #[test]
 fn a_successor_that_really_does_not_fit_drops_u1() {
@@ -147,7 +147,7 @@ fn a_successor_that_really_does_not_fit_drops_u1() {
     let pinned = view_until(&store, &before, None, None).unwrap().unwrap();
     assert!(in_view(pinned.upper.as_ref().unwrap(), fact));
 
-    // SYN-61. The commit reported the refusal, and its pinned revision can now rebuild.
+    // The commit reported the refusal, and its pinned revision can now rebuild.
     let recovered = report(&store);
     assert_eq!(recovered.revision, current.revision());
     assert_eq!(recovered.unavailable, None, "{recovered:?}");

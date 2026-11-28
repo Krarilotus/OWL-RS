@@ -15,7 +15,7 @@ fn term(n: u64) -> TermId {
     TermId::new(TermKind::Iri, n + 1)
 }
 
-/// REAS-3. Main-store point and subject/predicate reads count both range bounds.
+/// Main-store point and subject/predicate reads count both range bounds.
 /// A single packed block takes 11 units at the lower bound and 14 at the upper bound.
 #[test]
 fn main_store_reads_keep_their_range_work_units() {

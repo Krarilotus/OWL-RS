@@ -1089,7 +1089,7 @@ mod tests {
         );
     }
 
-    /// Contract §4.3c R6. A bound scan polls while it cancels the deleted prefix
+    /// A bound scan polls while it cancels the deleted prefix
     /// and reports the stop before the final live fact.
     #[test]
     fn the_upper_base_counts_the_stack_facts_it_passes_over() {

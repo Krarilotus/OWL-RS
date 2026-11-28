@@ -1,4 +1,4 @@
-//! Guard of U1's run memory (SYN-61). Building, advancing and compacting the stack and
+//! Building, advancing and compacting the stack and
 //! eligible sets must stay within their charge. Pinned readers keep their runs charged
 //! until they drop them. This test binary measures allocations against the budget.
 
