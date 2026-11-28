@@ -13,7 +13,7 @@ use nrese_reasoner::ReasonerConfig;
 use nrese_server::policy::{PolicyConfig, RequestTimeouts};
 use nrese_store::{StoreConfig, StoreService};
 
-async fn send(
+pub(crate) async fn send(
     app: &Router,
     method: Method,
     uri: &str,

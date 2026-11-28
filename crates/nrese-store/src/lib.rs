@@ -130,6 +130,8 @@ pub use reasoning_state::{ConsistencyStatus, ReasoningState, WhyUndecided};
 pub use running::{RunningQueries, RunningQuery};
 pub use runtime::Runtime;
 pub use scope::{EntryPoint, ReadContext, ReadScope, Requester, WriteScope};
+#[cfg(feature = "fault-points")]
+pub use service::LoadPanic;
 pub use service::{QueryRun, StoreService};
 pub use sessions::{SESSION_IDLE, Sessions};
 pub use shacl::{

@@ -133,6 +133,19 @@ pub struct StoreService {
     unavailable: std::sync::Arc<std::sync::OnceLock<String>>,
     /// Why the published shapes count is still pending, if a refresh was deferred.
     pub(crate) shapes_deferred: std::sync::Arc<crate::shacl::ShapesDeferred>,
+    /// Where the next bulk load panics ([`Self::panic_next_bulk_load`]).
+    #[cfg(feature = "fault-points")]
+    load_panic: std::sync::Arc<std::sync::Mutex<Option<LoadPanic>>>,
+}
+
+/// Where a test makes the next bulk load panic ([`StoreService::panic_next_bulk_load`]).
+#[cfg(feature = "fault-points")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadPanic {
+    /// In [`StoreService::bulk_load_with`], once the load published, before it returns.
+    BeforeReturn,
+    /// Where the load's caller calls [`StoreService::load_panic_point`] once it returned.
+    AfterReturn,
 }
 
 /// The file recording what the inferred stack is exact for ([`crate::reasoning_state`]).
@@ -555,6 +568,8 @@ impl StoreService {
             outside_profile: std::sync::Arc::new(std::sync::RwLock::new(outside_profile)),
             last_materialisation: std::sync::Arc::default(),
             shapes_deferred: Default::default(),
+            #[cfg(feature = "fault-points")]
+            load_panic: std::sync::Arc::default(),
         };
         // Every store a replica server opens is a replica's from its open on, the default and
         // the catalog's others alike: its `owl2-dl` mode interns no term (the default's
@@ -2744,7 +2759,34 @@ impl StoreService {
         hooks::run(&hooks::AFTER_WRITE_PUBLICATION);
         // A quarantine error can follow a publication. Count the shapes that are served.
         self.refresh_kept_shapes(&self.engine.snapshot(), &progress.stop());
+        #[cfg(feature = "fault-points")]
+        if loaded.is_ok() {
+            self.load_panic_point(LoadPanic::BeforeReturn);
+        }
         loaded
+    }
+
+    /// Test hook: the next bulk load panics at `at`.
+    #[cfg(feature = "fault-points")]
+    pub fn panic_next_bulk_load(&self, at: LoadPanic) {
+        *self
+            .load_panic
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(at);
+    }
+
+    /// Panics if [`Self::panic_next_bulk_load`] armed `here`, once.
+    #[cfg(feature = "fault-points")]
+    pub fn load_panic_point(&self, here: LoadPanic) {
+        let mut armed = self
+            .load_panic
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *armed == Some(here) {
+            *armed = None;
+            drop(armed);
+            panic!("simulated failure in a bulk load at {here:?}");
+        }
     }
 
     /// Builds the query planner's statistics of the store as it is now and saves them

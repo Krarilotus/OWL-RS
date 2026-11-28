@@ -949,17 +949,29 @@ fn start_import(
     [(axum::http::HeaderName, String); 1],
     Json<JobStarted>,
 ) {
-    let job = state
+    // How the caller sends the data again: an upload, or the import directory's files.
+    let retry = if remove.is_some() { "send" } else { "load" };
+    // Made before the task is submitted: a task dropped before it runs ends its job too.
+    let mut job = state
         .jobs()
-        .start("import", state.repository_id(), &description);
+        .start("import", state.repository_id(), &description, retry);
     let id = job.id();
     let state = state.clone();
     tokio::task::spawn_blocking(move || {
+        job.running();
         job.phase("loading");
         let store = state.store();
         let loaded = store.bulk_load_with(&request, job.progress());
-        // How the caller sends the data again: an upload, or the import directory's files.
-        let retry = if remove.is_some() { "send" } else { "load" };
+        match &loaded {
+            Ok(loaded) if loaded.published => job.loaded(loaded.revision),
+            Ok(loaded) => job.unchanged(loaded.revision),
+            Err(nrese_store::StoreError::LoadPublished { revision, .. }) => job.loaded(*revision),
+            Err(_) => {}
+        }
+        #[cfg(feature = "fault-points")]
+        if loaded.is_ok() {
+            store.load_panic_point(nrese_store::LoadPanic::AfterReturn);
+        }
         drop(remove);
         if let Err(nrese_store::StoreError::LoadPublished { revision, reason }) = &loaded {
             let warning = format!(
@@ -1471,3 +1483,6 @@ pub async fn rules_delete(
     .map_err(|error| ApiError::internal(error.to_string()))??;
     Ok(StatusCode::NO_CONTENT)
 }
+
+#[cfg(test)]
+mod import_job_tests;
