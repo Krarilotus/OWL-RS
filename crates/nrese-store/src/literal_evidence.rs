@@ -70,7 +70,7 @@ impl Drop for Link {
 }
 
 impl Node {
-    fn new(
+    fn charged(
         example: u128,
         prefix: u32,
         entry: Entry,
@@ -112,7 +112,7 @@ impl Link {
         change: Change,
         budget: &Arc<Budget>,
     ) -> Result<(), BudgetExceeded> {
-        let leaf = || Node::new(key, 128, Entry::Leaf(apply([0; 2], change)), budget);
+        let leaf = || Node::charged(key, 128, Entry::Leaf(apply([0; 2], change)), budget);
         let Some(root) = self.0.as_mut() else {
             self.0 = Some(leaf()?);
             return Ok(());
@@ -123,11 +123,16 @@ impl Link {
             if side(key, prefix) == 0 {
                 children.swap(0, 1);
             }
-            *self = Link(Some(Node::new(key, prefix, Entry::Fork(children), budget)?));
+            *self = Link(Some(Node::charged(
+                key,
+                prefix,
+                Entry::Fork(children),
+                budget,
+            )?));
             return Ok(());
         }
         if Arc::get_mut(root).is_none() {
-            let next = Node::new(root.example, root.prefix, root.entry.clone(), budget)?;
+            let next = Node::charged(root.example, root.prefix, root.entry.clone(), budget)?;
             // Drop the old holder through Link so the last release frees the Arc first.
             drop(Link(Some(std::mem::replace(root, next))));
         }
@@ -212,7 +217,7 @@ impl LiteralEvidence {
         let base = tx.base().stored();
         let mut next = self.clone();
         next.asserted = tx.asserted_identity_after();
-        let change = |model, quad| {
+        let change = |model, quad: &EncodedQuad| {
             i64::from(tx.contains_in(model, quad)) - i64::from(base.contains_in(model, quad))
         };
         for quad in tx.inserted().chain(tx.deleted()).filter(value_literal) {

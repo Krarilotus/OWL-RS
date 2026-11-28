@@ -139,7 +139,7 @@ fn assertion_takeover_retracts_the_inferred_literal_count() {
     let encoded = EncodedQuad::new(
         seed.intern(quad.subject.as_ref().into()),
         seed.intern(quad.predicate.as_ref().into()),
-        seed.intern(quad.object.as_ref().into()),
+        seed.intern(quad.object.as_ref()),
         TermId::DEFAULT_GRAPH,
     );
     assert!(seed.insert_inferred(encoded.into()));

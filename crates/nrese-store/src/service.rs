@@ -729,9 +729,9 @@ impl StoreService {
             None => tx.install(None, Some(service.read_basis(None, generation))),
         }
         drop(tx);
-        service.queue_literal_evidence();
         service.refresh_kept_shapes(&service.engine.snapshot(), &StopSource::none());
         service.pin_configured_queries()?;
+        service.queue_literal_evidence();
         Ok(service)
     }
 
