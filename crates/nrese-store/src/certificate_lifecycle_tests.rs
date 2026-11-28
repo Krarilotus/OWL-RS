@@ -1157,7 +1157,7 @@ fn a_store_leaving_quarantine_is_not_complete_until_revalidated_then_as_clean_da
     clean.rematerialise(rules()).expect("rebuilt");
     let clean = status(&clean, IN_H);
     let (revision, quarantined, during) = kept.lock().unwrap().take().expect("the hook ran");
-    let told = "sound-only; regime=owl2-dl; reasons=\"dl: the store is in quarantine (the \
+    let told = "sound-only; regime=owl2-dl; reasons=\"consistency: the store is in quarantine (the \
                 consistency rules found violations and have not found the data clean since), and \
                 as inconsistent data entail every answer, no read is certified complete until it \
                 leaves\"";
