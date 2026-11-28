@@ -146,6 +146,14 @@ fn a_successor_that_really_does_not_fit_drops_u1() {
     assert_eq!(upper.stack.len(), count);
     let pinned = view_until(&store, &before, None, None).unwrap().unwrap();
     assert!(in_view(pinned.upper.as_ref().unwrap(), fact));
+
+    // SYN-61. The commit reported the refusal, and its pinned revision can now rebuild.
+    let recovered = report(&store);
+    assert_eq!(recovered.revision, current.revision());
+    assert_eq!(recovered.unavailable, None, "{recovered:?}");
+    let rebuilt = ReadBasis::upper(&current).expect("the pinned revision retains its rebuild");
+    assert!(rebuilt.upper.is_ok());
+    assert_eq!(report(&store).last, "read");
 }
 
 /// What the bounds keep is charged while kept (SYN-61): the query-ontology cache's ontology

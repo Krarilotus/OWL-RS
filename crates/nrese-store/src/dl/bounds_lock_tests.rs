@@ -300,11 +300,23 @@ fn eligible_program_facts_follow_the_published_revision() {
         ("DELETE DATA { :x a :D }", false, true),
         ("INSERT DATA { :F rdfs:subClassOf :M }", false, true),
         ("INSERT DATA { :x owl:sameAs :a0 }", false, false),
+        ("INSERT DATA { :x a :M }", true, false),
+        ("DELETE DATA { :x a :M }", false, false),
         ("DELETE DATA { :x owl:sameAs :a0 }", false, true),
     ]
     .map(|(update, materialised, eligible)| {
         apply(update);
-        (store.engine().snapshot(), materialised, eligible)
+        let snapshot = store.engine().snapshot();
+        if update == "DELETE DATA { :x a :M }" && !eligible {
+            let maintained = ReadBasis::upper(&snapshot).unwrap().upper.unwrap();
+            let rebuilt = afresh(&store, &snapshot).0.unwrap();
+            assert_eq!(
+                maintained.eligible.scan([None; 3]).collect::<Vec<_>>(),
+                rebuilt.eligible.scan([None; 3]).collect::<Vec<_>>(),
+                "a sameAs member's retraction must keep the fresh eligible set",
+            );
+        }
+        (snapshot, materialised, eligible)
     });
     for (snapshot, materialised, eligible) in std::iter::once((first, false, true)).chain(results) {
         let published = ReadBasis::upper(&snapshot).expect("pinned U1 publication");
@@ -322,6 +334,89 @@ fn eligible_program_facts_follow_the_published_revision() {
             snapshot.revision()
         );
     }
+}
+
+/// Contract §4.2 and §4.3c R3. A publication that has no U1 cannot supply the next delta's root.
+#[test]
+fn a_commit_rebuilds_after_a_same_revision_reinstall_without_u1() {
+    let (store, pipeline) = pipeline();
+    let previous = store.engine().snapshot();
+    let compiled = ReadBasis::upper(&previous).unwrap().compiled;
+    store.use_dl(true, false);
+    let reinstalled = store.engine().snapshot();
+    assert_eq!(reinstalled.revision(), previous.revision());
+    assert!(!reinstalled.same_version(&previous));
+    assert!(ReadBasis::upper(&reinstalled).is_none());
+
+    update(&pipeline, "PREFIX : <urn:test:> INSERT DATA { :a0 a :F }");
+    let snapshot = store.engine().snapshot();
+    let published = ReadBasis::upper(&snapshot).expect("the new publication carries U1");
+    assert!(published.upper.is_ok());
+    assert_ne!(
+        published.compiled, compiled,
+        "the old root cannot supply the delta"
+    );
+    assert_eq!(published.last, "rebuilt");
+}
+
+/// R5. A panicking compaction must hand its ownership back to the next publisher.
+#[test]
+fn a_compaction_panic_releases_its_owner() {
+    let (store, _) = pipeline();
+    let mut upper = ReadBasis::upper(&store.engine().snapshot())
+        .unwrap()
+        .upper
+        .unwrap();
+    let budget = Arc::new(nrese_exec::Budget::unlimited());
+    upper.stack = TripleVersion::build([[1, 2, 3]], &budget)
+        .unwrap()
+        .successor(&[[4, 2, 3]], &[])
+        .unwrap();
+    let compaction = Compaction::default();
+    lock(&compaction.0).panic_before_merge = true;
+    let (notify, panicked) = std::sync::mpsc::channel();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .panic_handler(move |_| {
+            let _ = notify.send(());
+        })
+        .build()
+        .unwrap();
+    pool.install(|| compaction.publish(1, Some(&upper)));
+    panicked
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the worker panicked");
+    assert!(
+        !lock(&compaction.0).active,
+        "the next publication must be able to start a compactor"
+    );
+}
+
+/// The diagnostic's upper fact count and fact list describe the stack, even when
+/// the published program also has eligible facts (the BoundsReport API).
+#[test]
+fn upper_facts_reports_only_the_stack() {
+    let (store, pipeline) = pipeline();
+    update(
+        &pipeline,
+        "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+        INSERT DATA { :x a owl:NamedIndividual ,
+            [ owl:complementOf [ owl:complementOf :A ] ] . }",
+    );
+    let snapshot = store.engine().snapshot();
+    let upper = ReadBasis::upper(&snapshot).unwrap().upper.unwrap();
+    assert!(!upper.eligible.is_empty());
+    assert_eq!(
+        (
+            report(&store).upper_facts,
+            upper_facts(&store, false).unwrap().len()
+        ),
+        (upper.stack.len(), upper.stack.len())
+    );
+    assert_eq!(
+        canonical(&upper_facts(&store, true).unwrap()),
+        canonical(&upper_facts(&store, false).unwrap())
+    );
 }
 
 /// Part B T1 and reasoning-semantics.md §Default and named graphs. An assertion

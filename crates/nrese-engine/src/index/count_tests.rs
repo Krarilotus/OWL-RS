@@ -15,6 +15,35 @@ fn term(n: u64) -> TermId {
     TermId::new(TermKind::Iri, n + 1)
 }
 
+/// REAS-3. Main-store point and subject/predicate reads count both range bounds.
+/// A single packed block takes 11 units at the lower bound and 14 at the upper bound.
+#[test]
+fn main_store_reads_keep_their_range_work_units() {
+    let (s, p, o) = (term(0), term(1), term(2));
+    let fact = EncodedQuad::new(s, p, o, TermId::DEFAULT_GRAPH);
+    let version = IndexVersion::from_quads(Layout::DefaultGraph, vec![fact]);
+    let portions = std::cell::RefCell::new(Vec::new());
+    let visit = |n| {
+        portions.borrow_mut().push(n);
+        true
+    };
+    let plan = AccessPlan::for_pattern(&QuadPattern {
+        subject: Some(s),
+        predicate: Some(p),
+        ..QuadPattern::all()
+    });
+    let mut account: Visitor<'_> = &visit;
+    let mut scan = version.scan_plan_with(&plan, &mut account).unwrap();
+    assert_eq!(scan.step_with(&mut account).unwrap(), Some(fact));
+    let scan = portions.take();
+    assert!(version.contains_with(&fact, &mut account).unwrap());
+    let point = portions.take();
+    assert_eq!(
+        (scan.get(..2), point.as_slice()),
+        (Some(&[11, 14][..]), &[11, 14][..])
+    );
+}
+
 /// An account that allows its first `0` portions and refuses every one after.
 struct Allow(u32);
 

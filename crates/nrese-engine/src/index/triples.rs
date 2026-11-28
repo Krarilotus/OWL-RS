@@ -403,4 +403,40 @@ mod tests {
         assert!(old.contains(T));
         assert!(!old.contains(Z));
     }
+
+    /// R5 and R7. A stream of inserts uses the writer's cap without rewriting the runs
+    /// that a compactor will splice. The reader can see the merged base and every append.
+    #[test]
+    fn triple_writer_preserves_a_background_merge_during_monotonic_inserts() {
+        let budget = Arc::new(Budget::unlimited());
+        let policy = CompactionPolicy {
+            inline_entry_limit: 0,
+            ..Default::default()
+        };
+        let old = TripleVersion::build([A], &budget)
+            .unwrap()
+            .successor(&[T], &[])
+            .unwrap();
+        let splice = old.compact(policy, false).unwrap().unwrap();
+        let mut current = old.clone();
+        for s in 200..210 {
+            current = current.successor(&[[s, P, 1]], &[]).unwrap();
+            if let Some(compact) = current.compact(policy, true).unwrap() {
+                current = compact(&current).unwrap().unwrap();
+            }
+        }
+        let latest = splice(&current)
+            .unwrap()
+            .expect("writer compaction kept the owner's runs");
+        assert!(current.0.index.runs.len() <= 3);
+        assert!(latest.0.index.runs.len() <= 2);
+        assert_eq!(
+            latest.scan(PREDICATE).collect::<Vec<_>>(),
+            [A, T]
+                .into_iter()
+                .chain((200..210).map(|s| [s, P, 1]))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(old.len(), 2);
+    }
 }

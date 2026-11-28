@@ -60,6 +60,22 @@ fn the_runs_hold_nothing_beyond_their_charge() {
 
             assert_eq!(stack.len(), facts.len());
             assert!(eligible.is_empty());
+            // Both components also compact a window whose output still holds facts.
+            let keep = CompactionPolicy {
+                fanout: u64::MAX,
+                ..policy
+            };
+            let extra = [4 * n + 1, 0, 0];
+            for base in [&stack, &held_eligible] {
+                let staged = base.successor(&[extra], &[]).unwrap();
+                let compact = staged
+                    .compact(keep, false)
+                    .unwrap()
+                    .expect("a nonempty merge");
+                let compacted = compact(&staged).unwrap().expect("matching runs");
+                assert_eq!(compacted.len(), base.len() + 1);
+                assert!(compacted.contains(extra));
+            }
             drop((stack, eligible));
             assert_eq!(held_stack.len(), facts.len() - moved.len());
             assert_eq!(held_eligible.len(), moved.len());

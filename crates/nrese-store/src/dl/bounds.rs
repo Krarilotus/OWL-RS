@@ -458,6 +458,8 @@ struct Compaction(Arc<Mutex<Compacting>>);
 struct Compacting {
     latest: Option<(u64, TripleVersion, TripleVersion)>,
     active: bool,
+    #[cfg(test)]
+    panic_before_merge: bool,
 }
 
 impl Compaction {
@@ -486,7 +488,11 @@ impl Compaction {
                     slot.active = false;
                     return;
                 };
+                #[cfg(test)]
+                let panic_before_merge = std::mem::take(&mut slot.panic_before_merge);
                 drop(slot);
+                #[cfg(test)]
+                assert!(!panic_before_merge, "injected compaction panic");
                 let stack = stack.compact(policy, false);
                 let eligible = eligible.compact(policy, false);
                 let mut slot = lock(&shared);
