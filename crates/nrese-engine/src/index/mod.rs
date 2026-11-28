@@ -25,6 +25,7 @@ mod derive;
 pub(crate) mod keys;
 mod merge;
 pub(crate) mod run;
+mod triples;
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -45,6 +46,7 @@ use crate::visit::{Account, Free, Ledger};
 
 pub use compaction::CompactionPolicy;
 pub use keys::{IndexEncoding, set_index_encoding};
+pub use triples::TripleVersion;
 
 /// Which quads a stack of runs may hold, and therefore which permutations it maintains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1234,6 +1236,16 @@ impl IndexVersion {
             runs,
             len: self.len,
         }
+    }
+
+    /// A compaction taken from `captured` is still applicable where its input runs survive.
+    pub(crate) fn retains(&self, captured: &Self, mut window: Range<usize>) -> bool {
+        self.layout == captured.layout
+            && window.all(|i| {
+                self.runs
+                    .get(i)
+                    .is_some_and(|run| Arc::ptr_eq(run, &captured.runs[i]))
+            })
     }
 }
 

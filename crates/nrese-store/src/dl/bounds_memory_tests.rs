@@ -193,7 +193,6 @@ fn a_late_build_of_a_revision_a_read_let_go_publishes_nothing() {
         upper: Err(not_compiled()),
         last: "read",
         compiled: store.dl().bounds.compiled(),
-        taxonomy: None,
         kinds: None,
     };
     publish(&mut lock(&store.dl().bounds.state), state);
@@ -442,7 +441,6 @@ fn embedded_low_memory_stops_maintenance_of_an_existing_upper_bound() {
             upper: Ok(Arc::new(upper)),
             last: "read",
             compiled: store.dl().bounds.compiled(),
-            taxonomy: None,
             kinds: None,
         },
     );

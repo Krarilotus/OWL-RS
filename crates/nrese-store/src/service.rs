@@ -193,10 +193,13 @@ pub(crate) struct Certificate {
 /// Evidence owned by the published version. The engine attaches it with the stacks, including
 /// when a settings change replaces the version at the same revision.
 pub(crate) struct ReadBasis {
+    pub(crate) id: u64,
     certificate: Option<Certificate>,
     pub(crate) generation: crate::support::Generation,
     dl_route: (bool, bool),
     dl_status: std::sync::Mutex<Option<crate::dl::DlStatus>>,
+    upper: std::sync::Mutex<Option<crate::dl::bounds::Published>>,
+    left_out: std::sync::Mutex<Option<Option<String>>>,
     pub(crate) omission: std::sync::Mutex<Option<Option<String>>>,
 }
 
@@ -211,6 +214,47 @@ impl ReadBasis {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
+    }
+
+    pub(crate) fn left_out(snapshot: &Snapshot) -> Option<Option<String>> {
+        Self::dl_status(snapshot)
+            .and_then(|status| status.left_out)
+            .or_else(|| {
+                Self::of(snapshot)?
+                    .left_out
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone()
+            })
+    }
+
+    /// The ontology's actual diagnostic, which can be known before the consistency verdict.
+    pub(crate) fn record_left_out(snapshot: &Snapshot, left_out: Option<String>) {
+        if let Some(basis) = Self::of(snapshot) {
+            basis
+                .left_out
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get_or_insert(left_out);
+        }
+    }
+
+    pub(crate) fn upper(snapshot: &Snapshot) -> Option<crate::dl::bounds::Published> {
+        Self::of(snapshot)?
+            .upper
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn record_upper(snapshot: &Snapshot, upper: crate::dl::bounds::Published) {
+        if let Some(basis) = Self::of(snapshot) {
+            basis
+                .upper
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get_or_insert(upper);
+        }
     }
 
     pub(crate) fn record_dl(snapshot: &Snapshot, status: crate::dl::DlStatus) {
@@ -742,13 +786,20 @@ impl StoreService {
         literal_equality: bool,
         witness: Option<IllTyped>,
         dl_status: Option<crate::dl::DlStatus>,
+        dl_upper: Option<crate::dl::bounds::Published>,
+        left_out: Option<Option<String>>,
     ) -> Option<nrese_engine::Certificate> {
         let basis = ReadBasis::of(tx.base())?;
+        let finish = |next: std::sync::Arc<ReadBasis>| -> Option<nrese_engine::Certificate> {
+            *next.dl_status.lock().unwrap_or_else(|p| p.into_inner()) = dl_status;
+            *next.upper.lock().unwrap_or_else(|p| p.into_inner()) = dl_upper;
+            *next.left_out.lock().unwrap_or_else(|p| p.into_inner()) = left_out;
+            Some(next)
+        };
         let record = basis.certificate.as_ref();
         let Some(base) = record.filter(|c| c.exact) else {
             let next = self.read_basis(Self::without_verdict(record), basis.generation.clone());
-            *next.dl_status.lock().unwrap_or_else(|p| p.into_inner()) = dl_status;
-            return Some(next);
+            return finish(next);
         };
         let cell = *base.ill_typed.lock().unwrap_or_else(|p| p.into_inner());
         let ill_typed = if crate::dl::query::keeps_ill_typed(base.dl, &base.state.ruleset) {
@@ -784,8 +835,7 @@ impl StoreService {
             },
         };
         let next = self.read_basis(Some(certificate), basis.generation.clone());
-        *next.dl_status.lock().unwrap_or_else(|p| p.into_inner()) = dl_status;
-        Some(next)
+        finish(next)
     }
 
     /// The record a publication that doesn't maintain the inferences carries, by a holder of
@@ -828,11 +878,15 @@ impl StoreService {
         certificate: Option<Certificate>,
         generation: crate::support::Generation,
     ) -> std::sync::Arc<ReadBasis> {
+        static BASIS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         std::sync::Arc::new(ReadBasis {
+            id: BASIS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             certificate,
             generation,
             dl_route: (self.dl.active(), self.dl.user_rules()),
             dl_status: Default::default(),
+            upper: Default::default(),
+            left_out: Default::default(),
             omission: Default::default(),
         })
     }

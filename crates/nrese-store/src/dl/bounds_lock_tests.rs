@@ -89,7 +89,7 @@ const DELETE: &str = "PREFIX : <urn:test:> DELETE DATA { :a0 a :A . :a1 a :A . :
 
 /// A maintained read doesn't hold the bounds state across probes of its snapshot.
 #[test]
-fn program_fact_snapshot_probes_leave_the_bounds_state_unlocked() {
+fn a_read_uses_the_published_eligible_program_facts() {
     use std::fmt::Write as _;
 
     const MEMBERS: usize = 128;
@@ -117,10 +117,7 @@ fn program_fact_snapshot_probes_leave_the_bounds_state_unlocked() {
         assert_eq!(after.unavailable, None, "{after:?}");
     });
     eprintln!("{total} snapshot probes, {locked} under the bounds state lock");
-    assert!(
-        total >= MEMBERS,
-        "the read made only {total} snapshot probes"
-    );
+    assert_eq!(total, 0, "the read recomputed eligible facts");
     assert_eq!(
         locked, 0,
         "snapshot probes with the bounds state locked, of {total}"
@@ -512,7 +509,13 @@ fn until(event: impl Fn() -> bool) {
 
 /// Whether a read is asleep on the view build of `revision` under way (only while one is).
 fn asleep(store: &StoreService, revision: u64) -> bool {
-    matches!(store.dl().bounds.views.claim(revision, Kind::Opaque, || None),
+    let snapshot = store.engine().snapshot();
+    assert_eq!(snapshot.revision(), revision);
+    let key = (
+        snapshot.identity(),
+        ReadBasis::of(&snapshot).map(|basis| basis.id),
+    );
+    matches!(store.dl().bounds.views.claim(key, Kind::Opaque, || None),
         Claim::Wait(build) if build.waiting() >= 1)
 }
 
@@ -610,7 +613,7 @@ fn a_joined_read_gives_up(explain: bool) {
     // The build went on after its own request stopped, and is kept.
     let first = first.join().unwrap();
     assert!(cancelled(&first), "the first read, stopped: {first:?}");
-    let kept = lock(&store.dl().bounds.view)
+    let (_, kept) = lock(&store.dl().bounds.view)
         .clone()
         .expect("the view the stopped build made is kept");
     assert_eq!(kept.revision, revision);

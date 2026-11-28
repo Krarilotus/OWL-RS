@@ -5,7 +5,7 @@
 //! a clash fact). It is evaluated **over L ∪ data**: its input is the store's
 //! materialised view (asserted and inferred statements, every graph) plus the program's
 //! own facts, so U1 ⊇ L by construction. Only what it derives beyond that input is kept
-//! here, in [`Stack`]: never in the engine's inferred stack, so never visible as inferred
+//! here, in a [`TripleVersion`]: never in the engine's inferred stack, so never visible as inferred
 //! data. Queries read it through a snapshot of their own (`super::query`).
 //!
 //! **Maintained per commit** by the reasoner's delta executor (`nrese_reasoner::delta`),
@@ -28,230 +28,19 @@
 //! commit's equality would give classes ([`Change::merges`]): the delta executor reads
 //! facts as stored, and a class that may split is never maintained.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nrese_dl::bounds;
-use nrese_engine::{CountedSnapshot, GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
+use nrese_engine::{
+    CountedSnapshot, GraphSelector, QuadPattern, ReadModel, Snapshot, TermId, TripleVersion,
+};
 use nrese_owl::{Normalised, Ontology};
 use nrese_rdf::{LiteralRef, NamedNodeRef, TermRef};
 use nrese_reasoner::delta::{self, Base, VisitsBase};
 use nrese_reasoner::eval::{GroundProgram, Poller, Probe, Schema, Stop, Stopped, Visit};
 use nrese_reasoner::ir::{self, Triple};
-
-/// U1's own facts beyond its input, indexed for every bound pattern. What it holds is charged
-/// to `held` before it grows ([`Self::try_insert`], SYN-61); a fact's share is released once
-/// it is removed and the trees have freed what they free.
-#[derive(Debug, Default)]
-pub struct Stack {
-    spo: BTreeSet<[u64; 3]>,
-    pos: BTreeSet<[u64; 3]>,
-    osp: BTreeSet<[u64; 3]>,
-    /// Facts per predicate, for the delta executor's estimates.
-    per_predicate: std::collections::HashMap<u64, usize>,
-    /// Last: released after the trees and table it covers are freed.
-    held: Option<nrese_exec::Reservation>,
-}
-
-/// The largest node of the stack's trees: std's B-tree (B = 6) internal node, 11 keys, 12
-/// child links, a parent link and two 16-bit counts, aligned.
-const TREE_NODE: usize =
-    (11 * size_of::<[u64; 3]>() + 13 * size_of::<usize>() + 4).next_multiple_of(8);
-/// An upper bound on what one fact takes in each tree: every node but the root holds at
-/// least 5 keys, after an insert and after a remove alike (std's B-tree rebalances an
-/// underfull node), so the nodes number at most one per 5 keys, the root aside.
-const TREE_FACT: usize = TREE_NODE.div_ceil(5);
-/// An upper bound on what one more predicate takes in the per-predicate table: an entry and
-/// its control byte at a load of 7/8 rounded up to a power of two (so at most 16/7 slots an
-/// entry), the old table beside the new one while it grows (half as many again).
-const PREDICATE: usize = (16 + 1) * 16 * 3 / (7 * 2) + 1;
-/// What the stack takes once it holds anything: each tree's root, which may hold fewer than 5
-/// keys, and the table's smallest allocation (4 slots and its control group), twice over while
-/// it grows.
-const FIRST: usize = 3 * TREE_NODE + 2 * (4 * (16 + 1) + 16);
-
-impl Stack {
-    /// An empty stack charging what it holds to `budget`.
-    pub fn within(budget: &std::sync::Arc<nrese_exec::Budget>) -> Self {
-        Self {
-            held: Some(nrese_exec::Reservation::new(std::sync::Arc::clone(budget))),
-            ..Self::default()
-        }
-    }
-
-    /// `Self::insert`, charging what the fact takes first; nothing is inserted where the
-    /// budget can't take it.
-    pub fn try_insert(&mut self, t: Triple) -> Result<bool, nrese_exec::BudgetExceeded> {
-        if self.spo.contains(&t) {
-            return Ok(false);
-        }
-        if let Some(held) = &mut self.held {
-            // Charged once and kept: the roots and the table, which removes don't shrink.
-            let first = if held.bytes() == 0 { FIRST } else { 0 };
-            let predicate = match self.per_predicate.contains_key(&t[1]) {
-                true => 0,
-                false => PREDICATE,
-            };
-            held.charge(3 * TREE_FACT + first + predicate)?;
-        }
-        Ok(self.insert(t))
-    }
-
-    /// `Self::remove`, releasing the fact's share of the trees once they have freed it.
-    pub fn remove_charged(&mut self, t: Triple) -> bool {
-        let removed = self.remove(t);
-        if removed && let Some(held) = &mut self.held {
-            held.release(3 * TREE_FACT);
-        }
-        removed
-    }
-    pub fn len(&self) -> usize {
-        self.spo.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.spo.is_empty()
-    }
-
-    pub fn contains(&self, t: &Triple) -> bool {
-        self.spo.contains(t)
-    }
-
-    /// Uncharged: [`Self::try_insert`] outside this module.
-    fn insert(&mut self, [s, p, o]: Triple) -> bool {
-        if !self.spo.insert([s, p, o]) {
-            return false;
-        }
-        self.pos.insert([p, o, s]);
-        self.osp.insert([o, s, p]);
-        *self.per_predicate.entry(p).or_default() += 1;
-        true
-    }
-
-    /// Uncharged: [`Self::remove_charged`] outside this module.
-    fn remove(&mut self, [s, p, o]: Triple) -> bool {
-        if !self.spo.remove(&[s, p, o]) {
-            return false;
-        }
-        self.pos.remove(&[p, o, s]);
-        self.osp.remove(&[o, s, p]);
-        if let Some(n) = self.per_predicate.get_mut(&p) {
-            *n -= 1;
-        }
-        true
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = Triple> + '_ {
-        self.spo.iter().copied()
-    }
-
-    /// An upper bound on the facts matching `pattern`, zero only if none does. O(log n).
-    pub fn estimate(&self, pattern: [Option<u64>; 3]) -> usize {
-        self.estimate_counted(pattern, &|| true)
-    }
-
-    /// [`Self::estimate`], each fact its search for a match passes over counted with
-    /// `visited` (false once the reader's poller has stopped: then 0, an answer that means
-    /// nothing).
-    pub fn estimate_counted(&self, pattern: [Option<u64>; 3], visited: &dyn Fn() -> bool) -> usize {
-        let bound = match pattern[1] {
-            Some(p) => self.per_predicate.get(&p).copied().unwrap_or(0),
-            None => self.len(),
-        };
-        if bound == 0 {
-            return 0;
-        }
-        let mut any = false;
-        self.first(pattern, visited, &mut any);
-        if any { bound } else { 0 }
-    }
-
-    /// Whether a fact matches `pattern`, by the index whose prefix it binds, each fact it
-    /// passes over counted with `visited`.
-    fn first(&self, pattern: [Option<u64>; 3], visited: &dyn Fn() -> bool, any: &mut bool) {
-        let hit = |set: &BTreeSet<[u64; 3]>, prefix: &[u64], test: &dyn Fn(&[u64; 3]) -> bool| {
-            let mut low = [0u64; 3];
-            let mut high = [u64::MAX; 3];
-            low[..prefix.len()].copy_from_slice(prefix);
-            high[..prefix.len()].copy_from_slice(prefix);
-            let mut found = false;
-            for t in set.range(low..=high) {
-                if !visited() {
-                    return false;
-                }
-                if test(t) {
-                    found = true;
-                    break;
-                }
-            }
-            found
-        };
-        *any = match pattern {
-            [Some(s), Some(p), o] => hit(&self.spo, &[s, p], &|t| o.is_none_or(|o| t[2] == o)),
-            [Some(s), None, o] => hit(&self.spo, &[s], &|t| o.is_none_or(|o| t[2] == o)),
-            [None, Some(p), Some(o)] => hit(&self.pos, &[p, o], &|_| true),
-            [None, Some(p), None] => hit(&self.pos, &[p], &|_| true),
-            [None, None, Some(o)] => hit(&self.osp, &[o], &|_| true),
-            [None, None, None] => !self.is_empty(),
-        };
-    }
-
-    /// The facts matching `pattern`, by the index whose prefix it binds. O(log n + k).
-    pub fn scan(&self, pattern: [Option<u64>; 3], f: &mut dyn FnMut(Triple)) {
-        self.visit(pattern, &mut |t| {
-            if let Some(t) = t {
-                f(t);
-            }
-            true
-        });
-    }
-
-    /// Hands each fact of the index range `pattern` binds to `f` as it reads it: `Some` for
-    /// a match, `None` for one it passes over; ends once `f` returns false (the reader's
-    /// poller stopped).
-    pub fn visit(&self, pattern: [Option<u64>; 3], f: &mut dyn FnMut(Option<Triple>) -> bool) {
-        fn range<'s>(
-            set: &'s BTreeSet<[u64; 3]>,
-            prefix: &[u64],
-        ) -> impl Iterator<Item = [u64; 3]> + use<'s> {
-            let mut low = [0u64; 3];
-            let mut high = [u64::MAX; 3];
-            low[..prefix.len()].copy_from_slice(prefix);
-            high[..prefix.len()].copy_from_slice(prefix);
-            set.range(low..=high).copied()
-        }
-        let matches = |t: &Triple| {
-            pattern
-                .iter()
-                .zip(t)
-                .all(|(bound, value)| bound.is_none_or(|b| b == *value))
-        };
-        let mut hand = |t: Triple| f(matches(&t).then_some(t));
-        let _ = match pattern {
-            [Some(s), Some(p), _] => range(&self.spo, &[s, p]).try_for_each(|t| go(hand(t))),
-            [Some(s), None, _] => range(&self.spo, &[s]).try_for_each(|t| go(hand(t))),
-            [None, Some(p), Some(o)] => {
-                range(&self.pos, &[p, o]).try_for_each(|[p, o, s]| go(hand([s, p, o])))
-            }
-            [None, Some(p), None] => {
-                range(&self.pos, &[p]).try_for_each(|[p, o, s]| go(hand([s, p, o])))
-            }
-            [None, None, Some(o)] => {
-                range(&self.osp, &[o]).try_for_each(|[o, s, p]| go(hand([s, p, o])))
-            }
-            [None, None, None] => self.spo.iter().try_for_each(|&t| go(hand(t))),
-        };
-    }
-}
-
-/// `try_for_each`'s step: go on while `true`.
-fn go(on: bool) -> std::ops::ControlFlow<()> {
-    match on {
-        true => std::ops::ControlFlow::Continue(()),
-        false => std::ops::ControlFlow::Break(()),
-    }
-}
 
 /// A pattern over every graph.
 fn pattern([s, p, o]: [Option<u64>; 3]) -> QuadPattern {
@@ -435,7 +224,7 @@ struct UpperBase<'a> {
     /// (REAS-3, sweeps SW020, SW021).
     view: CountedSnapshot,
     facts: &'a HashSet<Triple>,
-    stack: &'a Stack,
+    stack: &'a TripleVersion,
     values: &'a Noting<'a>,
 }
 
@@ -517,11 +306,17 @@ impl VisitsBase for UpperBase<'_> {
                 return;
             }
         }
-        // Each stack fact the index range holds is a position, the ones it passes over too.
-        self.stack.visit(bound, &mut |t| match t {
-            Some(t) => visit.fact(t),
-            None => visit.skip(),
-        });
+        let Ok(facts) = self.stack.scan_counted(bound, &reads) else {
+            return;
+        };
+        for fact in facts {
+            let Ok(fact) = fact else {
+                return;
+            };
+            if !visit.fact(fact) {
+                return;
+            }
+        }
     }
 
     /// The view's count's work counted on `probe` as it goes; [`Stopped`]
@@ -533,7 +328,7 @@ impl VisitsBase for UpperBase<'_> {
                 probe.visited(n)
             })?
             .at_least();
-        let stack = self.stack.estimate_counted(bound, &|| probe.units(1));
+        let stack = estimate(self.stack, bound, &|n| probe.visited(n))?;
         probe.ended()?;
         // An expanded count past `u64` reads as its maximum (`Snapshot::count_in`): the sum
         // saturates too, never wrapping to a smaller estimate.
@@ -544,13 +339,30 @@ impl VisitsBase for UpperBase<'_> {
     }
 
     fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, Stopped> {
-        Ok(self.stack.contains(&fact) || self.asserts(fact, probe)?)
+        Ok(self
+            .stack
+            .any_counted(fact.map(Some), &|n| probe.visited(n))?
+            || self.asserts(fact, probe)?)
     }
 
     /// Each literal member the view is asked about is a unit, counted as it is asked.
     fn asserts(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, Stopped> {
         Ok(self.facts.contains(&fact) || self.in_view(fact, probe.poller())?)
     }
+}
+
+/// Upper bound on the matching facts. A narrower shape reports zero only after a
+/// counted probe establishes that it is empty.
+fn estimate(
+    stack: &TripleVersion,
+    bound @ [s, p, o]: [Option<u64>; 3],
+    visit: nrese_engine::Visitor<'_>,
+) -> Result<usize, Stopped> {
+    let count = p.map_or_else(|| stack.len(), |p| stack.count_predicate(p));
+    if count != 0 && (s.is_some() || o.is_some()) && !stack.any_counted(bound, visit)? {
+        return Ok(0);
+    }
+    Ok(count)
 }
 
 /// Gives IRIs and literals their ids in the store's dictionary (U1's own terms: fresh
@@ -683,16 +495,25 @@ pub(super) struct ProgramFacts {
     pub(super) classes: nrese_reasoner::representatives::EqualityClasses,
 }
 
-/// U1: the compiled program, its rules as the reasoner's, and its stack.
+/// Immutable evidence held together by a read of one publication.
+#[derive(Clone)]
+pub struct UpperVersion {
+    pub program: Arc<bounds::Program>,
+    pub stack: TripleVersion,
+    pub eligible: TripleVersion,
+    facts: Arc<ProgramFacts>,
+    values_unread: bool,
+    pub literals_by_value: usize,
+}
+
+/// U1: its published read evidence and the writer's state for maintaining it.
 pub struct Upper {
-    pub program: bounds::Program,
+    pub(super) version: UpperVersion,
     rules: Vec<ir::Rule>,
     schema: Schema,
     /// The `owl:sameAs` id `rules` hold the equality rules over, if they do, asked once with
     /// them ([`nrese_reasoner::delta::Rules::equality`]).
     equality: Option<u64>,
-    facts: Arc<ProgramFacts>,
-    pub stack: Stack,
     /// The classes U1 was compiled for: memberships in others change it.
     signature: HashSet<u64>,
     /// Its object and data properties: an assertion that uses one as the other kind, or
@@ -712,6 +533,14 @@ pub struct Upper {
     same_as: u64,
     /// How long the last evaluation or maintenance took.
     pub elapsed: Duration,
+}
+
+impl std::ops::Deref for Upper {
+    type Target = UpperVersion;
+
+    fn deref(&self) -> &Self::Target {
+        &self.version
+    }
 }
 
 impl std::fmt::Debug for Upper {
@@ -778,6 +607,10 @@ fn view_facts(
 
 /// Why U1 isn't available when its build's scratch doesn't fit.
 const SCRATCH_REFUSED: &str = "its evaluation's input doesn't fit the queries' memory";
+
+fn facts_refused(_: nrese_exec::BudgetExceeded) -> GaveUp {
+    GaveUp::refused("its facts don't fit the queries' memory")
+}
 
 /// `facts` sorted, each once; in place, allocating nothing.
 pub(crate) fn sort_dedup(facts: &mut nrese_exec::ChargedVec<Triple>) {
@@ -874,13 +707,12 @@ impl Upper {
         let same_as = program.names.same_as;
         // What U1 keeps of the evaluation, charged to `kept` before it is made (SYN-61); the
         // evaluation's own working set is watched (`stop`), as the support sets' is.
-        let mut stack = Stack::within(kept);
-        let refused = |_| GaveUp::refused("its facts don't fit the queries' memory");
+        let mut facts_derived = nrese_exec::ChargedVec::new(Arc::clone(kept));
         for (i, t) in m.derived.into_iter().enumerate() {
             if i % 1024 == 0 {
                 check_stop(stop)?;
             }
-            stack.try_insert(t).map_err(refused)?;
+            facts_derived.push(t).map_err(facts_refused)?;
         }
         // The input is consumed and the derived facts (which may have reused it) freed.
         drop(input_held);
@@ -889,11 +721,23 @@ impl Upper {
                 if i % 1024 == 0 {
                     check_stop(stop)?;
                 }
-                stack
-                    .try_insert([member, same_as, representative])
-                    .map_err(refused)?;
+                facts_derived
+                    .push([member, same_as, representative])
+                    .map_err(facts_refused)?;
             }
         }
+        let stack =
+            TripleVersion::build(facts_derived.iter().copied(), kept).map_err(facts_refused)?;
+        drop(facts_derived);
+        let eligible = TripleVersion::build(
+            facts.iter().copied().filter(|t| {
+                !t.iter().any(|&id| m.classes.class_of(id).is_some())
+                    && !super::bounds::in_view(view, *t)
+                    && !stack.contains(*t)
+            }),
+            kept,
+        )
+        .map_err(facts_refused)?;
         let s = &program.signature;
         let signature = s.classes.iter().copied().collect();
         let object_properties = s.object_properties.iter().copied().collect();
@@ -901,15 +745,20 @@ impl Upper {
         Ok(Self {
             rdf_type: program.names.rdf_type,
             same_as: program.names.same_as,
-            program,
             equality: nrese_reasoner::representatives::same_as(&rules, schema.same_as()),
             rules,
             schema,
-            facts: Arc::new(ProgramFacts {
-                triples: facts,
-                classes: m.classes,
-            }),
-            stack,
+            version: UpperVersion {
+                program: Arc::new(program),
+                facts: Arc::new(ProgramFacts {
+                    triples: facts,
+                    classes: m.classes,
+                }),
+                stack,
+                eligible,
+                values_unread: values.unread,
+                literals_by_value: values.seen.len(),
+            },
             signature,
             object_properties,
             data_properties,
@@ -974,10 +823,10 @@ impl Upper {
         // consequences are already there.
         let moved: Vec<Triple> = inserted
             .iter()
-            .filter(|t| self.stack.contains(t))
+            .filter(|&&t| self.stack.contains(t))
             .copied()
             .collect();
-        inserted.retain(|t| !self.stack.contains(t));
+        inserted.retain(|&t| !self.stack.contains(t));
         let mut deleted: Vec<Triple> = deleted
             .iter()
             .map(|&t| values.map(t))
@@ -1048,67 +897,97 @@ impl Upper {
         Ok(change)
     }
 
-    /// Applies a commit's change ([`Self::change`]) once the commit is done, the literals
-    /// it read by value first among them. Refused where the stack's budget can't take its
-    /// new facts: U1 is then partly changed, and not to be kept.
-    pub fn apply(&mut self, change: Change) -> Result<(), nrese_exec::BudgetExceeded> {
-        for t in change.moved.into_iter().chain(change.remove) {
-            self.stack.remove_charged(t);
+    /// Stages both exact deltas before the commit can publish either.
+    pub(super) fn stage(
+        &self,
+        mut change: Change,
+        changed: impl Iterator<Item = Triple>,
+        view: &Snapshot,
+        budget: &Arc<nrese_exec::Budget>,
+        compacted: Option<(TripleVersion, TripleVersion)>,
+    ) -> Result<(UpperVersion, Change), GaveUp> {
+        let mut candidates = nrese_exec::ChargedVec::new(Arc::clone(budget));
+        for t in changed.filter(|t| self.facts.triples.contains(t)) {
+            candidates.push(t).map_err(facts_refused)?;
         }
-        for t in change.insert {
-            self.stack.try_insert(t)?;
+        sort_dedup(&mut candidates);
+        let mut inserts = nrese_exec::ChargedVec::new(Arc::clone(budget));
+        let mut deletes = nrese_exec::ChargedVec::new(Arc::clone(budget));
+        for &t in candidates.iter() {
+            let was = self.eligible.contains(t);
+            let now = !super::bounds::in_view(view, t);
+            match (was, now) {
+                (false, true) => inserts.push(t).map_err(facts_refused)?,
+                (true, false) => deletes.push(t).map_err(facts_refused)?,
+                _ => {}
+            }
         }
+        let (stack, eligible) =
+            compacted.unwrap_or_else(|| (self.stack.clone(), self.eligible.clone()));
+        let eligible = advance(&eligible, &inserts, &deletes)?;
+
+        change.moved.append(&mut change.remove);
+        change.moved.sort_unstable();
+        change.moved.dedup();
+        change.insert.sort_unstable();
+        change.insert.dedup();
+        change
+            .moved
+            .retain(|&t| stack.contains(t) && change.insert.binary_search(&t).is_err());
+        change.insert.retain(|&t| !stack.contains(t));
+        let stack = advance(&stack, &change.insert, &change.moved)?;
+        let version = UpperVersion {
+            program: Arc::clone(&self.program),
+            facts: Arc::clone(&self.facts),
+            values_unread: self.values.unread || change.noted.unread,
+            literals_by_value: self.values.seen.len() + change.noted.seen.len(),
+            stack,
+            eligible,
+        };
+        Ok((version, change))
+    }
+
+    /// Installs the writer's accompanying state after its evidence was published.
+    pub(super) fn apply(&mut self, change: Change, version: UpperVersion) {
         if let Some(program) = change.program {
             self.ground = Some(program);
         }
         self.values.absorb(change.noted);
         self.elapsed = change.elapsed;
-        Ok(())
+        self.version = version;
     }
+}
 
-    /// The clashes the stack would have after `change`.
-    pub fn clashes_after(&self, change: &Change) -> usize {
-        let clash = self.program.names.clash;
-        let is_clash = |t: &Triple| t[1] == clash && t[2] == clash;
-        let gone = change
-            .moved
-            .iter()
-            .chain(&change.remove)
-            .filter(|t| is_clash(t) && self.stack.contains(t))
-            .count();
-        let new = change
-            .insert
-            .iter()
-            .filter(|t| is_clash(t) && !self.stack.contains(t))
-            .count();
-        (self.clashes() + new).saturating_sub(gone)
+fn advance(
+    previous: &TripleVersion,
+    inserts: &[Triple],
+    deletes: &[Triple],
+) -> Result<TripleVersion, GaveUp> {
+    let version = previous
+        .successor(inserts, deletes)
+        .map_err(facts_refused)?;
+    if let Some(splice) = version
+        .compact(nrese_engine::CompactionPolicy::default(), true)
+        .map_err(facts_refused)?
+    {
+        return Ok(splice(&version)
+            .map_err(facts_refused)?
+            .expect("compaction against its own version"));
     }
+    Ok(version)
+}
 
+impl UpperVersion {
     /// The terms a clash was derived at (`⊥` fired in U1): the ontology may be
     /// inconsistent.
     pub fn clashes(&self) -> usize {
-        let clash = self.program.names.clash;
-        let mut n = 0;
-        self.stack
-            .scan([None, Some(clash), Some(clash)], &mut |_| n += 1);
-        n
+        self.stack.count_predicate(self.program.names.clash)
     }
 
     /// Whether U1 proves the ontology consistent (PAGOdA, Theorem 5.5 (i)): no clash, and
     /// U1 checks every `⊥` ([`bounds::Program::proves_consistency`]).
     pub fn proves_consistency(&self) -> bool {
-        self.program.proves_consistency() && self.clashes() == 0 && !self.values.unread
-    }
-
-    /// Whether U1 and `change` read the value of every literal its rules compare: else a
-    /// clash-free U1 proves nothing ([`Values`]).
-    pub fn reads_every_value(&self, change: &Change) -> bool {
-        !self.values.unread && !change.noted.unread
-    }
-
-    /// The program's facts before projection and their equality classes.
-    pub(super) fn facts(&self) -> &Arc<ProgramFacts> {
-        &self.facts
+        self.program.proves_consistency() && self.clashes() == 0 && !self.values_unread
     }
 
     /// U1's `owl:sameAs` classes: its stack is over their representatives, each other
@@ -1120,12 +999,7 @@ impl Upper {
 
     /// `owl:sameAs`, as U1's program names it.
     pub fn same_as(&self) -> u64 {
-        self.same_as
-    }
-
-    /// How many literals U1 reads by value (`Values`).
-    pub fn literals_by_value(&self) -> usize {
-        self.values.seen.len()
+        self.program.names.same_as
     }
 
     /// Whether `term` is one of U1's own (a Skolem constant, a fresh class, the clash).
@@ -1136,7 +1010,11 @@ impl Upper {
 
 #[cfg(test)]
 mod tests {
-    use super::Stack;
+    use super::{Triple, TripleVersion, estimate};
+
+    fn stack(facts: impl IntoIterator<Item = Triple>) -> TripleVersion {
+        TripleVersion::build(facts, &std::sync::Arc::new(nrese_exec::Budget::unlimited())).unwrap()
+    }
 
     /// REAS-2 (a counted test per leaf that filters): U1's base counts
     /// the program facts its scan passes over, not only those it delivers. Over three poll
@@ -1154,7 +1032,7 @@ mod tests {
         .unwrap();
         let view = engine.snapshot();
         let facts: std::collections::HashSet<[u64; 3]> = (0..n).map(|i| [i, 5, i]).collect();
-        let (stack, values) = (Stack::default(), super::Values::default());
+        let (stack, values) = (stack([]), super::Values::default());
         let noting = super::Noting {
             base: &values,
             added: super::Values::default(),
@@ -1179,9 +1057,8 @@ mod tests {
         );
     }
 
-    /// The same for U1's stack: a scan of `x type B` reads the index range
-    /// of `x type`, three poll intervals of other types, and passes over each; uncounted,
-    /// the poller would never poll.
+    /// Contract §4.3c R6. A bound scan polls while it cancels the deleted prefix
+    /// and reports the stop before the final live fact.
     #[test]
     fn the_upper_base_counts_the_stack_facts_it_passes_over() {
         use nrese_reasoner::delta::Base;
@@ -1194,10 +1071,11 @@ mod tests {
         .unwrap();
         let view = engine.snapshot();
         let facts = std::collections::HashSet::new();
-        let mut stack = Stack::default();
-        for c in 0..n {
-            stack.insert([1, 2, 1_000 + c]);
-        }
+        let deleted: Vec<_> = (0..n).map(|c| [1, 2, 1_000 + c]).collect();
+        let tail = [1, 2, 1_000 + n];
+        let stack = stack(deleted.iter().copied().chain([tail]))
+            .successor(&[], &deleted)
+            .unwrap();
         let values = super::Values::default();
         let noting = super::Noting {
             base: &values,
@@ -1214,9 +1092,13 @@ mod tests {
         let poll = nrese_reasoner::eval::Poller::new(&stop).expect("not stopped yet");
         fired.store(true, Ordering::Relaxed);
         let mut delivered = 0;
-        let scanned = base.scan([Some(1), Some(2), Some(7)], &poll, &mut |_| delivered += 1);
+        let scanned = base.scan([Some(1), Some(2), None], &poll, &mut |_| delivered += 1);
         assert!(scanned.is_err(), "a scan its poller stopped says so");
-        assert_eq!(delivered, 0, "no stack fact has the object");
+        assert_eq!(delivered, 0, "the last fact is beyond the stopped prefix");
+        assert_eq!(
+            stack.scan([Some(1), Some(2), None]).collect::<Vec<_>>(),
+            [tail]
+        );
         assert!(
             poll.stopped(),
             "{n} stack facts passed over without the poller polling"
@@ -1252,7 +1134,7 @@ mod tests {
         let n = 64 * u64::from(nrese_exec::POLL_UNITS);
         let (engine, values, rep) = one_value_written(n);
         let view = engine.snapshot();
-        let (facts, stack) = (std::collections::HashSet::new(), Stack::default());
+        let (facts, stack) = (std::collections::HashSet::new(), stack([]));
         let noting = super::Noting {
             base: &values,
             added: super::Values::default(),
@@ -1297,7 +1179,7 @@ mod tests {
         let n = 8 * interval as u64;
         let (engine, values, rep) = one_value_written(n);
         let view = engine.snapshot();
-        let (facts, stack) = (std::collections::HashSet::new(), Stack::default());
+        let (facts, stack) = (std::collections::HashSet::new(), stack([]));
         let noting = super::Noting {
             base: &values,
             added: super::Values::default(),
@@ -1332,12 +1214,9 @@ mod tests {
     /// count of the matches.
     #[test]
     fn stack_estimates_are_bounds_and_zero_only_without_a_match() {
-        let mut stack = Stack::default();
-        for s in 0..50u64 {
-            stack.insert([s, 1, s + 100]);
-            stack.insert([s, 2, 7]);
-        }
-        stack.remove([0, 1, 100]);
+        let stack = stack((0..50u64).flat_map(|s| [[s, 1, s + 100], [s, 2, 7]]))
+            .successor(&[], &[[0, 1, 100]])
+            .unwrap();
         let patterns = [
             [None, None, None],
             [Some(3), None, None],
@@ -1351,14 +1230,19 @@ mod tests {
             [Some(0), Some(1), None],
         ];
         for pattern in patterns {
-            let mut matches = 0;
-            stack.scan(pattern, &mut |_| matches += 1);
-            let estimate = stack.estimate(pattern);
+            let matches = stack.scan(pattern).count();
+            let estimate = estimate(&stack, pattern, &|_| true).unwrap();
             assert!(estimate >= matches, "{pattern:?}: {estimate} < {matches}");
             assert_eq!(estimate == 0, matches == 0, "{pattern:?}");
         }
         // Bounded by the predicate's facts, not the stack's.
-        assert_eq!(stack.estimate([None, Some(2), Some(7)]), 50);
-        assert_eq!(stack.estimate([Some(3), Some(1), None]), 49);
+        assert_eq!(
+            estimate(&stack, [None, Some(2), Some(7)], &|_| true).unwrap(),
+            50
+        );
+        assert_eq!(
+            estimate(&stack, [Some(3), Some(1), None], &|_| true).unwrap(),
+            49
+        );
     }
 }

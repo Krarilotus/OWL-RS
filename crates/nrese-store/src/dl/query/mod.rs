@@ -346,7 +346,7 @@ pub(crate) fn plan_status(
     ))
 }
 
-/// The status when the DL bounds view isn't used ([`PART`], [`LATER`], [`DEADLINE`]): `why`,
+/// The status when the DL bounds view isn't used ([`PART`], [`DEADLINE`]): `why`,
 /// its cause without "answers over the RL closure" unless the read surely reads the closure
 /// ([`reads_store_closure`]); for a reader of every graph that can't read it
 /// ([`may_read_store_closure`]), also that its dataset leaves the closure out. A reader of
@@ -385,7 +385,7 @@ fn may_read_store_closure(prepared: &PreparedQuery) -> bool {
 }
 
 /// The bounds' view of `snapshot` its answers and their status are decided on, or
-/// why there is none ([`PART`], [`LATER`], [`FAILED`], [`DEADLINE`]). Never another
+/// why there is none ([`PART`], [`FAILED`], [`DEADLINE`]). Never another
 /// snapshot's view.
 type Decided = Result<(Snapshot, Arc<View>), &'static str>;
 
@@ -393,7 +393,7 @@ type Decided = Result<(Snapshot, Arc<View>), &'static str>;
 const PART: &str = "the reader sees part of the data: answers are checked against the bounds \
                     only for readers of every graph";
 
-/// The end of [`LATER`] and [`DEADLINE`]: what a read without the bounds' view answers over,
+/// The end of [`DEADLINE`]: what a read without the bounds' view answers over,
 /// where it surely reads the closure ([`fallback`]).
 macro_rules! over_the_closure {
     () => {
@@ -404,12 +404,6 @@ const OVER_THE_CLOSURE: &str = over_the_closure!();
 
 /// [`OVER_THE_CLOSURE`] for a read that may leave the closure out.
 const NOT_CHECKED: &str = ": not checked against the bounds";
-
-/// An older revision whose bounds a later commit replaced reads its RL closure.
-const LATER: &str = concat!(
-    "a later commit's bounds replaced this revision's while it was read",
-    over_the_closure!()
-);
 
 /// A read whose request's time was up before the view of its revision was built reads its RL
 /// closure: the build, another read's or none begun, isn't waited for.
@@ -443,7 +437,6 @@ fn decided(
     };
     Ok(match view {
         Ok(view) => Ok((snapshot.clone(), view)),
-        Err(Missing::Later) => Err(LATER),
         Err(Missing::Failed) => Err(FAILED),
     })
 }
@@ -652,7 +645,7 @@ fn reads_differently(store: &StoreService, at: Revision<'_>) -> Option<String> {
     // Named where its commit wrote it: only a reader of every graph is given the status this
     // reason is in (`status_for_its_reader`, service.rs). U1's proof of consistency is no
     // record: it says nothing of what the rules read beyond the ontology (an unused structure).
-    let left_out = crate::service::ReadBasis::dl_status(snapshot).and_then(|s| s.left_out);
+    let left_out = crate::service::ReadBasis::left_out(snapshot);
     // A pending read's record is its base's: one that tells nothing says nothing of pending
     // changes that may change what the reader reads (a node typed the ontology reads its
     // statements otherwise, a literal gives an object property a second kind), so it reads

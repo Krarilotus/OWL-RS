@@ -123,7 +123,7 @@ impl PermutationRun {
 
     /// [`Self::from_sorted`], each array reserved on `charge` before it is made, the keys
     /// packed on one thread unless `parallel`.
-    fn from_sorted_within<C: super::Charge>(
+    pub(super) fn from_sorted_within<C: super::Charge>(
         entries: Vec<(Key, bool)>,
         charge: &mut C,
         parallel: bool,
@@ -215,6 +215,8 @@ pub(crate) struct Run {
     quads_form: parking_lot::Mutex<std::sync::Weak<Run>>,
     /// On a quad-layout form: its bytes in its engine's [`Forms`] while it lives.
     account: Option<Accounted>,
+    /// The signed predicate summary and the charge owned by a derived triple run.
+    triples: Option<(Vec<(u64, i64)>, nrese_exec::Reservation)>,
 }
 
 impl Run {
@@ -359,7 +361,42 @@ impl Run {
             deletes,
             quads_form: Default::default(),
             account: None,
+            triples: None,
         }
+    }
+
+    pub(super) fn keep_triples(
+        &mut self,
+        budget: &std::sync::Arc<nrese_exec::Budget>,
+        held: &mut nrese_exec::Reservation,
+    ) -> Result<(), nrese_exec::BudgetExceeded> {
+        let mut counts = nrese_exec::ChargedVec::new(std::sync::Arc::clone(budget));
+        let pos = self.permutation(Permutation::Posg);
+        for (i, [predicate, ..]) in pos.keys.iter().enumerate() {
+            let sign = if pos.is_tombstone(i) { -1 } else { 1 };
+            match counts.last_mut() {
+                Some((p, count)) if *p == predicate => *count += sign,
+                _ => counts.push((predicate, sign))?,
+            }
+        }
+        held.charge(size_of::<Self>() + 2 * size_of::<usize>())?;
+        let (counts, charge) = counts.into_parts();
+        held.absorb(charge);
+        self.triples = Some((
+            counts,
+            std::mem::replace(
+                held,
+                nrese_exec::Reservation::new(std::sync::Arc::clone(budget)),
+            ),
+        ));
+        Ok(())
+    }
+
+    pub(super) fn predicate_delta(&self, predicate: u64) -> i64 {
+        let (counts, _) = self.triples.as_ref().expect("derived triple run");
+        counts
+            .binary_search_by_key(&predicate, |&(p, _)| p)
+            .map_or(0, |i| counts[i].1)
     }
 
     pub(crate) fn layout(&self) -> Layout {
