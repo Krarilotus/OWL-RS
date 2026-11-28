@@ -1542,6 +1542,10 @@ impl StoreService {
         memory: &nrese_exec::Envelope,
         cancel: &CancellationToken,
     ) -> StoreResult<Snapshot> {
+        #[cfg(test)]
+        if let Some(view) = hooks::QUERY_VIEW.with_borrow_mut(Option::take) {
+            return Ok(view(base));
+        }
         let Some(scope) = &prepared.inference_scope else {
             return self.view_of(base, prepared.access(), memory, Some(cancel));
         };
@@ -3692,8 +3696,11 @@ pub(crate) mod hooks {
     use std::thread::LocalKey;
 
     pub(crate) type Hook = RefCell<Option<Box<dyn FnOnce()>>>;
+    type QueryView = Box<dyn FnOnce(&nrese_engine::Snapshot) -> nrese_engine::Snapshot>;
 
     thread_local! {
+        /// Supply a withheld view for a test after the committed base has been pinned.
+        pub(crate) static QUERY_VIEW: RefCell<Option<QueryView>> = const { RefCell::new(None) };
         /// A bulk load holds the writer slot and is about to read its files.
         pub(crate) static BEFORE_LOAD_READS: Hook = const { RefCell::new(None) };
         /// A bulk load has cleared the reasoning certificate and is about to publish.

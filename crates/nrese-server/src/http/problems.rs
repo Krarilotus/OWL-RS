@@ -230,6 +230,20 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
     }
 
+    /// An HTTP/1.0 client must be able to detect a cut in the problem with its request id.
+    #[tokio::test]
+    async fn the_request_id_preserves_framing_of_a_problem_document() {
+        let response = respond(app(), Method::GET, "/own-as-written").await;
+        let length = response.headers().get(header::CONTENT_LENGTH).cloned();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            length.unwrap().to_str().unwrap().parse::<usize>().unwrap(),
+            bytes.len()
+        );
+    }
+
     /// `len` bytes of text, as a refusal that quotes long values has.
     fn long_text(len: usize) -> String {
         "x".repeat(len)

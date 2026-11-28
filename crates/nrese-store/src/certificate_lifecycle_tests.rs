@@ -142,6 +142,237 @@ fn reads(store: &StoreService) -> [String; 2] {
     [status(store, READ), status(store, NEGATED)]
 }
 
+/// A value-spelling reason needs a literal in the data read (reasoning-semantics,
+/// status reasons). Compact equality between IRIs doesn't supply one.
+#[test]
+fn distinct_iri_answers_have_no_literal_spelling_reason() {
+    let store = Arc::new(
+        StoreService::new(StoreConfig {
+            equality_compact: true,
+            ql_rewriting: crate::QlRewritingMode::On,
+            ..StoreConfig::in_memory()
+        })
+        .unwrap(),
+    );
+    let writes = pipeline(&store, ReasoningMode::Owl2Rl);
+    commit(&writes, ":x :p :a . :p a owl:ObjectProperty .");
+    commit(&writes, ":a owl:sameAs :b .");
+    let request = SparqlQueryRequest::all(format!(
+        "{PREFIXES} SELECT DISTINCT ?o WHERE {{ :x :p ?o }} ORDER BY ?o"
+    ));
+    let answer = store.execute_query(&request).unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&answer.payload).unwrap();
+    let values: Vec<_> = body["results"]["bindings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["o"]["value"].as_str().unwrap())
+        .collect();
+    assert_eq!(values, ["http://example.com/a", "http://example.com/b"]);
+    let claim = answer.completeness.unwrap();
+    assert!(
+        !claim
+            .reasons
+            .iter()
+            .any(|r| r.text.contains("two spellings")),
+        "{}",
+        claim.header()
+    );
+    assert_eq!(claim.as_str(), "complete");
+}
+
+/// Graph scope (reasoning-semantics): changing only hidden axioms can't change a
+/// restricted QL reader's reasons about its own answer.
+#[test]
+fn a_restricted_ql_reason_does_not_report_hidden_equality() {
+    let query = |hidden| {
+        let store = Arc::new(StoreService::new(StoreConfig::in_memory()).unwrap());
+        let writes = pipeline(&store, ReasoningMode::Owl2Ql);
+        commit(
+            &writes,
+            "GRAPH :visible { :A rdfs:subClassOf :B . :x a :A }",
+        );
+        if hidden {
+            commit(&writes, "GRAPH :hidden { :x owl:sameAs :y }");
+        }
+        let mut req = SparqlQueryRequest::all(format!("{PREFIXES} ASK {{ :x a :B }}"));
+        req.scope = crate::ReadScope::of(Some(Arc::new(nrese_sparql::GraphAccess {
+            graphs: vec!["http://example.com/visible".into()],
+            default_graph: true,
+            inferred: true,
+            inferred_by_support: true,
+            ..Default::default()
+        })));
+        let result = store.execute_query(&req).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&result.payload).unwrap();
+        assert_eq!(body["boolean"], true);
+        let claim = result.completeness.unwrap();
+        assert_eq!(result.ql.unwrap().completeness, claim);
+        claim.reasons.clone()
+    };
+    let visible = query(false);
+    assert!(
+        visible
+            .iter()
+            .any(|r| r.text.contains("can't read every graph"))
+    );
+    assert_eq!(query(true), visible);
+}
+
+/// A QL schema hazard depends on the pinned revision (reasoning-semantics, status
+/// reasons). Keeping the deleted predicate's dictionary ID cannot change the answer.
+#[test]
+fn ql_reasons_match_a_fresh_store_after_the_property_axiom_is_deleted() {
+    let query = |historical| {
+        let store = Arc::new(StoreService::new(StoreConfig::in_memory()).unwrap());
+        let writes = pipeline(&store, ReasoningMode::Owl2Ql);
+        commit(&writes, ":i1 owl:sameAs :i0 .");
+        if historical {
+            commit(&writes, ":p1 rdfs:subPropertyOf :p0 .");
+            writes
+                .execute_update_str(&format!(
+                    "{PREFIXES} DELETE DATA {{ :p1 rdfs:subPropertyOf :p0 }}"
+                ))
+                .unwrap();
+        }
+        let answer = store
+            .execute_query(&SparqlQueryRequest::all(format!(
+                "{PREFIXES} SELECT ?x ?o WHERE {{ ?x :p0 ?o }}"
+            )))
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&answer.payload).unwrap();
+        assert_eq!(body["results"]["bindings"], serde_json::json!([]));
+        let claim = answer.completeness.unwrap();
+        (claim.as_str(), claim.reasons.clone())
+    };
+    assert_eq!(query(true), query(false));
+}
+
+/// A published clash is part of the read's claim even when its completeness was
+/// already lowered (reasoning-semantics, consistency).
+#[test]
+fn a_query_on_an_inconsistent_ql_publication_reports_the_clash() {
+    let store = StoreService::new(StoreConfig::in_memory()).unwrap();
+    store
+        .update_str_ungated(&format!(
+            "{PREFIXES} INSERT DATA {{ :A owl:disjointWith :B . :a a :A, :B }}"
+        ))
+        .unwrap();
+    store
+        .rematerialise(
+            ReasonerConfig::for_mode(ReasoningMode::Owl2Ql)
+                .materialised_program()
+                .unwrap(),
+        )
+        .unwrap();
+    assert!(matches!(
+        store.consistency(),
+        crate::ConsistencyStatus::Inconsistent { .. }
+    ));
+    let result = store
+        .execute_query(&SparqlQueryRequest::all(format!(
+            "{PREFIXES} SELECT ?t WHERE {{ :a a ?t }}"
+        )))
+        .unwrap();
+    let claim = result.completeness.unwrap();
+    assert_eq!(claim.as_str(), "sound-only");
+    assert!(matches!(
+        claim.consistency(),
+        crate::ConsistencyStatus::Inconsistent { .. }
+    ));
+    assert!(claim.reasons.iter().any(|r| r.text.contains("quarantine")));
+}
+
+/// The header's reason cap never hides a known clash behind reasons about the query.
+#[test]
+fn the_reason_cap_keeps_the_publications_clash() {
+    let (store, _) = certificate_record_tests::quarantined(StoreConfig::in_memory());
+    let snapshot = store.engine.snapshot();
+    let mut status = nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Rl);
+    for i in 0..10 {
+        status.incomplete("query", format!("branch {i} is incomplete"));
+    }
+    let claim = store.assess(
+        Revision::Committed(&snapshot),
+        super::Evidence::Service {
+            status,
+            verdict: None,
+        },
+    );
+    assert!(claim.header().contains("quarantine"), "{}", claim.header());
+    assert!(
+        claim.header().contains("more"),
+        "the fixture reached the cap"
+    );
+}
+
+/// The pinned publication, not the withheld view or a later mode switch, decides the
+/// route for the same query, its explanation, and its plan.
+#[test]
+fn a_withheld_view_keeps_its_committed_bases_dl_route() {
+    let store = Arc::new(StoreService::new(StoreConfig::in_memory()).unwrap());
+    let request = SparqlQueryRequest::all("ASK { <urn:a> <urn:p> <urn:b> }");
+    let prepared = store.prepare_query(&request).unwrap();
+    let arm = || {
+        store.use_dl(true, false);
+        let switcher = Arc::clone(&store);
+        hooks::QUERY_VIEW.set(Some(Box::new(move |base| {
+            let view = base
+                .with_inferred_mask(
+                    &nrese_engine::InferredMask::default(),
+                    false,
+                    &nrese_exec::Budget::unlimited(),
+                )
+                .unwrap()
+                .unwrap();
+            switcher.use_dl(false, false);
+            assert!(super::Certificate::route(base, switcher.dl()).0);
+            assert!(!super::Certificate::route(&view, switcher.dl()).0);
+            view
+        })));
+    };
+    arm();
+    let run = store.execute_query(&request).unwrap();
+    assert_eq!(
+        run.completeness.map(|c| c.as_str()),
+        Some("not-certified"),
+        "execute"
+    );
+    arm();
+    let explained = store
+        .explain_query(&prepared, &CancellationToken::new())
+        .unwrap();
+    assert_eq!(
+        explained.completeness.unwrap().as_str(),
+        "not-certified",
+        "EXPLAIN"
+    );
+    arm();
+    let planned = store
+        .plan_query(&prepared, &CancellationToken::new())
+        .unwrap();
+    assert_eq!(
+        planned.completeness.unwrap().as_str(),
+        "not-certified",
+        "plan"
+    );
+
+    store.use_reasoning_rules(
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl).materialised_program(),
+    );
+    arm();
+    let mut request = request;
+    request.read_model = Some(nrese_engine::ReadModel::Inferred);
+    request.dl_answers = Some(crate::DlAnswers::Exact);
+    assert!(
+        matches!(
+            store.execute_query(&request),
+            Err(crate::StoreError::Incomplete(_))
+        ),
+        "exact"
+    );
+}
+
 /// Whether `header` is OWL 2 RL's closure status for [`READ`].
 fn owl2_rl(header: &str) -> bool {
     header.starts_with("sound-only; regime=owl2-rl")

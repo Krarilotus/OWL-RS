@@ -402,6 +402,7 @@ async fn http10_head_has_the_length_and_no_body() -> Result<(), Box<dyn Error>> 
         );
         assert!(end.is_ok());
         assert!(body.is_empty());
+        assert_eq!(header(&head, "nrese-completeness"), None);
         Ok(())
     })
     .await?
@@ -458,6 +459,7 @@ async fn http11_head_has_no_body_and_no_framing() -> Result<(), Box<dyn Error>> 
         assert_eq!(header(&head, "transfer-encoding"), None, "{head:?}");
         assert!(end.is_ok());
         assert!(body.is_empty());
+        assert_eq!(header(&head, "nrese-completeness"), None);
         Ok(())
     })
     .await?
@@ -546,6 +548,7 @@ async fn http2_head_ends_the_stream_without_data() -> Result<(), Box<dyn Error>>
         connection.abort();
         eprintln!("{:?} {:?}; end {end:?}", head.status, head.headers);
         assert!(end.is_none(), "a HEAD answer's stream ends without data");
+        assert!(!head.headers.contains_key("nrese-completeness"));
         Ok(())
     })
     .await?

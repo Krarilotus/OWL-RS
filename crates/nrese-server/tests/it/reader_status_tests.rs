@@ -32,6 +32,47 @@ const ADMIN: &[&str] = &["nrese.admin"];
 const DATA: &str = "GRAPH :g1 { ex:p rdfs:subPropertyOf ex:q . ex:a ex:p ex:b }";
 const ENTAILED: &str = "ASK { ex:a ex:q ex:b }";
 
+/// The consistency reason survives a competing true query reason in both the claim
+/// header and every representation of the same EXPLAIN or plan.
+#[tokio::test]
+async fn a_clash_and_a_query_reason_are_reported_together() -> TestResult {
+    let store = nrese_store::StoreService::new(StoreConfig::in_memory())?;
+    store.update_str_ungated(
+        "PREFIX owl: <http://www.w3.org/2002/07/owl#> PREFIX : <urn:clash:>
+         INSERT DATA { :A owl:disjointWith :B . :a a :A, :B }",
+    )?;
+    let reasoner = ReasonerConfig::for_mode(ReasoningMode::Owl2Ql);
+    store.rematerialise(reasoner.materialised_program().unwrap())?;
+    let app = crate::support::test_app_with_store(store, Default::default(), reasoner)?;
+    for suffix in ["", "?explain=true", "?explain=plan"] {
+        let response = send(
+            &app,
+            ADMIN,
+            Method::POST,
+            &format!("/dataset/query{suffix}"),
+            "SELECT ?t WHERE { <urn:clash:a> a ?t }".to_owned(),
+        )
+        .await?;
+        let (body, header) = read(response).await?;
+        assert_eq!(header.split(';').next(), Some("sound-only"), "{header}");
+        assert!(header.contains("quarantine"), "{header}");
+        assert!(header.contains("class it doesn't name"), "{header}");
+        if !suffix.is_empty() {
+            let claim = &body["completeness"];
+            assert_eq!(claim["status"], "sound-only", "{body}");
+            assert_eq!(claim["consistency"], "inconsistent", "{body}");
+            let reasons = claim["reasons"].as_array().unwrap();
+            assert!(
+                reasons
+                    .iter()
+                    .any(|r| r["text"].as_str().unwrap().contains("quarantine"))
+            );
+            assert_eq!(body["ql"]["reasons"], claim["reasons"], "{body}");
+        }
+    }
+    Ok(())
+}
+
 /// How the reader reads [`ENTAILED`].
 #[derive(Debug, Clone, Copy)]
 enum Route {

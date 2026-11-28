@@ -743,6 +743,60 @@ mod tests {
         );
     }
 
+    /// Framing can end with a trailer only after the producer succeeds.
+    #[tokio::test]
+    async fn a_late_error_precedes_the_terminal_trailer() {
+        use http_body_util::BodyExt;
+
+        for version in [Version::HTTP_11, Version::HTTP_2] {
+            for succeeds in [false, true] {
+                let response = answering(
+                    version,
+                    stream_blocking(
+                        Pace::Total(Instant::now() + Duration::from_secs(30)),
+                        CancellationToken::new(),
+                        Envelope::unlimited,
+                        Reader::Every,
+                        "text/plain",
+                        "timeout",
+                        move |writer| {
+                            io::Write::write_all(writer, &vec![b'x'; CHUNK_BYTES])
+                                .map_err(|error| ApiError::internal(error.to_string()))?;
+                            let mut trailers = HeaderMap::new();
+                            trailers.insert("x-result-checksum", HeaderValue::from_static("check"));
+                            writer
+                                .trailers(trailers)
+                                .map_err(|error| ApiError::internal(error.to_string()))?;
+                            if succeeds {
+                                Ok(())
+                            } else {
+                                Err(ApiError::internal("producer failed"))
+                            }
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+                let mut body = response.into_body();
+                let data = body.frame().await.unwrap().unwrap().into_data().unwrap();
+                assert_eq!(data.len(), CHUNK_BYTES);
+                let terminal = body.frame().await.unwrap();
+                if succeeds {
+                    assert_eq!(
+                        terminal.unwrap().into_trailers().unwrap()["x-result-checksum"],
+                        "check"
+                    );
+                } else {
+                    assert!(
+                        terminal.is_err(),
+                        "{version:?}: failure was framed as success"
+                    );
+                }
+                assert!(body.frame().await.is_none());
+            }
+        }
+    }
+
     /// On tokio's paused clock: the deadline passes when the test advances the clock, and
     /// the test waits for the producer's own signal that it stopped, so no timing under
     /// load decides it (it failed once under the gate's parallel load when it slept 1.5 s
