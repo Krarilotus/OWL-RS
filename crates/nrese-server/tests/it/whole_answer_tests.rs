@@ -87,15 +87,14 @@ async fn an_http10_answer_past_its_envelope_is_refused_and_its_memory_released()
     let before = held(&store);
     let response = app.oneshot(query_request(Version::HTTP_10)?).await?;
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    let claim = response.headers()["nrese-completeness"].to_str()?;
-    assert_eq!(claim.split(';').next(), Some("sound-only"));
-    assert!(claim.contains("the result was not delivered"), "{claim}");
+    assert!(!response.headers().contains_key("nrese-completeness"));
     let problem: serde_json::Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await?)?;
     assert_eq!(
         problem["type"],
         "https://nrese.dev/problems/payload-too-large"
     );
+    assert!(problem.get("completeness").is_none(), "{problem}");
     assert_eq!(
         problem["detail"],
         "This answer is larger than the 1 MiB an HTTP/1.0 request can be answered with: \
@@ -420,7 +419,11 @@ async fn restricted_http10_refuses_before_evaluation_on_every_streamed_route()
                 .ok_or("no head")?;
             let head = std::str::from_utf8(&response[..split])?;
             let body = &response[split + 4..];
-            assert!(head.starts_with("HTTP/1.0 505 "), "{route}: {head}");
+            // The server specifies the protocol it requires (RFC 9110 §§7.8, 15.5.22).
+            assert!(head.starts_with("HTTP/1.0 426 "), "{route}: {head}");
+            let headers = head.to_ascii_lowercase();
+            assert!(headers.contains("\r\nupgrade: http/1.1"), "{head}");
+            assert!(headers.contains("\r\nconnection: upgrade"), "{head}");
             assert!(
                 head.contains(&format!("\r\ncontent-length: {}", body.len())),
                 "{head}"

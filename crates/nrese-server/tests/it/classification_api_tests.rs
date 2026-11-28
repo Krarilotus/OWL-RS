@@ -228,9 +228,8 @@ async fn every_form_states_the_verdict_or_its_absence() -> Result<(), Box<dyn st
                 "{name} {route}"
             );
             if consistency == "inconsistent" {
-                let reason = json["consistency_reason"].as_str().expect("clash reason");
-                assert!(reason.contains("inconsistent"), "{reason}");
-                assert!(header.contains(reason), "{header}");
+                assert!(header.contains("inconsistent"), "{header}");
+                assert!(json.get("consistency_reason").is_none(), "{json}");
             }
             if name == "declared" {
                 let mut head = get_at(route, "application/json")?;

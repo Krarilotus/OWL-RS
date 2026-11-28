@@ -32,10 +32,7 @@ const ADMIN: &[&str] = &["nrese.admin"];
 const DATA: &str = "GRAPH :g1 { ex:p rdfs:subPropertyOf ex:q . ex:a ex:p ex:b }";
 const ENTAILED: &str = "ASK { ex:a ex:q ex:b }";
 
-/// The consistency reason survives a competing true query reason in both the claim
-/// header and every representation of the same EXPLAIN or plan.
-#[tokio::test]
-async fn a_clash_and_a_query_reason_are_reported_together() -> TestResult {
+fn quarantined_ql_app() -> TestResult<Router> {
     let store = nrese_store::StoreService::new(StoreConfig::in_memory())?;
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("clash.ttl");
@@ -52,7 +49,19 @@ async fn a_clash_and_a_query_reason_are_reported_together() -> TestResult {
     })?;
     let reasoner = ReasonerConfig::for_mode(ReasoningMode::Owl2Ql);
     store.rematerialise(reasoner.materialised_program().unwrap())?;
-    let app = crate::support::test_app_with_store(store, Default::default(), reasoner)?;
+    assert!(store.is_quarantined());
+    Ok(crate::support::test_app_with_store(
+        store,
+        Default::default(),
+        reasoner,
+    )?)
+}
+
+/// The consistency reason survives a competing query reason in the claim header and
+/// EXPLAIN or plan's reasons, with the documented report fields.
+#[tokio::test]
+async fn a_clash_and_a_query_reason_are_reported_together() -> TestResult {
+    let app = quarantined_ql_app()?;
     for suffix in ["", "?explain=true", "?explain=plan"] {
         let response = send(
             &app,
@@ -69,7 +78,6 @@ async fn a_clash_and_a_query_reason_are_reported_together() -> TestResult {
         if !suffix.is_empty() {
             let claim = &body["completeness"];
             assert_eq!(claim["status"], "sound-only", "{body}");
-            assert_eq!(claim["consistency"], "inconsistent", "{body}");
             let reasons = claim["reasons"].as_array().unwrap();
             assert!(
                 reasons
@@ -77,8 +85,40 @@ async fn a_clash_and_a_query_reason_are_reported_together() -> TestResult {
                     .any(|r| r["text"].as_str().unwrap().contains("quarantine"))
             );
             assert_eq!(body["ql"]["reasons"], claim["reasons"], "{body}");
+            assert!(claim.get("consistency").is_none(), "{body}");
+            assert!(body["ql"].get("consistency").is_none(), "{body}");
         }
     }
+    Ok(())
+}
+
+/// SYN-72 and the HTTP API: an asserted read answers over stored rows with a bare
+/// `complete`, even when the corresponding reasoned read cannot be complete.
+#[tokio::test]
+async fn asserted_negation_is_complete_on_a_quarantined_store() -> TestResult {
+    let app = quarantined_ql_app()?;
+    let response = send(
+        &app,
+        ADMIN,
+        Method::POST,
+        "/dataset/query?infer=false",
+        "SELECT ?s WHERE { ?s a <urn:clash:A> FILTER NOT EXISTS { ?s a <urn:clash:C> } }"
+            .to_owned(),
+    )
+    .await?;
+    let exposed = response
+        .headers()
+        .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
+        .cloned();
+    let (body, claim) = read(response).await?;
+    assert_eq!(
+        body["results"]["bindings"],
+        serde_json::json!([
+            { "s": { "type": "uri", "value": "urn:clash:a" } }
+        ])
+    );
+    assert_eq!(claim, "complete");
+    assert_eq!(exposed.unwrap(), "nrese-completeness");
     Ok(())
 }
 

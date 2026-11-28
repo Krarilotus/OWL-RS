@@ -279,6 +279,132 @@ fn a_query_on_an_inconsistent_ql_publication_reports_the_clash() {
     assert!(claim.reasons.iter().any(|r| r.text.contains("quarantine")));
 }
 
+/// A complete service decision can report a clash without saying the service result
+/// is incomplete (read contract, consistency independent of coverage).
+#[test]
+fn complete_services_report_quarantine_without_lowering_language() {
+    use crate::ReadScope;
+    use crate::dl::{Verdict, entailment::Entailed};
+    use crate::reasoning::JustificationMode;
+    use nrese_rdf::NamedNode;
+
+    let (store, _) = certificate_record_tests::quarantined(StoreConfig::in_memory());
+    let snapshot = store.engine.snapshot();
+    let subject = NamedNode::new("http://example.org/x").unwrap();
+    let class = NamedNode::new("http://example.org/A").unwrap();
+    let rules = ReasonerConfig::for_mode(ReasoningMode::Owl2Rl)
+        .materialised_program()
+        .unwrap();
+    let justification = store
+        .justify_statement(
+            rules,
+            &ReadScope::All,
+            [
+                subject.as_ref().into(),
+                nrese_rdf::vocab::rdf::TYPE.into(),
+                class.as_ref().into(),
+            ],
+            JustificationMode::One,
+        )
+        .unwrap()
+        .unwrap();
+    let claims = [
+        (
+            "classification",
+            store.classify(&ReadScope::All).unwrap().claim,
+        ),
+        ("realisation", store.realise(&ReadScope::All).unwrap().claim),
+        ("rules justification", justification.claim),
+        (
+            "rules entailment",
+            store.assess(
+                Revision::Committed(&snapshot),
+                super::Evidence::RulesEntailment(super::RulesEntailment::InconsistentPremise),
+            ),
+        ),
+        (
+            "DL entailment",
+            store.assess(
+                Revision::Committed(&snapshot),
+                super::Evidence::DlEntailment {
+                    premise: Verdict::Inconsistent,
+                    answer: &Entailed::Yes,
+                },
+            ),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (route, claim) in claims {
+        assert_eq!(claim.as_str(), "complete", "{route}: {claim:?}");
+        let reason = claim.consistency_reason().expect("clash or hold");
+        if reason.contains("no read is certified complete") {
+            wrong.push((route, reason.to_owned()));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Where certification is withheld, the publication's quarantine is still reported.
+#[test]
+fn a_restricted_read_keeps_the_quarantine_reason_when_not_certified() {
+    let (store, _) = certificate_record_tests::quarantined(StoreConfig {
+        equality_compact: true,
+        ..StoreConfig::in_memory()
+    });
+    let request = SparqlQueryRequest::new(
+        "ASK { <http://example.org/x> a <http://example.org/A> }",
+        crate::ReadScope::Graphs(Arc::new(nrese_sparql::GraphAccess {
+            default_graph: true,
+            inferred: true,
+            ..Default::default()
+        })),
+    );
+    let claim = store.execute_query(&request).unwrap().completeness.unwrap();
+    let header = claim.header();
+    assert!(
+        header.starts_with("not-certified; reasons=\"consistency: "),
+        "{header}"
+    );
+    assert!(header.contains("quarantine"), "{header}");
+}
+
+/// A missing evidence source lowers coverage without asserting that it found a literal.
+#[test]
+fn unchecked_spelling_evidence_lowers_a_value_comparison() {
+    let prepared = PreparedQuery::parse(&SparqlQueryRequest::all(
+        "SELECT DISTINCT ?o { <urn:s> <urn:p> ?o }",
+    ))
+    .unwrap();
+    let mut status = nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Rl);
+    crate::dl::query::certify_closure(&mut status, prepared.reads(), "rules", None);
+    let header = status.header();
+    assert!(
+        header.contains("literal evidence could not be checked"),
+        "{header}"
+    );
+    assert!(!header.contains("two spellings of one value"), "{header}");
+}
+
+/// A printed query also applies the operator rule when quarantine can leave rows missing.
+#[test]
+fn a_printed_negation_on_a_quarantined_store_is_unsound() {
+    let (store, _) = certificate_record_tests::quarantined(StoreConfig::in_memory());
+    let snapshot = store.engine.snapshot();
+    let query = nrese_sparql::compat::parse_query(
+        "SELECT ?s { ?s a <http://example.org/A> FILTER NOT EXISTS { ?s a <http://example.org/C> } }",
+        None,
+    ).unwrap();
+    let claim = store.assess(
+        Revision::Committed(&snapshot),
+        super::Evidence::Printed {
+            query: &query,
+            status: nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Rl),
+        },
+    );
+    assert_eq!(claim.as_str(), "unsound", "{claim:?}");
+    assert!(claim.header().contains("NOT EXISTS"), "{claim:?}");
+}
+
 /// The header's reason cap never hides a known clash behind reasons about the query.
 #[test]
 fn the_reason_cap_keeps_the_publications_clash() {
